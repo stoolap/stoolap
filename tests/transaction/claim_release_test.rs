@@ -58,7 +58,7 @@ fn a_claim_another_handle_relies_on_survives_a_refused_update() {
             start.send(()).unwrap();
             has_claimed.recv().unwrap();
         });
-        let updated = updater.update_by_row_ids(&[1, 2], &mut |row| Ok((row, true)));
+        let updated = updater.update_by_row_ids(&[1, 2], &mut |_, row| Ok((row, true)));
         resume.send(()).unwrap();
         (updated, delete.join().unwrap())
     });
@@ -92,14 +92,14 @@ fn a_prepared_row_another_handle_wrote_is_not_set_again() {
     let reader = txn.get_table("t").unwrap();
     // After the update claims row 1, the other handle writes it locally
     test_failpoints::after_cold_claim_taken(move || {
-        let mut set = |mut row: stoolap::core::Row| {
+        let mut set = |_: i64, mut row: stoolap::core::Row| {
             row.set(1, stoolap::core::Value::Integer(5)).unwrap();
             Ok((row, true))
         };
         writer.update_by_row_ids(&[1], &mut set).unwrap();
     });
     let mut calls = Vec::new();
-    let updated = updater.update(ScanAccess::Seq, None, &mut |mut row| {
+    let updated = updater.update(ScanAccess::Seq, None, &mut |_, mut row| {
         calls.push(row.get(0).and_then(|v| v.as_int64()).unwrap());
         row.set(1, stoolap::core::Value::Integer(7)).unwrap();
         Ok((row, true))
@@ -147,14 +147,14 @@ fn a_late_conflict_on_the_second_row_leaves_no_part_of_the_statement() {
     let reader = txn.get_table("t").unwrap();
     // Row 1 is claimed; the other handle writes row 2 before it is applied
     test_failpoints::after_cold_claim_taken(move || {
-        let mut set = |mut row: stoolap::core::Row| {
+        let mut set = |_: i64, mut row: stoolap::core::Row| {
             row.set(1, stoolap::core::Value::Integer(5)).unwrap();
             Ok((row, true))
         };
         writer.update_by_row_ids(&[2], &mut set).unwrap();
     });
     let mut calls = Vec::new();
-    let updated = updater.update(ScanAccess::Seq, None, &mut |mut row| {
+    let updated = updater.update(ScanAccess::Seq, None, &mut |_, mut row| {
         calls.push(row.get(0).and_then(|v| v.as_int64()).unwrap());
         row.set(1, stoolap::core::Value::Integer(7)).unwrap();
         Ok((row, true))

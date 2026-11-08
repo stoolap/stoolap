@@ -100,6 +100,16 @@ RETURNING id, price, (SELECT name FROM categories WHERE categories.id = products
 
 See [Subqueries in RETURNING]({% link _docs/sql-features/subqueries.md %}#subqueries-in-returning) for the rules.
 
+## Row Identity
+
+`RETURNING rowid` returns each row's identity, which in a table without a primary key is the id the insert assigned:
+
+```sql
+INSERT INTO events VALUES ('open', 'a') RETURNING rowid;
+```
+
+See [Row Identity (rowid)]({% link _docs/sql-features/rowid.md %}).
+
 ## Use Cases
 
 - **Get auto-generated IDs** after INSERT without a separate SELECT

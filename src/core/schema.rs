@@ -603,6 +603,12 @@ impl Schema {
         })
     }
 
+    /// The column an unquoted `rowid` or `_rowid_` reads when no column has
+    /// that name: the integer primary key, the row's identity
+    pub fn rowid_column(&self) -> Option<usize> {
+        self.pk_column_index()
+    }
+
     /// Validate column count matches expected value
     pub fn validate_column_count(&self, expected: usize) -> Result<()> {
         if self.columns.len() != expected {
@@ -871,6 +877,15 @@ impl Default for Schema {
     fn default() -> Self {
         Self::new("", Vec::new())
     }
+}
+
+/// The name a table without a primary key has its row id read under, a
+/// column past its own that no statement can spell
+pub const ROWID_SLOT: &str = "\u{0}rowid";
+
+/// Whether `name_lower` spells the row's identity
+pub fn is_rowid_name(name_lower: &str) -> bool {
+    matches!(name_lower, "rowid" | "_rowid_")
 }
 
 impl fmt::Display for Schema {

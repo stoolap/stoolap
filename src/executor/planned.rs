@@ -183,7 +183,7 @@ impl Executor {
             self,
             ctx,
             &branch,
-            &schema,
+            (&schema, true),
             scope,
             param_count,
             epoch,

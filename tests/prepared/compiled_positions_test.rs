@@ -454,7 +454,7 @@ fn a_handle_opened_inside_an_update_setter_does_not_wait_for_the_update() {
                 Value::Integer(10),
             ]))
             .unwrap();
-        let updated = table.update_by_row_ids(&[1], &mut |row| {
+        let updated = table.update_by_row_ids(&[1], &mut |_, row| {
             tx.get_table("t")?;
             Ok((row, true))
         });

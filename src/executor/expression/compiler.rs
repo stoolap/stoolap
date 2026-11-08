@@ -37,7 +37,7 @@ use super::vm::{ExecuteContext, ExprVM};
 use crate::core::interval::IntervalUnit;
 use crate::core::pattern::Pattern;
 use crate::core::predicate::PredicateSet;
-use crate::core::{DataType, Row, Value, ValueSet};
+use crate::core::{DataType, Row, Value, ValueSet, ROWID_SLOT};
 use crate::executor::expr_key::ExprKey;
 use crate::executor::pushdown::read_as_column;
 use crate::executor::utils::{
@@ -645,6 +645,7 @@ impl<'a> ExprCompiler<'a> {
                     })?;
                     builder.emit(match second {
                         true => Op::LoadColumn2(at),
+                        false if column.name.value_lower == ROWID_SLOT => Op::LoadRowId(at),
                         false => Op::LoadColumn(at),
                     });
                 }
@@ -848,7 +849,11 @@ impl<'a> ExprCompiler<'a> {
         expr: &Expression,
         builder: &mut ProgramBuilder,
     ) -> Result<(), CompileError> {
+        let slot = matches!(expr, Expression::Identifier(id) if id.value_lower == ROWID_SLOT);
         match self.ctx.reference(expr) {
+            Some(Reference::Column(ColumnSource::Row1(idx))) if slot => {
+                builder.emit(Op::LoadRowId(idx))
+            }
             Some(Reference::Column(ColumnSource::Row1(idx))) => builder.emit(Op::LoadColumn(idx)),
             Some(Reference::Column(ColumnSource::Row2(idx))) => builder.emit(Op::LoadColumn2(idx)),
             Some(Reference::Text) => {

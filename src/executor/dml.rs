@@ -312,7 +312,16 @@ impl InsertPrograms {
         }
         let returning = (!stmt.returning.is_empty()
             && !stmt.returning.iter().any(Executor::has_subqueries))
-        .then(|| returning_programs(&stmt.returning, &schema.column_names_arc()));
+        .then(|| {
+            let widened = returns_slot(&stmt.returning, schema);
+            let columns = super::prepared_select::read_names(schema, widened);
+            let rowid = schema.rowid_column();
+            returning_programs(
+                &stmt.returning,
+                &columns,
+                rowid.or(widened.then_some(schema.columns.len())),
+            )
+        });
         Self {
             default_values,
             default_programs,
@@ -357,15 +366,28 @@ fn compile_value(expr: &Expression) -> Result<super::expression::SharedProgram> 
     )
 }
 
-/// A RETURNING's programs over the target's `columns`, a star expanded
+/// A RETURNING's programs over the target's `columns`, a star expanded, a
+/// rowid read from the column `rowid`
 fn returning_programs(
     returning: &[Expression],
     columns: &[String],
+    rowid: Option<usize>,
 ) -> Vec<Result<super::expression::SharedProgram>> {
     use crate::parser::{Identifier, Position, Token, TokenType};
     let registry = crate::functions::global_registry();
+    let real = |expr: &Expression| {
+        let name = match expr {
+            Expression::QualifiedIdentifier(q) => &q.name.value_lower,
+            Expression::Identifier(id) => &id.value_lower,
+            _ => return true,
+        };
+        columns.iter().any(|c| c.eq_ignore_ascii_case(name))
+    };
     let compile = |expr: &Expression| {
-        super::aggregation::compile_over_slots(expr, columns, registry, None, false, None)
+        let expr = super::utils::rowids_respelled(expr, false, &mut |name| {
+            Ok(rowid.filter(|_| !real(name)).map(|at| columns[at].clone()))
+        })?;
+        super::aggregation::compile_over_slots(&expr, columns, registry, None, false, None)
     };
     let mut programs = Vec::with_capacity(returning.len());
     for expr in returning {
@@ -526,6 +548,35 @@ pub(crate) struct CompiledCheck {
     /// Whether its answer may change with no column changing (NOW, RANDOM)
     pub(crate) volatile: bool,
     pub(crate) program: super::expression::SharedProgram,
+}
+
+/// Whether an INSERT's RETURNING reads the row ids of a table without a
+/// primary key, which its rows returned then carry past their columns
+fn returns_slot(returning: &[Expression], schema: &Schema) -> bool {
+    schema.rowid_column().is_none() && returning.iter().any(super::utils::expr_names_rowid)
+}
+
+/// `row` inserted into `table` as a RETURNING reads it: with its row id
+/// past its columns when `widened`
+fn inserted(table: &mut dyn Table, row: Row, widened: bool) -> Result<Row> {
+    match widened {
+        true => table
+            .insert_with_id(row)
+            .map(|(id, row)| super::prepared_select::widened(row, id)),
+        false => table.insert(row),
+    }
+}
+
+/// The column a statement writes under the lowercase `name`, None for no
+/// column; an error for rowid, the row's identity, which nothing writes
+pub(crate) fn written_column(schema: &Schema, name: &str) -> Result<Option<usize>> {
+    match schema.column_index_map().get(name) {
+        Some(&at) => Ok(Some(at)),
+        None if crate::core::is_rowid_name(name) => Err(Error::invalid_argument(format!(
+            "cannot write {name}: it is the row's identity"
+        ))),
+        None => Ok(None),
+    }
 }
 
 /// Compile every CHECK constraint of `schema`, the columns' and the table's.
@@ -965,15 +1016,12 @@ impl Executor {
             } else {
                 // Validate columns exist and pre-compute their indices
                 // OPTIMIZATION: Use cached column_index_map for O(1) lookups instead of O(n) linear scan
-                let col_map = schema.column_index_map();
                 column_indices = stmt
                     .columns
                     .iter()
                     .map(|id| {
                         // Use pre-computed lowercase value from AST
-                        col_map
-                            .get(id.value_lower.as_str())
-                            .copied()
+                        written_column(schema, id.value_lower.as_str())?
                             .ok_or_else(|| Error::ColumnNotFound(id.value.to_string()))
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -1025,6 +1073,7 @@ impl Executor {
 
         // RETURNING clause support - collect inserted rows if RETURNING is specified
         let has_returning = !stmt.returning.is_empty();
+        let widened = has_returning && returns_slot(&stmt.returning, table.schema());
         let mut returning_rows: Vec<Row> = Vec::new();
         // OPTIMIZATION: Only get column names Arc when RETURNING is used (avoids 7ms clone)
         let schema_column_names_arc = if has_returning {
@@ -1135,7 +1184,7 @@ impl Executor {
                     let schema_ref = select_schema.as_ref().unwrap();
                     // ON CONFLICT DO NOTHING — silently skip duplicates
                     let insert_result: Result<Option<Row>> = if has_returning {
-                        table.insert(row).map(Some)
+                        inserted(&mut *table, row, widened).map(Some)
                     } else {
                         table.insert_discard(row).map(|()| None)
                     };
@@ -1160,7 +1209,7 @@ impl Executor {
                     let schema_ref = select_schema.as_ref().unwrap();
                     // ON CONFLICT DO UPDATE / ON DUPLICATE KEY UPDATE
                     let insert_result: Result<Option<Row>> = if has_returning {
-                        table.insert(row).map(Some)
+                        inserted(&mut *table, row, widened).map(Some)
                     } else {
                         table.insert_discard(row).map(|()| None)
                     };
@@ -1260,7 +1309,7 @@ impl Executor {
                     }
                 } else if has_returning {
                     // Use insert() which returns row (for RETURNING clause)
-                    let inserted_row = table.insert(row)?;
+                    let inserted_row = inserted(&mut *table, row, widened)?;
                     returning_rows.push(inserted_row);
                     rows_affected += 1;
                 } else {
@@ -1422,7 +1471,7 @@ impl Executor {
                 if stmt.do_nothing {
                     // ON CONFLICT DO NOTHING — silently skip duplicates
                     let insert_result: Result<Option<Row>> = if has_returning {
-                        table.insert(row).map(Some)
+                        inserted(&mut *table, row, widened).map(Some)
                     } else {
                         table.insert_discard(row).map(|()| None)
                     };
@@ -1445,7 +1494,7 @@ impl Executor {
                 } else {
                     // ON CONFLICT DO UPDATE / ON DUPLICATE KEY UPDATE
                     let insert_result: Result<Option<Row>> = if has_returning {
-                        table.insert(row).map(Some)
+                        inserted(&mut *table, row, widened).map(Some)
                     } else {
                         table.insert_discard(row).map(|()| None)
                     };
@@ -1626,7 +1675,7 @@ impl Executor {
 
                 if has_returning {
                     // Use insert() which returns row (for RETURNING clause)
-                    let inserted_row = table.insert(row)?;
+                    let inserted_row = inserted(&mut *table, row, widened)?;
                     returning_rows.push(inserted_row);
                 } else {
                     // Use insert_discard() to avoid clone overhead
@@ -1858,14 +1907,11 @@ impl Executor {
                     (indices, types, dims, names)
                 } else {
                     // Validate columns exist and pre-compute their indices
-                    let col_map = schema.column_index_map();
                     let indices: Vec<usize> = stmt
                         .columns
                         .iter()
                         .map(|id| {
-                            col_map
-                                .get(id.value_lower.as_str())
-                                .copied()
+                            written_column(schema, id.value_lower.as_str())?
                                 .ok_or_else(|| Error::ColumnNotFound(id.value.to_string()))
                         })
                         .collect::<Result<Vec<_>>>()?;
@@ -1980,6 +2026,7 @@ impl Executor {
 
         // RETURNING clause support - collect inserted rows if RETURNING is specified
         let has_returning = !stmt.returning.is_empty();
+        let widened = has_returning && returns_slot(&stmt.returning, table.schema());
         let mut returning_rows: Vec<Row> = Vec::new();
         let schema_column_names_arc = if has_returning {
             Some(table.schema().column_names_arc())
@@ -2067,7 +2114,7 @@ impl Executor {
                 }
 
                 if has_returning {
-                    let inserted_row = table.insert(row)?;
+                    let inserted_row = inserted(&mut *table, row, widened)?;
                     returning_rows.push(inserted_row);
                 } else {
                     table.insert_discard(row)?;
@@ -2157,7 +2204,7 @@ impl Executor {
                 }
 
                 if has_returning {
-                    let inserted_row = table.insert(row)?;
+                    let inserted_row = inserted(&mut *table, row, widened)?;
                     returning_rows.push(inserted_row);
                 } else {
                     table.insert_discard(row)?;
@@ -2357,6 +2404,9 @@ impl Executor {
         // throughout ~50 code paths (lookups, range scans, ORDER BY, FK cascade, WAL
         // recovery, etc.). Allowing PK mutation silently corrupts lookups.
         // This matches SQLite's behavior for rowid tables.
+        for col_name in stmt.updates.keys() {
+            written_column(schema, &col_name.to_lowercase())?;
+        }
         if let Some(pk_idx) = schema.pk_column_index() {
             let col_map = schema.column_index_map();
             for col_name in stmt.updates.keys() {
@@ -2714,7 +2764,12 @@ impl Executor {
                 Some(run) => run.context(&no_row),
                 None => ExecuteContext::new(&no_row).with_run(params, transaction_id, None),
             };
-            let mut setter = |mut row: Row| -> Result<(Row, bool)> {
+            let widen = dml_run.as_ref().is_some_and(|run| run.widens());
+            let mut set_row = |row_id: i64, row: Row| -> Result<(Row, bool)> {
+                let mut row = match widen {
+                    true => super::prepared_select::widened(row, row_id),
+                    false => row,
+                };
                 // Execute pre-compiled programs (no recompilation per row)
                 let updates_to_apply: Vec<(usize, Value)> = {
                     let exec_ctx = ExecuteContext {
@@ -2820,6 +2875,14 @@ impl Executor {
                     returning_rows.borrow_mut().push(row.clone());
                 }
 
+                Ok((row, changed))
+            };
+            // A widened row is written without its row id
+            let mut setter = |row_id: i64, row: Row| -> Result<(Row, bool)> {
+                let (mut row, changed) = set_row(row_id, row)?;
+                if widen {
+                    row.pop();
+                }
                 Ok((row, changed))
             };
 
@@ -3619,7 +3682,7 @@ impl Executor {
         let conflict = conflict.map(|conflict| conflict.runner);
 
         // Create a setter function that applies the ON DUPLICATE KEY UPDATE
-        let mut setter = |mut row: Row| -> Result<(Row, bool)> {
+        let mut setter = |_: i64, mut row: Row| -> Result<(Row, bool)> {
             if let Some(joined) = joined.as_mut() {
                 #[cfg(feature = "test-failpoints")]
                 crate::test_failpoints::prepared_dml_site_ran(
@@ -3911,7 +3974,7 @@ impl Executor {
         let programs = match held {
             Some(held) => held,
             None => {
-                compiled = returning_programs(returning, column_names);
+                compiled = returning_programs(returning, column_names, None);
                 &compiled[..]
             }
         };

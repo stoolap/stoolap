@@ -362,7 +362,7 @@ fn a_prepared_row_whose_sealed_copy_changed_conflicts_and_is_set_once() {
     let mut tx = db.engine().begin_transaction().unwrap();
     let mut table = tx.get_table("t").unwrap();
     let mut calls = 0;
-    let result = table.update_by_row_ids(&[5, 9001], &mut |mut row| {
+    let result = table.update_by_row_ids(&[5, 9001], &mut |_, mut row| {
         if row.get(0) != Some(&Value::Integer(9001)) {
             return Ok((row, false));
         }

@@ -1185,7 +1185,7 @@ fn an_older_handle_meets_its_transactions_rows_written_after_a_drop() {
         }),
         ("update_by_row_ids", |table, called| {
             table
-                .update_by_row_ids(&[5], &mut |row| {
+                .update_by_row_ids(&[5], &mut |_, row| {
                     called.store(true, Ordering::SeqCst);
                     Ok((row, true))
                 })
@@ -1200,7 +1200,7 @@ fn an_older_handle_meets_its_transactions_rows_written_after_a_drop() {
             let plan = table.index_plan(&range);
             let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
             table
-                .update(access, Some(&range), &mut |row| {
+                .update(access, Some(&range), &mut |_, row| {
                     called.store(true, Ordering::SeqCst);
                     Ok((row, true))
                 })
@@ -1212,7 +1212,7 @@ fn an_older_handle_meets_its_transactions_rows_written_after_a_drop() {
             let plan = table.index_plan(&key);
             let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
             table
-                .update(access, Some(&key), &mut |row| {
+                .update(access, Some(&key), &mut |_, row| {
                     called.store(true, Ordering::SeqCst);
                     Ok((row, true))
                 })

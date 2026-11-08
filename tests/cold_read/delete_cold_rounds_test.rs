@@ -604,7 +604,7 @@ fn update_through_another_handle(
     let done = Rc::new(Cell::new(None));
     let slot = Rc::clone(&done);
     after_cold_round_prepared(move || {
-        let mut set = |mut row: stoolap::core::Row| {
+        let mut set = |_: i64, mut row: stoolap::core::Row| {
             row.set(1, stoolap::core::Value::Integer(9))?;
             Ok((row, true))
         };

@@ -2286,11 +2286,12 @@ impl MVCCTable {
         &self,
         plan: &mut PlannedUpdate,
         start: usize,
-        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
     ) -> Result<()> {
         let mut kept = start;
         for i in start..plan.hot.len() {
-            let (mut row, changed) = setter(std::mem::take(&mut plan.hot[i].1))?;
+            let id = plan.hot[i].0;
+            let (mut row, changed) = setter(id, std::mem::take(&mut plan.hot[i].1))?;
             if changed {
                 self.validate_and_coerce_row(&mut row)?;
                 plan.hot[i].1 = row;
@@ -2309,7 +2310,7 @@ impl MVCCTable {
         &self,
         access: ScanAccess<'_>,
         where_expr: Option<&dyn Expression>,
-        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
         skip: Option<&FxHashMap<i64, u64>>,
         plan: &mut PlannedUpdate,
     ) -> Result<()> {
@@ -2514,7 +2515,7 @@ impl MVCCTable {
     fn plan_rows_by_id(
         &self,
         row_ids: &[i64],
-        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
         plan: &mut PlannedUpdate,
     ) -> Result<()> {
         let schema = &self.cached_schema;
@@ -3035,12 +3036,12 @@ impl Table for MVCCTable {
         Ok(())
     }
 
-    fn insert(&mut self, mut row: Row) -> Result<Row> {
+    fn insert_with_id(&mut self, mut row: Row) -> Result<(i64, Row)> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         let row_id = self.prepare_insert(&mut row)?;
         let inserted_row = row.clone();
         self.writes()?.put(row_id, row, false)?;
-        Ok(inserted_row)
+        Ok((row_id, inserted_row))
     }
 
     fn insert_discard(&mut self, row: Row) -> Result<()> {
@@ -3068,7 +3069,7 @@ impl Table for MVCCTable {
         &mut self,
         access: ScanAccess<'_>,
         where_expr: Option<&dyn Expression>,
-        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         let mut plan = PlannedUpdate::default();
@@ -3079,7 +3080,7 @@ impl Table for MVCCTable {
     fn update_by_row_ids(
         &mut self,
         row_ids: &[i64],
-        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         let mut plan = PlannedUpdate::default();
@@ -3091,7 +3092,7 @@ impl Table for MVCCTable {
         &mut self,
         access: ScanAccess<'_>,
         where_expr: Option<&dyn Expression>,
-        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
         skip: Option<&FxHashMap<i64, u64>>,
         plan: &mut PlannedUpdate,
     ) -> Result<()> {
@@ -3102,7 +3103,7 @@ impl Table for MVCCTable {
     fn plan_update_by_row_ids(
         &mut self,
         row_ids: &[i64],
-        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
         plan: &mut PlannedUpdate,
     ) -> Result<()> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
@@ -5562,7 +5563,7 @@ mod tests {
 
         // Update the row
         let updated = table
-            .update(ScanAccess::Seq, None, &mut |row| {
+            .update(ScanAccess::Seq, None, &mut |_, row| {
                 let mut new_row = row.clone();
                 let _ = new_row.set(1, Value::Integer(20));
                 Ok((new_row, true))

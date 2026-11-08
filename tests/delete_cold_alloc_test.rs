@@ -233,7 +233,7 @@ fn a_delete_finds_the_rows_its_transaction_changed_with_no_allocation_under_the_
     let changed = Rc::new(Cell::new(None));
     let slot = Rc::clone(&changed);
     after_cold_round_prepared(move || {
-        let mut set = |mut row: stoolap::core::Row| {
+        let mut set = |_: i64, mut row: stoolap::core::Row| {
             row.set(1, stoolap::core::Value::Integer(9))?;
             Ok((row, true))
         };

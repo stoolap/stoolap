@@ -420,7 +420,7 @@ fn an_update_written_before_a_column_change_cannot_commit() {
             .unwrap();
         let plan = older.index_plan(&by_key);
         let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-        let updated = older.update(access, Some(&by_key), &mut |row| {
+        let updated = older.update(access, Some(&by_key), &mut |_, row| {
             let mut values: Vec<Value> = row.iter().cloned().collect();
             values[2] = Value::text("new-b");
             Ok((Row::from_values(values), true))
@@ -602,7 +602,7 @@ fn every_write_through_an_older_handle_carries_its_layout() {
                 .unwrap();
             drop(newer);
             older
-                .update_by_row_ids(&[2], &mut |_| {
+                .update_by_row_ids(&[2], &mut |_, _| {
                     Ok((
                         Row::from_values(vec![
                             Value::Integer(2),
@@ -902,7 +902,7 @@ mod failpoints {
         // A commit at the history limit, its table handle kept
         let mut older = db.engine().begin_transaction().unwrap();
         let mut kept = older.get_table("a").unwrap();
-        kept.update_by_row_ids(&[1], &mut |_| {
+        kept.update_by_row_ids(&[1], &mut |_, _| {
             Ok((
                 Row::from_values(vec![Value::Integer(1), Value::text("b10")]),
                 true,

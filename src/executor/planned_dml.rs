@@ -282,7 +282,7 @@ impl Executor {
         let col_map = schema.column_index_map();
         let mut set = Vec::with_capacity(update.updates.len());
         for name in update.updates.keys() {
-            let column = col_map.get(name.to_lowercase().as_str()).copied();
+            let column = super::dml::written_column(schema, &name.to_lowercase())?;
             // The row id is the primary key's value
             if column == Some(pk) {
                 return Err(crate::core::Error::invalid_argument(format!(
@@ -511,7 +511,7 @@ impl Executor {
             DmlWrite::Delete => table.delete(access, Some(&pk_expr)),
             DmlWrite::Update(_) => {
                 let mut vm = super::expression::ExprVM::new();
-                let mut setter = |mut row: Row| -> Result<(Row, bool)> {
+                let mut setter = |_: i64, mut row: Row| -> Result<(Row, bool)> {
                     if let Some(where_) = &plan.where_ {
                         let exec_ctx = super::expression::execute_context(&row, ctx, None);
                         if !vm.execute_bool_checked(where_, &exec_ctx)? {

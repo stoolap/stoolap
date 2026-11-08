@@ -1862,6 +1862,85 @@ pub fn item_name(expr: &Expression) -> String {
     }
 }
 
+/// Whether `expr`, or a statement inside it, names an unquoted rowid
+pub(crate) fn expr_names_rowid(expr: &Expression) -> bool {
+    let names = expr_names_rowid;
+    match expr {
+        Expression::Identifier(id) => !id.quoted && crate::core::is_rowid_name(&id.value_lower),
+        Expression::QualifiedIdentifier(q) => {
+            !q.name.quoted && crate::core::is_rowid_name(&q.name.value_lower)
+        }
+        Expression::ScalarSubquery(sq) => names_rowid(&sq.subquery),
+        Expression::Exists(exists) => names_rowid(&exists.subquery),
+        Expression::AllAny(all_any) => names(&all_any.left) || names_rowid(&all_any.subquery),
+        Expression::SubquerySource(source) => names_rowid(&source.subquery),
+        Expression::JoinSource(join) => {
+            names(&join.left) || names(&join.right) || join.condition.as_deref().is_some_and(names)
+        }
+        other => other
+            .try_for_each_child(&mut |child| match names(child) {
+                true => Err(()),
+                false => Ok(()),
+            })
+            .is_err(),
+    }
+}
+
+/// Whether `stmt`, or a statement inside it, names an unquoted rowid
+pub(crate) fn names_rowid(stmt: &SelectStatement) -> bool {
+    let names = expr_names_rowid;
+    stmt.columns
+        .iter()
+        .chain(&stmt.distinct_on)
+        .chain(stmt.table_expr.as_deref())
+        .chain(stmt.where_clause.as_deref())
+        .chain(&stmt.group_by.columns)
+        .chain(stmt.having.as_deref())
+        .chain(stmt.order_by.iter().map(|o| &o.expression))
+        .chain(stmt.window_defs.iter().flat_map(|w| w.expressions()))
+        .any(names)
+        || stmt
+            .with
+            .iter()
+            .flat_map(|w| &w.ctes)
+            .any(|cte| names_rowid(&cte.query))
+        || stmt.set_operations.iter().any(|op| names_rowid(&op.right))
+}
+
+/// `expr` with each unquoted rowid name outside its subqueries spelled as the
+/// column `column` gives for it, a qualified one keeping its qualifier; a
+/// bare one stays when `aliased`, a SELECT alias then holding that name
+pub(crate) fn rowids_respelled(
+    expr: &Expression,
+    aliased: bool,
+    column: &mut dyn FnMut(&Expression) -> crate::core::Result<Option<String>>,
+) -> crate::core::Result<Expression> {
+    let respelled = |name: String| Identifier::new(dummy_token(&name, TokenType::Identifier), name);
+    match expr {
+        Expression::Identifier(id)
+            if !aliased && !id.quoted && crate::core::is_rowid_name(&id.value_lower) =>
+        {
+            Ok(
+                column(expr)?
+                    .map_or_else(|| expr.clone(), |c| Expression::Identifier(respelled(c))),
+            )
+        }
+        Expression::QualifiedIdentifier(q)
+            if !q.name.quoted && crate::core::is_rowid_name(&q.name.value_lower) =>
+        {
+            Ok(match column(expr)? {
+                Some(c) => {
+                    let mut q = q.clone();
+                    q.name = respelled(c);
+                    Expression::QualifiedIdentifier(q)
+                }
+                None => expr.clone(),
+            })
+        }
+        other => other.try_map_children(&mut |child| rowids_respelled(child, aliased, column)),
+    }
+}
+
 /// `item`, standing for the SELECT item `written`, under the name `written`
 /// gives when `item`'s own would differ
 pub fn named_as_written(item: Expression, written: &Expression) -> Expression {

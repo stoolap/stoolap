@@ -819,7 +819,7 @@ fn cascade_update_recursive(
 
     let plan = child.index_plan(&expr);
     let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-    let count = child.update(access, Some(&expr), &mut |mut row| {
+    let count = child.update(access, Some(&expr), &mut |_, mut row| {
         let _ = row.set(col_idx, new_val.clone());
         for check in &checks {
             super::dml::run_check(&mut vm, check, &row)?;
@@ -911,7 +911,7 @@ fn set_null_on_delete(
 
     let plan = child.index_plan(&expr);
     let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-    let count = child.update(access, Some(&expr), &mut |mut row| {
+    let count = child.update(access, Some(&expr), &mut |_, mut row| {
         let _ = row.set(col_idx, null_val.clone());
         for check in &checks {
             super::dml::run_check(&mut vm, check, &row)?;

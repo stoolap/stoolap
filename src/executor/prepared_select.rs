@@ -27,7 +27,10 @@ use smallvec::SmallVec;
 use crate::api::params::ParamVec;
 use crate::common::{CompactArc, SmartString};
 use crate::core::predicate::{kind, KeySide, PredicateSet};
-use crate::core::{DataType, Error, Operator, Result, Row, RowVec, Schema, SchemaColumn, Value};
+use crate::core::{
+    is_rowid_name, DataType, Error, Operator, Result, Row, RowVec, Schema, SchemaColumn, Value,
+    ROWID_SLOT,
+};
 use crate::functions::aggregate::{CallTemplate, ColumnsKey, CompiledAggregate, GroupedAggregates};
 use crate::functions::{global_registry, FunctionRegistry, Volatility};
 use crate::parser::ast::*;
@@ -77,10 +80,11 @@ use super::result::{
     ScannerResult,
 };
 use super::utils::{
-    bare_name, build_column_index_map, combine_predicates_with_and, expression_contains_aggregate,
-    extract_literal_value, flip_operator, for_each_qualified_star_column,
-    get_table_alias_from_expr, infix_to_operator, is_aggregate_function, item_name, needed_columns,
-    order_by_names_an_alias, qualified, split_qualified, strip_table_qualifier,
+    bare_name, build_column_index_map, combine_predicates_with_and, expr_names_rowid,
+    expression_contains_aggregate, extract_literal_value, flip_operator,
+    for_each_qualified_star_column, get_table_alias_from_expr, infix_to_operator,
+    is_aggregate_function, item_name, named_as_written, names_rowid, needed_columns,
+    order_by_names_an_alias, qualified, rowids_respelled, split_qualified, strip_table_qualifier,
     value_to_expression, visit_column_refs, visit_column_refs_outside, where_without_aggregates,
     QUALIFIER_SEP,
 };
@@ -1345,9 +1349,54 @@ struct ScopeTable {
     /// The columns a NATURAL or USING join merges, each a left side's column
     /// and the right side's it is one column with under a bare name
     merged: SmallVec<[(usize, usize); 1]>,
+    /// Each stored table's first column and the column its rowid reads,
+    /// None for a table without a primary key whose rows carry no row id
+    rowids: SmallVec<[(usize, Option<usize>); 2]>,
 }
 
 impl ScopeTable {
+    /// The scope of the stored table `schema`, whose rowid it reads: its
+    /// primary key, else, when `slot`, a column past its own its rows carry
+    fn of_table(name: impl Into<Option<SmartString>>, schema: &Schema, slot: bool) -> Self {
+        let mut scope = Self::of(name, schema);
+        match schema.rowid_column() {
+            Some(key) => scope.rowids.push((0, Some(key))),
+            None if slot => {
+                let at = scope.columns.len();
+                let with_slot = |names: &[String]| {
+                    let names = names.iter().cloned().chain([ROWID_SLOT.to_string()]);
+                    CompactArc::new(names.collect::<Vec<_>>())
+                };
+                scope.columns = with_slot(&scope.columns);
+                scope.lower = with_slot(&scope.lower);
+                scope.types.push(DataType::Integer);
+                scope.bare += 1;
+                scope.rowids.push((0, Some(at)));
+            }
+            None => scope.rowids.push((0, None)),
+        }
+        scope
+    }
+
+    /// Whether column `at` is a row id slot, which no `*` shows
+    fn is_slot(&self, at: usize) -> bool {
+        self.lower[at] == ROWID_SLOT
+    }
+
+    /// The columns of `range`, one table's, that a `*` shows: all but its
+    /// row id slot, which comes last
+    fn shown(&self, range: std::ops::Range<usize>) -> std::ops::Range<usize> {
+        match range.end > range.start && self.is_slot(range.end - 1) {
+            true => range.start..range.end - 1,
+            false => range,
+        }
+    }
+
+    /// Whether the scope's first table is read with its row id slot
+    fn widens(&self) -> bool {
+        matches!(self.rowids.first(), Some(&(_, Some(at))) if self.is_slot(at))
+    }
+
     fn of(name: impl Into<Option<SmartString>>, schema: &Schema) -> Self {
         // A column a join's run names under its table is read by its own name
         let lower = schema.column_names_lower_arc();
@@ -1362,6 +1411,7 @@ impl ScopeTable {
             types: schema.columns.iter().map(|c| c.data_type).collect(),
             bare: schema.columns.len(),
             merged: SmallVec::new(),
+            rowids: SmallVec::new(),
         }
     }
 
@@ -1386,6 +1436,13 @@ impl ScopeTable {
                 .iter()
                 .map(|(left, right)| (left + offset, right + offset)),
         );
+        let mut rowids = left.rowids;
+        rowids.extend(
+            right
+                .rowids
+                .iter()
+                .map(|(start, at)| (start + offset, at.map(|at| at + offset))),
+        );
         Self {
             tables,
             columns: joined(&left.columns, &right.columns),
@@ -1393,6 +1450,7 @@ impl ScopeTable {
             types: left.types.into_iter().chain(right.types).collect(),
             bare: offset + right.lower.len(),
             merged,
+            rowids,
         }
     }
 
@@ -1447,6 +1505,7 @@ impl ScopeTable {
             types: self.types.clone(),
             bare: self.bare,
             merged: self.merged.clone(),
+            rowids: self.rowids.clone(),
         }
     }
 
@@ -1475,6 +1534,7 @@ impl ScopeTable {
                 .collect(),
             bare: self.lower.len() + items.len(),
             merged: self.merged.clone(),
+            rowids: self.rowids.clone(),
         }
     }
 
@@ -1509,6 +1569,7 @@ impl ScopeTable {
             types: Vec::new(),
             bare: 0,
             merged: SmallVec::new(),
+            rowids: SmallVec::new(),
         }
     }
 
@@ -1600,6 +1661,7 @@ impl ScopeTable {
             types: vec![DataType::Null; columns.len()],
             bare: columns.len(),
             merged: SmallVec::new(),
+            rowids: SmallVec::new(),
         })
     }
 
@@ -1638,7 +1700,7 @@ impl ScopeTable {
 fn side_scopes(join: &JoinTableSource, sides: &JoinSides) -> Option<[ScopeTable; 2]> {
     let table = |(name, schema): &(Option<SmartString>, CompactArc<Schema>)| {
         let name = name.as_deref().map(|n| SmartString::from(n.to_lowercase()));
-        ScopeTable::of(name, schema)
+        ScopeTable::of_table(name, schema, false)
     };
     let side_scope = |expr: &Expression, side: &JoinSide| {
         ScopeTable::of_side(expr, &mut side.leaves.iter().map(table))
@@ -2015,7 +2077,7 @@ impl StatementWalk<'_> {
                                     }
                                     other => other,
                                 })?;
-                        ScopeTable::of(name, &schema)
+                        ScopeTable::of_table(name, &schema, true)
                     }
                 }
             }
@@ -2155,7 +2217,8 @@ impl StatementWalk<'_> {
                 });
                 match named.and_then(beyond) {
                     Some(_) => {
-                        let (depth, index) = chain.qualified(qualifier, &q.name.value_lower, q)?;
+                        let (depth, index) =
+                            chain.qualified(qualifier, &q.name.value_lower, q.name.quoted, q)?;
                         match beyond(depth) {
                             Some(depth) => self.outer(expr, depth, index),
                             None => Ok(expr.clone()),
@@ -2163,7 +2226,7 @@ impl StatementWalk<'_> {
                     }
                     None => {
                         if level.check {
-                            chain.qualified(qualifier, &q.name.value_lower, q)?;
+                            chain.qualified(qualifier, &q.name.value_lower, q.name.quoted, q)?;
                         }
                         Ok(expr.clone())
                     }
@@ -2239,6 +2302,57 @@ impl StatementWalk<'_> {
     }
 }
 
+/// `stmt` with each rowid its scope `own` reads outside its subqueries spelled
+/// as the column it reads, each SELECT item so changed named as written;
+/// None when it reads none. A SELECT alias of that name keeps it
+fn rowids_spelled(stmt: &SelectStatement, own: &ScopeTable) -> Result<Option<SelectStatement>> {
+    if own.rowids.is_empty() || !names_rowid(stmt) {
+        return Ok(None);
+    }
+    let aliased = stmt
+        .columns
+        .iter()
+        .any(|item| matches!(item, Expression::Aliased(a) if is_rowid_name(&a.alias.value_lower)));
+    let scopes = [own];
+    let chain = Chain { scopes: &scopes };
+    let mut changed = false;
+    let mut spell = |expr: &Expression| -> Result<Expression> {
+        rowids_respelled(expr, aliased, &mut |name| {
+            let Some((_, index)) = chain.resolve(name).ok().flatten() else {
+                return Ok(None);
+            };
+            let column = &own.columns[index];
+            let respelled = !is_rowid_name(&column.to_lowercase());
+            changed |= respelled;
+            Ok(respelled.then(|| column.clone()))
+        })
+    };
+    let mut out = stmt.clone();
+    for item in &mut out.columns {
+        let written = item.clone();
+        let walked = match &written {
+            Expression::Aliased(a) => {
+                let mut a = a.clone();
+                *a.expression = spell(&a.expression)?;
+                Expression::Aliased(a)
+            }
+            other => spell(other)?,
+        };
+        *item = named_as_written(walked, &written);
+    }
+    for expr in out
+        .distinct_on
+        .iter_mut()
+        .chain(out.group_by.columns.iter_mut())
+        .chain(out.where_clause.as_deref_mut())
+        .chain(out.having.as_deref_mut())
+        .chain(out.order_by.iter_mut().map(|o| &mut o.expression))
+    {
+        *expr = spell(expr)?;
+    }
+    Ok(changed.then_some(out))
+}
+
 /// `stands`, when it is a parameter, spelled `name`; a parameter is read by
 /// its index, so its spelling only names it
 fn spelled_as(stands: Expression, name: String) -> Expression {
@@ -2262,11 +2376,9 @@ fn output_names(stmt: &SelectStatement, own: &ScopeTable, shown: bool) -> Result
     let mut names = Vec::with_capacity(stmt.columns.len());
     for item in &stmt.columns {
         match item {
-            Expression::Star(_) => names.extend(
-                star_columns(own.columns.len(), &own.merged)
-                    .into_iter()
-                    .map(column),
-            ),
+            Expression::Star(_) => {
+                names.extend(star_columns(own, own.columns.len()).into_iter().map(column))
+            }
             Expression::QualifiedStar(star) => {
                 names.extend(qualified_star_columns(star, own)?.map(column))
             }
@@ -2294,7 +2406,7 @@ fn output_width(stmt: &SelectStatement, own: &ScopeTable) -> Result<usize> {
     for item in &stmt.columns {
         width += match item {
             // A merged pair shows once
-            Expression::Star(_) => star_columns(own.columns.len(), &own.merged).len(),
+            Expression::Star(_) => star_columns(own, own.columns.len()).len(),
             Expression::QualifiedStar(star) => qualified_star_columns(star, own)?.len(),
             _ => 1,
         };
@@ -2313,7 +2425,7 @@ fn qualified_star_columns(
         .iter()
         .find(|(name, _)| name.as_deref() == Some(qualifier.as_str()))
         .ok_or_else(|| Error::invalid_argument(unknown_qualifier(&star.qualifier)))?;
-    Ok(own.table(*start).1)
+    Ok(own.shown(own.table(*start).1))
 }
 
 /// The names of `view`'s columns, recorded when it was created; a view
@@ -2376,9 +2488,17 @@ impl Chain<'_> {
                 scope.unique(rest, &id.value_lower, &id.value)?;
                 return Ok(Some((depth, index)));
             }
+            if !id.quoted && is_rowid_name(&id.value_lower) {
+                match scope.rowids.as_slice() {
+                    [] => {}
+                    [(_, Some(index))] => return Ok(Some((depth, *index))),
+                    [(_, None)] => return Err(Error::ColumnNotFound(id.value.to_string())),
+                    _ => return Err(ambiguous_column(&id.value)),
+                }
+            }
         }
         if let Some((qualifier, name)) = split_qualified(&id.value_lower) {
-            let resolved = self.qualified(qualifier, name, &id.value);
+            let resolved = self.qualified(qualifier, name, id.quoted, &id.value);
             return match resolved {
                 Err(_) if id.quoted => Ok(None),
                 other => other.map(Some),
@@ -2395,6 +2515,7 @@ impl Chain<'_> {
         &self,
         qualifier: &str,
         column: &str,
+        quoted: bool,
         spelled: &dyn std::fmt::Display,
     ) -> Result<(usize, usize)> {
         let (depth, start) = self
@@ -2411,9 +2532,15 @@ impl Chain<'_> {
             .ok_or_else(|| Error::invalid_argument(unknown_qualifier(qualifier)))?;
         let scope = self.scopes[depth];
         let (_, mut range) = scope.table(start);
-        let index = range
-            .find(|i| scope.lower[*i] == column)
-            .ok_or_else(|| Error::ColumnNotFound(spelled.to_string()))?;
+        let Some(index) = range.find(|i| scope.lower[*i] == column) else {
+            let rowid = (!quoted && is_rowid_name(column))
+                .then(|| scope.rowids.iter().find(|(at, _)| *at == start))
+                .flatten();
+            return match rowid {
+                Some((_, Some(index))) => Ok((depth, *index)),
+                _ => Err(Error::ColumnNotFound(spelled.to_string())),
+            };
+        };
         scope.unique(range, column, spelled)?;
         Ok((depth, index))
     }
@@ -2422,7 +2549,12 @@ impl Chain<'_> {
         match expr {
             Expression::Identifier(id) => self.bare(id),
             Expression::QualifiedIdentifier(q) => self
-                .qualified(&q.qualifier.value_lower, &q.name.value_lower, q)
+                .qualified(
+                    &q.qualifier.value_lower,
+                    &q.name.value_lower,
+                    q.name.quoted,
+                    q,
+                )
                 .map(Some),
             _ => Ok(None),
         }
@@ -2574,6 +2706,33 @@ fn spelled_columns(expr: &Expression, scope: &ScopeTable) -> Result<Expression> 
 fn bound_column(expr: &Expression) -> Option<usize> {
     match expr {
         Expression::Column(c) => Some(c.index as usize),
+        _ => None,
+    }
+}
+
+/// The values `conjunct` names the row ids at `slot` by: an equality with one
+/// value, or an IN list of values
+fn slot_keys(conjunct: &Expression, slot: usize) -> Option<Vec<PreparedValue>> {
+    let value = |expr: &Expression| match expr {
+        Expression::Parameter(p) if p.index > 0 => Some(PreparedValue::Slot(p.index - 1)),
+        other => extract_literal_value(other).map(PreparedValue::Const),
+    };
+    match conjunct {
+        Expression::Infix(infix) if infix.op_type == InfixOperator::Equal => {
+            match (bound_column(&infix.left), bound_column(&infix.right)) {
+                (Some(at), _) if at == slot => Some(vec![value(&infix.right)?]),
+                (_, Some(at)) if at == slot => Some(vec![value(&infix.left)?]),
+                _ => None,
+            }
+        }
+        Expression::In(in_expr) if !in_expr.not && bound_column(&in_expr.left) == Some(slot) => {
+            let members = match in_expr.right.as_ref() {
+                Expression::List(list) => &list.elements,
+                Expression::ExpressionList(list) => &list.expressions,
+                _ => return None,
+            };
+            members.iter().map(value).collect()
+        }
         _ => None,
     }
 }
@@ -3173,6 +3332,11 @@ pub(crate) struct PreparedWhere {
     /// The table columns a statement without blocks reads, for a table
     /// that reads by need to leave the others out
     needed: Option<Vec<bool>>,
+    /// Whether each row read carries its row id past its columns
+    widen: bool,
+    /// The values naming the only row ids the WHERE may pass, by its row id
+    /// slot; the rows are read by those ids
+    ids: Option<Vec<PreparedValue>>,
 }
 
 /// A program over the statement's row, with whether a run binds it: it
@@ -3425,6 +3589,8 @@ struct WhereParts {
     /// Each conjunct equating a column with a value; none beside a primary
     /// key equality
     equalities: Vec<PreparedComparison>,
+    /// The values of the first conjunct naming row ids by the row id slot
+    ids: Option<Vec<PreparedValue>>,
     conjuncts: usize,
 }
 
@@ -3451,6 +3617,7 @@ impl WhereParts {
             set_tests: Vec::new(),
             point: None,
             equalities: Vec::new(),
+            ids: None,
             conjuncts: 0,
         }
     }
@@ -3499,6 +3666,7 @@ impl WhereParts {
         programs: WherePrograms,
         blocks: &PreparedBlocks,
         schema: &Schema,
+        widen: bool,
     ) -> PreparedWhere {
         let whole = self.conjuncts == 1;
         let narrowing_test =
@@ -3519,6 +3687,10 @@ impl WhereParts {
                         }
                         _ => return None,
                     };
+                    // A row id slot is no column the table reads members of
+                    if column >= schema.columns.len() {
+                        return None;
+                    }
                     Some((
                         at,
                         Narrowing {
@@ -3533,7 +3705,7 @@ impl WhereParts {
         let narrowing = narrowing_test.map(|(_, narrowing)| narrowing);
         let slot = |&(id, negated, column, _): &(u16, bool, Option<usize>, usize)| {
             let sq = &blocks.subqueries[id as usize];
-            let column = column.filter(|_| sq.uncorrelated())?;
+            let column = column.filter(|&c| sq.uncorrelated() && c < schema.columns.len())?;
             sq.member_set_test().is_some().then_some(SetSlot {
                 id,
                 column,
@@ -3590,6 +3762,8 @@ impl WhereParts {
             narrowing,
             sets,
             narrowing_set,
+            ids: self.ids.filter(|_| widen),
+            widen,
         }
     }
 }
@@ -4061,6 +4235,8 @@ struct PreparedSubquery {
     /// A FROM that is no table: its rows, read once per run
     source: Option<BlockSource>,
     column_indices: Vec<usize>,
+    /// Whether the table's rows carry their row ids past their columns
+    widen: bool,
     /// The table's schema the programs read positions of
     schema: CompactArc<Schema>,
     /// The WHERE's conjuncts the scan can take
@@ -5792,6 +5968,7 @@ impl Builder<'_> {
             table: None,
             source: None,
             column_indices: Vec::new(),
+            widen: false,
             schema: CompactArc::new(Schema::new("", Vec::new())),
             pushdown: Vec::new(),
             pushed_whole: true,
@@ -6418,7 +6595,7 @@ impl Builder<'_> {
                 match self.entry_read(entry, sq.where_clause.as_deref(), counts, outer)? {
                     FromEntry::Statement => return self.statement_block(sq, outer, parent, form),
                     FromEntry::Table(table, name, schema) => {
-                        let scope = ScopeTable::of(name, &schema);
+                        let scope = ScopeTable::of_table(name, &schema, names_rowid(sq));
                         (Some(table), None, schema, scope)
                     }
                     FromEntry::Source(name, source, columns) => over_source(name, source, columns),
@@ -6785,7 +6962,8 @@ impl Builder<'_> {
         self.subqueries[id as usize] = Some(PreparedSubquery {
             table,
             source,
-            column_indices: (0..scope.columns.len()).collect(),
+            column_indices: scope.shown(0..scope.columns.len()).collect(),
+            widen: scope.widens(),
             schema: CompactArc::clone(&schema),
             point: schema.pk_column_index().and_then(|pk| {
                 pushdown
@@ -6998,6 +7176,8 @@ impl Builder<'_> {
         let key_slot = |slot: usize| keys.iter().any(|(_, key)| *key == slot);
         !keys.is_empty()
             && keys.iter().all(|(_, slot)| !others.contains(slot))
+            // A row id slot is no column a keyed set reads its keys from
+            && keys.iter().all(|((own, ..), _)| !chain.scopes[0].is_slot(*own))
             && work.delegated.is_empty()
             && keys.iter().all(|((own, depth, index), _)| {
                 let own = chain.scopes[0].types[*own];
@@ -7457,11 +7637,13 @@ fn projected_aliases(
     names
 }
 
-/// The columns of a joined row of `width` columns a `*` shows: all but
-/// each merged pair's right column, as the merge shows the pair once
-fn star_columns(width: usize, merged: &[(usize, usize)]) -> Vec<usize> {
+/// The columns of a joined row of `width` columns over `scope` a `*` shows:
+/// all but each merged pair's right column, as the merge shows the pair
+/// once, and each row id slot
+fn star_columns(scope: &ScopeTable, width: usize) -> Vec<usize> {
     (0..width)
-        .filter(|at| !merged.iter().any(|&(_, right)| right == *at))
+        .filter(|at| !scope.merged.iter().any(|&(_, right)| right == *at))
+        .filter(|&at| at >= scope.lower.len() || !scope.is_slot(at))
         .collect()
 }
 
@@ -7543,21 +7725,22 @@ impl PreparedProjection {
         // A `*` item is read by position, under its column's name, by which
         // an ORDER BY key finds it selected
         let star_item = |i: usize| Expression::Identifier(ident(&columns[i], &scope.lower[i]));
+        let shown = scope.shown(0..columns.len());
         for (column, rewritten) in stmt.columns.iter().zip(select) {
             match column {
                 Expression::Star(_) => {
-                    select_exprs.extend((0..columns.len()).map(star_item));
-                    star_columns.extend((0..columns.len()).map(Some));
-                    item_rewritten.extend((0..columns.len()).map(|_| None));
+                    select_exprs.extend(shown.clone().map(star_item));
+                    star_columns.extend(shown.clone().map(Some));
+                    item_rewritten.extend(shown.clone().map(|_| None));
                 }
                 Expression::QualifiedStar(star) => {
                     if scope.tables[0].0.as_deref() != Some(star.qualifier.to_lowercase().as_str())
                     {
                         return Err(Error::invalid_argument(unknown_qualifier(&star.qualifier)));
                     }
-                    select_exprs.extend((0..columns.len()).map(star_item));
-                    star_columns.extend((0..columns.len()).map(Some));
-                    item_rewritten.extend((0..columns.len()).map(|_| None));
+                    select_exprs.extend(shown.clone().map(star_item));
+                    star_columns.extend(shown.clone().map(Some));
+                    item_rewritten.extend(shown.clone().map(|_| None));
                 }
                 other => {
                     check_names(chain, unaliased(other), &[])?;
@@ -8190,19 +8373,26 @@ impl PreparedSelect {
     /// Prepare `stmt` over its table, named `scope_name` and holding
     /// `columns`, for executions with `param_count` positional parameters;
     /// `keyed_branch` when it is a set operation's first branch whose rows
-    /// the whole one's DISTINCT ON reads by the layout
+    /// the whole one's DISTINCT ON reads by the layout. A `stored` table's
+    /// rows have row ids
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare(
         executor: &Executor,
         ctx: &ExecutionContext,
         stmt: &SelectStatement,
-        schema: &Schema,
+        (schema, stored): (&Schema, bool),
         scope_name: &SmartString,
         param_count: usize,
         epoch: u64,
         keyed_branch: bool,
     ) -> Result<Self> {
         let registry = global_registry();
+        let scope = match stored {
+            true => ScopeTable::of_table(scope_name.clone(), schema, names_rowid(stmt)),
+            false => ScopeTable::of(scope_name.clone(), schema),
+        };
+        let spelled = rowids_spelled(stmt, &scope)?;
+        let stmt = spelled.as_ref().unwrap_or(stmt);
         // A statement with window functions reads its rows as a SELECT * of
         // them would, and its window step computes the SELECT list over them
         let windowed = Self::computes_windows(stmt);
@@ -8226,7 +8416,6 @@ impl PreparedSelect {
             }
             false => stmt,
         };
-        let scope = ScopeTable::of(scope_name.clone(), schema);
         let scopes = [&scope];
         let chain = Chain { scopes: &scopes };
         let mut builder = Builder {
@@ -8370,15 +8559,15 @@ impl PreparedSelect {
         } else {
             std::borrow::Cow::Borrowed(&stmt.columns)
         };
-        let mut output_columns =
-            executor.get_output_column_names(&select, &scope.columns, Some(scope_name));
+        let shown = &scope.columns[scope.shown(0..scope.columns.len())];
+        let mut output_columns = executor.get_output_column_names(&select, shown, Some(scope_name));
         let visible = output_columns.len();
         output_columns.extend(extra_names);
         // The layout an ORDER BY or DISTINCT ON binds its names by, built
         // with the plan
         let layout = (keyed_branch || !stmt.order_by.is_empty() || !stmt.distinct_on.is_empty())
             .then(|| {
-                let mut layout = Executor::select_layout(&select, &scope.columns, Some(scope_name));
+                let mut layout = Executor::select_layout(&select, shown, Some(scope_name));
                 layout.sources.extend(extra_sources);
                 CompactArc::new(layout)
             });
@@ -8401,7 +8590,7 @@ impl PreparedSelect {
             true => Step::TopN,
             false => Step::Sort,
         };
-        let mut where_ = parts.prepare(where_programs, &blocks, schema);
+        let mut where_ = parts.prepare(where_programs, &blocks, schema, scope.widens());
         let mut steps = SmallVec::new();
         if stmt.limit.is_some() || stmt.offset.is_some() {
             steps.push(Step::Limit);
@@ -8519,7 +8708,7 @@ impl PreparedSelect {
         let window = (windowed && !aggregated)
             .then(|| {
                 executor
-                    .prepared_window_plan(computed, &schema.column_names_arc(), ctx, &windows)
+                    .prepared_window_plan(computed, &scope.columns, ctx, &windows)
                     .ok()
                     .flatten()
             })
@@ -8527,7 +8716,10 @@ impl PreparedSelect {
         Ok(Self {
             validity: executor.select_validity(written, epoch),
             cte_scope: ctx.cte_scope(),
-            columns: scope.columns.clone(),
+            columns: match scope.widens() {
+                true => schema.column_names_arc(),
+                false => scope.columns.clone(),
+            },
             blocks,
             holes,
             where_,
@@ -8918,8 +9110,8 @@ impl PreparedGrouped {
                 .find(|(name, _)| {
                     (name.as_ref()).is_some_and(|n| super::utils::eq_folded(&q.qualifier, n))
                 })
-                .map_or(0, |(_, start)| scope.table(*start).1.len()),
-            Expression::Star(_) => width,
+                .map_or(0, |(_, start)| scope.shown(scope.table(*start).1).len()),
+            Expression::Star(_) => star_columns(&scope, width).len(),
             _ => 1,
         };
         let aliases = projected_aliases(stmt, &scope.lower, filled);
@@ -9115,7 +9307,7 @@ impl PreparedGrouped {
             .transpose()?;
         let where_ = where_parts
             .zip(where_program)
-            .map(|(parts, program)| parts.prepare(program, &blocks, &schema));
+            .map(|(parts, program)| parts.prepare(program, &blocks, &schema, false));
         let mut run_stmt = SelectStatement {
             columns,
             having,
@@ -9542,7 +9734,7 @@ impl Executor {
             ),
             (None, None) => return Err(Error::internal("a grouped statement without one table")),
         };
-        let scope = ScopeTable::of(scope_name.clone(), &schema);
+        let scope = ScopeTable::of_table(scope_name.clone(), &schema, false);
         let prepared = Arc::new(PreparedGrouped::prepare(
             self,
             ctx,
@@ -9676,6 +9868,8 @@ pub struct PreparedDml {
     cte_scope: CteScope,
     /// The target's columns at preparation
     columns: CompactArc<Vec<String>>,
+    /// Whether each row read carries its row id past its columns
+    widen: bool,
     blocks: PreparedBlocks,
     holes: HoleSet,
     where_: Option<PreparedWhere>,
@@ -9787,7 +9981,16 @@ impl PreparedDml {
             .chain(conflict_exprs)
             .chain(returning.into_iter().flat_map(|sites| sites.values));
         let validity = executor.parts_validity(epoch, &targets, exprs);
-        let scope = ScopeTable::of(scope_name.clone(), schema);
+        // An UPDATE's or DELETE's rows carry their row ids when it reads them;
+        // an INSERT's have none yet
+        let slot = values.is_empty()
+            && conflict.is_none()
+            && where_clause
+                .into_iter()
+                .chain(sets.iter().map(|(_, value)| *value))
+                .chain(returning.into_iter().flat_map(|sites| sites.values))
+                .any(expr_names_rowid);
+        let scope = ScopeTable::of_table(scope_name.clone(), schema, slot);
         let scopes = [&scope];
         let chain = Chain { scopes: &scopes };
         let mut builder = Builder {
@@ -9868,7 +10071,7 @@ impl PreparedDml {
             };
             // A bare name reads the row met; the excluded row only by its name
             let mut joined = ScopeTable::beside(
-                ScopeTable::of(target, sites.schema),
+                ScopeTable::of_table(target, sites.schema, false),
                 ScopeTable::of(excluded, sites.schema),
             )
             .by_position();
@@ -9911,7 +10114,7 @@ impl PreparedDml {
         }
         // RETURNING reads the row returned, `*` each of its columns
         let returning_scope =
-            returning.map(|sites| ScopeTable::of(scope_name.clone(), sites.schema));
+            returning.map(|sites| ScopeTable::of_table(scope_name.clone(), sites.schema, slot));
         let mut returning_parts = None;
         if let (Some(sites), Some(returning_scope)) = (returning, &returning_scope) {
             let scopes = [returning_scope];
@@ -10018,7 +10221,7 @@ impl PreparedDml {
         let (blocks, holes) = builder.finish(param_count, run_slots)?;
         let where_ = where_parts
             .zip(where_program)
-            .map(|(parts, program)| parts.prepare(program, &blocks, schema));
+            .map(|(parts, program)| parts.prepare(program, &blocks, schema, scope.widens()));
         // The access the WHERE's scan reads by, decided once by the rule, as
         // a prepared SELECT's is: a run that adds a set's or a narrowing's
         // conjuncts decides over them
@@ -10034,7 +10237,8 @@ impl PreparedDml {
         Ok(Self {
             validity,
             cte_scope: ctx.cte_scope(),
-            columns: scope.columns.clone(),
+            columns: schema.column_names_arc(),
+            widen: scope.widens(),
             blocks,
             holes,
             where_,
@@ -10238,7 +10442,7 @@ impl JoinBlocks {
 
     /// The columns of the joined row a `*` the blocks project shows
     pub(crate) fn star_columns(&self) -> Vec<usize> {
-        star_columns(self.all.len(), &self.scope.merged)
+        star_columns(&self.scope, self.all.len())
     }
 
     /// `stmt` with each star written as the joined row's columns the join's
@@ -10330,7 +10534,7 @@ impl JoinBlocks {
         let rows_sides = [sides[0].rows, sides[1].rows];
         let table = |(name, schema): &(Option<SmartString>, CompactArc<Schema>)| {
             let name = name.as_deref().map(|n| SmartString::from(n.to_lowercase()));
-            ScopeTable::of(name, schema)
+            ScopeTable::of_table(name, schema, false)
         };
         let Some([left_scope, right_scope]) = side_scopes(join, sides) else {
             return Ok(None);
@@ -10342,7 +10546,7 @@ impl JoinBlocks {
             return Ok(None);
         }
         merged_once(&scope, &scope.merged[inner_merges..])?;
-        let items = items(star_columns(width, &scope.merged).len());
+        let items = items(star_columns(&scope, width).len());
         let scopes = [&scope];
         let chain = Chain { scopes: &scopes };
         let mut builder = Builder {
@@ -10560,7 +10764,7 @@ impl JoinBlocks {
             if let (Some((parts, program, joined_clause)), Some(schema)) = (part, sides[i].schema())
             {
                 let blockless = !mentions_subquery(&parts.clause);
-                let mut where_ = parts.prepare(program, &blocks, schema);
+                let mut where_ = parts.prepare(program, &blocks, schema, false);
                 // A side without conditions has no conjunct for its scan to take
                 if joined_clause.is_none() {
                     where_.pushdown = None;
@@ -11217,6 +11421,12 @@ impl<'a> DmlRunner<'a> {
         self.runner.current(bound)
     }
 
+    /// Whether the statement's programs read a row with its row id past its
+    /// columns
+    pub(crate) fn widens(&self) -> bool {
+        self.prepared.widen
+    }
+
     /// What the statement's programs read for `row`: its parameters, its
     /// run slots and its blocks
     pub(crate) fn context<'r>(&'r self, row: &'r Row) -> ExecuteContext<'r> {
@@ -11620,6 +11830,15 @@ impl Builder<'_> {
             }
             equalities.push(key);
         }
+        // A table without a primary key reads its rows by the ids its slot names
+        let ids = schema
+            .rowid_column()
+            .is_none()
+            .then(|| {
+                let slot = schema.columns.len();
+                rewritten.iter().find_map(|(part, _)| slot_keys(part, slot))
+            })
+            .flatten();
         // A WHERE pushed whole is its own pushdown: the clause stands for it
         let pushed = (pushed_count < conjuncts).then(|| {
             rewritten
@@ -11638,6 +11857,7 @@ impl Builder<'_> {
             set_tests,
             point,
             equalities,
+            ids,
             conjuncts,
         })
     }
@@ -11989,8 +12209,17 @@ impl Executor {
         let schema = untyped_schema(&scope, &columns);
         let epoch = self.engine.schema_epoch();
         let params = ctx.params().len();
-        let prepared =
-            PreparedSelect::prepare(self, ctx, stmt, &schema, &scope, params, epoch, false).ok()?;
+        let prepared = PreparedSelect::prepare(
+            self,
+            ctx,
+            stmt,
+            (&schema, false),
+            &scope,
+            params,
+            epoch,
+            false,
+        )
+        .ok()?;
         prepared.explain(stmt, (&scope, global_registry()), body, false)
     }
 
@@ -12180,7 +12409,8 @@ impl Executor {
     }
 
     /// The plan's prepared statement, prepared now over the source `schema`
-    /// gives when the plan holds none for this schema, these `columns` and
+    /// gives, with whether it is a stored table's, when the plan holds none
+    /// for this schema, these `columns` and
     /// this parameter count
     #[allow(clippy::too_many_arguments)]
     fn prepared_for<'s>(
@@ -12188,7 +12418,7 @@ impl Executor {
         compiled: Option<&RwLock<CompiledExecution>>,
         stmt: &SelectStatement,
         columns: &[String],
-        schema: impl FnOnce() -> std::borrow::Cow<'s, Schema>,
+        schema: impl FnOnce() -> (std::borrow::Cow<'s, Schema>, bool),
         scope_name: &SmartString,
         ctx: &ExecutionContext,
         fresh: bool,
@@ -12213,11 +12443,12 @@ impl Executor {
         }
         let (branch, keyed_branch) = prepared_branch(stmt);
         let stmt = &*branch;
+        let (schema, stored) = schema();
         let prepared = Arc::new(PreparedSelect::prepare(
             self,
             ctx,
             stmt,
-            &schema(),
+            (&schema, stored),
             scope_name,
             ctx.params().len(),
             epoch,
@@ -12755,9 +12986,10 @@ impl Executor {
         let aggregations = &*self.prepared_calls(prepared.calls, (ctx, runner))?;
         let windows = (prepared.windowed, prepared.windows);
         let blocks = prepared.blocks.then_some(runner as &dyn SubqueryExecutor);
+        let widen = prepared.where_.widen;
         if QueryClassification::groups(stmt) || windows.0 {
-            let columns = table.schema().column_names_arc();
-            if let Some(read) = prepared.read.and_then(Read::grouped) {
+            let columns = read_names(table.schema(), widen);
+            if let Some(read) = prepared.read.and_then(Read::grouped).filter(|_| !widen) {
                 let run = (ctx, blocks);
                 if let Some(result) =
                     self.grouped_aggregate(table, stmt, aggregations, read, run, &columns)?
@@ -12770,7 +13002,7 @@ impl Executor {
                 self.grouped_answer(windows, stmt, calls, ctx, input, &columns)
             });
         }
-        let source = prepared.read.and_then(Read::aggregated);
+        let source = prepared.read.and_then(Read::aggregated).filter(|_| !widen);
         let source = source.unwrap_or(GlobalSource::Scan);
         let pushed = match (source, stmt.where_clause.as_deref()) {
             (GlobalSource::StorageFiltered, Some(where_clause)) => {
@@ -12782,7 +13014,7 @@ impl Executor {
             _ => None,
         };
         let scan = || {
-            let columns = table.schema().column_names_arc();
+            let columns = read_names(table.schema(), widen);
             self.table_input(stmt, ctx, (runner, prepared), table, |input| {
                 self.global_row(aggregations, &columns, ctx, (blocks, prepared.feed), input)
                     .map(Some)
@@ -12807,8 +13039,9 @@ impl Executor {
         (names, plan): (&[String], Option<&super::window::WindowPlan<'_>>),
     ) -> Result<WindowRows> {
         let keeps_none = prepared.keeps_no_row(stmt, ctx, global_registry());
+        let widen = prepared.where_.widen;
         let indexed = match prepared.read.and_then(Read::window) {
-            Some(read) if !keeps_none => {
+            Some(read) if !keeps_none && !widen => {
                 self.read_window_rows(read, (stmt, plan, prepared.windows), ctx, table, names)?
             }
             _ => None,
@@ -12817,7 +13050,7 @@ impl Executor {
             return Ok(rows);
         }
         // Without a WHERE the table hands over every row at once
-        if prepared.where_.conjuncts == 0 {
+        if prepared.where_.conjuncts == 0 && !widen {
             return Ok(WindowRows::Rows(table.collect_all_rows(None)?, None, None));
         }
         let mut rows = RowVec::new();
@@ -13145,14 +13378,15 @@ impl Executor {
             StatementSource::Cte((columns, _)) => columns,
         };
         let schema = || match &source {
-            StatementSource::Table(table) => std::borrow::Cow::Borrowed(table.schema()),
+            StatementSource::Table(table) => (std::borrow::Cow::Borrowed(table.schema()), true),
             StatementSource::Rows(..)
             | StatementSource::Stream(..)
             | StatementSource::Values(..)
             | StatementSource::Function(..)
-            | StatementSource::Cte(_) => {
-                std::borrow::Cow::Owned(untyped_schema(scope_name, columns))
-            }
+            | StatementSource::Cte(_) => (
+                std::borrow::Cow::Owned(untyped_schema(scope_name, columns)),
+                false,
+            ),
         };
         // A column change between taking the plan and opening a subquery's
         // table prepares again, against the table as it now is
@@ -13230,7 +13464,7 @@ impl Executor {
             let window = prepared.window.as_ref().filter(|_| bound.is_none());
             let (names, rows, order) = match source {
                 StatementSource::Table(table) => {
-                    let names = table.schema().column_names_arc();
+                    let names = read_names(table.schema(), prepared.where_.widen);
                     let run = (&runner, prepared.rows_read());
                     let plan = window;
                     match self.window_table_rows(computed, ctx, run, &*table, (&names, plan))? {
@@ -13279,7 +13513,7 @@ impl Executor {
         // them; the finishing steps follow
         if prepared.aggregated {
             let names = match &source {
-                StatementSource::Table(table) => table.schema().column_names_arc(),
+                StatementSource::Table(table) => read_names(table.schema(), prepared.where_.widen),
                 other => CompactArc::new(other.columns().unwrap_or_default().to_vec()),
             };
             let run = (&runner, prepared.rows_read());
@@ -14039,6 +14273,22 @@ fn untyped_schema(name: &str, columns: &[String]) -> Schema {
     Schema::new(name, columns)
 }
 
+/// The names `schema`'s rows are read under, the row id slot last when they
+/// are `widened`
+pub(crate) fn read_names(schema: &Schema, widened: bool) -> CompactArc<Vec<String>> {
+    let names = schema.column_names_arc();
+    match widened {
+        true => CompactArc::new(names.iter().cloned().chain([ROWID_SLOT.into()]).collect()),
+        false => names,
+    }
+}
+
+/// `row` with its row id `id` past its columns, read under the row id slot
+pub(crate) fn widened(mut row: Row, id: i64) -> Row {
+    row.push(Value::Integer(id));
+    row
+}
+
 /// Rows read in place of a scan: the ones a primary key equality read by
 /// key, or a block source's, lent for one call
 struct PointRows<R> {
@@ -14057,12 +14307,52 @@ impl<R: std::ops::Deref<Target = Vec<(i64, Row)>> + Send> Scanner for PointRows<
         &self.rows[self.at.unwrap_or(0)].1
     }
 
+    fn current_row_id(&self) -> i64 {
+        self.rows[self.at.unwrap_or(0)].0
+    }
+
     fn err(&self) -> Option<&Error> {
         None
     }
 
     fn close(&mut self) -> Result<()> {
         Ok(())
+    }
+}
+
+/// A table's rows with each one's row id past its columns
+struct Widened {
+    scan: Box<dyn Scanner>,
+    row: Row,
+}
+
+impl Scanner for Widened {
+    fn next(&mut self) -> bool {
+        if !self.scan.next() {
+            return false;
+        }
+        self.row = widened(self.scan.take_row(), self.scan.current_row_id());
+        true
+    }
+
+    fn row(&self) -> &Row {
+        &self.row
+    }
+
+    fn take_row(&mut self) -> Row {
+        std::mem::take(&mut self.row)
+    }
+
+    fn current_row_id(&self) -> i64 {
+        self.scan.current_row_id()
+    }
+
+    fn err(&self) -> Option<&Error> {
+        self.scan.err()
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.scan.close()
     }
 }
 
@@ -14314,6 +14604,24 @@ impl<'a> PreparedRunner<'a> {
     /// its table's, its source's, which no pushdown reaches, or the one row
     /// without columns of a block without FROM
     fn scan(&self, index: usize, expr: Option<&dyn StorageExpr>) -> Result<Box<dyn Scanner>> {
+        let scan = self.block_scan(index, expr)?;
+        Ok(self.widened_block(index, scan))
+    }
+
+    /// `scan` of block `index`, its rows widened when the block reads them so
+    fn widened_block(&self, index: usize, scan: Box<dyn Scanner>) -> Box<dyn Scanner> {
+        let table = matches!(self.tables[index], Some(BlockInput::Table(_)));
+        match table && self.prepared.subqueries[index].widen {
+            true => Box::new(Widened {
+                scan,
+                row: Row::new(),
+            }),
+            false => scan,
+        }
+    }
+
+    /// [`Self::scan`] before widening
+    fn block_scan(&self, index: usize, expr: Option<&dyn StorageExpr>) -> Result<Box<dyn Scanner>> {
         match &self.tables[index] {
             // A probe within budget reads the candidates it was charged with
             Some(BlockInput::Table(table)) if self.blocks[index].counted.replace(false) => {
@@ -14388,7 +14696,7 @@ impl<'a> PreparedRunner<'a> {
             let params = self.blocks[index].buffer.borrow();
             if let Some(Value::Integer(key)) = sq.pushdown[point].value(&params) {
                 let rows = table.fetch_rows_by_ids(&[key], expr)?;
-                return Ok(Box::new(PointRows { rows, at: None }));
+                return Ok(self.widened_block(index, Box::new(PointRows { rows, at: None })));
             }
         }
         self.scan(index, expr)
@@ -15126,6 +15434,14 @@ impl<'a> PreparedRunner<'a> {
                         (storage_expr, scanned_whole, extra_whole, rest) = scan;
                     }
                     let filter = storage_expr.as_deref();
+                    // The row ids the WHERE names are read by those ids
+                    if let Some(ids) = where_.ids.as_deref().and_then(|keys| self.slot_ids(keys)) {
+                        let rows = match filter {
+                            Some(filter) => table.fetch_rows_by_ids(&ids, filter)?,
+                            None => table.fetch_rows_by_ids(&ids, &ConstBoolExpr::true_expr())?,
+                        };
+                        break 'read (Some(rows.into_iter()), None, true, false);
+                    }
                     // An index reads the values a failed slot does not have
                     let scan = chosen.filter(|_| self.failed_slots.is_none());
                     // A planned scan reads an IN list's members by keys
@@ -15137,8 +15453,9 @@ impl<'a> PreparedRunner<'a> {
                         }
                     }
                     // A read the plan did not choose, or chose over another
-                    // table's store, is chosen here by the same rule
-                    let limited = target.filter(|_| scanned_whole);
+                    // table's store, is chosen here by the same rule; a
+                    // widened row is read below, where its id is in hand
+                    let limited = target.filter(|_| scanned_whole && !where_.widen);
                     let decided;
                     let access = match scan.and_then(|scan| scan.access(table)) {
                         Some(access) => access,
@@ -15168,6 +15485,7 @@ impl<'a> PreparedRunner<'a> {
                                 && scanned_whole
                                 && extra_whole
                                 && needed.is_none()
+                                && !where_.widen
                             {
                                 let rows = table.collect_access_rows(access, filter)?;
                                 // A read that checks for no cancel is the statement's all the same
@@ -15176,6 +15494,7 @@ impl<'a> PreparedRunner<'a> {
                             }
                             let all: Vec<usize> = (0..table.schema().columns.len()).collect();
                             let scan = table.scan_access(access, &all, needed, filter)?;
+                            let stream = stream && !where_.widen;
                             if stream && scanned_whole && extra_whole {
                                 return Ok(Passing::Scan(scan));
                             }
@@ -15202,6 +15521,10 @@ impl<'a> PreparedRunner<'a> {
                     false => break,
                 },
                 (None, None) => break,
+            };
+            let row = match where_.widen {
+                true => widened(row, id),
+                false => row,
             };
             scanned += 1;
             if scanned.is_multiple_of(100) {
@@ -15230,6 +15553,26 @@ impl<'a> PreparedRunner<'a> {
         // A read that checks for no cancel is the statement's all the same
         ctx.check_cancelled()?;
         Ok(Passing::Read)
+    }
+
+    /// The row ids `keys` name in this run, ascending and once each, a NULL
+    /// naming none; None when one is no integer, which a scan then judges
+    fn slot_ids(&self, keys: &[PreparedValue]) -> Option<Vec<i64>> {
+        let mut ids = Vec::with_capacity(keys.len());
+        for key in keys {
+            let value = match key {
+                PreparedValue::Const(value) => value.clone(),
+                PreparedValue::Slot(slot) => self.base.get(*slot)?.clone(),
+            };
+            match coerce_constant(Some(DataType::Integer), value)? {
+                Value::Integer(id) => ids.push(id),
+                value if value.is_null() => {}
+                _ => return None,
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        Some(ids)
     }
 
     /// Whether a source's stream is read as a table's scan, for a caller
