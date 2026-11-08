@@ -1725,6 +1725,9 @@ pub struct SegmentManager {
     /// Held by a persist from its capture to its write, so an older
     /// capture never lands on disk after a newer one
     persisting: parking_lot::Mutex<()>,
+    /// Set under `persisting` once the table is dropped and its manifest
+    /// removed: a persist that still holds the manager writes nothing
+    retired: std::sync::atomic::AtomicBool,
     /// Committed tombstone map: cold row_id → commit_seq (when the tombstone was created).
     /// Built from manifest tombstones on startup, updated at commit time.
     /// Wrapped in Arc for cheap O(1) reads — most callers only need to check
@@ -1806,6 +1809,7 @@ impl SegmentManager {
             current_eviction_epoch: std::sync::atomic::AtomicU64::new(0),
             reloading: parking_lot::Mutex::new(()),
             persisting: parking_lot::Mutex::new(()),
+            retired: std::sync::atomic::AtomicBool::new(false),
             tombstones: RwLock::new(Arc::new(FxHashMap::default())),
             schema_generation: std::sync::atomic::AtomicU64::new(0),
             definition_epoch: std::sync::atomic::AtomicU64::new(0),
@@ -1849,6 +1853,7 @@ impl SegmentManager {
             current_eviction_epoch: std::sync::atomic::AtomicU64::new(0),
             reloading: parking_lot::Mutex::new(()),
             persisting: parking_lot::Mutex::new(()),
+            retired: std::sync::atomic::AtomicBool::new(false),
             tombstones: RwLock::new(Arc::new(tombstone_map)),
             schema_generation: std::sync::atomic::AtomicU64::new(0),
             definition_epoch: std::sync::atomic::AtomicU64::new(0),
@@ -4298,6 +4303,9 @@ impl SegmentManager {
         // The manifest and the tombstones are taken together, manifest first;
         // the list is built and written outside both locks
         let _persisting = self.persisting.lock();
+        if self.retired.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
         let loaded = Arc::clone(&*self.segments.read());
         let (manifest, tombstones) = {
             let mut manifest = self.manifest.write();
@@ -4342,6 +4350,26 @@ impl SegmentManager {
         manifest.write_to_disk(&manifest_path, &tombstones)?;
 
         Ok(())
+    }
+
+    /// Removes the manifest of a dropped table, after its volumes: from then
+    /// on no persist of this manager writes one again
+    pub fn retire(&self) -> Result<()> {
+        let _persisting = self.persisting.lock();
+        self.retired
+            .store(true, std::sync::atomic::Ordering::Release);
+        let Some(ref vol_dir) = self.volume_dir else {
+            return Ok(());
+        };
+        let path = vol_dir
+            .join(self.table_name().as_str())
+            .join("manifest.bin");
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(
+                crate::core::Error::internal(format!("failed to remove {:?}: {}", path, e)),
+            ),
+            _ => Ok(()),
+        }
     }
 
     /// Record a column rename. The caller must call invalidate_mappings()

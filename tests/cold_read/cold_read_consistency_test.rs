@@ -350,9 +350,7 @@ fn a_cold_reload_can_reuse_a_readers_unique_index() {
 
 #[cfg(feature = "test-failpoints")]
 #[test]
-fn dropping_a_pinned_table_persists_an_empty_manifest() {
-    use stoolap::storage::volume::manifest::TableManifest;
-
+fn dropping_a_pinned_table_leaves_no_manifest_naming_its_rows() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(&format!(
@@ -375,11 +373,8 @@ fn dropping_a_pinned_table_persists_an_empty_manifest() {
             .unwrap();
         other.execute("PRAGMA CHECKPOINT", ()).unwrap();
         assert!(old_names.is_subset(&vol_files(&root)));
-        let manifest = TableManifest::read_from_disk(&root.join("volumes/t/manifest.bin"))
-            .unwrap()
-            .manifest;
         assert!(
-            manifest.segments.is_empty(),
+            !root.join("volumes/t/manifest.bin").exists(),
             "recovery must not discover pinned, dropped rows"
         );
     });
