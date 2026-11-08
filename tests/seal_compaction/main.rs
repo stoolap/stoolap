@@ -36,6 +36,7 @@ mod sealed_window_columns_test;
 mod segment_correctness_test;
 mod segmented_count_equal_test;
 mod streaming_compaction_test;
+mod streaming_seal_test;
 mod truncate_reader_window_test;
 mod truncate_refusal_test;
 mod truncate_safety_test;

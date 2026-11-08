@@ -146,6 +146,10 @@ pub static RETIRED_WAL_SYNC_FAIL: AtomicBool = AtomicBool::new(false);
 /// A table manifest's write fails.
 pub static MANIFEST_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
 
+/// The copy of a snapshot's volume file into volumes/ fails, after its
+/// table directory was made
+pub static SNAPSHOT_VOLUME_COPY_FAIL: AtomicBool = AtomicBool::new(false);
+
 /// The n-th volume a column type change reads fails to read; zero leaves
 /// the reads alone
 pub static RETYPE_READS_BEFORE_FAIL: std::sync::atomic::AtomicUsize =
@@ -3474,6 +3478,7 @@ pub fn reset_all() {
     CHECKPOINT_WRITE_FAIL.store(false, Release);
     RETIRED_WAL_SYNC_FAIL.store(false, Release);
     MANIFEST_WRITE_FAIL.store(false, Release);
+    SNAPSHOT_VOLUME_COPY_FAIL.store(false, Release);
     RETYPE_READS_BEFORE_FAIL.store(0, Release);
     SEAL_REGISTRATION_STALE_ROUNDS.store(0, Release);
     VERSION_ROOT_HOOK.with(|slot| *slot.borrow_mut() = None);

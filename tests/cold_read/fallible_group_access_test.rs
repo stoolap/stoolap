@@ -1447,9 +1447,12 @@ fn seal_prebuild_schema_mismatch_removes_output_and_keeps_hot_rows() {
     );
     let outcome = catch_unwind(AssertUnwindSafe(|| engine.force_checkpoint_cycle()));
     assert!(outcome.is_ok(), "seal prebuild panicked on schema mismatch");
+    let err = outcome
+        .unwrap()
+        .expect_err("a unique set beyond the columns was sealed");
     assert!(
-        matches!(outcome.unwrap(), Err(stoolap::core::Error::Io { message })
-        if message == "column index out of range")
+        err.to_string().contains("unique column beyond the batch"),
+        "{err}"
     );
     assert!(engine.volume_stats().is_empty());
     assert_eq!(store.committed_row_count(), 2);

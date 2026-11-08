@@ -76,31 +76,46 @@ fn barrier_unsupported(code: Option<i32>) -> bool {
 /// Volume catalog filename
 const CATALOG_FILE: &str = "volumes.catalog";
 
-/// Write a frozen volume to disk atomically (V5 format, LZ4 compressed).
+/// Write a frozen volume to disk atomically (V5 format, LZ4 compressed),
+/// its rows fed to the streaming writer the seal uses. A volume already
+/// bound to a file is refused before anything is written; the writes
+/// take turns, so a check and its bind are never split by another write
 pub fn write_volume_to_disk(
     dir: &Path,
     table_name: &str,
     volume_id: u64,
     volume: &FrozenVolume,
 ) -> Result<PathBuf> {
-    let (path, _store) = write_volume_to_disk_opts(dir, table_name, volume_id, volume, true)?;
+    static WRITES: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    let _turn = WRITES.lock();
+    if volume.meta.file_identity.get().is_some() {
+        return Err(crate::core::Error::internal(
+            "the volume already belongs to another file",
+        ));
+    }
+    let mut schema = crate::core::SchemaBuilder::new(table_name);
+    for (name, &data_type) in volume
+        .meta
+        .column_names
+        .iter()
+        .zip(&volume.meta.column_types)
+    {
+        schema = schema.column(name, data_type, true, false);
+    }
+    let schema = schema.build();
+    let rows = volume.meta.row_count;
+    let mut writer =
+        super::output::VolumeFileWriter::new(dir, table_name, volume_id, &schema, rows, true)?;
+    writer.allow_any_row_order();
+    let ids = volume.row_ids()?;
+    for (idx, &row_id) in ids.iter().enumerate() {
+        writer.add_row(row_id, &volume.get_row(idx)?)?;
+    }
+    let (written, path) = writer.finish()?;
+    if let Some(&identity) = written.meta.file_identity.get() {
+        let _ = volume.meta.file_identity.set(identity);
+    }
     Ok(path)
-}
-
-/// Write a frozen volume to disk atomically as V5, with optional LZ4
-/// compression of its blocks (a block that does not shrink is stored raw).
-/// Returns (path, CompressedBlockStore).
-pub fn write_volume_to_disk_opts(
-    dir: &Path,
-    table_name: &str,
-    volume_id: u64,
-    volume: &FrozenVolume,
-    compress: bool,
-) -> Result<(PathBuf, CompressedBlockStore)> {
-    let (data, store) = serialize_v5_opts(volume, compress, volume_id)
-        .map_err(|e| crate::core::Error::internal(format!("V5 serialize failed: {}", e)))?;
-    let path = write_volume_file(dir, table_name, volume_id, data)?;
-    Ok((path, store))
 }
 
 /// Writes a volume as V4, the format files written before V5 have: the
@@ -159,62 +174,6 @@ fn write_volume_file(
     }
 
     Ok(final_path)
-}
-
-/// Serializes a volume as V5: the header, the blocks group by group, then
-/// the sections and the footer
-pub(crate) fn serialize_v5_opts(
-    vol: &FrozenVolume,
-    compress: bool,
-    volume_id: u64,
-) -> std::io::Result<(Vec<u8>, CompressedBlockStore)> {
-    let col_count = vol.columns.len();
-    let group_size = vol.meta.group_rows;
-    let num_groups = vol.meta.row_count.div_ceil(group_size);
-    let meta = super::format::v5_volume_sections(vol)?;
-    let meta_bytes: usize = meta.iter().map(|s| s.bytes.len()).sum();
-    let store = CompressedBlockStore::compress_columns_opts(
-        &vol.columns,
-        vol.meta.row_count,
-        group_size,
-        compress,
-    )?;
-    let blocks = store.raw_blocks();
-    let decoded = store.decompressed_lens();
-    let block_bytes: usize = blocks.iter().flatten().map(Vec::len).sum();
-    let mut buf = Vec::with_capacity(block_bytes + meta_bytes + 4096);
-    buf.extend_from_slice(&super::v5::header());
-    let mut entries = Vec::with_capacity(col_count * num_groups);
-    for group in 0..num_groups {
-        for (col, col_blocks) in blocks.iter().enumerate() {
-            let block = &col_blocks[group];
-            entries.push(super::v5::BlockEntry::new(
-                buf.len() as u64,
-                block,
-                decoded[col][group],
-                col,
-                group,
-            )?);
-            buf.extend_from_slice(block);
-        }
-    }
-    let pos = buf.len() as u64;
-    let root = super::v5::Root {
-        cols: col_count as u32,
-        groups: num_groups as u32,
-        group_rows: group_size as u32,
-        rows: vol.meta.row_count as u64,
-        volume_id,
-        nonce: super::v5::new_nonce(),
-    };
-    let identity = super::v5::write_tail(&mut buf, pos, &root, meta, &entries)?;
-    if vol.meta.file_identity.get_or_init(|| identity) != &identity {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "the volume already belongs to another file",
-        ));
-    }
-    Ok((buf, store))
 }
 
 /// Serialize a FrozenVolume to V4 format.
@@ -1657,6 +1616,52 @@ mod tests {
         let path = write_volume_to_disk(dir.path(), "t", 1, &vol).unwrap();
         let loaded = read_volume_from_disk(&path).unwrap();
         assert_eq!((loaded.columns.len(), loaded.meta.row_count), (0, 0));
+    }
+
+    #[test]
+    fn a_volume_written_again_is_refused_and_its_file_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let vol = mixed_volume(100);
+        let path = write_volume_to_disk(dir.path(), "t", 1, &vol).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let Err(error) = write_volume_to_disk(dir.path(), "t", 1, &vol) else {
+            panic!("a volume was written to a second file");
+        };
+        assert!(error.to_string().contains("already belongs"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "the file changed");
+        assert_eq!(read_volume_from_disk(&path).unwrap().meta.row_count, 100);
+    }
+
+    #[test]
+    fn of_two_writes_of_a_volume_at_once_one_binds_it_and_the_other_leaves_no_file() {
+        // Two directories, then one: the same target for both writes
+        for targets in [2, 1] {
+            let vol = mixed_volume(100_000);
+            let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+            let start = std::sync::Barrier::new(2);
+            let results: Vec<Result<PathBuf>> = std::thread::scope(|s| {
+                let writes: Vec<_> = (0..2)
+                    .map(|n| {
+                        let (vol, start, dir) = (&vol, &start, dirs[n % targets].path());
+                        s.spawn(move || {
+                            start.wait();
+                            write_volume_to_disk(dir, "t", 1, vol)
+                        })
+                    })
+                    .collect();
+                writes.into_iter().map(|w| w.join().unwrap()).collect()
+            });
+            let bound: Vec<&PathBuf> = results.iter().flatten().collect();
+            assert_eq!(bound.len(), 1, "{targets} targets: {results:?}");
+            let file = read_volume_from_disk(bound[0]).unwrap();
+            assert_eq!(file.meta.file_identity.get(), vol.meta.file_identity.get());
+            let left: Vec<_> = dirs
+                .iter()
+                .map(|dir| dir.path().join("t").join(format!("vol_{:016x}.vol", 1)))
+                .filter(|path| path.exists())
+                .collect();
+            assert_eq!(left, vec![bound[0].clone()], "{targets} targets");
+        }
     }
 }
 

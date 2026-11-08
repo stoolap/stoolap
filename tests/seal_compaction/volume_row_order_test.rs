@@ -77,7 +77,7 @@ fn a_later_chunk_out_of_order_leaves_no_volume_file_behind() {
         .map(|id| (id, Row::from_values(vec![Value::Integer(id)])))
         .collect();
     rows.swap(65_536, 65_537);
-    let err = seal_and_persist_multi(&schema, &rows, dir.path(), "t", true, 65_536)
+    let err = seal_and_persist_multi(&schema, &rows, dir.path(), "t", true, 65_536, &[])
         .err()
         .expect("a later chunk out of row id order was accepted");
     assert!(err.to_string().contains("row id order"), "{err}");

@@ -648,6 +648,17 @@ fn write_snapshot_metadata(path: &std::path::Path, lsn: u64) -> Result<()> {
     Ok(())
 }
 
+/// Removes the table directories a failed snapshot migration made under
+/// `vol_dir`: the migration starts only when it holds none, and one left
+/// without a manifest would make the next open skip the snapshots
+fn remove_migration_volumes(vol_dir: &std::path::Path) {
+    for entry in std::fs::read_dir(vol_dir).into_iter().flatten().flatten() {
+        if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// Read snapshot LSN from either binary or JSON format (backward compatibility)
 fn read_snapshot_lsn(snapshot_dir: &std::path::Path) -> u64 {
     // First try new binary format
@@ -1265,7 +1276,13 @@ impl MVCCEngine {
                     lsn
                 } else if has_legacy_snapshots {
                     // Legacy path: load snapshots (creates schemas + version stores)
-                    let snapshot_lsn = self.load_snapshots()?;
+                    let snapshot_lsn = match self.load_snapshots() {
+                        Ok(lsn) => lsn,
+                        Err(e) => {
+                            remove_migration_volumes(&pm.path().join("volumes"));
+                            return Err(e);
+                        }
+                    };
                     self.load_standalone_volumes();
                     snapshot_lsn
                 } else {
@@ -1615,7 +1632,7 @@ impl MVCCEngine {
                 let use_volume = has_vol || file_size > 16 * 1024 * 1024;
 
                 let load_result = if use_volume {
-                    self.load_table_snapshot_as_volume(&table_name, snapshot_path)
+                    self.load_table_snapshot_as_volume(&table_name, snapshot_path)?
                 } else {
                     self.load_table_snapshot(&table_name, snapshot_path)
                 };
@@ -1750,30 +1767,33 @@ impl MVCCEngine {
         Ok(source_lsn)
     }
 
-    /// Load a table's snapshot as a frozen volume instead of into the arena.
-    ///
-    /// Fast-startup path:
-    /// 1. Check for a pre-built `.vol` file next to the snapshot — load directly
-    /// 2. If no `.vol` file, convert from snapshot and save the `.vol` for next time
-    ///
-    /// The VersionStore is created empty (only WAL-replayed rows go into the arena).
-    /// Returns the source_lsn from the snapshot header.
+    /// Loads a table's snapshot as a volume, the `.vol` beside it or one
+    /// converted from it, promoted to `volumes/`; returns its source LSN.
+    /// The inner error is a snapshot or file that cannot be read, so an
+    /// older snapshot may be tried; the outer one, writing or promoting
+    /// the volume, fails the caller, which would otherwise lose the table
     fn load_table_snapshot_as_volume(
         &self,
         _table_name: &str,
         snapshot_path: &std::path::Path,
-    ) -> Result<u64> {
+    ) -> Result<Result<u64>> {
         // Derive the volume file path from the snapshot path:
         // snapshot-20260314-001020.947.bin → snapshot-20260314-001020.947.vol
         let vol_path = snapshot_path.with_extension("vol");
 
         // Try loading a pre-built volume file first (instant startup)
         if vol_path.exists() {
-            let volume = crate::storage::volume::io::read_volume_from_disk(&vol_path)?;
+            let volume = match crate::storage::volume::io::read_volume_from_disk(&vol_path) {
+                Ok(volume) => volume,
+                Err(e) => return Ok(Err(e)),
+            };
             let vol_row_count = volume.meta.row_count;
 
             // We still need the schema from the snapshot header
-            let reader = super::snapshot::SnapshotReader::open(snapshot_path)?;
+            let reader = match super::snapshot::SnapshotReader::open(snapshot_path) {
+                Ok(reader) => reader,
+                Err(e) => return Ok(Err(e)),
+            };
             let source_lsn = reader.source_lsn();
             let schema = reader.schema().clone();
             let table_name_lower = schema.table_name_lower.clone();
@@ -1796,25 +1816,19 @@ impl MVCCEngine {
                 stores.insert(table_name_lower.clone(), version_store);
             }
 
-            // Store the frozen volume in the segment manager.
-            // Promote to standalone FIRST to get the stable volume_id, then
-            // register with that same ID so load_standalone_volumes skips it.
             if vol_row_count > 0 {
-                let volume = Arc::new(volume);
-                let stable_id =
-                    self.promote_snapshot_vol_to_standalone(&table_name_lower, &vol_path);
-                if let Some(id) = stable_id {
-                    self.register_volume_with_id(&table_name_lower, volume, id)?;
-                } else {
-                    self.register_volume(&table_name_lower, volume)?;
-                }
+                drop(volume);
+                self.register_snapshot_volume(&table_name_lower, &vol_path)?;
             }
 
-            return Ok(source_lsn);
+            return Ok(Ok(source_lsn));
         }
 
         // No pre-built volume — convert from snapshot
-        let mut reader = super::snapshot::SnapshotReader::open(snapshot_path)?;
+        let mut reader = match super::snapshot::SnapshotReader::open(snapshot_path) {
+            Ok(reader) => reader,
+            Err(e) => return Ok(Err(e)),
+        };
         let source_lsn = reader.source_lsn();
         let schema = reader.schema().clone();
         let table_name_lower = schema.table_name_lower.clone();
@@ -1827,64 +1841,39 @@ impl MVCCEngine {
         ));
         register_pk_index(&schema, &version_store);
 
-        // Build a frozen volume from the snapshot rows
-        let mut builder = crate::storage::volume::writer::VolumeBuilder::new(&schema);
-        reader.for_each(|row_id, version| {
+        // The snapshot rows stream into a volume file next to it, whose
+        // columns the volume reads; the volume id is assigned when the
+        // file is promoted, so the root records none
+        let mut writer = crate::storage::volume::output::VolumeFileWriter::at(
+            vol_path.clone(),
+            0,
+            &schema,
+            reader.row_count() as usize,
+            true,
+        )?;
+        let mut fed = Ok(());
+        if let Err(e) = reader.for_each(|row_id, version| {
             if !version.is_deleted() {
-                builder.add_row(row_id, &version.data);
+                fed = writer.add_row(row_id, &version.data);
             }
-            true
-        })?;
-        let mut volume = builder.finish().map_err(|e| {
+            fed.is_ok()
+        }) {
+            return Ok(Err(e));
+        }
+        let converted = if fed.is_ok() && writer.rows() == 0 {
+            writer.abort();
+            crate::storage::volume::writer::VolumeBuilder::new(&schema).finish()
+        } else {
+            fed.and_then(|()| writer.finish()).map(|(volume, _)| volume)
+        };
+        let volume = converted.map_err(|e| {
             Error::internal(format!(
                 "converting the snapshot of table {}: {e}",
                 schema.table_name
             ))
         })?;
         let vol_row_count = volume.meta.row_count;
-
-        // Write volume file to disk and retain CompressedBlockStore for
-        // warm-tier eviction (single compress, no double work).
-        if vol_row_count > 0 {
-            // The volume id is assigned when the file is promoted, so the
-            // root records none
-            match crate::storage::volume::io::serialize_v5_opts(&volume, true, 0) {
-                Ok((data, store)) => {
-                    volume.columns.attach_compressed_store(store);
-                    if let Err(e) = (|| -> Result<()> {
-                        let tmp_path = vol_path.with_extension("vol.tmp");
-                        std::fs::write(&tmp_path, &data).map_err(|e| {
-                            crate::core::Error::internal(format!("failed to write volume: {}", e))
-                        })?;
-                        std::fs::File::open(&tmp_path)
-                            .and_then(|f| f.sync_all())
-                            .map_err(|e| {
-                                crate::core::Error::internal(format!(
-                                    "failed to sync volume: {}",
-                                    e
-                                ))
-                            })?;
-                        std::fs::rename(&tmp_path, &vol_path).map_err(|e| {
-                            crate::core::Error::internal(format!("failed to rename volume: {}", e))
-                        })?;
-                        Ok(())
-                    })() {
-                        eprintln!(
-                            "Warning: Failed to save volume file for {}: {}",
-                            table_name_lower, e
-                        );
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Warning: Failed to serialize volume for {}: {}",
-                        table_name_lower, e
-                    );
-                }
-            }
-        }
-
-        let volume = Arc::new(volume);
+        drop(volume);
 
         // Store schema and empty version store
         {
@@ -1896,17 +1885,35 @@ impl MVCCEngine {
             stores.insert(table_name_lower.clone(), version_store);
         }
 
-        // Promote to standalone FIRST, then register with the stable ID
         if vol_row_count > 0 {
-            let stable_id = self.promote_snapshot_vol_to_standalone(&table_name_lower, &vol_path);
-            if let Some(id) = stable_id {
-                self.register_volume_with_id(&table_name_lower, volume, id)?;
-            } else {
-                self.register_volume(&table_name_lower, volume)?;
-            }
+            self.register_snapshot_volume(&table_name_lower, &vol_path)?;
         }
 
-        Ok(source_lsn)
+        Ok(Ok(source_lsn))
+    }
+
+    /// Promotes the volume file beside a snapshot to `volumes/` and
+    /// registers the volume read from that copy, under its stable id so
+    /// `load_standalone_volumes` skips it: the migration removes the
+    /// snapshot's directory, and with it the file beside the snapshot
+    fn register_snapshot_volume(&self, table_name: &str, vol_path: &std::path::Path) -> Result<()> {
+        let promoted = self
+            .persistence
+            .as_ref()
+            .as_ref()
+            .zip(self.promote_snapshot_vol_to_standalone(table_name, vol_path));
+        let Some((pm, volume_id)) = promoted else {
+            return Err(Error::internal(format!(
+                "the snapshot volume of table {table_name} could not be promoted to volumes/"
+            )));
+        };
+        let path = pm
+            .path()
+            .join("volumes")
+            .join(table_name)
+            .join(format!("vol_{:016x}.vol", volume_id));
+        let volume = crate::storage::volume::io::read_volume_from_disk(&path)?;
+        self.register_volume_with_id(table_name, Arc::new(volume), volume_id)
     }
 
     /// Copy a snapshot-adjacent .vol file into the standalone volumes directory.
@@ -1939,15 +1946,22 @@ impl MVCCEngine {
         // Marker file stores the volume_id from the previous promotion.
         // On subsequent opens, return that ID so the caller registers with
         // the same segment_id as the standalone copy — preventing double-load.
+        // A copy a RESTORE removed since is made again under the same id
         let marker_path = vol_path.with_extension("vol.promoted");
-        if marker_path.exists() {
-            return std::fs::read_to_string(&marker_path)
-                .ok()
-                .and_then(|s| s.trim().parse::<u64>().ok());
-        }
+        let marked = std::fs::read_to_string(&marker_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok());
 
         let vol_dir = pm.path().join("volumes");
         let table_vol_dir = vol_dir.join(table_name);
+        if let Some(volume_id) = marked {
+            if table_vol_dir
+                .join(format!("vol_{:016x}.vol", volume_id))
+                .exists()
+            {
+                return Some(volume_id);
+            }
+        }
 
         if let Err(e) = std::fs::create_dir_all(&table_vol_dir) {
             eprintln!(
@@ -1957,13 +1971,20 @@ impl MVCCEngine {
             return None;
         }
 
-        let volume_id = crate::storage::volume::io::next_volume_id();
+        let volume_id = marked.unwrap_or_else(crate::storage::volume::io::next_volume_id);
         let dest_name = format!("vol_{:016x}.vol", volume_id);
         let dest_path = table_vol_dir.join(&dest_name);
         let tmp_path = table_vol_dir.join(format!("{}.tmp", dest_name));
 
         // Use fs::copy for streaming kernel-level copy (no userspace memory spike)
-        if let Err(e) = std::fs::copy(vol_path, &tmp_path) {
+        let copied = std::fs::copy(vol_path, &tmp_path);
+        #[cfg(feature = "test-failpoints")]
+        let copied = match crate::test_failpoints::SNAPSHOT_VOLUME_COPY_FAIL.load(Ordering::Acquire)
+        {
+            true => Err(std::io::Error::other("injected copy failure")),
+            false => copied,
+        };
+        if let Err(e) = copied {
             eprintln!(
                 "Warning: Failed to copy snapshot vol for {}: {}",
                 table_name, e
@@ -3898,6 +3919,7 @@ impl MVCCEngine {
 
     /// Register a frozen volume into a table's segment manager.
     /// Uses a fresh auto-assigned segment ID.
+    #[cfg(test)]
     fn register_volume(
         &self,
         table_name: &str,
@@ -6051,6 +6073,7 @@ impl MVCCEngine {
 
             let load_result = if use_volume {
                 self.load_table_snapshot_as_volume(table_name, snapshot_path)
+                    .and_then(|loaded| loaded)
             } else {
                 self.load_table_snapshot(table_name, snapshot_path)
             };
@@ -8110,6 +8133,13 @@ impl MVCCEngine {
                 .read()
                 .map(|c| c.persistence.volume_compression)
                 .unwrap_or(true);
+            // Each volume streams to its file a row group at a time, its
+            // unique indexes built as the rows pass, so the first INSERT
+            // after the seal reads no column whole
+            let unique_sets: Vec<Vec<usize>> = unique_columns
+                .into_iter()
+                .map(|(col_indices, _)| col_indices)
+                .collect();
             let sealed_volumes = crate::storage::volume::seal::seal_and_persist_multi(
                 &schema,
                 &all_rows,
@@ -8117,6 +8147,7 @@ impl MVCCEngine {
                 &table_name,
                 compress,
                 target_volume_rows,
+                &unique_sets,
             )?;
             // Each sealed volume's owner, before the fence: the registry
             // lock is global and must not be waited on under it
@@ -8131,19 +8162,6 @@ impl MVCCEngine {
                         Some(file)
                     })
                     .collect();
-            // Pre-build unique hash indices BEFORE registration so the
-            // first INSERT after seal doesn't pay a ~60ms stall scanning
-            // all rows. Safe: volumes are not yet visible to other threads.
-            for (col_indices, _) in unique_columns {
-                for (vol, _, _) in &sealed_volumes {
-                    if let Err(error) = vol.prebuild_unique_index(&col_indices) {
-                        for (_, path, _) in &sealed_volumes {
-                            let _ = std::fs::remove_file(path);
-                        }
-                        return Err(error.into());
-                    }
-                }
-            }
             // Each volume's secondary index side file, built and opened
             // before the fence under the builds budget; a refused or
             // failed build leaves its volume uncovered, and a volume that

@@ -29,12 +29,14 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::core::{Error, Result, Schema};
+use crate::core::{Error, Result, Row, Schema};
 
 use super::column::ROW_GROUP_SIZE;
 use super::format::serialize_typed_block;
 use super::transfer::TypedSink;
-use super::writer::{CompressedBlockStore, FrozenVolume, LazyColumns, TypedCells, VolumeBuilder};
+use super::writer::{
+    Accumulators, CompressedBlockStore, FrozenVolume, LazyColumns, TypedCells, VolumeBuilder,
+};
 
 /// The write buffer of the file being written
 const COPY_BUFFER: usize = 1 << 20;
@@ -48,11 +50,142 @@ fn io_error(what: &str, error: std::io::Error) -> Error {
     Error::internal(format!("{what}: {error}"))
 }
 
+/// Encodes one column's cells into `block`, LZ4-compressed when `compress`
+/// and that shrinks it; returns the encoded length
+fn encode_block(cells: &TypedCells<'_>, compress: bool, block: &mut Vec<u8>) -> Result<usize> {
+    let encoded = serialize_typed_block(cells);
+    let decoded = encoded.len();
+    if compress {
+        block.clear();
+        block.resize(lz4_flex::block::get_maximum_output_size(decoded), 0);
+        let n = lz4_flex::block::compress_into(&encoded, block)
+            .map_err(|e| Error::internal(format!("LZ4: {e}")))?;
+        if n < decoded {
+            block.truncate(n);
+            return Ok(decoded);
+        }
+    }
+    *block = encoded;
+    Ok(decoded)
+}
+
+/// One row group's cells and, once encoded, its blocks by column with
+/// their decoded lengths
+struct EncodeJob {
+    group: Accumulators,
+    blocks: Vec<(Vec<u8>, usize)>,
+    result: Result<()>,
+}
+
+impl EncodeJob {
+    fn run(&mut self, compress: bool) {
+        let group = &self.group;
+        self.result =
+            self.blocks
+                .iter_mut()
+                .enumerate()
+                .try_for_each(|(col_idx, (block, decoded))| {
+                    *decoded = encode_block(&group.cells(col_idx), compress, block)?;
+                    Ok(())
+                });
+    }
+}
+
+/// Encodes the groups handed to it in order, one at a time, on a thread
+/// of its own when the build has threads: a group is encoded while the
+/// next one accumulates
+struct Encoder {
+    compress: bool,
+    /// Whether a job was handed over and not taken back
+    out: bool,
+    #[cfg(feature = "parallel")]
+    channel: Option<(
+        std::sync::mpsc::SyncSender<EncodeJob>,
+        std::sync::mpsc::Receiver<EncodeJob>,
+    )>,
+    #[cfg(not(feature = "parallel"))]
+    done: Option<EncodeJob>,
+}
+
+impl Encoder {
+    fn new(compress: bool) -> Self {
+        Self {
+            compress,
+            out: false,
+            #[cfg(feature = "parallel")]
+            channel: None,
+            #[cfg(not(feature = "parallel"))]
+            done: None,
+        }
+    }
+
+    /// Hands `job` over; the previous one must have been taken back
+    fn submit(&mut self, job: EncodeJob) -> Result<()> {
+        debug_assert!(!self.out, "an encoded group was not taken back");
+        #[cfg(feature = "parallel")]
+        {
+            if self.channel.is_none() {
+                let (jobs, inbox) = std::sync::mpsc::sync_channel::<EncodeJob>(1);
+                let (outbox, done) = std::sync::mpsc::sync_channel::<EncodeJob>(1);
+                let compress = self.compress;
+                std::thread::Builder::new()
+                    .name("stoolap-volume-encode".into())
+                    .spawn(move || {
+                        for mut job in inbox {
+                            job.run(compress);
+                            if outbox.send(job).is_err() {
+                                break;
+                            }
+                        }
+                    })
+                    .map_err(|e| io_error("failed to start the volume encoder", e))?;
+                self.channel = Some((jobs, done));
+            }
+            let Some((jobs, _)) = &self.channel else {
+                return Err(Error::internal("volume encoder not started"));
+            };
+            jobs.send(job)
+                .map_err(|_| Error::internal("volume encoder stopped"))?;
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            let mut job = job;
+            job.run(self.compress);
+            self.done = Some(job);
+        }
+        self.out = true;
+        Ok(())
+    }
+
+    /// The job handed over last, once encoded; None when none is out
+    fn take(&mut self) -> Result<Option<EncodeJob>> {
+        if !self.out {
+            return Ok(None);
+        }
+        self.out = false;
+        #[cfg(feature = "parallel")]
+        {
+            let Some((_, done)) = &self.channel else {
+                return Err(Error::internal("volume encoder not started"));
+            };
+            done.recv()
+                .map(Some)
+                .map_err(|_| Error::internal("volume encoder stopped"))
+        }
+        #[cfg(not(feature = "parallel"))]
+        Ok(self.done.take())
+    }
+}
+
 /// Writes one volume file from typed batches; see the module
 pub struct VolumeFileWriter {
     /// None once `finish` has taken it
     builder: Option<VolumeBuilder>,
-    compress: bool,
+    encoder: Encoder,
+    /// The accumulators and block buffers of the last group written,
+    /// taken by the next group handed to the encoder
+    spare: Option<Accumulators>,
+    spare_blocks: Option<Vec<(Vec<u8>, usize)>>,
     final_path: PathBuf,
     blocks_path: PathBuf,
     blocks: Option<BufWriter<File>>,
@@ -63,7 +196,6 @@ pub struct VolumeFileWriter {
     index: Vec<Vec<(u64, usize, usize, u32)>>,
     /// Every block written, in file order, for the block table
     entries: Vec<super::v5::BlockEntry>,
-    packed: Vec<u8>,
     finished: bool,
     /// Rows the writer was sized for; caps a unique set's capacity
     expected_rows: usize,
@@ -105,6 +237,17 @@ impl VolumeFileWriter {
             .map_err(|e| io_error("failed to create volume dir", e))?;
         let final_path =
             table_dir.join(format!("vol_{:016x}.{}", volume_id, super::io::VOLUME_EXT));
+        Self::at(final_path, volume_id, schema, expected_rows, compress)
+    }
+
+    /// A writer for the file at `final_path`, whose directory exists
+    pub fn at(
+        final_path: PathBuf,
+        volume_id: u64,
+        schema: &Schema,
+        expected_rows: usize,
+        compress: bool,
+    ) -> Result<Self> {
         let blocks_path = block_file_path(&final_path);
         let blocks = std::fs::OpenOptions::new()
             .write(true)
@@ -123,12 +266,13 @@ impl VolumeFileWriter {
             index: vec![Vec::new(); schema.columns.len()],
             entries: Vec::new(),
             builder: Some(builder),
-            compress,
+            encoder: Encoder::new(compress),
+            spare: None,
+            spare_blocks: None,
             final_path,
             blocks_path,
             blocks: Some(blocks),
             block_pos: super::v5::HEADER_LEN,
-            packed: Vec::new(),
             finished: false,
             expected_rows,
             volume_id,
@@ -177,9 +321,6 @@ impl VolumeFileWriter {
     /// crosses a group boundary is split there, so every group but the
     /// last holds exactly `ROW_GROUP_SIZE` rows
     pub fn append_typed(&mut self, row_ids: &[i64], columns: &[TypedCells<'_>]) -> Result<()> {
-        if !self.unique.is_empty() {
-            self.hash_unique(columns)?;
-        }
         let mut start = 0;
         while start < row_ids.len() {
             let builder = self.builder()?;
@@ -202,17 +343,33 @@ impl VolumeFileWriter {
         Ok(())
     }
 
-    /// Hashes every row's cells of each unique column set the way
-    /// `unique_lookup_all` hashes its values; a row with a null in the
-    /// set is left out, as the index built over columns leaves it out
-    fn hash_unique(&mut self, columns: &[TypedCells<'_>]) -> Result<()> {
+    /// Adds one row, see `VolumeBuilder::add_row`; a full group is
+    /// written out
+    pub fn add_row(&mut self, row_id: i64, row: &Row) -> Result<()> {
+        let builder = self.builder()?;
+        builder.add_row(row_id, row);
+        if builder.group_len() == ROW_GROUP_SIZE {
+            self.flush_group()?;
+        }
+        Ok(())
+    }
+
+    /// Hashes every row's cells of the accumulated group for each unique
+    /// column set the way `unique_lookup_all` hashes its values; a row
+    /// with a null in the set is left out, as the index built over
+    /// columns leaves it out
+    fn hash_unique(&mut self) -> Result<()> {
         use std::hash::{Hash, Hasher};
-        let first = self.rows() as u32;
-        let rows = columns.first().map_or(0, TypedCells::len);
         let builder = self
             .builder
             .as_ref()
             .ok_or_else(|| Error::internal("volume writer already finished"))?;
+        let first = (builder.row_count() - builder.group_len()) as u32;
+        let columns: Vec<TypedCells<'_>> = (0..self.index.len())
+            .map(|col| builder.group_cells(col))
+            .collect();
+        let columns = columns.as_slice();
+        let rows = builder.group_len();
         for UniqueIndexing {
             columns: set,
             entries,
@@ -333,49 +490,70 @@ impl VolumeFileWriter {
 
     /// Encodes the accumulated group's blocks into the block file
     fn flush_group(&mut self) -> Result<()> {
-        let blocks = self
-            .blocks
-            .as_mut()
-            .ok_or_else(|| Error::internal("volume writer already finished"))?;
-        let compress = self.compress;
-        let (packed, index, block_pos, entries) = (
-            &mut self.packed,
-            &mut self.index,
-            &mut self.block_pos,
-            &mut self.entries,
-        );
+        if !self.unique.is_empty() {
+            self.hash_unique()?;
+        }
+        // The previous group, encoded while this one accumulated, is
+        // written first, and its accumulators take this group's place
+        self.write_encoded()?;
         let builder = self
             .builder
             .as_mut()
             .ok_or_else(|| Error::internal("volume writer already finished"))?;
-        builder.flush_group(|col_idx, cells| {
-            let encoded = serialize_typed_block(&cells);
-            let decompressed_len = encoded.len();
-            let bytes: &[u8] = if compress {
-                packed.clear();
-                packed.resize(lz4_flex::block::get_maximum_output_size(encoded.len()), 0);
-                let n = lz4_flex::block::compress_into(&encoded, packed)
-                    .map_err(|e| Error::internal(format!("LZ4: {e}")))?;
-                if n < encoded.len() {
-                    &packed[..n]
-                } else {
-                    &encoded
-                }
-            } else {
-                &encoded
-            };
-            blocks
-                .write_all(bytes)
-                .map_err(|e| io_error("failed to write volume block", e))?;
-            let group = index[col_idx].len();
-            let entry =
-                super::v5::BlockEntry::new(*block_pos, bytes, decompressed_len, col_idx, group)
-                    .map_err(|e| io_error("V5 block", e))?;
-            index[col_idx].push((*block_pos, bytes.len(), decompressed_len, entry.crc()));
-            entries.push(entry);
-            *block_pos += bytes.len() as u64;
-            Ok(())
+        let mut group = match self.spare.take() {
+            Some(group) => group,
+            None => builder.spare_accumulators(),
+        };
+        if builder.flush_group_into(&mut group)? == 0 {
+            self.spare = Some(group);
+            return Ok(());
+        }
+        let blocks = match self.spare_blocks.take() {
+            Some(blocks) => blocks,
+            None => vec![(Vec::new(), 0); group.columns()],
+        };
+        self.encoder.submit(EncodeJob {
+            group,
+            blocks,
+            result: Ok(()),
         })
+    }
+
+    /// Waits for the group handed to the encoder last and appends its
+    /// blocks to the file, column by column
+    fn write_encoded(&mut self) -> Result<()> {
+        let Some(EncodeJob {
+            group,
+            blocks,
+            result,
+        }) = self.encoder.take()?
+        else {
+            return Ok(());
+        };
+        self.spare = Some(group);
+        result?;
+        let file = self
+            .blocks
+            .as_mut()
+            .ok_or_else(|| Error::internal("volume writer already finished"))?;
+        for (col_idx, (bytes, decompressed_len)) in blocks.iter().enumerate() {
+            file.write_all(bytes)
+                .map_err(|e| io_error("failed to write volume block", e))?;
+            let group = self.index[col_idx].len();
+            let entry = super::v5::BlockEntry::new(
+                self.block_pos,
+                bytes,
+                *decompressed_len,
+                col_idx,
+                group,
+            )
+            .map_err(|e| io_error("V5 block", e))?;
+            self.index[col_idx].push((self.block_pos, bytes.len(), *decompressed_len, entry.crc()));
+            self.entries.push(entry);
+            self.block_pos += bytes.len() as u64;
+        }
+        self.spare_blocks = Some(blocks);
+        Ok(())
     }
 
     /// Writes the last group, the metadata and the final file, syncs it
@@ -385,6 +563,7 @@ impl VolumeFileWriter {
         if self.builder()?.group_len() > 0 {
             self.flush_group()?;
         }
+        self.write_encoded()?;
         let mut blocks = self
             .blocks
             .take()
@@ -553,7 +732,14 @@ mod tests {
     use crate::storage::volume::format::{
         V5_BLOOMS, V5_COLUMNS, V5_DICT, V5_GROUPS, V5_ROW_IDS, V5_STATS, V5_ZONES,
     };
-    use crate::storage::volume::io::{read_volume_from_disk, serialize_v5_opts};
+    use crate::storage::volume::io::{read_volume_from_disk, write_volume_to_disk};
+
+    /// The file the writer makes from `volume`'s rows fed one at a time
+    fn row_by_row(volume: &FrozenVolume, volume_id: u64) -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_volume_to_disk(dir.path(), "t", volume_id, volume).unwrap();
+        std::fs::read(path).unwrap()
+    }
 
     type Layout = (
         Vec<u8>,
@@ -688,7 +874,7 @@ mod tests {
             builder.add_row(i, &row(i));
         }
         let by_rows = builder.finish().unwrap();
-        let (bytes, _) = serialize_v5_opts(&by_rows, true, 7).unwrap();
+        let bytes = row_by_row(&by_rows, 7);
 
         let dir = tempfile::tempdir().unwrap();
         let mut writer =
@@ -776,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn the_file_is_the_one_serialize_v5_writes_for_the_same_rows() {
+    fn typed_batches_write_the_file_rows_fed_one_at_a_time_write() {
         let schema = schema();
         for (rows, batch) in [(500, 64), (500, 500), (3, 1)] {
             let (want, volume, path, _dir) = written(&schema, rows, batch);
@@ -819,7 +1005,7 @@ mod tests {
             );
         }
         let by_rows = builder.finish().unwrap();
-        let (want, _) = serialize_v5_opts(&by_rows, true, 9).unwrap();
+        let want = row_by_row(&by_rows, 9);
 
         let dir = tempfile::tempdir().unwrap();
         let mut writer =
@@ -1132,7 +1318,7 @@ mod tests {
         let (len, capacity, grown) = unique_entries(|_| false, |_| false, vec![1]);
         assert_eq!(len, UNIQUE_ROWS);
         assert_eq!(capacity, UNIQUE_ROWS, "entries hold no growth slack");
-        assert_eq!(grown, [4_096, 8_192, 16_384, 32_768, 65_536, UNIQUE_ROWS]);
+        assert_eq!(grown, [65_536], "the first group's rows, a group at a time");
     }
 
     #[test]
@@ -1146,7 +1332,11 @@ mod tests {
     fn a_mostly_null_unique_index_grows_as_push_would() {
         let (len, capacity, grown) = unique_entries(|row| row % 10_000 != 0, |_| false, vec![1]);
         assert_eq!((len, capacity), (10, 16));
-        assert_eq!(grown, [4, 8, 16], "the first growth takes 4 entries");
+        assert_eq!(
+            grown,
+            [8],
+            "the first group's 7 entries, rounded up as push would"
+        );
     }
 
     #[test]
@@ -1161,6 +1351,6 @@ mod tests {
         let (len, capacity, grown) =
             unique_entries(|_| false, |row| row % 10_000 != 0, vec![0, 1, 2]);
         assert_eq!((len, capacity), (10, 16));
-        assert_eq!(grown, [4, 8, 16]);
+        assert_eq!(grown, [8]);
     }
 }

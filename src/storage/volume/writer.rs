@@ -2186,14 +2186,7 @@ pub struct VolumeBuilder {
     schema: Schema,
     num_cols: usize,
     // Per-column accumulators
-    int_cols: Vec<Vec<i64>>,
-    float_cols: Vec<Vec<f64>>,
-    ts_cols: Vec<Vec<i64>>, // nanos since epoch
-    bool_cols: Vec<Vec<bool>>,
-    dict_cols: Vec<Vec<u32>>,
-    #[allow(clippy::type_complexity)]
-    bytes_cols: Vec<(Vec<u8>, Vec<(u64, u64)>)>, // (data, offsets)
-    null_cols: Vec<Vec<bool>>,
+    acc: Accumulators,
     // Column type mapping
     col_storage: Vec<StorageKind>,
     // Dictionary maps for text columns
@@ -2223,6 +2216,100 @@ pub struct VolumeBuilder {
     /// The first row refused for a value the volume cannot store; the
     /// build fails with it when its groups are flushed or it is finished
     refused: Option<Error>,
+}
+
+/// The accumulated cells of a builder's columns, by storage kind; a
+/// streaming producer swaps a full set for an empty one and encodes it
+/// while the next row group accumulates
+pub(crate) struct Accumulators {
+    kinds: Arc<[StorageKind]>,
+    int_cols: Vec<Vec<i64>>,
+    float_cols: Vec<Vec<f64>>,
+    ts_cols: Vec<Vec<i64>>, // nanos since epoch
+    bool_cols: Vec<Vec<bool>>,
+    dict_cols: Vec<Vec<u32>>,
+    #[allow(clippy::type_complexity)]
+    bytes_cols: Vec<(Vec<u8>, Vec<(u64, u64)>)>, // (data, offsets)
+    null_cols: Vec<Vec<bool>>,
+}
+
+impl Accumulators {
+    /// An empty set of the same columns
+    fn empty_like(&self) -> Self {
+        Self {
+            kinds: Arc::clone(&self.kinds),
+            int_cols: vec![Vec::new(); self.int_cols.len()],
+            float_cols: vec![Vec::new(); self.float_cols.len()],
+            ts_cols: vec![Vec::new(); self.ts_cols.len()],
+            bool_cols: vec![Vec::new(); self.bool_cols.len()],
+            dict_cols: vec![Vec::new(); self.dict_cols.len()],
+            bytes_cols: vec![(Vec::new(), Vec::new()); self.bytes_cols.len()],
+            null_cols: vec![Vec::new(); self.null_cols.len()],
+        }
+    }
+
+    /// Empties every column, capacity kept
+    fn clear(&mut self) {
+        for nulls in &mut self.null_cols {
+            nulls.clear();
+        }
+        for v in &mut self.int_cols {
+            v.clear();
+        }
+        for v in &mut self.float_cols {
+            v.clear();
+        }
+        for v in &mut self.ts_cols {
+            v.clear();
+        }
+        for v in &mut self.bool_cols {
+            v.clear();
+        }
+        for v in &mut self.dict_cols {
+            v.clear();
+        }
+        for (data, offsets) in &mut self.bytes_cols {
+            data.clear();
+            offsets.clear();
+        }
+    }
+
+    /// The number of columns
+    pub(crate) fn columns(&self) -> usize {
+        self.kinds.len()
+    }
+
+    /// One column's cells in storage form
+    pub(crate) fn cells(&self, col_idx: usize) -> TypedCells<'_> {
+        let nulls = &self.null_cols[col_idx];
+        match self.kinds[col_idx] {
+            StorageKind::Int64(idx) => TypedCells::Int64 {
+                values: &self.int_cols[idx],
+                nulls,
+            },
+            StorageKind::Float64(idx) => TypedCells::Float64 {
+                values: &self.float_cols[idx],
+                nulls,
+            },
+            StorageKind::Timestamp(idx) => TypedCells::TimestampNanos {
+                values: &self.ts_cols[idx],
+                nulls,
+            },
+            StorageKind::Boolean(idx) => TypedCells::Boolean {
+                values: &self.bool_cols[idx],
+                nulls,
+            },
+            StorageKind::Dictionary(idx) => TypedCells::Dictionary {
+                ids: &self.dict_cols[idx],
+                nulls,
+            },
+            StorageKind::Bytes(idx, _) => TypedCells::Bytes {
+                data: &self.bytes_cols[idx].0,
+                offsets: &self.bytes_cols[idx].1,
+                nulls,
+            },
+        }
+    }
 }
 
 /// One output column's cells for a batch of rows in the column's storage
@@ -2618,13 +2705,16 @@ impl VolumeBuilder {
         Self {
             schema: schema.clone(),
             num_cols,
-            int_cols,
-            float_cols,
-            ts_cols,
-            bool_cols,
-            dict_cols,
-            bytes_cols,
-            null_cols: vec![Vec::new(); num_cols],
+            acc: Accumulators {
+                kinds: Arc::from(col_storage.as_slice()),
+                int_cols,
+                float_cols,
+                ts_cols,
+                bool_cols,
+                dict_cols,
+                bytes_cols,
+                null_cols: vec![Vec::new(); num_cols],
+            },
             col_storage,
             dict_maps: vec![AHashMap::new(); num_dict_cols],
             dict_tables: vec![Vec::new(); num_dict_cols],
@@ -2655,10 +2745,10 @@ impl VolumeBuilder {
         self.row_ids.reserve_exact(rows);
     }
 
-    /// Feed the bloom filters as cells arrive, from `add_row` and
-    /// `append_typed` alike, instead of building them over the columns at
-    /// the end; a streaming producer, whose columns leave the
-    /// accumulators group by group, needs this
+    /// Feed the bloom filters a row group at a time as each is flushed,
+    /// from `add_row` and `append_typed` alike, instead of building them
+    /// over the columns at the end; a streaming producer, whose columns
+    /// leave the accumulators group by group, needs this
     pub fn feed_bloom_filters(&mut self, expected_rows: usize) {
         self.bloom = Some(
             (0..self.num_cols)
@@ -2685,20 +2775,24 @@ impl VolumeBuilder {
         self.row_count - self.flushed_rows
     }
 
-    /// Hands the accumulated rows to `emit` column by column as typed
-    /// cells, records them as one row group with its zone maps, and
-    /// clears the accumulators, capacity kept. The row ids, dictionaries,
-    /// extents, stats and sortedness stay: they are the volume's
-    pub fn flush_group(
-        &mut self,
-        mut emit: impl FnMut(usize, TypedCells<'_>) -> Result<()>,
-    ) -> Result<()> {
+    /// An empty set of accumulators of this builder's columns, for
+    /// `flush_group_into`
+    pub(crate) fn spare_accumulators(&self) -> Accumulators {
+        self.acc.empty_like()
+    }
+
+    /// Records the accumulated rows as one row group with its zone maps
+    /// and swaps the accumulators with `spare`, emptied first, capacity
+    /// kept: `spare` then holds the group's cells. The row ids,
+    /// dictionaries, extents, stats and sortedness stay: they are the
+    /// volume's. Returns the group's rows, none when nothing accumulated
+    pub(crate) fn flush_group_into(&mut self, spare: &mut Accumulators) -> Result<usize> {
         if let Some(e) = &self.refused {
             return Err(e.clone());
         }
         let rows = self.group_len();
         if rows == 0 {
-            return Ok(());
+            return Ok(0);
         }
         let mut zone_maps = Vec::with_capacity(self.num_cols);
         for col_idx in 0..self.num_cols {
@@ -2712,7 +2806,6 @@ impl VolumeBuilder {
                 _ => DataType::Null,
             };
             zone_maps.push(group_zone_map(&cells, dict, ext_type));
-            emit(col_idx, cells)?;
         }
         self.row_groups.push(super::column::RowGroupMeta {
             start_idx: self.flushed_rows as u32,
@@ -2720,61 +2813,73 @@ impl VolumeBuilder {
             zone_maps,
         });
         self.flushed_rows = self.row_count;
-        for nulls in &mut self.null_cols {
-            nulls.clear();
+        self.feed_group_blooms();
+        spare.clear();
+        std::mem::swap(&mut self.acc, spare);
+        Ok(rows)
+    }
+
+    /// Adds every stored cell of the accumulated group to the fed bloom
+    /// filters, a column at a time
+    fn feed_group_blooms(&mut self) {
+        let Some(blooms) = &mut self.bloom else {
+            return;
+        };
+        for (col_idx, bloom) in blooms.iter_mut().enumerate() {
+            match self.acc.cells(col_idx) {
+                TypedCells::Int64 { values, nulls } => {
+                    for (&v, &null) in values.iter().zip(nulls) {
+                        if !null {
+                            bloom.add_i64(v);
+                        }
+                    }
+                }
+                TypedCells::Float64 { values, nulls } => {
+                    for (&v, &null) in values.iter().zip(nulls) {
+                        if !null {
+                            bloom.add_f64(v);
+                        }
+                    }
+                }
+                TypedCells::TimestampNanos { values, nulls } => {
+                    for (&v, &null) in values.iter().zip(nulls) {
+                        if !null {
+                            bloom.add_timestamp_nanos(v);
+                        }
+                    }
+                }
+                TypedCells::Boolean { values, nulls } => {
+                    for (&v, &null) in values.iter().zip(nulls) {
+                        if !null {
+                            bloom.add_bool(v);
+                        }
+                    }
+                }
+                TypedCells::Dictionary { ids, nulls } => {
+                    let dict = match self.col_storage[col_idx] {
+                        StorageKind::Dictionary(idx) => self.dict_tables[idx].as_slice(),
+                        _ => &[],
+                    };
+                    for (&id, &null) in ids.iter().zip(nulls) {
+                        if let Some(text) = dict.get(id as usize).filter(|_| !null) {
+                            bloom.add_str(text.as_str());
+                        }
+                    }
+                }
+                TypedCells::Bytes { nulls, .. } => {
+                    for &null in nulls {
+                        if !null {
+                            bloom.add_extension_noop();
+                        }
+                    }
+                }
+            }
         }
-        for v in &mut self.int_cols {
-            v.clear();
-        }
-        for v in &mut self.float_cols {
-            v.clear();
-        }
-        for v in &mut self.ts_cols {
-            v.clear();
-        }
-        for v in &mut self.bool_cols {
-            v.clear();
-        }
-        for v in &mut self.dict_cols {
-            v.clear();
-        }
-        for (data, offsets) in &mut self.bytes_cols {
-            data.clear();
-            offsets.clear();
-        }
-        Ok(())
     }
 
     /// The accumulated cells of one column in storage form
-    fn group_cells(&self, col_idx: usize) -> TypedCells<'_> {
-        let nulls = &self.null_cols[col_idx];
-        match self.col_storage[col_idx] {
-            StorageKind::Int64(idx) => TypedCells::Int64 {
-                values: &self.int_cols[idx],
-                nulls,
-            },
-            StorageKind::Float64(idx) => TypedCells::Float64 {
-                values: &self.float_cols[idx],
-                nulls,
-            },
-            StorageKind::Timestamp(idx) => TypedCells::TimestampNanos {
-                values: &self.ts_cols[idx],
-                nulls,
-            },
-            StorageKind::Boolean(idx) => TypedCells::Boolean {
-                values: &self.bool_cols[idx],
-                nulls,
-            },
-            StorageKind::Dictionary(idx) => TypedCells::Dictionary {
-                ids: &self.dict_cols[idx],
-                nulls,
-            },
-            StorageKind::Bytes(idx, _) => TypedCells::Bytes {
-                data: &self.bytes_cols[idx].0,
-                offsets: &self.bytes_cols[idx].1,
-                nulls,
-            },
-        }
+    pub(crate) fn group_cells(&self, col_idx: usize) -> TypedCells<'_> {
+        self.acc.cells(col_idx)
     }
 
     /// The column's storage type tag and extension type tag, as the
@@ -2955,12 +3060,12 @@ impl VolumeBuilder {
         nulls: &[bool],
     ) {
         let target = if timestamps {
-            &mut self.ts_cols[idx]
+            &mut self.acc.ts_cols[idx]
         } else {
-            &mut self.int_cols[idx]
+            &mut self.acc.int_cols[idx]
         };
         let zone = &mut self.zone_maps[col_idx];
-        let null_col = &mut self.null_cols[col_idx];
+        let null_col = &mut self.acc.null_cols[col_idx];
         zone.row_count += values.len() as u32;
         let (mut lo, mut hi, mut sum, mut count) = (i64::MAX, i64::MIN, 0i128, 0u64);
         for (&v, &is_null) in values.iter().zip(nulls) {
@@ -2975,13 +3080,6 @@ impl VolumeBuilder {
             hi = hi.max(v);
             sum += v as i128;
             count += 1;
-            if let Some(bloom) = &mut self.bloom {
-                if timestamps {
-                    bloom[col_idx].add_timestamp_nanos(v);
-                } else {
-                    bloom[col_idx].add_i64(v);
-                }
-            }
             if self.sorted[col_idx] {
                 if let Some(last) = self.last_values[col_idx] {
                     if v < last {
@@ -3011,10 +3109,10 @@ impl VolumeBuilder {
     }
 
     fn append_f64_cells(&mut self, col_idx: usize, idx: usize, values: &[f64], nulls: &[bool]) {
-        let target = &mut self.float_cols[idx];
+        let target = &mut self.acc.float_cols[idx];
         let zone = &mut self.zone_maps[col_idx];
         let stats = &mut self.stats.columns[col_idx];
-        let null_col = &mut self.null_cols[col_idx];
+        let null_col = &mut self.acc.null_cols[col_idx];
         zone.row_count += values.len() as u32;
         let (mut lo, mut hi, mut count) = (f64::INFINITY, f64::NEG_INFINITY, 0u64);
         for (&v, &is_null) in values.iter().zip(nulls) {
@@ -3026,9 +3124,6 @@ impl VolumeBuilder {
                 continue;
             }
             target.push(v);
-            if let Some(bloom) = &mut self.bloom {
-                bloom[col_idx].add_f64(v);
-            }
             // NaN counts for nothing, as in add_row: it neither sums nor
             // bounds the column
             if v.is_nan() {
@@ -3059,9 +3154,9 @@ impl VolumeBuilder {
     }
 
     fn append_bool_cells(&mut self, col_idx: usize, idx: usize, values: &[bool], nulls: &[bool]) {
-        let target = &mut self.bool_cols[idx];
+        let target = &mut self.acc.bool_cols[idx];
         let zone = &mut self.zone_maps[col_idx];
-        let null_col = &mut self.null_cols[col_idx];
+        let null_col = &mut self.acc.null_cols[col_idx];
         zone.row_count += values.len() as u32;
         let (mut any_true, mut any_false, mut count) = (false, false, 0u64);
         for (&v, &is_null) in values.iter().zip(nulls) {
@@ -3075,9 +3170,6 @@ impl VolumeBuilder {
             any_true |= v;
             any_false |= !v;
             count += 1;
-            if let Some(bloom) = &mut self.bloom {
-                bloom[col_idx].add_bool(v);
-            }
             target.push(v);
         }
         if count == 0 {
@@ -3099,9 +3191,9 @@ impl VolumeBuilder {
     }
 
     fn append_dict_cells(&mut self, col_idx: usize, idx: usize, ids: &[u32], nulls: &[bool]) {
-        let target = &mut self.dict_cols[idx];
+        let target = &mut self.acc.dict_cols[idx];
         let zone = &mut self.zone_maps[col_idx];
-        let null_col = &mut self.null_cols[col_idx];
+        let null_col = &mut self.acc.null_cols[col_idx];
         zone.row_count += ids.len() as u32;
         let mut count = 0u64;
         for (&id, &is_null) in ids.iter().zip(nulls) {
@@ -3113,11 +3205,6 @@ impl VolumeBuilder {
                 continue;
             }
             count += 1;
-            if let Some(bloom) = &mut self.bloom {
-                if let Some(text) = self.dict_tables[idx].get(id as usize) {
-                    bloom[col_idx].add_str(text.as_str());
-                }
-            }
             target.push(id);
         }
         // The extents moved when the ids were interned
@@ -3133,10 +3220,10 @@ impl VolumeBuilder {
         offsets: &[(u64, u64)],
         nulls: &[bool],
     ) {
-        let (target_data, target_offsets) = &mut self.bytes_cols[idx];
+        let (target_data, target_offsets) = &mut self.acc.bytes_cols[idx];
         let zone = &mut self.zone_maps[col_idx];
         let stats = &mut self.stats.columns[col_idx];
-        let null_col = &mut self.null_cols[col_idx];
+        let null_col = &mut self.acc.null_cols[col_idx];
         zone.row_count += offsets.len() as u32;
         for (&(offset, length), &is_null) in offsets.iter().zip(nulls) {
             null_col.push(is_null);
@@ -3150,9 +3237,6 @@ impl VolumeBuilder {
             target_offsets.push((target_data.len() as u64, length));
             target_data.extend_from_slice(payload);
             stats.non_null_count += 1;
-            if let Some(bloom) = &mut self.bloom {
-                bloom[col_idx].add_extension_noop();
-            }
             // Extension values compare equal or not at all, so the first
             // non-null value is the column's minimum and maximum for good
             if zone.min.is_null() || stats.min.is_null() {
@@ -3176,22 +3260,22 @@ impl VolumeBuilder {
     pub fn with_capacity(schema: &Schema, capacity: usize) -> Self {
         let mut builder = Self::new(schema);
         builder.row_ids.reserve(capacity);
-        for nulls in &mut builder.null_cols {
+        for nulls in &mut builder.acc.null_cols {
             nulls.reserve(capacity);
         }
-        for v in &mut builder.int_cols {
+        for v in &mut builder.acc.int_cols {
             v.reserve(capacity);
         }
-        for v in &mut builder.float_cols {
+        for v in &mut builder.acc.float_cols {
             v.reserve(capacity);
         }
-        for v in &mut builder.ts_cols {
+        for v in &mut builder.acc.ts_cols {
             v.reserve(capacity);
         }
-        for v in &mut builder.bool_cols {
+        for v in &mut builder.acc.bool_cols {
             v.reserve(capacity);
         }
-        for v in &mut builder.dict_cols {
+        for v in &mut builder.acc.dict_cols {
             v.reserve(capacity);
         }
         builder
@@ -3234,7 +3318,7 @@ impl VolumeBuilder {
 
             self.zone_maps[col_idx].row_count += 1;
             let is_null = value.is_null();
-            self.null_cols[col_idx].push(is_null);
+            self.acc.null_cols[col_idx].push(is_null);
 
             if is_null {
                 self.zone_maps[col_idx].null_count += 1;
@@ -3243,13 +3327,13 @@ impl VolumeBuilder {
                 self.sorted[col_idx] = false;
                 // Push placeholder for null
                 match self.col_storage[col_idx] {
-                    StorageKind::Int64(idx) => self.int_cols[idx].push(0),
-                    StorageKind::Float64(idx) => self.float_cols[idx].push(0.0),
-                    StorageKind::Timestamp(idx) => self.ts_cols[idx].push(0),
-                    StorageKind::Boolean(idx) => self.bool_cols[idx].push(false),
-                    StorageKind::Dictionary(idx) => self.dict_cols[idx].push(0),
+                    StorageKind::Int64(idx) => self.acc.int_cols[idx].push(0),
+                    StorageKind::Float64(idx) => self.acc.float_cols[idx].push(0.0),
+                    StorageKind::Timestamp(idx) => self.acc.ts_cols[idx].push(0),
+                    StorageKind::Boolean(idx) => self.acc.bool_cols[idx].push(false),
+                    StorageKind::Dictionary(idx) => self.acc.dict_cols[idx].push(0),
                     StorageKind::Bytes(idx, _) => {
-                        self.bytes_cols[idx].1.push((0, 0));
+                        self.acc.bytes_cols[idx].1.push((0, 0));
                     }
                 }
                 continue;
@@ -3294,20 +3378,14 @@ impl VolumeBuilder {
                         }
                         self.last_values[col_idx] = Some(v);
                     }
-                    if let Some(bloom) = &mut self.bloom {
-                        bloom[col_idx].add_i64(v);
-                    }
-                    self.int_cols[idx].push(v);
+                    self.acc.int_cols[idx].push(v);
                 }
                 StorageKind::Float64(idx) => {
                     let v = match value {
                         Value::Float(f) => *f,
                         _ => 0.0,
                     };
-                    if let Some(bloom) = &mut self.bloom {
-                        bloom[col_idx].add_f64(v);
-                    }
-                    self.float_cols[idx].push(v);
+                    self.acc.float_cols[idx].push(v);
                 }
                 StorageKind::Timestamp(idx) => {
                     // The row was checked on entry, so every TIMESTAMP fits
@@ -3323,20 +3401,14 @@ impl VolumeBuilder {
                         }
                         self.last_values[col_idx] = Some(nanos);
                     }
-                    if let Some(bloom) = &mut self.bloom {
-                        bloom[col_idx].add_timestamp_nanos(nanos);
-                    }
-                    self.ts_cols[idx].push(nanos);
+                    self.acc.ts_cols[idx].push(nanos);
                 }
                 StorageKind::Boolean(idx) => {
                     let v = match value {
                         Value::Boolean(b) => *b,
                         _ => false,
                     };
-                    if let Some(bloom) = &mut self.bloom {
-                        bloom[col_idx].add_bool(v);
-                    }
-                    self.bool_cols[idx].push(v);
+                    self.acc.bool_cols[idx].push(v);
                 }
                 StorageKind::Dictionary(idx) => {
                     let s = match value {
@@ -3351,10 +3423,7 @@ impl VolumeBuilder {
                         self.dict_maps[idx].insert(s, id);
                         id
                     };
-                    if let Some(bloom) = &mut self.bloom {
-                        bloom[col_idx].add_str(self.dict_tables[idx][dict_id as usize].as_str());
-                    }
-                    self.dict_cols[idx].push(dict_id);
+                    self.acc.dict_cols[idx].push(dict_id);
                 }
                 StorageKind::Bytes(idx, _) => {
                     let bytes = match value {
@@ -3363,13 +3432,10 @@ impl VolumeBuilder {
                         }
                         _ => &[],
                     };
-                    let offset = self.bytes_cols[idx].0.len() as u64;
+                    let offset = self.acc.bytes_cols[idx].0.len() as u64;
                     let length = bytes.len() as u64;
-                    self.bytes_cols[idx].0.extend_from_slice(bytes);
-                    if let Some(bloom) = &mut self.bloom {
-                        bloom[col_idx].add_extension_noop();
-                    }
-                    self.bytes_cols[idx].1.push((offset, length));
+                    self.acc.bytes_cols[idx].0.extend_from_slice(bytes);
+                    self.acc.bytes_cols[idx].1.push((offset, length));
                 }
             }
         }
@@ -3411,37 +3477,38 @@ impl VolumeBuilder {
                 "a builder whose groups were flushed does not finish in memory",
             ));
         }
+        self.feed_group_blooms();
         let mut columns = Vec::with_capacity(self.num_cols);
         let mut sorted_columns = Vec::with_capacity(self.num_cols);
 
         for col_idx in 0..self.num_cols {
-            let nulls = std::mem::take(&mut self.null_cols[col_idx]);
+            let nulls = std::mem::take(&mut self.acc.null_cols[col_idx]);
             sorted_columns.push(self.sorted[col_idx]);
 
             let col_data = match self.col_storage[col_idx] {
                 StorageKind::Int64(idx) => ColumnData::Int64 {
-                    values: std::mem::take(&mut self.int_cols[idx]),
+                    values: std::mem::take(&mut self.acc.int_cols[idx]),
                     nulls,
                 },
                 StorageKind::Float64(idx) => ColumnData::Float64 {
-                    values: std::mem::take(&mut self.float_cols[idx]),
+                    values: std::mem::take(&mut self.acc.float_cols[idx]),
                     nulls,
                 },
                 StorageKind::Timestamp(idx) => ColumnData::TimestampNanos {
-                    values: std::mem::take(&mut self.ts_cols[idx]),
+                    values: std::mem::take(&mut self.acc.ts_cols[idx]),
                     nulls,
                 },
                 StorageKind::Boolean(idx) => ColumnData::Boolean {
-                    values: std::mem::take(&mut self.bool_cols[idx]),
+                    values: std::mem::take(&mut self.acc.bool_cols[idx]),
                     nulls,
                 },
                 StorageKind::Dictionary(idx) => ColumnData::Dictionary {
-                    ids: std::mem::take(&mut self.dict_cols[idx]),
+                    ids: std::mem::take(&mut self.acc.dict_cols[idx]),
                     dictionary: Arc::from(std::mem::take(&mut self.dict_tables[idx])),
                     nulls,
                 },
                 StorageKind::Bytes(idx, ext_type) => {
-                    let (data, offsets) = std::mem::take(&mut self.bytes_cols[idx]);
+                    let (data, offsets) = std::mem::take(&mut self.acc.bytes_cols[idx]);
                     ColumnData::Bytes {
                         data,
                         offsets,
@@ -4304,9 +4371,8 @@ impl FrozenVolume {
         Ok(group.get_value(row_idx & ((1 << shift) - 1)))
     }
 
-    /// Pre-build the unique sorted index for a set of column indices.
-    /// Called during seal/compaction so the first INSERT after seal doesn't
-    /// pay a ~60ms stall scanning all rows to build the index.
+    /// Pre-build the unique sorted index for a set of column indices, so
+    /// the first lookup does not build it
     pub fn prebuild_unique_index(&self, col_indices: &[usize]) -> std::io::Result<()> {
         self.unique_index(col_indices).map(|_| ())
     }

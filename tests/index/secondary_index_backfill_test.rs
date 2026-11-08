@@ -295,8 +295,9 @@ fn a_build_is_sized_to_half_the_budget_and_refused_only_below_its_least() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path(), "");
     create(&db);
-    // A single volume of 100,000 rows: its workspace at the engine's share
-    // is above half a megabyte, its least is not
+    // A single volume of 100,000 rows, read from its file: a group's decode
+    // and its least workspace fit under half of 5 MB, its workspace at the
+    // engine's share does not
     for chunk_start in (1..=100_000i64).step_by(2000) {
         let values = (chunk_start..chunk_start + 2000)
             .map(|id| format!("({id},{},{})", (id * 7919) % 100_000, id))
@@ -315,7 +316,7 @@ fn a_build_is_sized_to_half_the_budget_and_refused_only_below_its_least() {
         "{pass:?}"
     );
     assert!(files(dir.path(), "t", "sidx").is_empty());
-    db.execute("PRAGMA INDEX_BUILD_MB = 1", ()).unwrap();
+    db.execute("PRAGMA INDEX_BUILD_MB = 5", ()).unwrap();
     let pass = backfill(&db, None);
     db.execute("PRAGMA INDEX_BUILD_MB = 64", ()).unwrap();
     assert_eq!((pass["examined"], pass["built"]), (1, 1), "{pass:?}");
