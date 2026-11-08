@@ -266,6 +266,8 @@ pub struct Transfer<'a> {
     /// By input: the physical columns some plan entry reads
     needed: Vec<Vec<bool>>,
     handles: Vec<Handle<'a>>,
+    /// By input: its file reads, for the OS to read ahead of its groups
+    reads: Vec<super::writer::ScanReads>,
     handle_of: FxHashMap<(u32, u32), usize>,
     /// By (input, group): the position of its last reference, after
     /// which its handle is let go
@@ -360,6 +362,7 @@ impl<'a> Transfer<'a> {
             plans,
             needed,
             handles: Vec::new(),
+            reads: inputs.iter().map(|_| Default::default()).collect(),
             handle_of: FxHashMap::default(),
             last_use,
             position: 0,
@@ -558,7 +561,7 @@ impl<'a> Transfer<'a> {
         Ok(())
     }
 
-    fn open_handle(&self, input: usize, group: usize) -> Result<Handle<'a>> {
+    fn open_handle(&mut self, input: usize, group: usize) -> Result<Handle<'a>> {
         let volume = &self.inputs[input].1;
         let mut columns = Vec::with_capacity(self.needed[input].len());
         let mut held_bytes = 0;
@@ -575,7 +578,7 @@ impl<'a> Transfer<'a> {
                 .columns
                 .compressed_store()
                 .ok_or_else(|| Error::internal("compaction input has no column data to read"))?;
-            let column = store.group_column(physical, group)?;
+            let column = store.group_column_in(physical, group, &mut self.reads[input])?;
             held_bytes += column.cache_size();
             columns.push(Some(Cell::Group(column, group * volume.meta.group_rows)));
         }

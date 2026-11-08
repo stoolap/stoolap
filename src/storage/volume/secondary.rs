@@ -4467,6 +4467,7 @@ fn volume_pairs<'a>(
                 current: None,
                 next: 0,
                 failure,
+                reads: Default::default(),
             }),
         },
     };
@@ -4483,6 +4484,7 @@ struct GroupPairs<'a> {
     current: Option<(usize, Arc<super::column::ColumnData>)>,
     next: usize,
     failure: &'a std::cell::Cell<Option<std::io::Error>>,
+    reads: super::writer::ScanReads,
 }
 
 impl Iterator for GroupPairs<'_> {
@@ -4495,7 +4497,10 @@ impl Iterator for GroupPairs<'_> {
                 // The group done with goes before the next is decoded, so
                 // one group's decode is what the input holds at most
                 self.current = None;
-                match self.store.group_column(self.column, group) {
+                match self
+                    .store
+                    .group_column_in(self.column, group, &mut self.reads)
+                {
                     Ok(decoded) => self.current = Some((group, decoded)),
                     Err(error) => {
                         self.failure.set(Some(error));
@@ -4620,6 +4625,7 @@ struct VolumeKeys<'a> {
     rows: usize,
     next: usize,
     failure: &'a std::cell::Cell<Option<std::io::Error>>,
+    reads: super::writer::ScanReads,
 }
 
 impl VolumeKeys<'_> {
@@ -4650,7 +4656,7 @@ impl KeySource for VolumeKeys<'_> {
                     if self.groups[c].as_ref().is_none_or(|(g, _)| *g != group) {
                         // The group done with goes before the next is decoded
                         self.groups[c] = None;
-                        match store.group_column(column, group) {
+                        match store.group_column_in(column, group, &mut self.reads) {
                             Ok(decoded) => self.groups[c] = Some((group, decoded)),
                             Err(error) => return self.fail(error),
                         }
@@ -4911,6 +4917,7 @@ pub fn stage_side_for(
                 rows: volume.meta.row_count,
                 next: 0,
                 failure: &failure,
+                reads: Default::default(),
             }),
         })
         .collect();
@@ -5262,6 +5269,7 @@ mod tests {
                 rows: volume.meta.row_count,
                 next: 0,
                 failure: &failure,
+                reads: Default::default(),
             };
             let mut out = Vec::with_capacity(KEY_BUFFER_BYTES);
             let mut reads = Vec::new();

@@ -366,8 +366,6 @@ enum BlockSource {
         /// A V5 file's block CRCs by column and group, checked on every
         /// read from the file; a V4 file was checked whole at open
         crcs: Option<Vec<Vec<u32>>>,
-        /// By column, the reads advised ahead of a scan
-        ahead: Box<[ReadAhead]>,
     },
 }
 
@@ -377,53 +375,83 @@ const READ_AHEAD_BLOCKS: usize = 64;
 /// The bytes a scan of one column is advised ahead by at most
 const READ_AHEAD_BYTES: usize = 16 << 20;
 
-/// One column's file reads: the group read last, plus one, the bound
-/// below which the groups after it were advised to the OS, and the reads
-/// in a row that followed their last
+/// The read-ahead of one reader over a store's columns: a scan, a merge or
+/// a build carries one across the groups it reads in order, and a point
+/// read carries none, so nothing it reads is advised
+#[derive(Default)]
+pub struct ScanReads {
+    columns: smallvec::SmallVec<[(usize, ReadAhead); 4]>,
+}
+
+impl ScanReads {
+    fn column(&mut self, col_idx: usize) -> &mut ReadAhead {
+        let at = match self.columns.iter().position(|(col, _)| *col == col_idx) {
+            Some(at) => at,
+            None => {
+                self.columns.push((col_idx, ReadAhead::default()));
+                self.columns.len() - 1
+            }
+        };
+        &mut self.columns[at].1
+    }
+}
+
+/// One reader's file reads of one column: the group read last, plus one,
+/// the bound below which the groups after it were advised to the OS, and
+/// the reads in a row that followed their last
 #[derive(Default)]
 struct ReadAhead {
-    next: std::sync::atomic::AtomicUsize,
-    advised: std::sync::atomic::AtomicUsize,
-    run: std::sync::atomic::AtomicUsize,
+    next: usize,
+    advised: usize,
+    run: usize,
 }
 
 impl ReadAhead {
-    /// Advises the OS of the blocks after `group` when the column is read
-    /// group after group, so a cold scan waits on its reads together; the
-    /// window starts at 4 blocks and 1 MiB and doubles with the run. A read
-    /// that does not follow the last advises nothing: a point read or a
-    /// pruned scan reads only its blocks
-    fn read(&self, file: &std::fs::File, offsets: &[u64], lens: &[usize], group: usize) {
-        use std::sync::atomic::Ordering::Relaxed;
+    /// Advises the OS of the blocks after `group` when the reader reads the
+    /// column group after group, so a cold scan waits on its reads together;
+    /// the window starts at 4 blocks and 1 MiB and doubles with the run, a
+    /// block past the bytes left advised only in part. A read that does not
+    /// follow the last advises nothing: a pruned scan reads only its blocks
+    fn read(&mut self, file: &std::fs::File, offsets: &[u64], lens: &[usize], group: usize) {
         let first = group + 1;
-        if self.next.swap(first, Relaxed) != group || group == 0 {
-            self.advised.store(first, Relaxed);
-            self.run.store(0, Relaxed);
+        let follows = self.next == group && group > 0;
+        self.next = first;
+        if !follows {
+            (self.advised, self.run) = (first, 0);
             return;
         }
-        let run = self.run.fetch_add(1, Relaxed).min(4);
+        let run = self.run.min(4);
+        self.run += 1;
         let (max_blocks, max_bytes) = (
             (4 << run).min(READ_AHEAD_BLOCKS),
             ((1 << 20) << run).min(READ_AHEAD_BYTES),
         );
-        let advised = self.advised.load(Relaxed).clamp(first, lens.len());
+        let advised = self.advised.clamp(first, lens.len());
         let ahead: usize = lens[first..advised].iter().sum();
         if advised - first >= max_blocks / 2 || ahead >= max_bytes / 2 {
             return;
         }
         let (mut end, mut bytes) = (advised, ahead);
         while end < lens.len() && end - first < max_blocks && bytes < max_bytes {
-            advise_read(file, offsets[end], lens[end]);
+            advise_read(file, offsets[end], lens[end].min(max_bytes - bytes));
             bytes += lens[end];
             end += 1;
         }
-        self.advised.store(end, Relaxed);
+        self.advised = end;
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The (offset, length) of every read this thread advised
+    static ADVISED: std::cell::RefCell<Vec<(u64, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Asks the OS to start reading `len` bytes at `offset`; a hint, so a
 /// refusal is ignored, and a platform without one does nothing
 fn advise_read(file: &std::fs::File, offset: u64, len: usize) {
+    #[cfg(test)]
+    ADVISED.with(|advised| advised.borrow_mut().push((offset, len)));
     #[cfg(target_os = "macos")]
     {
         use std::os::unix::io::AsRawFd;
@@ -643,6 +671,27 @@ impl CompressedBlockStore {
         col_idx: usize,
         group_idx: usize,
     ) -> std::io::Result<Arc<ColumnData>> {
+        self.cached_group_column(col_idx, group_idx, None)
+    }
+
+    /// `group_column` for a reader that goes through the groups in order:
+    /// a file read that follows its last one of the column advises the OS
+    /// of the reads ahead
+    pub fn group_column_in(
+        &self,
+        col_idx: usize,
+        group_idx: usize,
+        reads: &mut ScanReads,
+    ) -> std::io::Result<Arc<ColumnData>> {
+        self.cached_group_column(col_idx, group_idx, Some(reads.column(col_idx)))
+    }
+
+    fn cached_group_column(
+        &self,
+        col_idx: usize,
+        group_idx: usize,
+        ahead: Option<&mut ReadAhead>,
+    ) -> std::io::Result<Arc<ColumnData>> {
         let key_col = u32::try_from(col_idx).map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -658,7 +707,7 @@ impl CompressedBlockStore {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::group_column_decoded(col_idx, group_idx);
-            self.decompress_single_group(col_idx, group_idx)
+            self.decompress_group_in(col_idx, group_idx, ahead)
         })
     }
 
@@ -863,7 +912,6 @@ impl CompressedBlockStore {
         Self {
             source: BlockSource::File {
                 file,
-                ahead: offsets.iter().map(|_| ReadAhead::default()).collect(),
                 offsets,
                 lens: compressed_lens,
                 crcs: None,
@@ -929,12 +977,14 @@ impl CompressedBlockStore {
     }
 
     /// The compressed block of (column, group): a slice of the store's
-    /// memory, or read from the file into `scratch`
+    /// memory, or read from the file into `scratch`, the reads after it
+    /// advised when `ahead` follows a run
     fn block<'s>(
         &'s self,
         col_idx: usize,
         group_idx: usize,
         scratch: &'s mut Vec<u8>,
+        ahead: Option<&mut ReadAhead>,
     ) -> std::io::Result<&'s [u8]> {
         let missing =
             || std::io::Error::new(std::io::ErrorKind::InvalidInput, "group index out of range");
@@ -949,7 +999,6 @@ impl CompressedBlockStore {
                 offsets,
                 lens,
                 crcs,
-                ahead,
             } => {
                 let offset = *offsets
                     .get(col_idx)
@@ -968,7 +1017,7 @@ impl CompressedBlockStore {
                 crate::test_failpoints::block_file_read();
                 let reader = file.block_reader()?;
                 if let (Some(ahead), Some(offsets), Some(lens)) =
-                    (ahead.get(col_idx), offsets.get(col_idx), lens.get(col_idx))
+                    (ahead, offsets.get(col_idx), lens.get(col_idx))
                 {
                     ahead.read(&reader, offsets, lens, group_idx);
                 }
@@ -1026,9 +1075,11 @@ impl CompressedBlockStore {
         };
 
         if num_groups == 1 {
-            let block = self.block(col_idx, 0, &mut block_buf)?;
+            let block = self.block(col_idx, 0, &mut block_buf, None)?;
             return self.decompress_block(col_idx, 0, block, type_tag, num_groups, dict, ext_type);
         }
+        // Every group in order: the reads ahead are advised
+        let mut ahead = ReadAhead::default();
 
         // Validate all group lengths before reserving the full-column buffers.
         let mut max_decomp = 0;
@@ -1045,7 +1096,7 @@ impl CompressedBlockStore {
                 let mut all_values = Vec::with_capacity(self.row_count);
                 let mut all_nulls = Vec::with_capacity(self.row_count);
                 for gi in 0..num_groups {
-                    let block = self.block(col_idx, gi, &mut block_buf)?;
+                    let block = self.block(col_idx, gi, &mut block_buf, Some(&mut ahead))?;
                     self.decompress_block_into(
                         col_idx,
                         gi,
@@ -1071,7 +1122,7 @@ impl CompressedBlockStore {
                 let mut all_values = Vec::with_capacity(self.row_count);
                 let mut all_nulls = Vec::with_capacity(self.row_count);
                 for gi in 0..num_groups {
-                    let block = self.block(col_idx, gi, &mut block_buf)?;
+                    let block = self.block(col_idx, gi, &mut block_buf, Some(&mut ahead))?;
                     self.decompress_block_into(
                         col_idx,
                         gi,
@@ -1097,7 +1148,7 @@ impl CompressedBlockStore {
                 let mut all_values = Vec::with_capacity(self.row_count);
                 let mut all_nulls = Vec::with_capacity(self.row_count);
                 for gi in 0..num_groups {
-                    let block = self.block(col_idx, gi, &mut block_buf)?;
+                    let block = self.block(col_idx, gi, &mut block_buf, Some(&mut ahead))?;
                     self.decompress_block_into(
                         col_idx,
                         gi,
@@ -1123,7 +1174,7 @@ impl CompressedBlockStore {
                 let mut all_values = Vec::with_capacity(self.row_count);
                 let mut all_nulls = Vec::with_capacity(self.row_count);
                 for gi in 0..num_groups {
-                    let block = self.block(col_idx, gi, &mut block_buf)?;
+                    let block = self.block(col_idx, gi, &mut block_buf, Some(&mut ahead))?;
                     self.decompress_block_into(
                         col_idx,
                         gi,
@@ -1149,7 +1200,7 @@ impl CompressedBlockStore {
                 let mut all_ids = Vec::with_capacity(self.row_count);
                 let mut all_nulls = Vec::with_capacity(self.row_count);
                 for gi in 0..num_groups {
-                    let block = self.block(col_idx, gi, &mut block_buf)?;
+                    let block = self.block(col_idx, gi, &mut block_buf, Some(&mut ahead))?;
                     self.decompress_block_into(
                         col_idx,
                         gi,
@@ -1196,7 +1247,7 @@ impl CompressedBlockStore {
                 let mut all_offsets = Vec::with_capacity(self.row_count);
                 let mut all_nulls = Vec::with_capacity(self.row_count);
                 for gi in 0..num_groups {
-                    let block = self.block(col_idx, gi, &mut block_buf)?;
+                    let block = self.block(col_idx, gi, &mut block_buf, Some(&mut ahead))?;
                     self.decompress_block_into(
                         col_idx,
                         gi,
@@ -1407,9 +1458,19 @@ impl CompressedBlockStore {
         col_idx: usize,
         group_idx: usize,
     ) -> std::io::Result<ColumnData> {
+        self.decompress_group_in(col_idx, group_idx, None)
+    }
+
+    /// `decompress_single_group`, its file read part of `ahead`'s run
+    fn decompress_group_in(
+        &self,
+        col_idx: usize,
+        group_idx: usize,
+        ahead: Option<&mut ReadAhead>,
+    ) -> std::io::Result<ColumnData> {
         let num_groups = self.column_groups(col_idx)?;
         let mut block_buf = Vec::new();
-        let block = self.block(col_idx, group_idx, &mut block_buf)?;
+        let block = self.block(col_idx, group_idx, &mut block_buf, ahead)?;
         let type_tag = *self.col_type_tags.get(col_idx).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "missing column type tag")
         })?;
@@ -4403,8 +4464,9 @@ impl FrozenVolume {
         })?;
         let groups = store.num_groups(col_idx);
         let shift = self.meta.group_shift();
+        let mut reads = ScanReads::default();
         for group in from >> shift..groups {
-            let column = store.group_column(col_idx, group)?;
+            let column = store.group_column_in(col_idx, group, &mut reads)?;
             if !f(group << shift, &column)? {
                 return Ok(());
             }
@@ -5247,31 +5309,41 @@ mod tests {
         );
     }
 
-    /// The groups advised past `group`, the last one read, after reading
-    /// `reads` of a column of `groups` blocks of `len` bytes each
-    fn advised_ahead(reads: &[usize], groups: usize, len: usize) -> usize {
+    /// The (offset, length) of the reads this thread advised in `f`
+    fn advised_in(f: impl FnOnce()) -> Vec<(u64, usize)> {
+        ADVISED.with(|advised| advised.borrow_mut().clear());
+        f();
+        ADVISED.with(|advised| std::mem::take(&mut *advised.borrow_mut()))
+    }
+
+    /// The groups advised past the last one read, and the reads advised,
+    /// after one reader reads `reads` of a column of `groups` blocks of
+    /// `len` bytes each
+    fn advised_ahead(reads: &[usize], groups: usize, len: usize) -> (usize, Vec<(u64, usize)>) {
         let file = tempfile::tempfile().unwrap();
         let lens = vec![len; groups];
         let offsets: Vec<u64> = (0..groups as u64).map(|g| g * len as u64).collect();
-        let ahead = ReadAhead::default();
-        for &group in reads {
-            ahead.read(&file, &offsets, &lens, group);
-        }
+        let mut ahead = ReadAhead::default();
+        let advised = advised_in(|| {
+            for &group in reads {
+                ahead.read(&file, &offsets, &lens, group);
+            }
+        });
         let last = *reads.last().unwrap();
-        ahead.advised.load(std::sync::atomic::Ordering::Relaxed) - (last + 1)
+        (ahead.advised - (last + 1), advised)
     }
 
     #[test]
     fn a_read_that_does_not_follow_the_last_advises_nothing() {
-        assert_eq!(advised_ahead(&[7], 500, 100), 0, "a point read");
+        for (reads, what) in [
+            (&[7][..], "a point read"),
+            (&[0, 2, 4, 6, 8], "a pruned scan"),
+            (&[3, 2], "a backward read"),
+        ] {
+            assert_eq!(advised_ahead(reads, 500, 100), (0, Vec::new()), "{what}");
+        }
         assert_eq!(
-            advised_ahead(&[0, 2, 4, 6, 8], 500, 100),
-            0,
-            "a pruned scan"
-        );
-        assert_eq!(advised_ahead(&[3, 2], 500, 100), 0, "a backward read");
-        assert_eq!(
-            advised_ahead(&[0, 1, 2, 9], 500, 100),
+            advised_ahead(&[0, 1, 2, 9], 500, 100).0,
             0,
             "a jump ends the run"
         );
@@ -5281,25 +5353,89 @@ mod tests {
     fn a_scan_is_advised_ahead_by_a_window_that_doubles_to_its_cap() {
         // Small blocks: 4 on the first read that follows, then the window
         // doubles; it is topped up once half of it has been read
-        assert_eq!(advised_ahead(&[0, 1], 500, 100), 4);
-        assert_eq!(advised_ahead(&[0, 1, 2], 500, 100), 8);
+        assert_eq!(advised_ahead(&[0, 1], 500, 100).0, 4);
+        assert_eq!(advised_ahead(&[0, 1, 2], 500, 100).0, 8);
         let scan: Vec<usize> = (0..200).collect();
-        let ahead = advised_ahead(&scan, 500, 100);
+        let (ahead, advised) = advised_ahead(&scan, 500, 100);
         assert!(
             (READ_AHEAD_BLOCKS / 2..=READ_AHEAD_BLOCKS).contains(&ahead),
             "{ahead}"
         );
+        // Each block advised once, in order, every one of them past the read
+        let offsets: Vec<u64> = advised.iter().map(|&(offset, _)| offset).collect();
+        assert!(offsets.windows(2).all(|w| w[0] < w[1]), "{offsets:?}");
         // Nothing past the column's last block
-        assert_eq!(advised_ahead(&scan, 210, 100), 10);
+        let (ahead, advised) = advised_ahead(&scan, 210, 100);
+        assert_eq!(ahead, 10);
+        assert_eq!(advised.last().map(|&(offset, _)| offset), Some(209 * 100));
     }
 
     #[test]
-    fn large_blocks_are_advised_ahead_by_their_bytes() {
-        // 8 MiB blocks: one past the 1 MiB of the first window, at most two
-        // past the 16 MiB cap later
-        assert_eq!(advised_ahead(&[0, 1], 500, 8 << 20), 1);
+    fn a_block_past_the_window_bytes_is_advised_in_part() {
+        // 64 MiB blocks: the first window advises 1 MiB of the next block,
+        // and no later read advises more than the 16 MiB cap
+        let (_, first) = advised_ahead(&[0, 1], 500, 64 << 20);
+        assert_eq!(first, vec![(2 * (64 << 20), 1 << 20)]);
         let scan: Vec<usize> = (0..50).collect();
-        let ahead = advised_ahead(&scan, 500, 8 << 20);
-        assert!((1..=2).contains(&ahead), "{ahead}");
+        let (_, advised) = advised_ahead(&scan, 500, 64 << 20);
+        assert!(!advised.is_empty());
+        assert!(
+            advised.iter().all(|&(_, len)| len <= READ_AHEAD_BYTES),
+            "{advised:?}"
+        );
+    }
+
+    /// A volume file of `groups` groups of a narrow column, read back
+    fn file_volume(groups: usize) -> (FrozenVolume, tempfile::TempDir) {
+        let schema = crate::core::SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .build();
+        let mut builder = VolumeBuilder::new(&schema);
+        for i in 0..(groups * ROW_GROUP_SIZE) as i64 {
+            builder.add_row(i, &Row::from_values(vec![Value::Integer(i)]));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            super::super::io::write_volume_to_disk(dir.path(), "t", 1, &builder.finish().unwrap())
+                .unwrap();
+        (super::super::io::read_volume_from_disk(&path).unwrap(), dir)
+    }
+
+    #[test]
+    fn point_reads_of_consecutive_groups_advise_nothing() {
+        let _budget = crate::storage::volume::group_cache::test_budget::hold(0);
+        let (volume, _dir) = file_volume(4);
+        let store = volume.columns.compressed_store().unwrap();
+        // Two point reads that happen to fall on groups 0 and 1, then a
+        // scan's reader over the same store, read between them
+        let advised = advised_in(|| {
+            store.group_column(0, 0).unwrap();
+            store.group_column(0, 1).unwrap();
+            store.group_column(0, 2).unwrap();
+        });
+        assert_eq!(advised, Vec::new());
+        let mut scan = ScanReads::default();
+        let advised = advised_in(|| {
+            store.group_column_in(0, 0, &mut scan).unwrap();
+            store.group_column(0, 3).unwrap();
+            store.group_column_in(0, 1, &mut scan).unwrap();
+        });
+        assert_eq!(advised.len(), 2, "groups 2 and 3, after the scan's 0 and 1");
+    }
+
+    #[test]
+    fn readers_of_one_store_keep_their_own_runs() {
+        let file = tempfile::tempfile().unwrap();
+        let lens = vec![100; 500];
+        let offsets: Vec<u64> = (0..500u64).map(|g| g * 100).collect();
+        let (mut a, mut b) = (ReadAhead::default(), ReadAhead::default());
+        let advised = advised_in(|| {
+            a.read(&file, &offsets, &lens, 0);
+            b.read(&file, &offsets, &lens, 400);
+            a.read(&file, &offsets, &lens, 1);
+        });
+        // A's run goes on as if B had not read: 4 blocks after group 1
+        let want: Vec<(u64, usize)> = (2..6u64).map(|g| (g * 100, 100)).collect();
+        assert_eq!(advised, want);
     }
 }
