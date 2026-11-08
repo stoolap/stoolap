@@ -345,7 +345,7 @@ impl VolumeFileWriter {
             if start == 0 && end == row_ids.len() {
                 builder.append_typed(row_ids, columns)?;
             } else {
-                let part: Vec<TypedCells<'_>> = columns
+                let part: smallvec::SmallVec<[TypedCells<'_>; 16]> = columns
                     .iter()
                     .map(|cells| cells.slice(start..end))
                     .collect();
