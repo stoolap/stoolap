@@ -499,3 +499,119 @@ fn test_intact_volumes_answer_every_row() {
         assert_eq!(rows, ROWS, "{table}");
     }
 }
+
+/// PRAGMA VERIFY's rows: (table, status, blocks, detail)
+fn verify(db: &Database) -> Vec<(String, String, i64, Option<String>)> {
+    db.query("PRAGMA VERIFY", ())
+        .unwrap()
+        .map(|row| {
+            let row = row.unwrap();
+            (
+                row.get::<String>(0).unwrap(),
+                row.get::<String>(2).unwrap(),
+                row.get::<i64>(3).unwrap(),
+                row.get::<Option<String>>(4).unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// The status and detail VERIFY gives `table`'s only volume
+fn verified(db: &Database, table: &str) -> (String, Option<String>) {
+    let rows: Vec<_> = verify(db).into_iter().filter(|r| r.0 == table).collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    (rows[0].1.clone(), rows[0].3.clone())
+}
+
+#[test]
+fn test_verify_reads_every_volume_and_finds_them_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let (dsn, _) = sealed(dir.path(), "verify_whole");
+    let db = Database::open(&dsn).unwrap();
+    let rows = verify(&db);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    for (table, status, blocks, detail) in &rows {
+        assert_eq!((status.as_str(), detail), ("ok", &None), "{table}");
+        // One group of three columns
+        assert_eq!(*blocks, 3, "{table}");
+    }
+}
+
+#[test]
+fn test_verify_reads_a_block_damaged_after_the_group_was_cached() {
+    let dir = tempfile::tempdir().unwrap();
+    let (dsn, volumes) = sealed(dir.path(), "verify_cached_block");
+    let db = Database::open(&dsn).unwrap();
+    // Every group of t decoded into the group cache, then the file damaged
+    assert_eq!(run(&db, "SELECT * FROM t"), Ok(ROWS as usize));
+    let mut bytes = std::fs::read(&volumes[0]).unwrap();
+    bytes[16] ^= 0xFF;
+    std::fs::write(&volumes[0], &bytes).unwrap();
+    let (status, detail) = verified(&db, "t");
+    assert_eq!(status, "damaged");
+    let detail = detail.unwrap();
+    assert!(
+        detail.contains("block CRC mismatch at column 0 (id), group 0"),
+        "{detail}"
+    );
+    assert_eq!(verified(&db, "u"), ("ok".to_string(), None));
+    // Reopened, the cache holds nothing: the read fails, naming the file
+    db.close().unwrap();
+    drop(db);
+    let db = Database::open(&dsn).unwrap();
+    match run(&db, "SELECT * FROM t") {
+        Err(msg) => assert!(
+            msg.contains("block CRC mismatch at column 0, group 0")
+                && msg.contains(volumes[0].file_name().unwrap().to_str().unwrap()),
+            "got: {msg}"
+        ),
+        Ok(n) => panic!("a damaged block was read: {n} rows"),
+    }
+}
+
+#[test]
+fn test_verify_reads_every_column_s_bloom_filter() {
+    let dir = tempfile::tempdir().unwrap();
+    let (dsn, volumes) = sealed(dir.path(), "verify_bloom");
+    let db = Database::open(&dsn).unwrap();
+    let mut bytes = std::fs::read(&volumes[0]).unwrap();
+    let at = bloom_words_at(&bytes, 2);
+    bytes[at] ^= 0xFF;
+    std::fs::write(&volumes[0], &bytes).unwrap();
+    let (status, detail) = verified(&db, "t");
+    assert_eq!(status, "damaged");
+    let detail = detail.unwrap();
+    assert!(
+        detail.contains("bloom filter CRC mismatch at column 2 (w)"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn test_verify_finds_a_file_other_than_the_one_the_manifest_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let (dsn, volumes) = sealed(dir.path(), "verify_swapped");
+    let db = Database::open(&dsn).unwrap();
+    // A whole, valid volume of the other table in t's file's place
+    let other = volume_files(&dir.path().join("verify_swapped"), "u");
+    std::fs::copy(&other[0], &volumes[0]).unwrap();
+    let (status, detail) = verified(&db, "t");
+    assert_eq!(status, "damaged");
+    let detail = detail.unwrap();
+    assert!(
+        detail.contains("not the file the manifest records"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn test_verify_reports_a_file_it_cannot_read_apart_from_damage() {
+    let dir = tempfile::tempdir().unwrap();
+    let (dsn, volumes) = sealed(dir.path(), "verify_unreadable");
+    let db = Database::open(&dsn).unwrap();
+    std::fs::remove_file(&volumes[0]).unwrap();
+    let (status, detail) = verified(&db, "t");
+    assert_eq!(status, "unreadable");
+    assert!(detail.is_some());
+    assert_eq!(verified(&db, "u"), ("ok".to_string(), None));
+}

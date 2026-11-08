@@ -1027,7 +1027,10 @@ impl CompressedBlockStore {
                     if want != Some(&super::v5::checksum(scratch)) {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
-                            format!("block CRC mismatch at column {col_idx}, group {group_idx}"),
+                            format!(
+                                "{:?}: block CRC mismatch at column {col_idx}, group {group_idx}",
+                                file.path()
+                            ),
                         ));
                     }
                 }

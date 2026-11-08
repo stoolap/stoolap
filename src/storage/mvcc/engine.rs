@@ -2936,6 +2936,30 @@ impl MVCCEngine {
         self.open.load(Ordering::Acquire)
     }
 
+    /// Every listed volume file read and checked for PRAGMA VERIFY, by table
+    /// name and segment id; the segment managers' locks are let go before
+    /// the first read
+    pub fn verify_volumes(&self) -> Vec<(String, u64, crate::storage::volume::io::VolumeCheck)> {
+        let targets: Vec<(String, Vec<_>)> = {
+            let mgrs = self.segment_managers.read().unwrap();
+            let mut tables: Vec<(String, Vec<_>)> = mgrs
+                .iter()
+                .map(|(name, mgr)| (name.clone(), mgr.verify_targets()))
+                .collect();
+            tables.sort_by(|a, b| a.0.cmp(&b.0));
+            tables
+        };
+        let mut checks = Vec::new();
+        for (table, files) in targets {
+            for (segment_id, file, recorded) in files {
+                let check =
+                    crate::storage::volume::io::verify_volume_file(&file, recorded.as_ref());
+                checks.push((table.clone(), segment_id, check));
+            }
+        }
+        checks
+    }
+
     /// Per-table, per-volume statistics for PRAGMA VOLUME_STATS.
     /// Returns (table_name, segment_id, tier, row_count, memory_bytes, idle_cycles, tombstones).
     pub fn volume_stats(&self) -> Vec<(String, u64, &'static str, usize, usize, u64, usize)> {

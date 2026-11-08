@@ -46,6 +46,7 @@ Stoolap currently supports the following PRAGMA commands:
 | `sync_mode` | Read current WAL sync mode (read-only, set via DSN) | 1 |
 | `wal_flush_trigger` | Read current WAL flush trigger (read-only, set via DSN) | 32768 |
 | `volume_stats` | Show per-volume storage statistics | - |
+| `verify` | Read every volume file and check it against its checksums | - |
 
 ### Memory and Hot Store
 
@@ -357,6 +358,24 @@ PRAGMA vacuum;
 ```
 
 **Note:** This PRAGMA cannot run inside an explicit transaction.
+
+#### verify
+
+Reads every volume file the tables list, through a descriptor of its own and past the decoded row group cache, and checks each one: the footer, the section table and every metadata section, each column's bloom filter and every block against their CRC-32C, and the file's identity against the one the table's manifest records. A V4 file is checked against its whole-file CRC. One row per volume:
+
+| Column | Meaning |
+|--------|---------|
+| `table_name` | The volume's table |
+| `segment_id` | The volume |
+| `status` | `ok`, `damaged` (a checksum, the structure or the identity does not match), `unreadable` (the file could not be read) or `failed` (a V4 file the V4 reader refused; it does not tell a read error from damage) |
+| `blocks` | The blocks checked when `ok` |
+| `detail` | What did not match, with the file, the column and the row group, or the read error; NULL when `ok` |
+
+```sql
+PRAGMA verify;
+```
+
+VERIFY changes nothing: a damaged volume stays listed, and a statement that needs a damaged block keeps failing with an error naming the file, the column and the row group, while the statements that do not need it answer as before. `ok` means the bytes VERIFY read matched; the reads go through the operating system's cache like any other, so it is not a scan of the medium beneath the cache.
 
 ## Connection String Parameters
 

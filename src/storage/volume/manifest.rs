@@ -2700,6 +2700,30 @@ impl SegmentManager {
             .unwrap_or(0)
     }
 
+    /// Each listed segment backed by a file: its id, the file's handle and
+    /// the identity the manifest records for it, for PRAGMA VERIFY to read
+    /// once the locks are let go; the handle keeps the file in place
+    #[allow(clippy::type_complexity)]
+    pub fn verify_targets(
+        &self,
+    ) -> Vec<(
+        u64,
+        Arc<super::writer::VolumeFile>,
+        Option<super::writer::FileIdentity>,
+    )> {
+        let manifest = self.manifest.read();
+        let segments = self.segments.read();
+        manifest
+            .segments
+            .iter()
+            .filter_map(|meta| {
+                let file = segments.get(&meta.segment_id)?.file.as_ref()?;
+                let recorded = manifest.identities.get(&meta.segment_id).copied();
+                Some((meta.segment_id, Arc::clone(file), recorded))
+            })
+            .collect()
+    }
+
     /// Per-volume statistics for PRAGMA VOLUME_STATS.
     /// Returns (segment_id, tier, row_count, memory_bytes, idle_cycles) for each volume.
     pub fn volume_stats(&self) -> Vec<(u64, &'static str, usize, usize, u64)> {

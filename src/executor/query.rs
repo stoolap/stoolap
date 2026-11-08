@@ -9287,6 +9287,40 @@ impl Executor {
                 }
                 Ok(Box::new(ExecutorResult::new(columns, rows)))
             }
+            "VERIFY" => {
+                if stmt.value.is_some() {
+                    return Err(Error::internal("PRAGMA VERIFY does not accept values"));
+                }
+                use crate::storage::volume::io::VolumeCheck;
+                let columns = vec![
+                    "table_name".to_string(),
+                    "segment_id".to_string(),
+                    "status".to_string(),
+                    "blocks".to_string(),
+                    "detail".to_string(),
+                ];
+                let checks = self.engine.verify_volumes();
+                let mut rows = RowVec::with_capacity(checks.len());
+                for (i, (table, seg_id, check)) in checks.into_iter().enumerate() {
+                    let (status, blocks, detail) = match check {
+                        VolumeCheck::Verified { blocks } => ("ok", blocks as i64, None),
+                        VolumeCheck::Damaged(why) => ("damaged", 0, Some(why)),
+                        VolumeCheck::Unreadable(why) => ("unreadable", 0, Some(why)),
+                        VolumeCheck::Failed(why) => ("failed", 0, Some(why)),
+                    };
+                    rows.push((
+                        i as i64,
+                        Row::from_values(vec![
+                            Value::text(&table),
+                            Value::Integer(seg_id as i64),
+                            Value::text(status),
+                            Value::Integer(blocks),
+                            detail.map_or(Value::Null(DataType::Text), Value::text),
+                        ]),
+                    ));
+                }
+                Ok(Box::new(ExecutorResult::new(columns, rows)))
+            }
             "VACUUM" => {
                 if stmt.value.is_some() {
                     return Err(Error::internal("PRAGMA VACUUM does not accept values"));

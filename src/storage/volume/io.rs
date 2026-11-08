@@ -681,6 +681,115 @@ pub fn read_volume_from_handle(
     Ok(volume)
 }
 
+/// What `verify_volume_file` found in a volume file
+#[derive(Debug, PartialEq, Eq)]
+pub enum VolumeCheck {
+    /// Every byte checked matched: the blocks read
+    Verified { blocks: usize },
+    /// A checksum, the structure or the file's identity did not match
+    Damaged(String),
+    /// The file could not be read
+    Unreadable(String),
+    /// A V4 file the V4 reader refused, which does not tell a read error
+    /// from damage
+    Failed(String),
+}
+
+/// Reads the file `handle` names through a descriptor of its own and checks
+/// every byte it reads: a V5 file's footer, section table and sections,
+/// each column's bloom filter and every block, against their CRC-32C and
+/// the identity the manifest records; a V4 file's whole-file CRC. Nothing
+/// read goes through or into a cache, and nothing is changed
+pub fn verify_volume_file(
+    handle: &Arc<super::writer::VolumeFile>,
+    recorded: Option<&super::writer::FileIdentity>,
+) -> VolumeCheck {
+    use std::io::Seek;
+    let path = handle.path();
+    let mut file = match handle.open() {
+        Ok(file) => file,
+        Err(e) => return VolumeCheck::Unreadable(format!("{:?}: {}", path, e)),
+    };
+    let mut magic = [0u8; 4];
+    let v5 =
+        super::writer::read_exact_at(&file, &mut magic, 0).is_ok() && magic == super::v5::V5_MAGIC;
+    if !v5 {
+        if let Err(e) = file.rewind() {
+            return VolumeCheck::Unreadable(format!("{:?}: {}", path, e));
+        }
+        return match read_volume_v4(file, Arc::clone(handle), &path) {
+            Ok(volume) => VolumeCheck::Verified {
+                blocks: volume.columns.len() * volume.meta.row_groups.len().max(1),
+            },
+            Err(e) => VolumeCheck::Failed(e.to_string()),
+        };
+    }
+    match verify_v5(&file, recorded) {
+        Ok(blocks) => VolumeCheck::Verified { blocks },
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            VolumeCheck::Damaged(format!("{:?}: {}", path, e))
+        }
+        Err(e) => VolumeCheck::Unreadable(format!("{:?}: {}", path, e)),
+    }
+}
+
+/// `verify_volume_file` for a V5 file: the blocks checked, or the first
+/// mismatch as an InvalidData error and the first failed read as its own
+fn verify_v5(
+    file: &std::fs::File,
+    recorded: Option<&super::writer::FileIdentity>,
+) -> std::io::Result<usize> {
+    use super::format::{
+        V5_BLOOMS, V5_COLUMNS, V5_DICT, V5_GROUPS, V5_ROW_IDS, V5_STATS, V5_ZONES,
+    };
+    let damaged = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
+    let len = file.metadata()?.len();
+    let read_at = |buf: &mut [u8], at: u64| super::writer::read_exact_at(file, buf, at);
+    let known = [
+        V5_COLUMNS, V5_GROUPS, V5_DICT, V5_ROW_IDS, V5_ZONES, V5_STATS,
+    ];
+    let mut opened = super::v5::open(len, &known, &[V5_BLOOMS], &read_at)?;
+    if recorded.is_some_and(|recorded| *recorded != opened.identity) {
+        return Err(damaged("not the file the manifest records".to_string()));
+    }
+    let super::format::V5Metadata { meta, bounds } =
+        super::format::v5_metadata_from_sections(&mut opened.meta, &opened.root)?;
+    let cols = meta.col_type_tags.len();
+    let name = |col: usize| meta.column_names.get(col).map_or("?", String::as_str);
+    let mut buf = Vec::new();
+    if let Some(&(_, enc, at, len)) = opened.deferred.iter().find(|s| s.0 == V5_BLOOMS) {
+        let places = super::format::v5_bloom_places(enc, at, len, cols, &read_at)?;
+        for (col, place) in places.iter().enumerate() {
+            let Some(place) = place else { continue };
+            buf.resize(place.words * 8, 0);
+            read_at(&mut buf, place.at)?;
+            if super::v5::checksum(&buf) != place.crc {
+                return Err(damaged(format!(
+                    "bloom filter CRC mismatch at column {col} ({})",
+                    name(col)
+                )));
+            }
+        }
+    }
+    let places = opened.places(cols, bounds.len())?;
+    let mut blocks = 0;
+    // In the file's order, group by group
+    for group in 0..bounds.len() {
+        for col in 0..cols {
+            buf.resize(places.stored[col][group], 0);
+            read_at(&mut buf, places.offsets[col][group])?;
+            if super::v5::checksum(&buf) != places.crcs[col][group] {
+                return Err(damaged(format!(
+                    "block CRC mismatch at column {col} ({}), group {group}",
+                    name(col)
+                )));
+            }
+            blocks += 1;
+        }
+    }
+    Ok(blocks)
+}
+
 /// List all volume files for a table, sorted by volume ID (oldest first).
 pub fn list_volumes(dir: &Path, table_name: &str) -> Vec<PathBuf> {
     let table_dir = dir.join(table_name);
@@ -1630,6 +1739,30 @@ mod tests {
         assert!(error.to_string().contains("already belongs"), "{error}");
         assert_eq!(std::fs::read(&path).unwrap(), before, "the file changed");
         assert_eq!(read_volume_from_disk(&path).unwrap().meta.row_count, 100);
+    }
+
+    #[test]
+    fn a_v4_file_is_verified_against_its_whole_file_crc() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_volume_to_disk_v4(dir.path(), "t", 1, &mixed_volume(1_000)).unwrap();
+        let handle = super::super::writer::VolumeFile::shared(&path);
+        assert!(
+            matches!(
+                verify_volume_file(&handle, None),
+                VolumeCheck::Verified { .. }
+            ),
+            "{:?}",
+            verify_volume_file(&handle, None)
+        );
+        let mut bytes = std::fs::read(&path).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(
+            matches!(verify_volume_file(&handle, None), VolumeCheck::Failed(_)),
+            "{:?}",
+            verify_volume_file(&handle, None)
+        );
     }
 
     #[test]
