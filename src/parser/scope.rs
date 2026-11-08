@@ -89,12 +89,33 @@ pub(crate) fn check(stmt: &Statement) -> Check {
     }
 }
 
+/// An error when `alias` takes the name of the row's identity
+fn check_alias(alias: &Identifier) -> Check {
+    crate::core::check_column_name(&alias.value).map_err(|error| ScopeError {
+        message: error.to_string(),
+        position: alias.position,
+    })
+}
+
+/// An error when an alias of `items`, a SELECT list or a RETURNING, takes
+/// the name of the row's identity
+fn check_item_aliases(items: &[Expression]) -> Check {
+    for item in items {
+        if let Expression::Aliased(aliased) = item {
+            check_alias(&aliased.alias)?;
+        }
+    }
+    Ok(())
+}
+
 fn check_select<'a>(select: &'a SelectStatement, outer: Option<&Scope<'a, '_>>) -> Check {
     if let Some(with) = &select.with {
         for cte in &with.ctes {
+            cte.column_names.iter().try_for_each(check_alias)?;
             check_select(&cte.query, outer)?;
         }
     }
+    check_item_aliases(&select.columns)?;
     let mut own = Scope::under(outer);
     if let Some(from) = &select.table_expr {
         from_names(from, &mut own);
@@ -452,6 +473,7 @@ fn check_source<'a>(
             check_select(&s.subquery, Some(&Scope::beside(query, outer)))
         }
         Expression::ValuesSource(v) => {
+            v.column_aliases.iter().try_for_each(check_alias)?;
             let beside = Scope::beside(query, outer);
             for expr in v.rows.iter().flatten() {
                 check_expr(expr, Some(&beside))?;
@@ -459,6 +481,7 @@ fn check_source<'a>(
             Ok(())
         }
         Expression::FunctionTableSource(f) => {
+            f.column_aliases.iter().try_for_each(check_alias)?;
             let beside = Scope::beside(query, outer);
             for expr in &f.arguments {
                 check_expr(expr, Some(&beside))?;
@@ -490,6 +513,7 @@ fn check_insert(insert: &InsertStatement) -> Check {
     let mut returning = Scope::under(None);
     returning.visible.push(&insert.table_name.value_lower);
     returning.hidden.push("excluded");
+    check_item_aliases(&insert.returning)?;
     for expr in &insert.returning {
         check_expr(expr, Some(&returning))?;
     }
@@ -505,6 +529,7 @@ fn check_update(update: &UpdateStatement) -> Check {
         check_expr(expr, target)?;
     }
     check_opt(update.where_clause.as_deref(), target)?;
+    check_item_aliases(&update.returning)?;
     for expr in &update.returning {
         check_expr(expr, target)?;
     }
@@ -523,6 +548,7 @@ fn check_delete(delete: &DeleteStatement) -> Check {
     }
     let target = Some(&target);
     check_opt(delete.where_clause.as_deref(), target)?;
+    check_item_aliases(&delete.returning)?;
     for expr in &delete.returning {
         check_expr(expr, target)?;
     }
@@ -531,6 +557,7 @@ fn check_delete(delete: &DeleteStatement) -> Check {
 
 fn check_with(with: Option<&WithClause>) -> Check {
     for cte in with.iter().flat_map(|w| &w.ctes) {
+        cte.column_names.iter().try_for_each(check_alias)?;
         check_select(&cte.query, None)?;
     }
     Ok(())

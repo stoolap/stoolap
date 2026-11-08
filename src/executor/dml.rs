@@ -376,19 +376,9 @@ fn returning_programs(
 ) -> Vec<Result<super::expression::SharedProgram>> {
     use crate::parser::{Identifier, Position, Token, TokenType};
     let registry = crate::functions::global_registry();
-    let real = |expr: &Expression| {
-        let name = match expr {
-            Expression::QualifiedIdentifier(q) => &q.name.value_lower,
-            Expression::Identifier(id) => &id.value_lower,
-            _ => return true,
-        };
-        columns.iter().any(|c| c.eq_ignore_ascii_case(name))
-    };
     let compile = |expr: &Expression| {
-        let expr = super::utils::rowids_respelled(expr, &[], &mut |name| {
-            Ok(rowid
-                .filter(|_| !real(name))
-                .map(|(at, table)| super::utils::qualified_reference(table, &columns[at])))
+        let expr = super::utils::rowids_respelled(expr, &mut |_| {
+            Ok(rowid.map(|(at, table)| super::utils::qualified_reference(table, &columns[at])))
         })?;
         super::aggregation::compile_over_slots(&expr, columns, registry, None, false, None)
     };

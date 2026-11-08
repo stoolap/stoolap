@@ -41,7 +41,8 @@ pub use error::{ConflictValues, Error, Result};
 pub use row::Row;
 pub use row_vec::{KeyRows, RowIdVec, RowVec};
 pub use schema::{
-    is_rowid_name, ForeignKeyConstraint, Schema, SchemaBuilder, SchemaColumn, ROWID_SLOT,
+    check_column_name, is_rowid_name, ForeignKeyConstraint, Schema, SchemaBuilder, SchemaColumn,
+    ROWID_NAME, ROWID_SLOT,
 };
 pub use sum::SumAccumulator;
 pub use types::{DataType, ForeignKeyAction, IndexEntry, IndexType, IsolationLevel, Operator};

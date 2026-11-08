@@ -379,6 +379,7 @@ pub(crate) fn check_stored_schema(schema: &Schema) -> Result<()> {
     use super::persistence::serialize_value;
     for col in &schema.columns {
         check_stored_name(&col.name, "a column name")?;
+        crate::core::check_column_name(&col.name)?;
         if let Some(default) = &col.default_expr {
             check_stored(default.len(), || {
                 format!("the DEFAULT of column {}", col.name)
@@ -1307,6 +1308,20 @@ impl MVCCEngine {
                 // Neither snapshots nor WAL persist the cached default_value, so old rows
                 // read via normalize_row_to_schema would get NULL instead of the column default.
                 self.populate_schema_defaults();
+
+                // A column an older build let take the row identity's name
+                // opens no database
+                {
+                    let schemas = (self.schemas.read())
+                        .map_err(|_| Error::internal("schemas lock poisoned"))?;
+                    for schema in schemas.values() {
+                        for col in &schema.columns {
+                            crate::core::check_column_name(&col.name).map_err(|e| {
+                                Error::invalid_argument(format!("table {}: {e}", schema.table_name))
+                            })?;
+                        }
+                    }
+                }
 
                 // A volume an older build left holding a column in another
                 // type than the schema's is rewritten before any mapping

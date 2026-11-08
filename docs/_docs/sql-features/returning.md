@@ -102,13 +102,13 @@ See [Subqueries in RETURNING]({% link _docs/sql-features/subqueries.md %}#subque
 
 ## Row Identity
 
-`RETURNING rowid` returns each row's identity, which in a table without a primary key is the id the insert assigned:
+`RETURNING _rowid_` returns each row's identity, which in a table without a primary key is the id the insert assigned:
 
 ```sql
-INSERT INTO events VALUES ('open', 'a') RETURNING rowid;
+INSERT INTO events VALUES ('open', 'a') RETURNING _rowid_;
 ```
 
-See [Row Identity (rowid)]({% link _docs/sql-features/rowid.md %}).
+See [Row Identity (_rowid_)]({% link _docs/sql-features/rowid.md %}).
 
 ## Use Cases
 

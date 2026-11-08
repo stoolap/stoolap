@@ -2345,16 +2345,13 @@ impl Executor {
             entries.push(entry);
         }
         let mut spelled = |expr: &Expression| -> Result<Option<Expression>> {
-            let (entry, written) = match expr {
-                Expression::QualifiedIdentifier(q) => {
-                    let named = entries
-                        .iter()
-                        .flatten()
-                        .find(|(name, _)| *name == q.qualifier.value_lower);
-                    (named, &q.name.value_lower)
-                }
-                Expression::Identifier(id) => match entries.as_slice() {
-                    [Some(entry)] => (Some(entry), &id.value_lower),
+            let entry = match expr {
+                Expression::QualifiedIdentifier(q) => entries
+                    .iter()
+                    .flatten()
+                    .find(|(name, _)| *name == q.qualifier.value_lower),
+                Expression::Identifier(_) => match entries.as_slice() {
+                    [Some(entry)] => Some(entry),
                     _ => return Ok(None),
                 },
                 _ => return Ok(None),
@@ -2362,9 +2359,6 @@ impl Executor {
             let Some((name, schema)) = entry else {
                 return Ok(None);
             };
-            if schema.column_index_map().contains_key(written.as_str()) {
-                return Ok(None);
-            }
             let column = match schema.rowid_column() {
                 // A key named as a literal is left to the scope that binds it
                 Some(key)
@@ -2398,49 +2392,25 @@ fn from_leaves<'e>(from: &'e Expression, out: &mut Vec<&'e Expression>) {
 }
 
 /// `stmt` with each rowid outside its subqueries replaced as `spelled` says,
-/// each SELECT item so changed named as written. A SELECT alias of that name
-/// keeps it where aliases are read
+/// each SELECT item so changed named as written
 fn spelled_statement(
     stmt: &SelectStatement,
     spelled: &mut dyn FnMut(&Expression) -> Result<Option<Expression>>,
 ) -> Result<SelectStatement> {
-    let aliases: SmallVec<[&str; 2]> = stmt
-        .columns
-        .iter()
-        .filter_map(|item| match item {
-            Expression::Aliased(a) => Some(a.alias.value_lower.as_str()),
-            _ => None,
-        })
-        .filter(|alias| is_rowid_name(alias))
-        .collect();
-    // A set operation's ORDER BY reads its items' expressions as they are
-    // written, which no qualifier may hold; an item reads no alias
-    let compound = !stmt.set_operations.is_empty();
-    // A SELECT alias holds the name only where aliases are read, never in
-    // the items, which define them, nor in a window's definition
-    let mut spell = |expr: &Expression, aliased: &[&str], bare: bool| -> Result<Expression> {
-        rowids_respelled(expr, aliased, &mut |name| {
-            Ok(match spelled(name)? {
-                Some(Expression::QualifiedIdentifier(q)) if bare => {
-                    Some(Expression::Identifier(q.name))
-                }
-                other => other,
-            })
-        })
-    };
+    let mut spell = |expr: &Expression| rowids_respelled(expr, spelled);
     let mut out = stmt.clone();
     if let Some(from) = out.table_expr.as_deref_mut() {
-        spell_join_conditions(from, &mut |expr| spell(expr, &[], false))?;
+        spell_join_conditions(from, &mut spell)?;
     }
     for item in &mut out.columns {
         let written = item.clone();
         let walked = match &written {
             Expression::Aliased(a) => {
                 let mut a = a.clone();
-                *a.expression = spell(&a.expression, &[], compound)?;
+                *a.expression = spell(&a.expression)?;
                 Expression::Aliased(a)
             }
-            other => spell(other, &[], compound)?,
+            other => spell(other)?,
         };
         *item = named_as_written(walked, &written);
     }
@@ -2449,49 +2419,42 @@ fn spelled_statement(
         _ => &mut [],
     };
     // A set operation's ORDER BY sorts its output: a key names an output
-    // column, or is the expression of an item, which it stays alike to
+    // column, or is an item's expression, which reads that item's position
+    let starred = (stmt.columns.iter())
+        .any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)));
     let order_by = match stmt.set_operations.is_empty() {
         true => out.order_by.as_mut_slice(),
         false => {
             for key in &mut out.order_by {
-                let identity = ExprKey::of(&key.expression);
-                let item = (stmt.columns.iter().zip(&out.columns))
-                    .find(|(written, _)| ExprKey::of(unaliased(written)) == identity);
                 let named = matches!(
                     key.expression,
                     Expression::Identifier(_) | Expression::QualifiedIdentifier(_)
                 );
-                if let (Some((_, spelled)), false) = (item, named) {
-                    key.expression = unaliased(spelled).clone();
+                let identity = ExprKey::of(&key.expression);
+                let at = (stmt.columns.iter())
+                    .position(|written| ExprKey::of(unaliased(written)) == identity);
+                if let (Some(at), false, false) = (at, named, starred) {
+                    key.expression = value_to_expression(&Value::Integer(at as i64 + 1));
                 }
             }
             &mut []
         }
     };
-    // A key that is a name reads an alias of it ahead of a column, as
-    // HAVING does throughout; a WHERE and a key's expression read columns
-    for key in out
+    for expr in out
         .distinct_on
         .iter_mut()
         .chain(out.group_by.columns.iter_mut())
         .chain(sets.iter_mut().flatten())
+        .chain(out.where_clause.as_deref_mut())
+        .chain(out.having.as_deref_mut())
         .chain(order_by.iter_mut().map(|o| &mut o.expression))
     {
-        if matches!(key, Expression::Identifier(id) if aliases.contains(&id.value_lower.as_str())) {
-            continue;
-        }
-        *key = spell(key, &[], false)?;
-    }
-    if let Some(where_clause) = out.where_clause.as_deref_mut() {
-        *where_clause = spell(where_clause, &[], false)?;
-    }
-    if let Some(having) = out.having.as_deref_mut() {
-        *having = spell(having, &aliases, false)?;
+        *expr = spell(expr)?;
     }
     for window in &mut out.window_defs {
         let keys = window.order_by.iter_mut().map(|o| &mut o.expression);
         for expr in window.partition_by.iter_mut().chain(keys) {
-            *expr = spell(expr, &[], false)?;
+            *expr = spell(expr)?;
         }
     }
     Ok(out)

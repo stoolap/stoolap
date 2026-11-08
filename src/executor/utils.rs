@@ -1910,34 +1910,19 @@ pub(crate) fn names_rowid(stmt: &SelectStatement) -> bool {
 }
 
 /// `expr` with each unquoted rowid name outside its subqueries replaced by
-/// what `spelled` gives for it; a bare name in `aliased` stays, a SELECT
-/// alias holding it, except in an aggregate's or a window's call, which
-/// reads the rows
+/// what `spelled` gives for it
 pub(crate) fn rowids_respelled(
     expr: &Expression,
-    aliased: &[&str],
     spelled: &mut dyn FnMut(&Expression) -> crate::core::Result<Option<Expression>>,
 ) -> crate::core::Result<Expression> {
-    match expr {
-        Expression::Identifier(id)
-            if !id.quoted
-                && crate::core::is_rowid_name(&id.value_lower)
-                && !aliased.contains(&id.value_lower.as_str()) =>
-        {
-            Ok(spelled(expr)?.unwrap_or_else(|| expr.clone()))
-        }
-        Expression::QualifiedIdentifier(q)
-            if !q.name.quoted && crate::core::is_rowid_name(&q.name.value_lower) =>
-        {
-            Ok(spelled(expr)?.unwrap_or_else(|| expr.clone()))
-        }
-        Expression::FunctionCall(call)
-            if !aliased.is_empty() && is_aggregate_function(&call.function) =>
-        {
-            rowids_respelled(expr, &[], spelled)
-        }
-        Expression::Window(_) if !aliased.is_empty() => rowids_respelled(expr, &[], spelled),
-        other => other.try_map_children(&mut |child| rowids_respelled(child, aliased, spelled)),
+    let name = match expr {
+        Expression::Identifier(id) if !id.quoted => &id.value_lower,
+        Expression::QualifiedIdentifier(q) if !q.name.quoted => &q.name.value_lower,
+        other => return other.try_map_children(&mut |child| rowids_respelled(child, spelled)),
+    };
+    match crate::core::is_rowid_name(name) {
+        true => Ok(spelled(expr)?.unwrap_or_else(|| expr.clone())),
+        false => Ok(expr.clone()),
     }
 }
 

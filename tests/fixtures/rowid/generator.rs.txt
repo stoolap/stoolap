@@ -1,0 +1,11 @@
+//! Writes a database whose table names a column after the row identity,
+//! which builds from before the name was reserved let a table do
+use stoolap::Database;
+
+fn main() {
+    let out = std::env::args().nth(1).expect("an output directory");
+    let db = Database::open(&format!("file://{out}")).unwrap();
+    db.execute("CREATE TABLE t (a INTEGER, _rowid_ INTEGER)", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 20)", ()).unwrap();
+    db.close().unwrap();
+}

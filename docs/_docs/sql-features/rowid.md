@@ -1,49 +1,53 @@
 ---
 layout: doc
-title: Row Identity (rowid)
+title: Row Identity (_rowid_)
 category: SQL Features
 order: 22
 ---
 
-# Row Identity (rowid)
+# Row Identity (_rowid_)
 
-Every row has an identity, a 64-bit integer that names it for as long as it lives. The pseudo-columns `rowid` and `_rowid_` read it.
+Every row has an identity, a 64-bit integer that names it for as long as it lives. The pseudo-column `_rowid_` reads it.
 
-- In a table with an `INTEGER PRIMARY KEY`, the identity is the key's value: `rowid` reads the same value as the key column.
+- In a table with an `INTEGER PRIMARY KEY`, the identity is the key's value: `_rowid_` reads the same value as the key column.
 - In a table without a primary key, the identity is the id the engine assigned when the row was inserted, counting up from 1.
 
 ```sql
 CREATE TABLE events (kind TEXT, payload TEXT);
 INSERT INTO events VALUES ('open', 'a'), ('close', 'b')
-RETURNING rowid;
+RETURNING _rowid_;
 -- Returns: 1, 2
 
-SELECT rowid, kind FROM events WHERE rowid = 2;
+SELECT _rowid_, kind FROM events WHERE _rowid_ = 2;
 -- Returns: 2, 'close'
 ```
 
-## Where rowid can be used
+## A reserved name
 
-`rowid` reads like any column: in the select list, `WHERE`, `ORDER BY`, `GROUP BY`, `HAVING`, `CASE`, window functions, subqueries (correlated ones included), set operations, and the `WHERE` and `RETURNING` of `UPDATE` and `DELETE`, and an `INSERT ... RETURNING`.
+`_rowid_` names the row identity and nothing else. No column and no alias may take it: `CREATE TABLE`, `ALTER TABLE ... ADD COLUMN` or `RENAME COLUMN`, `CREATE TABLE ... AS SELECT`, a select-list or `RETURNING` alias, and the column list of a CTE, a `VALUES` list or a table function all refuse it. `rowid` is an ordinary name: a table may have a column named `rowid`, and a query may alias to it.
 
-A `WHERE rowid = ?` or `WHERE rowid IN (...)` reads the rows it names by their ids, on rows in memory and on rows already written to disk alike, as a primary key lookup does.
+A database written before the name was reserved, holding a table with a column named `_rowid_`, refuses to open; the error names the table.
+
+## Where _rowid_ can be used
+
+`_rowid_` reads like any column: in the select list, `WHERE`, `ORDER BY`, `GROUP BY`, `HAVING`, `CASE`, window functions, subqueries (correlated ones included), set operations, joins (as `t._rowid_` of a table with a primary key), and the `WHERE` and `RETURNING` of `UPDATE`, `DELETE` and `INSERT`.
+
+A `WHERE _rowid_ = ?` or `WHERE _rowid_ IN (...)` reads the rows it names by their ids, on rows in memory and on rows already written to disk alike, as a primary key lookup does.
 
 ## Name rules
 
-- A real column named `rowid` or `_rowid_` wins: the name then reads that column. The other spelling still reads the identity.
-- A quoted `"rowid"` names only a real column.
-- `SELECT *` never shows `rowid`.
-- A select-list alias named `rowid` wins in `ORDER BY`, as any alias does.
-- `t.rowid` reads the identity of table `t`. A bare `rowid` over two tables is ambiguous.
-- A derived table, view or CTE has a `rowid` only when its query selects one as an output column.
+- A quoted `"_rowid_"` is not the row identity.
+- `SELECT *` never shows `_rowid_`.
+- `t._rowid_` reads the identity of table `t`. A bare `_rowid_` over two tables is ambiguous.
+- A derived table, view or CTE has a `_rowid_` only when its query selects one as an output column.
 
-## What rowid does not do
+## What _rowid_ does not do
 
-- `rowid` is never written: `UPDATE t SET rowid = ...` and `INSERT INTO t (rowid, ...)` are errors. In a table with a primary key, the key is not updatable either; delete and insert instead.
-- In a join, a table without a primary key has no `rowid`: the name is an error there. A table with a primary key reads its key as usual.
-- A table read `AS OF` a past point has no `rowid`.
-- The `RETURNING` of `INSERT ... ON CONFLICT DO UPDATE` does not read the `rowid` of a table without a primary key.
-- A primary key named `TRUE` or `FALSE` is read through `rowid` everywhere but inside an aggregate; write the key's quoted name there.
+- `_rowid_` is never written: `UPDATE t SET _rowid_ = ...` and `INSERT INTO t (_rowid_, ...)` are errors. In a table with a primary key, the key is not updatable either; delete and insert instead.
+- In a join, a table without a primary key has no `_rowid_`: the name is an error there. A table with a primary key reads its key as usual.
+- A table read `AS OF` a past point has no `_rowid_`.
+- The `RETURNING` of `INSERT ... ON CONFLICT DO UPDATE` does not read the `_rowid_` of a table without a primary key.
+- A primary key named `TRUE` or `FALSE` is read through `_rowid_` everywhere but inside an aggregate; write the key's quoted name there.
 
 ## Stability
 

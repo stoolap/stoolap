@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `rowid` and `_rowid_` read a row's identity: the primary key's value in a
-//! table with one, the id the engine assigned in a table without one.
+//! `_rowid_` reads a row's identity: the primary key's value in a table with
+//! one, the id the engine assigned in a table without one. No column and no
+//! alias takes the name.
 
 use stoolap::core::Value;
 use stoolap::Database;
@@ -53,8 +54,8 @@ fn error(db: &Database, sql: &str) -> String {
 }
 
 /// A database with `k`, keyed by `id`, and `n`, without a primary key, each
-/// holding three rows, and `r`, whose own column is named rowid; sealed into
-/// volumes when `sealed`
+/// holding three rows, and `r`, with a column of its own named rowid; sealed
+/// into volumes when `sealed`
 fn tables(dsn: &str, sealed: bool) -> Database {
     let db = Database::open(dsn).unwrap();
     for sql in [
@@ -84,141 +85,132 @@ fn each_layout(name: &str, check: impl Fn(&Database)) {
 /// the row ids `ids`
 fn reads(db: &Database, t: &str, [i1, i2, i3]: [i64; 3]) {
     let q = |sql: &str| rows(db, &sql.replace("$t", t));
+    let sum = i1 + i2 + i3;
     assert_eq!(
-        q("SELECT rowid, a FROM $t ORDER BY rowid"),
+        q("SELECT _rowid_, a FROM $t ORDER BY _rowid_"),
         [[int(i1), int(1)], [int(i2), int(2)], [int(i3), int(3)]],
         "select list in {t}"
     );
     assert_eq!(
-        names(db, &format!("SELECT rowid, _rowid_, {t}.rowid FROM {t}")),
-        ["rowid", "_rowid_", "rowid"],
+        names(db, &format!("SELECT _rowid_, {t}._rowid_ FROM {t}")),
+        ["_rowid_", "_rowid_"],
         "headers in {t}"
     );
     assert_eq!(
-        q(&format!("SELECT b FROM $t WHERE rowid = {i2}")),
+        q(&format!("SELECT b FROM $t WHERE _rowid_ = {i2}")),
         [[text("y")]],
         "equality in {t}"
     );
     assert_eq!(
         q(&format!(
-            "SELECT a FROM $t WHERE $t.rowid IN ({i3}, {i1}, NULL) ORDER BY a"
+            "SELECT a FROM $t WHERE $t._rowid_ IN ({i3}, {i1}, NULL) ORDER BY a"
         )),
         [[int(1)], [int(3)]],
         "IN in {t}"
     );
     assert_eq!(
         q(&format!(
-            "SELECT rowid FROM $t WHERE rowid > {i1} ORDER BY rowid DESC LIMIT 1"
+            "SELECT _rowid_ FROM $t WHERE _rowid_ > {i1} ORDER BY _rowid_ DESC LIMIT 1"
         )),
         [[int(i3)]],
         "range in {t}"
     );
     assert_eq!(
-        q(&format!("SELECT a FROM $t WHERE rowid = {i2} AND a = 9")),
+        q(&format!("SELECT a FROM $t WHERE _rowid_ = {i2} AND a = 9")),
         Vec::<Vec<Value>>::new(),
         "equality with another conjunct in {t}"
     );
     let by_param = db
-        .query(&format!("SELECT a FROM {t} WHERE rowid = $1"), (i3,))
+        .query(&format!("SELECT a FROM {t} WHERE _rowid_ = $1"), (i3,))
         .unwrap()
         .map(|row| row.unwrap().get_value(0).unwrap().clone())
         .collect::<Vec<_>>();
     assert_eq!(by_param, [int(3)], "parameter in {t}");
     assert_eq!(
-        q("SELECT COUNT(*), MAX(rowid), SUM(rowid) FROM $t"),
-        [[int(3), int(i3), int(i1 + i2 + i3)]],
+        q("SELECT COUNT(*), MAX(_rowid_), SUM(_rowid_) FROM $t"),
+        [[int(3), int(i3), int(sum)]],
         "aggregates in {t}"
     );
     assert_eq!(
         q(&format!(
-            "SELECT rowid, COUNT(*) FROM $t GROUP BY rowid HAVING rowid > {i1} ORDER BY rowid"
+            "SELECT _rowid_, COUNT(*) FROM $t GROUP BY _rowid_ HAVING _rowid_ > {i1} ORDER BY _rowid_"
         )),
         [[int(i2), int(1)], [int(i3), int(1)]],
         "GROUP BY and HAVING in {t}"
     );
     assert_eq!(
         q(&format!(
-            "SELECT CASE WHEN rowid = {i2} THEN 'hit' ELSE 'miss' END FROM $t ORDER BY a"
+            "SELECT CASE WHEN _rowid_ = {i2} THEN 'hit' ELSE 'miss' END FROM $t ORDER BY a"
         )),
         [[text("miss")], [text("hit")], [text("miss")]],
         "CASE in {t}"
     );
     assert_eq!(
-        q("SELECT a, ROW_NUMBER() OVER (ORDER BY rowid DESC) FROM $t ORDER BY a"),
+        q("SELECT a, ROW_NUMBER() OVER (ORDER BY _rowid_ DESC) FROM $t ORDER BY a"),
         [[int(1), int(3)], [int(2), int(2)], [int(3), int(1)]],
         "window in {t}"
     );
     assert_eq!(
-        q("SELECT (SELECT COUNT(*) FROM $t i WHERE i.rowid <= o.rowid) FROM $t o ORDER BY o.a"),
+        q("SELECT (SELECT COUNT(*) FROM $t i WHERE i._rowid_ <= o._rowid_) FROM $t o ORDER BY o.a"),
         [[int(1)], [int(2)], [int(3)]],
         "correlated subquery in {t}"
     );
     assert_eq!(
-        q("SELECT a FROM $t o WHERE EXISTS (SELECT 1 FROM $t i WHERE i.rowid > o.rowid) ORDER BY a"),
+        q("SELECT a FROM $t o WHERE EXISTS (SELECT 1 FROM $t i WHERE i._rowid_ > o._rowid_) ORDER BY a"),
         [[int(1)], [int(2)]],
         "EXISTS in {t}"
     );
     assert_eq!(
-        q("SELECT a FROM $t WHERE rowid IN (SELECT rowid FROM $t WHERE a > 1) ORDER BY a"),
+        q("SELECT a FROM $t WHERE _rowid_ IN (SELECT _rowid_ FROM $t WHERE a > 1) ORDER BY a"),
         [[int(2)], [int(3)]],
         "IN subquery in {t}"
     );
     assert_eq!(
-        q("SELECT (SELECT i.rowid FROM $t i ORDER BY i.rowid DESC LIMIT 1)"),
+        q("SELECT (SELECT i._rowid_ FROM $t i ORDER BY i._rowid_ DESC LIMIT 1)"),
         [[int(i3)]],
         "a subquery run as a statement in {t}"
     );
     assert_eq!(
-        q("SELECT (SELECT rowid FROM $t WHERE a = 2 UNION SELECT -1 ORDER BY 1 DESC LIMIT 1)"),
+        q("SELECT (SELECT _rowid_ FROM $t WHERE a = 2 UNION SELECT -1 ORDER BY 1 DESC LIMIT 1)"),
         [[int(i2)]],
         "a set operation inside a subquery in {t}"
     );
     assert_eq!(
-        q("SELECT a FROM $t o WHERE EXISTS (SELECT DISTINCT i.rowid FROM $t i WHERE i.rowid = o.rowid AND i.a > 1) ORDER BY a"),
+        q("SELECT a FROM $t o WHERE EXISTS (SELECT DISTINCT i._rowid_ FROM $t i WHERE i._rowid_ = o._rowid_ AND i.a > 1) ORDER BY a"),
         [[int(2)], [int(3)]],
         "EXISTS correlated by rowid in {t}"
     );
     assert_eq!(
-        q("SELECT rowid FROM $t WHERE a = 1 UNION ALL SELECT rowid FROM $t WHERE a = 3"),
+        q("SELECT _rowid_ FROM $t WHERE a = 1 UNION ALL SELECT _rowid_ FROM $t WHERE a = 3"),
         [[int(i1)], [int(i3)]],
         "set operation in {t}"
     );
     assert_eq!(
-        q("SELECT * FROM (SELECT rowid FROM $t) d ORDER BY 1"),
+        q("SELECT * FROM (SELECT _rowid_ FROM $t) d ORDER BY 1"),
         [[int(i1)], [int(i2)], [int(i3)]],
         "a derived table's output column in {t}"
     );
     assert_eq!(
-        q(&format!("SELECT * FROM $t WHERE rowid = {i1}"))[0].len(),
+        q(&format!("SELECT * FROM $t WHERE _rowid_ = {i1}"))[0].len(),
         if t == "k" { 3 } else { 2 },
         "a star leaves rowid out in {t}"
     );
     assert_eq!(
-        q("SELECT a AS rowid FROM $t ORDER BY rowid DESC"),
-        [[int(3)], [int(2)], [int(1)]],
-        "an alias wins in ORDER BY in {t}"
-    );
-    assert_eq!(
-        q("SELECT \"rowid\" FROM $t WHERE a = 1"),
-        [[text("rowid")]],
+        q("SELECT \"_rowid_\" FROM $t WHERE a = 1"),
+        [[text("_rowid_")]],
         "a quoted name is no rowid in {t}"
     );
     assert!(
-        error(db, &format!("SELECT rowid FROM (SELECT * FROM {t}) d")).contains("not found"),
+        error(db, &format!("SELECT _rowid_ FROM (SELECT * FROM {t}) d")).contains("not found"),
         "a derived table has no rowid in {t}"
     );
     assert_eq!(
-        q("SELECT *, rowid AS r FROM $t ORDER BY r + 0 DESC")[0].last(),
+        q("SELECT *, _rowid_ AS r FROM $t ORDER BY r + 0 DESC")[0].last(),
         Some(&int(i3)),
         "an alias after a star in {t}"
     );
     assert_eq!(
-        q("SELECT MAX(rowid) AS rowid FROM $t"),
-        [[int(i3)]],
-        "an alias over its own rowid in {t}"
-    );
-    assert_eq!(
-        q("SELECT rowid, COUNT(*) FROM $t GROUP BY GROUPING SETS ((rowid), ()) ORDER BY 1"),
+        q("SELECT _rowid_, COUNT(*) FROM $t GROUP BY GROUPING SETS ((_rowid_), ()) ORDER BY 1"),
         [
             [int(i1), int(1)],
             [int(i2), int(1)],
@@ -228,52 +220,43 @@ fn reads(db: &Database, t: &str, [i1, i2, i3]: [i64; 3]) {
         "GROUPING SETS in {t}"
     );
     assert_eq!(
-        q("SELECT a, SUM(a) OVER w FROM $t WINDOW w AS (ORDER BY rowid) ORDER BY a"),
+        q("SELECT a, SUM(a) OVER w FROM $t WINDOW w AS (ORDER BY _rowid_) ORDER BY a"),
         [[int(1), int(1)], [int(2), int(3)], [int(3), int(6)]],
         "a named window in {t}"
     );
     assert_eq!(
-        q("SELECT SUM((SELECT o.rowid)) FROM $t o"),
-        [[int(i1 + i2 + i3)]],
+        q("SELECT SUM((SELECT o._rowid_)) FROM $t o"),
+        [[int(sum)]],
         "a subquery inside an aggregate in {t}"
     );
     assert_eq!(
-        q("SELECT (SELECT x FROM (VALUES (o.rowid)) v(x)) FROM $t o ORDER BY o.a"),
+        q("SELECT (SELECT x FROM (VALUES (o._rowid_)) v(x)) FROM $t o ORDER BY o.a"),
         [[int(i1)], [int(i2)], [int(i3)]],
         "a VALUES row reading the outer rowid in {t}"
     );
     assert_eq!(
-        q("SELECT a FROM $t o ORDER BY (SELECT o.rowid) DESC"),
+        q("SELECT a FROM $t o ORDER BY (SELECT o._rowid_) DESC"),
         [[int(3)], [int(2)], [int(1)]],
         "an ORDER BY key reading rowid through a subquery in {t}"
     );
     assert_eq!(
-        q("SELECT SUM(rowid) OVER () + 0, (SELECT 1) FROM $t"),
-        [
-            [int(i1 + i2 + i3), int(1)],
-            [int(i1 + i2 + i3), int(1)],
-            [int(i1 + i2 + i3), int(1)]
-        ],
+        q("SELECT SUM(_rowid_) OVER () + 0, (SELECT 1) FROM $t"),
+        [[int(sum), int(1)], [int(sum), int(1)], [int(sum), int(1)]],
         "a grouped window over rowid in {t}"
     );
     assert_eq!(
-        q("SELECT *, SUM(rowid) OVER () FROM $t WHERE a = 1")[0].len(),
+        q("SELECT *, SUM(_rowid_) OVER () FROM $t WHERE a = 1")[0].len(),
         if t == "k" { 4 } else { 3 },
         "a star beside a window leaves rowid out in {t}"
     );
-    assert_eq!(
-        q("SELECT MAX(rowid) AS rowid FROM $t HAVING MAX(rowid) > 0"),
-        [[int(i3)]],
-        "an alias named rowid in HAVING's aggregate in {t}"
-    );
     assert!(
-        error(db, &format!("SELECT STRING_AGG(b, rowid) FROM {t}"))
+        error(db, &format!("SELECT STRING_AGG(b, _rowid_) FROM {t}"))
             .contains("must not read the row"),
         "rowid as an aggregate's later argument reads the row in {t}"
     );
     let lagged = db
         .query(
-            &format!("SELECT *, LAG(rowid, $1) OVER (ORDER BY rowid) FROM {t} ORDER BY a"),
+            &format!("SELECT *, LAG(_rowid_, $1) OVER (ORDER BY _rowid_) FROM {t} ORDER BY a"),
             (1,),
         )
         .unwrap()
@@ -298,32 +281,14 @@ fn reads(db: &Database, t: &str, [i1, i2, i3]: [i64; 3]) {
         "a star beside a window planned at its run in {t}"
     );
     assert_eq!(
-        q("SELECT a AS rowid, SUM(rowid) OVER () FROM $t ORDER BY 1"),
-        [
-            [int(1), int(i1 + i2 + i3)],
-            [int(2), int(i1 + i2 + i3)],
-            [int(3), int(i1 + i2 + i3)]
-        ],
-        "an alias named rowid beside a window reading rowid in {t}"
-    );
-    assert_eq!(
-        q("SELECT a AS rowid FROM $t ORDER BY SUM(rowid) OVER (), a"),
+        q("SELECT a FROM $t ORDER BY SUM(_rowid_) OVER (), a"),
         [[int(1)], [int(2)], [int(3)]],
-        "a window reading rowid in ORDER BY beside an alias named rowid in {t}"
+        "a window reading rowid in ORDER BY in {t}"
     );
     assert_eq!(
-        q("SELECT a, SUM(rowid) OVER () AS s FROM $t ORDER BY s, a"),
-        [
-            [int(1), int(i1 + i2 + i3)],
-            [int(2), int(i1 + i2 + i3)],
-            [int(3), int(i1 + i2 + i3)]
-        ],
+        q("SELECT a, SUM(_rowid_) OVER () AS s FROM $t ORDER BY s, a"),
+        [[int(1), int(sum)], [int(2), int(sum)], [int(3), int(sum)]],
         "a window reading rowid ordered by its alias in {t}"
-    );
-    assert_eq!(
-        q("SELECT a AS rowid, COUNT(*) FROM $t GROUP BY _rowid_, a ORDER BY 1"),
-        [[int(1), int(1)], [int(2), int(1)], [int(3), int(1)]],
-        "an alias named rowid beside _rowid_ in {t}"
     );
 }
 
@@ -331,36 +296,26 @@ fn reads(db: &Database, t: &str, [i1, i2, i3]: [i64; 3]) {
 /// row ids `ids`, ascending, so an order by a reads them backwards
 fn clauses(db: &Database, t: &str, [i1, i2, i3]: [i64; 3]) {
     let q = |sql: &str| rows(db, &sql.replace("$t", t));
-    let cases: [(&str, Vec<Vec<Value>>); 12] = [
-        // An alias named rowid takes the name only where it takes a column's
-        ("SELECT a AS rowid FROM $t WHERE rowid = 1", vec![vec![int(30)]]),
-        (
-            "SELECT a AS rowid FROM $t ORDER BY rowid + 0",
-            vec![vec![int(30)], vec![int(20)], vec![int(10)]],
-        ),
-        (
-            "SELECT a AS rowid FROM $t GROUP BY a, rowid HAVING rowid > 15 ORDER BY 1",
-            vec![vec![int(20)], vec![int(30)]],
-        ),
-        ("SELECT a FROM $t ORDER BY rowid", vec![vec![int(30)], vec![int(20)], vec![int(10)]]),
+    let cases: [(&str, Vec<Vec<Value>>); 9] = [
+        ("SELECT a FROM $t ORDER BY _rowid_", vec![vec![int(30)], vec![int(20)], vec![int(10)]]),
         ("SELECT a FROM $t ORDER BY _rowid_ DESC LIMIT 1", vec![vec![int(10)]]),
-        ("SELECT a FROM $t ORDER BY $t.rowid LIMIT 1 OFFSET 1", vec![vec![int(20)]]),
-        ("SELECT a AS id FROM $t ORDER BY rowid LIMIT 1", vec![vec![int(30)]]),
-        ("SELECT a AS rowid FROM $t ORDER BY rowid LIMIT 1", vec![vec![int(10)]]),
-        ("SELECT a FROM $t GROUP BY rowid, a ORDER BY rowid", vec![vec![int(30)], vec![int(20)], vec![int(10)]]),
+        ("SELECT a FROM $t ORDER BY $t._rowid_ LIMIT 1 OFFSET 1", vec![vec![int(20)]]),
+        ("SELECT a AS id FROM $t ORDER BY _rowid_ LIMIT 1", vec![vec![int(30)]]),
+        ("SELECT a FROM $t ORDER BY _rowid_ + 0", vec![vec![int(30)], vec![int(20)], vec![int(10)]]),
+        ("SELECT a FROM $t GROUP BY _rowid_, a ORDER BY _rowid_", vec![vec![int(30)], vec![int(20)], vec![int(10)]]),
         (
-            "SELECT SUM(a) FROM $t GROUP BY rowid HAVING rowid > (SELECT MIN(rowid) FROM $t) ORDER BY rowid",
+            "SELECT SUM(a) FROM $t GROUP BY _rowid_ HAVING _rowid_ > (SELECT MIN(_rowid_) FROM $t) ORDER BY _rowid_",
             vec![vec![int(20)], vec![int(10)]],
         ),
-        ("SELECT a FROM $t WHERE rowid > 0 ORDER BY rowid DESC", vec![vec![int(10)], vec![int(20)], vec![int(30)]]),
-        ("SELECT COUNT(*), SUM(rowid) FROM $t", vec![vec![int(3), int(i1 + i2 + i3)]]),
+        ("SELECT a FROM $t WHERE _rowid_ > 0 ORDER BY _rowid_ DESC", vec![vec![int(10)], vec![int(20)], vec![int(30)]]),
+        ("SELECT COUNT(*), SUM(_rowid_) FROM $t", vec![vec![int(3), int(i1 + i2 + i3)]]),
     ];
     for (sql, answer) in cases {
         assert_eq!(q(sql), answer, "{sql} in {t}");
     }
     for sql in [
-        "SELECT a FROM {t} WHERE rowid = (SELECT a FROM {t})",
-        "DELETE FROM {t} WHERE rowid = (SELECT a FROM {t})",
+        "SELECT a FROM {t} WHERE _rowid_ = (SELECT a FROM {t})",
+        "DELETE FROM {t} WHERE _rowid_ = (SELECT a FROM {t})",
     ] {
         let sql = sql.replace("{t}", t);
         assert!(error(db, &sql).contains("more than one row"), "{sql}");
@@ -371,7 +326,7 @@ fn clauses(db: &Database, t: &str, [i1, i2, i3]: [i64; 3]) {
         "nothing deleted in {t}"
     );
     let by_id = db
-        .query(&format!("SELECT a FROM {t} WHERE rowid = $1"), (i2,))
+        .query(&format!("SELECT a FROM {t} WHERE _rowid_ = $1"), (i2,))
         .unwrap()
         .map(|row| row.unwrap().get_value(0).unwrap().clone())
         .collect::<Vec<_>>();
@@ -382,9 +337,9 @@ fn clauses(db: &Database, t: &str, [i1, i2, i3]: [i64; 3]) {
 fn a_statement_shaped_like_one_without_rowid_still_reads_it() {
     let db = tables("memory://rowid_shaped_alike", false);
     assert_eq!(rows(&db, "SELECT SUM(a) FROM k"), [[int(6)]]);
-    assert_eq!(rows(&db, "SELECT SUM(rowid) FROM k"), [[int(60)]]);
+    assert_eq!(rows(&db, "SELECT SUM(_rowid_) FROM k"), [[int(60)]]);
     assert_eq!(rows(&db, "SELECT SUM(a) FROM n"), [[int(6)]]);
-    assert_eq!(rows(&db, "SELECT SUM(rowid) FROM n"), [[int(6)]]);
+    assert_eq!(rows(&db, "SELECT SUM(_rowid_) FROM n"), [[int(6)]]);
 }
 
 #[test]
@@ -404,7 +359,9 @@ fn rowid_reads_alike_in_every_clause() {
             assert_eq!(
                 rows(
                     db,
-                    &format!("SELECT rowid, a AS id FROM {t} UNION ALL SELECT 9, 0 ORDER BY rowid")
+                    &format!(
+                        "SELECT _rowid_, a AS id FROM {t} UNION ALL SELECT 9, 0 ORDER BY _rowid_"
+                    )
                 ),
                 [
                     [int(1), int(30)],
@@ -418,7 +375,7 @@ fn rowid_reads_alike_in_every_clause() {
                 rows(
                     db,
                     &format!(
-                        "SELECT SUM(rowid) AS s FROM {t} UNION ALL SELECT 0 ORDER BY SUM(rowid)"
+                        "SELECT SUM(_rowid_) AS s FROM {t} UNION ALL SELECT 0 ORDER BY SUM(_rowid_)"
                     )
                 ),
                 [[int(0)], [int(6)]],
@@ -428,7 +385,7 @@ fn rowid_reads_alike_in_every_clause() {
                 rows(
                     db,
                     &format!(
-                        "SELECT rowid + 0 FROM {t} UNION ALL SELECT 9 ORDER BY rowid + 0 DESC"
+                        "SELECT _rowid_ + 0 FROM {t} UNION ALL SELECT 9 ORDER BY _rowid_ + 0 DESC"
                     )
                 ),
                 [[int(9)], [int(3)], [int(2)], [int(1)]],
@@ -436,25 +393,28 @@ fn rowid_reads_alike_in_every_clause() {
             );
         }
         assert_eq!(
-            rows(db, "SELECT rowid, rowid + 0 FROM nr WHERE a = 10"),
+            rows(db, "SELECT _rowid_, _rowid_ + 0 FROM nr WHERE a = 10"),
             [[int(3), int(3)]]
         );
         assert_eq!(
             rows(
                 db,
-                "SELECT SUM(kr.rowid), COUNT(*) FROM kr JOIN k ON kr.rowid = k.id / 10"
+                "SELECT SUM(kr._rowid_), COUNT(*) FROM kr JOIN k ON kr._rowid_ = k.id / 10"
             ),
             [[int(6), int(3)]]
         );
         assert_eq!(
             rows(
                 db,
-                "SELECT kr.a FROM kr JOIN k ON kr.rowid = k.id / 10 ORDER BY kr.rowid"
+                "SELECT kr.a FROM kr JOIN k ON kr._rowid_ = k.id / 10 ORDER BY kr._rowid_"
             ),
             [[int(30)], [int(20)], [int(10)]]
         );
         assert!(db
-            .query("INSERT INTO nr VALUES (10) ON CONFLICT (a) DO UPDATE SET a = 10 RETURNING nr.rowid", ())
+            .query(
+                "INSERT INTO nr VALUES (10) ON CONFLICT (a) DO UPDATE SET a = 10 RETURNING nr._rowid_",
+                ()
+            )
             .map(|rows| rows.into_iter().any(|row| row.is_err()))
             .unwrap_or(true));
         assert_eq!(rows(db, "SELECT COUNT(*) FROM nr"), [[int(3)]]);
@@ -462,7 +422,28 @@ fn rowid_reads_alike_in_every_clause() {
 }
 
 #[test]
-fn a_primary_key_named_like_a_pseudo_column_or_a_literal_reads_as_itself() {
+fn a_set_operation_over_a_join_keeps_the_rowid_of_its_side() {
+    each_layout("using", |db| {
+        for sql in [
+            "CREATE TABLE ua (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE ub (id INTEGER PRIMARY KEY)",
+            "INSERT INTO ua VALUES (1)",
+            "INSERT INTO ub VALUES (2)",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        assert_eq!(
+            rows(
+                db,
+                "SELECT ub._rowid_ FROM ua LEFT JOIN ub USING (id) UNION ALL SELECT -1"
+            ),
+            [[Value::null_unknown()], [int(-1)]]
+        );
+    });
+}
+
+#[test]
+fn a_primary_key_named_rowid_or_like_a_literal_reads_as_itself() {
     each_layout("named_key", |db| {
         for sql in [
             "CREATE TABLE p1 (rowid INTEGER PRIMARY KEY)",
@@ -477,14 +458,14 @@ fn a_primary_key_named_like_a_pseudo_column_or_a_literal_reads_as_itself() {
             [[int(7), int(7)]]
         );
         assert_eq!(
-            rows(db, "SELECT CAST(rowid AS INTEGER), p2.rowid FROM p2"),
+            rows(db, "SELECT CAST(_rowid_ AS INTEGER), p2._rowid_ FROM p2"),
             [[int(8), int(8)]]
         );
-        assert!(error(db, "SELECT SUM(rowid) FROM p2").contains("not found"));
+        assert!(error(db, "SELECT SUM(_rowid_) FROM p2").contains("not found"));
         assert_eq!(
             rows(
                 db,
-                "INSERT INTO p2 VALUES (9) RETURNING CAST(rowid AS INTEGER)"
+                "INSERT INTO p2 VALUES (9) RETURNING CAST(_rowid_ AS INTEGER)"
             ),
             [[int(9)]]
         );
@@ -504,7 +485,7 @@ fn a_nearest_read_by_an_index_carries_the_rowid() {
         assert_eq!(
             rows(
                 db,
-                "SELECT rowid FROM h WHERE rowid > 0 ORDER BY VEC_DISTANCE_L2(v, '[0,0]') LIMIT 1"
+                "SELECT _rowid_ FROM h WHERE _rowid_ > 0 ORDER BY VEC_DISTANCE_L2(v, '[0,0]') LIMIT 1"
             ),
             [[int(2)]]
         );
@@ -522,16 +503,16 @@ fn an_index_ordered_read_carries_the_rowid() {
             db.execute(sql, ()).unwrap();
         }
         assert_eq!(
-            rows(db, "SELECT rowid FROM o ORDER BY a LIMIT 1"),
+            rows(db, "SELECT _rowid_ FROM o ORDER BY a LIMIT 1"),
             [[int(2)]]
         );
         assert_eq!(
-            rows(db, "SELECT rowid, a FROM o ORDER BY a DESC LIMIT 1"),
+            rows(db, "SELECT _rowid_, a FROM o ORDER BY a DESC LIMIT 1"),
             [[int(1), int(20)]]
         );
         // The ids order the rows against their values here
         assert_eq!(
-            rows(db, "SELECT a FROM o ORDER BY (SELECT o.rowid) DESC"),
+            rows(db, "SELECT a FROM o ORDER BY (SELECT o._rowid_) DESC"),
             [[int(10)], [int(20)]]
         );
     });
@@ -541,27 +522,19 @@ fn an_index_ordered_read_carries_the_rowid() {
 fn a_returned_row_carries_its_rowid() {
     each_layout("returned", |db| {
         assert_eq!(
-            names(db, "INSERT INTO r VALUES (300, 3) RETURNING *, rowid"),
-            ["rowid", "a", "rowid"]
-        );
-        assert_eq!(
-            rows(db, "INSERT INTO r VALUES (400, 4) RETURNING *, rowid"),
-            [[int(400), int(4), int(400)]]
+            names(db, "INSERT INTO n VALUES (4, 'w') RETURNING *, _rowid_"),
+            ["a", "b", "_rowid_"]
         );
         assert_eq!(
             rows(
                 db,
-                "INSERT INTO n VALUES (4, 'w') RETURNING rowid, (SELECT 1)"
+                "INSERT INTO n VALUES (5, 'v') RETURNING _rowid_, (SELECT 1)"
             ),
-            [[int(4), int(1)]]
+            [[int(5), int(1)]]
         );
-        let mut deleted = rows(db, "DELETE FROM n RETURNING rowid");
+        let mut deleted = rows(db, "DELETE FROM n RETURNING _rowid_");
         deleted.sort_by_key(|row| row[0].as_int64());
-        assert_eq!(deleted, [[int(1)], [int(2)], [int(3)], [int(4)]]);
-        db.execute("CREATE TABLE q (\"true\" INTEGER PRIMARY KEY)", ())
-            .unwrap();
-        db.execute("INSERT INTO q VALUES (7)", ()).unwrap();
-        assert_eq!(rows(db, "SELECT CAST(rowid AS INTEGER) FROM q"), [[int(7)]]);
+        assert_eq!(deleted, [[int(1)], [int(2)], [int(3)], [int(4)], [int(5)]]);
     });
 }
 
@@ -576,8 +549,8 @@ fn rowid_reads_the_assigned_id_of_a_table_without_a_key() {
 }
 
 #[test]
-fn a_column_named_rowid_wins_over_the_row_identity() {
-    each_layout("real_column", |db| {
+fn a_column_named_rowid_is_an_ordinary_column() {
+    each_layout("plain_rowid", |db| {
         assert_eq!(
             rows(db, "SELECT rowid, _rowid_ FROM r ORDER BY a"),
             [[int(100), int(1)], [int(200), int(2)]]
@@ -585,10 +558,38 @@ fn a_column_named_rowid_wins_over_the_row_identity() {
         db.execute("UPDATE r SET rowid = 300 WHERE a = 1", ())
             .unwrap();
         assert_eq!(
-            rows(db, "SELECT rowid FROM r ORDER BY a"),
-            [[int(300)], [int(200)]]
+            rows(db, "SELECT a AS rowid FROM k ORDER BY rowid DESC"),
+            [[int(3)], [int(2)], [int(1)]]
         );
+        assert!(error(db, "SELECT rowid FROM n").contains("not found"));
     });
+}
+
+#[test]
+fn no_column_and_no_alias_takes_the_name_of_the_row_identity() {
+    let db = tables("memory://rowid_reserved", false);
+    for sql in [
+        "CREATE TABLE x (_rowid_ INTEGER)",
+        "CREATE TABLE x (a INTEGER, _ROWID_ TEXT)",
+        "ALTER TABLE n ADD COLUMN _rowid_ INTEGER",
+        "ALTER TABLE n RENAME COLUMN a TO _rowid_",
+        "CREATE TABLE x AS SELECT _rowid_ FROM n",
+        "SELECT a AS _rowid_ FROM n",
+        "SELECT a _rowid_ FROM n",
+        "WITH c (_rowid_) AS (SELECT 1) SELECT * FROM c",
+        "SELECT * FROM (VALUES (1)) v (_rowid_)",
+        "SELECT (SELECT a AS _rowid_ FROM n WHERE a = 1)",
+        "UPDATE n SET a = a RETURNING a AS _rowid_",
+        "DELETE FROM n WHERE a = 0 RETURNING a AS _rowid_",
+        "INSERT INTO n VALUES (9, 'q') RETURNING a AS _rowid_",
+    ] {
+        let message = match db.execute(sql, ()) {
+            Ok(_) => panic!("{sql}: no error"),
+            Err(e) => e.to_string(),
+        };
+        assert!(message.contains("row's identity"), "{sql}: {message}");
+    }
+    assert_eq!(rows(&db, "SELECT COUNT(*) FROM n"), [[int(3)]]);
 }
 
 #[test]
@@ -598,7 +599,7 @@ fn rowid_is_read_by_writes_and_never_written() {
             assert_eq!(
                 rows(
                     db,
-                    &format!("UPDATE {t} SET a = a + 10 WHERE rowid = {i2} RETURNING rowid, a")
+                    &format!("UPDATE {t} SET a = a + 10 WHERE _rowid_ = {i2} RETURNING _rowid_, a")
                 ),
                 [[int(i2), int(12)]],
                 "UPDATE in {t}"
@@ -606,7 +607,7 @@ fn rowid_is_read_by_writes_and_never_written() {
             assert_eq!(
                 rows(
                     db,
-                    &format!("UPDATE {t} SET a = rowid WHERE a = 1 RETURNING a")
+                    &format!("UPDATE {t} SET a = _rowid_ WHERE a = 1 RETURNING a")
                 ),
                 [[int(if t == "k" { 10 } else { 1 })]],
                 "SET reading rowid in {t}"
@@ -614,15 +615,14 @@ fn rowid_is_read_by_writes_and_never_written() {
             assert_eq!(
                 rows(
                     db,
-                    &format!("DELETE FROM {t} WHERE rowid = {i3} RETURNING rowid, b")
+                    &format!("DELETE FROM {t} WHERE _rowid_ = {i3} RETURNING _rowid_, b")
                 ),
                 [[int(i3), text("z")]],
                 "DELETE in {t}"
             );
             for sql in [
-                format!("UPDATE {t} SET rowid = 5"),
                 format!("UPDATE {t} SET _rowid_ = 5"),
-                format!("INSERT INTO {t} (rowid, a) VALUES (5, 5)"),
+                format!("INSERT INTO {t} (_rowid_, a) VALUES (5, 5)"),
             ] {
                 assert!(
                     db.execute(&sql, ())
@@ -634,18 +634,18 @@ fn rowid_is_read_by_writes_and_never_written() {
             }
         }
         assert_eq!(
-            rows(db, "INSERT INTO k VALUES (40, 4, 'w') RETURNING rowid"),
+            rows(db, "INSERT INTO k VALUES (40, 4, 'w') RETURNING _rowid_"),
             [[int(40)]]
         );
         assert_eq!(
             rows(
                 db,
-                "INSERT INTO n VALUES (4, 'w'), (5, 'v') RETURNING rowid, a"
+                "INSERT INTO n VALUES (4, 'w'), (5, 'v') RETURNING _rowid_, a"
             ),
             [[int(4), int(4)], [int(5), int(5)]]
         );
         assert_eq!(
-            rows(db, "SELECT rowid, a FROM n ORDER BY rowid"),
+            rows(db, "SELECT _rowid_, a FROM n ORDER BY _rowid_"),
             [
                 [int(1), int(1)],
                 [int(2), int(12)],
@@ -662,13 +662,13 @@ fn a_join_reads_a_keyed_side_rowid_and_refuses_a_keyless_one() {
         assert_eq!(
             rows(
                 db,
-                "SELECT k.rowid, n.a FROM k JOIN n ON k.a = n.a ORDER BY 1"
+                "SELECT k._rowid_, n.a FROM k JOIN n ON k.a = n.a ORDER BY 1"
             ),
             [[int(10), int(1)], [int(20), int(2)], [int(30), int(3)]]
         );
-        assert!(error(db, "SELECT n.rowid FROM k JOIN n ON k.a = n.a").contains("not found"));
-        assert!(error(db, "SELECT rowid FROM k JOIN n ON k.a = n.a").contains("ambiguous"));
-        assert!(error(db, "SELECT rowid FROM k x JOIN k y ON x.a = y.a").contains("ambiguous"));
+        assert!(error(db, "SELECT n._rowid_ FROM k JOIN n ON k.a = n.a").contains("not found"));
+        assert!(error(db, "SELECT _rowid_ FROM k JOIN n ON k.a = n.a").contains("ambiguous"));
+        assert!(error(db, "SELECT _rowid_ FROM k x JOIN k y ON x.a = y.a").contains("ambiguous"));
     });
 }
 
@@ -679,8 +679,8 @@ fn a_keyless_table_reads_the_rows_its_rowid_names_by_id() {
     let dir = tempfile::tempdir().unwrap();
     let db = tables(&format!("file://{}", dir.path().display()), true);
     for sql in [
-        "SELECT a FROM n WHERE rowid = 2",
-        "SELECT a FROM n WHERE rowid IN (1, 3) ORDER BY a",
+        "SELECT a FROM n WHERE _rowid_ = 2",
+        "SELECT a FROM n WHERE _rowid_ IN (1, 3) ORDER BY a",
     ] {
         take_read_paths();
         assert!(!rows(&db, sql).is_empty(), "{sql}");
@@ -705,9 +705,9 @@ fn a_keyless_table_keeps_its_row_ids_across_a_reopen() {
     }
     let db = Database::open(&dsn).unwrap();
     assert_eq!(
-        rows(&db, "SELECT rowid, a FROM n ORDER BY rowid"),
+        rows(&db, "SELECT _rowid_, a FROM n ORDER BY _rowid_"),
         [[int(2), int(2)], [int(3), int(3)], [int(4), int(4)]]
     );
     db.execute("INSERT INTO n VALUES (5, 'v')", ()).unwrap();
-    assert_eq!(rows(&db, "SELECT rowid FROM n WHERE a = 5"), [[int(5)]]);
+    assert_eq!(rows(&db, "SELECT _rowid_ FROM n WHERE a = 5"), [[int(5)]]);
 }

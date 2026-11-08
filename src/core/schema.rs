@@ -883,9 +883,24 @@ impl Default for Schema {
 /// column past its own that no statement can spell
 pub const ROWID_SLOT: &str = "\u{0}rowid";
 
+/// The name the row's identity is read under, which no column and no alias
+/// may take
+pub const ROWID_NAME: &str = "_rowid_";
+
 /// Whether `name_lower` spells the row's identity
 pub fn is_rowid_name(name_lower: &str) -> bool {
-    matches!(name_lower, "rowid" | "_rowid_")
+    name_lower == ROWID_NAME
+}
+
+/// An error unless `name` may name a column or an alias: the row's identity
+/// is no column's name
+pub fn check_column_name(name: &str) -> Result<()> {
+    match name.eq_ignore_ascii_case(ROWID_NAME) {
+        true => Err(Error::invalid_argument(format!(
+            "{name} is the row's identity and names no column or alias"
+        ))),
+        false => Ok(()),
+    }
 }
 
 impl fmt::Display for Schema {

@@ -184,7 +184,7 @@ Running `VACUUM` (or `PRAGMA vacuum`) permanently removes all historical row ver
 ### Limitations
 
 - A view cannot read a table AS OF, and AS OF on a view or a CTE is an error
-- A table read AS OF has no [`rowid`]({% link _docs/sql-features/rowid.md %}); its primary key column reads as usual
+- A table read AS OF has no [`_rowid_`]({% link _docs/sql-features/rowid.md %}); its primary key column reads as usual
 - The timestamp resolution depends on the system clock precision
 
 ## Use Cases
