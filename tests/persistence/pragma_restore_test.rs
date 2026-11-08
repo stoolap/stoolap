@@ -575,6 +575,9 @@ fn payload(id: i64) -> String {
 
 #[test]
 fn test_restore_a_snapshot_past_16_mib_twice() {
+    // Serialised with the test that makes promotion fail
+    #[cfg(feature = "test-failpoints")]
+    let _failpoints = stoolap::test_failpoints::FailpointGuard::new();
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
     db.execute(

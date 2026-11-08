@@ -1425,6 +1425,9 @@ fn copy_v037db_with_a_large_snapshot(db_dir: &std::path::Path) {
 
 #[test]
 fn test_migration_v037_large_snapshot_reads_from_volumes_after_snapshots_go() {
+    // Serialised with the test that makes promotion fail
+    #[cfg(feature = "test-failpoints")]
+    let _failpoints = stoolap::test_failpoints::FailpointGuard::new();
     let tmp = tempfile::tempdir().unwrap();
     let db_dir = tmp.path().join("large");
     copy_v037db_with_a_large_snapshot(&db_dir);
@@ -1449,6 +1452,9 @@ fn test_migration_v037_large_snapshot_reads_from_volumes_after_snapshots_go() {
 
 #[test]
 fn test_migration_v037_large_snapshot_that_cannot_be_promoted_fails_the_open() {
+    // Serialised with the test that makes promotion fail
+    #[cfg(feature = "test-failpoints")]
+    let _failpoints = stoolap::test_failpoints::FailpointGuard::new();
     let tmp = tempfile::tempdir().unwrap();
     let db_dir = tmp.path().join("blocked");
     copy_v037db_with_a_large_snapshot(&db_dir);
@@ -1467,4 +1473,44 @@ fn test_migration_v037_large_snapshot_that_cannot_be_promoted_fails_the_open() {
         db_dir.join("snapshots").join("big").exists(),
         "the snapshot went with the failed open"
     );
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_migration_v037_a_promotion_that_failed_part_way_migrates_again_at_the_next_open() {
+    use std::sync::atomic::Ordering;
+    use stoolap::test_failpoints::{FailpointGuard, SNAPSHOT_VOLUME_COPY_FAIL};
+
+    let _failpoints = FailpointGuard::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let db_dir = tmp.path().join("retried");
+    copy_v037db_with_a_large_snapshot(&db_dir);
+    let dsn = format!("file://{}", db_dir.display());
+
+    SNAPSHOT_VOLUME_COPY_FAIL.store(true, Ordering::Release);
+    let first = Database::open(&dsn);
+    SNAPSHOT_VOLUME_COPY_FAIL.store(false, Ordering::Release);
+    assert!(
+        first.is_err(),
+        "the open succeeded without the table's copy"
+    );
+    drop(first);
+
+    let db = Database::open(&dsn).unwrap();
+    assert!(
+        !db_dir.join("snapshots").exists(),
+        "the migration left snapshots/"
+    );
+    assert_eq!(query_i64(&db, "SELECT COUNT(*) FROM big"), 100_000);
+    assert_eq!(
+        query_i64(&db, "SELECT SUM(LENGTH(payload)) FROM big"),
+        200 * 100_000
+    );
+    assert_eq!(
+        query_str(&db, "SELECT payload FROM big WHERE id = 77777"),
+        Some(payload(77777))
+    );
+    assert_eq!(query_i64(&db, "SELECT COUNT(*) FROM users"), 13);
+    assert_eq!(query_i64(&db, "SELECT COUNT(*) FROM orders"), 22);
+    db.close().unwrap();
 }

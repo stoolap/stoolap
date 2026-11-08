@@ -648,6 +648,17 @@ fn write_snapshot_metadata(path: &std::path::Path, lsn: u64) -> Result<()> {
     Ok(())
 }
 
+/// Removes the table directories a failed snapshot migration made under
+/// `vol_dir`: the migration starts only when it holds none, and one left
+/// without a manifest would make the next open skip the snapshots
+fn remove_migration_volumes(vol_dir: &std::path::Path) {
+    for entry in std::fs::read_dir(vol_dir).into_iter().flatten().flatten() {
+        if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// Read snapshot LSN from either binary or JSON format (backward compatibility)
 fn read_snapshot_lsn(snapshot_dir: &std::path::Path) -> u64 {
     // First try new binary format
@@ -1265,7 +1276,13 @@ impl MVCCEngine {
                     lsn
                 } else if has_legacy_snapshots {
                     // Legacy path: load snapshots (creates schemas + version stores)
-                    let snapshot_lsn = self.load_snapshots()?;
+                    let snapshot_lsn = match self.load_snapshots() {
+                        Ok(lsn) => lsn,
+                        Err(e) => {
+                            remove_migration_volumes(&pm.path().join("volumes"));
+                            return Err(e);
+                        }
+                    };
                     self.load_standalone_volumes();
                     snapshot_lsn
                 } else {
@@ -1960,7 +1977,14 @@ impl MVCCEngine {
         let tmp_path = table_vol_dir.join(format!("{}.tmp", dest_name));
 
         // Use fs::copy for streaming kernel-level copy (no userspace memory spike)
-        if let Err(e) = std::fs::copy(vol_path, &tmp_path) {
+        let copied = std::fs::copy(vol_path, &tmp_path);
+        #[cfg(feature = "test-failpoints")]
+        let copied = match crate::test_failpoints::SNAPSHOT_VOLUME_COPY_FAIL.load(Ordering::Acquire)
+        {
+            true => Err(std::io::Error::other("injected copy failure")),
+            false => copied,
+        };
+        if let Err(e) = copied {
             eprintln!(
                 "Warning: Failed to copy snapshot vol for {}: {}",
                 table_name, e

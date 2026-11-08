@@ -77,13 +77,17 @@ fn barrier_unsupported(code: Option<i32>) -> bool {
 const CATALOG_FILE: &str = "volumes.catalog";
 
 /// Write a frozen volume to disk atomically (V5 format, LZ4 compressed),
-/// its rows fed to the streaming writer the seal uses
+/// its rows fed to the streaming writer the seal uses. A volume already
+/// bound to a file is refused before anything is written; the writes
+/// take turns, so a check and its bind are never split by another write
 pub fn write_volume_to_disk(
     dir: &Path,
     table_name: &str,
     volume_id: u64,
     volume: &FrozenVolume,
 ) -> Result<PathBuf> {
+    static WRITES: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    let _turn = WRITES.lock();
     if volume.meta.file_identity.get().is_some() {
         return Err(crate::core::Error::internal(
             "the volume already belongs to another file",
@@ -108,15 +112,8 @@ pub fn write_volume_to_disk(
         writer.add_row(row_id, &volume.get_row(idx)?)?;
     }
     let (written, path) = writer.finish()?;
-    // A write that raced this one bound the volume first: this file goes
     if let Some(&identity) = written.meta.file_identity.get() {
-        if volume.meta.file_identity.set(identity).is_err() {
-            drop(written);
-            let _ = std::fs::remove_file(&path);
-            return Err(crate::core::Error::internal(
-                "the volume already belongs to another file",
-            ));
-        }
+        let _ = volume.meta.file_identity.set(identity);
     }
     Ok(path)
 }
@@ -1637,36 +1634,34 @@ mod tests {
 
     #[test]
     fn of_two_writes_of_a_volume_at_once_one_binds_it_and_the_other_leaves_no_file() {
-        let vol = mixed_volume(100_000);
-        let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
-        let start = std::sync::Barrier::new(2);
-        let results: Vec<Result<PathBuf>> = std::thread::scope(|s| {
-            let writes: Vec<_> = dirs
-                .iter()
-                .map(|dir| {
-                    let (vol, start) = (&vol, &start);
-                    s.spawn(move || {
-                        start.wait();
-                        write_volume_to_disk(dir.path(), "t", 1, vol)
+        // Two directories, then one: the same target for both writes
+        for targets in [2, 1] {
+            let vol = mixed_volume(100_000);
+            let dirs = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+            let start = std::sync::Barrier::new(2);
+            let results: Vec<Result<PathBuf>> = std::thread::scope(|s| {
+                let writes: Vec<_> = (0..2)
+                    .map(|n| {
+                        let (vol, start, dir) = (&vol, &start, dirs[n % targets].path());
+                        s.spawn(move || {
+                            start.wait();
+                            write_volume_to_disk(dir, "t", 1, vol)
+                        })
                     })
-                })
+                    .collect();
+                writes.into_iter().map(|w| w.join().unwrap()).collect()
+            });
+            let bound: Vec<&PathBuf> = results.iter().flatten().collect();
+            assert_eq!(bound.len(), 1, "{targets} targets: {results:?}");
+            let file = read_volume_from_disk(bound[0]).unwrap();
+            assert_eq!(file.meta.file_identity.get(), vol.meta.file_identity.get());
+            let left: Vec<_> = dirs
+                .iter()
+                .map(|dir| dir.path().join("t").join(format!("vol_{:016x}.vol", 1)))
+                .filter(|path| path.exists())
                 .collect();
-            writes.into_iter().map(|w| w.join().unwrap()).collect()
-        });
-        let bound: Vec<&PathBuf> = results.iter().flatten().collect();
-        assert_eq!(bound.len(), 1, "{results:?}");
-        let file = read_volume_from_disk(bound[0]).unwrap();
-        assert_eq!(file.meta.file_identity.get(), vol.meta.file_identity.get());
-        let left: Vec<_> = dirs
-            .iter()
-            .map(|dir| dir.path().join("t").join(format!("vol_{:016x}.vol", 1)))
-            .filter(|path| path.exists())
-            .collect();
-        assert_eq!(
-            left,
-            vec![bound[0].clone()],
-            "the refused write left a file"
-        );
+            assert_eq!(left, vec![bound[0].clone()], "{targets} targets");
+        }
     }
 }
 
