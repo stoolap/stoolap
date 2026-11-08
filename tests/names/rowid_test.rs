@@ -357,6 +357,15 @@ fn clauses(db: &Database, t: &str, [i1, i2, i3]: [i64; 3]) {
 }
 
 #[test]
+fn a_statement_shaped_like_one_without_rowid_still_reads_it() {
+    let db = tables("memory://rowid_shaped_alike", false);
+    assert_eq!(rows(&db, "SELECT SUM(a) FROM k"), [[int(6)]]);
+    assert_eq!(rows(&db, "SELECT SUM(rowid) FROM k"), [[int(60)]]);
+    assert_eq!(rows(&db, "SELECT SUM(a) FROM n"), [[int(6)]]);
+    assert_eq!(rows(&db, "SELECT SUM(rowid) FROM n"), [[int(6)]]);
+}
+
+#[test]
 fn rowid_reads_alike_in_every_clause() {
     each_layout("clauses", |db| {
         for sql in [
@@ -369,6 +378,21 @@ fn rowid_reads_alike_in_every_clause() {
         }
         clauses(db, "kr", [1, 2, 3]);
         clauses(db, "nr", [1, 2, 3]);
+        for t in ["kr", "nr"] {
+            assert_eq!(
+                rows(
+                    db,
+                    &format!("SELECT rowid, a AS id FROM {t} UNION ALL SELECT 9, 0 ORDER BY rowid")
+                ),
+                [
+                    [int(1), int(30)],
+                    [int(2), int(20)],
+                    [int(3), int(10)],
+                    [int(9), int(0)]
+                ],
+                "a set operation's ORDER BY names its output in {t}"
+            );
+        }
         assert_eq!(
             rows(db, "SELECT rowid, rowid + 0 FROM nr WHERE a = 10"),
             [[int(3), int(3)]]

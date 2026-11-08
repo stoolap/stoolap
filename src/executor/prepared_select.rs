@@ -2438,6 +2438,11 @@ fn spelled_statement(
         GroupByModifier::GroupingSets(sets) => sets.as_mut_slice(),
         _ => &mut [],
     };
+    // A set operation's ORDER BY sorts its output, whose columns it names
+    let order_by = match stmt.set_operations.is_empty() {
+        true => out.order_by.as_mut_slice(),
+        false => &mut [],
+    };
     for expr in out
         .distinct_on
         .iter_mut()
@@ -2445,7 +2450,7 @@ fn spelled_statement(
         .chain(sets.iter_mut().flatten())
         .chain(out.where_clause.as_deref_mut())
         .chain(out.having.as_deref_mut())
-        .chain(out.order_by.iter_mut().map(|o| &mut o.expression))
+        .chain(order_by.iter_mut().map(|o| &mut o.expression))
     {
         *expr = spell(expr, &aliases)?;
     }

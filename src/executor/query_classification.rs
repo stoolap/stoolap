@@ -828,6 +828,8 @@ fn hash_classification_inputs<H: std::hash::Hasher>(stmt: &SelectStatement, hash
     stmt.having.is_some().hash(hasher);
     stmt.with.is_some().hash(hasher);
     stmt.set_operations.len().hash(hasher);
+    // The one input of the classification a name decides
+    super::utils::names_rowid(stmt).hash(hasher);
 
     // Hash DISTINCT ON expression structures
     for expr in &stmt.distinct_on {
