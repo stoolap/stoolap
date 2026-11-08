@@ -569,7 +569,7 @@ fn read_volume_v5(
     // A column's bloom words are read on its first probe
     let cols = meta.col_type_tags.len();
     let places = match opened.deferred.iter().find(|s| s.0 == V5_BLOOMS) {
-        Some(&(_, enc, at, len)) => {
+        Some(&(_, enc, at, len, _)) => {
             super::format::v5_bloom_places(enc, at, len, cols, &read_at).map_err(fail)?
         }
         None => (0..cols).map(|_| None).collect(),
@@ -710,9 +710,14 @@ pub fn verify_volume_file(
         Ok(file) => file,
         Err(e) => return VolumeCheck::Unreadable(format!("{:?}: {}", path, e)),
     };
+    // A file shorter than a magic is no V5 file; any other failed read
+    // leaves its format unknown
     let mut magic = [0u8; 4];
-    let v5 =
-        super::writer::read_exact_at(&file, &mut magic, 0).is_ok() && magic == super::v5::V5_MAGIC;
+    let v5 = match super::writer::read_exact_at(&file, &mut magic, 0) {
+        Ok(()) => magic == super::v5::V5_MAGIC,
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => false,
+        Err(e) => return VolumeCheck::Unreadable(format!("{:?}: {}", path, e)),
+    };
     if !v5 {
         // A V4 file carries no identity: where the manifest recorded one,
         // it is not the file written for the segment
@@ -765,7 +770,7 @@ fn verify_v5(
     let cols = meta.col_type_tags.len();
     let name = |col: usize| meta.column_names.get(col).map_or("?", String::as_str);
     let mut buf = Vec::new();
-    if let Some(&(_, enc, at, len)) = opened.deferred.iter().find(|s| s.0 == V5_BLOOMS) {
+    if let Some(&(_, enc, at, len, _)) = opened.deferred.iter().find(|s| s.0 == V5_BLOOMS) {
         let places = super::format::v5_bloom_places(enc, at, len, cols, &read_at)?;
         for (col, place) in places.iter().enumerate() {
             let Some(place) = place else { continue };
@@ -781,7 +786,11 @@ fn verify_v5(
     }
     // The sections the open left unread, whole: the bloom section's header
     // and an unknown optional section are covered only here
-    for &(kind, at, stored, crc) in &opened.unread {
+    let deferred = opened
+        .deferred
+        .iter()
+        .map(|&(kind, _, at, len, crc)| (kind, at, len, crc));
+    for (kind, at, stored, crc) in deferred.chain(opened.skipped.iter().copied()) {
         let stored = usize::try_from(stored)
             .map_err(|_| damaged(format!("section {kind} length exceeds the address space")))?;
         buf.resize(stored, 0);
@@ -1758,6 +1767,38 @@ mod tests {
         assert!(error.to_string().contains("already belongs"), "{error}");
         assert_eq!(std::fs::read(&path).unwrap(), before, "the file changed");
         assert_eq!(read_volume_from_disk(&path).unwrap().meta.row_count, 100);
+    }
+
+    #[test]
+    fn a_failed_first_read_is_unreadable_not_another_format() {
+        // A directory opens and fails its first read
+        let dir = tempfile::tempdir().unwrap();
+        let handle = super::super::writer::VolumeFile::shared(dir.path());
+        let recorded = super::super::writer::FileIdentity {
+            len: 1,
+            nonce: 2,
+            table_crc: 3,
+        };
+        let check = verify_volume_file(&handle, Some(&recorded));
+        assert!(matches!(check, VolumeCheck::Unreadable(_)), "{check:?}");
+    }
+
+    #[test]
+    fn a_volume_open_lists_no_skipped_section_and_allocates_none_for_it() {
+        use super::super::format::{
+            V5_BLOOMS, V5_COLUMNS, V5_DICT, V5_GROUPS, V5_ROW_IDS, V5_STATS, V5_ZONES,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_volume_to_disk(dir.path(), "t", 1, &mixed_volume(1_000)).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let len = file.metadata().unwrap().len();
+        let read_at = |buf: &mut [u8], at: u64| super::super::writer::read_exact_at(&file, buf, at);
+        let known = [
+            V5_COLUMNS, V5_GROUPS, V5_DICT, V5_ROW_IDS, V5_ZONES, V5_STATS,
+        ];
+        let opened = super::super::v5::open(len, &known, &[V5_BLOOMS], &read_at).unwrap();
+        assert_eq!(opened.skipped.capacity(), 0, "the open allocated a list");
+        assert_eq!(opened.deferred.len(), 1, "the bloom section, deferred");
     }
 
     #[test]
