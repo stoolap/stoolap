@@ -2025,6 +2025,8 @@ pub struct VolumeMeta {
     /// Positions sorted by row id when the ids are not ascending, built on
     /// first use; None when a binary search over `row_ids` works
     pub row_order: std::sync::OnceLock<Option<Box<[u32]>>>,
+    /// Where the V5 file holds `row_order`, read instead of sorting
+    pub locator: Option<LocatorPlace>,
     /// Whether the time/integer columns are sorted (enables binary search)
     pub sorted_columns: Vec<bool>,
     /// Precomputed lowercase column name -> index map for O(1) lookup.
@@ -2039,6 +2041,49 @@ pub struct VolumeMeta {
     /// The identity of the V5 file the volume was written to or read from,
     /// which the manifest records and an open compares
     pub file_identity: std::sync::OnceLock<FileIdentity>,
+}
+
+/// The locator section of a V5 file: its offset, its length and its CRC
+#[derive(Clone)]
+pub struct LocatorPlace {
+    pub file: Arc<VolumeFile>,
+    pub at: u64,
+    pub len: u64,
+    pub crc: u32,
+}
+
+impl LocatorPlace {
+    /// The positions in row id order the file holds, when they read, match
+    /// their CRC and order `ids`; None otherwise, for the caller to sort.
+    /// In bounds and strictly ascending by distinct ids, they are a
+    /// permutation
+    fn read(&self, ids: &[i64]) -> Option<Box<[u32]>> {
+        if self.len != ids.len() as u64 * 4 {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(ids.len() * 4).ok()?;
+        bytes.resize(ids.len() * 4, 0);
+        read_exact_at(&*self.file.block_reader().ok()?, &mut bytes, self.at).ok()?;
+        if super::v5::checksum(&bytes) != self.crc {
+            return None;
+        }
+        let order: Box<[u32]> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| u32::from_le_bytes(*b))
+            .collect();
+        let mut last = None;
+        for &position in order.iter() {
+            let id = *ids.get(position as usize)?;
+            if last.is_some_and(|last| id <= last) {
+                return None;
+            }
+            last = Some(id);
+        }
+        Some(order)
+    }
 }
 
 /// What tells one V5 volume file from any other: its length, its random
@@ -3098,6 +3143,7 @@ impl VolumeBuilder {
             column_types,
             row_ids: std::mem::take(&mut self.row_ids),
             row_order: std::sync::OnceLock::from(row_order),
+            locator: None,
             sorted_columns: std::mem::take(&mut self.sorted),
             column_name_map,
             row_groups,
@@ -3760,6 +3806,7 @@ impl VolumeBuilder {
                 column_types,
                 row_ids: self.row_ids,
                 row_order: std::sync::OnceLock::from(row_order),
+                locator: None,
                 sorted_columns,
                 column_name_map,
                 row_groups,
@@ -4193,6 +4240,10 @@ impl FrozenVolume {
         self.meta
             .row_order
             .get_or_init(|| {
+                // The file's locator, when it reads and holds; else sorted
+                if let Some(order) = self.meta.locator.as_ref().and_then(|l| l.read(ids)) {
+                    return Some(order);
+                }
                 let order = (!ids.windows(2).all(|w| w[0] < w[1])).then(|| row_order_of(ids));
                 #[cfg(feature = "test-failpoints")]
                 if order.is_some() {
@@ -4230,7 +4281,7 @@ impl FrozenVolume {
 
     /// Position of `row_id` in this volume in whatever order its rows were
     /// added: a binary search over ascending ids, otherwise over a
-    /// permutation built on first use
+    /// permutation read from the file or built on first use
     pub fn locate(&self, row_id: i64) -> Option<usize> {
         let ids = &self.meta.row_ids;
         let (Some(&first), Some(&last)) = (ids.first(), ids.last()) else {
@@ -5452,5 +5503,35 @@ mod tests {
         // A's run goes on as if B had not read: 4 blocks after group 1
         let want: Vec<(u64, usize)> = (2..6u64).map(|g| (g * 100, 100)).collect();
         assert_eq!(advised, want);
+    }
+
+    #[test]
+    fn a_locator_is_trusted_only_when_it_orders_the_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let ids = [30i64, 10, 20];
+        let place = |name: &str, order: &[u32], crc_off: u32| {
+            let bytes: Vec<u8> = order.iter().flat_map(|p| p.to_le_bytes()).collect();
+            let path = dir.path().join(name);
+            std::fs::write(&path, &bytes).unwrap();
+            LocatorPlace {
+                file: VolumeFile::shared(&path),
+                at: 0,
+                len: bytes.len() as u64,
+                crc: super::super::v5::checksum(&bytes).wrapping_add(crc_off),
+            }
+        };
+        assert_eq!(
+            place("ok", &[1, 2, 0], 0).read(&ids).as_deref(),
+            Some(&[1u32, 2, 0][..])
+        );
+        for (name, order, crc_off) in [
+            ("unordered", &[1u32, 0, 2][..], 0),
+            ("out_of_bounds", &[1, 2, 3], 0),
+            ("repeated", &[1, 1, 2], 0),
+            ("short", &[1, 2], 0),
+            ("crc", &[1, 2, 0], 1),
+        ] {
+            assert_eq!(place(name, order, crc_off).read(&ids), None, "{name}");
+        }
     }
 }

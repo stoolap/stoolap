@@ -473,6 +473,7 @@ fn read_volume_v4(
         (all_offsets, all_comp_lens, all_decomp_lens),
         group_size,
         None,
+        None,
     ))
 }
 
@@ -485,6 +486,7 @@ fn file_volume(
     (all_offsets, all_comp_lens, all_decomp_lens): BlockPlaces,
     group_size: usize,
     crcs: Option<Vec<Vec<u32>>>,
+    locator: Option<super::writer::LocatorPlace>,
 ) -> FrozenVolume {
     let col_data_types = meta.column_types.clone();
     let dict_ranges: Vec<(usize, usize, usize)> = {
@@ -527,6 +529,7 @@ fn file_volume(
             column_types: meta.column_types,
             row_ids: meta.row_ids,
             row_order: std::sync::OnceLock::new(),
+            locator,
             sorted_columns: meta.col_sorted,
             column_name_map: meta.column_name_map,
             row_groups: meta.row_groups,
@@ -554,7 +557,7 @@ fn read_volume_v5(
     path: &Path,
 ) -> Result<FrozenVolume> {
     use super::format::{
-        V5_BLOOMS, V5_COLUMNS, V5_DICT, V5_GROUPS, V5_ROW_IDS, V5_STATS, V5_ZONES,
+        V5_BLOOMS, V5_COLUMNS, V5_DICT, V5_GROUPS, V5_LOCATOR, V5_ROW_IDS, V5_STATS, V5_ZONES,
     };
     let fail = |e: std::io::Error| crate::core::Error::internal(format!("{:?}: {}", path, e));
     let inv = |msg: &str| crate::core::Error::internal(format!("{:?}: V5: {}", path, msg));
@@ -563,9 +566,21 @@ fn read_volume_v5(
     let known = [
         V5_COLUMNS, V5_GROUPS, V5_DICT, V5_ROW_IDS, V5_ZONES, V5_STATS,
     ];
-    let mut opened = super::v5::open(len, &known, &[V5_BLOOMS], &read_at).map_err(fail)?;
+    let mut opened =
+        super::v5::open(len, &known, &[V5_BLOOMS, V5_LOCATOR], &read_at).map_err(fail)?;
     let super::format::V5Metadata { mut meta, bounds } =
         super::format::v5_metadata_from_sections(&mut opened.meta, &opened.root).map_err(fail)?;
+    // The locator is read on the first lookup by row id
+    let locator = opened
+        .deferred
+        .iter()
+        .find(|s| s.0 == V5_LOCATOR && s.1 == 1)
+        .map(|&(_, _, at, len, crc)| super::writer::LocatorPlace {
+            file: Arc::clone(&handle),
+            at,
+            len,
+            crc,
+        });
     // A column's bloom words are read on its first probe
     let cols = meta.col_type_tags.len();
     let places = match opened.deferred.iter().find(|s| s.0 == V5_BLOOMS) {
@@ -598,6 +613,7 @@ fn read_volume_v5(
         (places.offsets, places.stored, places.decoded),
         group_size,
         Some(places.crcs),
+        locator,
     );
     let _ = volume.meta.file_identity.set(opened.identity);
     Ok(volume)
@@ -753,7 +769,7 @@ fn verify_v5(
     recorded: Option<&super::writer::FileIdentity>,
 ) -> std::io::Result<usize> {
     use super::format::{
-        V5_BLOOMS, V5_COLUMNS, V5_DICT, V5_GROUPS, V5_ROW_IDS, V5_STATS, V5_ZONES,
+        V5_BLOOMS, V5_COLUMNS, V5_DICT, V5_GROUPS, V5_LOCATOR, V5_ROW_IDS, V5_STATS, V5_ZONES,
     };
     let damaged = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
     let len = file.metadata()?.len();
@@ -761,7 +777,7 @@ fn verify_v5(
     let known = [
         V5_COLUMNS, V5_GROUPS, V5_DICT, V5_ROW_IDS, V5_ZONES, V5_STATS,
     ];
-    let mut opened = super::v5::open(len, &known, &[V5_BLOOMS], &read_at)?;
+    let mut opened = super::v5::open(len, &known, &[V5_BLOOMS, V5_LOCATOR], &read_at)?;
     if recorded.is_some_and(|recorded| *recorded != opened.identity) {
         return Err(damaged("not the file the manifest records".to_string()));
     }

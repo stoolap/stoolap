@@ -1625,6 +1625,9 @@ pub(crate) const V5_ROW_IDS: u32 = 7;
 pub(crate) const V5_ZONES: u32 = 8;
 pub(crate) const V5_BLOOMS: u32 = 9;
 pub(crate) const V5_STATS: u32 = 10;
+/// The locator: for a volume whose row ids do not ascend, the u32
+/// positions in row id order, stored raw and read on the first lookup
+pub(crate) const V5_LOCATOR: u32 = 11;
 
 /// Column entries (type, flags, extension, encoding, kind, data type,
 /// dictionary size, name length), then the names
@@ -1677,7 +1680,7 @@ pub(crate) fn v5_metadata_sections(
         compress,
         bytes,
     };
-    let mut sections = Vec::with_capacity(7);
+    let mut sections = Vec::with_capacity(8);
 
     let mut columns = Vec::with_capacity(16 + col_count * (V5_COLUMN_ENTRY + 16));
     columns.extend_from_slice(&(meta.row_count as u64).to_le_bytes());
@@ -1835,6 +1838,15 @@ pub(crate) fn v5_metadata_sections(
         write_value(&mut stats, &cs.max)?;
     }
     sections.push(section(V5_STATS, true, 1, false, stats));
+
+    // Optional: a reader without it sorts the ids itself
+    if let Some(Some(order)) = meta.row_order.get() {
+        let mut locator = Vec::with_capacity(order.len() * 4);
+        for &position in order.iter() {
+            locator.extend_from_slice(&position.to_le_bytes());
+        }
+        sections.push(section(V5_LOCATOR, false, 1, false, locator));
+    }
     Ok(sections)
 }
 
