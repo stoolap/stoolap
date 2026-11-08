@@ -384,7 +384,7 @@ fn returning_programs(
         columns.iter().any(|c| c.eq_ignore_ascii_case(name))
     };
     let compile = |expr: &Expression| {
-        let expr = super::utils::rowids_respelled(expr, false, &mut |name| {
+        let expr = super::utils::rowids_respelled(expr, &[], &mut |name| {
             Ok(rowid.filter(|_| !real(name)).map(|at| columns[at].clone()))
         })?;
         super::aggregation::compile_over_slots(&expr, columns, registry, None, false, None)

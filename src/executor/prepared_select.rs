@@ -2309,16 +2309,21 @@ fn rowids_spelled(stmt: &SelectStatement, own: &ScopeTable) -> Result<Option<Sel
     if own.rowids.is_empty() || !names_rowid(stmt) {
         return Ok(None);
     }
-    let aliased = stmt
+    let aliases: SmallVec<[&str; 2]> = stmt
         .columns
         .iter()
-        .any(|item| matches!(item, Expression::Aliased(a) if is_rowid_name(&a.alias.value_lower)));
+        .filter_map(|item| match item {
+            Expression::Aliased(a) => Some(a.alias.value_lower.as_str()),
+            _ => None,
+        })
+        .filter(|alias| is_rowid_name(alias))
+        .collect();
     let scopes = [own];
     let chain = Chain { scopes: &scopes };
     let mut changed = false;
     // A SELECT alias holds the name only where aliases are read, never in
     // the items, which define them, nor in a window's definition
-    let mut spell = |expr: &Expression, aliased: bool| -> Result<Expression> {
+    let mut spell = |expr: &Expression, aliased: &[&str]| -> Result<Expression> {
         rowids_respelled(expr, aliased, &mut |name| {
             let Some((_, index)) = chain.resolve(name).ok().flatten() else {
                 return Ok(None);
@@ -2341,10 +2346,10 @@ fn rowids_spelled(stmt: &SelectStatement, own: &ScopeTable) -> Result<Option<Sel
         let walked = match &written {
             Expression::Aliased(a) => {
                 let mut a = a.clone();
-                *a.expression = spell(&a.expression, false)?;
+                *a.expression = spell(&a.expression, &[])?;
                 Expression::Aliased(a)
             }
-            other => spell(other, false)?,
+            other => spell(other, &[])?,
         };
         *item = named_as_written(walked, &written);
     }
@@ -2361,12 +2366,12 @@ fn rowids_spelled(stmt: &SelectStatement, own: &ScopeTable) -> Result<Option<Sel
         .chain(out.having.as_deref_mut())
         .chain(out.order_by.iter_mut().map(|o| &mut o.expression))
     {
-        *expr = spell(expr, aliased)?;
+        *expr = spell(expr, &aliases)?;
     }
     for window in &mut out.window_defs {
         let keys = window.order_by.iter_mut().map(|o| &mut o.expression);
         for expr in window.partition_by.iter_mut().chain(keys) {
-            *expr = spell(expr, false)?;
+            *expr = spell(expr, &[])?;
         }
     }
     Ok(changed.then_some(out))

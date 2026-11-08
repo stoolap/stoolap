@@ -43,6 +43,7 @@ A `WHERE rowid = ?` or `WHERE rowid IN (...)` reads the rows it names by their i
 - In a join, a table without a primary key has no `rowid`: the name is an error there. A table with a primary key reads its key as usual.
 - A table read `AS OF` a past point has no `rowid`.
 - The `RETURNING` of `INSERT ... ON CONFLICT DO UPDATE` does not read the `rowid` of a table without a primary key.
+- A window function written in `ORDER BY` does not read `rowid`; select it under an alias and order by the alias.
 - A primary key named `TRUE` or `FALSE` is read through `rowid` in the select list and `WHERE`, but not inside an aggregate or a `RETURNING`; write the key's quoted name there.
 
 ## Stability

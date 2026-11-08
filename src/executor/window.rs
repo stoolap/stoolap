@@ -1314,7 +1314,11 @@ impl Executor {
         // sort reads and the projection then drops
         let written_items = stmt.columns.len();
         let stmt = Self::with_hidden_order_by_windows(stmt);
-        let visible_columns = base_columns.len();
+        // A row's id carried past its columns is no column a star shows
+        let slot = base_columns
+            .last()
+            .is_some_and(|c| c == crate::core::ROWID_SLOT);
+        let visible_columns = base_columns.len() - usize::from(slot);
 
         let plan = self.window_plan(
             stmt,

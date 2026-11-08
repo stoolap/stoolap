@@ -271,6 +271,54 @@ fn reads(db: &Database, t: &str, [i1, i2, i3]: [i64; 3]) {
             .contains("must not read the row"),
         "rowid as an aggregate's later argument reads the row in {t}"
     );
+    let lagged = db
+        .query(
+            &format!("SELECT *, LAG(rowid, $1) OVER (ORDER BY rowid) FROM {t} ORDER BY a"),
+            (1,),
+        )
+        .unwrap()
+        .map(|row| {
+            let row = row.unwrap();
+            (0..row.len())
+                .map(|i| row.get_value(i).unwrap().clone())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lagged
+            .iter()
+            .map(|row| row.last().cloned())
+            .collect::<Vec<_>>(),
+        [Some(Value::null_unknown()), Some(int(i1)), Some(int(i2))],
+        "a window planned at its run in {t}"
+    );
+    assert_eq!(
+        lagged[0].len(),
+        if t == "k" { 4 } else { 3 },
+        "a star beside a window planned at its run in {t}"
+    );
+    assert_eq!(
+        q("SELECT a AS rowid, SUM(rowid) OVER () FROM $t ORDER BY 1"),
+        [
+            [int(1), int(i1 + i2 + i3)],
+            [int(2), int(i1 + i2 + i3)],
+            [int(3), int(i1 + i2 + i3)]
+        ],
+        "an alias named rowid beside a window reading rowid in {t}"
+    );
+    assert!(
+        db.query(
+            &format!("SELECT a AS rowid FROM {t} ORDER BY SUM(rowid) OVER ()"),
+            ()
+        )
+        .is_err(),
+        "a window reading rowid in ORDER BY is refused in {t}"
+    );
+    assert_eq!(
+        q("SELECT a AS rowid, COUNT(*) FROM $t GROUP BY _rowid_, a ORDER BY 1"),
+        [[int(1), int(1)], [int(2), int(1)], [int(3), int(1)]],
+        "an alias named rowid beside _rowid_ in {t}"
+    );
 }
 
 #[test]
@@ -338,6 +386,11 @@ fn an_index_ordered_read_carries_the_rowid() {
         assert_eq!(
             rows(db, "SELECT rowid, a FROM o ORDER BY a DESC LIMIT 1"),
             [[int(1), int(20)]]
+        );
+        // The ids order the rows against their values here
+        assert_eq!(
+            rows(db, "SELECT a FROM o ORDER BY (SELECT o.rowid) DESC"),
+            [[int(10)], [int(20)]]
         );
     });
 }
