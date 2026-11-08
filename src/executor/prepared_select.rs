@@ -2426,14 +2426,15 @@ fn spelled_statement(
         true => out.order_by.as_mut_slice(),
         false => {
             for key in &mut out.order_by {
-                let named = matches!(
+                // Only a key the spelling changes moves; a position stays one
+                let moves = !matches!(
                     key.expression,
                     Expression::Identifier(_) | Expression::QualifiedIdentifier(_)
-                );
+                ) && expr_names_rowid(&key.expression);
                 let identity = ExprKey::of(&key.expression);
                 let at = (stmt.columns.iter())
                     .position(|written| ExprKey::of(unaliased(written)) == identity);
-                if let (Some(at), false, false) = (at, named, starred) {
+                if let (Some(at), true, false) = (at, moves, starred) {
                     key.expression = value_to_expression(&Value::Integer(at as i64 + 1));
                 }
             }

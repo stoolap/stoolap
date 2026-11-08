@@ -391,6 +391,21 @@ fn rowid_reads_alike_in_every_clause() {
                 [[int(9)], [int(3)], [int(2)], [int(1)]],
                 "a set operation's ORDER BY reading an item's rowid expression in {t}"
             );
+            assert_eq!(
+                rows(
+                    db,
+                    &format!(
+                        "SELECT 2, 1, _rowid_ FROM {t} UNION ALL SELECT 3, 4, 0 ORDER BY 1, 3"
+                    )
+                ),
+                [
+                    [int(2), int(1), int(1)],
+                    [int(2), int(1), int(2)],
+                    [int(2), int(1), int(3)],
+                    [int(3), int(4), int(0)]
+                ],
+                "a set operation's ORDER BY position beside items alike to it in {t}"
+            );
         }
         assert_eq!(
             rows(db, "SELECT _rowid_, _rowid_ + 0 FROM nr WHERE a = 10"),
@@ -590,6 +605,24 @@ fn no_column_and_no_alias_takes_the_name_of_the_row_identity() {
         assert!(message.contains("row's identity"), "{sql}: {message}");
     }
     assert_eq!(rows(&db, "SELECT COUNT(*) FROM n"), [[int(3)]]);
+    // The storage API changes a table's columns by the same rule
+    use stoolap::storage::traits::Engine;
+    let mut tx = db.engine().begin_transaction().unwrap();
+    let column = stoolap::core::SchemaColumn::new(
+        2,
+        "_rowid_",
+        stoolap::core::DataType::Integer,
+        true,
+        false,
+    );
+    for refused in [
+        tx.add_table_column("n", column),
+        tx.rename_table_column("n", "a", "_rowid_"),
+    ] {
+        assert!(refused.unwrap_err().to_string().contains("row's identity"));
+    }
+    tx.rollback().unwrap();
+    assert_eq!(names(&db, "SELECT * FROM n"), ["a", "b"]);
 }
 
 #[test]

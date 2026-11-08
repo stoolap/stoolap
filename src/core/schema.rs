@@ -603,10 +603,20 @@ impl Schema {
         })
     }
 
-    /// The column an unquoted `rowid` or `_rowid_` reads when no column has
-    /// that name: the integer primary key, the row's identity
+    /// The column `_rowid_` reads: the integer primary key, the row's
+    /// identity; None for a table without one
     pub fn rowid_column(&self) -> Option<usize> {
         self.pk_column_index()
+    }
+
+    /// An error naming the table when a column takes the name of the row's
+    /// identity, as only a schema an older build kept can
+    pub fn check_column_names(&self) -> Result<()> {
+        for col in &self.columns {
+            check_column_name(&col.name)
+                .map_err(|e| Error::invalid_argument(format!("table {}: {e}", self.table_name)))?;
+        }
+        Ok(())
     }
 
     /// Validate column count matches expected value

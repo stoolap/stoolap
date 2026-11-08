@@ -1315,11 +1315,7 @@ impl MVCCEngine {
                     let schemas = (self.schemas.read())
                         .map_err(|_| Error::internal("schemas lock poisoned"))?;
                     for schema in schemas.values() {
-                        for col in &schema.columns {
-                            crate::core::check_column_name(&col.name).map_err(|e| {
-                                Error::invalid_argument(format!("table {}: {e}", schema.table_name))
-                            })?;
-                        }
+                        schema.check_column_names()?;
                     }
                 }
 
@@ -5945,7 +5941,11 @@ impl MVCCEngine {
         // before the destructive step. Without this, a corrupt .vol would fail after
         // WAL/volumes are already deleted, causing total data loss.
         for (table_name, path) in &snapshot_files {
-            if let Err(e) = super::snapshot::SnapshotReader::open(path) {
+            // A schema an older build kept with the row identity's name is
+            // refused here, before anything is removed
+            let checked = super::snapshot::SnapshotReader::open(path)
+                .and_then(|reader| reader.schema().check_column_names());
+            if let Err(e) = checked {
                 self.registry.start_accepting_transactions();
                 return Err(Error::internal(format!(
                     "Snapshot validation failed for table {}: {}",

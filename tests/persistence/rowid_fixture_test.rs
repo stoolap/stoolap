@@ -33,13 +33,31 @@ fn copy_tree(from: &Path, to: &Path) {
     }
 }
 
-#[test]
-fn a_table_with_a_column_named_after_the_row_identity_refuses_to_open() {
-    let fixture =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rowid/column_named_rowid");
+/// A copy of the fixture `name` in a directory of its own, and its DSN
+fn copied(name: &str) -> (tempfile::TempDir, String) {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/rowid")
+        .join(name);
     let dir = tempfile::tempdir().unwrap();
     copy_tree(&fixture, dir.path());
-    let message = match Database::open(&format!("file://{}", dir.path().display())) {
+    let dsn = format!("file://{}", dir.path().display());
+    (dir, dsn)
+}
+
+fn pairs(db: &Database) -> Vec<(i64, i64)> {
+    db.query("SELECT a, b FROM t ORDER BY a", ())
+        .unwrap()
+        .map(|row| {
+            let row = row.unwrap();
+            (row.get(0).unwrap(), row.get(1).unwrap())
+        })
+        .collect()
+}
+
+#[test]
+fn a_table_with_a_column_named_after_the_row_identity_refuses_to_open() {
+    let (_dir, dsn) = copied("column_named_rowid");
+    let message = match Database::open(&dsn) {
         Ok(_) => panic!("the database opened"),
         Err(e) => e.to_string(),
     };
@@ -47,4 +65,19 @@ fn a_table_with_a_column_named_after_the_row_identity_refuses_to_open() {
         message.contains("table t") && message.contains("row's identity"),
         "{message}"
     );
+}
+
+#[test]
+fn a_snapshot_with_a_column_named_after_the_row_identity_restores_nothing() {
+    let (_dir, dsn) = copied("snapshot_named_rowid");
+    {
+        let db = Database::open(&dsn).unwrap();
+        assert_eq!(pairs(&db), [(1, 10), (2, 20)]);
+        let message = db.execute("PRAGMA RESTORE", ()).unwrap_err().to_string();
+        assert!(message.contains("row's identity"), "{message}");
+        assert_eq!(pairs(&db), [(1, 10), (2, 20)]);
+        db.close().unwrap();
+    }
+    let db = Database::open(&dsn).unwrap();
+    assert_eq!(pairs(&db), [(1, 10), (2, 20)]);
 }

@@ -1640,6 +1640,10 @@ impl Executor {
         // Every path reads a rowid as the column it is, spelled once here
         if classification.names_rowid {
             if let Some(spelled) = self.rowids_spelled(stmt, ctx)? {
+                // Spelling is its own fixed point: the run below spells nothing again
+                if self.rowids_spelled(&spelled, ctx)?.is_some() {
+                    return Err(Error::internal("a statement's rowid spelled twice"));
+                }
                 return self.select_rows_with_plan(&spelled, ctx, false, None, compiled);
             }
         }

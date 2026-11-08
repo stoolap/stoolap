@@ -3005,6 +3005,7 @@ impl Table for MVCCTable {
         default_expr: Option<String>,
         default_value: Option<Value>,
     ) -> Result<()> {
+        crate::core::check_column_name(name)?;
         if let Some(Value::Timestamp(t)) = &default_value {
             crate::core::value::timestamp_in_range(*t)?;
         }
@@ -5082,6 +5083,7 @@ impl Table for MVCCTable {
     }
 
     fn rename_column(&mut self, old_name: &str, new_name: &str) -> Result<()> {
+        crate::core::check_column_name(new_name)?;
         // The version store's schema is the truth; the cached copy follows
         // it whole, since another statement may have changed it meanwhile
         {
