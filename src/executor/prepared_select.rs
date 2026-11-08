@@ -2413,24 +2413,34 @@ fn spelled_statement(
         })
         .filter(|alias| is_rowid_name(alias))
         .collect();
+    // A set operation's ORDER BY reads its items' expressions as they are
+    // written, which no qualifier may hold; an item reads no alias
+    let compound = !stmt.set_operations.is_empty();
     // A SELECT alias holds the name only where aliases are read, never in
     // the items, which define them, nor in a window's definition
-    let mut spell = |expr: &Expression, aliased: &[&str]| -> Result<Expression> {
-        rowids_respelled(expr, aliased, spelled)
+    let mut spell = |expr: &Expression, aliased: &[&str], bare: bool| -> Result<Expression> {
+        rowids_respelled(expr, aliased, &mut |name| {
+            Ok(match spelled(name)? {
+                Some(Expression::QualifiedIdentifier(q)) if bare => {
+                    Some(Expression::Identifier(q.name))
+                }
+                other => other,
+            })
+        })
     };
     let mut out = stmt.clone();
     if let Some(from) = out.table_expr.as_deref_mut() {
-        spell_join_conditions(from, &mut |expr| spell(expr, &[]))?;
+        spell_join_conditions(from, &mut |expr| spell(expr, &[], false))?;
     }
     for item in &mut out.columns {
         let written = item.clone();
         let walked = match &written {
             Expression::Aliased(a) => {
                 let mut a = a.clone();
-                *a.expression = spell(&a.expression, &[])?;
+                *a.expression = spell(&a.expression, &[], compound)?;
                 Expression::Aliased(a)
             }
-            other => spell(other, &[])?,
+            other => spell(other, &[], compound)?,
         };
         *item = named_as_written(walked, &written);
     }
@@ -2438,10 +2448,25 @@ fn spelled_statement(
         GroupByModifier::GroupingSets(sets) => sets.as_mut_slice(),
         _ => &mut [],
     };
-    // A set operation's ORDER BY sorts its output, whose columns it names
+    // A set operation's ORDER BY sorts its output: a key names an output
+    // column, or is the expression of an item, which it stays alike to
     let order_by = match stmt.set_operations.is_empty() {
         true => out.order_by.as_mut_slice(),
-        false => &mut [],
+        false => {
+            for key in &mut out.order_by {
+                let identity = ExprKey::of(&key.expression);
+                let item = (stmt.columns.iter().zip(&out.columns))
+                    .find(|(written, _)| ExprKey::of(unaliased(written)) == identity);
+                let named = matches!(
+                    key.expression,
+                    Expression::Identifier(_) | Expression::QualifiedIdentifier(_)
+                );
+                if let (Some((_, spelled)), false) = (item, named) {
+                    key.expression = unaliased(spelled).clone();
+                }
+            }
+            &mut []
+        }
     };
     for expr in out
         .distinct_on
@@ -2452,12 +2477,12 @@ fn spelled_statement(
         .chain(out.having.as_deref_mut())
         .chain(order_by.iter_mut().map(|o| &mut o.expression))
     {
-        *expr = spell(expr, &aliases)?;
+        *expr = spell(expr, &aliases, false)?;
     }
     for window in &mut out.window_defs {
         let keys = window.order_by.iter_mut().map(|o| &mut o.expression);
         for expr in window.partition_by.iter_mut().chain(keys) {
-            *expr = spell(expr, &[])?;
+            *expr = spell(expr, &[], false)?;
         }
     }
     Ok(out)

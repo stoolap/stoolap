@@ -392,6 +392,26 @@ fn rowid_reads_alike_in_every_clause() {
                 ],
                 "a set operation's ORDER BY names its output in {t}"
             );
+            assert_eq!(
+                rows(
+                    db,
+                    &format!(
+                        "SELECT SUM(rowid) AS s FROM {t} UNION ALL SELECT 0 ORDER BY SUM(rowid)"
+                    )
+                ),
+                [[int(0)], [int(6)]],
+                "a set operation's ORDER BY reading an item's expression in {t}"
+            );
+            assert_eq!(
+                rows(
+                    db,
+                    &format!(
+                        "SELECT rowid + 0 FROM {t} UNION ALL SELECT 9 ORDER BY rowid + 0 DESC"
+                    )
+                ),
+                [[int(9)], [int(3)], [int(2)], [int(1)]],
+                "a set operation's ORDER BY reading an item's rowid expression in {t}"
+            );
         }
         assert_eq!(
             rows(db, "SELECT rowid, rowid + 0 FROM nr WHERE a = 10"),
