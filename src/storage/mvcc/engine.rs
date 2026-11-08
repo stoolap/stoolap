@@ -1827,62 +1827,36 @@ impl MVCCEngine {
         ));
         register_pk_index(&schema, &version_store);
 
-        // Build a frozen volume from the snapshot rows
-        let mut builder = crate::storage::volume::writer::VolumeBuilder::new(&schema);
+        // The snapshot rows stream into a volume file next to it, whose
+        // columns the volume reads; the volume id is assigned when the
+        // file is promoted, so the root records none
+        let mut writer = crate::storage::volume::output::VolumeFileWriter::at(
+            vol_path.clone(),
+            0,
+            &schema,
+            reader.row_count() as usize,
+            true,
+        )?;
+        let mut fed = Ok(());
         reader.for_each(|row_id, version| {
             if !version.is_deleted() {
-                builder.add_row(row_id, &version.data);
+                fed = writer.add_row(row_id, &version.data);
             }
-            true
+            fed.is_ok()
         })?;
-        let mut volume = builder.finish().map_err(|e| {
+        let converted = if fed.is_ok() && writer.rows() == 0 {
+            writer.abort();
+            crate::storage::volume::writer::VolumeBuilder::new(&schema).finish()
+        } else {
+            fed.and_then(|()| writer.finish()).map(|(volume, _)| volume)
+        };
+        let volume = converted.map_err(|e| {
             Error::internal(format!(
                 "converting the snapshot of table {}: {e}",
                 schema.table_name
             ))
         })?;
         let vol_row_count = volume.meta.row_count;
-
-        // Write volume file to disk and retain CompressedBlockStore for
-        // warm-tier eviction (single compress, no double work).
-        if vol_row_count > 0 {
-            // The volume id is assigned when the file is promoted, so the
-            // root records none
-            match crate::storage::volume::io::serialize_v5_opts(&volume, true, 0) {
-                Ok((data, store)) => {
-                    volume.columns.attach_compressed_store(store);
-                    if let Err(e) = (|| -> Result<()> {
-                        let tmp_path = vol_path.with_extension("vol.tmp");
-                        std::fs::write(&tmp_path, &data).map_err(|e| {
-                            crate::core::Error::internal(format!("failed to write volume: {}", e))
-                        })?;
-                        std::fs::File::open(&tmp_path)
-                            .and_then(|f| f.sync_all())
-                            .map_err(|e| {
-                                crate::core::Error::internal(format!(
-                                    "failed to sync volume: {}",
-                                    e
-                                ))
-                            })?;
-                        std::fs::rename(&tmp_path, &vol_path).map_err(|e| {
-                            crate::core::Error::internal(format!("failed to rename volume: {}", e))
-                        })?;
-                        Ok(())
-                    })() {
-                        eprintln!(
-                            "Warning: Failed to save volume file for {}: {}",
-                            table_name_lower, e
-                        );
-                    }
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Warning: Failed to serialize volume for {}: {}",
-                        table_name_lower, e
-                    );
-                }
-            }
-        }
 
         let volume = Arc::new(volume);
 
@@ -8110,6 +8084,13 @@ impl MVCCEngine {
                 .read()
                 .map(|c| c.persistence.volume_compression)
                 .unwrap_or(true);
+            // Each volume streams to its file a row group at a time, its
+            // unique indexes built as the rows pass, so the first INSERT
+            // after the seal reads no column whole
+            let unique_sets: Vec<Vec<usize>> = unique_columns
+                .into_iter()
+                .map(|(col_indices, _)| col_indices)
+                .collect();
             let sealed_volumes = crate::storage::volume::seal::seal_and_persist_multi(
                 &schema,
                 &all_rows,
@@ -8117,6 +8098,7 @@ impl MVCCEngine {
                 &table_name,
                 compress,
                 target_volume_rows,
+                &unique_sets,
             )?;
             // Each sealed volume's owner, before the fence: the registry
             // lock is global and must not be waited on under it
@@ -8131,19 +8113,6 @@ impl MVCCEngine {
                         Some(file)
                     })
                     .collect();
-            // Pre-build unique hash indices BEFORE registration so the
-            // first INSERT after seal doesn't pay a ~60ms stall scanning
-            // all rows. Safe: volumes are not yet visible to other threads.
-            for (col_indices, _) in unique_columns {
-                for (vol, _, _) in &sealed_volumes {
-                    if let Err(error) = vol.prebuild_unique_index(&col_indices) {
-                        for (_, path, _) in &sealed_volumes {
-                            let _ = std::fs::remove_file(path);
-                        }
-                        return Err(error.into());
-                    }
-                }
-            }
             // Each volume's secondary index side file, built and opened
             // before the fence under the builds budget; a refused or
             // failed build leaves its volume uncovered, and a volume that

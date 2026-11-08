@@ -27,6 +27,7 @@ use crate::core::{Result, Row, Schema, Value};
 
 use super::column::value_kind;
 use super::io;
+use super::output::VolumeFileWriter;
 use super::writer::{FrozenVolume, VolumeBuilder};
 
 /// Seal hot buffer rows into a frozen volume.
@@ -85,47 +86,37 @@ pub fn cluster_order(schema: &Schema, a: &(i64, Row), b: &(i64, Row)) -> Orderin
         .unwrap_or_else(|| a.0.cmp(&b.0))
 }
 
-/// Seal hot buffer rows and write the volume to disk.
-///
-/// This is the full seal operation:
-/// 1. Build a FrozenVolume from the rows
-/// 2. Write it to disk as a `.vol` file
-/// 3. Return the volume for in-memory use
-///
-/// # Arguments
-/// * `schema` - Table schema
-/// * `rows` - Committed rows to freeze
-/// * `volume_dir` - Directory for volume files
-/// * `table_name` - Table name (for the subdirectory)
-///
-/// # Returns
-/// (FrozenVolume, volume_file_path) on success
-pub fn seal_and_persist(
-    schema: &Schema,
-    rows: &[(i64, Row)],
-    volume_dir: &std::path::Path,
-    table_name: &str,
-) -> Result<(Arc<FrozenVolume>, std::path::PathBuf, u64)> {
-    seal_and_persist_opts(schema, rows, volume_dir, table_name, true)
-}
-
-/// Seal rows into a frozen volume with optional LZ4 compression.
-/// When V4 (compress=true), the returned volume keeps eager columns pre-loaded
-/// in OnceLock slots with a compressed backing store for per-group scanner access.
-pub fn seal_and_persist_opts(
+/// Writes one volume of `rows` through the streaming writer, its unique
+/// column sets indexed as the rows pass; the volume's columns are backed
+/// by the file
+fn seal_chunk(
     schema: &Schema,
     rows: &[(i64, Row)],
     volume_dir: &std::path::Path,
     table_name: &str,
     compress: bool,
+    unique_sets: &[Vec<usize>],
 ) -> Result<(Arc<FrozenVolume>, std::path::PathBuf, u64)> {
-    let mut volume = seal_rows(schema, rows)?;
     let volume_id = io::next_volume_id();
-    let (path, store) =
-        io::write_volume_to_disk_opts(volume_dir, table_name, volume_id, &volume, compress)?;
-    // Retain compressed store so eviction can transition hot → warm
-    // (drop decompressed columns, keep compressed blocks in RAM).
-    volume.columns.attach_compressed_store(store);
+    let mut writer = VolumeFileWriter::new(
+        volume_dir,
+        table_name,
+        volume_id,
+        schema,
+        rows.len(),
+        compress,
+    )?;
+    // A clustered table's rows arrive in key order, which the caller decided
+    if !schema.cluster_key.is_empty() {
+        writer.allow_any_row_order();
+    }
+    writer.index_unique_sets(unique_sets.to_vec());
+    let fed = rows
+        .iter()
+        .try_for_each(|(row_id, row)| writer.add_row(*row_id, row));
+    let (volume, path) = fed.and_then(|()| writer.finish()).map_err(|e| {
+        crate::core::Error::internal(format!("sealing table {}: {e}", schema.table_name))
+    })?;
     Ok((Arc::new(volume), path, volume_id))
 }
 
@@ -142,27 +133,19 @@ pub fn seal_and_persist_multi(
     table_name: &str,
     compress: bool,
     target_rows: usize,
+    unique_sets: &[Vec<usize>],
 ) -> Result<Vec<(Arc<FrozenVolume>, std::path::PathBuf, u64)>> {
     // Row-group aligned chunk size
     let row_group_size = 65_536usize;
-    let chunk_size = (target_rows / row_group_size).max(1) * row_group_size;
-
-    if rows.len() <= chunk_size || target_rows == 0 {
-        let (vol, path, id) =
-            seal_and_persist_opts(schema, rows, volume_dir, table_name, compress)?;
-        return Ok(vec![(vol, path, id)]);
-    }
+    let chunk_size = if target_rows == 0 {
+        rows.len().max(1)
+    } else {
+        (target_rows / row_group_size).max(1) * row_group_size
+    };
 
     let mut results = Vec::new();
     for chunk in rows.chunks(chunk_size) {
-        let sealed = seal_rows(schema, chunk).and_then(|mut volume| {
-            let volume_id = io::next_volume_id();
-            let (path, store) = io::write_volume_to_disk_opts(
-                volume_dir, table_name, volume_id, &volume, compress,
-            )?;
-            volume.columns.attach_compressed_store(store);
-            Ok((Arc::new(volume), path, volume_id))
-        });
+        let sealed = seal_chunk(schema, chunk, volume_dir, table_name, compress, unique_sets);
         match sealed {
             Ok(entry) => results.push(entry),
             Err(e) => {
@@ -260,8 +243,9 @@ mod tests {
         ];
 
         let vol_dir = dir.path().join("volumes");
-        let (volume, path, _vol_id) =
-            seal_and_persist(&schema, &rows, &vol_dir, "test_table").unwrap();
+        let mut sealed =
+            seal_and_persist_multi(&schema, &rows, &vol_dir, "test_table", true, 0, &[]).unwrap();
+        let (volume, path, _vol_id) = sealed.pop().unwrap();
 
         assert_eq!(volume.meta.row_count, 2);
         assert!(path.exists());

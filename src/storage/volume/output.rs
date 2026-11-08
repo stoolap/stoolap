@@ -29,7 +29,7 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::core::{Error, Result, Schema};
+use crate::core::{Error, Result, Row, Schema};
 
 use super::column::ROW_GROUP_SIZE;
 use super::format::serialize_typed_block;
@@ -105,6 +105,17 @@ impl VolumeFileWriter {
             .map_err(|e| io_error("failed to create volume dir", e))?;
         let final_path =
             table_dir.join(format!("vol_{:016x}.{}", volume_id, super::io::VOLUME_EXT));
+        Self::at(final_path, volume_id, schema, expected_rows, compress)
+    }
+
+    /// A writer for the file at `final_path`, whose directory exists
+    pub fn at(
+        final_path: PathBuf,
+        volume_id: u64,
+        schema: &Schema,
+        expected_rows: usize,
+        compress: bool,
+    ) -> Result<Self> {
         let blocks_path = block_file_path(&final_path);
         let blocks = std::fs::OpenOptions::new()
             .write(true)
@@ -177,9 +188,6 @@ impl VolumeFileWriter {
     /// crosses a group boundary is split there, so every group but the
     /// last holds exactly `ROW_GROUP_SIZE` rows
     pub fn append_typed(&mut self, row_ids: &[i64], columns: &[TypedCells<'_>]) -> Result<()> {
-        if !self.unique.is_empty() {
-            self.hash_unique(columns)?;
-        }
         let mut start = 0;
         while start < row_ids.len() {
             let builder = self.builder()?;
@@ -202,17 +210,33 @@ impl VolumeFileWriter {
         Ok(())
     }
 
-    /// Hashes every row's cells of each unique column set the way
-    /// `unique_lookup_all` hashes its values; a row with a null in the
-    /// set is left out, as the index built over columns leaves it out
-    fn hash_unique(&mut self, columns: &[TypedCells<'_>]) -> Result<()> {
+    /// Adds one row, see `VolumeBuilder::add_row`; a full group is
+    /// written out
+    pub fn add_row(&mut self, row_id: i64, row: &Row) -> Result<()> {
+        let builder = self.builder()?;
+        builder.add_row(row_id, row);
+        if builder.group_len() == ROW_GROUP_SIZE {
+            self.flush_group()?;
+        }
+        Ok(())
+    }
+
+    /// Hashes every row's cells of the accumulated group for each unique
+    /// column set the way `unique_lookup_all` hashes its values; a row
+    /// with a null in the set is left out, as the index built over
+    /// columns leaves it out
+    fn hash_unique(&mut self) -> Result<()> {
         use std::hash::{Hash, Hasher};
-        let first = self.rows() as u32;
-        let rows = columns.first().map_or(0, TypedCells::len);
         let builder = self
             .builder
             .as_ref()
             .ok_or_else(|| Error::internal("volume writer already finished"))?;
+        let first = (builder.row_count() - builder.group_len()) as u32;
+        let columns: Vec<TypedCells<'_>> = (0..self.index.len())
+            .map(|col| builder.group_cells(col))
+            .collect();
+        let columns = columns.as_slice();
+        let rows = builder.group_len();
         for UniqueIndexing {
             columns: set,
             entries,
@@ -333,6 +357,9 @@ impl VolumeFileWriter {
 
     /// Encodes the accumulated group's blocks into the block file
     fn flush_group(&mut self) -> Result<()> {
+        if !self.unique.is_empty() {
+            self.hash_unique()?;
+        }
         let blocks = self
             .blocks
             .as_mut()
@@ -553,7 +580,14 @@ mod tests {
     use crate::storage::volume::format::{
         V5_BLOOMS, V5_COLUMNS, V5_DICT, V5_GROUPS, V5_ROW_IDS, V5_STATS, V5_ZONES,
     };
-    use crate::storage::volume::io::{read_volume_from_disk, serialize_v5_opts};
+    use crate::storage::volume::io::{read_volume_from_disk, write_volume_to_disk};
+
+    /// The file the writer makes from `volume`'s rows fed one at a time
+    fn row_by_row(volume: &FrozenVolume, volume_id: u64) -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_volume_to_disk(dir.path(), "t", volume_id, volume).unwrap();
+        std::fs::read(path).unwrap()
+    }
 
     type Layout = (
         Vec<u8>,
@@ -688,7 +722,7 @@ mod tests {
             builder.add_row(i, &row(i));
         }
         let by_rows = builder.finish().unwrap();
-        let (bytes, _) = serialize_v5_opts(&by_rows, true, 7).unwrap();
+        let bytes = row_by_row(&by_rows, 7);
 
         let dir = tempfile::tempdir().unwrap();
         let mut writer =
@@ -776,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn the_file_is_the_one_serialize_v5_writes_for_the_same_rows() {
+    fn typed_batches_write_the_file_rows_fed_one_at_a_time_write() {
         let schema = schema();
         for (rows, batch) in [(500, 64), (500, 500), (3, 1)] {
             let (want, volume, path, _dir) = written(&schema, rows, batch);
@@ -819,7 +853,7 @@ mod tests {
             );
         }
         let by_rows = builder.finish().unwrap();
-        let (want, _) = serialize_v5_opts(&by_rows, true, 9).unwrap();
+        let want = row_by_row(&by_rows, 9);
 
         let dir = tempfile::tempdir().unwrap();
         let mut writer =
@@ -1132,7 +1166,7 @@ mod tests {
         let (len, capacity, grown) = unique_entries(|_| false, |_| false, vec![1]);
         assert_eq!(len, UNIQUE_ROWS);
         assert_eq!(capacity, UNIQUE_ROWS, "entries hold no growth slack");
-        assert_eq!(grown, [4_096, 8_192, 16_384, 32_768, 65_536, UNIQUE_ROWS]);
+        assert_eq!(grown, [65_536], "the first group's rows, a group at a time");
     }
 
     #[test]
@@ -1146,7 +1180,11 @@ mod tests {
     fn a_mostly_null_unique_index_grows_as_push_would() {
         let (len, capacity, grown) = unique_entries(|row| row % 10_000 != 0, |_| false, vec![1]);
         assert_eq!((len, capacity), (10, 16));
-        assert_eq!(grown, [4, 8, 16], "the first growth takes 4 entries");
+        assert_eq!(
+            grown,
+            [8],
+            "the first group's 7 entries, rounded up as push would"
+        );
     }
 
     #[test]
@@ -1161,6 +1199,6 @@ mod tests {
         let (len, capacity, grown) =
             unique_entries(|_| false, |row| row % 10_000 != 0, vec![0, 1, 2]);
         assert_eq!((len, capacity), (10, 16));
-        assert_eq!(grown, [4, 8, 16]);
+        assert_eq!(grown, [8]);
     }
 }

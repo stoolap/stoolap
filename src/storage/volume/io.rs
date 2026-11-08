@@ -76,31 +76,42 @@ fn barrier_unsupported(code: Option<i32>) -> bool {
 /// Volume catalog filename
 const CATALOG_FILE: &str = "volumes.catalog";
 
-/// Write a frozen volume to disk atomically (V5 format, LZ4 compressed).
+/// Write a frozen volume to disk atomically (V5 format, LZ4 compressed),
+/// its rows fed to the streaming writer the seal uses
 pub fn write_volume_to_disk(
     dir: &Path,
     table_name: &str,
     volume_id: u64,
     volume: &FrozenVolume,
 ) -> Result<PathBuf> {
-    let (path, _store) = write_volume_to_disk_opts(dir, table_name, volume_id, volume, true)?;
+    let mut schema = crate::core::SchemaBuilder::new(table_name);
+    for (name, &data_type) in volume
+        .meta
+        .column_names
+        .iter()
+        .zip(&volume.meta.column_types)
+    {
+        schema = schema.column(name, data_type, true, false);
+    }
+    let schema = schema.build();
+    let rows = volume.meta.row_count;
+    let mut writer =
+        super::output::VolumeFileWriter::new(dir, table_name, volume_id, &schema, rows, true)?;
+    writer.allow_any_row_order();
+    let ids = volume.row_ids()?;
+    for (idx, &row_id) in ids.iter().enumerate() {
+        writer.add_row(row_id, &volume.get_row(idx)?)?;
+    }
+    let (written, path) = writer.finish()?;
+    if let Some(&identity) = written.meta.file_identity.get() {
+        if volume.meta.file_identity.get_or_init(|| identity) != &identity {
+            let _ = std::fs::remove_file(&path);
+            return Err(crate::core::Error::internal(
+                "the volume already belongs to another file",
+            ));
+        }
+    }
     Ok(path)
-}
-
-/// Write a frozen volume to disk atomically as V5, with optional LZ4
-/// compression of its blocks (a block that does not shrink is stored raw).
-/// Returns (path, CompressedBlockStore).
-pub fn write_volume_to_disk_opts(
-    dir: &Path,
-    table_name: &str,
-    volume_id: u64,
-    volume: &FrozenVolume,
-    compress: bool,
-) -> Result<(PathBuf, CompressedBlockStore)> {
-    let (data, store) = serialize_v5_opts(volume, compress, volume_id)
-        .map_err(|e| crate::core::Error::internal(format!("V5 serialize failed: {}", e)))?;
-    let path = write_volume_file(dir, table_name, volume_id, data)?;
-    Ok((path, store))
 }
 
 /// Writes a volume as V4, the format files written before V5 have: the
@@ -159,62 +170,6 @@ fn write_volume_file(
     }
 
     Ok(final_path)
-}
-
-/// Serializes a volume as V5: the header, the blocks group by group, then
-/// the sections and the footer
-pub(crate) fn serialize_v5_opts(
-    vol: &FrozenVolume,
-    compress: bool,
-    volume_id: u64,
-) -> std::io::Result<(Vec<u8>, CompressedBlockStore)> {
-    let col_count = vol.columns.len();
-    let group_size = vol.meta.group_rows;
-    let num_groups = vol.meta.row_count.div_ceil(group_size);
-    let meta = super::format::v5_volume_sections(vol)?;
-    let meta_bytes: usize = meta.iter().map(|s| s.bytes.len()).sum();
-    let store = CompressedBlockStore::compress_columns_opts(
-        &vol.columns,
-        vol.meta.row_count,
-        group_size,
-        compress,
-    )?;
-    let blocks = store.raw_blocks();
-    let decoded = store.decompressed_lens();
-    let block_bytes: usize = blocks.iter().flatten().map(Vec::len).sum();
-    let mut buf = Vec::with_capacity(block_bytes + meta_bytes + 4096);
-    buf.extend_from_slice(&super::v5::header());
-    let mut entries = Vec::with_capacity(col_count * num_groups);
-    for group in 0..num_groups {
-        for (col, col_blocks) in blocks.iter().enumerate() {
-            let block = &col_blocks[group];
-            entries.push(super::v5::BlockEntry::new(
-                buf.len() as u64,
-                block,
-                decoded[col][group],
-                col,
-                group,
-            )?);
-            buf.extend_from_slice(block);
-        }
-    }
-    let pos = buf.len() as u64;
-    let root = super::v5::Root {
-        cols: col_count as u32,
-        groups: num_groups as u32,
-        group_rows: group_size as u32,
-        rows: vol.meta.row_count as u64,
-        volume_id,
-        nonce: super::v5::new_nonce(),
-    };
-    let identity = super::v5::write_tail(&mut buf, pos, &root, meta, &entries)?;
-    if vol.meta.file_identity.get_or_init(|| identity) != &identity {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "the volume already belongs to another file",
-        ));
-    }
-    Ok((buf, store))
 }
 
 /// Serialize a FrozenVolume to V4 format.

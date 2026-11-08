@@ -2746,7 +2746,7 @@ impl VolumeBuilder {
     }
 
     /// The accumulated cells of one column in storage form
-    fn group_cells(&self, col_idx: usize) -> TypedCells<'_> {
+    pub(crate) fn group_cells(&self, col_idx: usize) -> TypedCells<'_> {
         let nulls = &self.null_cols[col_idx];
         match self.col_storage[col_idx] {
             StorageKind::Int64(idx) => TypedCells::Int64 {
@@ -4304,9 +4304,8 @@ impl FrozenVolume {
         Ok(group.get_value(row_idx & ((1 << shift) - 1)))
     }
 
-    /// Pre-build the unique sorted index for a set of column indices.
-    /// Called during seal/compaction so the first INSERT after seal doesn't
-    /// pay a ~60ms stall scanning all rows to build the index.
+    /// Pre-build the unique sorted index for a set of column indices, so
+    /// the first lookup does not build it
     pub fn prebuild_unique_index(&self, col_indices: &[usize]) -> std::io::Result<()> {
         self.unique_index(col_indices).map(|_| ())
     }

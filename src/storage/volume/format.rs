@@ -1150,6 +1150,7 @@ pub(crate) fn serialize_volume_metadata(vol: &FrozenVolume) -> io::Result<Vec<u8
 }
 
 /// The V5 metadata sections of a volume with decoded columns
+#[cfg(test)]
 pub(crate) fn v5_volume_sections(vol: &FrozenVolume) -> io::Result<Vec<V5Section>> {
     let (kinds, dictionaries) = column_kinds(vol)?;
     v5_metadata_sections(&vol.meta, &kinds, &dictionaries)
