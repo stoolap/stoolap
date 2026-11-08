@@ -1388,14 +1388,13 @@ fn payload(id: i64) -> String {
         .collect()
 }
 
-#[test]
-fn test_migration_v037_large_snapshot_reads_from_volumes_after_snapshots_go() {
+/// The v0.3.7 fixture in `db_dir` plus a table `big` whose snapshot is
+/// past 16 MiB: 100,000 rows of incompressible text
+fn copy_v037db_with_a_large_snapshot(db_dir: &std::path::Path) {
     use stoolap::core::{DataType, Row, SchemaBuilder, Value};
     use stoolap::storage::mvcc::{RowVersion, SnapshotReader, SnapshotWriter};
 
-    let tmp = tempfile::tempdir().unwrap();
-    let db_dir = tmp.path().join("large");
-    copy_v037db(&db_dir);
+    copy_v037db(db_dir);
     let snapshots = db_dir.join("snapshots");
     let users = std::fs::read_dir(snapshots.join("users"))
         .unwrap()
@@ -1422,9 +1421,19 @@ fn test_migration_v037_large_snapshot_reads_from_volumes_after_snapshots_go() {
     }
     writer.finalize().unwrap();
     assert!(std::fs::metadata(&path).unwrap().len() > 16 * 1024 * 1024);
+}
+
+#[test]
+fn test_migration_v037_large_snapshot_reads_from_volumes_after_snapshots_go() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_dir = tmp.path().join("large");
+    copy_v037db_with_a_large_snapshot(&db_dir);
 
     let db = Database::open(&format!("file://{}", db_dir.display())).unwrap();
-    assert!(!snapshots.exists(), "the migration left snapshots/");
+    assert!(
+        !db_dir.join("snapshots").exists(),
+        "the migration left snapshots/"
+    );
     assert_eq!(query_i64(&db, "SELECT COUNT(*) FROM big"), 100_000);
     assert_eq!(
         query_i64(&db, "SELECT SUM(LENGTH(payload)) FROM big"),
@@ -1436,4 +1445,26 @@ fn test_migration_v037_large_snapshot_reads_from_volumes_after_snapshots_go() {
     );
     assert_eq!(query_i64(&db, "SELECT COUNT(*) FROM users"), 13);
     db.close().unwrap();
+}
+
+#[test]
+fn test_migration_v037_large_snapshot_that_cannot_be_promoted_fails_the_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_dir = tmp.path().join("blocked");
+    copy_v037db_with_a_large_snapshot(&db_dir);
+    // A file where the table's volume directory goes
+    std::fs::create_dir_all(db_dir.join("volumes")).unwrap();
+    std::fs::write(db_dir.join("volumes").join("big"), b"not a directory").unwrap();
+
+    let Err(error) = Database::open(&format!("file://{}", db_dir.display())) else {
+        panic!("the open succeeded without the table's volume");
+    };
+    assert!(
+        error.to_string().contains("could not be promoted"),
+        "{error}"
+    );
+    assert!(
+        db_dir.join("snapshots").join("big").exists(),
+        "the snapshot went with the failed open"
+    );
 }

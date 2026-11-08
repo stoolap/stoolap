@@ -559,3 +559,45 @@ fn test_pragma_restore_indexes_and_views() {
     );
     db.close().unwrap();
 }
+
+/// 200 hex digits from a xorshift seeded by `id`, which do not compress
+fn payload(id: i64) -> String {
+    let mut x = (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..25)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            format!("{:08x}", x as u32)
+        })
+        .collect()
+}
+
+#[test]
+fn test_restore_a_snapshot_past_16_mib_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+    db.execute(
+        "CREATE TABLE big (id INTEGER PRIMARY KEY, payload TEXT)",
+        (),
+    )
+    .unwrap();
+    let insert = db.prepare("INSERT INTO big VALUES ($1, $2)").unwrap();
+    let mut tx = db.begin().unwrap();
+    for id in 1..=100_000i64 {
+        insert.execute_in(&mut tx, (id, payload(id))).unwrap();
+    }
+    tx.commit().unwrap();
+    db.execute("PRAGMA SNAPSHOT", ()).unwrap();
+
+    for restore in 1..=2 {
+        db.execute("PRAGMA RESTORE", ())
+            .unwrap_or_else(|e| panic!("restore {restore}: {e}"));
+        let count: i64 = db.query_one("SELECT COUNT(*) FROM big", ()).unwrap();
+        assert_eq!(count, 100_000, "restore {restore}");
+        let read: String = db
+            .query_one("SELECT payload FROM big WHERE id = 77777", ())
+            .unwrap();
+        assert_eq!(read, payload(77777), "restore {restore}");
+    }
+}

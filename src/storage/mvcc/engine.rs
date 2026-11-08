@@ -1615,7 +1615,7 @@ impl MVCCEngine {
                 let use_volume = has_vol || file_size > 16 * 1024 * 1024;
 
                 let load_result = if use_volume {
-                    self.load_table_snapshot_as_volume(&table_name, snapshot_path)
+                    self.load_table_snapshot_as_volume(&table_name, snapshot_path)?
                 } else {
                     self.load_table_snapshot(&table_name, snapshot_path)
                 };
@@ -1750,30 +1750,33 @@ impl MVCCEngine {
         Ok(source_lsn)
     }
 
-    /// Load a table's snapshot as a frozen volume instead of into the arena.
-    ///
-    /// Fast-startup path:
-    /// 1. Check for a pre-built `.vol` file next to the snapshot — load directly
-    /// 2. If no `.vol` file, convert from snapshot and save the `.vol` for next time
-    ///
-    /// The VersionStore is created empty (only WAL-replayed rows go into the arena).
-    /// Returns the source_lsn from the snapshot header.
+    /// Loads a table's snapshot as a volume, the `.vol` beside it or one
+    /// converted from it, promoted to `volumes/`; returns its source LSN.
+    /// The inner error is a snapshot or file that cannot be read, so an
+    /// older snapshot may be tried; the outer one, writing or promoting
+    /// the volume, fails the caller, which would otherwise lose the table
     fn load_table_snapshot_as_volume(
         &self,
         _table_name: &str,
         snapshot_path: &std::path::Path,
-    ) -> Result<u64> {
+    ) -> Result<Result<u64>> {
         // Derive the volume file path from the snapshot path:
         // snapshot-20260314-001020.947.bin → snapshot-20260314-001020.947.vol
         let vol_path = snapshot_path.with_extension("vol");
 
         // Try loading a pre-built volume file first (instant startup)
         if vol_path.exists() {
-            let volume = crate::storage::volume::io::read_volume_from_disk(&vol_path)?;
+            let volume = match crate::storage::volume::io::read_volume_from_disk(&vol_path) {
+                Ok(volume) => volume,
+                Err(e) => return Ok(Err(e)),
+            };
             let vol_row_count = volume.meta.row_count;
 
             // We still need the schema from the snapshot header
-            let reader = super::snapshot::SnapshotReader::open(snapshot_path)?;
+            let reader = match super::snapshot::SnapshotReader::open(snapshot_path) {
+                Ok(reader) => reader,
+                Err(e) => return Ok(Err(e)),
+            };
             let source_lsn = reader.source_lsn();
             let schema = reader.schema().clone();
             let table_name_lower = schema.table_name_lower.clone();
@@ -1801,11 +1804,14 @@ impl MVCCEngine {
                 self.register_snapshot_volume(&table_name_lower, &vol_path)?;
             }
 
-            return Ok(source_lsn);
+            return Ok(Ok(source_lsn));
         }
 
         // No pre-built volume — convert from snapshot
-        let mut reader = super::snapshot::SnapshotReader::open(snapshot_path)?;
+        let mut reader = match super::snapshot::SnapshotReader::open(snapshot_path) {
+            Ok(reader) => reader,
+            Err(e) => return Ok(Err(e)),
+        };
         let source_lsn = reader.source_lsn();
         let schema = reader.schema().clone();
         let table_name_lower = schema.table_name_lower.clone();
@@ -1829,12 +1835,14 @@ impl MVCCEngine {
             true,
         )?;
         let mut fed = Ok(());
-        reader.for_each(|row_id, version| {
+        if let Err(e) = reader.for_each(|row_id, version| {
             if !version.is_deleted() {
                 fed = writer.add_row(row_id, &version.data);
             }
             fed.is_ok()
-        })?;
+        }) {
+            return Ok(Err(e));
+        }
         let converted = if fed.is_ok() && writer.rows() == 0 {
             writer.abort();
             crate::storage::volume::writer::VolumeBuilder::new(&schema).finish()
@@ -1864,7 +1872,7 @@ impl MVCCEngine {
             self.register_snapshot_volume(&table_name_lower, &vol_path)?;
         }
 
-        Ok(source_lsn)
+        Ok(Ok(source_lsn))
     }
 
     /// Promotes the volume file beside a snapshot to `volumes/` and
@@ -1921,15 +1929,22 @@ impl MVCCEngine {
         // Marker file stores the volume_id from the previous promotion.
         // On subsequent opens, return that ID so the caller registers with
         // the same segment_id as the standalone copy — preventing double-load.
+        // A copy a RESTORE removed since is made again under the same id
         let marker_path = vol_path.with_extension("vol.promoted");
-        if marker_path.exists() {
-            return std::fs::read_to_string(&marker_path)
-                .ok()
-                .and_then(|s| s.trim().parse::<u64>().ok());
-        }
+        let marked = std::fs::read_to_string(&marker_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok());
 
         let vol_dir = pm.path().join("volumes");
         let table_vol_dir = vol_dir.join(table_name);
+        if let Some(volume_id) = marked {
+            if table_vol_dir
+                .join(format!("vol_{:016x}.vol", volume_id))
+                .exists()
+            {
+                return Some(volume_id);
+            }
+        }
 
         if let Err(e) = std::fs::create_dir_all(&table_vol_dir) {
             eprintln!(
@@ -1939,7 +1954,7 @@ impl MVCCEngine {
             return None;
         }
 
-        let volume_id = crate::storage::volume::io::next_volume_id();
+        let volume_id = marked.unwrap_or_else(crate::storage::volume::io::next_volume_id);
         let dest_name = format!("vol_{:016x}.vol", volume_id);
         let dest_path = table_vol_dir.join(&dest_name);
         let tmp_path = table_vol_dir.join(format!("{}.tmp", dest_name));
@@ -6034,6 +6049,7 @@ impl MVCCEngine {
 
             let load_result = if use_volume {
                 self.load_table_snapshot_as_volume(table_name, snapshot_path)
+                    .and_then(|loaded| loaded)
             } else {
                 self.load_table_snapshot(table_name, snapshot_path)
             };
