@@ -207,6 +207,90 @@ fn reads(db: &Database, t: &str, [i1, i2, i3]: [i64; 3]) {
         error(db, &format!("SELECT rowid FROM (SELECT * FROM {t}) d")).contains("not found"),
         "a derived table has no rowid in {t}"
     );
+    assert_eq!(
+        q("SELECT *, rowid AS r FROM $t ORDER BY r + 0 DESC")[0].last(),
+        Some(&int(i3)),
+        "an alias after a star in {t}"
+    );
+    assert_eq!(
+        q("SELECT MAX(rowid) AS rowid FROM $t"),
+        [[int(i3)]],
+        "an alias over its own rowid in {t}"
+    );
+    assert_eq!(
+        q("SELECT rowid, COUNT(*) FROM $t GROUP BY GROUPING SETS ((rowid), ()) ORDER BY 1"),
+        [
+            [int(i1), int(1)],
+            [int(i2), int(1)],
+            [int(i3), int(1)],
+            [Value::null_unknown(), int(3)]
+        ],
+        "GROUPING SETS in {t}"
+    );
+    assert_eq!(
+        q("SELECT a, SUM(a) OVER w FROM $t WINDOW w AS (ORDER BY rowid) ORDER BY a"),
+        [[int(1), int(1)], [int(2), int(3)], [int(3), int(6)]],
+        "a named window in {t}"
+    );
+    assert_eq!(
+        q("SELECT SUM((SELECT o.rowid)) FROM $t o"),
+        [[int(i1 + i2 + i3)]],
+        "a subquery inside an aggregate in {t}"
+    );
+    assert_eq!(
+        q("SELECT (SELECT x FROM (VALUES (o.rowid)) v(x)) FROM $t o ORDER BY o.a"),
+        [[int(i1)], [int(i2)], [int(i3)]],
+        "a VALUES row reading the outer rowid in {t}"
+    );
+}
+
+#[test]
+fn an_index_ordered_read_carries_the_rowid() {
+    each_layout("ordered", |db| {
+        for sql in [
+            "CREATE TABLE o (a INTEGER)",
+            "INSERT INTO o VALUES (20), (10)",
+            "CREATE INDEX o_a ON o (a)",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        assert_eq!(
+            rows(db, "SELECT rowid FROM o ORDER BY a LIMIT 1"),
+            [[int(2)]]
+        );
+        assert_eq!(
+            rows(db, "SELECT rowid, a FROM o ORDER BY a DESC LIMIT 1"),
+            [[int(1), int(20)]]
+        );
+    });
+}
+
+#[test]
+fn a_returned_row_carries_its_rowid() {
+    each_layout("returned", |db| {
+        assert_eq!(
+            names(db, "INSERT INTO r VALUES (300, 3) RETURNING *, rowid"),
+            ["rowid", "a", "rowid"]
+        );
+        assert_eq!(
+            rows(db, "INSERT INTO r VALUES (400, 4) RETURNING *, rowid"),
+            [[int(400), int(4), int(400)]]
+        );
+        assert_eq!(
+            rows(
+                db,
+                "INSERT INTO n VALUES (4, 'w') RETURNING rowid, (SELECT 1)"
+            ),
+            [[int(4), int(1)]]
+        );
+        let mut deleted = rows(db, "DELETE FROM n RETURNING rowid");
+        deleted.sort_by_key(|row| row[0].as_int64());
+        assert_eq!(deleted, [[int(1)], [int(2)], [int(3)], [int(4)]]);
+        db.execute("CREATE TABLE q (\"true\" INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.execute("INSERT INTO q VALUES (7)", ()).unwrap();
+        assert_eq!(rows(db, "SELECT CAST(rowid AS INTEGER) FROM q"), [[int(7)]]);
+    });
 }
 
 #[test]

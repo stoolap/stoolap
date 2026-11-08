@@ -1877,6 +1877,8 @@ pub(crate) fn expr_names_rowid(expr: &Expression) -> bool {
         Expression::JoinSource(join) => {
             names(&join.left) || names(&join.right) || join.condition.as_deref().is_some_and(names)
         }
+        Expression::ValuesSource(values) => values.rows.iter().flatten().any(names),
+        Expression::FunctionTableSource(function) => function.arguments.iter().any(names),
         other => other
             .try_for_each_child(&mut |child| match names(child) {
                 true => Err(()),
@@ -1915,7 +1917,11 @@ pub(crate) fn rowids_respelled(
     aliased: bool,
     column: &mut dyn FnMut(&Expression) -> crate::core::Result<Option<String>>,
 ) -> crate::core::Result<Expression> {
-    let respelled = |name: String| Identifier::new(dummy_token(&name, TokenType::Identifier), name);
+    // Quoted, so a column named as a literal is still read as the column
+    let respelled = |name: String| Identifier {
+        quoted: true,
+        ..Identifier::new(dummy_token(&name, TokenType::Identifier), name)
+    };
     match expr {
         Expression::Identifier(id)
             if !aliased && !id.quoted && crate::core::is_rowid_name(&id.value_lower) =>

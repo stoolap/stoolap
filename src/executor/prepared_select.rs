@@ -2316,7 +2316,9 @@ fn rowids_spelled(stmt: &SelectStatement, own: &ScopeTable) -> Result<Option<Sel
     let scopes = [own];
     let chain = Chain { scopes: &scopes };
     let mut changed = false;
-    let mut spell = |expr: &Expression| -> Result<Expression> {
+    // A SELECT alias holds the name only where aliases are read, never in
+    // the items, which define them, nor in a window's definition
+    let mut spell = |expr: &Expression, aliased: bool| -> Result<Expression> {
         rowids_respelled(expr, aliased, &mut |name| {
             let Some((_, index)) = chain.resolve(name).ok().flatten() else {
                 return Ok(None);
@@ -2333,22 +2335,33 @@ fn rowids_spelled(stmt: &SelectStatement, own: &ScopeTable) -> Result<Option<Sel
         let walked = match &written {
             Expression::Aliased(a) => {
                 let mut a = a.clone();
-                *a.expression = spell(&a.expression)?;
+                *a.expression = spell(&a.expression, false)?;
                 Expression::Aliased(a)
             }
-            other => spell(other)?,
+            other => spell(other, false)?,
         };
         *item = named_as_written(walked, &written);
     }
+    let sets = match &mut out.group_by.modifier {
+        GroupByModifier::GroupingSets(sets) => sets.as_mut_slice(),
+        _ => &mut [],
+    };
     for expr in out
         .distinct_on
         .iter_mut()
         .chain(out.group_by.columns.iter_mut())
+        .chain(sets.iter_mut().flatten())
         .chain(out.where_clause.as_deref_mut())
         .chain(out.having.as_deref_mut())
         .chain(out.order_by.iter_mut().map(|o| &mut o.expression))
     {
-        *expr = spell(expr)?;
+        *expr = spell(expr, aliased)?;
+    }
+    for window in &mut out.window_defs {
+        let keys = window.order_by.iter_mut().map(|o| &mut o.expression);
+        for expr in window.partition_by.iter_mut().chain(keys) {
+            *expr = spell(expr, false)?;
+        }
     }
     Ok(changed.then_some(out))
 }
@@ -5625,7 +5638,7 @@ impl Builder<'_> {
         id: u16,
         work: &Rewritten,
     ) -> Result<()> {
-        check_block_positions(sq, own.columns.len())?;
+        check_block_positions(sq, star_columns(own, own.columns.len()).len())?;
         let mut scopes = Vec::with_capacity(outer.len() + 1);
         scopes.push(own);
         scopes.extend_from_slice(outer);
@@ -5911,7 +5924,7 @@ impl Builder<'_> {
         let joined = own.tables.len() > 1;
         if joined {
             if dropped {
-                check_block_positions(sq, own.columns.len())?;
+                check_block_positions(sq, star_columns(&own, own.columns.len()).len())?;
             }
             let around = std::mem::replace(&mut self.ctes, ctes);
             let bound =
@@ -6688,7 +6701,7 @@ impl Builder<'_> {
         // the member reads
         let mut row_keys = vec![None; if values.len() > 1 { values.len() } else { 0 }];
         let mut repeats = Vec::new();
-        check_block_positions(sq, scope.columns.len())?;
+        check_block_positions(sq, star_columns(&scope, scope.columns.len()).len())?;
         for ob in &sq.order_by {
             // A key naming one of a row's values, by its alias, its position or
             // as written, sorts by that value as a single item's does
@@ -8466,7 +8479,7 @@ impl PreparedSelect {
                     .iter()
                     .any(|c| ExprKey::of(unaliased(c)) == ExprKey::of(key))
         };
-        let width = scope.columns.len();
+        let width = scope.shown(0..scope.columns.len()).len();
         let items = projected_aliases(stmt, &scope.columns, |_| width);
         // Only a key holding a subquery reads the projected row's aliases
         let keyed = stmt
@@ -8958,6 +8971,8 @@ impl PreparedGrouped {
         epoch: u64,
     ) -> Result<Self> {
         let validity = executor.select_validity(stmt, epoch);
+        let spelled = rowids_spelled(stmt, &scope)?;
+        let stmt = spelled.as_ref().unwrap_or(stmt);
         // A DISTINCT ON key rides along as the hidden item it runs with
         let keyed = Executor::with_distinct_on_items(stmt, &get_classification(stmt));
         let stmt = keyed.as_ref().unwrap_or(stmt);
@@ -9307,7 +9322,7 @@ impl PreparedGrouped {
             .transpose()?;
         let where_ = where_parts
             .zip(where_program)
-            .map(|(parts, program)| parts.prepare(program, &blocks, &schema, false));
+            .map(|(parts, program)| parts.prepare(program, &blocks, &schema, scope.widens()));
         let mut run_stmt = SelectStatement {
             columns,
             having,
@@ -9442,7 +9457,7 @@ impl PreparedGrouped {
         // reads for what the block wrote, by that output's own keys and item
         // names, which it binds by text until it reads bound columns
         let held = held_columns(stmt, &chain);
-        let names = schema.column_names_arc();
+        let names = read_names(&schema, scope.widens());
         let item_names = executor.resolve_group_by_column_names_new(
             &group_items,
             &names,
@@ -9734,7 +9749,8 @@ impl Executor {
             ),
             (None, None) => return Err(Error::internal("a grouped statement without one table")),
         };
-        let scope = ScopeTable::of_table(scope_name.clone(), &schema, false);
+        let slot = kind == GroupedSource::Table && names_rowid(stmt);
+        let scope = ScopeTable::of_table(scope_name.clone(), &schema, slot);
         let prepared = Arc::new(PreparedGrouped::prepare(
             self,
             ctx,
@@ -10113,8 +10129,11 @@ impl PreparedDml {
             conflict_parts = Some((sets, where_, reads_target));
         }
         // RETURNING reads the row returned, `*` each of its columns
-        let returning_scope =
-            returning.map(|sites| ScopeTable::of_table(scope_name.clone(), sites.schema, slot));
+        let returning_scope = returning.map(|sites| {
+            // The row returned has its id, an inserted one's included
+            let slot = sites.values.iter().any(expr_names_rowid);
+            ScopeTable::of_table(scope_name.clone(), sites.schema, slot)
+        });
         let mut returning_parts = None;
         if let (Some(sites), Some(returning_scope)) = (returning, &returning_scope) {
             let scopes = [returning_scope];
@@ -12817,7 +12836,7 @@ impl Executor {
         if !held.windows_alone() {
             return self.prepared_aggregate(stmt, ctx, (run, prepared), table);
         }
-        let names = table.schema().column_names_arc();
+        let names = read_names(table.schema(), prepared.where_.widen);
         let plan = held.window.as_ref().filter(|_| bound.is_none());
         match self.window_table_rows(stmt, ctx, (run, prepared), table, (&names, plan))? {
             WindowRows::Answer(result) => Ok((result, None)),
@@ -13619,6 +13638,11 @@ impl Executor {
             }
             _ => None,
         };
+        let widen = prepared.where_.widen;
+        let (nearest, ordered) = (
+            nearest.map(|rows| widened_rows(rows, widen)),
+            ordered.map(|rows| widened_rows(rows, widen)),
+        );
         let read_in_order = ordered.is_some();
         if read_in_order {
             #[cfg(feature = "test-failpoints")]
@@ -14281,6 +14305,16 @@ pub(crate) fn read_names(schema: &Schema, widened: bool) -> CompactArc<Vec<Strin
         true => CompactArc::new(names.iter().cloned().chain([ROWID_SLOT.into()]).collect()),
         false => names,
     }
+}
+
+/// `rows`, each with its row id past its columns when `widen`
+fn widened_rows(mut rows: RowVec, widen: bool) -> RowVec {
+    if widen {
+        for (id, row) in rows.iter_mut() {
+            row.push(Value::Integer(*id));
+        }
+    }
+    rows
 }
 
 /// `row` with its row id `id` past its columns, read under the row id slot

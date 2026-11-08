@@ -23,7 +23,7 @@ use crate::common::CompactArc;
 use crate::common::I64Set;
 use crate::common::SmartString;
 use crate::core::integer::integer_neg;
-use crate::core::{DataType, Error, Result, Row, RowVec, Schema, Value};
+use crate::core::{DataType, Error, Result, Row, RowVec, Schema, Value, ROWID_SLOT};
 use crate::parser::ast::*;
 use crate::storage::expression::{ComparisonExpr, Expression as StorageExpr};
 use crate::storage::mvcc::version_store::LayoutToken;
@@ -392,13 +392,16 @@ fn returning_programs(
     let mut programs = Vec::with_capacity(returning.len());
     for expr in returning {
         match expr {
-            Expression::Star(_) => programs.extend(columns.iter().map(|name| {
-                let token = Token::new(TokenType::Identifier, name.clone(), Position::new(0, 0, 0));
-                compile(&Expression::Identifier(Identifier::new(
-                    token,
-                    name.clone(),
-                )))
-            })),
+            Expression::Star(_) => {
+                programs.extend(columns.iter().filter(|c| *c != ROWID_SLOT).map(|name| {
+                    let token =
+                        Token::new(TokenType::Identifier, name.clone(), Position::new(0, 0, 0));
+                    compile(&Expression::Identifier(Identifier::new(
+                        token,
+                        name.clone(),
+                    )))
+                }))
+            }
             _ => programs.push(compile(expr)),
         }
     }
@@ -3233,7 +3236,9 @@ impl Executor {
                 })?;
             }
 
-            // Scan all rows and collect IDs of rows to delete
+            // Scan all rows and collect IDs of rows to delete; a RETURNING
+            // reading the row id has it past the row's columns
+            let returns_widened = has_returning && dml_run.as_ref().is_some_and(|r| r.widens());
             let column_indices: Vec<usize> = (0..column_count).collect();
             let mut scanner = if where_prepared {
                 None
@@ -3261,7 +3266,14 @@ impl Executor {
                 };
 
                 if matches {
-                    collect(scanner.current_row_id(), row);
+                    let row_id = scanner.current_row_id();
+                    match returns_widened {
+                        true => collect(
+                            row_id,
+                            &super::prepared_select::widened(row.clone(), row_id),
+                        ),
+                        false => collect(row_id, row),
+                    }
                 }
             }
             if let Some(error) = scanner.as_ref().and_then(|scanner| scanner.err()) {
