@@ -518,6 +518,25 @@ fn read_value(data: &[u8], pos: &mut usize) -> io::Result<Value> {
 
 /// Serialize a single column's row range [start, end) to raw bytes.
 /// For Dictionary columns, only nulls+ids are written (dictionary stored separately).
+/// The length of the block `serialize_typed_block` makes of `cells`
+pub(crate) fn typed_block_len(cells: &super::writer::TypedCells<'_>) -> usize {
+    use super::writer::TypedCells;
+    let count = cells.len();
+    match cells {
+        TypedCells::Int64 { .. } | TypedCells::TimestampNanos { .. } => count * 9,
+        TypedCells::Float64 { .. } => count * 9,
+        TypedCells::Boolean { .. } => count * 2,
+        TypedCells::Dictionary { .. } => count * 5,
+        TypedCells::Bytes { data, offsets, .. } => {
+            let stored: u64 = offsets
+                .iter()
+                .map(|&(off, len)| (off + len).min(data.len() as u64).saturating_sub(off))
+                .sum();
+            count * 17 + 16 + stored as usize
+        }
+    }
+}
+
 /// One block from typed cells, the encoding `serialize_column_block` gives
 /// the same cells inside a column
 pub(crate) fn serialize_typed_block(cells: &super::writer::TypedCells<'_>) -> Vec<u8> {

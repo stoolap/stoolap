@@ -2882,6 +2882,15 @@ impl VolumeBuilder {
         self.acc.cells(col_idx)
     }
 
+    /// The decoded length of the widest column block the accumulated rows
+    /// would make, exact
+    pub(crate) fn widest_group_block(&self) -> usize {
+        (0..self.num_cols)
+            .map(|col_idx| super::format::typed_block_len(&self.acc.cells(col_idx)))
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The column's storage type tag and extension type tag, as the
     /// metadata records them
     pub fn column_kind(&self, col_idx: usize) -> (u8, u8) {
@@ -2896,10 +2905,13 @@ impl VolumeBuilder {
     }
 
     /// The volume's metadata and dictionaries once every row has been
-    /// flushed by a streaming producer: what `finish` computes, without
-    /// the columns. Row groups are kept only for a volume of more than
-    /// one group, as `finish` keeps them
-    pub fn finish_streamed(mut self) -> Result<(VolumeMeta, Vec<Vec<SmartString>>)> {
+    /// flushed by a streaming producer in groups of `group_rows`: what
+    /// `finish` computes, without the columns. Row groups are kept only
+    /// for a volume of more than one group, as `finish` keeps them
+    pub fn finish_streamed(
+        mut self,
+        group_rows: usize,
+    ) -> Result<(VolumeMeta, Vec<Vec<SmartString>>)> {
         if let Some(e) = self.refused.take() {
             return Err(e);
         }
@@ -2916,7 +2928,7 @@ impl VolumeBuilder {
             self.schema.columns.iter().map(|c| c.name.clone()).collect();
         let column_types: Vec<DataType> = self.schema.columns.iter().map(|c| c.data_type).collect();
         let column_name_map = column_name_map(&column_names);
-        let row_groups = if self.row_count > super::column::ROW_GROUP_SIZE {
+        let row_groups = if self.row_count > group_rows {
             std::mem::take(&mut self.row_groups)
         } else {
             Vec::new()
@@ -2933,7 +2945,7 @@ impl VolumeBuilder {
             sorted_columns: std::mem::take(&mut self.sorted),
             column_name_map,
             row_groups,
-            group_rows: super::column::ROW_GROUP_SIZE,
+            group_rows,
             file_identity: std::sync::OnceLock::new(),
         };
         Ok((meta, std::mem::take(&mut self.dict_tables)))

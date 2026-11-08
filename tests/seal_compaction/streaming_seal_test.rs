@@ -96,3 +96,73 @@ fn a_sealed_volume_is_published_over_its_file_and_a_unique_insert_reads_no_colum
         .unwrap();
     assert_eq!(v, "v0");
 }
+
+/// (rows, rows per group) of every volume file of table `w`
+fn group_sizes(dir: &std::path::Path) -> Vec<(usize, usize)> {
+    let mut sizes: Vec<(usize, usize)> = std::fs::read_dir(dir.join("volumes").join("w"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "vol"))
+        .map(|p| {
+            let volume = stoolap::storage::volume::io::read_volume_from_disk(&p).unwrap();
+            (volume.meta.row_count, volume.meta.group_rows)
+        })
+        .collect();
+    sizes.sort_unstable();
+    sizes
+}
+
+fn doc(i: i64) -> String {
+    format!("{{\"i\":{i},\"k\":\"{}\"}}", "x".repeat(3_000))
+}
+
+fn check_wide(db: &Database, rows: i64) {
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM w", ()).unwrap();
+    assert_eq!(count, rows);
+    for id in [0, 2_047, 2_048, rows / 2, rows - 1] {
+        let read: String = db
+            .query_one("SELECT doc FROM w WHERE id = $1", (id,))
+            .unwrap();
+        assert_eq!(read, doc(id), "row {id}");
+    }
+}
+
+#[test]
+fn a_table_of_wide_rows_is_sealed_and_compacted_in_groups_its_rows_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!(
+        "file://{}?target_volume_rows=65536&compact_threshold=2",
+        dir.path().display()
+    );
+    let db = Database::open(&dsn).unwrap();
+    db.execute("CREATE TABLE w (id INTEGER PRIMARY KEY, doc JSON)", ())
+        .unwrap();
+    let insert = db.prepare("INSERT INTO w VALUES ($1, $2)").unwrap();
+    for part in 0..2i64 {
+        let mut tx = db.begin().unwrap();
+        for id in part * 6_000..(part + 1) * 6_000 {
+            insert.execute_in(&mut tx, (id, doc(id))).unwrap();
+        }
+        tx.commit().unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        if part == 0 {
+            // 3,000 bytes a row: the first volume measures 2,048 rows a group
+            assert_eq!(group_sizes(dir.path()), vec![(6_000, 2_048)]);
+        }
+    }
+    assert_eq!(
+        group_sizes(dir.path()),
+        vec![(6_000, 2_048), (6_000, 2_048)]
+    );
+    check_wide(&db, 12_000);
+    drop(db);
+    // Reopened, a checkpoint compacts both into one, measured again
+    let db = Database::open(&dsn).unwrap();
+    db.execute("PRAGMA COMPACT_THRESHOLD = 2", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    assert_eq!(group_sizes(dir.path()), vec![(12_000, 2_048)]);
+    check_wide(&db, 12_000);
+    drop(db);
+    check_wide(&Database::open(&dsn).unwrap(), 12_000);
+}

@@ -41,6 +41,13 @@ use super::writer::{
 /// The write buffer of the file being written
 const COPY_BUFFER: usize = 1 << 20;
 
+/// The decoded size of a volume's widest column block past which its
+/// groups stop doubling
+const TARGET_BLOCK_BYTES: usize = 8 << 20;
+
+/// The fewest rows a group of a volume holds, but its last
+const MIN_GROUP_ROWS: usize = 1024;
+
 /// The name the file has until it is complete, next to the final file
 fn block_file_path(final_path: &Path) -> PathBuf {
     final_path.with_extension("blocks.tmp")
@@ -181,6 +188,11 @@ impl Encoder {
 pub struct VolumeFileWriter {
     /// None once `finish` has taken it
     builder: Option<VolumeBuilder>,
+    /// The volume's rows per group, decided as its first group fills
+    group_rows: Option<usize>,
+    /// The row count at which the group is next measured or flushed:
+    /// powers of two from `MIN_GROUP_ROWS` until the size is decided
+    cut: usize,
     encoder: Encoder,
     /// The accumulators and block buffers of the last group written,
     /// taken by the next group handed to the encoder
@@ -266,6 +278,8 @@ impl VolumeFileWriter {
             index: vec![Vec::new(); schema.columns.len()],
             entries: Vec::new(),
             builder: Some(builder),
+            group_rows: None,
+            cut: MIN_GROUP_ROWS,
             encoder: Encoder::new(compress),
             spare: None,
             spare_blocks: None,
@@ -318,13 +332,15 @@ impl VolumeFileWriter {
     }
 
     /// Appends a batch, see `VolumeBuilder::append_typed`; a batch that
-    /// crosses a group boundary is split there, so every group but the
-    /// last holds exactly `ROW_GROUP_SIZE` rows
+    /// crosses a group boundary, or a row count where the group size is
+    /// decided, is split there, so every group but the last holds exactly
+    /// the volume's group size
     pub fn append_typed(&mut self, row_ids: &[i64], columns: &[TypedCells<'_>]) -> Result<()> {
         let mut start = 0;
         while start < row_ids.len() {
+            let cut = self.cut;
             let builder = self.builder()?;
-            let room = ROW_GROUP_SIZE - builder.group_len();
+            let room = cut - builder.group_len();
             let end = (start + room).min(row_ids.len());
             if start == 0 && end == row_ids.len() {
                 builder.append_typed(row_ids, columns)?;
@@ -335,9 +351,7 @@ impl VolumeFileWriter {
                     .collect();
                 builder.append_typed(&row_ids[start..end], &part)?;
             }
-            if builder.group_len() == ROW_GROUP_SIZE {
-                self.flush_group()?;
-            }
+            self.reached_cut()?;
             start = end;
         }
         Ok(())
@@ -346,12 +360,36 @@ impl VolumeFileWriter {
     /// Adds one row, see `VolumeBuilder::add_row`; a full group is
     /// written out
     pub fn add_row(&mut self, row_id: i64, row: &Row) -> Result<()> {
+        let cut = self.cut;
         let builder = self.builder()?;
         builder.add_row(row_id, row);
-        if builder.group_len() == ROW_GROUP_SIZE {
-            self.flush_group()?;
+        if builder.group_len() == cut {
+            self.reached_cut()?;
         }
         Ok(())
+    }
+
+    /// At `cut` rows: flushes the group when the group size is, or now
+    /// becomes, `cut`, at the ceiling or when the widest column's block
+    /// would pass `TARGET_BLOCK_BYTES` on the next doubling; else doubles
+    /// `cut` for the next measure
+    fn reached_cut(&mut self) -> Result<()> {
+        let builder = self
+            .builder
+            .as_ref()
+            .ok_or_else(|| Error::internal("volume writer already finished"))?;
+        if builder.group_len() < self.cut {
+            return Ok(());
+        }
+        if self.group_rows.is_none() {
+            let widest = builder.widest_group_block();
+            if self.cut < ROW_GROUP_SIZE && widest.saturating_mul(2) <= TARGET_BLOCK_BYTES {
+                self.cut *= 2;
+                return Ok(());
+            }
+            self.group_rows = Some(self.cut);
+        }
+        self.flush_group()
     }
 
     /// Hashes every row's cells of the accumulated group for each unique
@@ -576,7 +614,9 @@ impl VolumeFileWriter {
         let kinds: Vec<(u8, u8)> = (0..self.index.len())
             .map(|col| builder.column_kind(col))
             .collect();
-        let (meta, dict_tables) = builder.finish_streamed()?;
+        // A volume still deciding at its end is one group
+        let (meta, dict_tables) =
+            builder.finish_streamed(self.group_rows.unwrap_or(ROW_GROUP_SIZE))?;
         let dictionaries: Vec<&[crate::common::SmartString]> =
             dict_tables.iter().map(Vec::as_slice).collect();
         let sections = super::format::v5_metadata_sections(&meta, &kinds, &dictionaries)
@@ -686,7 +726,7 @@ impl VolumeFileWriter {
             kinds.iter().map(|k| k.1).collect(),
             shared_dict,
             dict_ranges,
-            ROW_GROUP_SIZE,
+            meta.group_rows,
             meta.row_count,
         );
         store.check_blocks(crcs);
@@ -1352,5 +1392,153 @@ mod tests {
             unique_entries(|_| false, |row| row % 10_000 != 0, vec![0, 1, 2]);
         assert_eq!((len, capacity), (10, 16));
         assert_eq!(grown, [8]);
+    }
+
+    /// `rows` rows of an id and a JSON document of about `bytes` bytes,
+    /// written row by row, or in typed batches of `batch` rows
+    fn wide(
+        rows: i64,
+        bytes: usize,
+        batch: Option<usize>,
+    ) -> (FrozenVolume, Vec<u8>, PathBuf, tempfile::TempDir) {
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("doc", DataType::Json, true, false)
+            .build();
+        let doc = |i: i64| format!("{{\"i\":{i},\"k\":\"{}\"}}", "x".repeat(bytes));
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer =
+            VolumeFileWriter::new(dir.path(), "t", 21, &schema, rows as usize, true).unwrap();
+        match batch {
+            None => {
+                for i in 0..rows {
+                    let row = Row::from_values(vec![Value::Integer(i), Value::json(doc(i))]);
+                    writer.add_row(i, &row).unwrap();
+                }
+            }
+            Some(batch) => {
+                let ids: Vec<i64> = (0..rows).collect();
+                let nulls = vec![false; rows as usize];
+                for start in (0..rows as usize).step_by(batch) {
+                    let end = (start + batch).min(rows as usize);
+                    let mut data = Vec::new();
+                    let mut offsets = Vec::new();
+                    for &i in &ids[start..end] {
+                        let text = doc(i);
+                        offsets.push((data.len() as u64, text.len() as u64));
+                        data.extend_from_slice(text.as_bytes());
+                    }
+                    let cells = [
+                        TypedCells::Int64 {
+                            values: &ids[start..end],
+                            nulls: &nulls[start..end],
+                        },
+                        TypedCells::Bytes {
+                            data: &data,
+                            offsets: &offsets,
+                            nulls: &nulls[start..end],
+                        },
+                    ];
+                    writer.append_typed(&ids[start..end], &cells).unwrap();
+                }
+            }
+        }
+        let (volume, path) = writer.finish().unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        (volume, bytes, path, dir)
+    }
+
+    /// The volume read back from `path`, checked row by row against what
+    /// was written at the rows on either side of every group boundary
+    fn read_back(path: &Path, rows: i64, bytes: usize) -> FrozenVolume {
+        let read = read_volume_from_disk(path).unwrap();
+        let size = read.meta.group_rows as i64;
+        let mut at: Vec<i64> = (1..=rows / size)
+            .flat_map(|g| [g * size - 1, g * size])
+            .collect();
+        at.extend([0, rows - 1]);
+        for i in at.into_iter().filter(|&i| i < rows) {
+            let row = read.get_row(i as usize).unwrap();
+            assert_eq!(row.get(0), Some(&Value::Integer(i)), "row {i}");
+            let want = format!("{{\"i\":{i},\"k\":\"{}\"}}", "x".repeat(bytes));
+            assert_eq!(row.get(1), Some(&Value::json(want)), "row {i}");
+        }
+        read
+    }
+
+    #[test]
+    fn a_volume_of_wide_rows_takes_the_group_size_its_first_group_measures() {
+        // 3,000 bytes a row: about 3 MiB at 1,024 rows, so a doubling stays
+        // under 8 MiB; about 6 MiB at 2,048, so the next one would not
+        let (volume, by_rows, path, _dir) = wide(10_000, 3_000, None);
+        assert_eq!(volume.meta.group_rows, 2_048);
+        assert_eq!(volume.meta.row_groups.len(), 5);
+        assert_eq!(read_back(&path, 10_000, 3_000).meta.group_rows, 2_048);
+        // Batches of 1,500 rows cross both the measures and the cuts
+        let (_, by_batches, _, _dir2) = wide(10_000, 3_000, Some(1_500));
+        assert!(
+            layout(&by_batches) == layout(&by_rows),
+            "batches and rows wrote different files"
+        );
+    }
+
+    #[test]
+    fn rows_past_the_target_at_the_floor_take_the_floor() {
+        let (volume, _, path, _dir) = wide(3_000, 20_000, None);
+        assert_eq!(volume.meta.group_rows, 1_024);
+        assert_eq!(volume.meta.row_groups.len(), 3);
+        read_back(&path, 3_000, 20_000);
+    }
+
+    #[test]
+    fn a_wide_volume_that_ends_before_its_size_is_decided_is_one_group() {
+        let (volume, _, path, _dir) = wide(1_500, 3_000, None);
+        assert_eq!(volume.meta.group_rows, ROW_GROUP_SIZE);
+        assert!(volume.meta.row_groups.is_empty());
+        read_back(&path, 1_500, 3_000);
+    }
+
+    #[test]
+    fn the_measured_block_length_is_the_length_of_the_block_written() {
+        let values = [3i64, -7, 0, 9];
+        let floats = [1.5f64, f64::NAN, 0.0, -2.0];
+        let flags = [true, false, true, true];
+        let ids = [0u32, 4, 1, 2];
+        let nulls = [false, true, false, false];
+        let data = b"{}{\"a\":1}xyz";
+        // A null's cell, an empty one and one past the data hold no bytes
+        let offsets = [(0u64, 2u64), (0, 0), (2, 7), (9, 9)];
+        for cells in [
+            TypedCells::Int64 {
+                values: &values,
+                nulls: &nulls,
+            },
+            TypedCells::TimestampNanos {
+                values: &values,
+                nulls: &nulls,
+            },
+            TypedCells::Float64 {
+                values: &floats,
+                nulls: &nulls,
+            },
+            TypedCells::Boolean {
+                values: &flags,
+                nulls: &nulls,
+            },
+            TypedCells::Dictionary {
+                ids: &ids,
+                nulls: &nulls,
+            },
+            TypedCells::Bytes {
+                data,
+                offsets: &offsets,
+                nulls: &nulls,
+            },
+        ] {
+            assert_eq!(
+                super::super::format::typed_block_len(&cells),
+                serialize_typed_block(&cells).len()
+            );
+        }
     }
 }
