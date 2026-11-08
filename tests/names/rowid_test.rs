@@ -306,13 +306,10 @@ fn reads(db: &Database, t: &str, [i1, i2, i3]: [i64; 3]) {
         ],
         "an alias named rowid beside a window reading rowid in {t}"
     );
-    assert!(
-        error(
-            db,
-            &format!("SELECT a AS rowid FROM {t} ORDER BY SUM(rowid) OVER ()")
-        )
-        .contains("a window function in ORDER BY reading rowid"),
-        "a window reading rowid in ORDER BY is refused in {t}"
+    assert_eq!(
+        q("SELECT a AS rowid FROM $t ORDER BY SUM(rowid) OVER (), a"),
+        [[int(1)], [int(2)], [int(3)]],
+        "a window reading rowid in ORDER BY beside an alias named rowid in {t}"
     );
     assert_eq!(
         q("SELECT a, SUM(rowid) OVER () AS s FROM $t ORDER BY s, a"),
@@ -328,6 +325,74 @@ fn reads(db: &Database, t: &str, [i1, i2, i3]: [i64; 3]) {
         [[int(1), int(1)], [int(2), int(1)], [int(3), int(1)]],
         "an alias named rowid beside _rowid_ in {t}"
     );
+}
+
+/// Every clause over table `t`, whose rows 30, 20 and 10 (column a) have the
+/// row ids `ids`, ascending, so an order by a reads them backwards
+fn clauses(db: &Database, t: &str, [i1, i2, i3]: [i64; 3]) {
+    let q = |sql: &str| rows(db, &sql.replace("$t", t));
+    let cases: [(&str, Vec<Vec<Value>>); 9] = [
+        ("SELECT a FROM $t ORDER BY rowid", vec![vec![int(30)], vec![int(20)], vec![int(10)]]),
+        ("SELECT a FROM $t ORDER BY _rowid_ DESC LIMIT 1", vec![vec![int(10)]]),
+        ("SELECT a FROM $t ORDER BY $t.rowid LIMIT 1 OFFSET 1", vec![vec![int(20)]]),
+        ("SELECT a AS id FROM $t ORDER BY rowid LIMIT 1", vec![vec![int(30)]]),
+        ("SELECT a AS rowid FROM $t ORDER BY rowid LIMIT 1", vec![vec![int(10)]]),
+        ("SELECT a FROM $t GROUP BY rowid, a ORDER BY rowid", vec![vec![int(30)], vec![int(20)], vec![int(10)]]),
+        (
+            "SELECT SUM(a) FROM $t GROUP BY rowid HAVING rowid > (SELECT MIN(rowid) FROM $t) ORDER BY rowid",
+            vec![vec![int(20)], vec![int(10)]],
+        ),
+        ("SELECT a FROM $t WHERE rowid > 0 ORDER BY rowid DESC", vec![vec![int(10)], vec![int(20)], vec![int(30)]]),
+        ("SELECT COUNT(*), SUM(rowid) FROM $t", vec![vec![int(3), int(i1 + i2 + i3)]]),
+    ];
+    for (sql, answer) in cases {
+        assert_eq!(q(sql), answer, "{sql} in {t}");
+    }
+    let by_id = db
+        .query(&format!("SELECT a FROM {t} WHERE rowid = $1"), (i2,))
+        .unwrap()
+        .map(|row| row.unwrap().get_value(0).unwrap().clone())
+        .collect::<Vec<_>>();
+    assert_eq!(by_id, [int(20)], "a parameter in {t}");
+}
+
+#[test]
+fn rowid_reads_alike_in_every_clause() {
+    each_layout("clauses", |db| {
+        for sql in [
+            "CREATE TABLE kr (id INTEGER PRIMARY KEY, a INTEGER UNIQUE)",
+            "CREATE TABLE nr (a INTEGER UNIQUE)",
+            "INSERT INTO kr VALUES (1, 30), (2, 20), (3, 10)",
+            "INSERT INTO nr VALUES (30), (20), (10)",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        clauses(db, "kr", [1, 2, 3]);
+        clauses(db, "nr", [1, 2, 3]);
+        assert_eq!(
+            rows(db, "SELECT rowid, rowid + 0 FROM nr WHERE a = 10"),
+            [[int(3), int(3)]]
+        );
+        assert_eq!(
+            rows(
+                db,
+                "SELECT SUM(kr.rowid), COUNT(*) FROM kr JOIN k ON kr.rowid = k.id / 10"
+            ),
+            [[int(6), int(3)]]
+        );
+        assert_eq!(
+            rows(
+                db,
+                "SELECT kr.a FROM kr JOIN k ON kr.rowid = k.id / 10 ORDER BY kr.rowid"
+            ),
+            [[int(30)], [int(20)], [int(10)]]
+        );
+        assert!(db
+            .query("INSERT INTO nr VALUES (10) ON CONFLICT (a) DO UPDATE SET a = 10 RETURNING nr.rowid", ())
+            .map(|rows| rows.into_iter().any(|row| row.is_err()))
+            .unwrap_or(true));
+        assert_eq!(rows(db, "SELECT COUNT(*) FROM nr"), [[int(3)]]);
+    });
 }
 
 #[test]
@@ -349,12 +414,14 @@ fn a_primary_key_named_like_a_pseudo_column_or_a_literal_reads_as_itself() {
             rows(db, "SELECT CAST(rowid AS INTEGER), p2.rowid FROM p2"),
             [[int(8), int(8)]]
         );
-        for sql in [
-            "SELECT SUM(rowid) FROM p2",
-            "INSERT INTO p2 VALUES (9) RETURNING CAST(rowid AS INTEGER)",
-        ] {
-            assert!(error(db, sql).contains("not found"), "{sql}");
-        }
+        assert!(error(db, "SELECT SUM(rowid) FROM p2").contains("not found"));
+        assert_eq!(
+            rows(
+                db,
+                "INSERT INTO p2 VALUES (9) RETURNING CAST(rowid AS INTEGER)"
+            ),
+            [[int(9)]]
+        );
     });
 }
 

@@ -143,6 +143,9 @@ pub struct QueryClassification {
     // === Compound classifications ===
     /// Simple scan: no joins, no subqueries, no aggregation, no window functions
     pub is_simple_scan: bool,
+
+    /// Whether the statement, or one inside it, names rowid or _rowid_
+    pub names_rowid: bool,
 }
 
 impl QueryClassification {
@@ -296,6 +299,7 @@ impl QueryClassification {
             order_by_has_correlated_subqueries,
             has_derived_tables,
             is_simple_scan,
+            names_rowid: super::utils::names_rowid(stmt),
         }
     }
 

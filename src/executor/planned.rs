@@ -123,6 +123,10 @@ impl Executor {
             Some(slot) => Arc::clone(slot.get_or_init(|| get_classification(stmt))),
             None => get_classification(stmt),
         };
+        // A rowid is spelled by the statement's own run before any plan
+        if shape.names_rowid && self.rowids_spelled(stmt, ctx)?.is_some() {
+            return Ok(None);
+        }
         // A statement that aggregates its rows; one whose row the table
         // keeps whole is answered from there before its run
         let aggregating = PreparedSelect::aggregates(stmt);

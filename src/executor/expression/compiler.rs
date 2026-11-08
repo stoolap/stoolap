@@ -849,7 +849,11 @@ impl<'a> ExprCompiler<'a> {
         expr: &Expression,
         builder: &mut ProgramBuilder,
     ) -> Result<(), CompileError> {
-        let slot = matches!(expr, Expression::Identifier(id) if id.value_lower == ROWID_SLOT);
+        let slot = match expr {
+            Expression::Identifier(id) => id.value_lower == ROWID_SLOT,
+            Expression::QualifiedIdentifier(q) => q.name.value_lower == ROWID_SLOT,
+            _ => false,
+        };
         match self.ctx.reference(expr) {
             Some(Reference::Column(ColumnSource::Row1(idx))) if slot => {
                 builder.emit(Op::LoadRowId(idx))

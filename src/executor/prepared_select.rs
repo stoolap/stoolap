@@ -84,9 +84,9 @@ use super::utils::{
     expression_contains_aggregate, extract_literal_value, flip_operator,
     for_each_qualified_star_column, get_table_alias_from_expr, infix_to_operator,
     is_aggregate_function, item_name, named_as_written, names_rowid, needed_columns,
-    order_by_names_an_alias, qualified, rowids_respelled, split_qualified, strip_table_qualifier,
-    value_to_expression, visit_column_refs, visit_column_refs_outside, where_without_aggregates,
-    QUALIFIER_SEP,
+    order_by_names_an_alias, qualified, qualified_reference, rowids_respelled, split_qualified,
+    strip_table_qualifier, value_to_expression, visit_column_refs, visit_column_refs_outside,
+    where_without_aggregates, QUALIFIER_SEP,
 };
 use super::volatility::{expression_volatility, read_once_argument, statement_draws_per_call};
 use super::window::{
@@ -2302,13 +2302,108 @@ impl StatementWalk<'_> {
     }
 }
 
-/// `stmt` with each rowid its scope `own` reads outside its subqueries spelled
-/// as the column it reads, each SELECT item so changed named as written;
-/// None when it reads none. A SELECT alias of that name keeps it
-fn rowids_spelled(stmt: &SelectStatement, own: &ScopeTable) -> Result<Option<SelectStatement>> {
-    if own.rowids.is_empty() || !names_rowid(stmt) {
-        return Ok(None);
+impl Executor {
+    /// `stmt` with each rowid its own FROM's stored tables read, outside its
+    /// subqueries, spelled as the column it reads under its entry's name: the
+    /// primary key, or the row id slot of a lone table without one; each
+    /// SELECT item so changed named as written. None when it spells none
+    pub(crate) fn rowids_spelled(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+    ) -> Result<Option<SelectStatement>> {
+        let mut leaves = Vec::new();
+        if let Some(from) = stmt.table_expr.as_deref() {
+            from_leaves(from, &mut leaves);
+        }
+        let cte = |name: &str| {
+            let ctes = stmt.with.iter().flat_map(|with| &with.ctes);
+            ctes.into_iter().any(|cte| cte.name.value_lower == name)
+        };
+        // Each entry's name and its table's schema; None for an entry that
+        // reads no stored table's rows
+        let mut entries: SmallVec<[Option<NamedSchema>; 2]> = SmallVec::new();
+        for leaf in leaves {
+            let entry = match leaf {
+                Expression::TableSource(ts) if ts.as_of.is_none() && !cte(&ts.name.value_lower) => {
+                    match self.named(ctx, &ts.name.value_lower)? {
+                        Named::Table => self
+                            .engine
+                            .get_table_schema(&ts.name.value_lower)
+                            .ok()
+                            .map(|schema| {
+                                (
+                                    ts.alias.as_ref().unwrap_or(&ts.name).value_lower.clone(),
+                                    schema,
+                                )
+                            }),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            entries.push(entry);
+        }
+        let mut spelled = |expr: &Expression| -> Result<Option<Expression>> {
+            let (entry, written) = match expr {
+                Expression::QualifiedIdentifier(q) => {
+                    let named = entries
+                        .iter()
+                        .flatten()
+                        .find(|(name, _)| *name == q.qualifier.value_lower);
+                    (named, &q.name.value_lower)
+                }
+                Expression::Identifier(id) => match entries.as_slice() {
+                    [Some(entry)] => (Some(entry), &id.value_lower),
+                    _ => return Ok(None),
+                },
+                _ => return Ok(None),
+            };
+            let Some((name, schema)) = entry else {
+                return Ok(None);
+            };
+            if schema.column_index_map().contains_key(written.as_str()) {
+                return Ok(None);
+            }
+            let column = match schema.rowid_column() {
+                // A key named as a literal is left to the scope that binds it
+                Some(key)
+                    if matches!(schema.columns[key].name_lower.as_str(), "true" | "false") =>
+                {
+                    return Ok(None)
+                }
+                Some(key) => schema.columns[key].name.as_str(),
+                None if entries.len() == 1 => ROWID_SLOT,
+                None => return Ok(None),
+            };
+            Ok(Some(qualified_reference(name, column)))
+        };
+        let spelled = spelled_statement(stmt, &mut spelled)?;
+        Ok((spelled != *stmt).then_some(spelled))
     }
+}
+
+/// A FROM entry's name and its stored table's schema
+type NamedSchema = (SmartString, CompactArc<Schema>);
+
+/// Each FROM entry of `from` past its joins
+fn from_leaves<'e>(from: &'e Expression, out: &mut Vec<&'e Expression>) {
+    match from {
+        Expression::JoinSource(join) => {
+            from_leaves(&join.left, out);
+            from_leaves(&join.right, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// `stmt` with each rowid outside its subqueries replaced as `spelled` says,
+/// each SELECT item so changed named as written. A SELECT alias of that name
+/// keeps it where aliases are read
+fn spelled_statement(
+    stmt: &SelectStatement,
+    spelled: &mut dyn FnMut(&Expression) -> Result<Option<Expression>>,
+) -> Result<SelectStatement> {
     let aliases: SmallVec<[&str; 2]> = stmt
         .columns
         .iter()
@@ -2318,29 +2413,15 @@ fn rowids_spelled(stmt: &SelectStatement, own: &ScopeTable) -> Result<Option<Sel
         })
         .filter(|alias| is_rowid_name(alias))
         .collect();
-    let scopes = [own];
-    let chain = Chain { scopes: &scopes };
-    let mut changed = false;
     // A SELECT alias holds the name only where aliases are read, never in
     // the items, which define them, nor in a window's definition
     let mut spell = |expr: &Expression, aliased: &[&str]| -> Result<Expression> {
-        rowids_respelled(expr, aliased, &mut |name| {
-            let Some((_, index)) = chain.resolve(name).ok().flatten() else {
-                return Ok(None);
-            };
-            // A name that is its column's own stays as written
-            let written = match name {
-                Expression::QualifiedIdentifier(q) => &q.name.value_lower,
-                Expression::Identifier(id) => &id.value_lower,
-                _ => return Ok(None),
-            };
-            let column = &own.columns[index];
-            let respelled = !column.eq_ignore_ascii_case(written);
-            changed |= respelled;
-            Ok(respelled.then(|| column.clone()))
-        })
+        rowids_respelled(expr, aliased, spelled)
     };
     let mut out = stmt.clone();
+    if let Some(from) = out.table_expr.as_deref_mut() {
+        spell_join_conditions(from, &mut |expr| spell(expr, &[]))?;
+    }
     for item in &mut out.columns {
         let written = item.clone();
         let walked = match &written {
@@ -2374,19 +2455,22 @@ fn rowids_spelled(stmt: &SelectStatement, own: &ScopeTable) -> Result<Option<Sel
             *expr = spell(expr, &[])?;
         }
     }
-    // The sort that finishes the statement binds an ORDER BY window by its
-    // written form, which a spelled one no longer has
-    let spelled_window = (out.order_by.iter().zip(&stmt.order_by)).any(|(spelled, written)| {
-        spelled.expression != written.expression
-            && QueryClassification::expression_has_window_function(&written.expression)
-    });
-    if spelled_window {
-        return Err(Error::NotSupported(
-            "a window function in ORDER BY reading rowid; select it under an alias and order by the alias"
-                .to_string(),
-        ));
+    Ok(out)
+}
+
+/// Each join condition of `from` replaced by `spell`'s answer for it
+fn spell_join_conditions(
+    from: &mut Expression,
+    spell: &mut dyn FnMut(&Expression) -> Result<Expression>,
+) -> Result<()> {
+    if let Expression::JoinSource(join) = from {
+        spell_join_conditions(&mut join.left, spell)?;
+        spell_join_conditions(&mut join.right, spell)?;
+        if let Some(condition) = join.condition.as_deref_mut() {
+            *condition = spell(condition)?;
+        }
     }
-    Ok(changed.then_some(out))
+    Ok(())
 }
 
 /// `stands`, when it is a parameter, spelled `name`; a parameter is read by
@@ -4036,7 +4120,8 @@ impl PreparedSelect {
         (schema, token): (CompactArc<Schema>, LayoutToken),
         (offset, limit): (usize, Option<usize>),
     ) {
-        if self.where_.narrowing.is_some() || !self.where_.sets.is_empty() {
+        // A key read hands its row back without its row id
+        if self.where_.narrowing.is_some() || !self.where_.sets.is_empty() || self.where_.widen {
             return;
         }
         let Some(items) = self.output_items() else {
@@ -8435,8 +8520,6 @@ impl PreparedSelect {
             true => ScopeTable::of_table(scope_name.clone(), schema, names_rowid(stmt)),
             false => ScopeTable::of(scope_name.clone(), schema),
         };
-        let spelled = rowids_spelled(stmt, &scope)?;
-        let stmt = spelled.as_ref().unwrap_or(stmt);
         // A statement with window functions reads its rows as a SELECT * of
         // them would, and its window step computes the SELECT list over them
         let windowed = Self::computes_windows(stmt);
@@ -8604,15 +8687,15 @@ impl PreparedSelect {
         } else {
             std::borrow::Cow::Borrowed(&stmt.columns)
         };
-        let shown = &scope.columns[scope.shown(0..scope.columns.len())];
-        let mut output_columns = executor.get_output_column_names(&select, shown, Some(scope_name));
+        let mut output_columns =
+            executor.get_output_column_names(&select, &scope.columns, Some(scope_name));
         let visible = output_columns.len();
         output_columns.extend(extra_names);
         // The layout an ORDER BY or DISTINCT ON binds its names by, built
         // with the plan
         let layout = (keyed_branch || !stmt.order_by.is_empty() || !stmt.distinct_on.is_empty())
             .then(|| {
-                let mut layout = Executor::select_layout(&select, shown, Some(scope_name));
+                let mut layout = Executor::select_layout(&select, &scope.columns, Some(scope_name));
                 layout.sources.extend(extra_sources);
                 CompactArc::new(layout)
             });
@@ -9008,8 +9091,6 @@ impl PreparedGrouped {
         epoch: u64,
     ) -> Result<Self> {
         let validity = executor.select_validity(stmt, epoch);
-        let spelled = rowids_spelled(stmt, &scope)?;
-        let stmt = spelled.as_ref().unwrap_or(stmt);
         // A DISTINCT ON key rides along as the hidden item it runs with
         let keyed = Executor::with_distinct_on_items(stmt, &get_classification(stmt));
         let stmt = keyed.as_ref().unwrap_or(stmt);
@@ -9682,6 +9763,11 @@ impl PreparedGrouped {
     /// carry beside the blocks'
     pub(crate) fn reads_run_slots(&self) -> bool {
         !self.blocks.run_slots.is_empty()
+    }
+
+    /// The names its table's rows are read under, the row id slot included
+    pub(crate) fn read_names(&self, schema: &Schema) -> CompactArc<Vec<String>> {
+        read_names(schema, self.where_.as_ref().is_some_and(|w| w.widen))
     }
 
     /// Whether the statement computes windows over its rows without

@@ -33,7 +33,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::common::{CompactArc, CompactVec, StringMap};
 use crate::core::predicate::{kind, KeySide};
-use crate::core::{DataType, Error, Result, Row, RowVec, Schema, Value, ValueSet};
+use crate::core::{DataType, Error, Result, Row, RowVec, Schema, Value, ValueSet, ROWID_SLOT};
 use crate::optimizer::ExpressionSimplifier;
 use crate::parser::ast::*;
 use crate::parser::token::{Position, Token, TokenType};
@@ -1637,6 +1637,12 @@ impl Executor {
             Some(slot) => slot.get_or_init(|| get_classification(stmt)).clone(),
             None => get_classification(stmt),
         };
+        // Every path reads a rowid as the column it is, spelled once here
+        if classification.names_rowid {
+            if let Some(spelled) = self.rowids_spelled(stmt, ctx)? {
+                return self.select_rows_with_plan(&spelled, ctx, false, None, compiled);
+            }
+        }
 
         // A statement of the prepared family runs on that path and no other,
         // and so does one over a single source with a plan slot to keep
@@ -6687,7 +6693,7 @@ impl Executor {
         let layout = match held.classification.has_window_functions {
             true => layout,
             false => {
-                let names = table.schema().column_names_arc();
+                let names = held.read_names(table.schema());
                 let alias = table_source.alias.as_ref().map_or(name, |a| &a.value_lower);
                 Self::shared_result_layout(&held.stmt, &names, Some(alias), &columns)
             }
@@ -8330,11 +8336,14 @@ impl Executor {
                             }
                             shown.iter().for_each(|&at| source(i, Some(at)));
                         }
+                        // A row id slot a row carries is no column a star shows
                         None => {
+                            let shown =
+                                (0..all_columns.len()).filter(|&at| all_columns[at] != ROWID_SLOT);
                             if !laid_out {
-                                names.extend(all_columns.iter().cloned());
+                                names.extend(shown.clone().map(|at| all_columns[at].clone()));
                             }
-                            (0..all_columns.len()).for_each(|idx| source(i, Some(idx)));
+                            shown.for_each(|idx| source(i, Some(idx)));
                         }
                     }
                     continue;
@@ -8346,6 +8355,9 @@ impl Executor {
                         &qs.qualifier,
                         table_alias,
                         |idx, start| {
+                            if all_columns[idx] == ROWID_SLOT {
+                                return;
+                            }
                             if !laid_out {
                                 names.push(all_columns[idx][start..].to_string());
                             }

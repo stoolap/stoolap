@@ -1862,14 +1862,14 @@ pub fn item_name(expr: &Expression) -> String {
     }
 }
 
-/// Whether `expr`, or a statement inside it, names an unquoted rowid
+/// Whether `expr`, or a statement inside it, names an unquoted rowid, or the
+/// row id slot a spelled one reads
 pub(crate) fn expr_names_rowid(expr: &Expression) -> bool {
     let names = expr_names_rowid;
+    let rowid = |name: &str| crate::core::is_rowid_name(name) || name == crate::core::ROWID_SLOT;
     match expr {
-        Expression::Identifier(id) => !id.quoted && crate::core::is_rowid_name(&id.value_lower),
-        Expression::QualifiedIdentifier(q) => {
-            !q.name.quoted && crate::core::is_rowid_name(&q.name.value_lower)
-        }
+        Expression::Identifier(id) => !id.quoted && rowid(&id.value_lower),
+        Expression::QualifiedIdentifier(q) => !q.name.quoted && rowid(&q.name.value_lower),
         Expression::ScalarSubquery(sq) => names_rowid(&sq.subquery),
         Expression::Exists(exists) => names_rowid(&exists.subquery),
         Expression::AllAny(all_any) => names(&all_any.left) || names_rowid(&all_any.subquery),
@@ -1909,48 +1909,46 @@ pub(crate) fn names_rowid(stmt: &SelectStatement) -> bool {
         || stmt.set_operations.iter().any(|op| names_rowid(&op.right))
 }
 
-/// `expr` with each unquoted rowid name outside its subqueries spelled as the
-/// column `column` gives for it, a qualified one keeping its qualifier; a
-/// bare name in `aliased` stays, a SELECT alias holding it, except in an
-/// aggregate's or a window's call, which reads the rows. A column named as
-/// a literal is not spelled, which would read the literal
+/// `expr` with each unquoted rowid name outside its subqueries replaced by
+/// what `spelled` gives for it; a bare name in `aliased` stays, a SELECT
+/// alias holding it, except in an aggregate's or a window's call, which
+/// reads the rows
 pub(crate) fn rowids_respelled(
     expr: &Expression,
     aliased: &[&str],
-    column: &mut dyn FnMut(&Expression) -> crate::core::Result<Option<String>>,
+    spelled: &mut dyn FnMut(&Expression) -> crate::core::Result<Option<Expression>>,
 ) -> crate::core::Result<Expression> {
-    let mut spelled = |expr: &Expression| -> crate::core::Result<Option<Identifier>> {
-        Ok(column(expr)?
-            .filter(|c| !matches!(c.to_lowercase().as_str(), "true" | "false"))
-            .map(|c| Identifier::new(dummy_token(&c, TokenType::Identifier), c)))
-    };
     match expr {
         Expression::Identifier(id)
             if !id.quoted
                 && crate::core::is_rowid_name(&id.value_lower)
                 && !aliased.contains(&id.value_lower.as_str()) =>
         {
-            Ok(spelled(expr)?.map_or_else(|| expr.clone(), Expression::Identifier))
+            Ok(spelled(expr)?.unwrap_or_else(|| expr.clone()))
         }
         Expression::QualifiedIdentifier(q)
             if !q.name.quoted && crate::core::is_rowid_name(&q.name.value_lower) =>
         {
-            Ok(match spelled(expr)? {
-                Some(name) => Expression::QualifiedIdentifier(QualifiedIdentifier {
-                    qualifier: q.qualifier.clone(),
-                    name,
-                }),
-                None => expr.clone(),
-            })
+            Ok(spelled(expr)?.unwrap_or_else(|| expr.clone()))
         }
         Expression::FunctionCall(call)
             if !aliased.is_empty() && is_aggregate_function(&call.function) =>
         {
-            rowids_respelled(expr, &[], column)
+            rowids_respelled(expr, &[], spelled)
         }
-        Expression::Window(_) if !aliased.is_empty() => rowids_respelled(expr, &[], column),
-        other => other.try_map_children(&mut |child| rowids_respelled(child, aliased, column)),
+        Expression::Window(_) if !aliased.is_empty() => rowids_respelled(expr, &[], spelled),
+        other => other.try_map_children(&mut |child| rowids_respelled(child, aliased, spelled)),
     }
+}
+
+/// `column` of the FROM entry named `table`, as a qualified reference, which
+/// no SELECT alias and no literal can stand for
+pub(crate) fn qualified_reference(table: &str, column: &str) -> Expression {
+    let named = |name: &str| Identifier::new(dummy_token(name, TokenType::Identifier), name);
+    Expression::QualifiedIdentifier(QualifiedIdentifier {
+        qualifier: named(table),
+        name: named(column),
+    })
 }
 
 /// `item`, standing for the SELECT item `written`, under the name `written`

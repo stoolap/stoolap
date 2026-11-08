@@ -316,10 +316,11 @@ impl InsertPrograms {
             let widened = returns_slot(&stmt.returning, schema);
             let columns = super::prepared_select::read_names(schema, widened);
             let rowid = schema.rowid_column();
+            let at = rowid.or(widened.then_some(schema.columns.len()));
             returning_programs(
                 &stmt.returning,
                 &columns,
-                rowid.or(widened.then_some(schema.columns.len())),
+                at.map(|at| (at, schema.table_name.as_str())),
             )
         });
         Self {
@@ -367,11 +368,11 @@ fn compile_value(expr: &Expression) -> Result<super::expression::SharedProgram> 
 }
 
 /// A RETURNING's programs over the target's `columns`, a star expanded, a
-/// rowid read from the column `rowid`
+/// rowid read from the column `rowid` gives of the target it names
 fn returning_programs(
     returning: &[Expression],
     columns: &[String],
-    rowid: Option<usize>,
+    rowid: Option<(usize, &str)>,
 ) -> Vec<Result<super::expression::SharedProgram>> {
     use crate::parser::{Identifier, Position, Token, TokenType};
     let registry = crate::functions::global_registry();
@@ -385,7 +386,9 @@ fn returning_programs(
     };
     let compile = |expr: &Expression| {
         let expr = super::utils::rowids_respelled(expr, &[], &mut |name| {
-            Ok(rowid.filter(|_| !real(name)).map(|at| columns[at].clone()))
+            Ok(rowid
+                .filter(|_| !real(name))
+                .map(|(at, table)| super::utils::qualified_reference(table, &columns[at])))
         })?;
         super::aggregation::compile_over_slots(&expr, columns, registry, None, false, None)
     };
