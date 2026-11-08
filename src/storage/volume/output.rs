@@ -493,6 +493,9 @@ impl VolumeFileWriter {
         if !self.unique.is_empty() {
             self.hash_unique()?;
         }
+        // The previous group, encoded while this one accumulated, is
+        // written first, and its accumulators take this group's place
+        self.write_encoded()?;
         let builder = self
             .builder
             .as_mut()
@@ -505,8 +508,6 @@ impl VolumeFileWriter {
             self.spare = Some(group);
             return Ok(());
         }
-        // The previous group is written while this one is encoded
-        self.write_encoded()?;
         let blocks = match self.spare_blocks.take() {
             Some(blocks) => blocks,
             None => vec![(Vec::new(), 0); group.columns()],

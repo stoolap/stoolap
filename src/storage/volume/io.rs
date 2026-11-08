@@ -84,6 +84,11 @@ pub fn write_volume_to_disk(
     volume_id: u64,
     volume: &FrozenVolume,
 ) -> Result<PathBuf> {
+    if volume.meta.file_identity.get().is_some() {
+        return Err(crate::core::Error::internal(
+            "the volume already belongs to another file",
+        ));
+    }
     let mut schema = crate::core::SchemaBuilder::new(table_name);
     for (name, &data_type) in volume
         .meta
@@ -104,12 +109,7 @@ pub fn write_volume_to_disk(
     }
     let (written, path) = writer.finish()?;
     if let Some(&identity) = written.meta.file_identity.get() {
-        if volume.meta.file_identity.get_or_init(|| identity) != &identity {
-            let _ = std::fs::remove_file(&path);
-            return Err(crate::core::Error::internal(
-                "the volume already belongs to another file",
-            ));
-        }
+        let _ = volume.meta.file_identity.set(identity);
     }
     Ok(path)
 }
@@ -1612,6 +1612,20 @@ mod tests {
         let path = write_volume_to_disk(dir.path(), "t", 1, &vol).unwrap();
         let loaded = read_volume_from_disk(&path).unwrap();
         assert_eq!((loaded.columns.len(), loaded.meta.row_count), (0, 0));
+    }
+
+    #[test]
+    fn a_volume_written_again_is_refused_and_its_file_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let vol = mixed_volume(100);
+        let path = write_volume_to_disk(dir.path(), "t", 1, &vol).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let Err(error) = write_volume_to_disk(dir.path(), "t", 1, &vol) else {
+            panic!("a volume was written to a second file");
+        };
+        assert!(error.to_string().contains("already belongs"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), before, "the file changed");
+        assert_eq!(read_volume_from_disk(&path).unwrap().meta.row_count, 100);
     }
 }
 

@@ -1796,18 +1796,9 @@ impl MVCCEngine {
                 stores.insert(table_name_lower.clone(), version_store);
             }
 
-            // Store the frozen volume in the segment manager.
-            // Promote to standalone FIRST to get the stable volume_id, then
-            // register with that same ID so load_standalone_volumes skips it.
             if vol_row_count > 0 {
-                let volume = Arc::new(volume);
-                let stable_id =
-                    self.promote_snapshot_vol_to_standalone(&table_name_lower, &vol_path);
-                if let Some(id) = stable_id {
-                    self.register_volume_with_id(&table_name_lower, volume, id)?;
-                } else {
-                    self.register_volume(&table_name_lower, volume)?;
-                }
+                drop(volume);
+                self.register_snapshot_volume(&table_name_lower, &vol_path)?;
             }
 
             return Ok(source_lsn);
@@ -1857,8 +1848,7 @@ impl MVCCEngine {
             ))
         })?;
         let vol_row_count = volume.meta.row_count;
-
-        let volume = Arc::new(volume);
+        drop(volume);
 
         // Store schema and empty version store
         {
@@ -1870,17 +1860,35 @@ impl MVCCEngine {
             stores.insert(table_name_lower.clone(), version_store);
         }
 
-        // Promote to standalone FIRST, then register with the stable ID
         if vol_row_count > 0 {
-            let stable_id = self.promote_snapshot_vol_to_standalone(&table_name_lower, &vol_path);
-            if let Some(id) = stable_id {
-                self.register_volume_with_id(&table_name_lower, volume, id)?;
-            } else {
-                self.register_volume(&table_name_lower, volume)?;
-            }
+            self.register_snapshot_volume(&table_name_lower, &vol_path)?;
         }
 
         Ok(source_lsn)
+    }
+
+    /// Promotes the volume file beside a snapshot to `volumes/` and
+    /// registers the volume read from that copy, under its stable id so
+    /// `load_standalone_volumes` skips it: the migration removes the
+    /// snapshot's directory, and with it the file beside the snapshot
+    fn register_snapshot_volume(&self, table_name: &str, vol_path: &std::path::Path) -> Result<()> {
+        let promoted = self
+            .persistence
+            .as_ref()
+            .as_ref()
+            .zip(self.promote_snapshot_vol_to_standalone(table_name, vol_path));
+        let Some((pm, volume_id)) = promoted else {
+            return Err(Error::internal(format!(
+                "the snapshot volume of table {table_name} could not be promoted to volumes/"
+            )));
+        };
+        let path = pm
+            .path()
+            .join("volumes")
+            .join(table_name)
+            .join(format!("vol_{:016x}.vol", volume_id));
+        let volume = crate::storage::volume::io::read_volume_from_disk(&path)?;
+        self.register_volume_with_id(table_name, Arc::new(volume), volume_id)
     }
 
     /// Copy a snapshot-adjacent .vol file into the standalone volumes directory.
@@ -3872,6 +3880,7 @@ impl MVCCEngine {
 
     /// Register a frozen volume into a table's segment manager.
     /// Uses a fresh auto-assigned segment ID.
+    #[cfg(test)]
     fn register_volume(
         &self,
         table_name: &str,

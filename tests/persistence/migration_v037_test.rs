@@ -1372,3 +1372,68 @@ fn test_migration_v037_metrics_every_row() {
 
     db.close().unwrap();
 }
+
+// ── Test: a snapshot past 16 MiB converted to a volume ──────────────
+
+/// 200 hex digits from a xorshift seeded by `id`, which do not compress
+fn payload(id: i64) -> String {
+    let mut x = (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..25)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            format!("{:08x}", x as u32)
+        })
+        .collect()
+}
+
+#[test]
+fn test_migration_v037_large_snapshot_reads_from_volumes_after_snapshots_go() {
+    use stoolap::core::{DataType, Row, SchemaBuilder, Value};
+    use stoolap::storage::mvcc::{RowVersion, SnapshotReader, SnapshotWriter};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_dir = tmp.path().join("large");
+    copy_v037db(&db_dir);
+    let snapshots = db_dir.join("snapshots");
+    let users = std::fs::read_dir(snapshots.join("users"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "bin"))
+        .unwrap();
+    let lsn = SnapshotReader::open(&users).unwrap().source_lsn();
+    let path = snapshots.join("big").join(users.file_name().unwrap());
+    let schema = SchemaBuilder::new("big")
+        .column("id", DataType::Integer, false, true)
+        .column("payload", DataType::Text, false, false)
+        .build();
+    let mut writer = SnapshotWriter::with_source_lsn(&path, lsn).unwrap();
+    writer.write_schema(&schema).unwrap();
+    for start in (1..=100_000i64).step_by(10_000) {
+        let batch: Vec<(i64, RowVersion)> = (start..start + 10_000)
+            .map(|id| {
+                let row = vec![Value::Integer(id), Value::text(payload(id))];
+                (id, RowVersion::new(-1, Row::from_values(row)))
+            })
+            .collect();
+        writer.append_batch(&batch).unwrap();
+    }
+    writer.finalize().unwrap();
+    assert!(std::fs::metadata(&path).unwrap().len() > 16 * 1024 * 1024);
+
+    let db = Database::open(&format!("file://{}", db_dir.display())).unwrap();
+    assert!(!snapshots.exists(), "the migration left snapshots/");
+    assert_eq!(query_i64(&db, "SELECT COUNT(*) FROM big"), 100_000);
+    assert_eq!(
+        query_i64(&db, "SELECT SUM(LENGTH(payload)) FROM big"),
+        200 * 100_000
+    );
+    assert_eq!(
+        query_str(&db, "SELECT payload FROM big WHERE id = 77777"),
+        Some(payload(77777))
+    );
+    assert_eq!(query_i64(&db, "SELECT COUNT(*) FROM users"), 13);
+    db.close().unwrap();
+}
