@@ -714,6 +714,14 @@ pub fn verify_volume_file(
     let v5 =
         super::writer::read_exact_at(&file, &mut magic, 0).is_ok() && magic == super::v5::V5_MAGIC;
     if !v5 {
+        // A V4 file carries no identity: where the manifest recorded one,
+        // it is not the file written for the segment
+        if recorded.is_some() {
+            return VolumeCheck::Damaged(format!(
+                "{:?}: not the file the manifest records, a V4 file in its place",
+                path
+            ));
+        }
         if let Err(e) = file.rewind() {
             return VolumeCheck::Unreadable(format!("{:?}: {}", path, e));
         }
@@ -769,6 +777,17 @@ fn verify_v5(
                     name(col)
                 )));
             }
+        }
+    }
+    // The sections the open left unread, whole: the bloom section's header
+    // and an unknown optional section are covered only here
+    for &(kind, at, stored, crc) in &opened.unread {
+        let stored = usize::try_from(stored)
+            .map_err(|_| damaged(format!("section {kind} length exceeds the address space")))?;
+        buf.resize(stored, 0);
+        read_at(&mut buf, at)?;
+        if super::v5::checksum(&buf) != crc {
+            return Err(damaged(format!("section {kind} CRC mismatch")));
         }
     }
     let places = opened.places(cols, bounds.len())?;

@@ -234,6 +234,9 @@ pub(crate) struct Opened {
     /// The sections left in the file: (kind, encoding, offset, length),
     /// each stored raw
     pub deferred: Vec<(u32, u8, u64, u64)>,
+    /// Every section the open did not read, deferred or unknown and
+    /// optional: (kind, offset, stored length, CRC-32C), for a check
+    pub unread: Vec<(u32, u64, u64, u32)>,
     /// The block table, its entry size and where the sections begin
     blocks: Vec<u8>,
     block_entry: usize,
@@ -324,6 +327,7 @@ pub(crate) fn open(
     let mut blocks = None;
     let mut meta: Vec<(u32, u8, Vec<u8>)> = Vec::with_capacity(count);
     let mut left = Vec::new();
+    let mut unread = Vec::new();
     let mut seen = Vec::with_capacity(count);
     let mut sections_start = table_at;
     for i in 0..count {
@@ -349,6 +353,7 @@ pub(crate) fn open(
                 return Err(invalid(format!("section {kind} is not stored raw")));
             }
             left.push((kind, encoding, at, stored));
+            unread.push((kind, at, stored, crc));
             continue;
         }
         let wanted = kind == SECTION_ROOT || kind == SECTION_BLOCKS || known.contains(&kind);
@@ -356,6 +361,7 @@ pub(crate) fn open(
             if flags & REQUIRED != 0 {
                 return Err(invalid(format!("unknown required section {kind}")));
             }
+            unread.push((kind, at, stored, crc));
             continue;
         }
         let mut bytes = vec![0u8; bounded(stored, table_at, "section")?];
@@ -430,6 +436,7 @@ pub(crate) fn open(
         root,
         meta,
         deferred: left,
+        unread,
         blocks,
         block_entry,
         sections_start,

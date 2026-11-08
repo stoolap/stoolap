@@ -236,15 +236,23 @@ fn test_a_damaged_block_fails_the_statements_that_read_it() {
 /// Where column `col`'s bloom words start in a V5 file: the footer names
 /// the section table, whose bloom section entry (kind 9) names the section
 fn bloom_words_at(bytes: &[u8], col: usize) -> usize {
-    let u64_at = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize;
-    let table = u64_at(bytes.len() - 32);
+    let section = bloom_section_at(bytes);
+    section + u64_at(bytes, section + 16 + col * 24 + 16)
+}
+
+fn u64_at(bytes: &[u8], at: usize) -> usize {
+    u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize
+}
+
+/// Where the bloom section (kind 9) of a V5 file's bytes begins
+fn bloom_section_at(bytes: &[u8]) -> usize {
+    let table = u64_at(bytes, bytes.len() - 32);
     let count = u32::from_le_bytes(bytes[table..table + 4].try_into().unwrap()) as usize;
-    let section = (0..count)
+    (0..count)
         .map(|i| table + 8 + i * 40)
         .find(|&entry| bytes[entry..entry + 4] == 9u32.to_le_bytes())
-        .map(|entry| u64_at(entry + 8))
-        .unwrap();
-    section + u64_at(section + 16 + col * 24 + 16)
+        .map(|entry| u64_at(bytes, entry + 8))
+        .unwrap()
 }
 
 #[test]
@@ -614,4 +622,70 @@ fn test_verify_reports_a_file_it_cannot_read_apart_from_damage() {
     assert_eq!(status, "unreadable");
     assert!(detail.is_some());
     assert_eq!(verified(&db, "u"), ("ok".to_string(), None));
+}
+
+#[test]
+fn test_verify_reports_a_volume_that_did_not_load_at_the_open() {
+    for (name, damage) in [("verify_footer", "footer"), ("verify_gone", "gone")] {
+        let dir = tempfile::tempdir().unwrap();
+        let (dsn, volumes) = sealed(dir.path(), name);
+        if damage == "gone" {
+            std::fs::remove_file(&volumes[0]).unwrap();
+        } else {
+            let mut bytes = std::fs::read(&volumes[0]).unwrap();
+            let last = bytes.len() - 1;
+            bytes[last - 8] ^= 0xFF;
+            std::fs::write(&volumes[0], &bytes).unwrap();
+        }
+        let db = Database::open(&dsn).unwrap();
+        assert!(
+            run(&db, "SELECT COUNT(*) FROM t").is_err(),
+            "{damage}: t answered without its volume"
+        );
+        let (status, detail) = verified(&db, "t");
+        let want = if damage == "gone" {
+            "unreadable"
+        } else {
+            "damaged"
+        };
+        assert_eq!(status, want, "{damage}: {detail:?}");
+        assert_eq!(verified(&db, "u"), ("ok".to_string(), None));
+    }
+}
+
+#[test]
+fn test_verify_finds_a_v4_file_in_place_of_the_recorded_one() {
+    use stoolap::storage::volume::io::{read_volume_from_disk, write_volume_to_disk_v4};
+    let dir = tempfile::tempdir().unwrap();
+    let (dsn, volumes) = sealed(dir.path(), "verify_v4_in_place");
+    let db = Database::open(&dsn).unwrap();
+    // t's own rows, whole, in a V4 file in its file's place
+    let rows = read_volume_from_disk(&volumes[0]).unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let v4 = write_volume_to_disk_v4(elsewhere.path(), "t", 1, &rows).unwrap();
+    std::fs::copy(&v4, &volumes[0]).unwrap();
+    let (status, detail) = verified(&db, "t");
+    assert_eq!(status, "damaged");
+    let detail = detail.unwrap();
+    assert!(
+        detail.contains("not the file the manifest records"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn test_verify_checks_the_bloom_section_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let (dsn, volumes) = sealed(dir.path(), "verify_bloom_header");
+    let db = Database::open(&dsn).unwrap();
+    let mut bytes = std::fs::read(&volumes[0]).unwrap();
+    // A reserved byte of the section's header: no entry and no filter's
+    // words cover it, the section's CRC does
+    let section = bloom_section_at(&bytes);
+    bytes[section + 3] ^= 0xFF;
+    std::fs::write(&volumes[0], &bytes).unwrap();
+    let (status, detail) = verified(&db, "t");
+    assert_eq!(status, "damaged");
+    let detail = detail.unwrap();
+    assert!(detail.contains("section 9 CRC mismatch"), "{detail}");
 }
