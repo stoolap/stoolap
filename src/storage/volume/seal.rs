@@ -190,7 +190,8 @@ mod tests {
 
         let mut builder = VolumeBuilder::new(&schema);
         builder.add_row(1, &rows[1].1);
-        assert!(builder.flush_group(|_, _| Ok(())).is_err());
+        let mut spare = builder.spare_accumulators();
+        assert!(builder.flush_group_into(&mut spare).is_err());
         assert_eq!(builder.group_len(), 0, "the refused row took no column");
     }
 

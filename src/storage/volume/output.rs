@@ -34,7 +34,9 @@ use crate::core::{Error, Result, Row, Schema};
 use super::column::ROW_GROUP_SIZE;
 use super::format::serialize_typed_block;
 use super::transfer::TypedSink;
-use super::writer::{CompressedBlockStore, FrozenVolume, LazyColumns, TypedCells, VolumeBuilder};
+use super::writer::{
+    Accumulators, CompressedBlockStore, FrozenVolume, LazyColumns, TypedCells, VolumeBuilder,
+};
 
 /// The write buffer of the file being written
 const COPY_BUFFER: usize = 1 << 20;
@@ -48,11 +50,142 @@ fn io_error(what: &str, error: std::io::Error) -> Error {
     Error::internal(format!("{what}: {error}"))
 }
 
+/// Encodes one column's cells into `block`, LZ4-compressed when `compress`
+/// and that shrinks it; returns the encoded length
+fn encode_block(cells: &TypedCells<'_>, compress: bool, block: &mut Vec<u8>) -> Result<usize> {
+    let encoded = serialize_typed_block(cells);
+    let decoded = encoded.len();
+    if compress {
+        block.clear();
+        block.resize(lz4_flex::block::get_maximum_output_size(decoded), 0);
+        let n = lz4_flex::block::compress_into(&encoded, block)
+            .map_err(|e| Error::internal(format!("LZ4: {e}")))?;
+        if n < decoded {
+            block.truncate(n);
+            return Ok(decoded);
+        }
+    }
+    *block = encoded;
+    Ok(decoded)
+}
+
+/// One row group's cells and, once encoded, its blocks by column with
+/// their decoded lengths
+struct EncodeJob {
+    group: Accumulators,
+    blocks: Vec<(Vec<u8>, usize)>,
+    result: Result<()>,
+}
+
+impl EncodeJob {
+    fn run(&mut self, compress: bool) {
+        let group = &self.group;
+        self.result =
+            self.blocks
+                .iter_mut()
+                .enumerate()
+                .try_for_each(|(col_idx, (block, decoded))| {
+                    *decoded = encode_block(&group.cells(col_idx), compress, block)?;
+                    Ok(())
+                });
+    }
+}
+
+/// Encodes the groups handed to it in order, one at a time, on a thread
+/// of its own when the build has threads: a group is encoded while the
+/// next one accumulates
+struct Encoder {
+    compress: bool,
+    /// Whether a job was handed over and not taken back
+    out: bool,
+    #[cfg(feature = "parallel")]
+    channel: Option<(
+        std::sync::mpsc::SyncSender<EncodeJob>,
+        std::sync::mpsc::Receiver<EncodeJob>,
+    )>,
+    #[cfg(not(feature = "parallel"))]
+    done: Option<EncodeJob>,
+}
+
+impl Encoder {
+    fn new(compress: bool) -> Self {
+        Self {
+            compress,
+            out: false,
+            #[cfg(feature = "parallel")]
+            channel: None,
+            #[cfg(not(feature = "parallel"))]
+            done: None,
+        }
+    }
+
+    /// Hands `job` over; the previous one must have been taken back
+    fn submit(&mut self, job: EncodeJob) -> Result<()> {
+        debug_assert!(!self.out, "an encoded group was not taken back");
+        #[cfg(feature = "parallel")]
+        {
+            if self.channel.is_none() {
+                let (jobs, inbox) = std::sync::mpsc::sync_channel::<EncodeJob>(1);
+                let (outbox, done) = std::sync::mpsc::sync_channel::<EncodeJob>(1);
+                let compress = self.compress;
+                std::thread::Builder::new()
+                    .name("stoolap-volume-encode".into())
+                    .spawn(move || {
+                        for mut job in inbox {
+                            job.run(compress);
+                            if outbox.send(job).is_err() {
+                                break;
+                            }
+                        }
+                    })
+                    .map_err(|e| io_error("failed to start the volume encoder", e))?;
+                self.channel = Some((jobs, done));
+            }
+            let Some((jobs, _)) = &self.channel else {
+                return Err(Error::internal("volume encoder not started"));
+            };
+            jobs.send(job)
+                .map_err(|_| Error::internal("volume encoder stopped"))?;
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            let mut job = job;
+            job.run(self.compress);
+            self.done = Some(job);
+        }
+        self.out = true;
+        Ok(())
+    }
+
+    /// The job handed over last, once encoded; None when none is out
+    fn take(&mut self) -> Result<Option<EncodeJob>> {
+        if !self.out {
+            return Ok(None);
+        }
+        self.out = false;
+        #[cfg(feature = "parallel")]
+        {
+            let Some((_, done)) = &self.channel else {
+                return Err(Error::internal("volume encoder not started"));
+            };
+            done.recv()
+                .map(Some)
+                .map_err(|_| Error::internal("volume encoder stopped"))
+        }
+        #[cfg(not(feature = "parallel"))]
+        Ok(self.done.take())
+    }
+}
+
 /// Writes one volume file from typed batches; see the module
 pub struct VolumeFileWriter {
     /// None once `finish` has taken it
     builder: Option<VolumeBuilder>,
-    compress: bool,
+    encoder: Encoder,
+    /// The accumulators and block buffers of the last group written,
+    /// taken by the next group handed to the encoder
+    spare: Option<Accumulators>,
+    spare_blocks: Option<Vec<(Vec<u8>, usize)>>,
     final_path: PathBuf,
     blocks_path: PathBuf,
     blocks: Option<BufWriter<File>>,
@@ -63,7 +196,6 @@ pub struct VolumeFileWriter {
     index: Vec<Vec<(u64, usize, usize, u32)>>,
     /// Every block written, in file order, for the block table
     entries: Vec<super::v5::BlockEntry>,
-    packed: Vec<u8>,
     finished: bool,
     /// Rows the writer was sized for; caps a unique set's capacity
     expected_rows: usize,
@@ -134,12 +266,13 @@ impl VolumeFileWriter {
             index: vec![Vec::new(); schema.columns.len()],
             entries: Vec::new(),
             builder: Some(builder),
-            compress,
+            encoder: Encoder::new(compress),
+            spare: None,
+            spare_blocks: None,
             final_path,
             blocks_path,
             blocks: Some(blocks),
             block_pos: super::v5::HEADER_LEN,
-            packed: Vec::new(),
             finished: false,
             expected_rows,
             volume_id,
@@ -360,49 +493,66 @@ impl VolumeFileWriter {
         if !self.unique.is_empty() {
             self.hash_unique()?;
         }
-        let blocks = self
-            .blocks
-            .as_mut()
-            .ok_or_else(|| Error::internal("volume writer already finished"))?;
-        let compress = self.compress;
-        let (packed, index, block_pos, entries) = (
-            &mut self.packed,
-            &mut self.index,
-            &mut self.block_pos,
-            &mut self.entries,
-        );
         let builder = self
             .builder
             .as_mut()
             .ok_or_else(|| Error::internal("volume writer already finished"))?;
-        builder.flush_group(|col_idx, cells| {
-            let encoded = serialize_typed_block(&cells);
-            let decompressed_len = encoded.len();
-            let bytes: &[u8] = if compress {
-                packed.clear();
-                packed.resize(lz4_flex::block::get_maximum_output_size(encoded.len()), 0);
-                let n = lz4_flex::block::compress_into(&encoded, packed)
-                    .map_err(|e| Error::internal(format!("LZ4: {e}")))?;
-                if n < encoded.len() {
-                    &packed[..n]
-                } else {
-                    &encoded
-                }
-            } else {
-                &encoded
-            };
-            blocks
-                .write_all(bytes)
-                .map_err(|e| io_error("failed to write volume block", e))?;
-            let group = index[col_idx].len();
-            let entry =
-                super::v5::BlockEntry::new(*block_pos, bytes, decompressed_len, col_idx, group)
-                    .map_err(|e| io_error("V5 block", e))?;
-            index[col_idx].push((*block_pos, bytes.len(), decompressed_len, entry.crc()));
-            entries.push(entry);
-            *block_pos += bytes.len() as u64;
-            Ok(())
+        let mut group = match self.spare.take() {
+            Some(group) => group,
+            None => builder.spare_accumulators(),
+        };
+        if builder.flush_group_into(&mut group)? == 0 {
+            self.spare = Some(group);
+            return Ok(());
+        }
+        // The previous group is written while this one is encoded
+        self.write_encoded()?;
+        let blocks = match self.spare_blocks.take() {
+            Some(blocks) => blocks,
+            None => vec![(Vec::new(), 0); group.columns()],
+        };
+        self.encoder.submit(EncodeJob {
+            group,
+            blocks,
+            result: Ok(()),
         })
+    }
+
+    /// Waits for the group handed to the encoder last and appends its
+    /// blocks to the file, column by column
+    fn write_encoded(&mut self) -> Result<()> {
+        let Some(EncodeJob {
+            group,
+            blocks,
+            result,
+        }) = self.encoder.take()?
+        else {
+            return Ok(());
+        };
+        self.spare = Some(group);
+        result?;
+        let file = self
+            .blocks
+            .as_mut()
+            .ok_or_else(|| Error::internal("volume writer already finished"))?;
+        for (col_idx, (bytes, decompressed_len)) in blocks.iter().enumerate() {
+            file.write_all(bytes)
+                .map_err(|e| io_error("failed to write volume block", e))?;
+            let group = self.index[col_idx].len();
+            let entry = super::v5::BlockEntry::new(
+                self.block_pos,
+                bytes,
+                *decompressed_len,
+                col_idx,
+                group,
+            )
+            .map_err(|e| io_error("V5 block", e))?;
+            self.index[col_idx].push((self.block_pos, bytes.len(), *decompressed_len, entry.crc()));
+            self.entries.push(entry);
+            self.block_pos += bytes.len() as u64;
+        }
+        self.spare_blocks = Some(blocks);
+        Ok(())
     }
 
     /// Writes the last group, the metadata and the final file, syncs it
@@ -412,6 +562,7 @@ impl VolumeFileWriter {
         if self.builder()?.group_len() > 0 {
             self.flush_group()?;
         }
+        self.write_encoded()?;
         let mut blocks = self
             .blocks
             .take()
