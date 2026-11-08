@@ -2700,6 +2700,48 @@ impl SegmentManager {
             .unwrap_or(0)
     }
 
+    /// Each listed segment backed by a file: its id, the file's handle and
+    /// the identity the manifest records for it, for PRAGMA VERIFY to read
+    /// once the locks are let go; the handle keeps the file in place. A
+    /// segment that did not load at open is named by its file's path
+    #[allow(clippy::type_complexity)]
+    pub fn verify_targets(
+        &self,
+    ) -> Vec<(
+        u64,
+        Arc<super::writer::VolumeFile>,
+        Option<super::writer::FileIdentity>,
+    )> {
+        // Taken under the locks; a path is resolved after them, since
+        // `file_of` takes the reload lock, which is taken before them
+        let listed: Vec<_> = {
+            let manifest = self.manifest.read();
+            let segments = self.segments.read();
+            manifest
+                .segments
+                .iter()
+                .filter_map(|meta| {
+                    let file = match segments.get(&meta.segment_id) {
+                        Some(segment) => Some(Arc::clone(segment.file.as_ref()?)),
+                        None => None,
+                    };
+                    let recorded = manifest.identities.get(&meta.segment_id).copied();
+                    Some((meta.segment_id, file, recorded))
+                })
+                .collect()
+        };
+        listed
+            .into_iter()
+            .filter_map(|(segment_id, file, recorded)| {
+                let file = match file {
+                    Some(file) => file,
+                    None => self.file_of(segment_id)?,
+                };
+                Some((segment_id, file, recorded))
+            })
+            .collect()
+    }
+
     /// Per-volume statistics for PRAGMA VOLUME_STATS.
     /// Returns (segment_id, tier, row_count, memory_bytes, idle_cycles) for each volume.
     pub fn volume_stats(&self) -> Vec<(u64, &'static str, usize, usize, u64)> {

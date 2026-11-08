@@ -231,9 +231,12 @@ pub(crate) struct Opened {
     pub root: Root,
     /// The metadata sections this reader knows: (kind, encoding, bytes)
     pub meta: Vec<(u32, u8, Vec<u8>)>,
-    /// The sections left in the file: (kind, encoding, offset, length),
-    /// each stored raw
-    pub deferred: Vec<(u32, u8, u64, u64)>,
+    /// The sections left in the file: (kind, encoding, offset, length,
+    /// CRC-32C), each stored raw
+    pub deferred: Vec<(u32, u8, u64, u64, u32)>,
+    /// The unknown optional sections the open skipped: (kind, offset,
+    /// stored length, CRC-32C); none in a file this writer wrote
+    pub skipped: Vec<(u32, u64, u64, u32)>,
     /// The block table, its entry size and where the sections begin
     blocks: Vec<u8>,
     block_entry: usize,
@@ -324,6 +327,7 @@ pub(crate) fn open(
     let mut blocks = None;
     let mut meta: Vec<(u32, u8, Vec<u8>)> = Vec::with_capacity(count);
     let mut left = Vec::new();
+    let mut skipped = Vec::new();
     let mut seen = Vec::with_capacity(count);
     let mut sections_start = table_at;
     for i in 0..count {
@@ -348,7 +352,7 @@ pub(crate) fn open(
             if codec != CODEC_RAW || stored != decoded {
                 return Err(invalid(format!("section {kind} is not stored raw")));
             }
-            left.push((kind, encoding, at, stored));
+            left.push((kind, encoding, at, stored, crc));
             continue;
         }
         let wanted = kind == SECTION_ROOT || kind == SECTION_BLOCKS || known.contains(&kind);
@@ -356,6 +360,7 @@ pub(crate) fn open(
             if flags & REQUIRED != 0 {
                 return Err(invalid(format!("unknown required section {kind}")));
             }
+            skipped.push((kind, at, stored, crc));
             continue;
         }
         let mut bytes = vec![0u8; bounded(stored, table_at, "section")?];
@@ -430,6 +435,7 @@ pub(crate) fn open(
         root,
         meta,
         deferred: left,
+        skipped,
         blocks,
         block_entry,
         sections_start,
