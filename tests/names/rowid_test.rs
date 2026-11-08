@@ -331,7 +331,17 @@ fn reads(db: &Database, t: &str, [i1, i2, i3]: [i64; 3]) {
 /// row ids `ids`, ascending, so an order by a reads them backwards
 fn clauses(db: &Database, t: &str, [i1, i2, i3]: [i64; 3]) {
     let q = |sql: &str| rows(db, &sql.replace("$t", t));
-    let cases: [(&str, Vec<Vec<Value>>); 9] = [
+    let cases: [(&str, Vec<Vec<Value>>); 12] = [
+        // An alias named rowid takes the name only where it takes a column's
+        ("SELECT a AS rowid FROM $t WHERE rowid = 1", vec![vec![int(30)]]),
+        (
+            "SELECT a AS rowid FROM $t ORDER BY rowid + 0",
+            vec![vec![int(30)], vec![int(20)], vec![int(10)]],
+        ),
+        (
+            "SELECT a AS rowid FROM $t GROUP BY a, rowid HAVING rowid > 15 ORDER BY 1",
+            vec![vec![int(20)], vec![int(30)]],
+        ),
         ("SELECT a FROM $t ORDER BY rowid", vec![vec![int(30)], vec![int(20)], vec![int(10)]]),
         ("SELECT a FROM $t ORDER BY _rowid_ DESC LIMIT 1", vec![vec![int(10)]]),
         ("SELECT a FROM $t ORDER BY $t.rowid LIMIT 1 OFFSET 1", vec![vec![int(20)]]),
@@ -348,6 +358,18 @@ fn clauses(db: &Database, t: &str, [i1, i2, i3]: [i64; 3]) {
     for (sql, answer) in cases {
         assert_eq!(q(sql), answer, "{sql} in {t}");
     }
+    for sql in [
+        "SELECT a FROM {t} WHERE rowid = (SELECT a FROM {t})",
+        "DELETE FROM {t} WHERE rowid = (SELECT a FROM {t})",
+    ] {
+        let sql = sql.replace("{t}", t);
+        assert!(error(db, &sql).contains("more than one row"), "{sql}");
+    }
+    assert_eq!(
+        q("SELECT COUNT(*) FROM $t"),
+        [[int(3)]],
+        "nothing deleted in {t}"
+    );
     let by_id = db
         .query(&format!("SELECT a FROM {t} WHERE rowid = $1"), (i2,))
         .unwrap()

@@ -2468,16 +2468,25 @@ fn spelled_statement(
             &mut []
         }
     };
-    for expr in out
+    // A key that is a name reads an alias of it ahead of a column, as
+    // HAVING does throughout; a WHERE and a key's expression read columns
+    for key in out
         .distinct_on
         .iter_mut()
         .chain(out.group_by.columns.iter_mut())
         .chain(sets.iter_mut().flatten())
-        .chain(out.where_clause.as_deref_mut())
-        .chain(out.having.as_deref_mut())
         .chain(order_by.iter_mut().map(|o| &mut o.expression))
     {
-        *expr = spell(expr, &aliases, false)?;
+        if matches!(key, Expression::Identifier(id) if aliases.contains(&id.value_lower.as_str())) {
+            continue;
+        }
+        *key = spell(key, &[], false)?;
+    }
+    if let Some(where_clause) = out.where_clause.as_deref_mut() {
+        *where_clause = spell(where_clause, &[], false)?;
+    }
+    if let Some(having) = out.having.as_deref_mut() {
+        *having = spell(having, &aliases, false)?;
     }
     for window in &mut out.window_defs {
         let keys = window.order_by.iter_mut().map(|o| &mut o.expression);
@@ -15627,8 +15636,13 @@ impl<'a> PreparedRunner<'a> {
                         (storage_expr, scanned_whole, extra_whole, rest) = scan;
                     }
                     let filter = storage_expr.as_deref();
-                    // The row ids the WHERE names are read by those ids
-                    if let Some(ids) = where_.ids.as_deref().and_then(|keys| self.slot_ids(keys)) {
+                    // The row ids the WHERE names are read by those ids; a
+                    // failed slot's error is the rows' to raise, which a scan reads
+                    let ids = where_
+                        .ids
+                        .as_deref()
+                        .filter(|_| self.failed_slots.is_none());
+                    if let Some(ids) = ids.and_then(|keys| self.slot_ids(keys)) {
                         let rows = match filter {
                             Some(filter) => table.fetch_rows_by_ids(&ids, filter)?,
                             None => table.fetch_rows_by_ids(&ids, &ConstBoolExpr::true_expr())?,
