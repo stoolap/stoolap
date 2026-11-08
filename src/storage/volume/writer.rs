@@ -366,7 +366,91 @@ enum BlockSource {
         /// A V5 file's block CRCs by column and group, checked on every
         /// read from the file; a V4 file was checked whole at open
         crcs: Option<Vec<Vec<u32>>>,
+        /// By column, the reads advised ahead of a scan
+        ahead: Box<[ReadAhead]>,
     },
+}
+
+/// The blocks a scan of one column is advised ahead by at most
+const READ_AHEAD_BLOCKS: usize = 64;
+
+/// The bytes a scan of one column is advised ahead by at most
+const READ_AHEAD_BYTES: usize = 16 << 20;
+
+/// One column's file reads: the group read last, plus one, the bound
+/// below which the groups after it were advised to the OS, and the reads
+/// in a row that followed their last
+#[derive(Default)]
+struct ReadAhead {
+    next: std::sync::atomic::AtomicUsize,
+    advised: std::sync::atomic::AtomicUsize,
+    run: std::sync::atomic::AtomicUsize,
+}
+
+impl ReadAhead {
+    /// Advises the OS of the blocks after `group` when the column is read
+    /// group after group, so a cold scan waits on its reads together; the
+    /// window starts at 4 blocks and 1 MiB and doubles with the run. A read
+    /// that does not follow the last advises nothing: a point read or a
+    /// pruned scan reads only its blocks
+    fn read(&self, file: &std::fs::File, offsets: &[u64], lens: &[usize], group: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let first = group + 1;
+        if self.next.swap(first, Relaxed) != group || group == 0 {
+            self.advised.store(first, Relaxed);
+            self.run.store(0, Relaxed);
+            return;
+        }
+        let run = self.run.fetch_add(1, Relaxed).min(4);
+        let (max_blocks, max_bytes) = (
+            (4 << run).min(READ_AHEAD_BLOCKS),
+            ((1 << 20) << run).min(READ_AHEAD_BYTES),
+        );
+        let advised = self.advised.load(Relaxed).clamp(first, lens.len());
+        let ahead: usize = lens[first..advised].iter().sum();
+        if advised - first >= max_blocks / 2 || ahead >= max_bytes / 2 {
+            return;
+        }
+        let (mut end, mut bytes) = (advised, ahead);
+        while end < lens.len() && end - first < max_blocks && bytes < max_bytes {
+            advise_read(file, offsets[end], lens[end]);
+            bytes += lens[end];
+            end += 1;
+        }
+        self.advised.store(end, Relaxed);
+    }
+}
+
+/// Asks the OS to start reading `len` bytes at `offset`; a hint, so a
+/// refusal is ignored, and a platform without one does nothing
+fn advise_read(file: &std::fs::File, offset: u64, len: usize) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let mut advice = libc::radvisory {
+            ra_offset: offset as libc::off_t,
+            ra_count: len.min(i32::MAX as usize) as libc::c_int,
+        };
+        // SAFETY: the descriptor is open for the call's duration, held by
+        // `file`, and F_RDADVISE reads only the radvisory it is given
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_RDADVISE, &mut advice) };
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: the descriptor is open for the call's duration, held by
+        // `file`; the call takes plain integers
+        unsafe {
+            libc::posix_fadvise(
+                file.as_raw_fd(),
+                offset as libc::off_t,
+                len as libc::off_t,
+                libc::POSIX_FADV_WILLNEED,
+            )
+        };
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+    let _ = (file, offset, len);
 }
 
 /// Reads `buf.len()` bytes at `offset` without moving a shared cursor
@@ -779,6 +863,7 @@ impl CompressedBlockStore {
         Self {
             source: BlockSource::File {
                 file,
+                ahead: offsets.iter().map(|_| ReadAhead::default()).collect(),
                 offsets,
                 lens: compressed_lens,
                 crcs: None,
@@ -864,6 +949,7 @@ impl CompressedBlockStore {
                 offsets,
                 lens,
                 crcs,
+                ahead,
             } => {
                 let offset = *offsets
                     .get(col_idx)
@@ -880,7 +966,13 @@ impl CompressedBlockStore {
                 scratch.resize(len, 0);
                 #[cfg(any(test, feature = "test-failpoints"))]
                 crate::test_failpoints::block_file_read();
-                read_exact_at(&*file.block_reader()?, scratch, offset)?;
+                let reader = file.block_reader()?;
+                if let (Some(ahead), Some(offsets), Some(lens)) =
+                    (ahead.get(col_idx), offsets.get(col_idx), lens.get(col_idx))
+                {
+                    ahead.read(&reader, offsets, lens, group_idx);
+                }
+                read_exact_at(&reader, scratch, offset)?;
                 if let Some(crcs) = crcs {
                     let want = crcs.get(col_idx).and_then(|col| col.get(group_idx));
                     if want != Some(&super::v5::checksum(scratch)) {
@@ -5153,5 +5245,61 @@ mod tests {
             capacity * std::mem::size_of::<(u64, u32)>(),
             "the built index is counted by its capacity"
         );
+    }
+
+    /// The groups advised past `group`, the last one read, after reading
+    /// `reads` of a column of `groups` blocks of `len` bytes each
+    fn advised_ahead(reads: &[usize], groups: usize, len: usize) -> usize {
+        let file = tempfile::tempfile().unwrap();
+        let lens = vec![len; groups];
+        let offsets: Vec<u64> = (0..groups as u64).map(|g| g * len as u64).collect();
+        let ahead = ReadAhead::default();
+        for &group in reads {
+            ahead.read(&file, &offsets, &lens, group);
+        }
+        let last = *reads.last().unwrap();
+        ahead.advised.load(std::sync::atomic::Ordering::Relaxed) - (last + 1)
+    }
+
+    #[test]
+    fn a_read_that_does_not_follow_the_last_advises_nothing() {
+        assert_eq!(advised_ahead(&[7], 500, 100), 0, "a point read");
+        assert_eq!(
+            advised_ahead(&[0, 2, 4, 6, 8], 500, 100),
+            0,
+            "a pruned scan"
+        );
+        assert_eq!(advised_ahead(&[3, 2], 500, 100), 0, "a backward read");
+        assert_eq!(
+            advised_ahead(&[0, 1, 2, 9], 500, 100),
+            0,
+            "a jump ends the run"
+        );
+    }
+
+    #[test]
+    fn a_scan_is_advised_ahead_by_a_window_that_doubles_to_its_cap() {
+        // Small blocks: 4 on the first read that follows, then the window
+        // doubles; it is topped up once half of it has been read
+        assert_eq!(advised_ahead(&[0, 1], 500, 100), 4);
+        assert_eq!(advised_ahead(&[0, 1, 2], 500, 100), 8);
+        let scan: Vec<usize> = (0..200).collect();
+        let ahead = advised_ahead(&scan, 500, 100);
+        assert!(
+            (READ_AHEAD_BLOCKS / 2..=READ_AHEAD_BLOCKS).contains(&ahead),
+            "{ahead}"
+        );
+        // Nothing past the column's last block
+        assert_eq!(advised_ahead(&scan, 210, 100), 10);
+    }
+
+    #[test]
+    fn large_blocks_are_advised_ahead_by_their_bytes() {
+        // 8 MiB blocks: one past the 1 MiB of the first window, at most two
+        // past the 16 MiB cap later
+        assert_eq!(advised_ahead(&[0, 1], 500, 8 << 20), 1);
+        let scan: Vec<usize> = (0..50).collect();
+        let ahead = advised_ahead(&scan, 500, 8 << 20);
+        assert!((1..=2).contains(&ahead), "{ahead}");
     }
 }
