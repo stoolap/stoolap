@@ -51,6 +51,8 @@ struct Cursor<'a> {
     /// The key of the last row of the previous group, to check the order
     /// across the boundary
     last_key: Vec<Value>,
+    /// The cursor's file reads, for the OS to read ahead of its groups
+    reads: super::writer::ScanReads,
 }
 
 impl<'a> Cursor<'a> {
@@ -79,7 +81,7 @@ impl<'a> Cursor<'a> {
                         let store = self.volume.columns.compressed_store().ok_or_else(|| {
                             Error::internal("compaction input has no column data to read")
                         })?;
-                        let column = store.group_column(*physical, group)?;
+                        let column = store.group_column_in(*physical, group, &mut self.reads)?;
                         self.held_bytes += column.cache_size();
                         KeyCell::Group(column, group * self.volume.meta.group_rows)
                     }
@@ -221,6 +223,7 @@ pub fn merge_key_order<'a>(
             cells: Vec::with_capacity(schema.cluster_key.len()),
             held_bytes: 0,
             last_key: Vec::new(),
+            reads: Default::default(),
         };
         if let Some((_, _, row)) = cursor.head() {
             cursor.load(row)?;
@@ -297,6 +300,7 @@ pub fn volume_in_key_order(volume: &FrozenVolume, key: &[usize]) -> Result<bool>
     }
     let mut cells: Vec<KeyCell<'_>> = Vec::with_capacity(key.len());
     let mut last_key: Vec<Value> = Vec::new();
+    let mut reads = super::writer::ScanReads::default();
     let mut group_start = 0;
     let group_rows = volume.meta.group_rows;
     while group_start < rows {
@@ -310,7 +314,10 @@ pub fn volume_in_key_order(volume: &FrozenVolume, key: &[usize]) -> Result<bool>
                     .columns
                     .compressed_store()
                     .ok_or_else(|| Error::internal("volume has no column data to read"))?;
-                KeyCell::Group(store.group_column(column, group)?, group_start)
+                KeyCell::Group(
+                    store.group_column_in(column, group, &mut reads)?,
+                    group_start,
+                )
             });
         }
         let group_end = (group_start + group_rows).min(rows);

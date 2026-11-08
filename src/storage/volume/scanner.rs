@@ -117,6 +117,8 @@ pub struct VolumeScanner {
     volume: Arc<FrozenVolume>,
     /// The volume's `group_shift`, read once for the per-row walks
     group_shift: u32,
+    /// This scan's file reads, for the OS to read ahead of its groups
+    reads: std::cell::RefCell<super::writer::ScanReads>,
     /// Column indices to project (empty = all columns)
     project_cols: Vec<usize>,
     /// Pre-computed flag: true when project_cols is an identity mapping over
@@ -300,7 +302,9 @@ impl VolumeScanner {
         if let Some(st) = store {
             for &(col_idx, _) in &self.dict_filters {
                 if blocks.iter().all(|&(c, _)| c != col_idx) {
-                    let col = st.group_column(col_idx, group_idx).map_err(Error::from)?;
+                    let col = st
+                        .group_column_in(col_idx, group_idx, &mut self.reads.borrow_mut())
+                        .map_err(Error::from)?;
                     blocks.push((col_idx, col));
                 }
             }
@@ -446,6 +450,7 @@ impl VolumeScanner {
         let mut s = Self {
             end_idx,
             group_shift: volume.meta.group_shift(),
+            reads: Default::default(),
             volume,
             project_cols: project,
             is_full_projection,
@@ -509,6 +514,7 @@ impl VolumeScanner {
         volume.mark_accessed();
         let mut s = Self {
             group_shift: volume.meta.group_shift(),
+            reads: Default::default(),
             volume,
             project_cols: project,
             is_full_projection,
@@ -608,6 +614,7 @@ impl VolumeScanner {
                 last_access_epoch: std::sync::atomic::AtomicU64::new(0),
             }),
             group_shift: super::column::ROW_GROUP_SIZE.trailing_zeros(),
+            reads: Default::default(),
             project_cols: Vec::new(),
             is_full_projection: true,
             current_idx: 0,
@@ -765,7 +772,7 @@ impl VolumeScanner {
                     let mut group_cols = Vec::with_capacity(self.dict_filters.len());
                     let mut failed = None;
                     for &(ci, _) in &self.dict_filters {
-                        match st.group_column(ci, gi) {
+                        match st.group_column_in(ci, gi, &mut self.reads.borrow_mut()) {
                             Ok(col) => group_cols.push(col),
                             Err(e) => {
                                 failed = Some(Error::from(e));
@@ -1228,7 +1235,7 @@ impl VolumeScanner {
                 columns[ci] = Some(decoded.swap_remove(pos).1);
                 continue;
             }
-            match store.group_column(ci, group_idx) {
+            match store.group_column_in(ci, group_idx, &mut self.reads.borrow_mut()) {
                 Ok(col) => columns[ci] = Some(col),
                 Err(e) => {
                     self.error = Some(Error::from(e));
