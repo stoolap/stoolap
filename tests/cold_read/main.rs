@@ -15,6 +15,7 @@
 //! Reads of sealed rows: cold scans, zone maps, the group cache and schema changes over volumes
 
 mod cluster_by_test;
+mod clustered_locator_test;
 mod cold_distinct_null_test;
 mod cold_read_consistency_test;
 mod cold_unique_equality_test;
