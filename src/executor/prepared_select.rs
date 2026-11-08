@@ -2374,6 +2374,18 @@ fn rowids_spelled(stmt: &SelectStatement, own: &ScopeTable) -> Result<Option<Sel
             *expr = spell(expr, &[])?;
         }
     }
+    // The sort that finishes the statement binds an ORDER BY window by its
+    // written form, which a spelled one no longer has
+    let spelled_window = (out.order_by.iter().zip(&stmt.order_by)).any(|(spelled, written)| {
+        spelled.expression != written.expression
+            && QueryClassification::expression_has_window_function(&written.expression)
+    });
+    if spelled_window {
+        return Err(Error::NotSupported(
+            "a window function in ORDER BY reading rowid; select it under an alias and order by the alias"
+                .to_string(),
+        ));
+    }
     Ok(changed.then_some(out))
 }
 

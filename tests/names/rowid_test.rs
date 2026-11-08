@@ -307,12 +307,21 @@ fn reads(db: &Database, t: &str, [i1, i2, i3]: [i64; 3]) {
         "an alias named rowid beside a window reading rowid in {t}"
     );
     assert!(
-        db.query(
-            &format!("SELECT a AS rowid FROM {t} ORDER BY SUM(rowid) OVER ()"),
-            ()
+        error(
+            db,
+            &format!("SELECT a AS rowid FROM {t} ORDER BY SUM(rowid) OVER ()")
         )
-        .is_err(),
+        .contains("a window function in ORDER BY reading rowid"),
         "a window reading rowid in ORDER BY is refused in {t}"
+    );
+    assert_eq!(
+        q("SELECT a, SUM(rowid) OVER () AS s FROM $t ORDER BY s, a"),
+        [
+            [int(1), int(i1 + i2 + i3)],
+            [int(2), int(i1 + i2 + i3)],
+            [int(3), int(i1 + i2 + i3)]
+        ],
+        "a window reading rowid ordered by its alias in {t}"
     );
     assert_eq!(
         q("SELECT a AS rowid, COUNT(*) FROM $t GROUP BY _rowid_, a ORDER BY 1"),
