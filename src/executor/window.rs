@@ -1352,7 +1352,7 @@ impl Executor {
     pub(crate) fn prepared_window_plan(
         &self,
         stmt: &SelectStatement,
-        columns: &[String],
+        (columns, visible): (&[String], usize),
         ctx: &ExecutionContext,
         held: &HeldWindow,
     ) -> Result<Option<WindowPlan<'static>>> {
@@ -1373,7 +1373,7 @@ impl Executor {
         }
         self.window_plan(
             std::borrow::Cow::Owned(extended),
-            (columns, columns.len(), stmt.columns.len()),
+            (columns, visible, stmt.columns.len()),
             &FxHashMap::default(),
             (ctx, None, Some(held)),
         )

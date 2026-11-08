@@ -242,6 +242,83 @@ fn reads(db: &Database, t: &str, [i1, i2, i3]: [i64; 3]) {
         [[int(i1)], [int(i2)], [int(i3)]],
         "a VALUES row reading the outer rowid in {t}"
     );
+    assert_eq!(
+        q("SELECT a FROM $t o ORDER BY (SELECT o.rowid) DESC"),
+        [[int(3)], [int(2)], [int(1)]],
+        "an ORDER BY key reading rowid through a subquery in {t}"
+    );
+    assert_eq!(
+        q("SELECT SUM(rowid) OVER () + 0, (SELECT 1) FROM $t"),
+        [
+            [int(i1 + i2 + i3), int(1)],
+            [int(i1 + i2 + i3), int(1)],
+            [int(i1 + i2 + i3), int(1)]
+        ],
+        "a grouped window over rowid in {t}"
+    );
+    assert_eq!(
+        q("SELECT *, SUM(rowid) OVER () FROM $t WHERE a = 1")[0].len(),
+        if t == "k" { 4 } else { 3 },
+        "a star beside a window leaves rowid out in {t}"
+    );
+    assert_eq!(
+        q("SELECT MAX(rowid) AS rowid FROM $t HAVING MAX(rowid) > 0"),
+        [[int(i3)]],
+        "an alias named rowid in HAVING's aggregate in {t}"
+    );
+    assert!(
+        error(db, &format!("SELECT STRING_AGG(b, rowid) FROM {t}"))
+            .contains("must not read the row"),
+        "rowid as an aggregate's later argument reads the row in {t}"
+    );
+}
+
+#[test]
+fn a_primary_key_named_like_a_pseudo_column_or_a_literal_reads_as_itself() {
+    each_layout("named_key", |db| {
+        for sql in [
+            "CREATE TABLE p1 (rowid INTEGER PRIMARY KEY)",
+            "CREATE TABLE p2 (\"true\" INTEGER PRIMARY KEY)",
+            "INSERT INTO p1 VALUES (7)",
+            "INSERT INTO p2 VALUES (8)",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        assert_eq!(
+            rows(db, "SELECT SUM(_rowid_), rowid FROM p1 GROUP BY rowid"),
+            [[int(7), int(7)]]
+        );
+        assert_eq!(
+            rows(db, "SELECT CAST(rowid AS INTEGER), p2.rowid FROM p2"),
+            [[int(8), int(8)]]
+        );
+        for sql in [
+            "SELECT SUM(rowid) FROM p2",
+            "INSERT INTO p2 VALUES (9) RETURNING CAST(rowid AS INTEGER)",
+        ] {
+            assert!(error(db, sql).contains("not found"), "{sql}");
+        }
+    });
+}
+
+#[test]
+fn a_nearest_read_by_an_index_carries_the_rowid() {
+    each_layout("nearest", |db| {
+        for sql in [
+            "CREATE TABLE h (v VECTOR(2))",
+            "INSERT INTO h VALUES ('[3,3]'), ('[1,1]')",
+            "CREATE INDEX h_v ON h (v) USING HNSW",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        assert_eq!(
+            rows(
+                db,
+                "SELECT rowid FROM h WHERE rowid > 0 ORDER BY VEC_DISTANCE_L2(v, '[0,0]') LIMIT 1"
+            ),
+            [[int(2)]]
+        );
+    });
 }
 
 #[test]

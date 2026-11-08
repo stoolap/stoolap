@@ -2323,8 +2323,14 @@ fn rowids_spelled(stmt: &SelectStatement, own: &ScopeTable) -> Result<Option<Sel
             let Some((_, index)) = chain.resolve(name).ok().flatten() else {
                 return Ok(None);
             };
+            // A name that is its column's own stays as written
+            let written = match name {
+                Expression::QualifiedIdentifier(q) => &q.name.value_lower,
+                Expression::Identifier(id) => &id.value_lower,
+                _ => return Ok(None),
+            };
             let column = &own.columns[index];
-            let respelled = !is_rowid_name(&column.to_lowercase());
+            let respelled = !column.eq_ignore_ascii_case(written);
             changed |= respelled;
             Ok(respelled.then(|| column.clone()))
         })
@@ -2419,7 +2425,7 @@ fn output_width(stmt: &SelectStatement, own: &ScopeTable) -> Result<usize> {
     for item in &stmt.columns {
         width += match item {
             // A merged pair shows once
-            Expression::Star(_) => star_columns(own, own.columns.len()).len(),
+            Expression::Star(_) => star_width(own, own.columns.len()),
             Expression::QualifiedStar(star) => qualified_star_columns(star, own)?.len(),
             _ => 1,
         };
@@ -5638,7 +5644,7 @@ impl Builder<'_> {
         id: u16,
         work: &Rewritten,
     ) -> Result<()> {
-        check_block_positions(sq, star_columns(own, own.columns.len()).len())?;
+        check_block_positions(sq, star_width(own, own.columns.len()))?;
         let mut scopes = Vec::with_capacity(outer.len() + 1);
         scopes.push(own);
         scopes.extend_from_slice(outer);
@@ -5924,7 +5930,7 @@ impl Builder<'_> {
         let joined = own.tables.len() > 1;
         if joined {
             if dropped {
-                check_block_positions(sq, star_columns(&own, own.columns.len()).len())?;
+                check_block_positions(sq, star_width(&own, own.columns.len()))?;
             }
             let around = std::mem::replace(&mut self.ctes, ctes);
             let bound =
@@ -6701,7 +6707,7 @@ impl Builder<'_> {
         // the member reads
         let mut row_keys = vec![None; if values.len() > 1 { values.len() } else { 0 }];
         let mut repeats = Vec::new();
-        check_block_positions(sq, star_columns(&scope, scope.columns.len()).len())?;
+        check_block_positions(sq, star_width(&scope, scope.columns.len()))?;
         for ob in &sq.order_by {
             // A key naming one of a row's values, by its alias, its position or
             // as written, sorts by that value as a single item's does
@@ -7654,10 +7660,18 @@ fn projected_aliases(
 /// all but each merged pair's right column, as the merge shows the pair
 /// once, and each row id slot
 fn star_columns(scope: &ScopeTable, width: usize) -> Vec<usize> {
-    (0..width)
-        .filter(|at| !scope.merged.iter().any(|&(_, right)| right == *at))
-        .filter(|&at| at >= scope.lower.len() || !scope.is_slot(at))
-        .collect()
+    (0..width).filter(|&at| star_shows(scope, at)).collect()
+}
+
+/// How many columns [`star_columns`] gives, counted without them
+fn star_width(scope: &ScopeTable, width: usize) -> usize {
+    (0..width).filter(|&at| star_shows(scope, at)).count()
+}
+
+/// Whether a `*` over `scope` shows its column `at`
+fn star_shows(scope: &ScopeTable, at: usize) -> bool {
+    !scope.merged.iter().any(|&(_, right)| right == at)
+        && (at >= scope.lower.len() || !scope.is_slot(at))
 }
 
 /// The SELECT alias each column of a join statement's projected row has,
@@ -8479,8 +8493,9 @@ impl PreparedSelect {
                     .iter()
                     .any(|c| ExprKey::of(unaliased(c)) == ExprKey::of(key))
         };
-        let width = scope.shown(0..scope.columns.len()).len();
-        let items = projected_aliases(stmt, &scope.columns, |_| width);
+        let width = scope.columns.len();
+        let shown = star_width(&scope, width);
+        let items = projected_aliases(stmt, &scope.columns, |_| shown);
         // Only a key holding a subquery reads the projected row's aliases
         let keyed = stmt
             .order_by
@@ -8721,7 +8736,12 @@ impl PreparedSelect {
         let window = (windowed && !aggregated)
             .then(|| {
                 executor
-                    .prepared_window_plan(computed, &scope.columns, ctx, &windows)
+                    .prepared_window_plan(
+                        computed,
+                        (&scope.columns, star_width(&scope, scope.columns.len())),
+                        ctx,
+                        &windows,
+                    )
                     .ok()
                     .flatten()
             })
@@ -9126,7 +9146,7 @@ impl PreparedGrouped {
                     (name.as_ref()).is_some_and(|n| super::utils::eq_folded(&q.qualifier, n))
                 })
                 .map_or(0, |(_, start)| scope.shown(scope.table(*start).1).len()),
-            Expression::Star(_) => star_columns(&scope, width).len(),
+            Expression::Star(_) => star_width(&scope, width),
             _ => 1,
         };
         let aliases = projected_aliases(stmt, &scope.lower, filled);
@@ -9597,7 +9617,12 @@ impl PreparedGrouped {
         let window = (windowed && !aggregated)
             .then(|| {
                 executor
-                    .prepared_window_plan(&stmt, &schema.column_names_arc(), ctx, &windows)
+                    .prepared_window_plan(
+                        &stmt,
+                        (&read_names(&schema, scope.widens()), schema.columns.len()),
+                        ctx,
+                        &windows,
+                    )
                     .ok()
                     .flatten()
             })
@@ -10565,7 +10590,7 @@ impl JoinBlocks {
             return Ok(None);
         }
         merged_once(&scope, &scope.merged[inner_merges..])?;
-        let items = items(star_columns(&scope, width).len());
+        let items = items(star_width(&scope, width));
         let scopes = [&scope];
         let chain = Chain { scopes: &scopes };
         let mut builder = Builder {
@@ -13638,11 +13663,8 @@ impl Executor {
             }
             _ => None,
         };
-        let widen = prepared.where_.widen;
-        let (nearest, ordered) = (
-            nearest.map(|rows| widened_rows(rows, widen)),
-            ordered.map(|rows| widened_rows(rows, widen)),
-        );
+        // An index-ordered read hands its rows back without their row ids
+        let ordered = ordered.map(|rows| widened_rows(rows, prepared.where_.widen));
         let read_in_order = ordered.is_some();
         if read_in_order {
             #[cfg(feature = "test-failpoints")]
@@ -15359,6 +15381,10 @@ impl<'a> PreparedRunner<'a> {
                     }
                     let Some(row) = rows.remove(id) else {
                         continue;
+                    };
+                    let row = match where_.widen {
+                        true => widened(row, id),
+                        false => row,
                     };
                     let exec = self
                         .exec_over(&row, &self.base)

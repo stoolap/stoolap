@@ -1911,37 +1911,38 @@ pub(crate) fn names_rowid(stmt: &SelectStatement) -> bool {
 
 /// `expr` with each unquoted rowid name outside its subqueries spelled as the
 /// column `column` gives for it, a qualified one keeping its qualifier; a
-/// bare one stays when `aliased`, a SELECT alias then holding that name
+/// bare one stays when `aliased`, a SELECT alias then holding that name,
+/// except in an aggregate's arguments, which read the rows. A column named
+/// as a literal is not spelled, which would read the literal
 pub(crate) fn rowids_respelled(
     expr: &Expression,
     aliased: bool,
     column: &mut dyn FnMut(&Expression) -> crate::core::Result<Option<String>>,
 ) -> crate::core::Result<Expression> {
-    // Quoted, so a column named as a literal is still read as the column
-    let respelled = |name: String| Identifier {
-        quoted: true,
-        ..Identifier::new(dummy_token(&name, TokenType::Identifier), name)
+    let mut spelled = |expr: &Expression| -> crate::core::Result<Option<Identifier>> {
+        Ok(column(expr)?
+            .filter(|c| !matches!(c.to_lowercase().as_str(), "true" | "false"))
+            .map(|c| Identifier::new(dummy_token(&c, TokenType::Identifier), c)))
     };
     match expr {
         Expression::Identifier(id)
             if !aliased && !id.quoted && crate::core::is_rowid_name(&id.value_lower) =>
         {
-            Ok(
-                column(expr)?
-                    .map_or_else(|| expr.clone(), |c| Expression::Identifier(respelled(c))),
-            )
+            Ok(spelled(expr)?.map_or_else(|| expr.clone(), Expression::Identifier))
         }
         Expression::QualifiedIdentifier(q)
             if !q.name.quoted && crate::core::is_rowid_name(&q.name.value_lower) =>
         {
-            Ok(match column(expr)? {
-                Some(c) => {
-                    let mut q = q.clone();
-                    q.name = respelled(c);
-                    Expression::QualifiedIdentifier(q)
-                }
+            Ok(match spelled(expr)? {
+                Some(name) => Expression::QualifiedIdentifier(QualifiedIdentifier {
+                    qualifier: q.qualifier.clone(),
+                    name,
+                }),
                 None => expr.clone(),
             })
+        }
+        Expression::FunctionCall(call) if aliased && is_aggregate_function(&call.function) => {
+            rowids_respelled(expr, false, column)
         }
         other => other.try_map_children(&mut |child| rowids_respelled(child, aliased, column)),
     }
