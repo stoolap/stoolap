@@ -2342,6 +2342,7 @@ impl Executor {
         let rowids = self.rowid_entries(stmt, ctx, &[])?;
         distinct_rowid_order(stmt, &rowids)?;
         let mut spelled = |expr: &Expression| -> Result<Option<Expression>> {
+            rowids.unique(expr)?;
             let Some((name, schema)) = rowids.stored(expr) else {
                 return Ok(None);
             };
@@ -2413,70 +2414,51 @@ impl Executor {
             ctes.into_iter().find(|cte| cte.name.value_lower == name)
         };
         let outer = |name: &str| around.iter().rev().find(|(cte, _)| cte == name);
-        // Whether a source's output columns hold a `_rowid_`; unknown ones may
-        let holds = |names: Result<Vec<String>>| {
-            names.map_or(true, |names| {
-                names.iter().any(|c| c.eq_ignore_ascii_case(ROWID_NAME))
-            })
-        };
+        // Whether output columns hold a `_rowid_`; None for unknown ones
+        let column = |names: &[String]| names.iter().any(|c| c.eq_ignore_ascii_case(ROWID_NAME));
+        let holds = |names: Result<Vec<String>>| names.ok().map(|names| column(&names));
         // Each entry's name and its table's schema; None for an entry that
         // reads no stored table's rows, which `others` says may still hold
-        // a `_rowid_` a bare one would read
+        // a `_rowid_` a bare one would read, and `holders` counts when known
         let mut entries: SmallVec<[Option<NamedSchema>; 2]> = SmallVec::new();
-        let mut others = false;
+        let (mut others, mut holders) = (false, 0);
         for leaf in leaves {
-            let entry = match leaf {
-                Expression::TableSource(ts) if ts.as_of.is_some() => {
-                    others = true;
-                    None
-                }
+            let (entry, held) = match leaf {
+                Expression::TableSource(ts) if ts.as_of.is_some() => (None, None),
                 Expression::TableSource(ts) => {
                     match (cte(&ts.name.value_lower), outer(&ts.name.value_lower)) {
                         (Some(cte), _) if cte.column_names.is_empty() => {
-                            others |= holds(names(&cte.query));
-                            None
+                            (None, holds(names(&cte.query)))
                         }
-                        (Some(_), _) => None,
-                        (None, Some((_, columns))) => {
-                            others |= columns.iter().any(|c| c.eq_ignore_ascii_case(ROWID_NAME));
-                            None
-                        }
+                        (Some(_), _) => (None, Some(false)),
+                        (None, Some((_, columns))) => (None, Some(column(columns))),
                         (None, None) => match self.named(ctx, &ts.name.value_lower)? {
-                            Named::Table => self
-                                .engine
-                                .get_table_schema(&ts.name.value_lower)
-                                .ok()
-                                .map(|schema| {
-                                    (
-                                        ts.alias.as_ref().unwrap_or(&ts.name).value_lower.clone(),
-                                        schema,
-                                    )
-                                }),
-                            Named::Cte((columns, _)) => {
-                                others |=
-                                    columns.iter().any(|c| c.eq_ignore_ascii_case(ROWID_NAME));
-                                None
+                            Named::Table => {
+                                let schema = self.engine.get_table_schema(&ts.name.value_lower);
+                                let name = ts.alias.as_ref().unwrap_or(&ts.name);
+                                let entry = schema.ok().map(|s| (name.value_lower.clone(), s));
+                                (entry, Some(false))
                             }
-                            Named::View(view) => {
-                                others |= holds(view_names(self, &view, ctx, false));
-                                None
-                            }
+                            Named::Cte((columns, _)) => (None, Some(column(columns))),
+                            Named::View(view) => (None, holds(view_names(self, &view, ctx, false))),
                         },
                     }
                 }
-                Expression::SubquerySource(derived) => {
-                    others |= holds(names(&derived.subquery));
-                    None
+                Expression::SubquerySource(derived) => (None, holds(names(&derived.subquery))),
+                Expression::ValuesSource(_) | Expression::FunctionTableSource(_) => {
+                    (None, Some(false))
                 }
-                Expression::ValuesSource(_) | Expression::FunctionTableSource(_) => None,
-                _ => {
-                    others = true;
-                    None
-                }
+                _ => (None, None),
             };
+            others |= held != Some(false);
+            holders += usize::from(held == Some(true));
             entries.push(entry);
         }
-        Ok(RowidEntries { entries, others })
+        Ok(RowidEntries {
+            entries,
+            others,
+            holders,
+        })
     }
 }
 
@@ -2488,9 +2470,23 @@ type NamedSchema = (SmartString, CompactArc<Schema>);
 struct RowidEntries {
     entries: SmallVec<[Option<NamedSchema>; 2]>,
     others: bool,
+    /// The entries known to have a `_rowid_` output column
+    holders: usize,
 }
 
 impl RowidEntries {
+    /// An error for a bare rowid two entries may read: two stored tables,
+    /// or one and a source with a `_rowid_` column
+    fn unique(&self, rowid: &Expression) -> Result<()> {
+        let tables = self.entries.iter().flatten().count();
+        match rowid {
+            Expression::Identifier(id) if tables > 0 && tables + self.holders > 1 => {
+                Err(ambiguous_column(&id.value))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// The stored entry whose identity `rowid` reads: a bare one reads the
     /// one stored table's when no other entry can hold one
     fn stored(&self, rowid: &Expression) -> Option<&NamedSchema> {

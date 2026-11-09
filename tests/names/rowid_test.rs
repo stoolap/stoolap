@@ -786,6 +786,10 @@ fn a_bare_rowid_counts_a_derived_table_column_with_the_tables_beside_it() {
             "SELECT (SELECT _rowid_) FROM k CROSS JOIN (SELECT _rowid_ FROM n) d",
             "WITH c AS (SELECT _rowid_ FROM n) SELECT _rowid_ FROM k CROSS JOIN c",
             "SELECT _rowid_ FROM (SELECT x._rowid_, y._rowid_ FROM k x, k y) d",
+            "SELECT k.a FROM k JOIN (SELECT _rowid_ FROM n) d ON k.a = d._rowid_ WHERE _rowid_ > 0",
+            "SELECT COUNT(*) FROM k CROSS JOIN v WHERE _rowid_ IS NOT NULL",
+            "SELECT k.a FROM k CROSS JOIN (SELECT _rowid_ FROM n) d ORDER BY _rowid_",
+            "SELECT COUNT(*) FROM k CROSS JOIN (SELECT _rowid_ FROM n) d GROUP BY _rowid_",
         ] {
             assert!(error(db, sql).contains("ambiguous"), "{sql}");
         }
