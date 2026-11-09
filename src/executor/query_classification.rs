@@ -799,7 +799,11 @@ fn compute_classification_key(stmt: &SelectStatement) -> ClassificationKey {
     // 64-bit hash is not collision-safe as a cache identity (PR #36
     // lesson), and a collision here pins the wrong classification into the
     // plan's OnceLock.
+    // The one input of the classification a name decides, over every
+    // statement inside it too
+    let names_rowid = super::utils::names_rowid(stmt);
     let mut h1 = FxHasher::default();
+    names_rowid.hash(&mut h1);
     hash_classification_inputs(stmt, &mut h1);
 
     use std::hash::BuildHasher;
@@ -810,6 +814,7 @@ fn compute_classification_key(stmt: &SelectStatement) -> ClassificationKey {
         0x8f4c_a136_bef1_39c9,
     )
     .build_hasher();
+    names_rowid.hash(&mut h2);
     hash_classification_inputs(stmt, &mut h2);
 
     (h1.finish(), h2.finish())
@@ -828,8 +833,6 @@ fn hash_classification_inputs<H: std::hash::Hasher>(stmt: &SelectStatement, hash
     stmt.having.is_some().hash(hasher);
     stmt.with.is_some().hash(hasher);
     stmt.set_operations.len().hash(hasher);
-    // The one input of the classification a name decides
-    super::utils::names_rowid(stmt).hash(hasher);
 
     // Hash DISTINCT ON expression structures
     for expr in &stmt.distinct_on {
