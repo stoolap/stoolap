@@ -2351,17 +2351,16 @@ impl Executor {
                 return Ok(None);
             };
             let column = match schema.rowid_column() {
-                // A key named as a literal is left to the scope that binds it
-                Some(key)
-                    if matches!(schema.columns[key].name_lower.as_str(), "true" | "false") =>
-                {
-                    return Ok(None)
-                }
                 Some(key) => schema.columns[key].name.as_str(),
                 None if rowids.entries.len() == 1 => ROWID_SLOT,
                 None => return Ok(None),
             };
-            Ok(Some(qualified_reference(name, column)))
+            let mut spelled = qualified_reference(name, column);
+            // A key named as a literal is spelled quoted, read as the column
+            if let Expression::QualifiedIdentifier(q) = &mut spelled {
+                q.name.quoted = matches!(q.name.value_lower.as_str(), "true" | "false");
+            }
+            Ok(Some(spelled))
         };
         let mut spelled = |expr: &Expression| spell(&rowids, expr);
         // A join condition reads the entries of its own two sides

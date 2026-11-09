@@ -47,7 +47,6 @@ A `WHERE _rowid_ = ?` or `WHERE _rowid_ IN (...)` reads the rows it names by the
 - `_rowid_` is never written: `UPDATE t SET _rowid_ = ...`, `INSERT INTO t (_rowid_, ...)` and `ON CONFLICT DO UPDATE SET _rowid_ = ...` are errors. In a table with a primary key, the key is not updatable either; delete and insert instead.
 - In a join, a table without a primary key has no `_rowid_`: the name is an error there. A table with a primary key reads its key as usual.
 - A table read `AS OF` a past point has no `_rowid_`.
-- A primary key named `TRUE` or `FALSE` is read through `_rowid_` everywhere but inside an aggregate; write the key's quoted name there.
 - Under `SELECT DISTINCT`, an `ORDER BY` key is matched to the select list as written: `_rowid_` and the primary key column it reads count as different, and a `*` selects `_rowid_` only from a derived table, view or CTE that has it as a column, so `SELECT DISTINCT id FROM t ORDER BY _rowid_` and `SELECT DISTINCT * FROM t ORDER BY _rowid_` are errors, while `SELECT DISTINCT * FROM (SELECT _rowid_ FROM t) d ORDER BY _rowid_` sorts. Sort by what the list selects.
 
 ## Stability

@@ -538,8 +538,10 @@ fn a_primary_key_named_rowid_or_like_a_literal_reads_as_itself() {
         for sql in [
             "CREATE TABLE p1 (rowid INTEGER PRIMARY KEY)",
             "CREATE TABLE p2 (\"true\" INTEGER PRIMARY KEY)",
+            "CREATE TABLE p3 (\"FALSE\" INTEGER PRIMARY KEY, a INTEGER)",
             "INSERT INTO p1 VALUES (7)",
             "INSERT INTO p2 VALUES (8)",
+            "INSERT INTO p3 VALUES (20, 1), (10, 2)",
         ] {
             db.execute(sql, ()).unwrap();
         }
@@ -551,7 +553,23 @@ fn a_primary_key_named_rowid_or_like_a_literal_reads_as_itself() {
             rows(db, "SELECT CAST(_rowid_ AS INTEGER), p2._rowid_ FROM p2"),
             [[int(8), int(8)]]
         );
-        assert!(error(db, "SELECT SUM(_rowid_) FROM p2").contains("not found"));
+        assert_eq!(rows(db, "SELECT SUM(_rowid_) FROM p2"), [[int(8)]]);
+        for sql in [
+            "SELECT a FROM p3 ORDER BY _rowid_",
+            "SELECT a FROM p3 ORDER BY p3._rowid_",
+            "SELECT a FROM p3 GROUP BY _rowid_, a ORDER BY _rowid_",
+            "SELECT a FROM p3 ORDER BY ROW_NUMBER() OVER (ORDER BY _rowid_)",
+            "SELECT a FROM p3 ORDER BY MAX(_rowid_) OVER (PARTITION BY a)",
+        ] {
+            assert_eq!(rows(db, sql), [[int(2)], [int(1)]], "{sql}");
+        }
+        assert_eq!(
+            rows(
+                db,
+                "SELECT MAX(_rowid_) + 1, COUNT(DISTINCT _rowid_) FROM p3"
+            ),
+            [[int(21), int(2)]]
+        );
         assert_eq!(
             rows(
                 db,
