@@ -915,6 +915,44 @@ fn test_a_not_exists_by_the_primary_key_over_a_table_without_volumes_walks_to_it
 }
 
 #[test]
+fn test_runs_of_a_not_exists_by_the_primary_key_collect_the_ids_left_out_once() {
+    use stoolap::test_failpoints::left_out_ids_collections;
+    let _guard = serial();
+    let db = setup("left_out");
+    db.execute("CREATE TABLE big (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO big SELECT value, value FROM generate_series(1, 300)",
+        (),
+    )
+    .unwrap();
+    force_exists_strategy(Some(true));
+    let sql = "SELECT id FROM big WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.id = big.id) LIMIT 3";
+    let collected = left_out_ids_collections();
+    for run in 1..=3 {
+        let before = prepared_rows_narrowed();
+        assert_eq!(ids(&db, sql), [6, 7, 8], "run {run}");
+        assert!(
+            prepared_rows_narrowed() > before,
+            "run {run} read big by its keys"
+        );
+    }
+    assert_eq!(
+        left_out_ids_collections() - collected,
+        1,
+        "the runs collect the ids left out once"
+    );
+    db.execute("INSERT INTO u VALUES (6, 6, 'f', 6.0, 6, 1)", ())
+        .unwrap();
+    assert_eq!(ids(&db, sql), [7, 8, 9], "after a write");
+    assert_eq!(
+        left_out_ids_collections() - collected,
+        2,
+        "a changed table collects them again"
+    );
+}
+
+#[test]
 fn test_an_in_family_statement_never_reaches_the_general_path() {
     let _guard = serial();
     let db = setup("general");

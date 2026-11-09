@@ -15372,7 +15372,7 @@ impl<'a> PreparedRunner<'a> {
                 .iter()
                 .filter(|(_, outcome)| matches!(outcome, ExistsOutcome::Passed))
                 .filter_map(|(key, _)| key.first());
-            Executor::rows_without_members(table, column, passing, enough)?
+            Executor::rows_without_members(table, column, &set.left_out, passing, enough)?
         } else {
             let members = set.outcomes.keys().filter_map(|key| key.first());
             Executor::rows_of_members(table, column, members, target.is_some(), enough)?
@@ -15957,7 +15957,7 @@ impl SubqueryExecutor for PreparedRunner<'_> {
 
     fn kept_members(&self, subquery_index: u16) -> Option<&KeptMembers> {
         match self.blocks.get(subquery_index as usize)?.members.get()? {
-            BlockAnswer::Members(set) => Some(set),
+            BlockAnswer::Members(set) => Some(&set.members),
             _ => None,
         }
     }
@@ -16682,7 +16682,7 @@ impl PreparedRunner<'_> {
             if !keyed
                 .is_some_and(|plan| self.takes_keyed_set(index, plan) && self.keys_fit(index, plan))
             {
-                let set = CompactArc::new(self.collect_members(index, members, None)?);
+                let set = CompactArc::new(self.collect_members(index, members, None)?.into());
                 self.answer_call(index, call, || {
                     BlockAnswer::Members(CompactArc::clone(&set))
                 });
@@ -16773,7 +16773,7 @@ impl PreparedRunner<'_> {
                 }
                 let set = member_set(test, width, values, true);
                 let members = KeptMembers { set, failed: None };
-                Ok(BlockAnswer::Members(CompactArc::new(members)))
+                Ok(BlockAnswer::Members(CompactArc::new(members.into())))
             })
         })?;
         let _ = self.blocks[index].members.set(answer);
@@ -16801,7 +16801,7 @@ impl PreparedRunner<'_> {
             self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller, site)?;
             self.kept(kept, || {
                 self.collect_members(index, members, None)
-                    .map(|set| BlockAnswer::Members(CompactArc::new(set)))
+                    .map(|set| BlockAnswer::Members(CompactArc::new(set.into())))
             })
         })?;
         let _ = self.blocks[index].members.set(answer);
@@ -17381,8 +17381,13 @@ impl PreparedRunner<'_> {
             if set_of.has_null() || unknown {
                 return Ok(whole.then(|| (RowVec::new(), true)));
             }
-            let rows =
-                Executor::rows_without_members(table, name, values, target.filter(|_| whole))?;
+            let rows = Executor::rows_without_members(
+                table,
+                name,
+                &set.left_out,
+                values,
+                target.filter(|_| whole),
+            )?;
             return Ok(rows.map(|rows| (rows, true)));
         }
         let rows = Executor::rows_of_members(

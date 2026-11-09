@@ -1771,6 +1771,20 @@ pub(crate) fn active_ids_gathered() {
     ACTIVE_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+thread_local! {
+    static LEFT_OUT_IDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Row id sets a NOT EXISTS or NOT IN read by the primary key collected
+/// from its block's answer on this thread
+pub fn left_out_ids_collections() -> usize {
+    LEFT_OUT_IDS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn left_out_ids_collected() {
+    LEFT_OUT_IDS.with(|c| c.set(c.get() + 1));
+}
+
 pub(crate) fn prepared_exists_looked_up() {
     PREPARED_EXISTS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
