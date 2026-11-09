@@ -128,7 +128,7 @@ fn parent_row_exists(
     value: &Value,
 ) -> Result<bool> {
     let parent = engine
-        .get_table_for_txn(txn_id, parent_table)
+        .get_table_to_check(txn_id, parent_table)
         .map_err(|e| match e {
             Error::TableNotFound(_) => Error::internal(format!(
                 "foreign key references non-existent table '{}'",
@@ -139,12 +139,7 @@ fn parent_row_exists(
     // The filter's positions come from the handle that reads the rows
     let parent_schema = parent.schema_arc();
 
-    let (ref_idx, _) = parent_schema.find_column(parent_column).ok_or_else(|| {
-        Error::internal(format!(
-            "foreign key references non-existent column '{}' in table '{}'",
-            parent_column, parent_table
-        ))
-    })?;
+    let ref_idx = referenced_position(&parent_schema, parent_table, parent_column)?;
 
     // Held before the read: a delete of the key then waits for this
     // transaction, or has committed and the read misses the row
@@ -162,6 +157,23 @@ fn parent_row_exists(
     Ok(!rows.is_empty())
 }
 
+/// The position in `schema` of the column a foreign key references. A name
+/// stored in lower case, as a key naming the primary key by default is, is
+/// found without lowering it again
+fn referenced_position(schema: &Schema, parent_table: &str, column: &str) -> Result<usize> {
+    schema
+        .column_index_map()
+        .get(column)
+        .copied()
+        .or_else(|| schema.find_column(column).map(|(at, _)| at))
+        .ok_or_else(|| {
+            Error::internal(format!(
+                "foreign key references non-existent column '{}' in table '{}'",
+                column, parent_table
+            ))
+        })
+}
+
 /// Holds each of `values` of the column `fk` references in `parent_table`
 /// alone until the transaction ends. Taken before the rows pointing at a
 /// key are read: a child check of the key then waits for this transaction,
@@ -174,18 +186,7 @@ fn hold_alone<'v>(
     values: impl IntoIterator<Item = &'v Value>,
 ) -> Result<()> {
     let schema = engine.get_table_schema(parent_table)?;
-    // A name stored in lower case is found without lowering it again
-    let at = schema
-        .column_index_map()
-        .get(fk.referenced_column.as_str())
-        .copied()
-        .or_else(|| schema.find_column(&fk.referenced_column).map(|(at, _)| at))
-        .ok_or_else(|| {
-            Error::internal(format!(
-                "foreign key references non-existent column '{}' in table '{}'",
-                fk.referenced_column, parent_table
-            ))
-        })?;
+    let at = referenced_position(&schema, parent_table, &fk.referenced_column)?;
     let column = &schema.columns[at].name;
     for value in values.into_iter().filter(|v| !v.is_null()) {
         engine.hold_key(txn_id, parent_table, column, value, true)?;
@@ -301,7 +302,7 @@ fn pre_check_delete_recursive(
                 // Each key beneath the child names the column it points at,
                 // and the child rows that would go are read through that
                 // column, whether or not it is the child's primary key
-                let child_handle = engine.get_table_for_txn(txn_id, child_table_name)?;
+                let child_handle = engine.get_table_to_check(txn_id, child_table_name)?;
                 let child_schema = child_handle.schema_arc();
                 let filter = key_filter(&child_schema, key_position(&child_schema, fk)?, value);
                 let rows = child_handle.collect_all_rows(Some(&filter))?;
@@ -556,7 +557,7 @@ fn child_rows_exist(
 ) -> Result<bool> {
     #[cfg(feature = "test-failpoints")]
     crate::test_failpoints::fk_child_probe_next();
-    let child = engine.get_table_for_txn(txn_id, child_table)?;
+    let child = engine.get_table_to_check(txn_id, child_table)?;
     let child_schema = child.schema();
 
     let expr = key_filter(
@@ -594,7 +595,7 @@ fn check_children_seen(
             .collect())
     };
     let seen = ids(engine.get_table_as_seen(txn_id, child_table)?)?;
-    let newest = ids(engine.get_table_for_txn(txn_id, child_table)?)?;
+    let newest = ids(engine.get_table_to_check(txn_id, child_table)?)?;
     let unseen = newest.iter().find(|&id| !seen.contains(id));
     match unseen {
         Some(id) => Err(Error::internal(format!(
@@ -702,7 +703,7 @@ fn cascade_delete_recursive(
     let mut deleted_child_keys: Vec<(usize, Vec<Value>)> = Vec::new();
 
     if !grandchild_fks.is_empty() {
-        let child_handle = engine.get_table_for_txn(txn_id, child_table)?;
+        let child_handle = engine.get_table_to_check(txn_id, child_table)?;
         let child_schema = child_handle.schema_arc();
         // Use filtered scan instead of full table scan
         let filter = key_filter(
@@ -1072,7 +1073,7 @@ pub(crate) fn check_no_referencing_rows(
         };
 
         let has_ref = if let Some(tid) = txn_id {
-            references(&*engine.get_table_for_txn(tid, child_table)?)?
+            references(&*engine.get_table_to_check(tid, child_table)?)?
         } else {
             let tx = engine.begin_transaction()?;
             references(&*tx.get_statement_table(child_table)?)?

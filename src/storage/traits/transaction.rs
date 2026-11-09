@@ -272,9 +272,12 @@ pub enum TableUse {
     Read,
     /// It writes other tables: by cascade only tables with a foreign key
     ReadBesideWrites,
-    /// It checks or carries out a foreign key: it may write the table, and
-    /// reads the newest commits under any isolation
+    /// It checks a foreign key: it writes no table, and reads the newest
+    /// commits under any isolation
     KeyCheck,
+    /// It carries out a foreign key's action: it may write the table, and
+    /// reads the newest commits under any isolation
+    KeyAction,
 }
 
 /// The query executor's table for its own statements on the thread that
