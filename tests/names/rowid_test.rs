@@ -704,7 +704,7 @@ fn no_column_and_no_alias_takes_the_name_of_the_row_identity() {
     let column = |name: &str| {
         stoolap::core::SchemaColumn::new(0, name, stoolap::core::DataType::Integer, true, false)
     };
-    for name in ["_rowid_", "\0rowid"] {
+    for name in ["_rowid_", "\0rowid", "\0ROWID", "\0RoWiD"] {
         for refused in [
             tx.add_table_column("n", column(name)),
             tx.rename_table_column("n", "a", name),

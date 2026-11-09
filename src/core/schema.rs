@@ -905,7 +905,7 @@ pub fn is_rowid_name(name_lower: &str) -> bool {
 /// An error unless `name` may name a column or an alias: the row's identity
 /// and the slot it is read from are no column's name
 pub fn check_column_name(name: &str) -> Result<()> {
-    match name.eq_ignore_ascii_case(ROWID_NAME) || name == ROWID_SLOT {
+    match name.eq_ignore_ascii_case(ROWID_NAME) || name.eq_ignore_ascii_case(ROWID_SLOT) {
         true => Err(Error::invalid_argument(format!(
             "{} is the row's identity and names no column or alias",
             name.escape_debug()
