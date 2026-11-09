@@ -1912,7 +1912,12 @@ impl StatementWalk<'_> {
             Some(with) => Some(self.with_clause(with, enclosing, inside, check)?),
             None => None,
         };
-        let (table_expr, own) = self.from(stmt.table_expr.as_deref(), enclosing, inside, check)?;
+        let (table_expr, own) = self.from(
+            stmt.table_expr.as_deref(),
+            enclosing,
+            inside,
+            (check, false),
+        )?;
         let mut scopes = Vec::with_capacity(enclosing.len() + 1);
         scopes.push(&own);
         scopes.extend_from_slice(enclosing);
@@ -2045,13 +2050,14 @@ impl StatementWalk<'_> {
     }
 
     /// A FROM walked over the scopes it sees, `enclosing` and not its
-    /// siblings, and the scope it gives its statement
+    /// siblings, and the scope it gives its statement; a table `joined`
+    /// carries no row id slot, as a join reads none
     fn from(
         &mut self,
         table_expr: Option<&Expression>,
         enclosing: &[&ScopeTable],
         inside: usize,
-        check: Check,
+        (check, joined): (Check, bool),
     ) -> Result<(Option<Expression>, ScopeTable)> {
         // A FROM runs with its statement unless no clause of it does
         let check = match check {
@@ -2097,7 +2103,7 @@ impl StatementWalk<'_> {
                                     }
                                     other => other,
                                 })?;
-                        ScopeTable::of_table(name, &schema, true)
+                        ScopeTable::of_table(name, &schema, !joined)
                     }
                 }
             }
@@ -2153,9 +2159,10 @@ impl StatementWalk<'_> {
             // Each side sees what the join does, not its sibling; the ON
             // sees both, as the statement's other clauses do
             Expression::JoinSource(join) => {
-                let (left, left_scope) = self.from(Some(&join.left), enclosing, inside, check)?;
+                let (left, left_scope) =
+                    self.from(Some(&join.left), enclosing, inside, (check, true))?;
                 let (right, right_scope) =
-                    self.from(Some(&join.right), enclosing, inside, check)?;
+                    self.from(Some(&join.right), enclosing, inside, (check, true))?;
                 let (Some(left), Some(right)) = (left, right) else {
                     return Err(Error::internal("a join side without a source"));
                 };
@@ -11218,7 +11225,7 @@ impl Executor {
             visible: Vec::new(),
             ctes: Vec::new(),
         };
-        let (_, scope) = walk.from(Some(side), &[], 0, Check::Off)?;
+        let (_, scope) = walk.from(Some(side), &[], 0, (Check::Off, true))?;
         let name = scope.tables.first().and_then(|(name, _)| name.as_deref());
         Ok(CompactArc::new(untyped_schema(
             name.unwrap_or_default(),

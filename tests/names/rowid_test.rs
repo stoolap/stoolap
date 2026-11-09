@@ -754,6 +754,20 @@ fn a_join_reads_a_keyed_side_rowid_and_refuses_a_keyless_one() {
             [[int(10), int(1)], [int(20), int(2)], [int(30), int(3)]]
         );
         assert!(error(db, "SELECT n._rowid_ FROM k JOIN n ON k.a = n.a").contains("not found"));
+        for sql in [
+            "SELECT EXISTS (SELECT 1 FROM n CROSS JOIN k ORDER BY n._rowid_)",
+            "SELECT EXISTS (SELECT 1 FROM n x CROSS JOIN (SELECT 1 FROM n) d ORDER BY x._rowid_)",
+            "SELECT 1 IN (SELECT 1 FROM n JOIN k ON k.a = n.a ORDER BY n._rowid_ LIMIT 1)",
+        ] {
+            assert!(error(db, sql).contains("not found"), "{sql}");
+        }
+        assert_eq!(
+            rows(
+                db,
+                "SELECT EXISTS (SELECT 1 FROM n CROSS JOIN k ORDER BY k._rowid_)"
+            ),
+            [[Value::Boolean(true)]]
+        );
         assert!(error(db, "SELECT _rowid_ FROM k JOIN n ON k.a = n.a").contains("ambiguous"));
         assert!(error(db, "SELECT _rowid_ FROM k x JOIN k y ON x.a = y.a").contains("ambiguous"));
     });
