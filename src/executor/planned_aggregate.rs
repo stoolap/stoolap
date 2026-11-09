@@ -102,6 +102,8 @@ pub struct PlannedAggregate {
     source_columns: CompactArc<Vec<String>>,
     /// The output names of a SELECT list of nothing but the calls
     alone: Option<CompactArc<Vec<String>>>,
+    /// The statement planned, whose SELECT list a run computes
+    stmt: SelectStatement,
 }
 
 impl Executor {
@@ -425,12 +427,12 @@ impl Executor {
         .map(Some)
     }
 
-    /// `stmt` answered by `planned`, held with its plan: one count the table
-    /// keeps or an index's bound, read through committed state. None for the
-    /// plan's rows to answer, when the table cannot answer so in this run
+    /// The statement `planned` was planned for, answered by it, held with
+    /// its plan: one count the table keeps or an index's bound, read through
+    /// committed state. None for the plan's rows to answer, when the table
+    /// cannot answer so in this run
     pub(crate) fn run_quiet_aggregate(
         &self,
-        stmt: &SelectStatement,
         planned: &PlannedAggregate,
         ctx: &ExecutionContext,
     ) -> Option<Result<Box<dyn QueryResult>>> {
@@ -461,7 +463,7 @@ impl Executor {
             rows.push((0, Row::from_compact_vec(values)));
             self.finish_global(
                 answered.path(),
-                stmt,
+                &planned.stmt,
                 &planned.aggregations,
                 &planned.source_columns,
                 ctx,
@@ -490,6 +492,7 @@ impl Executor {
             aggregations,
             table,
             source_columns,
+            stmt: stmt.clone(),
         })
     }
 

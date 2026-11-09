@@ -343,6 +343,18 @@ fn a_statement_shaped_like_one_without_rowid_still_reads_it() {
 }
 
 #[test]
+fn a_kept_aggregate_plan_answers_every_run_of_a_rowid_statement() {
+    each_layout("kept_aggregate", |db| {
+        for _ in 0..3 {
+            assert_eq!(rows(db, "SELECT MAX(_rowid_) + 1 FROM k"), [[int(31)]]);
+            assert_eq!(rows(db, "SELECT MIN(_rowid_) * 2 AS m FROM k"), [[int(20)]]);
+            assert_eq!(rows(db, "SELECT COUNT(_rowid_) + 1 FROM k"), [[int(4)]]);
+            assert_eq!(rows(db, "SELECT MAX(_rowid_) + 1 FROM n"), [[int(4)]]);
+        }
+    });
+}
+
+#[test]
 fn rowid_reads_alike_in_every_clause() {
     each_layout("clauses", |db| {
         for sql in [

@@ -365,7 +365,7 @@ impl Executor {
             // and no statement's view: those read the plan's rows
             if let Some(quiet) = &planned.quiet {
                 let ctx = ctx.filter(|ctx| !in_txn && ctx.statement_view().is_none())?;
-                return self.run_quiet_aggregate(stmt, quiet, ctx);
+                return self.run_quiet_aggregate(quiet, ctx);
             }
             if let Some(ctx) = ctx {
                 // In a transaction the normal path arms a timeout; every
