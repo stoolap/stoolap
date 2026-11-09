@@ -88,6 +88,21 @@ struct ReplayLog {
     failed_renames: Vec<(u64, String, String, Error)>,
 }
 
+impl ReplayLog {
+    /// A catalog record or a drop of `table_name` settles every rename that
+    /// led to it and failed only because the log had not yet named its table
+    fn settle_renames_to(&mut self, table_name: &str) {
+        let mut renamed = table_name.to_string();
+        while let Some(at) = self
+            .failed_renames
+            .iter()
+            .rposition(|(_, _, new, e)| *new == renamed && matches!(e, Error::TableNotFound(_)))
+        {
+            renamed = self.failed_renames.remove(at).1;
+        }
+    }
+}
+
 /// The change a column DDL makes to a table's history, checked against its
 /// volumes before it is recorded
 pub(crate) enum ColumnEvent<'a> {
@@ -2376,15 +2391,7 @@ impl MVCCEngine {
                     register_pk_index(&schema, &version_store);
 
                     let table_name = schema.table_name_lower.clone();
-                    // The table restated settles every rename that led to it
-                    let mut renamed = table_name.clone();
-                    while let Some(at) = log
-                        .failed_renames
-                        .iter()
-                        .rposition(|(_, _, new, _)| *new == renamed)
-                    {
-                        renamed = log.failed_renames.remove(at).1;
-                    }
+                    log.settle_renames_to(&table_name);
 
                     {
                         let mut schemas = self.schemas.write().unwrap();
@@ -2398,6 +2405,7 @@ impl MVCCEngine {
             }
             WALOperationType::DropTable => {
                 let table_name = entry.table_name.to_lowercase();
+                log.settle_renames_to(&table_name);
 
                 // Remove schema, strip FK references from child tables, and remove version store.
                 // Must strip FK references before removing schema, same as drop_table_internal.

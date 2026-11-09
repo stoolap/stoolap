@@ -183,7 +183,7 @@ fn a_rename_to_a_dropped_name_after_the_last_checkpoint_keeps_the_rows_it_moved(
 }
 
 #[test]
-fn a_manifest_a_dropped_table_left_behind_stops_the_open_and_keeps_the_files() {
+fn a_manifest_a_dropped_table_left_behind_opens_with_the_rows_the_log_kept() {
     let dir = tempfile::tempdir().unwrap();
     let volumes = dir.path().join("volumes");
     run(
@@ -211,13 +211,19 @@ fn a_manifest_a_dropped_table_left_behind_stops_the_open_and_keeps_the_files() {
     );
     std::fs::create_dir_all(volumes.join("bak")).unwrap();
     std::fs::write(volumes.join("bak").join("manifest.bin"), stale).unwrap();
-    let files = std::fs::read_dir(volumes.join("t")).unwrap().count();
-    let error = Database::open(&dsn(dir.path())).err().unwrap().to_string();
+    for open in 1..=2 {
+        let db = Database::open(&dsn(dir.path())).unwrap();
+        assert_eq!(
+            rows(&db, "SELECT id, n FROM t ORDER BY id"),
+            [(1, 10), (2, 20)],
+            "open {open}"
+        );
+        db.close().unwrap();
+    }
     assert!(
-        error.contains("cannot replay the rename of table 't' to 'bak'"),
-        "{error}"
+        !volumes.join("bak").exists(),
+        "the dropped table left its directory"
     );
-    assert_eq!(std::fs::read_dir(volumes.join("t")).unwrap().count(), files);
 }
 
 #[cfg(feature = "test-failpoints")]
@@ -297,5 +303,40 @@ mod failpoints {
         crash_image(dir.path(), image.path());
         let recovered = Database::open(&dsn(image.path())).unwrap();
         assert_eq!(rows(&recovered, "SELECT id, n FROM v"), [(1, 1)]);
+    }
+
+    #[test]
+    fn a_rename_and_a_drop_between_the_checkpoint_cut_and_its_catalog_records_reopen() {
+        let _guard = FailpointGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        run(
+            dir.path(),
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)",
+                "CREATE TABLE s (id INTEGER PRIMARY KEY, n INTEGER)",
+                "INSERT INTO t VALUES (1, 1)",
+                "INSERT INTO s VALUES (2, 2)",
+            ],
+        );
+        let db = Database::open(&dsn(dir.path())).unwrap();
+        let other = db.clone();
+        fp::after_checkpoint_cut_taken(move || {
+            for sql in ["ALTER TABLE t RENAME TO u", "DROP TABLE u"] {
+                other.execute(sql, ()).map(drop).unwrap()
+            }
+        });
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        let image = tempfile::tempdir().unwrap();
+        crash_image(dir.path(), image.path());
+        let recovered = Database::open(&dsn(image.path())).unwrap();
+        assert_eq!(rows(&recovered, "SELECT id, n FROM s"), [(2, 2)]);
+        assert!(
+            recovered.query("SELECT id FROM u", ()).is_err(),
+            "u is dropped"
+        );
+        assert!(
+            recovered.query("SELECT id FROM t", ()).is_err(),
+            "t is renamed"
+        );
     }
 }
