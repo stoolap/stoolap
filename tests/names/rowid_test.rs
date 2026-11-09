@@ -816,7 +816,7 @@ fn a_join_condition_reads_the_rowid_of_its_own_two_sides() {
 
 #[test]
 fn columns_a_using_join_merges_are_one_rowid() {
-    each_layout("using", |db| {
+    each_layout("using_merge", |db| {
         for sql in [
             "SELECT _rowid_ FROM (SELECT _rowid_ FROM k) a JOIN (SELECT _rowid_ FROM k) b USING (_rowid_) ORDER BY 1",
             "SELECT _rowid_ FROM (SELECT _rowid_ FROM k) a NATURAL JOIN (SELECT _rowid_ FROM k) b ORDER BY 1",
