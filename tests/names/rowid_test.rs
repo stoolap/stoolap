@@ -1066,6 +1066,10 @@ fn distinct_matches_an_order_by_rowid_to_the_list_as_written() {
             "SELECT DISTINCT d.* FROM (SELECT _rowid_ FROM k) d ORDER BY d._rowid_ DESC",
             "WITH c AS (SELECT _rowid_ FROM k) SELECT DISTINCT * FROM c ORDER BY _rowid_ DESC",
             "SELECT DISTINCT * FROM kv ORDER BY _rowid_ DESC",
+            "SELECT DISTINCT d.\"_rowid_\" FROM (SELECT _rowid_ FROM k) d ORDER BY d._rowid_ DESC",
+            "SELECT DISTINCT _rowid_ FROM (SELECT _rowid_ FROM k) d ORDER BY \"_rowid_\" DESC",
+            "WITH c AS (SELECT _rowid_ FROM k) SELECT DISTINCT \"_rowid_\" FROM c ORDER BY _rowid_ DESC",
+            "SELECT DISTINCT \"_rowid_\" FROM kv ORDER BY _rowid_ DESC",
         ] {
             assert_eq!(rows(db, sql), [[int(30)], [int(20)], [int(10)]], "{sql}");
         }

@@ -275,7 +275,7 @@ fn groups_by_an_item(key: &Expression, items: &[Expression], level: &[&str]) -> 
         }
         key => items
             .iter()
-            .any(|item| same_value(key, unaliased(item), level)),
+            .any(|item| same_value(key, unaliased(item), level, &|_| true)),
     }
 }
 
@@ -307,7 +307,7 @@ fn determined(
     }
     items
         .iter()
-        .any(|item| same_value(key, unaliased(item), level))
+        .any(|item| same_value(key, unaliased(item), level, star_shows))
         || scalar_of(key, &mut |column| {
             column_determined(column, items.iter().map(unaliased), level, star_shows)
         })
@@ -344,7 +344,7 @@ fn column_determined<'i>(
                 }
                 _ => level == [star.qualifier.to_lowercase().as_str()],
             },
-            item => same_column(column, item, level),
+            item => same_column(column, item, level, star_shows),
         })
 }
 
@@ -394,8 +394,8 @@ fn scalar_of(expr: &Expression, column: &mut dyn FnMut(&Expression) -> bool) -> 
     }
 }
 
-/// Whether `column` reads the row identity: an unquoted `_rowid_`, which a
-/// quoted name of its spelling is not
+/// Whether `column` may read the row identity: an unquoted `_rowid_`, which
+/// a quoted name of its spelling is not
 fn reads_identity(column: &Expression) -> bool {
     match column {
         Expression::Identifier(c) => !c.quoted && crate::core::is_rowid_name(&c.value_lower),
@@ -408,10 +408,17 @@ fn reads_identity(column: &Expression) -> bool {
 
 /// Whether two column references name the same column: the same name, and
 /// a qualifier on one side only when it is an entry of this query's FROM,
-/// where a bare name of a valid statement binds
-fn same_column(a: &Expression, b: &Expression, level: &[&str]) -> bool {
+/// where a bare name of a valid statement binds. A `_rowid_` reading a
+/// stored table's identity, which no star shows, is not a quoted one
+fn same_column(
+    a: &Expression,
+    b: &Expression,
+    level: &[&str],
+    star_shows: &dyn Fn(&Expression) -> bool,
+) -> bool {
     let at_level = |q: &Identifier| level.contains(&q.value_lower.as_str());
-    if reads_identity(a) != reads_identity(b) {
+    let identity = |c: &Expression| reads_identity(c) && !star_shows(c);
+    if identity(a) != identity(b) {
         return false;
     }
     match (a, b) {
@@ -431,7 +438,12 @@ fn same_column(a: &Expression, b: &Expression, level: &[&str]) -> bool {
 /// Whether two expressions compute the same value: the same tree, each pair
 /// of columns the same column. A tree reading more than its names, as a
 /// subquery or a window does, must be written alike
-fn same_value(a: &Expression, b: &Expression, level: &[&str]) -> bool {
+fn same_value(
+    a: &Expression,
+    b: &Expression,
+    level: &[&str],
+    star_shows: &dyn Fn(&Expression) -> bool,
+) -> bool {
     use crate::executor::expr_key::ExprKey;
     use crate::executor::utils::visit_column_refs;
     if ExprKey::by_column_name(a) != ExprKey::by_column_name(b) {
@@ -447,7 +459,7 @@ fn same_value(a: &Expression, b: &Expression, level: &[&str]) -> bool {
         && left
             .iter()
             .zip(&right)
-            .all(|(x, y)| same_column(x, y, level))
+            .all(|(x, y)| same_column(x, y, level, star_shows))
 }
 
 /// The names a FROM tree shows: each entry's alias, else its own name
