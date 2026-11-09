@@ -882,6 +882,39 @@ fn test_a_top_level_exists_reads_only_the_rows_its_keys_name() {
 }
 
 #[test]
+fn test_a_not_exists_by_the_primary_key_over_a_table_without_volumes_walks_to_its_limit() {
+    use stoolap::test_failpoints::active_ids_gatherings;
+    let _guard = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+    for sql in [
+        "CREATE TABLE big (id INTEGER PRIMARY KEY, v INTEGER)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, v INTEGER)",
+        "INSERT INTO big SELECT value, value FROM generate_series(1, 300)",
+        "INSERT INTO u SELECT value, value FROM generate_series(1, 5)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    force_exists_strategy(Some(true));
+    let sql = "SELECT id FROM big WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.id = big.id) LIMIT 3";
+    let gathered = active_ids_gatherings();
+    let before = prepared_rows_narrowed();
+    assert_eq!(ids(&db, sql), [6, 7, 8]);
+    assert_eq!(
+        prepared_rows_narrowed(),
+        before + 1,
+        "{sql} read big by its keys"
+    );
+    assert_eq!(
+        active_ids_gatherings(),
+        gathered,
+        "a table without volumes gathered every row id"
+    );
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    assert_eq!(ids(&db, sql), [6, 7, 8], "over volumes");
+}
+
+#[test]
 fn test_an_in_family_statement_never_reaches_the_general_path() {
     let _guard = serial();
     let db = setup("general");

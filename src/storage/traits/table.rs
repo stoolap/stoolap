@@ -93,6 +93,23 @@ pub struct ProbeScratch {
     pub(crate) key: crate::storage::volume::secondary::KeyBuffer,
 }
 
+/// `Table::visible_row_ids_excluding` from every active row id, sorted
+pub(crate) fn active_ids_excluding<T: Table + ?Sized>(
+    table: &T,
+    exclude: &crate::common::I64Set,
+    limit: usize,
+) -> Result<Vec<i64>> {
+    #[cfg(feature = "test-failpoints")]
+    crate::test_failpoints::active_ids_gathered();
+    let mut ids = table.get_active_row_ids()?;
+    ids.sort_unstable();
+    Ok(ids
+        .into_iter()
+        .filter(|id| !exclude.contains(*id))
+        .take(limit)
+        .collect())
+}
+
 /// `Table::count_equal_candidates` by reading each row and checking its key
 pub(crate) fn count_equal_by_reading<T: Table + ?Sized>(
     table: &T,
@@ -426,13 +443,7 @@ pub trait Table: Send + Sync {
         exclude: &crate::common::I64Set,
         limit: usize,
     ) -> Result<Vec<i64>> {
-        let mut ids = self.get_active_row_ids()?;
-        ids.sort_unstable();
-        Ok(ids
-            .into_iter()
-            .filter(|id| !exclude.contains(*id))
-            .take(limit)
-            .collect())
+        active_ids_excluding(self, exclude, limit)
     }
 
     /// Populate a FxHashSet with all hot row_ids. Avoids the intermediate Vec

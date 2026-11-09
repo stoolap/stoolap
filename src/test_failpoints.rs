@@ -1759,6 +1759,18 @@ pub(crate) fn prepared_exists_set_built() {
     run_hook(&PREPARED_EXISTS_HOOK);
 }
 
+static ACTIVE_IDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Lists of visible row ids in key order, some left out, that gathered
+/// and sorted every active row id first, so far
+pub fn active_ids_gatherings() -> usize {
+    ACTIVE_IDS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn active_ids_gathered() {
+    ACTIVE_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub(crate) fn prepared_exists_looked_up() {
     PREPARED_EXISTS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }

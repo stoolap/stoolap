@@ -4465,6 +4465,18 @@ impl Table for SegmentedTable {
         })
     }
 
+    fn visible_row_ids_excluding(
+        &self,
+        exclude: &crate::common::I64Set,
+        limit: usize,
+    ) -> Result<Vec<i64>> {
+        // Without a volume the hot walk in key order stops at the limit
+        if let Some(result) = self.unsealed(|hot| hot.visible_row_ids_excluding(exclude, limit)) {
+            return result;
+        }
+        crate::storage::traits::table::active_ids_excluding(self, exclude, limit)
+    }
+
     fn delete(
         &mut self,
         access: ScanAccess<'_>,
