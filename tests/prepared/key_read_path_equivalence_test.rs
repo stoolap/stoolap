@@ -25,8 +25,8 @@ use crate::oracle;
 
 const RECORDED: oracle::Answers = answers!("key_read_paths");
 
-/// A statement on `path`, and its twin, which compares the key computed
-/// and so reads by a scan
+/// A statement on `path`, and its twin, which selects the same list and
+/// compares the key computed, and so reads by a scan
 const CASES: &[(&str, &str, &str)] = &[
     (
         "pk_get",
@@ -36,7 +36,7 @@ const CASES: &[(&str, &str, &str)] = &[
     (
         "pk_get",
         "SELECT a, b, _rowid_ FROM k WHERE _rowid_ = 30",
-        "SELECT a, b, id FROM k WHERE id + 0 = 30",
+        "SELECT a, b, _rowid_ FROM k WHERE _rowid_ + 0 = 30",
     ),
     (
         "unique_get",
@@ -51,7 +51,7 @@ const CASES: &[(&str, &str, &str)] = &[
     (
         "key_members",
         "SELECT a, _rowid_ FROM k WHERE _rowid_ IN (30, 10)",
-        "SELECT a, id FROM k WHERE id + 0 IN (30, 10)",
+        "SELECT a, _rowid_ FROM k WHERE _rowid_ + 0 IN (30, 10)",
     ),
     (
         "row_ids",
@@ -65,8 +65,8 @@ const CASES: &[(&str, &str, &str)] = &[
     ),
     (
         "block_point_rows",
-        "SELECT o.a, (SELECT i.b FROM k i WHERE i.id = o.id AND i.a > 1) FROM k o",
-        "SELECT o.a, (SELECT i.b FROM k i WHERE i.id + 0 = o.id AND i.a > 1) FROM k o",
+        "SELECT o.a, (SELECT i.b FROM k i WHERE i.id = o.id AND i.a > 1) AS v FROM k o",
+        "SELECT o.a, (SELECT i.b FROM k i WHERE i.id + 0 = o.id AND i.a > 1) AS v FROM k o",
     ),
     (
         "block_point_rows",
@@ -75,8 +75,8 @@ const CASES: &[(&str, &str, &str)] = &[
     ),
     (
         "block_point_value",
-        "SELECT o.a, (SELECT i.b FROM k i WHERE i.id = o.id) FROM k o",
-        "SELECT o.a, (SELECT i.b FROM k i WHERE i.id + 0 = o.id) FROM k o",
+        "SELECT o.a, (SELECT i.b FROM k i WHERE i.id = o.id) AS v FROM k o",
+        "SELECT o.a, (SELECT i.b FROM k i WHERE i.id + 0 = o.id) AS v FROM k o",
     ),
 ];
 
@@ -97,9 +97,10 @@ fn open(dsn: &str, sealed: bool) -> Database {
     db
 }
 
-/// The rows, sorted: no case orders them
+/// The column names, then the rows, sorted: no case orders them
 fn answer(db: &Database, sql: &str) -> Result<Vec<String>, String> {
     let rows = db.query(sql, ()).map_err(|e| e.to_string())?;
+    let names = format!("{:?}", rows.columns());
     let mut found = rows
         .map(|row| {
             let row = row.map_err(|e| e.to_string())?;
@@ -110,6 +111,7 @@ fn answer(db: &Database, sql: &str) -> Result<Vec<String>, String> {
         })
         .collect::<Result<Vec<_>, String>>()?;
     found.sort();
+    found.insert(0, names);
     Ok(found)
 }
 
