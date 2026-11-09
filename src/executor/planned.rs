@@ -52,17 +52,18 @@ impl Executor {
         ctx: Option<&ExecutionContext>,
         run: impl FnOnce(&PreparedSelect) -> R,
     ) -> Option<R> {
-        self.with_planned_or_error(stmt, compiled, classification, ctx, run, &mut None)
+        self.with_planned_or_error(stmt, compiled, classification, (ctx, false), run, &mut None)
     }
 
     /// [`Self::with_planned`], keeping in `error` the error planning gives
-    /// a statement that names what its table does not have
+    /// a statement that names what its table does not have; `spelled` when
+    /// `stmt` has passed its entry's rowid spelling
     pub(crate) fn with_planned_or_error<R>(
         &self,
         stmt: &SelectStatement,
         compiled: &RwLock<CompiledExecution>,
         classification: Option<&OnceLock<Arc<QueryClassification>>>,
-        ctx: Option<&ExecutionContext>,
+        (ctx, spelled): (Option<&ExecutionContext>, bool),
         run: impl FnOnce(&PreparedSelect) -> R,
         error: &mut Option<Error>,
     ) -> Option<R> {
@@ -95,7 +96,7 @@ impl Executor {
             crate::test_failpoints::compiled_epoch_checked();
             return Some(run(&p));
         }
-        let planned = match self.plan_into(stmt, compiled, classification, ctx?, epoch) {
+        let planned = match self.plan_into(stmt, compiled, classification, (ctx?, spelled), epoch) {
             Ok(planned) => planned?,
             Err(e) => {
                 *error = Some(e);
@@ -116,15 +117,15 @@ impl Executor {
         stmt: &SelectStatement,
         compiled: &RwLock<CompiledExecution>,
         classification: Option<&OnceLock<Arc<QueryClassification>>>,
-        ctx: &ExecutionContext,
+        (ctx, spelled): (&ExecutionContext, bool),
         epoch: u64,
     ) -> Result<Option<Arc<PreparedSelect>>> {
         let shape = match classification {
             Some(slot) => Arc::clone(slot.get_or_init(|| get_classification(stmt))),
             None => get_classification(stmt),
         };
-        // A rowid is spelled by the statement's own run before any plan
-        if shape.names_rowid && self.rowids_spelled(stmt, ctx)?.is_some() {
+        // A rowid is spelled by the statement's own run, which plans that
+        if shape.names_rowid && !spelled {
             return Ok(None);
         }
         // A statement that aggregates its rows; one whose row the table

@@ -1605,18 +1605,26 @@ impl Executor {
             let ctx = snapshot.as_ref().unwrap_or(ctx);
             return self.run_over_cut_ctes(stmt, with, compiled, ctx, |ctes| {
                 let ctx = ctx.with_cte_data(ctes.data());
-                self.select_rows_with_plan(stmt, &ctx, reads_blocks, plan_classification, compiled)
+                let at = (reads_blocks, false);
+                self.select_rows_with_plan(stmt, &ctx, at, plan_classification, compiled)
             });
         }
-        self.select_rows_with_plan(stmt, ctx, reads_blocks, plan_classification, compiled)
+        self.select_rows_with_plan(
+            stmt,
+            ctx,
+            (reads_blocks, false),
+            plan_classification,
+            compiled,
+        )
     }
 
-    /// `select_with_plan` past its CTEs, which `ctx` holds
+    /// `select_with_plan` past its CTEs, which `ctx` holds; `spelled` when
+    /// `stmt` is its entry's spelling of the statement
     fn select_rows_with_plan(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
-        reads_blocks: bool,
+        (reads_blocks, spelled): (bool, bool),
         plan_classification: Option<&std::sync::OnceLock<Arc<QueryClassification>>>,
         compiled: Option<&NestedPlan>,
     ) -> Result<Box<dyn QueryResult>> {
@@ -1638,13 +1646,14 @@ impl Executor {
             None => get_classification(stmt),
         };
         // Every path reads a rowid as the column it is, spelled once here
-        if classification.names_rowid {
+        if classification.names_rowid && !spelled {
             if let Some(spelled) = self.rowids_spelled(stmt, ctx)? {
-                // Spelling is its own fixed point: the run below spells nothing again
-                if self.rowids_spelled(&spelled, ctx)?.is_some() {
-                    return Err(Error::internal("a statement's rowid spelled twice"));
-                }
-                return self.select_rows_with_plan(&spelled, ctx, false, None, compiled);
+                debug_assert!(
+                    self.rowids_spelled(&spelled, ctx)
+                        .is_ok_and(|again| again.is_none()),
+                    "a statement's rowid spelled twice"
+                );
+                return self.select_rows_with_plan(&spelled, ctx, (false, true), None, compiled);
             }
         }
 
@@ -1661,7 +1670,7 @@ impl Executor {
                         stmt,
                         slot,
                         plan_classification,
-                        Some(ctx),
+                        (Some(ctx), true),
                         |_| (),
                         &mut error,
                     );
