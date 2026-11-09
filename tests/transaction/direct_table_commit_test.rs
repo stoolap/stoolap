@@ -218,7 +218,7 @@ fn a_savepoint_rollback_takes_back_an_indexed_change_two_table_commits_kept() {
     table.commit().unwrap();
     txn.create_savepoint("s").unwrap();
     table
-        .update_by_row_ids(&[2], &mut |_| {
+        .update_by_row_ids(&[2], &mut |_, _| {
             Ok((Row::from(vec![Value::Integer(2), Value::Integer(9)]), true))
         })
         .unwrap();

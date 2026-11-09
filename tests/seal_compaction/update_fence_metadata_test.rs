@@ -142,8 +142,8 @@ fn rows_through(table: &dyn stoolap::storage::traits::Table) -> Vec<(i64, i64)> 
     rows
 }
 
-fn set_v(calls: &mut Vec<i64>) -> impl FnMut(Row) -> stoolap::core::Result<(Row, bool)> + '_ {
-    move |mut row| {
+fn set_v(calls: &mut Vec<i64>) -> impl FnMut(i64, Row) -> stoolap::core::Result<(Row, bool)> + '_ {
+    move |_, mut row| {
         if let Some(Value::Integer(id)) = row.get(0) {
             calls.push(*id);
         }

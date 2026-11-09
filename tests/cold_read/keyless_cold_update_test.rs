@@ -138,11 +138,11 @@ fn an_integer_key_cold_update_refuses_a_null_or_a_wrong_type_when_it_runs() {
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     let mut txn = db.engine().begin_transaction().unwrap();
     let mut table = txn.get_table("t").unwrap();
-    let null = table.update_by_row_ids(&[1], &mut |mut row| {
+    let null = table.update_by_row_ids(&[1], &mut |_, mut row| {
         row.set(1, stoolap::core::Value::null_unknown()).unwrap();
         Ok((row, true))
     });
-    let text = table.update_by_row_ids(&[1], &mut |mut row| {
+    let text = table.update_by_row_ids(&[1], &mut |_, mut row| {
         row.set(1, stoolap::core::Value::text("not a number"))
             .unwrap();
         Ok((row, true))

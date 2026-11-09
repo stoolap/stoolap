@@ -23,7 +23,7 @@ use crate::common::CompactArc;
 use crate::common::I64Set;
 use crate::common::SmartString;
 use crate::core::integer::integer_neg;
-use crate::core::{DataType, Error, Result, Row, RowVec, Schema, Value};
+use crate::core::{DataType, Error, Result, Row, RowVec, Schema, Value, ROWID_SLOT};
 use crate::parser::ast::*;
 use crate::storage::expression::{ComparisonExpr, Expression as StorageExpr};
 use crate::storage::mvcc::version_store::LayoutToken;
@@ -312,7 +312,17 @@ impl InsertPrograms {
         }
         let returning = (!stmt.returning.is_empty()
             && !stmt.returning.iter().any(Executor::has_subqueries))
-        .then(|| returning_programs(&stmt.returning, &schema.column_names_arc()));
+        .then(|| {
+            let widened = returns_slot(&stmt.returning, schema);
+            let columns = super::prepared_select::read_names(schema, widened);
+            let rowid = schema.rowid_column();
+            let at = rowid.or(widened.then_some(schema.columns.len()));
+            returning_programs(
+                &stmt.returning,
+                &columns,
+                at.map(|at| (at, schema.table_name.as_str())),
+            )
+        });
         Self {
             default_values,
             default_programs,
@@ -357,26 +367,34 @@ fn compile_value(expr: &Expression) -> Result<super::expression::SharedProgram> 
     )
 }
 
-/// A RETURNING's programs over the target's `columns`, a star expanded
+/// A RETURNING's programs over the target's `columns`, a star expanded, a
+/// rowid read from the column `rowid` gives of the target it names
 fn returning_programs(
     returning: &[Expression],
     columns: &[String],
+    rowid: Option<(usize, &str)>,
 ) -> Vec<Result<super::expression::SharedProgram>> {
     use crate::parser::{Identifier, Position, Token, TokenType};
     let registry = crate::functions::global_registry();
     let compile = |expr: &Expression| {
-        super::aggregation::compile_over_slots(expr, columns, registry, None, false, None)
+        let expr = super::utils::rowids_respelled(expr, &mut |_| {
+            Ok(rowid.map(|(at, table)| super::utils::qualified_reference(table, &columns[at])))
+        })?;
+        super::aggregation::compile_over_slots(&expr, columns, registry, None, false, None)
     };
     let mut programs = Vec::with_capacity(returning.len());
     for expr in returning {
         match expr {
-            Expression::Star(_) => programs.extend(columns.iter().map(|name| {
-                let token = Token::new(TokenType::Identifier, name.clone(), Position::new(0, 0, 0));
-                compile(&Expression::Identifier(Identifier::new(
-                    token,
-                    name.clone(),
-                )))
-            })),
+            Expression::Star(_) => {
+                programs.extend(columns.iter().filter(|c| *c != ROWID_SLOT).map(|name| {
+                    let token =
+                        Token::new(TokenType::Identifier, name.clone(), Position::new(0, 0, 0));
+                    compile(&Expression::Identifier(Identifier::new(
+                        token,
+                        name.clone(),
+                    )))
+                }))
+            }
             _ => programs.push(compile(expr)),
         }
     }
@@ -392,6 +410,8 @@ pub(crate) struct CompiledUpsert {
     compiled_where: Option<super::expression::SharedProgram>,
     /// CHECK constraints of the updated columns
     compiled_checks: Vec<CompiledCheck>,
+    /// Whether the programs read the row met with its row id past its columns
+    widens: bool,
 }
 
 /// An ON CONFLICT DO UPDATE whose programs are prepared: `upsert` holds
@@ -526,6 +546,39 @@ pub(crate) struct CompiledCheck {
     /// Whether its answer may change with no column changing (NOW, RANDOM)
     pub(crate) volatile: bool,
     pub(crate) program: super::expression::SharedProgram,
+}
+
+/// Whether an INSERT's RETURNING reads the row ids of a table without a
+/// primary key, which its rows returned then carry past their columns
+fn returns_slot(returning: &[Expression], schema: &Schema) -> bool {
+    schema.rowid_column().is_none() && returning.iter().any(super::utils::expr_names_rowid)
+}
+
+/// `row` inserted into `table` as a RETURNING reads it: with its row id
+/// past its columns when `widened`
+fn inserted(table: &mut dyn Table, row: Row, widened: bool) -> Result<Row> {
+    match widened {
+        true => table
+            .insert_with_id(row)
+            .map(|(id, row)| super::prepared_select::widened(row, id)),
+        false => table.insert(row),
+    }
+}
+
+/// An ON CONFLICT DO UPDATE's SET values, each with the column it writes,
+/// and its WHERE
+type ConflictClauses = (Vec<(usize, Expression)>, Option<Expression>);
+
+/// The column a statement writes under the lowercase `name`, None for no
+/// column; an error for rowid, the row's identity, which nothing writes
+pub(crate) fn written_column(schema: &Schema, name: &str) -> Result<Option<usize>> {
+    match schema.column_index_map().get(name) {
+        Some(&at) => Ok(Some(at)),
+        None if crate::core::is_rowid_name(name) => Err(Error::invalid_argument(format!(
+            "cannot write {name}: it is the row's identity"
+        ))),
+        None => Ok(None),
+    }
 }
 
 /// Compile every CHECK constraint of `schema`, the columns' and the table's.
@@ -965,15 +1018,12 @@ impl Executor {
             } else {
                 // Validate columns exist and pre-compute their indices
                 // OPTIMIZATION: Use cached column_index_map for O(1) lookups instead of O(n) linear scan
-                let col_map = schema.column_index_map();
                 column_indices = stmt
                     .columns
                     .iter()
                     .map(|id| {
                         // Use pre-computed lowercase value from AST
-                        col_map
-                            .get(id.value_lower.as_str())
-                            .copied()
+                        written_column(schema, id.value_lower.as_str())?
                             .ok_or_else(|| Error::ColumnNotFound(id.value.to_string()))
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -1025,6 +1075,7 @@ impl Executor {
 
         // RETURNING clause support - collect inserted rows if RETURNING is specified
         let has_returning = !stmt.returning.is_empty();
+        let widened = has_returning && returns_slot(&stmt.returning, table.schema());
         let mut returning_rows: Vec<Row> = Vec::new();
         // OPTIMIZATION: Only get column names Arc when RETURNING is used (avoids 7ms clone)
         let schema_column_names_arc = if has_returning {
@@ -1135,7 +1186,7 @@ impl Executor {
                     let schema_ref = select_schema.as_ref().unwrap();
                     // ON CONFLICT DO NOTHING — silently skip duplicates
                     let insert_result: Result<Option<Row>> = if has_returning {
-                        table.insert(row).map(Some)
+                        inserted(&mut *table, row, widened).map(Some)
                     } else {
                         table.insert_discard(row).map(|()| None)
                     };
@@ -1160,7 +1211,7 @@ impl Executor {
                     let schema_ref = select_schema.as_ref().unwrap();
                     // ON CONFLICT DO UPDATE / ON DUPLICATE KEY UPDATE
                     let insert_result: Result<Option<Row>> = if has_returning {
-                        table.insert(row).map(Some)
+                        inserted(&mut *table, row, widened).map(Some)
                     } else {
                         table.insert_discard(row).map(|()| None)
                     };
@@ -1184,7 +1235,7 @@ impl Executor {
                                 stmt,
                                 &mut insert_plan,
                                 ctx,
-                                has_returning,
+                                (has_returning, widened),
                                 conflict,
                             ) {
                                 Ok((updated, returned)) => {
@@ -1233,7 +1284,7 @@ impl Executor {
                                         stmt,
                                         &mut insert_plan,
                                         ctx,
-                                        has_returning,
+                                        (has_returning, widened),
                                         conflict,
                                     ) {
                                         Ok((updated, returned)) => {
@@ -1260,7 +1311,7 @@ impl Executor {
                     }
                 } else if has_returning {
                     // Use insert() which returns row (for RETURNING clause)
-                    let inserted_row = table.insert(row)?;
+                    let inserted_row = inserted(&mut *table, row, widened)?;
                     returning_rows.push(inserted_row);
                     rows_affected += 1;
                 } else {
@@ -1422,7 +1473,7 @@ impl Executor {
                 if stmt.do_nothing {
                     // ON CONFLICT DO NOTHING — silently skip duplicates
                     let insert_result: Result<Option<Row>> = if has_returning {
-                        table.insert(row).map(Some)
+                        inserted(&mut *table, row, widened).map(Some)
                     } else {
                         table.insert_discard(row).map(|()| None)
                     };
@@ -1445,7 +1496,7 @@ impl Executor {
                 } else {
                     // ON CONFLICT DO UPDATE / ON DUPLICATE KEY UPDATE
                     let insert_result: Result<Option<Row>> = if has_returning {
-                        table.insert(row).map(Some)
+                        inserted(&mut *table, row, widened).map(Some)
                     } else {
                         table.insert_discard(row).map(|()| None)
                     };
@@ -1469,7 +1520,7 @@ impl Executor {
                                 stmt,
                                 &mut insert_plan,
                                 ctx,
-                                has_returning,
+                                (has_returning, widened),
                                 conflict,
                             ) {
                                 Ok((updated, returned)) => {
@@ -1519,7 +1570,7 @@ impl Executor {
                                         stmt,
                                         &mut insert_plan,
                                         ctx,
-                                        has_returning,
+                                        (has_returning, widened),
                                         conflict,
                                     ) {
                                         Ok((updated, returned)) => {
@@ -1626,7 +1677,7 @@ impl Executor {
 
                 if has_returning {
                     // Use insert() which returns row (for RETURNING clause)
-                    let inserted_row = table.insert(row)?;
+                    let inserted_row = inserted(&mut *table, row, widened)?;
                     returning_rows.push(inserted_row);
                 } else {
                     // Use insert_discard() to avoid clone overhead
@@ -1858,14 +1909,11 @@ impl Executor {
                     (indices, types, dims, names)
                 } else {
                     // Validate columns exist and pre-compute their indices
-                    let col_map = schema.column_index_map();
                     let indices: Vec<usize> = stmt
                         .columns
                         .iter()
                         .map(|id| {
-                            col_map
-                                .get(id.value_lower.as_str())
-                                .copied()
+                            written_column(schema, id.value_lower.as_str())?
                                 .ok_or_else(|| Error::ColumnNotFound(id.value.to_string()))
                         })
                         .collect::<Result<Vec<_>>>()?;
@@ -1980,6 +2028,7 @@ impl Executor {
 
         // RETURNING clause support - collect inserted rows if RETURNING is specified
         let has_returning = !stmt.returning.is_empty();
+        let widened = has_returning && returns_slot(&stmt.returning, table.schema());
         let mut returning_rows: Vec<Row> = Vec::new();
         let schema_column_names_arc = if has_returning {
             Some(table.schema().column_names_arc())
@@ -2067,7 +2116,7 @@ impl Executor {
                 }
 
                 if has_returning {
-                    let inserted_row = table.insert(row)?;
+                    let inserted_row = inserted(&mut *table, row, widened)?;
                     returning_rows.push(inserted_row);
                 } else {
                     table.insert_discard(row)?;
@@ -2157,7 +2206,7 @@ impl Executor {
                 }
 
                 if has_returning {
-                    let inserted_row = table.insert(row)?;
+                    let inserted_row = inserted(&mut *table, row, widened)?;
                     returning_rows.push(inserted_row);
                 } else {
                     table.insert_discard(row)?;
@@ -2357,6 +2406,9 @@ impl Executor {
         // throughout ~50 code paths (lookups, range scans, ORDER BY, FK cascade, WAL
         // recovery, etc.). Allowing PK mutation silently corrupts lookups.
         // This matches SQLite's behavior for rowid tables.
+        for col_name in stmt.updates.keys() {
+            written_column(schema, &col_name.to_lowercase())?;
+        }
         if let Some(pk_idx) = schema.pk_column_index() {
             let col_map = schema.column_index_map();
             for col_name in stmt.updates.keys() {
@@ -2714,7 +2766,12 @@ impl Executor {
                 Some(run) => run.context(&no_row),
                 None => ExecuteContext::new(&no_row).with_run(params, transaction_id, None),
             };
-            let mut setter = |mut row: Row| -> Result<(Row, bool)> {
+            let widen = dml_run.as_ref().is_some_and(|run| run.widens());
+            let mut set_row = |row_id: i64, row: Row| -> Result<(Row, bool)> {
+                let mut row = match widen {
+                    true => super::prepared_select::widened(row, row_id),
+                    false => row,
+                };
                 // Execute pre-compiled programs (no recompilation per row)
                 let updates_to_apply: Vec<(usize, Value)> = {
                     let exec_ctx = ExecuteContext {
@@ -2820,6 +2877,14 @@ impl Executor {
                     returning_rows.borrow_mut().push(row.clone());
                 }
 
+                Ok((row, changed))
+            };
+            // A widened row is written without its row id
+            let mut setter = |row_id: i64, row: Row| -> Result<(Row, bool)> {
+                let (mut row, changed) = set_row(row_id, row)?;
+                if widen {
+                    row.pop();
+                }
                 Ok((row, changed))
             };
 
@@ -3170,7 +3235,9 @@ impl Executor {
                 })?;
             }
 
-            // Scan all rows and collect IDs of rows to delete
+            // Scan all rows and collect IDs of rows to delete; a RETURNING
+            // reading the row id has it past the row's columns
+            let returns_widened = has_returning && dml_run.as_ref().is_some_and(|r| r.widens());
             let column_indices: Vec<usize> = (0..column_count).collect();
             let mut scanner = if where_prepared {
                 None
@@ -3198,7 +3265,14 @@ impl Executor {
                 };
 
                 if matches {
-                    collect(scanner.current_row_id(), row);
+                    let row_id = scanner.current_row_id();
+                    match returns_widened {
+                        true => collect(
+                            row_id,
+                            &super::prepared_select::widened(row.clone(), row_id),
+                        ),
+                        false => collect(row_id, row),
+                    }
                 }
             }
             if let Some(error) = scanner.as_ref().and_then(|scanner| scanner.err()) {
@@ -3438,13 +3512,13 @@ impl Executor {
         use super::expression::{CompileContext, ExprCompiler, SharedProgram};
         use crate::functions::registry::global_registry;
 
-        let update_specs = Self::conflict_sets(schema, stmt);
+        let (update_specs, update_where) = Self::conflict_sets(schema, stmt)?;
+        let widens = Self::conflict_widens(schema, stmt);
 
-        let column_names: Vec<String> = schema.column_names_owned().to_vec();
+        let column_names: Vec<String> = super::prepared_select::read_names(schema, widens).to_vec();
 
         // Build EXCLUDED column name list for the second row source.
-        let excluded_columns: Vec<String> = column_names
-            .iter()
+        let excluded_columns: Vec<String> = (schema.column_names_owned().iter())
             .map(|c| qualified("excluded", c))
             .collect();
 
@@ -3476,7 +3550,7 @@ impl Executor {
 
         // DO UPDATE ... WHERE is compiled the same way, with EXCLUDED as the
         // second row source
-        let compiled_where = match stmt.update_where.as_deref() {
+        let compiled_where = match &update_where {
             Some(expr) => {
                 let compile_ctx = CompileContext::new(&column_names, global_registry())
                     .with_second_row(&excluded_columns);
@@ -3491,24 +3565,55 @@ impl Executor {
             None => None,
         };
 
-        Self::upsert_of(schema, compiled_updates, compiled_where)
+        Self::upsert_of(schema, compiled_updates, compiled_where, widens)
     }
 
-    /// Each ON CONFLICT SET value of `stmt` with the column it writes
-    pub(super) fn conflict_sets<'s>(
+    /// Whether `stmt`'s ON CONFLICT SET values or WHERE read the row id of
+    /// a row met in `schema`'s table, which has no primary key
+    pub(super) fn conflict_widens(schema: &crate::core::Schema, stmt: &InsertStatement) -> bool {
+        let clauses = stmt.update_expressions.iter();
+        schema.rowid_column().is_none()
+            && (clauses.chain(stmt.update_where.as_deref())).any(super::utils::expr_names_rowid)
+    }
+
+    /// Each ON CONFLICT SET value of `stmt` with the column it writes, and
+    /// its WHERE, a rowid of the row met spelled as the column it reads: the
+    /// primary key, quoted, or the row id slot
+    pub(super) fn conflict_sets(
         schema: &crate::core::Schema,
-        stmt: &'s InsertStatement,
-    ) -> Vec<(usize, &'s Expression)> {
-        let col_map = schema.column_index_map();
-        stmt.update_columns
-            .iter()
-            .zip(stmt.update_expressions.iter())
-            .filter_map(|(col, expr)| {
-                col_map
-                    .get(col.value_lower.as_str())
-                    .map(|&idx| (idx, expr))
+        stmt: &InsertStatement,
+    ) -> Result<ConflictClauses> {
+        use crate::parser::{Position, Token, TokenType};
+        let key = match schema.rowid_column() {
+            Some(at) => schema.columns[at].name.as_str(),
+            None => ROWID_SLOT,
+        };
+        let target = &stmt.table_name.value_lower;
+        let spell = |expr: &Expression| {
+            super::utils::rowids_respelled(expr, &mut |rowid| {
+                let met = match rowid {
+                    Expression::QualifiedIdentifier(q) => {
+                        q.qualifier.value_lower == *target && q.qualifier.value_lower != "excluded"
+                    }
+                    _ => true,
+                };
+                Ok(met.then(|| {
+                    let token = Token::new(TokenType::Identifier, key, Position::new(0, 0, 0));
+                    Expression::Identifier(Identifier {
+                        quoted: true,
+                        ..Identifier::new(token, key.to_string())
+                    })
+                }))
             })
-            .collect()
+        };
+        let mut sets = Vec::with_capacity(stmt.update_columns.len());
+        for (column, value) in stmt.update_columns.iter().zip(&stmt.update_expressions) {
+            if let Some(at) = written_column(schema, &column.value_lower)? {
+                sets.push((at, spell(value)?));
+            }
+        }
+        let where_ = stmt.update_where.as_deref().map(spell).transpose()?;
+        Ok((sets, where_))
     }
 
     /// The upsert writing each program of `compiled_updates` into its column,
@@ -3518,6 +3623,7 @@ impl Executor {
         schema: &crate::core::Schema,
         compiled_updates: Vec<(usize, DataType, u16, super::expression::SharedProgram)>,
         compiled_where: Option<super::expression::SharedProgram>,
+        widens: bool,
     ) -> Result<CompiledUpsert> {
         // The CHECK constraints reading an updated column, shared immutably:
         // the VM that runs them lives in the setter closure
@@ -3528,6 +3634,7 @@ impl Executor {
             compiled_updates,
             compiled_where,
             compiled_checks,
+            widens,
         })
     }
 
@@ -3536,7 +3643,8 @@ impl Executor {
     /// in update expressions (PostgreSQL-style).
     /// `conflict_column` is the unique constraint column(s) that caused the conflict (comma-separated).
     /// Used to build WHERE clause when the table has no primary key.
-    /// When `capture_row` is true, returns the post-update row for RETURNING clauses.
+    /// When `capture_row` is true, returns the post-update row for RETURNING clauses,
+    /// its row id past its columns when `returns_id`.
     #[allow(clippy::too_many_arguments)]
     fn apply_on_duplicate_update(
         &self,
@@ -3548,7 +3656,7 @@ impl Executor {
         stmt: &InsertStatement,
         insert_plan: &mut InsertPlan<'_>,
         ctx: &ExecutionContext,
-        capture_row: bool,
+        (capture_row, returns_id): (bool, bool),
         conflict: Option<&ConflictRun<'_, '_>>,
     ) -> Result<(bool, Option<Row>)> {
         // Build a WHERE clause to find the specific row
@@ -3619,7 +3727,11 @@ impl Executor {
         let conflict = conflict.map(|conflict| conflict.runner);
 
         // Create a setter function that applies the ON DUPLICATE KEY UPDATE
-        let mut setter = |mut row: Row| -> Result<(Row, bool)> {
+        let mut setter = |id: i64, row: Row| -> Result<(Row, bool)> {
+            let mut row = match effective.widens {
+                true => super::prepared_select::widened(row, id),
+                false => row,
+            };
             if let Some(joined) = joined.as_mut() {
                 #[cfg(feature = "test-failpoints")]
                 crate::test_failpoints::prepared_dml_site_ran(
@@ -3640,6 +3752,9 @@ impl Executor {
                     ),
                 };
                 if !vm.execute_bool_checked(program, &exec_ctx)? {
+                    if effective.widens {
+                        row.pop();
+                    }
                     return Ok((row, false));
                 }
             }
@@ -3692,9 +3807,15 @@ impl Executor {
                 }
             }
 
-            // Capture post-update row for RETURNING
+            // The row written has the table's columns; one RETURNING reads has its id too
+            if effective.widens {
+                row.pop();
+            }
             if capture_row {
-                captured_row = Some(row.clone());
+                captured_row = Some(match returns_id {
+                    true => super::prepared_select::widened(row.clone(), id),
+                    false => row.clone(),
+                });
             }
 
             Ok((row, changed))
@@ -3911,7 +4032,7 @@ impl Executor {
         let programs = match held {
             Some(held) => held,
             None => {
-                compiled = returning_programs(returning, column_names);
+                compiled = returning_programs(returning, column_names, None);
                 &compiled[..]
             }
         };

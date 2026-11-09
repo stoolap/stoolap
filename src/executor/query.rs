@@ -33,7 +33,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::common::{CompactArc, CompactVec, StringMap};
 use crate::core::predicate::{kind, KeySide};
-use crate::core::{DataType, Error, Result, Row, RowVec, Schema, Value, ValueSet};
+use crate::core::{DataType, Error, Result, Row, RowVec, Schema, Value, ValueSet, ROWID_SLOT};
 use crate::optimizer::ExpressionSimplifier;
 use crate::parser::ast::*;
 use crate::parser::token::{Position, Token, TokenType};
@@ -812,14 +812,14 @@ fn natural_join_condition(
 #[derive(Clone, Copy)]
 pub(crate) enum SplitSide<'a> {
     Source(Option<&'a str>, Option<&'a Schema>),
-    Joined(&'a [(Option<SmartString>, CompactArc<Schema>)]),
+    Joined(&'a [super::prepared_join::SideLeaf]),
 }
 
 impl<'a> SplitSide<'a> {
     /// `side` as the blocks read it, `alias` its name when it is one source
     pub(crate) fn of(alias: Option<&'a str>, side: &'a JoinSide) -> Self {
         match side.leaves.as_slice() {
-            [(_, schema)] => SplitSide::Source(alias, Some(schema)),
+            [(_, schema, _)] => SplitSide::Source(alias, Some(schema)),
             leaves => SplitSide::Joined(leaves),
         }
     }
@@ -857,7 +857,7 @@ impl<'a> SplitSide<'a> {
         match self {
             SplitSide::Source(alias, _) => alias.is_some_and(names),
             SplitSide::Joined(leaves) => {
-                (leaves.iter()).any(|(name, _)| name.as_deref().is_some_and(names))
+                (leaves.iter()).any(|(name, _, _)| name.as_deref().is_some_and(names))
             }
         }
     }
@@ -867,7 +867,7 @@ impl<'a> SplitSide<'a> {
     fn has_column(&self, name: &str) -> Option<bool> {
         match self {
             SplitSide::Source(_, schema) => schema.map(|s| s.has_column(name)),
-            SplitSide::Joined(leaves) => Some(leaves.iter().any(|(_, s)| s.has_column(name))),
+            SplitSide::Joined(leaves) => Some(leaves.iter().any(|(_, s, _)| s.has_column(name))),
         }
     }
 
@@ -1605,18 +1605,26 @@ impl Executor {
             let ctx = snapshot.as_ref().unwrap_or(ctx);
             return self.run_over_cut_ctes(stmt, with, compiled, ctx, |ctes| {
                 let ctx = ctx.with_cte_data(ctes.data());
-                self.select_rows_with_plan(stmt, &ctx, reads_blocks, plan_classification, compiled)
+                let at = (reads_blocks, false);
+                self.select_rows_with_plan(stmt, &ctx, at, plan_classification, compiled)
             });
         }
-        self.select_rows_with_plan(stmt, ctx, reads_blocks, plan_classification, compiled)
+        self.select_rows_with_plan(
+            stmt,
+            ctx,
+            (reads_blocks, false),
+            plan_classification,
+            compiled,
+        )
     }
 
-    /// `select_with_plan` past its CTEs, which `ctx` holds
+    /// `select_with_plan` past its CTEs, which `ctx` holds; `spelled` when
+    /// `stmt` is its entry's spelling of the statement
     fn select_rows_with_plan(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
-        reads_blocks: bool,
+        (reads_blocks, spelled): (bool, bool),
         plan_classification: Option<&std::sync::OnceLock<Arc<QueryClassification>>>,
         compiled: Option<&NestedPlan>,
     ) -> Result<Box<dyn QueryResult>> {
@@ -1637,6 +1645,17 @@ impl Executor {
             Some(slot) => slot.get_or_init(|| get_classification(stmt)).clone(),
             None => get_classification(stmt),
         };
+        // Every path reads a rowid as the column it is, spelled once here
+        if classification.names_rowid && !spelled {
+            if let Some(spelled) = self.rowids_spelled(stmt, ctx)? {
+                debug_assert!(
+                    self.rowids_spelled(&spelled, ctx)
+                        .is_ok_and(|again| again.is_none()),
+                    "a statement's rowid spelled twice"
+                );
+                return self.select_rows_with_plan(&spelled, ctx, (false, true), None, compiled);
+            }
+        }
 
         // A statement of the prepared family runs on that path and no other,
         // and so does one over a single source with a plan slot to keep
@@ -1651,7 +1670,7 @@ impl Executor {
                         stmt,
                         slot,
                         plan_classification,
-                        Some(ctx),
+                        (Some(ctx), true),
                         |_| (),
                         &mut error,
                     );
@@ -3462,7 +3481,7 @@ impl Executor {
                 let schema = self.base_table_side_schema(expr, CteNames::Context(ctx))?;
                 let name = get_table_alias_from_expr(expr).map(SmartString::from);
                 Some(JoinSide {
-                    leaves: smallvec::smallvec![(name, schema)],
+                    leaves: smallvec::smallvec![(name, schema, false)],
                     rows: true,
                 })
             }
@@ -3477,7 +3496,7 @@ impl Executor {
                     None => (self.join_side_schema(expr, ctx, runs).ok()?, true),
                 };
                 Some(JoinSide {
-                    leaves: smallvec::smallvec![(name, schema)],
+                    leaves: smallvec::smallvec![(name, schema, !rows)],
                     rows,
                 })
             }
@@ -3707,7 +3726,7 @@ impl Executor {
             let on = natural.as_ref().or(join_source.condition.as_deref());
             // A table side's scan reads only the columns the statement names
             let lower = (sides.iter().flat_map(|side| &side.leaves))
-                .flat_map(|(_, schema)| schema.columns.iter().map(|c| c.name_lower.as_str()));
+                .flat_map(|(_, schema, _)| schema.columns.iter().map(|c| c.name_lower.as_str()));
             let filters = stmt.where_clause.as_deref().into_iter().chain(on);
             let needed = needed_columns(stmt, filters, lower);
             let opened = cross.map(|cross| {
@@ -6687,7 +6706,7 @@ impl Executor {
         let layout = match held.classification.has_window_functions {
             true => layout,
             false => {
-                let names = table.schema().column_names_arc();
+                let names = held.read_names(table.schema());
                 let alias = table_source.alias.as_ref().map_or(name, |a| &a.value_lower);
                 Self::shared_result_layout(&held.stmt, &names, Some(alias), &columns)
             }
@@ -8330,11 +8349,14 @@ impl Executor {
                             }
                             shown.iter().for_each(|&at| source(i, Some(at)));
                         }
+                        // A row id slot a row carries is no column a star shows
                         None => {
+                            let shown =
+                                (0..all_columns.len()).filter(|&at| all_columns[at] != ROWID_SLOT);
                             if !laid_out {
-                                names.extend(all_columns.iter().cloned());
+                                names.extend(shown.clone().map(|at| all_columns[at].clone()));
                             }
-                            (0..all_columns.len()).for_each(|idx| source(i, Some(idx)));
+                            shown.for_each(|idx| source(i, Some(idx)));
                         }
                     }
                     continue;
@@ -8346,6 +8368,9 @@ impl Executor {
                         &qs.qualifier,
                         table_alias,
                         |idx, start| {
+                            if all_columns[idx] == ROWID_SLOT {
+                                return;
+                            }
                             if !laid_out {
                                 names.push(all_columns[idx][start..].to_string());
                             }

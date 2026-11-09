@@ -1540,7 +1540,7 @@ impl SegmentedTable {
         mgr: &'m super::manifest::SegmentManager,
         ids: Option<&[i64]>,
         where_expr: Option<&dyn Expression>,
-        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
     ) -> Result<PreparedCold<'m>> {
         if !mgr.has_segments() {
             let guard = mgr.acquire_seal_read();
@@ -1730,7 +1730,7 @@ impl SegmentedTable {
         cut: &CommitCut,
         ids: &[i64],
         where_expr: Option<&dyn Expression>,
-        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
         prep: &mut ColdPrepare,
     ) -> Result<()> {
         let fallible = where_expr.is_some_and(|expr| expr.can_fail());
@@ -1782,7 +1782,7 @@ impl SegmentedTable {
         where_expr: Option<&dyn Expression>,
         comparisons: &[(&str, crate::core::Operator, &Value)],
         bloom_hashes: &[Option<u64>],
-        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
         prep: &mut ColdPrepare,
     ) -> Result<()> {
         let tombstones_arc = Arc::clone(&snap.tombstones);
@@ -1834,11 +1834,11 @@ impl SegmentedTable {
         seg_id: u64,
         row_id: i64,
         row: Row,
-        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
         prep: &mut ColdPrepare,
     ) -> Result<()> {
         let old_row = row.clone();
-        let (mut new_row, changed) = setter(row)?;
+        let (mut new_row, changed) = setter(row_id, row)?;
         if !changed {
             prep.visited.insert(row_id, seg_id);
             return Ok(());
@@ -1945,7 +1945,7 @@ impl SegmentedTable {
     fn update_admitted_by_row_ids(
         &mut self,
         row_ids: &[i64],
-        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
         let txn_id = self.txn_id();
         // The cold rows named are read, set and checked outside the fence;
@@ -4242,7 +4242,7 @@ impl Table for SegmentedTable {
     // DML — writes go to hot buffer, constraints checked against segments
     // =========================================================================
 
-    fn insert(&mut self, row: Row) -> Result<Row> {
+    fn insert_with_id(&mut self, row: Row) -> Result<(i64, Row)> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::statement_admitted();
@@ -4253,7 +4253,7 @@ impl Table for SegmentedTable {
                 self.check_segment_constraints_with_snapshot(snapshot, loads, &row, None)
             },
         )?;
-        let result = self.hot.insert(row)?;
+        let result = self.hot.insert_with_id(row)?;
         // Checked at this generation, trivially when no volume exists yet
         self.segment_mgr.record_txn_seal_generation(self.txn_id());
         Ok(result)
@@ -4307,7 +4307,7 @@ impl Table for SegmentedTable {
         &mut self,
         access: ScanAccess<'_>,
         where_expr: Option<&dyn Expression>,
-        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         #[cfg(feature = "test-failpoints")]
@@ -4362,7 +4362,7 @@ impl Table for SegmentedTable {
     fn update_by_row_ids(
         &mut self,
         row_ids: &[i64],
-        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         #[cfg(feature = "test-failpoints")]
@@ -8673,10 +8673,10 @@ mod tests {
         fn drop_column(&mut self, _: &str) -> Result<()> {
             Ok(())
         }
-        fn insert(&mut self, row: Row) -> Result<Row> {
+        fn insert_with_id(&mut self, row: Row) -> Result<(i64, Row)> {
             let id = self.rows.len() as i64 + 1000;
             self.rows.push((id, row.clone()));
-            Ok(row)
+            Ok((id, row))
         }
         fn insert_batch(&mut self, rows: Vec<Row>) -> Result<()> {
             for row in rows {
@@ -8688,14 +8688,14 @@ mod tests {
             &mut self,
             _: ScanAccess<'_>,
             _: Option<&dyn Expression>,
-            _: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+            _: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
         ) -> Result<i32> {
             Ok(0)
         }
         fn update_by_row_ids(
             &mut self,
             _: &[i64],
-            _: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+            _: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
         ) -> Result<i32> {
             Ok(0)
         }

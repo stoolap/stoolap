@@ -187,7 +187,7 @@ fn a_seal_landing_while_a_row_is_prepared_runs_the_setter_once() {
     let other = db.clone();
     let mut calls = 0;
     let mut returned = Vec::new();
-    let mut setter = |mut row: stoolap::core::Row| {
+    let mut setter = |_: i64, mut row: stoolap::core::Row| {
         calls += 1;
         returned.push(bump(&mut row));
         if calls == 1 {
@@ -214,7 +214,7 @@ fn a_row_another_transaction_changed_while_prepared_is_a_write_conflict() {
     let mut table = txn.get_table("t").unwrap();
     let other = db.clone();
     let mut calls = 0;
-    let mut setter = |mut row: stoolap::core::Row| {
+    let mut setter = |_: i64, mut row: stoolap::core::Row| {
         calls += 1;
         bump(&mut row);
         if calls == 1 {
@@ -245,7 +245,7 @@ fn a_prepared_row_sealed_again_by_another_transaction_is_a_write_conflict() {
     let mut table = txn.get_table("t").unwrap();
     let other = db.clone();
     let mut calls = 0;
-    let mut setter = |mut row: stoolap::core::Row| {
+    let mut setter = |_: i64, mut row: stoolap::core::Row| {
         calls += 1;
         bump(&mut row);
         if calls == 1 {
@@ -281,7 +281,7 @@ fn a_prepared_row_sealed_again_outside_the_filter_is_a_write_conflict() {
     filter.prepare_for_schema(table.schema());
     let other = db.clone();
     let mut calls = 0;
-    let mut setter = |mut row: stoolap::core::Row| {
+    let mut setter = |_: i64, mut row: stoolap::core::Row| {
         calls += 1;
         bump(&mut row);
         if calls == 1 {
@@ -323,7 +323,7 @@ fn a_compaction_moving_a_prepared_row_is_no_conflict() {
     let mut table = txn.get_table("t").unwrap();
     let other = db.clone();
     let mut calls = 0;
-    let mut setter = |mut row: stoolap::core::Row| {
+    let mut setter = |_: i64, mut row: stoolap::core::Row| {
         calls += 1;
         bump(&mut row);
         if calls == 1 {
@@ -354,7 +354,7 @@ fn a_prepared_row_another_transaction_holds_fails_before_any_hot_write() {
     let mut holder = db.engine().begin_transaction().unwrap();
     let mut held = holder.get_table("t").unwrap();
     assert_eq!(
-        held.update_by_row_ids(&[1], &mut |mut row| {
+        held.update_by_row_ids(&[1], &mut |_, mut row| {
             bump(&mut row);
             Ok((row, true))
         })
@@ -364,7 +364,7 @@ fn a_prepared_row_another_transaction_holds_fails_before_any_hot_write() {
     let mut txn = db.engine().begin_transaction().unwrap();
     let mut table = txn.get_table("t").unwrap();
     let mut calls = 0;
-    let mut setter = |mut row: stoolap::core::Row| {
+    let mut setter = |_: i64, mut row: stoolap::core::Row| {
         calls += 1;
         bump(&mut row);
         Ok((row, true))
@@ -400,7 +400,7 @@ fn a_prepared_key_another_row_took_while_a_seal_landed_is_refused() {
     let mut table = txn.get_table("t").unwrap();
     let other = db.clone();
     let mut calls = 0;
-    let mut setter = |mut row: stoolap::core::Row| {
+    let mut setter = |_: i64, mut row: stoolap::core::Row| {
         calls += 1;
         row.set(1, stoolap::core::Value::Integer(99)).unwrap();
         if calls == 1 {
@@ -431,7 +431,7 @@ fn a_row_the_setter_left_unchanged_is_not_set_again_hot() {
     let mut table = txn.get_table("t").unwrap();
     let other = db.clone();
     let mut calls = 0;
-    let mut setter = |row: stoolap::core::Row| {
+    let mut setter = |_: i64, row: stoolap::core::Row| {
         calls += 1;
         if calls == 1 {
             // The row moves to the hot store before the fence
@@ -463,7 +463,7 @@ fn a_changed_row_lands_while_an_unchanged_one_went_hot() {
     let mut table = txn.get_table("t").unwrap();
     let other = db.clone();
     let mut seen = Vec::new();
-    let mut setter = |mut row: stoolap::core::Row| {
+    let mut setter = |_: i64, mut row: stoolap::core::Row| {
         let id = row.get(0).and_then(|v| v.as_int64()).unwrap();
         seen.push(id);
         match id {
@@ -509,7 +509,7 @@ fn a_named_row_left_unchanged_that_went_hot_across_a_seal_is_not_set_again() {
     let mut table = txn.get_table("t").unwrap();
     let other = db.clone();
     let mut calls = Vec::new();
-    let mut setter = |mut row: stoolap::core::Row| {
+    let mut setter = |_: i64, mut row: stoolap::core::Row| {
         let id = row.get(0).and_then(|v| v.as_int64()).unwrap();
         calls.push(id);
         if id == 3 {
@@ -552,7 +552,7 @@ fn a_failed_storage_update_lets_go_of_the_claims_it_took() {
         .unwrap();
     let mut txn = db.engine().begin_transaction().unwrap();
     let mut table = txn.get_table("t").unwrap();
-    let mut set = |mut row: stoolap::core::Row| {
+    let mut set = |_: i64, mut row: stoolap::core::Row| {
         bump(&mut row);
         Ok((row, true))
     };
@@ -592,7 +592,7 @@ fn a_keyless_row_left_unchanged_that_went_hot_is_not_set_again() {
     let mut table = txn.get_table("k").unwrap();
     let other = db.clone();
     let mut seen = Vec::new();
-    let mut setter = |row: stoolap::core::Row| {
+    let mut setter = |_: i64, row: stoolap::core::Row| {
         let a = row.get(0).and_then(|v| v.as_int64()).unwrap();
         if a == 1 && !seen.contains(&1) {
             // The row moves to the hot store under a row id of its own
@@ -629,7 +629,7 @@ fn a_refused_statement_keeps_an_earlier_hot_claim_and_takes_no_new_one() {
         .unwrap();
     let mut txn = db.engine().begin_transaction().unwrap();
     let mut table = txn.get_table("t").unwrap();
-    let mut set = |mut row: stoolap::core::Row| {
+    let mut set = |_: i64, mut row: stoolap::core::Row| {
         bump(&mut row);
         Ok((row, true))
     };
@@ -689,11 +689,11 @@ fn a_cold_row_another_handle_wrote_from_the_setter_leaves_no_part_of_the_stateme
     let updated = updater.update(
         stoolap::storage::traits::ScanAccess::Seq,
         None,
-        &mut |mut row| {
+        &mut |_, mut row| {
             let id = row.get(0).and_then(|v| v.as_int64()).unwrap();
             calls.push(id);
             if id == 3 {
-                let mut set = |mut row: stoolap::core::Row| {
+                let mut set = |_: i64, mut row: stoolap::core::Row| {
                     row.set(1, stoolap::core::Value::Integer(5)).unwrap();
                     Ok((row, true))
                 };
@@ -735,7 +735,7 @@ fn a_keyless_cold_update_refuses_a_null_or_a_wrong_type_when_it_runs() {
     let null = table.update(
         stoolap::storage::traits::ScanAccess::Seq,
         None,
-        &mut |mut row| {
+        &mut |_, mut row| {
             row.set(0, stoolap::core::Value::null_unknown()).unwrap();
             Ok((row, true))
         },
@@ -743,7 +743,7 @@ fn a_keyless_cold_update_refuses_a_null_or_a_wrong_type_when_it_runs() {
     let text = table.update(
         stoolap::storage::traits::ScanAccess::Seq,
         None,
-        &mut |mut row| {
+        &mut |_, mut row| {
             row.set(1, stoolap::core::Value::text("not a number"))
                 .unwrap();
             Ok((row, true))
@@ -775,7 +775,7 @@ fn a_keyless_cold_update_meets_a_hot_unique_key_when_it_runs() {
     let updated = table.update(
         stoolap::storage::traits::ScanAccess::Seq,
         None,
-        &mut |mut row| {
+        &mut |_, mut row| {
             let a = row.get(0).and_then(|v| v.as_int64()).unwrap();
             if a == 1 {
                 row.set(0, stoolap::core::Value::Integer(2)).unwrap();
@@ -829,7 +829,7 @@ fn a_hot_row_another_transaction_holds_leaves_no_part_of_the_statement() {
     let updated = table.update(
         stoolap::storage::traits::ScanAccess::Seq,
         None,
-        &mut |mut row| {
+        &mut |_, mut row| {
             bump(&mut row);
             Ok((row, true))
         },
@@ -861,7 +861,7 @@ fn a_hot_setter_error_lets_go_of_the_cold_claims() {
     let updated = table.update(
         stoolap::storage::traits::ScanAccess::Seq,
         None,
-        &mut |mut row| {
+        &mut |_, mut row| {
             if row.get(0).and_then(|v| v.as_int64()) == Some(2) {
                 return Err(stoolap::core::Error::internal("refused by the setter"));
             }
@@ -899,9 +899,9 @@ fn a_hot_row_another_handle_wrote_from_the_setter_leaves_no_part_of_the_statemen
     let updated = updater.update(
         stoolap::storage::traits::ScanAccess::Seq,
         None,
-        &mut |mut row| {
+        &mut |_, mut row| {
             if row.get(0).and_then(|v| v.as_int64()) == Some(2) {
-                let mut set = |mut row: stoolap::core::Row| {
+                let mut set = |_: i64, mut row: stoolap::core::Row| {
                     row.set(1, stoolap::core::Value::Integer(5)).unwrap();
                     Ok((row, true))
                 };
@@ -943,7 +943,7 @@ fn rows_of_one_statement_cannot_take_one_unique_key() {
     db.execute("INSERT INTO t VALUES (3, 3)", ()).unwrap();
     let mut txn = db.engine().begin_transaction().unwrap();
     let mut table = txn.get_table("t").unwrap();
-    let mut to_five = |mut row: stoolap::core::Row| {
+    let mut to_five = |_: i64, mut row: stoolap::core::Row| {
         row.set(1, stoolap::core::Value::Integer(5)).unwrap();
         Ok((row, true))
     };
@@ -993,7 +993,7 @@ fn a_new_sealed_row_is_checked_with_the_key_it_is_published_with() {
     let mut txn = db.engine().begin_transaction().unwrap();
     let mut table = txn.get_table("t").unwrap();
     // Text the publish turns into the JSON row 1 holds
-    let updated = table.update_by_row_ids(&[2], &mut |mut row| {
+    let updated = table.update_by_row_ids(&[2], &mut |_, mut row| {
         row.set(1, Value::text("bad")).unwrap();
         Ok((row, true))
     });

@@ -30,7 +30,7 @@ use crate::storage::traits::{Engine, QueryResult};
 
 use super::context::ExecutionContext;
 use super::expression::{ExecuteContext, ExprVM};
-use super::prepared_select::{first_branch_of, prepared_branch, PreparedSelect};
+use super::prepared_select::{first_branch_of, prepared_branch, KeyReadPath, PreparedSelect};
 use super::query_cache::{check_compiled_token, or_normal_path, CompiledExecution};
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::ExecutorResult;
@@ -52,17 +52,18 @@ impl Executor {
         ctx: Option<&ExecutionContext>,
         run: impl FnOnce(&PreparedSelect) -> R,
     ) -> Option<R> {
-        self.with_planned_or_error(stmt, compiled, classification, ctx, run, &mut None)
+        self.with_planned_or_error(stmt, compiled, classification, (ctx, false), run, &mut None)
     }
 
     /// [`Self::with_planned`], keeping in `error` the error planning gives
-    /// a statement that names what its table does not have
+    /// a statement that names what its table does not have; `spelled` when
+    /// `stmt` has passed its entry's rowid spelling
     pub(crate) fn with_planned_or_error<R>(
         &self,
         stmt: &SelectStatement,
         compiled: &RwLock<CompiledExecution>,
         classification: Option<&OnceLock<Arc<QueryClassification>>>,
-        ctx: Option<&ExecutionContext>,
+        (ctx, spelled): (Option<&ExecutionContext>, bool),
         run: impl FnOnce(&PreparedSelect) -> R,
         error: &mut Option<Error>,
     ) -> Option<R> {
@@ -95,7 +96,7 @@ impl Executor {
             crate::test_failpoints::compiled_epoch_checked();
             return Some(run(&p));
         }
-        let planned = match self.plan_into(stmt, compiled, classification, ctx?, epoch) {
+        let planned = match self.plan_into(stmt, compiled, classification, (ctx?, spelled), epoch) {
             Ok(planned) => planned?,
             Err(e) => {
                 *error = Some(e);
@@ -116,13 +117,17 @@ impl Executor {
         stmt: &SelectStatement,
         compiled: &RwLock<CompiledExecution>,
         classification: Option<&OnceLock<Arc<QueryClassification>>>,
-        ctx: &ExecutionContext,
+        (ctx, spelled): (&ExecutionContext, bool),
         epoch: u64,
     ) -> Result<Option<Arc<PreparedSelect>>> {
         let shape = match classification {
             Some(slot) => Arc::clone(slot.get_or_init(|| get_classification(stmt))),
             None => get_classification(stmt),
         };
+        // A rowid is spelled by the statement's own run, which plans that
+        if shape.names_rowid && !spelled {
+            return Ok(None);
+        }
         // A statement that aggregates its rows; one whose row the table
         // keeps whole is answered from there before its run
         let aggregating = PreparedSelect::aggregates(stmt);
@@ -183,7 +188,7 @@ impl Executor {
             self,
             ctx,
             &branch,
-            &schema,
+            (&schema, true),
             scope,
             param_count,
             epoch,
@@ -361,7 +366,7 @@ impl Executor {
             // and no statement's view: those read the plan's rows
             if let Some(quiet) = &planned.quiet {
                 let ctx = ctx.filter(|ctx| !in_txn && ctx.statement_view().is_none())?;
-                return self.run_quiet_aggregate(stmt, quiet, ctx);
+                return self.run_quiet_aggregate(quiet, ctx);
             }
             if let Some(ctx) = ctx {
                 // In a transaction the normal path arms a timeout; every
@@ -435,6 +440,10 @@ impl Executor {
                 .fetch_unique_row(plan, params, in_txn, view)
                 .transpose()?,
         };
+        match unique {
+            false => KeyReadPath::PkGet.taken(),
+            true => KeyReadPath::UniqueGet.taken(),
+        }
         or_normal_path(rows.and_then(|rows| self.read_planned(plan, rows, params, transaction)))
     }
 

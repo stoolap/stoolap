@@ -89,12 +89,33 @@ pub(crate) fn check(stmt: &Statement) -> Check {
     }
 }
 
+/// An error when `alias` takes the name of the row's identity
+fn check_alias(alias: &Identifier) -> Check {
+    crate::core::check_column_name(&alias.value).map_err(|error| ScopeError {
+        message: error.to_string(),
+        position: alias.position,
+    })
+}
+
+/// An error when an alias of `items`, a SELECT list or a RETURNING, takes
+/// the name of the row's identity
+fn check_item_aliases(items: &[Expression]) -> Check {
+    for item in items {
+        if let Expression::Aliased(aliased) = item {
+            check_alias(&aliased.alias)?;
+        }
+    }
+    Ok(())
+}
+
 fn check_select<'a>(select: &'a SelectStatement, outer: Option<&Scope<'a, '_>>) -> Check {
     if let Some(with) = &select.with {
         for cte in &with.ctes {
+            cte.column_names.iter().try_for_each(check_alias)?;
             check_select(&cte.query, outer)?;
         }
     }
+    check_item_aliases(&select.columns)?;
     let mut own = Scope::under(outer);
     if let Some(from) = &select.table_expr {
         from_names(from, &mut own);
@@ -139,23 +160,9 @@ fn check_select<'a>(select: &'a SelectStatement, outer: Option<&Scope<'a, '_>>) 
         });
     }
     let level: SmallVec<[&str; 4]> = own.map_or_else(SmallVec::new, |own| own.visible.clone());
-    if let Some(key) = distinct_key_outside(select, &level) {
-        let otherwise = match crate::executor::utils::expression_contains_aggregate(key) {
-            true => String::from(
-                "an aggregate is one value per distinct row once every GROUP BY item is \
-                 selected",
-            ),
-            false => format!(
-                "to sort by something else, group the rows and sort by an aggregate of it, \
-                 such as MAX({key})"
-            ),
-        };
+    if let Some(key) = distinct_key_outside(select, &level, &|_| true) {
         return Err(ScopeError {
-            message: format!(
-                "ORDER BY {key} is not in the SELECT DISTINCT list: rows merged into one \
-                 distinct row may hold different values of it. Sort by a selected item, its \
-                 alias or position, or an expression of selected columns; {otherwise}"
-            ),
+            message: distinct_key_message(key),
             position: key.position(),
         });
     }
@@ -193,10 +200,46 @@ pub(crate) fn order_position_message(position: i64) -> String {
     format!("ORDER BY position {position} is not in the select list")
 }
 
+/// The refusal of an ORDER BY `key` outside the SELECT DISTINCT list
+pub(crate) fn distinct_key_message(key: &Expression) -> String {
+    let otherwise = match crate::executor::utils::expression_contains_aggregate(key) {
+        true => String::from(
+            "an aggregate is one value per distinct row once every GROUP BY item is selected",
+        ),
+        false => format!(
+            "to sort by something else, group the rows and sort by an aggregate of it, \
+             such as MAX({key})"
+        ),
+    };
+    format!(
+        "ORDER BY {key} is not in the SELECT DISTINCT list: rows merged into one \
+         distinct row may hold different values of it. Sort by a selected item, its \
+         alias or position, or an expression of selected columns; {otherwise}"
+    )
+}
+
+/// [`distinct_key_outside`] over `select`'s own FROM entries, once its
+/// sources are known: `star_shows` says whether a star shows a rowid
+pub(crate) fn distinct_key_unshown<'s>(
+    select: &'s SelectStatement,
+    star_shows: &dyn Fn(&Expression) -> bool,
+) -> Option<&'s Expression> {
+    let mut own = Scope::under(None);
+    if let Some(from) = &select.table_expr {
+        from_names(from, &mut own);
+    }
+    distinct_key_outside(select, &own.visible, star_shows)
+}
+
 /// Under SELECT DISTINCT, the first ORDER BY key the SELECT items do not
 /// determine: one distinct row stands for several rows, which such a key
-/// may tell apart. `level` holds the names this query's FROM entries show
-fn distinct_key_outside<'s>(select: &'s SelectStatement, level: &[&str]) -> Option<&'s Expression> {
+/// may tell apart. `level` holds the names this query's FROM entries show;
+/// a star shows a rowid when `star_shows` says so
+fn distinct_key_outside<'s>(
+    select: &'s SelectStatement,
+    level: &[&str],
+    star_shows: &dyn Fn(&Expression) -> bool,
+) -> Option<&'s Expression> {
     if !select.distinct || !select.distinct_on.is_empty() || !select.set_operations.is_empty() {
         return None;
     }
@@ -216,7 +259,7 @@ fn distinct_key_outside<'s>(select: &'s SelectStatement, level: &[&str]) -> Opti
         .order_by
         .iter()
         .map(|order| &order.expression)
-        .find(|key| !determined(key, &select.columns, level))
+        .find(|key| !determined(key, &select.columns, level, star_shows))
 }
 
 /// Whether GROUP BY `key` is a SELECT item itself: its position, or its
@@ -239,7 +282,12 @@ fn groups_by_an_item(key: &Expression, items: &[Expression], level: &[&str]) -> 
 /// Whether ORDER BY `key` has one value across the rows a distinct row of
 /// `items` stands for: a position in the list or an alias, an item's own
 /// expression, or a scalar expression of columns the items determine
-fn determined(key: &Expression, items: &[Expression], level: &[&str]) -> bool {
+fn determined(
+    key: &Expression,
+    items: &[Expression],
+    level: &[&str],
+    star_shows: &dyn Fn(&Expression) -> bool,
+) -> bool {
     let star = items
         .iter()
         .any(|item| matches!(item, Expression::Star(_) | Expression::QualifiedStar(_)));
@@ -261,7 +309,7 @@ fn determined(key: &Expression, items: &[Expression], level: &[&str]) -> bool {
         .iter()
         .any(|item| same_value(key, unaliased(item), level))
         || scalar_of(key, &mut |column| {
-            column_determined(column, items.iter().map(unaliased), level)
+            column_determined(column, items.iter().map(unaliased), level, star_shows)
         })
 }
 
@@ -280,11 +328,20 @@ fn column_determined<'i>(
     column: &Expression,
     items: impl Iterator<Item = &'i Expression>,
     level: &[&str],
+    star_shows: &dyn Fn(&Expression) -> bool,
 ) -> bool {
     let outer = matches!(column, Expression::QualifiedIdentifier(c)
         if !level.contains(&c.qualifier.value_lower.as_str()));
+    let hidden = match column {
+        Expression::Identifier(c) => !c.quoted && crate::core::is_rowid_name(&c.value_lower),
+        Expression::QualifiedIdentifier(c) => {
+            !c.name.quoted && crate::core::is_rowid_name(&c.name.value_lower)
+        }
+        _ => false,
+    } && !star_shows(column);
     outer
         || items.into_iter().any(|item| match item {
+            Expression::Star(_) | Expression::QualifiedStar(_) if hidden => false,
             Expression::Star(_) => true,
             // A bare name is the starred table's when it is the one FROM entry
             Expression::QualifiedStar(star) => match column {
@@ -452,6 +509,7 @@ fn check_source<'a>(
             check_select(&s.subquery, Some(&Scope::beside(query, outer)))
         }
         Expression::ValuesSource(v) => {
+            v.column_aliases.iter().try_for_each(check_alias)?;
             let beside = Scope::beside(query, outer);
             for expr in v.rows.iter().flatten() {
                 check_expr(expr, Some(&beside))?;
@@ -459,6 +517,7 @@ fn check_source<'a>(
             Ok(())
         }
         Expression::FunctionTableSource(f) => {
+            f.column_aliases.iter().try_for_each(check_alias)?;
             let beside = Scope::beside(query, outer);
             for expr in &f.arguments {
                 check_expr(expr, Some(&beside))?;
@@ -490,6 +549,7 @@ fn check_insert(insert: &InsertStatement) -> Check {
     let mut returning = Scope::under(None);
     returning.visible.push(&insert.table_name.value_lower);
     returning.hidden.push("excluded");
+    check_item_aliases(&insert.returning)?;
     for expr in &insert.returning {
         check_expr(expr, Some(&returning))?;
     }
@@ -505,6 +565,7 @@ fn check_update(update: &UpdateStatement) -> Check {
         check_expr(expr, target)?;
     }
     check_opt(update.where_clause.as_deref(), target)?;
+    check_item_aliases(&update.returning)?;
     for expr in &update.returning {
         check_expr(expr, target)?;
     }
@@ -523,6 +584,7 @@ fn check_delete(delete: &DeleteStatement) -> Check {
     }
     let target = Some(&target);
     check_opt(delete.where_clause.as_deref(), target)?;
+    check_item_aliases(&delete.returning)?;
     for expr in &delete.returning {
         check_expr(expr, target)?;
     }
@@ -531,6 +593,7 @@ fn check_delete(delete: &DeleteStatement) -> Check {
 
 fn check_with(with: Option<&WithClause>) -> Check {
     for cte in with.iter().flat_map(|w| &w.ctes) {
+        cte.column_names.iter().try_for_each(check_alias)?;
         check_select(&cte.query, None)?;
     }
     Ok(())

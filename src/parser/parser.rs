@@ -350,6 +350,15 @@ impl<'a> Parser<'a> {
     pub(crate) fn next_token(&mut self) {
         let next = next_significant_token(&mut self.lexer, &mut self.errors);
         self.cur_token = std::mem::replace(&mut self.peek_token, next);
+        // The row identity's name is checked where the statement names it
+        if self.cur_token.token_type == TokenType::Identifier
+            && self
+                .cur_token
+                .literal
+                .eq_ignore_ascii_case(crate::core::ROWID_NAME)
+        {
+            self.scope_checked = true;
+        }
     }
 
     /// Check if the current token is of the given type

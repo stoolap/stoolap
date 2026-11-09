@@ -368,7 +368,8 @@ mod written_by_the_filter {
             filter.prepare_for_schema(first.schema());
             let plan = first.index_plan(filter.as_ref());
             let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-            let updated = first.update(access, Some(filter.as_ref()), &mut |row| Ok((row, true)));
+            let updated =
+                first.update(access, Some(filter.as_ref()), &mut |_, row| Ok((row, true)));
             let _ = done.send(updated.map_err(|e| e.to_string()));
         });
         finished

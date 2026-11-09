@@ -167,16 +167,20 @@ impl<K, T: ?Sized> Shelf<K, T> {
 /// is itself a join; and whether the side is read as rows
 #[derive(Debug, Clone)]
 pub(crate) struct JoinSide {
-    /// Each table's name, None for a source without one, and its columns
-    pub(crate) leaves: SmallVec<[(Option<SmartString>, CompactArc<Schema>); 1]>,
+    pub(crate) leaves: SmallVec<[SideLeaf; 1]>,
     pub(crate) rows: bool,
 }
+
+/// A table of a join side: its name, None for a source without one, its
+/// columns, and whether it is a stored table read as it is now, whose key a
+/// rowid reads
+pub(crate) type SideLeaf = (Option<SmartString>, CompactArc<Schema>, bool);
 
 impl JoinSide {
     /// The side's columns when it is one table, not a join
     pub(crate) fn schema(&self) -> Option<&Schema> {
         match self.leaves.as_slice() {
-            [(_, schema)] => Some(schema),
+            [(_, schema, _)] => Some(schema),
             _ => None,
         }
     }
@@ -184,7 +188,7 @@ impl JoinSide {
     /// Each column as a reference spells it: its table's name, None for a
     /// source without one, and its own
     pub(crate) fn columns(&self) -> impl Iterator<Item = (Option<&str>, &str)> {
-        self.leaves.iter().flat_map(|(name, schema)| {
+        self.leaves.iter().flat_map(|(name, schema, _)| {
             schema
                 .columns
                 .iter()

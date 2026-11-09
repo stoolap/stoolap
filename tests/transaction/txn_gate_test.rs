@@ -83,8 +83,8 @@ fn row(values: &[i64]) -> Row {
     )
 }
 
-fn set(column: usize, value: i64) -> impl FnMut(Row) -> stoolap::Result<(Row, bool)> {
-    move |mut row| {
+fn set(column: usize, value: i64) -> impl FnMut(i64, Row) -> stoolap::Result<(Row, bool)> {
+    move |_, mut row| {
         row.set(column, Value::Integer(value))?;
         Ok((row, true))
     }
@@ -380,7 +380,7 @@ fn a_waiting_commit_holds_no_lock_a_running_statement_needs() {
     let (hook, paused) = pause();
     let writer = thread::spawn(move || {
         after_statement_admitted(hook);
-        handle.update_by_row_ids(&[1], &mut |mut row| {
+        handle.update_by_row_ids(&[1], &mut |_, mut row| {
             other.insert(self::row(&[9]))?;
             row.set(1, Value::Integer(5))?;
             Ok((row, true))
@@ -567,7 +567,7 @@ fn a_row_written_while_the_rollback_waits_is_cleaned_up() {
     let (hook, paused) = pause();
     let writer = thread::spawn(move || {
         after_statement_admitted(hook);
-        let written = handle.update_by_row_ids(&[1], &mut |mut row| {
+        let written = handle.update_by_row_ids(&[1], &mut |_, mut row| {
             other.insert(self::row(&[9]))?;
             row.set(1, Value::Integer(5))?;
             Ok((row, true))
@@ -596,7 +596,7 @@ fn a_transaction_cannot_finish_inside_its_own_statement() {
         txn.create_savepoint("s").unwrap();
         let mut handle = txn.get_table("t").unwrap();
         let mut refused = Vec::new();
-        let written = handle.update_by_row_ids(&[1], &mut |mut row| {
+        let written = handle.update_by_row_ids(&[1], &mut |_, mut row| {
             refused.push(txn.commit());
             refused.push(txn.rollback());
             refused.push(txn.rollback_to_savepoint("s"));
@@ -675,7 +675,7 @@ fn a_transaction_dropped_inside_its_own_statement_cleans_up_when_it_ends() {
         let txn = db.engine().begin_transaction().unwrap();
         let mut kept = txn.get_table("t").unwrap();
         let mut owner = Some(txn);
-        let written = kept.update_by_row_ids(&[1], &mut |mut row| {
+        let written = kept.update_by_row_ids(&[1], &mut |_, mut row| {
             drop(owner.take());
             row.set(1, Value::Integer(5))?;
             Ok((row, true))
@@ -760,7 +760,7 @@ fn a_statement_of_one_engine_may_finish_a_transaction_of_another_with_the_same_i
         let mut handle = txn_a.get_table("t").unwrap();
         let mut finished = None;
         handle
-            .update_by_row_ids(&[1], &mut |mut row| {
+            .update_by_row_ids(&[1], &mut |_, mut row| {
                 finished = Some(txn_b.commit());
                 row.set(1, Value::Integer(5))?;
                 Ok((row, true))
@@ -843,7 +843,7 @@ fn a_chain_of_nine_transactions_nested_on_one_thread_works() {
                 return Ok(());
             };
             first
-                .update_by_row_ids(&[1], &mut |mut row| {
+                .update_by_row_ids(&[1], &mut |_, mut row| {
                     nest(rest)?;
                     row.set(1, Value::Integer(5))?;
                     Ok((row, true))
@@ -901,7 +901,7 @@ fn a_statement_is_admitted_once_whatever_its_layers_rows_and_claims() {
     assert_eq!(counted, (1, 1), "a cold update claiming each row");
     let mut other = txn.get_table("t").unwrap();
     let counted = measure(&mut || {
-        cold.update_by_row_ids(&[1], &mut |mut row| {
+        cold.update_by_row_ids(&[1], &mut |_, mut row| {
             other.insert(self::row(&[5000, 9]))?;
             row.set(1, Value::Integer(7))?;
             Ok((row, true))

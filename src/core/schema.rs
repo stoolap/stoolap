@@ -603,6 +603,22 @@ impl Schema {
         })
     }
 
+    /// The column `_rowid_` reads: the integer primary key, the row's
+    /// identity; None for a table without one
+    pub fn rowid_column(&self) -> Option<usize> {
+        self.pk_column_index()
+    }
+
+    /// An error naming the table when a column takes the name of the row's
+    /// identity, as only a schema an older build kept can
+    pub fn check_column_names(&self) -> Result<()> {
+        for col in &self.columns {
+            check_column_name(&col.name)
+                .map_err(|e| Error::invalid_argument(format!("table {}: {e}", self.table_name)))?;
+        }
+        Ok(())
+    }
+
     /// Validate column count matches expected value
     pub fn validate_column_count(&self, expected: usize) -> Result<()> {
         if self.columns.len() != expected {
@@ -870,6 +886,31 @@ impl Schema {
 impl Default for Schema {
     fn default() -> Self {
         Self::new("", Vec::new())
+    }
+}
+
+/// The name a table without a primary key has its row id read under, a
+/// column past its own that no statement can spell
+pub const ROWID_SLOT: &str = "\u{0}rowid";
+
+/// The name the row's identity is read under, which no column and no alias
+/// may take
+pub const ROWID_NAME: &str = "_rowid_";
+
+/// Whether `name_lower` spells the row's identity
+pub fn is_rowid_name(name_lower: &str) -> bool {
+    name_lower == ROWID_NAME
+}
+
+/// An error unless `name` may name a column or an alias: the row's identity
+/// and the slot it is read from are no column's name
+pub fn check_column_name(name: &str) -> Result<()> {
+    match name.eq_ignore_ascii_case(ROWID_NAME) || name.eq_ignore_ascii_case(ROWID_SLOT) {
+        true => Err(Error::invalid_argument(format!(
+            "{} is the row's identity and names no column or alias",
+            name.escape_debug()
+        ))),
+        false => Ok(()),
     }
 }
 

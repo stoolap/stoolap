@@ -420,6 +420,7 @@ pub(crate) fn check_stored_schema(schema: &Schema) -> Result<()> {
     use super::persistence::serialize_value;
     for col in &schema.columns {
         check_stored_name(&col.name, "a column name")?;
+        crate::core::check_column_name(&col.name)?;
         if let Some(default) = &col.default_expr {
             check_stored(default.len(), || {
                 format!("the DEFAULT of column {}", col.name)
@@ -1368,6 +1369,16 @@ impl MVCCEngine {
                 // Neither snapshots nor WAL persist the cached default_value, so old rows
                 // read via normalize_row_to_schema would get NULL instead of the column default.
                 self.populate_schema_defaults();
+
+                // A column an older build let take the row identity's name
+                // opens no database
+                {
+                    let schemas = (self.schemas.read())
+                        .map_err(|_| Error::internal("schemas lock poisoned"))?;
+                    for schema in schemas.values() {
+                        schema.check_column_names()?;
+                    }
+                }
 
                 // A volume an older build left holding a column in another
                 // type than the schema's is rewritten before any mapping
@@ -6021,7 +6032,11 @@ impl MVCCEngine {
         // before the destructive step. Without this, a corrupt .vol would fail after
         // WAL/volumes are already deleted, causing total data loss.
         for (table_name, path) in &snapshot_files {
-            if let Err(e) = super::snapshot::SnapshotReader::open(path) {
+            // A schema an older build kept with the row identity's name is
+            // refused here, before anything is removed
+            let checked = super::snapshot::SnapshotReader::open(path)
+                .and_then(|reader| reader.schema().check_column_names());
+            if let Err(e) = checked {
                 self.registry.start_accepting_transactions();
                 return Err(Error::internal(format!(
                     "Snapshot validation failed for table {}: {}",

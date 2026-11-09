@@ -822,11 +822,13 @@ impl Identifier {
             }
         } else {
             let value_lower = value.to_lowercase();
+            // Quoting does not change the name of the row identity
+            let quoted = token.quoted && !crate::core::is_rowid_name(&value_lower);
             Self {
                 value,
                 value_lower,
                 position: token.position,
-                quoted: token.quoted,
+                quoted,
             }
         }
     }

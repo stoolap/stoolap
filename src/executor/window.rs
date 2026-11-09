@@ -39,6 +39,7 @@ use std::sync::{Arc, OnceLock};
 use crate::common::{CompactVec, SmartString, StringMap};
 use crate::core::row_vec::RowVec;
 use crate::core::value::NULL_VALUE;
+use crate::core::ROWID_SLOT;
 
 /// Stack constant for COUNT(*) accumulation by reference
 const COUNT_ONE: Value = Value::Integer(1);
@@ -2487,8 +2488,9 @@ impl Executor {
                     }
                 }
                 Expression::Star(_) => {
-                    // SELECT * - include all base columns
-                    for (idx, col) in base_columns.iter().take(visible_columns).enumerate() {
+                    // SELECT * - include all base columns but a row id slot
+                    let columns = base_columns.iter().take(visible_columns).enumerate();
+                    for (idx, col) in columns.filter(|(_, col)| *col != ROWID_SLOT) {
                         items.push(SelectItem {
                             output_name: col.clone(),
                             source: SelectItemSource::BaseColumn(idx),
@@ -2506,10 +2508,12 @@ impl Executor {
                         &qs.qualifier,
                         table_alias.as_deref(),
                         |idx, start| {
-                            items.push(SelectItem {
-                                output_name: visible[idx][start..].to_string(),
-                                source: SelectItemSource::BaseColumn(idx),
-                            })
+                            if visible[idx] != ROWID_SLOT {
+                                items.push(SelectItem {
+                                    output_name: visible[idx][start..].to_string(),
+                                    source: SelectItemSource::BaseColumn(idx),
+                                })
+                            }
                         },
                     );
                 }

@@ -343,7 +343,7 @@ fn a_failed_commit_releases_its_rows_while_table_handles_are_held() {
     let mut a = tx.get_table("a").unwrap();
     let mut b = tx.get_table("b").unwrap();
     for table in [&mut a, &mut b] {
-        let mut set = |row: stoolap::core::Row| {
+        let mut set = |_: i64, row: stoolap::core::Row| {
             let mut row = row;
             row.set(1, stoolap::core::Value::Integer(999)).unwrap();
             Ok((row, true))

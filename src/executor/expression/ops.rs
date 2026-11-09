@@ -54,6 +54,11 @@ pub enum Op {
     /// Stack: [] -> [value]
     LoadColumn2(u16),
 
+    /// Load the row id a widened row carries at its index; an error when
+    /// the row was not widened
+    /// Stack: [] -> [value]
+    LoadRowId(u16),
+
     /// Load constant value (pre-cloned at compile time)
     /// Stack: [] -> [value]
     LoadConst(Value),
@@ -883,6 +888,7 @@ impl std::fmt::Debug for Op {
         match self {
             Op::LoadColumn(idx) => write!(f, "LoadColumn({})", idx),
             Op::LoadColumn2(idx) => write!(f, "LoadColumn2({})", idx),
+            Op::LoadRowId(idx) => write!(f, "LoadRowId({})", idx),
             Op::LoadConst(v) => write!(f, "LoadConst({:?})", v),
             Op::LoadParam(idx) => write!(f, "LoadParam({})", idx),
             Op::LoadNull(dt) => write!(f, "LoadNull({:?})", dt),

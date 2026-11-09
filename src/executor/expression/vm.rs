@@ -663,6 +663,16 @@ impl ExprVM {
                     pc += 1;
                 }
 
+                Op::LoadRowId(idx) => {
+                    let Some(value) = ctx.row.get(*idx as usize) else {
+                        return Err(crate::core::Error::internal(
+                            "a row read without its row id",
+                        ));
+                    };
+                    stack.push_ref(value);
+                    pc += 1;
+                }
+
                 Op::LoadConst(value) => {
                     stack.push_ref(value);
                     pc += 1;

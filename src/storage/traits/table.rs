@@ -320,7 +320,13 @@ pub trait Table: Send + Sync {
     ///
     /// # Returns
     /// The inserted row (with AUTO_INCREMENT values applied)
-    fn insert(&mut self, row: Row) -> Result<Row>;
+    fn insert(&mut self, row: Row) -> Result<Row> {
+        self.insert_with_id(row).map(|(_, row)| row)
+    }
+
+    /// Inserts a single row, returning the row id it was given with the row
+    /// as inserted
+    fn insert_with_id(&mut self, row: Row) -> Result<(i64, Row)>;
 
     /// Inserts a single row without returning it (avoids clone overhead)
     ///
@@ -347,7 +353,8 @@ pub trait Table: Send + Sync {
     /// # Arguments
     /// * `access` - How the rows are found, decided by the caller
     /// * `where_expr` - Expression to filter rows to update (None means all rows)
-    /// * `setter` - Function that transforms a row in place, returns true if changed
+    /// * `setter` - Function that transforms a row, given with its row id,
+    ///   returns true if changed
     ///
     /// # Returns
     /// The number of rows updated
@@ -355,7 +362,7 @@ pub trait Table: Send + Sync {
         &mut self,
         access: ScanAccess<'_>,
         where_expr: Option<&dyn Expression>,
-        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
     ) -> Result<i32>;
 
     /// Updates rows by their row IDs directly (O(k) lookup instead of O(n) scan).
@@ -365,14 +372,15 @@ pub trait Table: Send + Sync {
     ///
     /// # Arguments
     /// * `row_ids` - The row IDs to update (should be sorted for cache locality)
-    /// * `setter` - Function that transforms a row in place, returns true if changed
+    /// * `setter` - Function that transforms a row, given with its row id,
+    ///   returns true if changed
     ///
     /// # Returns
     /// The number of rows updated
     fn update_by_row_ids(
         &mut self,
         row_ids: &[i64],
-        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
     ) -> Result<i32>;
 
     /// Runs the setter on the rows `update` sets, except the ids in `skip`,
@@ -381,7 +389,7 @@ pub trait Table: Send + Sync {
         &mut self,
         _access: ScanAccess<'_>,
         _where_expr: Option<&dyn Expression>,
-        _setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        _setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
         _skip: Option<&FxHashMap<i64, u64>>,
         _plan: &mut PlannedUpdate,
     ) -> Result<()> {
@@ -393,7 +401,7 @@ pub trait Table: Send + Sync {
     fn plan_update_by_row_ids(
         &mut self,
         _row_ids: &[i64],
-        _setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        _setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
         _plan: &mut PlannedUpdate,
     ) -> Result<()> {
         Err(Error::NotSupported("plan_update_by_row_ids".to_string()))
