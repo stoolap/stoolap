@@ -2624,18 +2624,6 @@ impl Executor {
                 FxHashMap::default()
             };
 
-        // The referenced columns whose cascade reaches a child's primary key
-        let key_cascades: Vec<(usize, &[(String, crate::core::ForeignKeyConstraint)])> =
-            fks_by_ref_col
-                .iter()
-                .filter(|(_, fks)| super::foreign_key::reaches_key_cascade(&self.engine, fks))
-                .map(|(&col, fks)| (col, fks.as_slice()))
-                .collect();
-        // Each such column's values whose change the cascade refuses, read
-        // here, before any fence: the setter refuses a row that changes one
-        let mut key_refusals: FxHashMap<usize, FxHashMap<Value, crate::core::Error>> =
-            FxHashMap::default();
-
         // Pre-check RESTRICT constraints and CASCADE depth BEFORE writing parent rows.
         // Only scan rows if the FK tree actually has RESTRICT or exceeds depth limits.
         // Pure CASCADE/SET NULL trees within depth limits skip this scan entirely.
@@ -2643,7 +2631,7 @@ impl Executor {
             let any_needs_precheck = fks_by_ref_col
                 .values()
                 .any(|fks| super::foreign_key::fk_tree_needs_precheck(&self.engine, fks));
-            if any_needs_precheck || !key_cascades.is_empty() {
+            if any_needs_precheck {
                 let parent_rows = match dml_run.as_ref().filter(|_| where_prepared) {
                     Some(run) => {
                         let mut rows = RowVec::new();
@@ -2662,9 +2650,7 @@ impl Executor {
                             continue;
                         }
                     }
-                    for (&col_idx, fks_for_col) in
-                        fks_by_ref_col.iter().filter(|_| any_needs_precheck)
-                    {
+                    for (&col_idx, fks_for_col) in &fks_by_ref_col {
                         if let Some(old_val) = row.get(col_idx) {
                             if !old_val.is_null() {
                                 super::foreign_key::pre_check_restrict_for_update(
@@ -2675,23 +2661,6 @@ impl Executor {
                                     fks_for_col,
                                 )?;
                             }
-                        }
-                    }
-                    for &(col_idx, fks) in &key_cascades {
-                        let Some(old_val) = row.get(col_idx).filter(|v| !v.is_null()) else {
-                            continue;
-                        };
-                        let refusals = key_refusals.entry(col_idx).or_default();
-                        if refusals.contains_key(old_val) {
-                            continue;
-                        }
-                        if let Some(refusal) = super::foreign_key::key_cascade_refusal(
-                            &self.engine,
-                            table.txn_id(),
-                            old_val,
-                            fks,
-                        )? {
-                            refusals.insert(old_val.clone(), refusal);
                         }
                     }
                 }
@@ -2893,12 +2862,6 @@ impl Executor {
                     for (ci, old_val) in &ref_old_values {
                         if let Some(new_val) = row.get(*ci) {
                             if old_val != new_val {
-                                // Read before the fence: no I/O under it
-                                if let Some(refusal) =
-                                    key_refusals.get(ci).and_then(|values| values.get(old_val))
-                                {
-                                    return Err(refusal.clone());
-                                }
                                 ref_col_changes.borrow_mut().push((
                                     *ci,
                                     old_val.clone(),

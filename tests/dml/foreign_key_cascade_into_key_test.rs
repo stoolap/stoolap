@@ -58,7 +58,7 @@ fn refused(db: &Database, sql: &str) {
 }
 
 #[test]
-fn a_cascade_that_would_change_a_child_key_is_refused_before_any_write() {
+fn a_cascade_that_would_change_a_child_key_is_refused_and_leaves_nothing_written() {
     each_layout("refused", |db| {
         refused(db, "UPDATE p SET u = 40 WHERE id = 1");
         refused(db, "UPDATE p SET u = u + 100");
@@ -100,6 +100,63 @@ fn an_update_that_leaves_a_named_value_as_it_is_goes_through() {
     });
 }
 
+static TICKS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+/// The counter is process-wide: the tests that read it take turns
+static TICK_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 1 on its first call, then 2, 3 and on; registered as answering anew per call
+#[derive(Default)]
+struct KeyCascadeTick;
+
+impl stoolap::functions::ScalarFunction for KeyCascadeTick {
+    fn name(&self) -> &str {
+        "KEY_CASCADE_TICK"
+    }
+    fn info(&self) -> stoolap::functions::FunctionInfo {
+        use stoolap::functions::{FunctionDataType, FunctionInfo, FunctionSignature, FunctionType};
+        FunctionInfo::new(
+            "KEY_CASCADE_TICK",
+            FunctionType::Scalar,
+            "test counter",
+            FunctionSignature::new(FunctionDataType::Integer, vec![], 0, 0),
+        )
+        .non_deterministic()
+    }
+    fn evaluate(
+        &self,
+        _args: &[stoolap::core::Value],
+    ) -> stoolap::core::Result<stoolap::core::Value> {
+        let tick = TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        Ok(stoolap::core::Value::Integer(tick))
+    }
+    fn clone_box(&self) -> Box<dyn stoolap::functions::ScalarFunction> {
+        Box::new(KeyCascadeTick)
+    }
+}
+
+#[test]
+fn an_update_over_a_key_cascade_asks_its_where_once_per_row() {
+    stoolap::functions::global_registry()
+        .register_scalar::<KeyCascadeTick>()
+        .unwrap();
+    let db = Database::open("memory://fk_cascade_into_key_where_once").unwrap();
+    for sql in [
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, u INTEGER UNIQUE)",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY REFERENCES p(u) ON UPDATE CASCADE)",
+        "INSERT INTO p VALUES (1, 10)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let _ticks = TICK_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    TICKS.store(0, std::sync::atomic::Ordering::Relaxed);
+    let updated = db
+        .execute("UPDATE p SET u = 11 WHERE KEY_CASCADE_TICK() = 1", ())
+        .unwrap();
+    assert_eq!(updated, 1, "the row the WHERE chose is the row written");
+    assert_eq!(rows(&db, "SELECT u FROM p"), [[11]]);
+    assert_eq!(TICKS.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
 #[test]
 fn a_parent_value_no_child_names_is_updated() {
     each_layout("unreferenced", |db| {
@@ -124,7 +181,7 @@ fn a_refused_cascade_leaves_an_open_transaction_as_it_was() {
 }
 
 #[test]
-fn a_cascade_reaching_a_grandchild_key_is_refused_before_any_write() {
+fn a_cascade_reaching_a_grandchild_key_is_refused_and_leaves_nothing_written() {
     let db = Database::open("memory://fk_cascade_into_key_grandchild").unwrap();
     for sql in [
         "CREATE TABLE g (id INTEGER PRIMARY KEY, a INTEGER UNIQUE)",
