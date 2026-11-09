@@ -2340,6 +2340,12 @@ impl Executor {
             let ctes = stmt.with.iter().flat_map(|with| &with.ctes);
             ctes.into_iter().find(|cte| cte.name.value_lower == name)
         };
+        // Whether a source's output columns hold a `_rowid_`; unknown ones may
+        let holds = |names: Result<Vec<String>>| {
+            names.map_or(true, |names| {
+                names.iter().any(|c| c.eq_ignore_ascii_case(ROWID_NAME))
+            })
+        };
         // Each entry's name and its table's schema; None for an entry that
         // reads no stored table's rows, which `others` says may still hold
         // a `_rowid_` a bare one would read
@@ -2352,10 +2358,11 @@ impl Executor {
                     None
                 }
                 Expression::TableSource(ts) => match cte(&ts.name.value_lower) {
-                    Some(cte) => {
-                        others |= names_rowid(&cte.query);
+                    Some(cte) if cte.column_names.is_empty() => {
+                        others |= holds(self.statement_names(&cte.query, ctx));
                         None
                     }
+                    Some(_) => None,
                     None => match self.named(ctx, &ts.name.value_lower)? {
                         Named::Table => self
                             .engine
@@ -2371,14 +2378,14 @@ impl Executor {
                             others |= columns.iter().any(|c| c.eq_ignore_ascii_case(ROWID_NAME));
                             None
                         }
-                        Named::View(_) => {
-                            others = true;
+                        Named::View(view) => {
+                            others |= holds(view_names(self, &view, ctx, false));
                             None
                         }
                     },
                 },
                 Expression::SubquerySource(derived) => {
-                    others |= names_rowid(&derived.subquery);
+                    others |= holds(self.statement_names(&derived.subquery, ctx));
                     None
                 }
                 Expression::ValuesSource(_) | Expression::FunctionTableSource(_) => None,
@@ -2395,19 +2402,24 @@ impl Executor {
             (Some(entry), None) if !others => Some(entry),
             _ => None,
         };
+        // The stored entry whose identity a rowid reads
+        let stored_entry = |expr: &Expression| match expr {
+            Expression::QualifiedIdentifier(q) => entries
+                .iter()
+                .flatten()
+                .find(|(name, _)| *name == q.qualifier.value_lower),
+            Expression::Identifier(_) => lone,
+            _ => None,
+        };
+        // No star shows a stored table's identity
+        let shown = |rowid: &Expression| stored_entry(rowid).is_none();
+        if let Some(key) = crate::parser::scope::distinct_key_unshown(stmt, &shown) {
+            return Err(Error::invalid_argument(
+                crate::parser::scope::distinct_key_message(key),
+            ));
+        }
         let mut spelled = |expr: &Expression| -> Result<Option<Expression>> {
-            let entry = match expr {
-                Expression::QualifiedIdentifier(q) => entries
-                    .iter()
-                    .flatten()
-                    .find(|(name, _)| *name == q.qualifier.value_lower),
-                Expression::Identifier(_) => match lone {
-                    Some(entry) => Some(entry),
-                    None => return Ok(None),
-                },
-                _ => return Ok(None),
-            };
-            let Some((name, schema)) = entry else {
+            let Some((name, schema)) = stored_entry(expr) else {
                 return Ok(None);
             };
             let column = match schema.rowid_column() {

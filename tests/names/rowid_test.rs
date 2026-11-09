@@ -738,7 +738,12 @@ fn a_join_reads_a_keyed_side_rowid_and_refuses_a_keyless_one() {
 #[test]
 fn a_bare_rowid_counts_a_derived_table_column_with_the_tables_beside_it() {
     each_layout("derived", |db| {
+        db.execute("CREATE VIEW v AS SELECT _rowid_ FROM n", ())
+            .unwrap();
         for sql in [
+            "SELECT _rowid_ FROM k CROSS JOIN (SELECT * FROM v) d",
+            "SELECT _rowid_ FROM k CROSS JOIN v",
+            "SELECT SUM(_rowid_) FROM k CROSS JOIN (SELECT * FROM (SELECT _rowid_ FROM n) e) d",
             "SELECT _rowid_ FROM k CROSS JOIN (SELECT _rowid_ FROM n) d",
             "SELECT (SELECT _rowid_) FROM k CROSS JOIN (SELECT _rowid_ FROM n) d",
             "WITH c AS (SELECT _rowid_ FROM n) SELECT _rowid_ FROM k CROSS JOIN c",
@@ -749,6 +754,8 @@ fn a_bare_rowid_counts_a_derived_table_column_with_the_tables_beside_it() {
         for sql in [
             "SELECT SUM(_rowid_) FROM k CROSS JOIN (VALUES (7)) v (x)",
             "SELECT SUM(_rowid_) / 3 FROM k CROSS JOIN (SELECT a FROM n) d",
+            "SELECT SUM(_rowid_) / 3 FROM k CROSS JOIN (SELECT _rowid_ AS r FROM n) d",
+            "WITH c (x) AS (SELECT _rowid_ FROM n) SELECT SUM(_rowid_) / 3 FROM k CROSS JOIN c",
         ] {
             assert_eq!(rows(db, sql), [[int(60)]], "{sql}");
         }
@@ -887,9 +894,22 @@ fn distinct_matches_an_order_by_rowid_to_the_list_as_written() {
         for sql in [
             "SELECT DISTINCT id FROM k ORDER BY _rowid_",
             "SELECT DISTINCT * FROM n ORDER BY _rowid_",
+            "SELECT DISTINCT * FROM k ORDER BY _rowid_",
             "SELECT DISTINCT n.* FROM n ORDER BY n._rowid_",
+            "SELECT DISTINCT k.* FROM k CROSS JOIN (SELECT _rowid_ FROM n) d ORDER BY k._rowid_",
+            "SELECT * FROM (SELECT DISTINCT * FROM n ORDER BY _rowid_) d",
         ] {
             assert!(error(db, sql).contains("SELECT DISTINCT list"), "{sql}");
+        }
+        db.execute("CREATE VIEW kv AS SELECT _rowid_ FROM k", ())
+            .unwrap();
+        for sql in [
+            "SELECT DISTINCT * FROM (SELECT _rowid_ FROM k) d ORDER BY _rowid_ DESC",
+            "SELECT DISTINCT d.* FROM (SELECT _rowid_ FROM k) d ORDER BY d._rowid_ DESC",
+            "WITH c AS (SELECT _rowid_ FROM k) SELECT DISTINCT * FROM c ORDER BY _rowid_ DESC",
+            "SELECT DISTINCT * FROM kv ORDER BY _rowid_ DESC",
+        ] {
+            assert_eq!(rows(db, sql), [[int(30)], [int(20)], [int(10)]], "{sql}");
         }
     });
 }
