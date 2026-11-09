@@ -411,6 +411,7 @@ thread_local! {
     static GC_ROWS_REMOVED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static COLUMN_CHANGE_WAITING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static CHECKPOINT_CUT_TAKEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static CHECKPOINT_MANAGERS_TAKEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static RETYPE_OUTPUTS_WRITTEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static RETYPE_MANIFEST_WRITTEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static ANALYZE_ROWS_COLLECTED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
@@ -639,6 +640,16 @@ pub(crate) fn checkpoint_cut_taken() {
     if let Some(hook) = hook {
         hook();
     }
+}
+
+/// Run once on this thread when its next checkpoint took the managers whose
+/// manifests it persists, before it writes any of them
+pub fn after_checkpoint_managers_taken(hook: impl FnOnce() + 'static) {
+    CHECKPOINT_MANAGERS_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn checkpoint_managers_taken() {
+    run_hook(&CHECKPOINT_MANAGERS_TAKEN_HOOK);
 }
 
 /// Run once on this thread when its next column type change wrote the
@@ -3548,6 +3559,7 @@ pub fn reset_all() {
     GC_ROWS_REMOVED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLUMN_CHANGE_WAITING_HOOK.with(|slot| *slot.borrow_mut() = None);
     CHECKPOINT_CUT_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
+    CHECKPOINT_MANAGERS_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     RETYPE_OUTPUTS_WRITTEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     RETYPE_MANIFEST_WRITTEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     ANALYZE_ROWS_COLLECTED_HOOK.with(|slot| *slot.borrow_mut() = None);

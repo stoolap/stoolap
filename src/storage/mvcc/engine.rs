@@ -62,6 +62,47 @@ pub use retype::ColumnTypeChange;
 /// The operation byte of an ALTER TABLE ... MODIFY COLUMN record
 const ALTER_MODIFY_COLUMN: u8 = 4;
 
+/// The operation byte of an ALTER TABLE ... RENAME TO record
+const ALTER_RENAME_TABLE: u8 = 5;
+
+/// The new name a RENAME TO record gives its table: the record holds the
+/// operation byte, then the old name and the new one, each after its length
+fn renamed_to(data: &[u8]) -> Option<String> {
+    let old_len = u16::from_le_bytes(data.get(1..3)?.try_into().ok()?) as usize;
+    let at = 3 + old_len;
+    let new_len = u16::from_le_bytes(data.get(at..at + 2)?.try_into().ok()?) as usize;
+    let new = data.get(at + 2..at + 2 + new_len)?;
+    String::from_utf8(new.to_vec()).ok()
+}
+
+/// What a replay settles once the whole log is read
+#[derive(Default)]
+struct ReplayLog {
+    /// Each table the log dropped, with the manager the open had loaded
+    dropped: Vec<(
+        String,
+        Arc<crate::storage::volume::manifest::SegmentManager>,
+    )>,
+    /// Each rename that did not apply, by LSN, old name and new name, until
+    /// a later catalog record of the new name restates the table
+    failed_renames: Vec<(u64, String, String, Error)>,
+}
+
+impl ReplayLog {
+    /// A catalog record or a drop of `table_name` settles every rename that
+    /// led to it and failed only because the log had not yet named its table
+    fn settle_renames_to(&mut self, table_name: &str) {
+        let mut renamed = table_name.to_string();
+        while let Some(at) = self
+            .failed_renames
+            .iter()
+            .rposition(|(_, _, new, e)| *new == renamed && matches!(e, Error::TableNotFound(_)))
+        {
+            renamed = self.failed_renames.remove(at).1;
+        }
+    }
+}
+
 /// The change a column DDL makes to a table's history, checked against its
 /// volumes before it is recorded
 pub(crate) enum ColumnEvent<'a> {
@@ -1059,6 +1100,26 @@ fn get_or_create_segment_manager(
         .clone()
 }
 
+/// Removes a dropped table's files once its emptied manifest is durable:
+/// its volumes retire, then its manifest goes, then its directory if
+/// nothing a reader still holds is left in it
+fn remove_dropped_table_files(
+    persistence: &Option<PersistenceManager>,
+    table_name: &str,
+    mgr: Option<&crate::storage::volume::manifest::SegmentManager>,
+) -> Result<()> {
+    let Some(pm) = persistence.as_ref().filter(|pm| pm.is_enabled()) else {
+        return Ok(());
+    };
+    let vol_dir = pm.path().join("volumes");
+    let _ = crate::storage::volume::io::delete_all_volumes(&vol_dir, table_name);
+    if let Some(mgr) = mgr {
+        mgr.retire()?;
+    }
+    let _ = std::fs::remove_dir(vol_dir.join(table_name));
+    Ok(())
+}
+
 /// The manager a column change of `table_name` moves: created when the
 /// engine persists, so a seal starting later carries the change
 fn column_change_manager(
@@ -2041,10 +2102,29 @@ impl MVCCEngine {
 
         // Use two-phase recovery for crash consistency
         // This ensures uncommitted transactions are NOT applied after a crash
-        let result = pm.replay_two_phase(from_lsn, |entry| self.apply_wal_entry(entry));
+        let mut log = ReplayLog::default();
+        let result = pm.replay_two_phase(from_lsn, |entry| self.apply_wal_entry(entry, &mut log));
 
         match result {
             Ok(info) => {
+                if let Some((lsn, old, new, e)) = log.failed_renames.into_iter().next() {
+                    return Err(Error::internal(format!(
+                        "cannot replay the rename of table '{}' to '{}' at LSN {}: {} \
+                         (the files are kept as they are)",
+                        old, new, lsn, e
+                    )));
+                }
+                // A table the log dropped and nothing named again leaves no files
+                for (name, mgr) in &log.dropped {
+                    if !self.schemas.read().unwrap().contains_key(name) {
+                        if let Err(e) =
+                            remove_dropped_table_files(&self.persistence, name, Some(mgr))
+                        {
+                            eprintln!("Warning: Failed to remove dropped table '{}': {}", name, e);
+                        }
+                    }
+                }
+
                 if info.skipped_entries > 0 {
                     eprintln!(
                         "Recovery: {} entries skipped (from aborted/uncommitted transactions)",
@@ -2288,7 +2368,11 @@ impl MVCCEngine {
     }
 
     /// Apply a single WAL entry during recovery
-    fn apply_wal_entry(&self, entry: crate::storage::mvcc::wal_manager::WALEntry) -> Result<()> {
+    fn apply_wal_entry(
+        &self,
+        entry: crate::storage::mvcc::wal_manager::WALEntry,
+        log: &mut ReplayLog,
+    ) -> Result<()> {
         use crate::storage::mvcc::persistence::{deserialize_row_version, IndexMetadata};
         use crate::storage::mvcc::wal_manager::WALOperationType;
 
@@ -2307,6 +2391,7 @@ impl MVCCEngine {
                     register_pk_index(&schema, &version_store);
 
                     let table_name = schema.table_name_lower.clone();
+                    log.settle_renames_to(&table_name);
 
                     {
                         let mut schemas = self.schemas.write().unwrap();
@@ -2320,6 +2405,7 @@ impl MVCCEngine {
             }
             WALOperationType::DropTable => {
                 let table_name = entry.table_name.to_lowercase();
+                log.settle_renames_to(&table_name);
 
                 // Remove schema, strip FK references from child tables, and remove version store.
                 // Must strip FK references before removing schema, same as drop_table_internal.
@@ -2335,13 +2421,13 @@ impl MVCCEngine {
                         store.close();
                     }
                 }
-                // Clear segments for dropped table
-                {
-                    let mut mgrs = self.segment_managers.write().unwrap();
-                    if let Some(mgr) = mgrs.get(&table_name) {
-                        mgr.clear();
+                // The segments are set aside: a later rename to this name
+                // takes them back, else they go once the log is read
+                if let Some(mgr) = self.segment_managers.write().unwrap().remove(&table_name) {
+                    // A name the open gave moved files leaves them to their own
+                    if mgr.table_name().as_str() == table_name {
+                        log.dropped.push((table_name, mgr));
                     }
-                    mgrs.remove(&table_name);
                 }
             }
             WALOperationType::CreateIndex => {
@@ -2495,6 +2581,16 @@ impl MVCCEngine {
                 // Their changes should not be visible
             }
             WALOperationType::AlterTable => {
+                // A rename to a name the log dropped before it found the
+                // directory free: the files under that name are its own
+                if entry.data.first() == Some(&ALTER_RENAME_TABLE) {
+                    let new = renamed_to(&entry.data).unwrap_or_default().to_lowercase();
+                    if let Some(at) = log.dropped.iter().position(|(name, _)| *name == new) {
+                        let (_, mgr) = log.dropped.swap_remove(at);
+                        let mut mgrs = self.segment_managers.write().unwrap();
+                        mgrs.entry(new).or_insert(mgr);
+                    }
+                }
                 // Schema modification - replay the ALTER TABLE operation
                 if let Err(e) = self.replay_alter_table(&entry.data, entry.lsn) {
                     // A type change left half applied holds rows of two types
@@ -2503,6 +2599,12 @@ impl MVCCEngine {
                             "cannot replay a column type change at LSN {}: {}",
                             entry.lsn, e
                         )));
+                    }
+                    if entry.data.first() == Some(&ALTER_RENAME_TABLE) {
+                        let new = renamed_to(&entry.data).unwrap_or_default().to_lowercase();
+                        let old = entry.table_name.to_lowercase();
+                        log.failed_renames.push((entry.lsn, old, new, e));
+                        return Ok(());
                     }
                     eprintln!("Warning: Failed to replay ALTER TABLE: {}", e);
                 }
@@ -3299,28 +3401,10 @@ impl MVCCEngine {
                     vector_dimensions,
                 )?;
             }
-            5 => {
-                // RenameTable - special handling since table name changes
-                // The table_name read above is actually old_table_name for RenameTable
-                // because we re-serialized in that format
-
-                // Read new table name
-                if pos + 2 > data.len() {
-                    return Err(Error::internal(
-                        "invalid RenameTable data: missing new name length",
-                    ));
-                }
-                let new_name_len =
-                    u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
-                pos += 2;
-
-                if pos + new_name_len > data.len() {
-                    return Err(Error::internal(
-                        "invalid RenameTable data: missing new name",
-                    ));
-                }
-                let new_table_name = String::from_utf8(data[pos..pos + new_name_len].to_vec())
-                    .map_err(|e| Error::internal(format!("invalid new table name: {}", e)))?;
+            ALTER_RENAME_TABLE => {
+                // The table_name read above is the old name
+                let new_table_name = renamed_to(data)
+                    .ok_or_else(|| Error::internal("invalid RenameTable data: missing new name"))?;
 
                 // Apply the RENAME TABLE using engine method
                 self.rename_table(&table_name, &new_table_name)?;
@@ -3663,18 +3747,12 @@ impl MVCCEngine {
             .unwrap()
             .get(&table_name)
             .cloned();
-        if let Some(mgr) = mgr {
+        if let Some(mgr) = &mgr {
             mgr.clear();
             mgr.persist()?;
         }
         self.segment_managers.write().unwrap().remove(&table_name);
-        // Delete volume files from disk
-        if let Some(ref pm) = *self.persistence {
-            if pm.is_enabled() {
-                let vol_dir = pm.path().join("volumes");
-                let _ = crate::storage::volume::io::delete_all_volumes(&vol_dir, &table_name);
-            }
-        }
+        remove_dropped_table_files(&self.persistence, &table_name, mgr.as_deref())?;
 
         // Increment schema epoch for cache invalidation
         neighbors.push(table_name);
@@ -4066,6 +4144,13 @@ impl MVCCEngine {
                 &vol_dir,
             ) {
                 Ok(Some(mgr)) => {
+                    // A rename moves the directory before its manifest is
+                    // written again: the directory holds the table's name,
+                    // and the log's records before the rename the written one
+                    let written = mgr.table_name();
+                    if written.as_str() != table_name {
+                        mgr.rename(&table_name);
+                    }
                     let lsn = mgr.manifest().checkpoint_lsn;
                     if lsn > 0 && lsn < min_checkpoint_lsn {
                         min_checkpoint_lsn = lsn;
@@ -4074,8 +4159,14 @@ impl MVCCEngine {
 
                     // Store the segment manager so WAL replay can use
                     // is_row_id_in_volume_range() for tombstone creation.
+                    let mgr = Arc::new(mgr);
                     let mut mgrs = self.segment_managers.write().unwrap();
-                    mgrs.insert(table_name, Arc::new(mgr));
+                    if written.as_str() != table_name {
+                        // A directory of that name keeps its own manager
+                        mgrs.entry(written.to_string())
+                            .or_insert_with(|| Arc::clone(&mgr));
+                    }
+                    mgrs.insert(table_name, mgr);
                 }
                 Ok(None) => {
                     // No manifest.bin in this directory, skip
@@ -6385,6 +6476,8 @@ impl MVCCEngine {
                 let mgrs = self.segment_managers.read().unwrap();
                 mgrs.values().cloned().collect()
             };
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::checkpoint_managers_taken();
             for mgr in &mgr_arcs {
                 if checkpoint_lsn > 0 {
                     mgr.manifest_mut().checkpoint_lsn = checkpoint_lsn;
@@ -8857,7 +8950,7 @@ impl Engine for MVCCEngine {
 
         // Serialize: operation_type(1) + old_name_len(2) + old_name + new_name_len(2) + new_name
         let mut data = Vec::new();
-        data.push(5u8); // Operation type: RenameTable = 5
+        data.push(ALTER_RENAME_TABLE);
 
         // Old table name
         data.extend_from_slice(&(old_table_name.len() as u16).to_le_bytes());
@@ -9932,7 +10025,7 @@ impl TransactionEngineOperations for EngineOperations {
             .unwrap()
             .get(&table_name_lower)
             .cloned();
-        if let Some(mgr) = mgr {
+        if let Some(mgr) = &mgr {
             mgr.clear();
             mgr.persist()?;
         }
@@ -9940,14 +10033,7 @@ impl TransactionEngineOperations for EngineOperations {
             .write()
             .unwrap()
             .remove(&table_name_lower);
-
-        // Delete volume files from disk
-        if let Some(ref pm) = *self.persistence() {
-            if pm.is_enabled() {
-                let vol_dir = pm.path().join("volumes");
-                let _ = crate::storage::volume::io::delete_all_volumes(&vol_dir, &table_name_lower);
-            }
-        }
+        remove_dropped_table_files(self.persistence(), &table_name_lower, mgr.as_deref())?;
 
         neighbors.push(table_name_lower);
         self.ddl
@@ -9963,6 +10049,31 @@ impl TransactionEngineOperations for EngineOperations {
     fn rename_table(&self, old_name: &str, new_name: &str) -> Result<()> {
         let old_name_lower = old_name.to_lowercase();
         let new_name_lower = new_name.to_lowercase();
+
+        // Files under the new name are taken over only by a replay whose
+        // open loaded them there, from a manager that holds no rows
+        let taken = {
+            let mgrs = self.segment_managers.read().unwrap();
+            let moving = mgrs.get(&old_name_lower);
+            match mgrs.get(&new_name_lower) {
+                // The open found the files moved and gave them both names
+                Some(new) if moving.is_some_and(|old| Arc::ptr_eq(old, new)) => false,
+                Some(_) => {
+                    moving.is_some_and(|mgr| mgr.has_segments())
+                        || !self.loading_from_disk.load(Ordering::Acquire)
+                }
+                None => false,
+            }
+        };
+        if taken {
+            let schemas = self.schemas().read().unwrap();
+            if schemas.contains_key(&old_name_lower) && !schemas.contains_key(&new_name_lower) {
+                return Err(Error::internal(format!(
+                    "cannot rename table '{}' to '{}': files of a table '{}' remain",
+                    old_name_lower, new_name_lower, new_name_lower
+                )));
+            }
+        }
 
         // Atomically check-and-rename under write lock to prevent TOCTOU race
         {
@@ -10005,7 +10116,7 @@ impl TransactionEngineOperations for EngineOperations {
         {
             let mut mgrs = self.segment_managers.write().unwrap();
             if let Some(mgr) = mgrs.remove(&old_name_lower) {
-                mgrs.insert(new_name_lower.clone(), mgr);
+                mgrs.entry(new_name_lower.clone()).or_insert(mgr);
             }
         }
         // The manager takes the new name with the files: a table whose
