@@ -67,7 +67,7 @@ use super::expression::{
 };
 use super::operators::index_nested_loop::{crosses_inner_key, EQUALITY_CANDIDATE_CAP};
 use super::planned_aggregate::{AggregatePlan, AggregateRead, GlobalSource};
-use super::prepared_join::{JoinSide, JoinSides};
+use super::prepared_join::{JoinSide, JoinSides, SideLeaf};
 use super::projection::{Item, Projection};
 use super::pushdown::{self, coerce_constant, read_as_column, scan_compares};
 use super::query::{
@@ -1404,6 +1404,11 @@ impl ScopeTable {
             true => CompactArc::new(lower.iter().map(|c| bare_name(c).to_string()).collect()),
             false => lower,
         };
+        // A derived table's rowid is each output column of that name
+        let rowids = (lower.iter().enumerate())
+            .filter(|(_, c)| is_rowid_name(c))
+            .map(|(at, _)| (0, Some(at)))
+            .collect();
         Self {
             tables: smallvec::smallvec![(name.into(), 0)],
             columns: schema.column_names_arc(),
@@ -1411,7 +1416,7 @@ impl ScopeTable {
             types: schema.columns.iter().map(|c| c.data_type).collect(),
             bare: schema.columns.len(),
             merged: SmallVec::new(),
-            rowids: SmallVec::new(),
+            rowids,
         }
     }
 
@@ -1695,15 +1700,21 @@ impl ScopeTable {
     }
 }
 
+/// The scope of a join side's table: a stored table's with its rowid, any
+/// other source's with its columns
+fn leaf_scope((name, schema, stored): &SideLeaf) -> ScopeTable {
+    let name = name.as_deref().map(|n| SmartString::from(n.to_lowercase()));
+    match stored {
+        true => ScopeTable::of_table(name, schema, false),
+        false => ScopeTable::of(name, schema),
+    }
+}
+
 /// The scope of each side of `join` over `sides`, its tables side by side,
 /// read by position in the joined row
 fn side_scopes(join: &JoinTableSource, sides: &JoinSides) -> Option<[ScopeTable; 2]> {
-    let table = |(name, schema): &(Option<SmartString>, CompactArc<Schema>)| {
-        let name = name.as_deref().map(|n| SmartString::from(n.to_lowercase()));
-        ScopeTable::of_table(name, schema, false)
-    };
     let side_scope = |expr: &Expression, side: &JoinSide| {
-        ScopeTable::of_side(expr, &mut side.leaves.iter().map(table))
+        ScopeTable::of_side(expr, &mut side.leaves.iter().map(leaf_scope))
     };
     Some([
         side_scope(&join.left, &sides[0])?,
@@ -2379,7 +2390,10 @@ impl Executor {
                 _ => None,
             },
             Expression::QualifiedStar(star) => (entries.iter().flatten())
-                .find(|(name, _)| name.eq_ignore_ascii_case(&star.qualifier))
+                .find(|(name, _)| {
+                    name.chars()
+                        .eq(star.qualifier.chars().flat_map(char::to_lowercase))
+                })
                 .map(|(_, schema)| schema.columns.len()),
             _ => None,
         };
@@ -2623,22 +2637,24 @@ impl Chain<'_> {
         if !id.quoted && matches!(id.value_lower.as_str(), "true" | "false") {
             return Ok(None);
         }
-        // A name is a column's whole name, dots and all, before a qualifier's
+        // A name is a column's whole name, dots and all, before a qualifier's;
+        // a rowid is each entry's, a derived table's column of that name too
+        let rowid = !id.quoted && is_rowid_name(&id.value_lower);
         for (depth, scope) in self.scopes.iter().enumerate() {
+            if rowid {
+                match scope.rowids.as_slice() {
+                    [] => continue,
+                    [(_, Some(index))] => return Ok(Some((depth, *index))),
+                    [(_, None)] => return Err(Error::ColumnNotFound(id.value.to_string())),
+                    _ => return Err(ambiguous_column(&id.value)),
+                }
+            }
             let bare = &scope.lower[..scope.bare];
             if let Some(index) = bare.iter().position(|c| *c == id.value_lower) {
                 let rest =
                     (index + 1..scope.bare).filter(|&at| !scope.merged.contains(&(index, at)));
                 scope.unique(rest, &id.value_lower, &id.value)?;
                 return Ok(Some((depth, index)));
-            }
-            if !id.quoted && is_rowid_name(&id.value_lower) {
-                match scope.rowids.as_slice() {
-                    [] => {}
-                    [(_, Some(index))] => return Ok(Some((depth, *index))),
-                    [(_, None)] => return Err(Error::ColumnNotFound(id.value.to_string())),
-                    _ => return Err(ambiguous_column(&id.value)),
-                }
             }
         }
         if let Some((qualifier, name)) = split_qualified(&id.value_lower) {
@@ -10267,15 +10283,13 @@ impl PreparedDml {
                     .any(|sq| sq.may_read(sites.table));
                 Ok::<_, Error>(rewritten_value)
             };
-            let site_sets = Executor::conflict_sets(sites.schema, sites.stmt);
+            let (site_sets, site_where) = Executor::conflict_sets(sites.schema, sites.stmt)?;
             let mut sets = Vec::with_capacity(site_sets.len());
-            for (column, value) in site_sets {
-                sets.push((column, per_value(&mut builder, value)?));
+            for (column, value) in &site_sets {
+                sets.push((*column, per_value(&mut builder, value)?));
             }
-            let where_ = sites
-                .stmt
-                .update_where
-                .as_deref()
+            let where_ = site_where
+                .as_ref()
                 .map(|clause| per_value(&mut builder, clause))
                 .transpose()?;
             conflict_parts = Some((sets, where_, reads_target));
@@ -10703,10 +10717,6 @@ impl JoinBlocks {
         param_count: usize,
     ) -> Result<Option<Self>> {
         let rows_sides = [sides[0].rows, sides[1].rows];
-        let table = |(name, schema): &(Option<SmartString>, CompactArc<Schema>)| {
-            let name = name.as_deref().map(|n| SmartString::from(n.to_lowercase()));
-            ScopeTable::of_table(name, schema, false)
-        };
         let Some([left_scope, right_scope]) = side_scopes(join, sides) else {
             return Ok(None);
         };
@@ -10736,7 +10746,7 @@ impl JoinBlocks {
         // FROM, or streamed; one they cannot read keeps its own conditions
         let mut side_sources: [Option<SideSource>; 2] = [None, None];
         for (i, entry) in [&*join.left, &*join.right].into_iter().enumerate() {
-            let [(_, schema)] = sides[i].leaves.as_slice() else {
+            let [(_, schema, _)] = sides[i].leaves.as_slice() else {
                 continue;
             };
             if !rows_sides[i] || matches!(entry, Expression::JoinSource(_)) {
@@ -10789,7 +10799,7 @@ impl JoinBlocks {
                 kept[i] = Some(filter.clone());
                 continue;
             };
-            let side = table(&sides[i].leaves[0]);
+            let side = leaf_scope(&sides[i].leaves[0]);
             let side_scopes = [&side];
             let side_chain = Chain {
                 scopes: &side_scopes,
@@ -10886,7 +10896,7 @@ impl JoinBlocks {
                 None if !rows_sides[i] => (&none, true),
                 None => continue,
             };
-            let side = table(&sides[i].leaves[0]);
+            let side = leaf_scope(&sides[i].leaves[0]);
             let side_scopes = [&side];
             let side_chain = Chain {
                 scopes: &side_scopes,
@@ -10928,7 +10938,10 @@ impl JoinBlocks {
         let mut side_wheres = [None, None];
         let mut side_scans = [None, None];
         let side_columns = sides.each_ref().map(|side| {
-            let columns = side.leaves.iter().flat_map(|(_, schema)| &schema.columns);
+            let columns = side
+                .leaves
+                .iter()
+                .flat_map(|(_, schema, _)| &schema.columns);
             columns.cloned().collect()
         });
         for (i, part) in side_parts.into_iter().enumerate() {

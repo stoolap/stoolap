@@ -563,6 +563,10 @@ fn inserted(table: &mut dyn Table, row: Row, widened: bool) -> Result<Row> {
     }
 }
 
+/// An ON CONFLICT DO UPDATE's SET values, each with the column it writes,
+/// and its WHERE
+type ConflictClauses = (Vec<(usize, Expression)>, Option<Expression>);
+
 /// The column a statement writes under the lowercase `name`, None for no
 /// column; an error for rowid, the row's identity, which nothing writes
 pub(crate) fn written_column(schema: &Schema, name: &str) -> Result<Option<usize>> {
@@ -3506,7 +3510,7 @@ impl Executor {
         use super::expression::{CompileContext, ExprCompiler, SharedProgram};
         use crate::functions::registry::global_registry;
 
-        let update_specs = Self::conflict_sets(schema, stmt);
+        let (update_specs, update_where) = Self::conflict_sets(schema, stmt)?;
 
         let column_names: Vec<String> = schema.column_names_owned().to_vec();
 
@@ -3544,7 +3548,7 @@ impl Executor {
 
         // DO UPDATE ... WHERE is compiled the same way, with EXCLUDED as the
         // second row source
-        let compiled_where = match stmt.update_where.as_deref() {
+        let compiled_where = match &update_where {
             Some(expr) => {
                 let compile_ctx = CompileContext::new(&column_names, global_registry())
                     .with_second_row(&excluded_columns);
@@ -3562,21 +3566,40 @@ impl Executor {
         Self::upsert_of(schema, compiled_updates, compiled_where)
     }
 
-    /// Each ON CONFLICT SET value of `stmt` with the column it writes
-    pub(super) fn conflict_sets<'s>(
+    /// Each ON CONFLICT SET value of `stmt` with the column it writes, and
+    /// its WHERE, a rowid of the row met spelled as its primary key
+    pub(super) fn conflict_sets(
         schema: &crate::core::Schema,
-        stmt: &'s InsertStatement,
-    ) -> Vec<(usize, &'s Expression)> {
-        let col_map = schema.column_index_map();
-        stmt.update_columns
-            .iter()
-            .zip(stmt.update_expressions.iter())
-            .filter_map(|(col, expr)| {
-                col_map
-                    .get(col.value_lower.as_str())
-                    .map(|&idx| (idx, expr))
+        stmt: &InsertStatement,
+    ) -> Result<ConflictClauses> {
+        use crate::parser::{Position, Token, TokenType};
+        // A key named as a literal is left to the scope that binds it
+        let key = (schema.rowid_column().map(|at| &schema.columns[at]))
+            .filter(|key| !matches!(key.name_lower.as_str(), "true" | "false"));
+        let target = &stmt.table_name.value_lower;
+        let spell = |expr: &Expression| {
+            super::utils::rowids_respelled(expr, &mut |rowid| {
+                let met = match rowid {
+                    Expression::QualifiedIdentifier(q) => {
+                        q.qualifier.value_lower == *target && q.qualifier.value_lower != "excluded"
+                    }
+                    _ => true,
+                };
+                Ok(key.filter(|_| met).map(|key| {
+                    let token =
+                        Token::new(TokenType::Identifier, &key.name, Position::new(0, 0, 0));
+                    Expression::Identifier(Identifier::new(token, key.name.clone()))
+                }))
             })
-            .collect()
+        };
+        let mut sets = Vec::with_capacity(stmt.update_columns.len());
+        for (column, value) in stmt.update_columns.iter().zip(&stmt.update_expressions) {
+            if let Some(at) = written_column(schema, &column.value_lower)? {
+                sets.push((at, spell(value)?));
+            }
+        }
+        let where_ = stmt.update_where.as_deref().map(spell).transpose()?;
+        Ok((sets, where_))
     }
 
     /// The upsert writing each program of `compiled_updates` into its column,

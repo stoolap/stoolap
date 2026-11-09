@@ -39,15 +39,17 @@ A `WHERE _rowid_ = ?` or `WHERE _rowid_ IN (...)` reads the rows it names by the
 - A quoted `"_rowid_"` is not the row identity.
 - `SELECT *` never shows `_rowid_`.
 - `t._rowid_` reads the identity of table `t`. A bare `_rowid_` over two tables is ambiguous.
-- A derived table, view or CTE has a `_rowid_` only when its query selects one as an output column.
+- A derived table, view or CTE has a `_rowid_` only when its query selects one as an output column. A bare `_rowid_` counts it with the tables beside it, so a table joined with such a derived table makes the name ambiguous.
+- In `INSERT ... ON CONFLICT DO UPDATE`, the `SET` values and the `WHERE` read the `_rowid_` of the row met; `excluded._rowid_` is an error.
 
 ## What _rowid_ does not do
 
-- `_rowid_` is never written: `UPDATE t SET _rowid_ = ...` and `INSERT INTO t (_rowid_, ...)` are errors. In a table with a primary key, the key is not updatable either; delete and insert instead.
+- `_rowid_` is never written: `UPDATE t SET _rowid_ = ...`, `INSERT INTO t (_rowid_, ...)` and `ON CONFLICT DO UPDATE SET _rowid_ = ...` are errors. In a table with a primary key, the key is not updatable either; delete and insert instead.
 - In a join, a table without a primary key has no `_rowid_`: the name is an error there. A table with a primary key reads its key as usual.
 - A table read `AS OF` a past point has no `_rowid_`.
 - The `RETURNING` of `INSERT ... ON CONFLICT DO UPDATE` does not read the `_rowid_` of a table without a primary key.
 - A primary key named `TRUE` or `FALSE` is read through `_rowid_` everywhere but inside an aggregate; write the key's quoted name there.
+- Under `SELECT DISTINCT`, an `ORDER BY` key is matched to the select list as written: `_rowid_` and the primary key column it reads count as different, so `SELECT DISTINCT id FROM t ORDER BY _rowid_` is an error. Sort by what the list selects.
 
 ## Stability
 

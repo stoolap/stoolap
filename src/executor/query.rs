@@ -812,14 +812,14 @@ fn natural_join_condition(
 #[derive(Clone, Copy)]
 pub(crate) enum SplitSide<'a> {
     Source(Option<&'a str>, Option<&'a Schema>),
-    Joined(&'a [(Option<SmartString>, CompactArc<Schema>)]),
+    Joined(&'a [super::prepared_join::SideLeaf]),
 }
 
 impl<'a> SplitSide<'a> {
     /// `side` as the blocks read it, `alias` its name when it is one source
     pub(crate) fn of(alias: Option<&'a str>, side: &'a JoinSide) -> Self {
         match side.leaves.as_slice() {
-            [(_, schema)] => SplitSide::Source(alias, Some(schema)),
+            [(_, schema, _)] => SplitSide::Source(alias, Some(schema)),
             leaves => SplitSide::Joined(leaves),
         }
     }
@@ -857,7 +857,7 @@ impl<'a> SplitSide<'a> {
         match self {
             SplitSide::Source(alias, _) => alias.is_some_and(names),
             SplitSide::Joined(leaves) => {
-                (leaves.iter()).any(|(name, _)| name.as_deref().is_some_and(names))
+                (leaves.iter()).any(|(name, _, _)| name.as_deref().is_some_and(names))
             }
         }
     }
@@ -867,7 +867,7 @@ impl<'a> SplitSide<'a> {
     fn has_column(&self, name: &str) -> Option<bool> {
         match self {
             SplitSide::Source(_, schema) => schema.map(|s| s.has_column(name)),
-            SplitSide::Joined(leaves) => Some(leaves.iter().any(|(_, s)| s.has_column(name))),
+            SplitSide::Joined(leaves) => Some(leaves.iter().any(|(_, s, _)| s.has_column(name))),
         }
     }
 
@@ -3472,7 +3472,7 @@ impl Executor {
                 let schema = self.base_table_side_schema(expr, CteNames::Context(ctx))?;
                 let name = get_table_alias_from_expr(expr).map(SmartString::from);
                 Some(JoinSide {
-                    leaves: smallvec::smallvec![(name, schema)],
+                    leaves: smallvec::smallvec![(name, schema, true)],
                     rows: true,
                 })
             }
@@ -3487,7 +3487,7 @@ impl Executor {
                     None => (self.join_side_schema(expr, ctx, runs).ok()?, true),
                 };
                 Some(JoinSide {
-                    leaves: smallvec::smallvec![(name, schema)],
+                    leaves: smallvec::smallvec![(name, schema, !rows)],
                     rows,
                 })
             }
@@ -3717,7 +3717,7 @@ impl Executor {
             let on = natural.as_ref().or(join_source.condition.as_deref());
             // A table side's scan reads only the columns the statement names
             let lower = (sides.iter().flat_map(|side| &side.leaves))
-                .flat_map(|(_, schema)| schema.columns.iter().map(|c| c.name_lower.as_str()));
+                .flat_map(|(_, schema, _)| schema.columns.iter().map(|c| c.name_lower.as_str()));
             let filters = stmt.where_clause.as_deref().into_iter().chain(on);
             let needed = needed_columns(stmt, filters, lower);
             let opened = cross.map(|cross| {

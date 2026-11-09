@@ -428,6 +428,10 @@ fn rowid_reads_alike_in_every_clause() {
                     "{sql}"
                 );
             }
+            let sql = format!(
+                "SELECT \"Ö\".*, _rowid_ + 0 AS r FROM {t} AS \"Ö\" UNION ALL SELECT {other} ORDER BY _rowid_ + 0"
+            );
+            assert_eq!(rows(db, &sql)[0], first, "{sql}");
         }
         assert_eq!(
             rows(db, "SELECT _rowid_, _rowid_ + 0 FROM nr WHERE a = 10"),
@@ -724,6 +728,77 @@ fn a_join_reads_a_keyed_side_rowid_and_refuses_a_keyless_one() {
         assert!(error(db, "SELECT n._rowid_ FROM k JOIN n ON k.a = n.a").contains("not found"));
         assert!(error(db, "SELECT _rowid_ FROM k JOIN n ON k.a = n.a").contains("ambiguous"));
         assert!(error(db, "SELECT _rowid_ FROM k x JOIN k y ON x.a = y.a").contains("ambiguous"));
+    });
+}
+
+#[test]
+fn a_bare_rowid_counts_a_derived_table_column_with_the_tables_beside_it() {
+    each_layout("derived", |db| {
+        for sql in [
+            "SELECT _rowid_ FROM k CROSS JOIN (SELECT _rowid_ FROM n) d",
+            "SELECT (SELECT _rowid_) FROM k CROSS JOIN (SELECT _rowid_ FROM n) d",
+            "WITH c AS (SELECT _rowid_ FROM n) SELECT _rowid_ FROM k CROSS JOIN c",
+            "SELECT _rowid_ FROM (SELECT x._rowid_, y._rowid_ FROM k x, k y) d",
+        ] {
+            assert!(error(db, sql).contains("ambiguous"), "{sql}");
+        }
+        for sql in [
+            "SELECT _rowid_ FROM k CROSS JOIN (SELECT a AS x FROM n WHERE a = 1) d ORDER BY 1",
+            "SELECT (SELECT _rowid_) FROM k CROSS JOIN (SELECT a AS x FROM n WHERE a = 1) d ORDER BY 1",
+            "SELECT _rowid_ FROM k CROSS JOIN (VALUES (7)) v (x) ORDER BY 1",
+        ] {
+            assert_eq!(
+                rows(db, sql),
+                [[int(10)], [int(20)], [int(30)]],
+                "{sql}"
+            );
+        }
+        assert_eq!(
+            rows(
+                db,
+                "SELECT d._rowid_, k._rowid_ FROM k CROSS JOIN (SELECT _rowid_ FROM n WHERE a = 2) d WHERE k.a = 1"
+            ),
+            [[int(2), int(10)]]
+        );
+    });
+}
+
+#[test]
+fn an_upsert_reads_the_rowid_of_the_row_met_and_never_writes_it() {
+    each_layout("upsert", |db| {
+        let upsert = "INSERT INTO k VALUES (10, 5, 'q') ON CONFLICT (id) DO UPDATE SET";
+        let sql = format!("{upsert} _rowid_ = 2, a = 99");
+        let refused = db.execute(&sql, ()).unwrap_err().to_string();
+        assert!(refused.contains("row's identity"), "{sql}: {refused}");
+        for (set, a) in [
+            ("a = _rowid_ + 1 WHERE _rowid_ = 10", 11),
+            ("a = (SELECT _rowid_) + 2 WHERE (SELECT _rowid_) = 10", 12),
+            ("a = k._rowid_ + 3", 13),
+            ("a = 0 WHERE _rowid_ = 20", 13),
+        ] {
+            db.execute(&format!("{upsert} {set}"), ())
+                .unwrap_or_else(|e| panic!("{set}: {e}"));
+            assert_eq!(
+                rows(db, "SELECT id, a FROM k WHERE id = 10"),
+                [[int(10), int(a)]],
+                "{set}"
+            );
+        }
+        let sql = format!("{upsert} a = excluded._rowid_");
+        let refused = db.execute(&sql, ()).unwrap_err().to_string();
+        assert!(refused.contains("not found"), "{sql}: {refused}");
+    });
+}
+
+#[test]
+fn distinct_matches_an_order_by_rowid_to_the_list_as_written() {
+    each_layout("distinct", |db| {
+        assert_eq!(
+            rows(db, "SELECT DISTINCT _rowid_ FROM k ORDER BY _rowid_ DESC"),
+            [[int(30)], [int(20)], [int(10)]]
+        );
+        let sql = "SELECT DISTINCT id FROM k ORDER BY _rowid_";
+        assert!(error(db, sql).contains("SELECT DISTINCT list"), "{sql}");
     });
 }
 
