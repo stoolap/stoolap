@@ -2332,6 +2332,60 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<Option<SelectStatement>> {
+        let rowids = self.rowid_entries(stmt, ctx)?;
+        distinct_rowid_order(stmt, &rowids)?;
+        let mut spelled = |expr: &Expression| -> Result<Option<Expression>> {
+            let Some((name, schema)) = rowids.stored(expr) else {
+                return Ok(None);
+            };
+            let column = match schema.rowid_column() {
+                // A key named as a literal is left to the scope that binds it
+                Some(key)
+                    if matches!(schema.columns[key].name_lower.as_str(), "true" | "false") =>
+                {
+                    return Ok(None)
+                }
+                Some(key) => schema.columns[key].name.as_str(),
+                None if rowids.entries.len() == 1 => ROWID_SLOT,
+                None => return Ok(None),
+            };
+            Ok(Some(qualified_reference(name, column)))
+        };
+        let entries = &rowids.entries;
+        // How many columns a star over the entries shows, when one is known
+        let star_width = |item: &Expression| match item {
+            Expression::Star(_) => match entries.as_slice() {
+                [Some((_, schema))] => Some(schema.columns.len()),
+                _ => None,
+            },
+            Expression::QualifiedStar(star) => (entries.iter().flatten())
+                .find(|(name, _)| super::utils::eq_folded(&star.qualifier, name))
+                .map(|(_, schema)| schema.columns.len()),
+            _ => None,
+        };
+        let spelled = spelled_statement(stmt, &mut spelled, &star_width)?;
+        Ok((spelled != *stmt).then_some(spelled))
+    }
+
+    /// An error when `stmt` is a SELECT DISTINCT whose ORDER BY reads a
+    /// stored table's rowid that only a star covers
+    pub(crate) fn check_distinct_rowid_order(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+    ) -> Result<()> {
+        if !stmt.distinct || stmt.order_by.is_empty() || !names_rowid(stmt) {
+            return Ok(());
+        }
+        distinct_rowid_order(stmt, &self.rowid_entries(stmt, ctx)?)
+    }
+
+    /// `stmt`'s own FROM entries as a rowid reads them
+    fn rowid_entries(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+    ) -> Result<RowidEntries> {
         let mut leaves = Vec::new();
         if let Some(from) = stmt.table_expr.as_deref() {
             from_leaves(from, &mut leaves);
@@ -2396,63 +2450,49 @@ impl Executor {
             };
             entries.push(entry);
         }
-        // A bare rowid reads the one stored table's when no other entry can hold one
-        let mut stored = entries.iter().flatten();
-        let lone = match (stored.next(), stored.next()) {
-            (Some(entry), None) if !others => Some(entry),
-            _ => None,
-        };
-        // The stored entry whose identity a rowid reads
-        let stored_entry = |expr: &Expression| match expr {
-            Expression::QualifiedIdentifier(q) => entries
-                .iter()
-                .flatten()
-                .find(|(name, _)| *name == q.qualifier.value_lower),
-            Expression::Identifier(_) => lone,
-            _ => None,
-        };
-        // No star shows a stored table's identity
-        let shown = |rowid: &Expression| stored_entry(rowid).is_none();
-        if let Some(key) = crate::parser::scope::distinct_key_unshown(stmt, &shown) {
-            return Err(Error::invalid_argument(
-                crate::parser::scope::distinct_key_message(key),
-            ));
-        }
-        let mut spelled = |expr: &Expression| -> Result<Option<Expression>> {
-            let Some((name, schema)) = stored_entry(expr) else {
-                return Ok(None);
-            };
-            let column = match schema.rowid_column() {
-                // A key named as a literal is left to the scope that binds it
-                Some(key)
-                    if matches!(schema.columns[key].name_lower.as_str(), "true" | "false") =>
-                {
-                    return Ok(None)
-                }
-                Some(key) => schema.columns[key].name.as_str(),
-                None if entries.len() == 1 => ROWID_SLOT,
-                None => return Ok(None),
-            };
-            Ok(Some(qualified_reference(name, column)))
-        };
-        // How many columns a star over the entries shows, when one is known
-        let star_width = |item: &Expression| match item {
-            Expression::Star(_) => match entries.as_slice() {
-                [Some((_, schema))] => Some(schema.columns.len()),
-                _ => None,
-            },
-            Expression::QualifiedStar(star) => (entries.iter().flatten())
-                .find(|(name, _)| super::utils::eq_folded(&star.qualifier, name))
-                .map(|(_, schema)| schema.columns.len()),
-            _ => None,
-        };
-        let spelled = spelled_statement(stmt, &mut spelled, &star_width)?;
-        Ok((spelled != *stmt).then_some(spelled))
+        Ok(RowidEntries { entries, others })
     }
 }
 
 /// A FROM entry's name and its stored table's schema
 type NamedSchema = (SmartString, CompactArc<Schema>);
+
+/// A statement's FROM entries, each with its stored table's schema or None
+/// when it reads none, and whether such another may hold a `_rowid_`
+struct RowidEntries {
+    entries: SmallVec<[Option<NamedSchema>; 2]>,
+    others: bool,
+}
+
+impl RowidEntries {
+    /// The stored entry whose identity `rowid` reads: a bare one reads the
+    /// one stored table's when no other entry can hold one
+    fn stored(&self, rowid: &Expression) -> Option<&NamedSchema> {
+        let mut stored = self.entries.iter().flatten();
+        match rowid {
+            Expression::QualifiedIdentifier(q) => {
+                stored.find(|(name, _)| *name == q.qualifier.value_lower)
+            }
+            Expression::Identifier(_) => match (stored.next(), stored.next()) {
+                (Some(entry), None) if !self.others => Some(entry),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
+/// Under SELECT DISTINCT, an error for an ORDER BY key the list selects
+/// only through a star covering a stored table's rowid, which no star shows
+fn distinct_rowid_order(stmt: &SelectStatement, rowids: &RowidEntries) -> Result<()> {
+    let shown = |rowid: &Expression| rowids.stored(rowid).is_none();
+    match crate::parser::scope::distinct_key_unshown(stmt, &shown) {
+        Some(key) => Err(Error::invalid_argument(
+            crate::parser::scope::distinct_key_message(key),
+        )),
+        None => Ok(()),
+    }
+}
 
 /// Each FROM entry of `from` past its joins
 fn from_leaves<'e>(from: &'e Expression, out: &mut Vec<&'e Expression>) {
@@ -6750,6 +6790,7 @@ impl Builder<'_> {
         form: Form<'_>,
     ) -> Result<(u16, Vec<Delegated>, bool)> {
         where_without_aggregates(sq.where_clause.as_deref())?;
+        self.executor.check_distinct_rowid_order(sq, self.ctx)?;
         // A value block, and a row compared with the block's one row, count
         // its rows
         let counts_rows = matches!(

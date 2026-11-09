@@ -891,7 +891,13 @@ fn distinct_matches_an_order_by_rowid_to_the_list_as_written() {
             rows(db, "SELECT DISTINCT _rowid_ FROM k ORDER BY _rowid_ DESC"),
             [[int(30)], [int(20)], [int(10)]]
         );
+        db.execute("CREATE TABLE n1 (a INTEGER)", ()).unwrap();
         for sql in [
+            "SELECT 7 IN (SELECT DISTINCT * FROM n1 ORDER BY _rowid_)",
+            "SELECT 7 = ANY (SELECT DISTINCT n1.* FROM n1 CROSS JOIN k ORDER BY n1._rowid_)",
+            "SELECT EXISTS (SELECT DISTINCT * FROM n ORDER BY _rowid_)",
+            "SELECT a FROM n o WHERE EXISTS (SELECT DISTINCT * FROM n i WHERE i.a = o.a ORDER BY _rowid_)",
+            "SELECT a FROM n o WHERE a IN (SELECT DISTINCT * FROM n1 i WHERE i.a = o.a ORDER BY _rowid_)",
             "SELECT DISTINCT id FROM k ORDER BY _rowid_",
             "SELECT DISTINCT * FROM n ORDER BY _rowid_",
             "SELECT DISTINCT * FROM k ORDER BY _rowid_",
@@ -910,6 +916,12 @@ fn distinct_matches_an_order_by_rowid_to_the_list_as_written() {
             "SELECT DISTINCT * FROM kv ORDER BY _rowid_ DESC",
         ] {
             assert_eq!(rows(db, sql), [[int(30)], [int(20)], [int(10)]], "{sql}");
+        }
+        for sql in [
+            "SELECT 10 IN (SELECT DISTINCT * FROM (SELECT _rowid_ FROM k) d ORDER BY _rowid_)",
+            "SELECT EXISTS (SELECT DISTINCT * FROM kv ORDER BY _rowid_)",
+        ] {
+            assert_eq!(rows(db, sql), [[Value::Boolean(true)]], "{sql}");
         }
     });
 }
