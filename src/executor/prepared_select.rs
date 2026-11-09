@@ -2351,19 +2351,25 @@ impl Executor {
             };
             Ok(Some(qualified_reference(name, column)))
         };
-        let entries = &rowids.entries;
-        // How many columns a star over the entries shows, when one is known
-        let star_width = |item: &Expression| match item {
-            Expression::Star(_) => match entries.as_slice() {
-                [Some((_, schema))] => Some(schema.columns.len()),
-                _ => None,
-            },
-            Expression::QualifiedStar(star) => (entries.iter().flatten())
-                .find(|(name, _)| super::utils::eq_folded(&star.qualifier, name))
-                .map(|(_, schema)| schema.columns.len()),
-            _ => None,
+        // A set operation's ORDER BY key past a star counts the columns the
+        // star shows over the statement's own scope, when that is known
+        let star =
+            |item: &Expression| matches!(item, Expression::Star(_) | Expression::QualifiedStar(_));
+        let own = match !stmt.set_operations.is_empty() && stmt.columns.iter().any(star) {
+            true => self.statement_walked(stmt, ctx, Vec::new()).ok(),
+            false => None,
         };
-        let spelled = spelled_statement(stmt, &mut spelled, &star_width)?;
+        let shown = |item: &Expression| {
+            let (_, own) = own.as_ref()?;
+            match item {
+                Expression::Star(_) => Some(star_width(own, own.columns.len())),
+                Expression::QualifiedStar(star) => {
+                    qualified_star_columns(star, own).ok().map(|at| at.len())
+                }
+                _ => None,
+            }
+        };
+        let spelled = spelled_statement(stmt, &mut spelled, &shown)?;
         Ok((spelled != *stmt).then_some(spelled))
     }
 
@@ -12557,7 +12563,17 @@ impl Executor {
         ctx: &ExecutionContext,
         ctes: Vec<(SmartString, Vec<String>)>,
     ) -> Result<Vec<String>> {
-        let (_, names, _) = StatementWalk {
+        Ok(self.statement_walked(stmt, ctx, ctes)?.0)
+    }
+
+    /// [`Self::statement_names_under`] with the scope its own FROM gives
+    fn statement_walked(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        ctes: Vec<(SmartString, Vec<String>)>,
+    ) -> Result<(Vec<String>, ScopeTable)> {
+        let (_, names, own) = StatementWalk {
             executor: self,
             ctx,
             on: &mut |_| Ok(None),
@@ -12566,7 +12582,7 @@ impl Executor {
             ctes,
         }
         .statement(stmt, &[], 0, Check::Off)?;
-        Ok(names)
+        Ok((names, own))
     }
 
     /// The tables `select` reads, unknown when one of them is a view or it

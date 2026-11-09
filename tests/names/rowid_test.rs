@@ -484,6 +484,18 @@ fn a_set_operation_over_a_join_keeps_the_rowid_of_its_side() {
             ),
             [[Value::null_unknown()], [int(-1)]]
         );
+        for sql in [
+            "SELECT *, _rowid_ + 0 AS r FROM k CROSS JOIN (VALUES (1)) v (x) \
+             UNION ALL SELECT 0, 0, '', 0, 0 ORDER BY _rowid_ + 0 DESC",
+            "SELECT k.*, _rowid_ + 0 AS r FROM k CROSS JOIN (VALUES (1)) v (x) \
+             UNION ALL SELECT 0, 0, '', 0 ORDER BY _rowid_ + 0 DESC",
+            "SELECT *, _rowid_ + 0 AS r FROM k JOIN (VALUES (10), (20), (30)) v (id) USING (id) \
+             UNION ALL SELECT 0, 0, '', 0 ORDER BY _rowid_ + 0 DESC",
+        ] {
+            let last = |row: &Vec<Value>| row[row.len() - 1].clone();
+            let sorted: Vec<Value> = rows(db, sql).iter().map(last).collect();
+            assert_eq!(sorted, [int(30), int(20), int(10), int(0)], "{sql}");
+        }
     });
 }
 
