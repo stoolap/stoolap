@@ -63,7 +63,6 @@ fn every_index_kind_shares_its_data_with_its_rebound_object() {
             "a".into(),
             DataType::Integer,
             false,
-            0,
         )),
         1,
     );
@@ -87,7 +86,6 @@ fn every_index_kind_shares_its_data_with_its_rebound_object() {
             vec![1],
             vec![DataType::Integer],
             false,
-            0,
         )),
         1,
     );
@@ -114,7 +112,6 @@ fn a_rebound_btree_sees_the_extremes_the_old_object_wrote() {
         "a".into(),
         DataType::Integer,
         false,
-        0,
     ));
     old.add(&[int(10)], 1, 0).unwrap();
     let rebound = old.rebound(&["b".to_string()], &[1]);

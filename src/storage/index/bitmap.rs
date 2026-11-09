@@ -52,7 +52,7 @@ use roaring::RoaringTreemap;
 use crate::common::{CompactArc, I64Map};
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
-use crate::storage::traits::{Index, RemovalBuffers};
+use crate::storage::traits::Index;
 
 /// Warning threshold for cardinality
 const HIGH_CARDINALITY_WARNING_THRESHOLD: usize = 1000;
@@ -98,10 +98,6 @@ pub struct BitmapData {
     /// AHash for HashDoS resistance (user-controlled indexed values)
     bitmaps: RwLock<AHashMap<CompactArc<Value>, RoaringTreemap>>,
 
-    /// Reverse mapping: row_id -> CompactArc<Value> for efficient removal
-    /// Uses I64Map for fast O(1) lookups and CompactArc<Value> (8 bytes per entry)
-    row_to_value: RwLock<I64Map<CompactArc<Value>>>,
-
     /// Track cardinality for warnings
     distinct_count: AtomicUsize,
 }
@@ -124,13 +120,6 @@ fn bit_of(row_id: i64) -> u64 {
 #[inline]
 fn row_of(bit: u64) -> i64 {
     (bit ^ (1 << 63)) as i64
-}
-
-/// A seal cleanup's buffers: the small row map swapped in for an emptied one,
-/// and the removed rows' keys, reused across the seal's calls
-struct SealBuffers {
-    fresh: I64Map<CompactArc<Value>>,
-    removed: Vec<(CompactArc<Value>, i64)>,
 }
 
 /// The row ids of `bits`, each as `row_id as u64`: what the public set
@@ -161,10 +150,6 @@ impl std::fmt::Debug for BitmapIndex {
 
 impl BitmapIndex {
     /// Create a new BitmapIndex
-    ///
-    /// # Arguments
-    /// * `expected_rows` - Hint for initial capacity of row_to_value map.
-    ///   Pass 0 if unknown; the map will grow automatically.
     pub fn new(
         name: String,
         table_name: String,
@@ -172,7 +157,6 @@ impl BitmapIndex {
         column_ids: Vec<i32>,
         data_types: Vec<DataType>,
         is_unique: bool,
-        expected_rows: usize,
     ) -> Self {
         Self {
             name,
@@ -184,11 +168,6 @@ impl BitmapIndex {
             data: Arc::new(BitmapData {
                 closed: AtomicBool::new(false),
                 bitmaps: RwLock::new(AHashMap::default()),
-                row_to_value: RwLock::new(if expected_rows > 0 {
-                    I64Map::with_capacity(expected_rows)
-                } else {
-                    I64Map::new()
-                }),
                 distinct_count: AtomicUsize::new(0),
             }),
         }
@@ -303,10 +282,8 @@ impl BitmapIndex {
     fn add_multi_column_slow(
         &self,
         values: &[Value],
-        row_id: i64,
         row_id_u64: u64,
         mut bitmaps: parking_lot::RwLockWriteGuard<'_, AHashMap<CompactArc<Value>, RoaringTreemap>>,
-        mut row_to_value: parking_lot::RwLockWriteGuard<'_, I64Map<CompactArc<Value>>>,
     ) -> Result<()> {
         // Create composite key for multi-column lookup
         let arc_key = self.value_to_arc_key(values);
@@ -332,26 +309,10 @@ impl BitmapIndex {
             }
         }
 
-        // Check if row already exists with a different value
-        if let Some(old_arc_key) = row_to_value.get(row_id).cloned() {
-            if !CompactArc::ptr_eq(&old_arc_key, &arc_key) {
-                if let Some(old_bitmap) = bitmaps.get_mut(&old_arc_key) {
-                    old_bitmap.remove(row_id_u64);
-                    if old_bitmap.is_empty() {
-                        bitmaps.remove(&old_arc_key);
-                        self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
-                    }
-                }
-            }
-        }
-
         // Add to bitmap
         let is_new_value = !bitmaps.contains_key(&arc_key);
-        let bitmap = bitmaps.entry(CompactArc::clone(&arc_key)).or_default();
+        let bitmap = bitmaps.entry(arc_key).or_default();
         bitmap.insert(row_id_u64);
-
-        // Update reverse mapping
-        row_to_value.insert(row_id, arc_key);
 
         if is_new_value {
             self.distinct_count.fetch_add(1, AtomicOrdering::Relaxed);
@@ -390,9 +351,8 @@ impl Index for BitmapIndex {
             )));
         }
 
-        // Acquire write locks
+        // Acquire the write lock
         let mut bitmaps = self.bitmaps.write();
-        let mut row_to_value = self.row_to_value.write();
 
         // Build lookup key (for single-column, just the first value)
         let lookup_value = if values.len() == 1 {
@@ -400,7 +360,7 @@ impl Index for BitmapIndex {
         } else {
             // For multi-column, we need to create a composite key for lookup
             // This is less common but supported
-            return self.add_multi_column_slow(values, row_id, row_id_u64, bitmaps, row_to_value);
+            return self.add_multi_column_slow(values, row_id_u64, bitmaps);
         };
 
         // Check uniqueness constraint (using Borrow trait for &Value lookup)
@@ -422,42 +382,16 @@ impl Index for BitmapIndex {
             }
         }
 
-        // Try to reuse existing Arc if value already exists (O(1) clone)
-        // Only create new Arc if this is a new unique value
-        let (arc_key, is_new_value) =
-            if let Some((existing_arc, _)) = bitmaps.get_key_value(lookup_value) {
-                // Value exists - reuse the existing Arc (O(1) atomic refcount bump)
-                (CompactArc::clone(existing_arc), false)
-            } else {
-                // New unique value - create Arc once
-                (CompactArc::new(lookup_value.clone()), true)
-            };
-
-        // Check if row already exists with a different value (for updates)
-        if let Some(old_arc_key) = row_to_value.get(row_id).cloned() {
-            // Compare Arc pointers - if same Arc, same value
-            if !CompactArc::ptr_eq(&old_arc_key, &arc_key) {
-                // Remove from old bitmap
-                if let Some(old_bitmap) = bitmaps.get_mut(&old_arc_key) {
-                    old_bitmap.remove(row_id_u64);
-                    if old_bitmap.is_empty() {
-                        bitmaps.remove(&old_arc_key);
-                        self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
-                    }
-                }
+        match bitmaps.get_mut(lookup_value) {
+            Some(bitmap) => {
+                bitmap.insert(row_id_u64);
             }
-        }
-
-        // Add to bitmap
-        let bitmap = bitmaps.entry(CompactArc::clone(&arc_key)).or_default();
-        bitmap.insert(row_id_u64);
-
-        // Update reverse mapping with Arc reference
-        row_to_value.insert(row_id, arc_key);
-
-        // Update cardinality if this is a new distinct value
-        if is_new_value {
-            self.distinct_count.fetch_add(1, AtomicOrdering::Relaxed);
+            None => {
+                let mut bitmap = RoaringTreemap::new();
+                bitmap.insert(row_id_u64);
+                bitmaps.insert(CompactArc::new(lookup_value.clone()), bitmap);
+                self.distinct_count.fetch_add(1, AtomicOrdering::Relaxed);
+            }
         }
 
         Ok(())
@@ -481,7 +415,6 @@ impl Index for BitmapIndex {
         let arc_key = self.value_to_arc_key(values);
 
         let mut bitmaps = self.bitmaps.write();
-        let mut row_to_value = self.row_to_value.write();
 
         // Remove from bitmap
         if let Some(bitmap) = bitmaps.get_mut(&arc_key) {
@@ -491,9 +424,6 @@ impl Index for BitmapIndex {
                 self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
             }
         }
-
-        // Remove from reverse mapping
-        row_to_value.remove(row_id);
 
         Ok(())
     }
@@ -517,12 +447,8 @@ impl Index for BitmapIndex {
 
         let num_cols = self.column_ids.len();
 
-        // Acquire write locks ONCE for entire batch
+        // Acquire the write lock ONCE for entire batch
         let mut bitmaps = self.bitmaps.write();
-        let mut row_to_value = self.row_to_value.write();
-
-        // Reserve capacity
-        row_to_value.reserve(entries.len());
 
         // PRE-CHECK PHASE: Validate all unique constraints BEFORE modifying anything
         // This prevents partial batch execution on failure
@@ -584,39 +510,16 @@ impl Index for BitmapIndex {
             }
 
             let arc_key = self.value_to_arc_key(values);
-
-            // Try to reuse existing Arc
-            let (final_arc_key, is_new_value) =
-                if let Some((existing_arc, _)) = bitmaps.get_key_value(&arc_key) {
-                    (CompactArc::clone(existing_arc), false)
-                } else {
-                    (arc_key, true)
-                };
-
-            // Handle update case - remove from old bitmap
-            if let Some(old_arc_key) = row_to_value.get(row_id).cloned() {
-                if !CompactArc::ptr_eq(&old_arc_key, &final_arc_key) {
-                    if let Some(old_bitmap) = bitmaps.get_mut(&old_arc_key) {
-                        old_bitmap.remove(row_id_u64);
-                        if old_bitmap.is_empty() {
-                            bitmaps.remove(&old_arc_key);
-                            self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
-                        }
-                    }
+            match bitmaps.get_mut(&arc_key) {
+                Some(bitmap) => {
+                    bitmap.insert(row_id_u64);
                 }
-            }
-
-            // Add to bitmap
-            let bitmap = bitmaps
-                .entry(CompactArc::clone(&final_arc_key))
-                .or_default();
-            bitmap.insert(row_id_u64);
-
-            // Update reverse mapping
-            row_to_value.insert(row_id, final_arc_key);
-
-            if is_new_value {
-                self.distinct_count.fetch_add(1, AtomicOrdering::Relaxed);
+                None => {
+                    let mut bitmap = RoaringTreemap::new();
+                    bitmap.insert(row_id_u64);
+                    bitmaps.insert(arc_key, bitmap);
+                    self.distinct_count.fetch_add(1, AtomicOrdering::Relaxed);
+                }
             }
         }
 
@@ -633,9 +536,8 @@ impl Index for BitmapIndex {
             return Err(Error::IndexClosed);
         }
 
-        // Acquire write locks ONCE for entire batch
+        // Acquire the write lock ONCE for entire batch
         let mut bitmaps = self.bitmaps.write();
-        let mut row_to_value = self.row_to_value.write();
 
         for &(row_id, values) in entries {
             let row_id_u64 = bit_of(row_id);
@@ -650,53 +552,9 @@ impl Index for BitmapIndex {
                     self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
                 }
             }
-
-            // Remove from reverse mapping
-            row_to_value.remove(row_id);
         }
 
         Ok(())
-    }
-
-    fn removal_buffers(&self, batch_rows: usize) -> Option<RemovalBuffers> {
-        Some(Box::new(SealBuffers {
-            fresh: I64Map::new(),
-            removed: Vec::with_capacity(batch_rows),
-        }))
-    }
-
-    fn remove_batch_ids(
-        &self,
-        row_ids: &[i64],
-        buffers: &mut RemovalBuffers,
-    ) -> Option<Result<()>> {
-        let SealBuffers { fresh, removed } = buffers.downcast_mut::<SealBuffers>()?;
-        if self.closed.load(AtomicOrdering::Acquire) {
-            return Some(Err(Error::IndexClosed));
-        }
-        removed.clear();
-        let mut bitmaps = self.bitmaps.write();
-        let mut row_to_value = self.row_to_value.write();
-        for &row_id in row_ids {
-            if let Some(arc_key) = row_to_value.remove_keeping_capacity(row_id) {
-                removed.push((arc_key, row_id));
-            }
-        }
-        row_to_value.swap_if_empty(fresh);
-        // Each key's bitmap is looked up once and its bits leave in order
-        removed.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-        for run in removed.chunk_by(|a, b| a.0 == b.0) {
-            if let Some(bitmap) = bitmaps.get_mut(&run[0].0) {
-                for &(_, row_id) in run {
-                    bitmap.remove(bit_of(row_id));
-                }
-                if bitmap.is_empty() {
-                    bitmaps.remove(&run[0].0);
-                    self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
-                }
-            }
-        }
-        Some(Ok(()))
     }
 
     fn column_ids(&self) -> &[i32] {
@@ -880,7 +738,6 @@ impl Index for BitmapIndex {
 
     fn clear(&self) -> Result<()> {
         self.bitmaps.write().clear();
-        self.row_to_value.write().clear();
         self.distinct_count.store(0, AtomicOrdering::Relaxed);
         Ok(())
     }
@@ -908,7 +765,6 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             false,
-            0,
         );
 
         // Add entries
@@ -941,7 +797,6 @@ mod tests {
             vec![1],
             vec![DataType::Boolean],
             false,
-            0,
         );
 
         // Add boolean values
@@ -972,7 +827,6 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             false,
-            0,
         );
 
         index.add(&[Value::Text("pending".into())], 1, 0).unwrap();
@@ -995,7 +849,6 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             false,
-            0,
         );
 
         index.add(&[Value::Text("pending".into())], 1, 0).unwrap();
@@ -1020,7 +873,6 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             false,
-            0,
         );
 
         index.add(&[Value::Text("pending".into())], 1, 0).unwrap();
@@ -1042,7 +894,6 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             false,
-            0,
         );
 
         index.add(&[Value::Text("pending".into())], 1, 0).unwrap();
@@ -1075,14 +926,16 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             false,
-            0,
         );
 
         // Initial value
         index.add(&[Value::Text("pending".into())], 1, 0).unwrap();
         assert_eq!(index.cardinality(), 1);
 
-        // Update to new value
+        // Update to new value: the old key leaves, the new one comes
+        index
+            .remove(&[Value::Text("pending".into())], 1, 0)
+            .unwrap();
         index.add(&[Value::Text("shipped".into())], 1, 0).unwrap();
         assert_eq!(index.cardinality(), 1); // Old empty bitmap removed
 
@@ -1105,7 +958,6 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             false,
-            0,
         );
 
         index.add(&[Value::Text("pending".into())], 1, 0).unwrap();
@@ -1126,7 +978,6 @@ mod tests {
             vec![1],
             vec![DataType::Integer],
             false,
-            0,
         );
 
         // Add many distinct values
@@ -1146,7 +997,6 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             false,
-            0,
         );
 
         index.add(&[Value::Null(DataType::Text)], 1, 0).unwrap();
@@ -1166,7 +1016,6 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             true, // unique
-            0,
         );
 
         index.add(&[Value::Text("pending".into())], 1, 0).unwrap();
@@ -1191,7 +1040,6 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             false,
-            0,
         );
 
         // Use row IDs beyond u32::MAX
@@ -1237,7 +1085,6 @@ mod tests {
             vec![1],
             vec![DataType::Text],
             false,
-            0,
         );
         let pending = [Value::Text("pending".into())];
         for id in [5, -1, i64::MAX, 0, -7, i64::MIN + 1] {
@@ -1252,10 +1099,8 @@ mod tests {
         assert_eq!(entries, vec![i64::MIN + 1, -7, -1, 0, 5, i64::MAX]);
 
         index.remove(&pending, -1, 0).unwrap();
-        let mut buffers = index.removal_buffers(2).unwrap();
         index
-            .remove_batch_ids(&[-7, 5], &mut buffers)
-            .unwrap()
+            .remove_batch_slice(&[(-7, &pending[..]), (5, &pending[..])])
             .unwrap();
         let mut left = Vec::new();
         index.get_row_ids_equal_into(&pending, &mut left);

@@ -4029,7 +4029,6 @@ impl Table for MVCCTable {
                 column_ids,
                 data_types,
                 is_unique,
-                expected_rows,
             )),
             IndexType::BTree => {
                 // For single-column BTree, use BTreeIndex
@@ -4042,7 +4041,6 @@ impl Table for MVCCTable {
                         column_names[0].clone(),
                         data_types[0],
                         is_unique,
-                        expected_rows,
                     ))
                 } else {
                     Arc::new(MultiColumnIndex::new(
@@ -4517,8 +4515,6 @@ impl Table for MVCCTable {
             }
         }
 
-        // Create the btree index with capacity hint
-        let expected_rows = self.version_store.row_count();
         let index = BTreeIndex::new(
             index_name.clone(),
             self.name().to_string(),
@@ -4526,7 +4522,6 @@ impl Table for MVCCTable {
             column_name.to_string(),
             col.data_type,
             is_unique,
-            expected_rows,
         );
 
         // Populate the index with existing data using batch_slice

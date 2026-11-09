@@ -121,7 +121,6 @@ mod seal_removal_tests {
                     "k".into(),
                     DataType::Integer,
                     false,
-                    0,
                 )),
             ),
             (
@@ -130,15 +129,7 @@ mod seal_removal_tests {
             ),
             (
                 "bitmap",
-                Box::new(BitmapIndex::new(
-                    "i".into(),
-                    "t".into(),
-                    bn,
-                    bi,
-                    bt,
-                    false,
-                    0,
-                )),
+                Box::new(BitmapIndex::new("i".into(), "t".into(), bn, bi, bt, false)),
             ),
             (
                 "multi_column",
@@ -159,87 +150,42 @@ mod seal_removal_tests {
         ]
     }
 
-    fn key(name: &str, id: i64) -> Vec<Value> {
-        match name {
-            "pk" => vec![Value::Integer(id)],
-            "multi_column" => vec![Value::Integer(id % 100), Value::Integer(id)],
-            _ => vec![Value::Integer(id % 100)],
-        }
-    }
-
     #[test]
     fn a_seal_removal_keeps_capacity_and_releases_an_emptied_map() {
-        for (name, index) in indexes() {
-            for id in FIRST..FIRST + ROWS {
-                index.add(&key(name, id), id, id).unwrap();
-            }
-            let ids: Vec<i64> = (FIRST..FIRST + ROWS).collect();
-            let mut buffers = index.removal_buffers(2_000).unwrap();
-            let before = slot_visits();
-            let mut next = 0usize;
-            for left in [4_096usize, 1, 0] {
-                let upto = ids.len() - left;
-                for chunk in ids[next..upto].chunks(2_000) {
-                    index
-                        .remove_batch_ids(chunk, &mut buffers)
-                        .unwrap()
-                        .unwrap();
-                }
-                next = upto;
-                assert_eq!(slot_visits() - before, 0, "{name}: {left} rows left");
-            }
-            if let Some(set) = buffers.downcast_ref::<crate::common::I64Set>() {
-                assert!(
-                    set.capacity() >= ROWS as usize,
-                    "pk: the buffers hold the old set"
-                );
-            } else {
-                drop(buffers);
-                assert!(
-                    slot_visits() - before > 0,
-                    "{name}: the buffers hold the old map, walked when dropped"
-                );
-            }
-            let id = FIRST + ROWS;
-            index.add(&key(name, id), id, id).unwrap();
-            assert_eq!(
-                index
-                    .get_row_ids_equal(&key(name, id))
-                    .iter()
-                    .copied()
-                    .collect::<Vec<_>>(),
-                vec![id],
-                "{name} works after"
-            );
+        let index = PkIndex::new("i".into(), "t".into(), 0, "id".into());
+        for id in FIRST..FIRST + ROWS {
+            index.add(&[Value::Integer(id)], id, id).unwrap();
         }
-    }
-
-    #[test]
-    fn a_delete_removal_keeps_the_old_shrink_policy() {
-        let index = BTreeIndex::new(
-            "i".into(),
-            "t".into(),
-            1,
-            "k".into(),
-            DataType::Integer,
-            false,
-            0,
-        );
-        let rows: Vec<(i64, Vec<Value>)> = (0..ROWS)
-            .map(|id| (id, vec![Value::Integer(id % 100)]))
-            .collect();
-        for (id, values) in &rows {
-            index.add(values, *id, *id).unwrap();
-        }
+        let ids: Vec<i64> = (FIRST..FIRST + ROWS).collect();
+        let mut buffers = index.removal_buffers(2_000).unwrap();
         let before = slot_visits();
-        let entries: Vec<(i64, &[Value])> = rows[1..]
-            .iter()
-            .map(|(id, v)| (*id, v.as_slice()))
-            .collect();
-        index.remove_batch_slice(&entries).unwrap();
+        let mut next = 0usize;
+        for left in [4_096usize, 1, 0] {
+            let upto = ids.len() - left;
+            for chunk in ids[next..upto].chunks(2_000) {
+                index
+                    .remove_batch_ids(chunk, &mut buffers)
+                    .unwrap()
+                    .unwrap();
+            }
+            next = upto;
+            assert_eq!(slot_visits() - before, 0, "{left} rows left");
+        }
+        let set = buffers.downcast_ref::<crate::common::I64Set>().unwrap();
         assert!(
-            slot_visits() - before > 0,
-            "a DELETE still shrinks the row map"
+            set.capacity() >= ROWS as usize,
+            "the buffers hold the old set"
+        );
+        let id = FIRST + ROWS;
+        index.add(&[Value::Integer(id)], id, id).unwrap();
+        assert_eq!(
+            index
+                .get_row_ids_equal(&[Value::Integer(id)])
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![id],
+            "works after"
         );
     }
 }

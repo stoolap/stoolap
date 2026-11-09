@@ -347,7 +347,6 @@ fn a_btree_walk_takes_its_bounds_in_the_index_order() {
         "t".into(),
         DataType::Integer,
         false,
-        0,
     );
     for id in 1..=900i64 {
         index.add(&[Value::Integer(id)], id, id).unwrap();

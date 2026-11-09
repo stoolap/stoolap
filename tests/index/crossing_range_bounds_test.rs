@@ -110,7 +110,6 @@ fn range_bounds_through_the_index_api_follow_the_index_order() {
         "t".into(),
         DataType::Integer,
         false,
-        0,
     );
     let multi = MultiColumnIndex::new(
         "m".into(),
