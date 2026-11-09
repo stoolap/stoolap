@@ -44,6 +44,7 @@ use crate::functions::aggregate::{CallTemplate, ColumnsKey, CompiledAggregate, G
 use crate::storage::expression::CompiledFilter;
 use crate::storage::mvcc::arena::{Relayout, RowArena};
 use crate::storage::mvcc::commit_log::ReadPoint;
+use crate::storage::mvcc::key_hold::KeyHolds;
 #[cfg(not(test))]
 use crate::storage::mvcc::registry::TransactionRegistry;
 use crate::storage::mvcc::registry::{CommitCut, HistoryEvent, StatementView};
@@ -1256,6 +1257,8 @@ pub struct VersionStore {
     auto_increment_counter: AtomicI64,
     /// Track which transaction has uncommitted changes to each row
     uncommitted_writes: RwLock<I64Map<i64>>,
+    /// The holds on this table's keys that foreign keys reference
+    key_holds: KeyHolds,
     /// Visibility checker (registry reference)
     /// Production: concrete type for zero-cost inlining in hot paths
     /// Test: dyn trait for TestVisibilityChecker flexibility
@@ -1466,6 +1469,7 @@ impl VersionStore {
             cold_unavailable: AtomicBool::new(false),
             auto_increment_counter: AtomicI64::new(0),
             uncommitted_writes: RwLock::new(new_i64_map()),
+            key_holds: KeyHolds::default(),
             visibility_checker: checker,
             arena: RowArena::with_capacity(expected_rows),
             zone_maps: RwLock::new(None),
@@ -1507,6 +1511,7 @@ impl VersionStore {
             cold_unavailable: AtomicBool::new(false),
             auto_increment_counter: AtomicI64::new(0),
             uncommitted_writes: RwLock::new(new_i64_map()),
+            key_holds: KeyHolds::default(),
             visibility_checker: checker,
             arena: RowArena::with_capacity(expected_rows),
             zone_maps: RwLock::new(None),
@@ -5344,6 +5349,11 @@ impl VersionStore {
     pub fn row_count(&self) -> usize {
         self.versions.read().len()
     }
+    /// The holds on this table's referenced keys
+    pub(crate) fn key_holds(&self) -> &KeyHolds {
+        &self.key_holds
+    }
+
     /// Tries to claim a row for update (dirty write prevention)
     pub fn try_claim_row(&self, row_id: i64, txn_id: i64) -> Result<(), Error> {
         use crate::common::i64_map::Entry;

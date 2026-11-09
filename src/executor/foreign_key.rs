@@ -31,6 +31,7 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+use crate::common::I64Set;
 use crate::core::{Error, ForeignKeyAction, ForeignKeyConstraint, Result, Schema, Value};
 use crate::storage::expression::Expression as StorageExpression;
 use crate::storage::mvcc::engine::MVCCEngine;
@@ -145,14 +146,51 @@ fn parent_row_exists(
         ))
     })?;
 
+    // Held before the read: a delete of the key then waits for this
+    // transaction, or has committed and the read misses the row
+    let key = key_value(&parent_schema, ref_idx, value);
+    let column = &parent_schema.columns[ref_idx].name;
+    engine.hold_key(txn_id, parent_table, column, &key, false)?;
+
     // The storage layer uses the PK fast path (O(1)) or a secondary index
     // (O(log N)) when available
-    let expr = key_filter(&parent_schema, ref_idx, value);
+    let expr = filter_on(&parent_schema, ref_idx, key);
 
     let plan = parent.index_plan(&expr);
     let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
     let rows = parent.collect_access_rows_with_limit_unordered(access, Some(&expr), 1, 0)?;
     Ok(!rows.is_empty())
+}
+
+/// Holds each of `values` of the column `fk` references in `parent_table`
+/// alone until the transaction ends. Taken before the rows pointing at a
+/// key are read: a child check of the key then waits for this transaction,
+/// or has committed and the read finds its row
+fn hold_alone<'v>(
+    engine: &MVCCEngine,
+    txn_id: i64,
+    parent_table: &str,
+    fk: &ForeignKeyConstraint,
+    values: impl IntoIterator<Item = &'v Value>,
+) -> Result<()> {
+    let schema = engine.get_table_schema(parent_table)?;
+    // A name stored in lower case is found without lowering it again
+    let at = schema
+        .column_index_map()
+        .get(fk.referenced_column.as_str())
+        .copied()
+        .or_else(|| schema.find_column(&fk.referenced_column).map(|(at, _)| at))
+        .ok_or_else(|| {
+            Error::internal(format!(
+                "foreign key references non-existent column '{}' in table '{}'",
+                fk.referenced_column, parent_table
+            ))
+        })?;
+    let column = &schema.columns[at].name;
+    for value in values.into_iter().filter(|v| !v.is_null()) {
+        engine.hold_key(txn_id, parent_table, column, value, true)?;
+    }
+    Ok(())
 }
 
 /// Find all foreign key constraints in other tables that reference the given parent table.
@@ -180,6 +218,9 @@ pub(crate) fn pre_check_delete_keys(
     values: &[&Value],
     referencing_fks: &[(String, ForeignKeyConstraint)],
 ) -> Result<()> {
+    for (_, fk) in referencing_fks {
+        hold_alone(engine, txn_id, parent_table, fk, values.iter().copied())?;
+    }
     if !fk_tree_can_refuse_delete(engine, referencing_fks, 0) {
         return Ok(());
     }
@@ -341,6 +382,9 @@ pub(crate) fn pre_check_restrict_for_update(
     old_value: &Value,
     referencing_fks: &[(String, ForeignKeyConstraint)],
 ) -> Result<()> {
+    for (_, fk) in referencing_fks {
+        hold_alone(engine, txn_id, parent_table, fk, [old_value])?;
+    }
     pre_check_restrict_recursive(engine, txn_id, parent_table, old_value, referencing_fks, 0)
 }
 
@@ -460,6 +504,10 @@ pub(crate) fn enforce_update_actions(
         return Ok(0);
     }
 
+    for (_, fk) in referencing_fks {
+        hold_alone(engine, txn_id, &fk.referenced_table, fk, [old_pk_value])?;
+    }
+
     let mut total_affected = 0i32;
 
     for (child_table_name, fk) in referencing_fks {
@@ -523,26 +571,73 @@ fn child_rows_exist(
     Ok(!rows.is_empty())
 }
 
-/// The filter `column = value` over `schema`. A number against a numeric
-/// column is read as the column's type as a pushed-down equality reads it,
-/// so every layer finds the rows that compare equal whichever numeric type
-/// the other side has; any other value is compared as it is, both ways
+/// Refuses with a write conflict a snapshot transaction's action on the
+/// children of `parent_value` that would change a row committed after its
+/// snapshot, which the snapshot does not see
+fn check_children_seen(
+    engine: &MVCCEngine,
+    txn_id: i64,
+    child_table: &str,
+    fk: &ForeignKeyConstraint,
+    parent_value: &Value,
+) -> Result<()> {
+    if !engine.reads_snapshot(txn_id) {
+        return Ok(());
+    }
+    let ids = |child: Box<dyn crate::storage::traits::Table>| -> Result<I64Set> {
+        let schema = child.schema();
+        let expr = key_filter(schema, key_position(schema, fk)?, parent_value);
+        Ok(child
+            .collect_all_rows(Some(&expr))?
+            .iter()
+            .map(|(id, _)| *id)
+            .collect())
+    };
+    let seen = ids(engine.get_table_as_seen(txn_id, child_table)?)?;
+    let newest = ids(engine.get_table_for_txn(txn_id, child_table)?)?;
+    let unseen = newest.iter().find(|&id| !seen.contains(id));
+    match unseen {
+        Some(id) => Err(Error::internal(format!(
+            "write conflict: row {id} of table '{child_table}' was committed after the transaction's snapshot"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The filter `column = value` over `schema`, with `value` read as
+/// [`key_value`] reads it
 fn key_filter(
     schema: &Schema,
     column: usize,
     value: &Value,
 ) -> crate::storage::expression::ComparisonExpr {
+    filter_on(schema, column, key_value(schema, column, value))
+}
+
+/// `value` as `column` compares it. A number against a numeric column is
+/// read as the column's type as a pushed-down equality reads it, so every
+/// layer finds the rows that compare equal whichever numeric type the other
+/// side has; any other value is compared as it is, both ways
+fn key_value(schema: &Schema, column: usize, value: &Value) -> Value {
     let column = &schema.columns[column];
     let numbers =
         column.data_type.is_numeric() && matches!(value, Value::Integer(_) | Value::Float(_));
-    let value = numbers
+    numbers
         .then(|| super::pushdown::coerce_constant(Some(column.data_type), value.clone()))
         .flatten()
-        .unwrap_or_else(|| value.clone());
+        .unwrap_or_else(|| value.clone())
+}
+
+/// The filter `column = key` over `schema`, `key` as [`key_value`] gives it
+fn filter_on(
+    schema: &Schema,
+    column: usize,
+    key: Value,
+) -> crate::storage::expression::ComparisonExpr {
     let mut expr = crate::storage::expression::ComparisonExpr::new(
-        column.name.as_str(),
+        schema.columns[column].name.as_str(),
         crate::core::Operator::Eq,
-        value,
+        key,
     );
     expr.prepare_for_schema(schema);
     expr
@@ -597,6 +692,7 @@ fn cascade_delete_recursive(
             MAX_CASCADE_DEPTH
         )));
     }
+    check_children_seen(engine, txn_id, child_table, fk, parent_pk_value)?;
 
     // Before deleting child rows, read what the keys beneath the child point
     // at. Each such key names a column of the child, its primary key or
@@ -632,6 +728,16 @@ fn cascade_delete_recursive(
                 deleted_child_keys.push((gfk_idx, values));
             }
         }
+    }
+
+    for (gfk_idx, values) in &deleted_child_keys {
+        hold_alone(
+            engine,
+            txn_id,
+            child_table,
+            &grandchild_fks[*gfk_idx].1,
+            values,
+        )?;
     }
 
     // Pre-check: verify grandchild RESTRICT constraints BEFORE deleting child rows.
@@ -750,6 +856,7 @@ fn cascade_update_recursive(
             MAX_CASCADE_DEPTH
         )));
     }
+    check_children_seen(engine, txn_id, child_table, fk, old_value)?;
 
     // Find grandchild FKs that reference the column being updated
     let grandchild_fks = find_referencing_fks(engine, child_table);
@@ -759,6 +866,10 @@ fn cascade_update_recursive(
         .iter()
         .filter(|(_, gfk)| gfk.referenced_column == *child_fk_col)
         .collect();
+
+    for (_, grandchild_fk) in &relevant_grandchild_fks {
+        hold_alone(engine, txn_id, child_table, grandchild_fk, [old_value])?;
+    }
 
     // Pre-check: verify grandchild RESTRICT constraints BEFORE updating child rows
     if !relevant_grandchild_fks.is_empty() {
@@ -883,6 +994,7 @@ fn set_null_on_delete(
     fk: &ForeignKeyConstraint,
     parent_pk_value: &Value,
 ) -> Result<i32> {
+    check_children_seen(engine, txn_id, child_table, fk, parent_pk_value)?;
     let mut child = engine.get_table_for_txn(txn_id, child_table)?;
 
     // Check that the FK column is nullable

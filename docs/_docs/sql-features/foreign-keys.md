@@ -214,6 +214,27 @@ ROLLBACK;
 -- All rows are back to their original state
 ```
 
+### Concurrent Transactions
+
+A child row's FK check and a delete or key change of its parent row in two open transactions never both commit. The second of the two to reach the key fails with a write conflict, which can be retried once the first transaction has ended:
+
+```sql
+-- Session A
+BEGIN;
+DELETE FROM parents WHERE id = 1;
+
+-- Session B
+INSERT INTO children VALUES (3, 1, 'Child');
+-- Error: write conflict: key id = 1 of table 'parents' is held by transaction ...
+
+-- Session A
+COMMIT;
+```
+
+The same holds the other way round: while a transaction that inserted or updated a child of parent 1 is open, a delete of parent 1, or an update of the column the key references, fails with a write conflict. Child rows of the same parent inserted by several transactions at once do not conflict with each other.
+
+FK checks read the newest committed rows, also in a transaction under `SNAPSHOT` isolation. A child insert in such a transaction fails if its parent was deleted after the transaction began. A parent delete or key change finds the children committed after the transaction began: `RESTRICT` refuses it as usual, and a `CASCADE` or `SET NULL` that would change such a child fails with a write conflict, since the transaction's snapshot does not see that row.
+
 ## DDL Interactions
 
 ### DROP TABLE
@@ -311,6 +332,8 @@ SHOW INDEXES FROM employees;
 | DELETE CASCADE | O(K log N) | K = number of child rows to delete |
 | DELETE SET NULL | O(K log N) | K = number of child rows to update |
 | Non-FK table operations | Zero cost | All checks short-circuit immediately |
+
+Each FK check also holds the parent key until its transaction ends: one lock and one hash entry on the parent table per checked key.
 
 ## Persistence
 

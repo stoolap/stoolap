@@ -40,6 +40,7 @@ pub mod commit_log;
 pub mod engine;
 pub mod file_lock;
 pub mod index_plan;
+pub(crate) mod key_hold;
 pub mod persistence;
 pub mod registry;
 pub mod scanner;
