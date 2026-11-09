@@ -1052,6 +1052,9 @@ fn distinct_matches_an_order_by_rowid_to_the_list_as_written() {
             "SELECT DISTINCT n.* FROM n ORDER BY n._rowid_",
             "SELECT DISTINCT k.* FROM k CROSS JOIN (SELECT _rowid_ FROM n) d ORDER BY k._rowid_",
             "SELECT * FROM (SELECT DISTINCT * FROM n ORDER BY _rowid_) d",
+            "SELECT DISTINCT \"_rowid_\" AS x, a FROM k ORDER BY _rowid_",
+            "SELECT DISTINCT \"_rowid_\" + 1 AS x, a FROM n ORDER BY _rowid_ + 1",
+            "SELECT DISTINCT _rowid_, a FROM k ORDER BY \"_rowid_\"",
         ] {
             assert!(error(db, sql).contains("SELECT DISTINCT list"), "{sql}");
         }

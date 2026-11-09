@@ -332,13 +332,7 @@ fn column_determined<'i>(
 ) -> bool {
     let outer = matches!(column, Expression::QualifiedIdentifier(c)
         if !level.contains(&c.qualifier.value_lower.as_str()));
-    let hidden = match column {
-        Expression::Identifier(c) => !c.quoted && crate::core::is_rowid_name(&c.value_lower),
-        Expression::QualifiedIdentifier(c) => {
-            !c.name.quoted && crate::core::is_rowid_name(&c.name.value_lower)
-        }
-        _ => false,
-    } && !star_shows(column);
+    let hidden = reads_identity(column) && !star_shows(column);
     outer
         || items.into_iter().any(|item| match item {
             Expression::Star(_) | Expression::QualifiedStar(_) if hidden => false,
@@ -400,11 +394,26 @@ fn scalar_of(expr: &Expression, column: &mut dyn FnMut(&Expression) -> bool) -> 
     }
 }
 
+/// Whether `column` reads the row identity: an unquoted `_rowid_`, which a
+/// quoted name of its spelling is not
+fn reads_identity(column: &Expression) -> bool {
+    match column {
+        Expression::Identifier(c) => !c.quoted && crate::core::is_rowid_name(&c.value_lower),
+        Expression::QualifiedIdentifier(c) => {
+            !c.name.quoted && crate::core::is_rowid_name(&c.name.value_lower)
+        }
+        _ => false,
+    }
+}
+
 /// Whether two column references name the same column: the same name, and
 /// a qualifier on one side only when it is an entry of this query's FROM,
 /// where a bare name of a valid statement binds
 fn same_column(a: &Expression, b: &Expression, level: &[&str]) -> bool {
     let at_level = |q: &Identifier| level.contains(&q.value_lower.as_str());
+    if reads_identity(a) != reads_identity(b) {
+        return false;
+    }
     match (a, b) {
         (Expression::Identifier(x), Expression::Identifier(y)) => x.value_lower == y.value_lower,
         (Expression::QualifiedIdentifier(x), Expression::QualifiedIdentifier(y)) => {
