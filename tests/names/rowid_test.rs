@@ -747,6 +747,12 @@ fn a_bare_rowid_counts_a_derived_table_column_with_the_tables_beside_it() {
             assert!(error(db, sql).contains("ambiguous"), "{sql}");
         }
         for sql in [
+            "SELECT SUM(_rowid_) FROM k CROSS JOIN (VALUES (7)) v (x)",
+            "SELECT SUM(_rowid_) / 3 FROM k CROSS JOIN (SELECT a FROM n) d",
+        ] {
+            assert_eq!(rows(db, sql), [[int(60)]], "{sql}");
+        }
+        for sql in [
             "SELECT _rowid_ FROM k CROSS JOIN (SELECT a AS x FROM n WHERE a = 1) d ORDER BY 1",
             "SELECT (SELECT _rowid_) FROM k CROSS JOIN (SELECT a AS x FROM n WHERE a = 1) d ORDER BY 1",
             "SELECT _rowid_ FROM k CROSS JOIN (VALUES (7)) v (x) ORDER BY 1",
@@ -771,6 +777,29 @@ fn a_bare_rowid_counts_a_derived_table_column_with_the_tables_beside_it() {
             ),
             [[int(6), int(3)]]
         );
+    });
+}
+
+#[test]
+fn a_star_never_shows_the_row_id() {
+    each_layout("star", |db| {
+        db.execute("CREATE TABLE n1 (a INTEGER)", ()).unwrap();
+        db.execute("INSERT INTO n1 VALUES (10), (20)", ()).unwrap();
+        for (sql, answer) in [
+            ("SELECT (SELECT * FROM n1 WHERE _rowid_ = 2)", int(20)),
+            ("SELECT (SELECT n1.* FROM n1 WHERE _rowid_ = 1)", int(10)),
+            (
+                "SELECT 20 IN (SELECT * FROM n1 WHERE _rowid_ > 1)",
+                Value::Boolean(true),
+            ),
+        ] {
+            assert_eq!(rows(db, sql), [[answer]], "{sql}");
+        }
+        for keys in ["_rowid_, a, b", "a, b, _rowid_"] {
+            let sql = format!("SELECT *, COUNT(*) OVER () FROM n GROUP BY {keys} ORDER BY a");
+            assert_eq!(names(db, &sql), ["a", "b", "COUNT(*) OVER ()"], "{sql}");
+            assert_eq!(rows(db, &sql)[0], [int(1), text("x"), int(3)], "{sql}");
+        }
     });
 }
 
@@ -855,8 +884,13 @@ fn distinct_matches_an_order_by_rowid_to_the_list_as_written() {
             rows(db, "SELECT DISTINCT _rowid_ FROM k ORDER BY _rowid_ DESC"),
             [[int(30)], [int(20)], [int(10)]]
         );
-        let sql = "SELECT DISTINCT id FROM k ORDER BY _rowid_";
-        assert!(error(db, sql).contains("SELECT DISTINCT list"), "{sql}");
+        for sql in [
+            "SELECT DISTINCT id FROM k ORDER BY _rowid_",
+            "SELECT DISTINCT * FROM n ORDER BY _rowid_",
+            "SELECT DISTINCT n.* FROM n ORDER BY n._rowid_",
+        ] {
+            assert!(error(db, sql).contains("SELECT DISTINCT list"), "{sql}");
+        }
     });
 }
 

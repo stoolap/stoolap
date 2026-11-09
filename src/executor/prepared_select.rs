@@ -29,7 +29,7 @@ use crate::common::{CompactArc, SmartString};
 use crate::core::predicate::{kind, KeySide, PredicateSet};
 use crate::core::{
     is_rowid_name, DataType, Error, Operator, Result, Row, RowVec, Schema, SchemaColumn, Value,
-    ROWID_SLOT,
+    ROWID_NAME, ROWID_SLOT,
 };
 use crate::functions::aggregate::{CallTemplate, ColumnsKey, CompiledAggregate, GroupedAggregates};
 use crate::functions::{global_registry, FunctionRegistry, Volatility};
@@ -878,12 +878,17 @@ fn star_items(items: &[Expression], scope: &ScopeTable) -> Result<Option<Vec<Exp
                 continue;
             }
         }
-        written.extend(scope.lower.iter().enumerate().map(|(index, column)| {
-            Expression::Column(ColumnRef {
-                index: index as u32,
-                name: ident(column, column),
-            })
-        }));
+        written.extend(
+            star_columns(scope, scope.lower.len())
+                .into_iter()
+                .map(|index| {
+                    let column = &scope.lower[index];
+                    Expression::Column(ColumnRef {
+                        index: index as u32,
+                        name: ident(column, column),
+                    })
+                }),
+        );
     }
     Ok(Some(written))
 }
@@ -2333,15 +2338,25 @@ impl Executor {
         }
         let cte = |name: &str| {
             let ctes = stmt.with.iter().flat_map(|with| &with.ctes);
-            ctes.into_iter().any(|cte| cte.name.value_lower == name)
+            ctes.into_iter().find(|cte| cte.name.value_lower == name)
         };
         // Each entry's name and its table's schema; None for an entry that
-        // reads no stored table's rows
+        // reads no stored table's rows, which `others` says may still hold
+        // a `_rowid_` a bare one would read
         let mut entries: SmallVec<[Option<NamedSchema>; 2]> = SmallVec::new();
+        let mut others = false;
         for leaf in leaves {
             let entry = match leaf {
-                Expression::TableSource(ts) if ts.as_of.is_none() && !cte(&ts.name.value_lower) => {
-                    match self.named(ctx, &ts.name.value_lower)? {
+                Expression::TableSource(ts) if ts.as_of.is_some() => {
+                    others = true;
+                    None
+                }
+                Expression::TableSource(ts) => match cte(&ts.name.value_lower) {
+                    Some(cte) => {
+                        others |= names_rowid(&cte.query);
+                        None
+                    }
+                    None => match self.named(ctx, &ts.name.value_lower)? {
                         Named::Table => self
                             .engine
                             .get_table_schema(&ts.name.value_lower)
@@ -2352,22 +2367,43 @@ impl Executor {
                                     schema,
                                 )
                             }),
-                        _ => None,
-                    }
+                        Named::Cte((columns, _)) => {
+                            others |= columns.iter().any(|c| c.eq_ignore_ascii_case(ROWID_NAME));
+                            None
+                        }
+                        Named::View(_) => {
+                            others = true;
+                            None
+                        }
+                    },
+                },
+                Expression::SubquerySource(derived) => {
+                    others |= names_rowid(&derived.subquery);
+                    None
                 }
-                _ => None,
+                Expression::ValuesSource(_) | Expression::FunctionTableSource(_) => None,
+                _ => {
+                    others = true;
+                    None
+                }
             };
             entries.push(entry);
         }
+        // A bare rowid reads the one stored table's when no other entry can hold one
+        let mut stored = entries.iter().flatten();
+        let lone = match (stored.next(), stored.next()) {
+            (Some(entry), None) if !others => Some(entry),
+            _ => None,
+        };
         let mut spelled = |expr: &Expression| -> Result<Option<Expression>> {
             let entry = match expr {
                 Expression::QualifiedIdentifier(q) => entries
                     .iter()
                     .flatten()
                     .find(|(name, _)| *name == q.qualifier.value_lower),
-                Expression::Identifier(_) => match entries.as_slice() {
-                    [Some(entry)] => Some(entry),
-                    _ => return Ok(None),
+                Expression::Identifier(_) => match lone {
+                    Some(entry) => Some(entry),
+                    None => return Ok(None),
                 },
                 _ => return Ok(None),
             };
@@ -8877,12 +8913,7 @@ impl PreparedSelect {
         let window = (windowed && !aggregated)
             .then(|| {
                 executor
-                    .prepared_window_plan(
-                        computed,
-                        (&scope.columns, star_width(&scope, scope.columns.len())),
-                        ctx,
-                        &windows,
-                    )
+                    .prepared_window_plan(computed, &scope.columns, ctx, &windows)
                     .ok()
                     .flatten()
             })
@@ -9758,7 +9789,7 @@ impl PreparedGrouped {
                 executor
                     .prepared_window_plan(
                         &stmt,
-                        (&read_names(&schema, scope.widens()), schema.columns.len()),
+                        &read_names(&schema, scope.widens()),
                         ctx,
                         &windows,
                     )

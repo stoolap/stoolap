@@ -39,6 +39,7 @@ use std::sync::{Arc, OnceLock};
 use crate::common::{CompactVec, SmartString, StringMap};
 use crate::core::row_vec::RowVec;
 use crate::core::value::NULL_VALUE;
+use crate::core::ROWID_SLOT;
 
 /// Stack constant for COUNT(*) accumulation by reference
 const COUNT_ONE: Value = Value::Integer(1);
@@ -1314,11 +1315,7 @@ impl Executor {
         // sort reads and the projection then drops
         let written_items = stmt.columns.len();
         let stmt = Self::with_hidden_order_by_windows(stmt);
-        // A row's id carried past its columns is no column a star shows
-        let slot = base_columns
-            .last()
-            .is_some_and(|c| c == crate::core::ROWID_SLOT);
-        let visible_columns = base_columns.len() - usize::from(slot);
+        let visible_columns = base_columns.len();
 
         let plan = self.window_plan(
             stmt,
@@ -1356,7 +1353,7 @@ impl Executor {
     pub(crate) fn prepared_window_plan(
         &self,
         stmt: &SelectStatement,
-        (columns, visible): (&[String], usize),
+        columns: &[String],
         ctx: &ExecutionContext,
         held: &HeldWindow,
     ) -> Result<Option<WindowPlan<'static>>> {
@@ -1377,7 +1374,7 @@ impl Executor {
         }
         self.window_plan(
             std::borrow::Cow::Owned(extended),
-            (columns, visible, stmt.columns.len()),
+            (columns, columns.len(), stmt.columns.len()),
             &FxHashMap::default(),
             (ctx, None, Some(held)),
         )
@@ -2491,8 +2488,9 @@ impl Executor {
                     }
                 }
                 Expression::Star(_) => {
-                    // SELECT * - include all base columns
-                    for (idx, col) in base_columns.iter().take(visible_columns).enumerate() {
+                    // SELECT * - include all base columns but a row id slot
+                    let columns = base_columns.iter().take(visible_columns).enumerate();
+                    for (idx, col) in columns.filter(|(_, col)| *col != ROWID_SLOT) {
                         items.push(SelectItem {
                             output_name: col.clone(),
                             source: SelectItemSource::BaseColumn(idx),
@@ -2510,10 +2508,12 @@ impl Executor {
                         &qs.qualifier,
                         table_alias.as_deref(),
                         |idx, start| {
-                            items.push(SelectItem {
-                                output_name: visible[idx][start..].to_string(),
-                                source: SelectItemSource::BaseColumn(idx),
-                            })
+                            if visible[idx] != ROWID_SLOT {
+                                items.push(SelectItem {
+                                    output_name: visible[idx][start..].to_string(),
+                                    source: SelectItemSource::BaseColumn(idx),
+                                })
+                            }
                         },
                     );
                 }

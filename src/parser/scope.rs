@@ -304,8 +304,17 @@ fn column_determined<'i>(
 ) -> bool {
     let outer = matches!(column, Expression::QualifiedIdentifier(c)
         if !level.contains(&c.qualifier.value_lower.as_str()));
+    // No star shows the row's identity
+    let rowid = match column {
+        Expression::Identifier(c) => !c.quoted && crate::core::is_rowid_name(&c.value_lower),
+        Expression::QualifiedIdentifier(c) => {
+            !c.name.quoted && crate::core::is_rowid_name(&c.name.value_lower)
+        }
+        _ => false,
+    };
     outer
         || items.into_iter().any(|item| match item {
+            Expression::Star(_) | Expression::QualifiedStar(_) if rowid => false,
             Expression::Star(_) => true,
             // A bare name is the starred table's when it is the one FROM entry
             Expression::QualifiedStar(star) => match column {
