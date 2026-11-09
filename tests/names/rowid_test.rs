@@ -824,11 +824,15 @@ fn columns_a_using_join_merges_are_one_rowid() {
         ] {
             assert_eq!(rows(db, sql), [[int(10)], [int(20)], [int(30)]], "{sql}");
         }
-        assert!(error(
-            db,
-            "SELECT _rowid_ FROM (SELECT _rowid_, a FROM k) a JOIN (SELECT _rowid_, a FROM k) b USING (a)"
-        )
-        .contains("ambiguous"));
+        for sql in [
+            "SELECT _rowid_ FROM (SELECT _rowid_, a FROM k) a JOIN (SELECT _rowid_, a FROM k) b USING (a)",
+            "SELECT _rowid_ FROM k a JOIN k b USING (id)",
+            "SELECT (SELECT _rowid_) FROM k a JOIN k b USING (id)",
+            "SELECT (SELECT _rowid_) FROM k a NATURAL JOIN k b",
+            "SELECT a.id FROM k a JOIN k b USING (id) WHERE EXISTS (SELECT 1 WHERE _rowid_ > 10)",
+        ] {
+            assert!(error(db, sql).contains("ambiguous"), "{sql}");
+        }
     });
 }
 

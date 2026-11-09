@@ -2776,10 +2776,14 @@ impl Chain<'_> {
         let rowid = !id.quoted && is_rowid_name(&id.value_lower);
         for (depth, scope) in self.scopes.iter().enumerate() {
             if rowid {
-                // A pair a USING or NATURAL join merges is one column
+                // A pair of `_rowid_` columns a USING or NATURAL join merges is
+                // one column; merged keys of two tables stay two identities
                 let merged = |at: &Option<usize>| {
                     scope.rowids.iter().any(|(_, first)| match (first, at) {
-                        (Some(first), Some(at)) => scope.merged.contains(&(*first, *at)),
+                        (Some(first), Some(at)) => {
+                            is_rowid_name(&scope.lower[*at])
+                                && scope.merged.contains(&(*first, *at))
+                        }
                         _ => false,
                     })
                 };
