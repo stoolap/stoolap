@@ -441,6 +441,42 @@ fn test_a_top_level_set_test_reads_only_the_rows_its_members_name() {
 }
 
 #[test]
+fn test_runs_of_a_not_in_by_the_primary_key_collect_the_ids_left_out_once() {
+    use stoolap::test_failpoints::{left_out_ids_collections, prepared_rows_narrowed};
+    let _guard = serial();
+    let db = setup("left_out");
+    db.execute("CREATE TABLE big (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO big SELECT value, value FROM generate_series(1, 12)",
+        (),
+    )
+    .unwrap();
+    let sql = "SELECT id FROM big WHERE id NOT IN (SELECT v FROM u WHERE v IS NOT NULL) LIMIT 3";
+    let collected = left_out_ids_collections();
+    for run in 1..=3 {
+        let before = prepared_rows_narrowed();
+        assert_eq!(ids(&db, sql), Ok(vec![2, 3, 5]), "run {run}");
+        assert!(
+            prepared_rows_narrowed() > before,
+            "run {run} read big by its members"
+        );
+    }
+    assert_eq!(
+        left_out_ids_collections() - collected,
+        1,
+        "the runs collect the ids left out once"
+    );
+    db.execute("INSERT INTO u VALUES (9, 2, 2, 1)", ()).unwrap();
+    assert_eq!(ids(&db, sql), Ok(vec![3, 5, 6]), "after a write");
+    assert_eq!(
+        left_out_ids_collections() - collected,
+        2,
+        "a changed table collects them again"
+    );
+}
+
+#[test]
 fn test_a_probe_reads_only_members_its_equality_answers() {
     let _guard = serial();
     let db = setup("domains");

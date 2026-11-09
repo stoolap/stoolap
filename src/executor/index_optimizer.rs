@@ -455,10 +455,12 @@ impl Executor {
     }
 
     /// The rows whose `column`, the table's primary key, is none of
-    /// `members`, in key order and up to `target`; None for another column
+    /// `members`, in key order and up to `target`; None for another column.
+    /// The row ids left out are collected into `left_out` on first need
     pub(crate) fn rows_without_members<'v>(
         table: &dyn Table,
         column: &str,
+        left_out: &std::sync::OnceLock<I64Set>,
         members: impl Iterator<Item = &'v Value> + 'v,
         target: Option<usize>,
     ) -> Result<Option<RowVec>> {
@@ -466,8 +468,12 @@ impl Executor {
         if !Self::is_primary_key(table, column) {
             return Ok(None);
         }
-        let excluded: I64Set = Self::primary_key_members(members).collect();
-        let ids = table.visible_row_ids_excluding(&excluded, target.unwrap_or(usize::MAX))?;
+        let excluded = left_out.get_or_init(|| {
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::left_out_ids_collected();
+            Self::primary_key_members(members).collect()
+        });
+        let ids = table.visible_row_ids_excluding(excluded, target.unwrap_or(usize::MAX))?;
         Self::fetch_rows_up_to(table, &ids, &ConstBoolExpr::true_expr(), usize::MAX).map(Some)
     }
 

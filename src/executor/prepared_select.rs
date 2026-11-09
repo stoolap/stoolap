@@ -15372,7 +15372,7 @@ impl<'a> PreparedRunner<'a> {
                 .iter()
                 .filter(|(_, outcome)| matches!(outcome, ExistsOutcome::Passed))
                 .filter_map(|(key, _)| key.first());
-            Executor::rows_without_members(table, column, passing, enough)?
+            Executor::rows_without_members(table, column, &set.left_out, passing, enough)?
         } else {
             let members = set.outcomes.keys().filter_map(|key| key.first());
             Executor::rows_of_members(table, column, members, target.is_some(), enough)?
@@ -16600,10 +16600,7 @@ impl PreparedRunner<'_> {
                 if let Some(e) = rows.last_error() {
                     return Err(e);
                 }
-                KeptMembers {
-                    set: member_set(test, row.len(), values, false),
-                    failed: None,
-                }
+                KeptMembers::new(member_set(test, row.len(), values, false), None)
             }
             Answer::Members(_, members) => {
                 self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller, site)?;
@@ -16772,7 +16769,7 @@ impl PreparedRunner<'_> {
                     return Err(e);
                 }
                 let set = member_set(test, width, values, true);
-                let members = KeptMembers { set, failed: None };
+                let members = KeptMembers::new(set, None);
                 Ok(BlockAnswer::Members(CompactArc::new(members)))
             })
         })?;
@@ -17203,10 +17200,10 @@ impl PreparedRunner<'_> {
                         .collect(),
                     None => values,
                 };
-                return Ok(KeptMembers {
-                    set: member_set(members.test, width, values, true),
-                    failed: None,
-                });
+                return Ok(KeptMembers::new(
+                    member_set(members.test, width, values, true),
+                    None,
+                ));
             }
             let rows = self.group_rows(index, grouping)?;
             let mut vm = self.blocks[index].vm.borrow_mut();
@@ -17223,15 +17220,14 @@ impl PreparedRunner<'_> {
                     failed.get_or_insert(deferred(e)?);
                 }
             }
-            return Ok(KeptMembers {
-                set: member_set(members.test, width, values, true),
+            return Ok(KeptMembers::new(
+                member_set(members.test, width, values, true),
                 failed,
-            });
+            ));
         }
         let mut grouped = self.group_members(index, members, plan)?;
-        Ok(grouped.remove(&[][..]).unwrap_or_else(|| KeptMembers {
-            set: member_set(members.test, width, Vec::new(), true),
-            failed: None,
+        Ok(grouped.remove(&[][..]).unwrap_or_else(|| {
+            KeptMembers::new(member_set(members.test, width, Vec::new(), true), None)
         }))
     }
 
@@ -17264,7 +17260,7 @@ impl PreparedRunner<'_> {
                 }
             }
             let set = member_set(members.test, members.width(), values, true);
-            return Ok(std::iter::once((SmallVec::new(), KeptMembers { set, failed })).collect());
+            return Ok(std::iter::once((SmallVec::new(), KeptMembers::new(set, failed))).collect());
         }
         let mut vm = self.blocks[index].vm.borrow_mut();
         let params = self.blocks[index].buffer.borrow();
@@ -17327,10 +17323,10 @@ impl PreparedRunner<'_> {
             .map(|(key, (values, failed))| {
                 (
                     key,
-                    KeptMembers {
-                        set: member_set(members.test, members.width(), values, plan.is_none()),
+                    KeptMembers::new(
+                        member_set(members.test, members.width(), values, plan.is_none()),
                         failed,
-                    },
+                    ),
                 )
             })
             .collect())
@@ -17381,8 +17377,13 @@ impl PreparedRunner<'_> {
             if set_of.has_null() || unknown {
                 return Ok(whole.then(|| (RowVec::new(), true)));
             }
-            let rows =
-                Executor::rows_without_members(table, name, values, target.filter(|_| whole))?;
+            let rows = Executor::rows_without_members(
+                table,
+                name,
+                &set.left_out,
+                values,
+                target.filter(|_| whole),
+            )?;
             return Ok(rows.map(|rows| (rows, true)));
         }
         let rows = Executor::rows_of_members(

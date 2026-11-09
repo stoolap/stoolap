@@ -292,6 +292,9 @@ pub enum ExistsOutcome {
 pub struct ExistsKeys {
     pub outcomes: FxHashMap<SmallVec<[Value; 1]>, ExistsOutcome>,
     pub failed: bool,
+    /// The row ids of the keys that passed, which a NOT EXISTS read by the
+    /// primary key leaves out, collected once for every run
+    pub left_out: std::sync::OnceLock<crate::common::I64Set>,
 }
 
 /// A value block's members as one test asks them
@@ -313,9 +316,20 @@ pub enum MemberSet {
 pub struct KeptMembers {
     pub set: MemberSet,
     pub failed: Option<crate::core::Error>,
+    /// The row ids a NOT IN read by the primary key leaves out, collected
+    /// once for every run
+    pub left_out: std::sync::OnceLock<crate::common::I64Set>,
 }
 
 impl KeptMembers {
+    pub(crate) fn new(set: MemberSet, failed: Option<crate::core::Error>) -> Self {
+        Self {
+            set,
+            failed,
+            left_out: std::sync::OnceLock::new(),
+        }
+    }
+
     /// `value` tested against the members: a member that settles the test
     /// (TRUE for IN and ANY, FALSE for ALL) wins; else the first error a
     /// candidate raised; else what the members say
