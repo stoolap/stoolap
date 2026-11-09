@@ -2372,7 +2372,18 @@ impl Executor {
             };
             Ok(Some(qualified_reference(name, column)))
         };
-        let spelled = spelled_statement(stmt, &mut spelled)?;
+        // How many columns a star over the entries shows, when one is known
+        let star_width = |item: &Expression| match item {
+            Expression::Star(_) => match entries.as_slice() {
+                [Some((_, schema))] => Some(schema.columns.len()),
+                _ => None,
+            },
+            Expression::QualifiedStar(star) => (entries.iter().flatten())
+                .find(|(name, _)| name.eq_ignore_ascii_case(&star.qualifier))
+                .map(|(_, schema)| schema.columns.len()),
+            _ => None,
+        };
+        let spelled = spelled_statement(stmt, &mut spelled, &star_width)?;
         Ok((spelled != *stmt).then_some(spelled))
     }
 }
@@ -2396,6 +2407,7 @@ fn from_leaves<'e>(from: &'e Expression, out: &mut Vec<&'e Expression>) {
 fn spelled_statement(
     stmt: &SelectStatement,
     spelled: &mut dyn FnMut(&Expression) -> Result<Option<Expression>>,
+    star_width: &dyn Fn(&Expression) -> Option<usize>,
 ) -> Result<SelectStatement> {
     let mut spell = |expr: &Expression| rowids_respelled(expr, spelled);
     let mut out = stmt.clone();
@@ -2420,8 +2432,20 @@ fn spelled_statement(
     };
     // A set operation's ORDER BY sorts its output: a key names an output
     // column, or is an item's expression, which reads that item's position
-    let starred = (stmt.columns.iter())
-        .any(|c| matches!(c, Expression::Star(_) | Expression::QualifiedStar(_)));
+    // in the output, a star counting the columns it shows
+    let position = |identity: &ExprKey| -> Option<usize> {
+        let mut at = 0;
+        for item in &stmt.columns {
+            if ExprKey::of(unaliased(item)) == *identity {
+                return Some(at + 1);
+            }
+            at += match item {
+                Expression::Star(_) | Expression::QualifiedStar(_) => star_width(item)?,
+                _ => 1,
+            };
+        }
+        None
+    };
     let order_by = match stmt.set_operations.is_empty() {
         true => out.order_by.as_mut_slice(),
         false => {
@@ -2431,11 +2455,8 @@ fn spelled_statement(
                     key.expression,
                     Expression::Identifier(_) | Expression::QualifiedIdentifier(_)
                 ) && expr_names_rowid(&key.expression);
-                let identity = ExprKey::of(&key.expression);
-                let at = (stmt.columns.iter())
-                    .position(|written| ExprKey::of(unaliased(written)) == identity);
-                if let (Some(at), true, false) = (at, moves, starred) {
-                    key.expression = value_to_expression(&Value::Integer(at as i64 + 1));
+                if let Some(at) = position(&ExprKey::of(&key.expression)).filter(|_| moves) {
+                    key.expression = value_to_expression(&Value::Integer(at as i64));
                 }
             }
             &mut []

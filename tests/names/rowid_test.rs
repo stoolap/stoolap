@@ -406,6 +406,28 @@ fn rowid_reads_alike_in_every_clause() {
                 ],
                 "a set operation's ORDER BY position beside items alike to it in {t}"
             );
+            // A star before the item counts every column it shows
+            let other = if t == "kr" { "0, 99, 0" } else { "99, 0" };
+            let first = if t == "kr" {
+                vec![int(0), int(99), int(0)]
+            } else {
+                vec![int(99), int(0)]
+            };
+            for star in ["*", &format!("{t}.*")] {
+                let sql = format!(
+                    "SELECT {star}, _rowid_ + 0 AS r FROM {t} UNION ALL SELECT {other} ORDER BY _rowid_ + 0"
+                );
+                let answer = rows(db, &sql);
+                assert_eq!(answer[0], first, "{sql}");
+                assert_eq!(
+                    answer
+                        .iter()
+                        .map(|row| row.last().cloned())
+                        .collect::<Vec<_>>(),
+                    [Some(int(0)), Some(int(1)), Some(int(2)), Some(int(3))],
+                    "{sql}"
+                );
+            }
         }
         assert_eq!(
             rows(db, "SELECT _rowid_, _rowid_ + 0 FROM nr WHERE a = 10"),
