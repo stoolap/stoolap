@@ -1891,18 +1891,12 @@ pub(crate) fn expr_names_rowid(expr: &Expression) -> bool {
 /// Whether `stmt`, or a statement inside it, names an unquoted rowid
 pub(crate) fn names_rowid(stmt: &SelectStatement) -> bool {
     let names = expr_names_rowid;
-    // A set's expression may be one its distinct columns hold another of
-    let sets = match &stmt.group_by.modifier {
-        GroupByModifier::GroupingSets(sets) => sets.as_slice(),
-        _ => &[],
-    };
     stmt.columns
         .iter()
         .chain(&stmt.distinct_on)
         .chain(stmt.table_expr.as_deref())
         .chain(stmt.where_clause.as_deref())
         .chain(&stmt.group_by.columns)
-        .chain(sets.iter().flatten())
         .chain(stmt.having.as_deref())
         .chain(stmt.order_by.iter().map(|o| &o.expression))
         .chain(stmt.window_defs.iter().flat_map(|w| w.expressions()))

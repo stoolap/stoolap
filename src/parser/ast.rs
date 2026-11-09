@@ -822,11 +822,13 @@ impl Identifier {
             }
         } else {
             let value_lower = value.to_lowercase();
+            // Quoting does not change the name of the row identity
+            let quoted = token.quoted && !crate::core::is_rowid_name(&value_lower);
             Self {
                 value,
                 value_lower,
                 position: token.position,
-                quoted: token.quoted,
+                quoted,
             }
         }
     }
@@ -834,13 +836,11 @@ impl Identifier {
 
 impl fmt::Display for Identifier {
     /// The name as the lexer reads it back as one name: quoted, its quotes
-    /// doubled, when it holds a character a bare name cannot, or is a
-    /// quoted name of the row identity's spelling, which bare reads the row
+    /// doubled, when it holds a character a bare name cannot
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut chars = self.value.chars();
         let bare = chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
-            && chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$')
-            && !(self.quoted && crate::core::is_rowid_name(&self.value_lower));
+            && chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$');
         if bare {
             write!(f, "{}", self.value)
         } else {

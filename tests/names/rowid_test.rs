@@ -197,8 +197,8 @@ fn reads(db: &Database, t: &str, [i1, i2, i3]: [i64; 3]) {
     );
     assert_eq!(
         q("SELECT \"_rowid_\" FROM $t WHERE a = 1"),
-        [[text("_rowid_")]],
-        "a quoted name is no rowid in {t}"
+        [[int(i1)]],
+        "a quoted name is the rowid in {t}"
     );
     assert!(
         error(db, &format!("SELECT _rowid_ FROM (SELECT * FROM {t}) d")).contains("not found"),
@@ -937,45 +937,50 @@ fn a_bare_rowid_counts_a_derived_table_column_with_the_tables_beside_it() {
 }
 
 #[test]
-fn a_quoted_rowid_name_stays_a_name_through_views_keys_and_groups() {
+fn a_quoted_rowid_is_the_row_identity_in_every_place() {
     each_layout("quoted", |db| {
         db.execute("CREATE VIEW vq AS SELECT \"_rowid_\" AS q, a FROM k", ())
             .unwrap();
+        let ids = || vec![[int(10)], [int(20)], [int(30)]];
+        for sql in [
+            "SELECT q FROM vq ORDER BY a",
+            "SELECT DISTINCT \"_rowid_\" FROM k ORDER BY _rowid_",
+            "SELECT DISTINCT \"_rowid_\" AS x FROM k GROUP BY _rowid_ ORDER BY _rowid_",
+            "SELECT DISTINCT _rowid_ FROM (SELECT _rowid_ FROM k) d ORDER BY d.\"_rowid_\"",
+            "SELECT \"_rowid_\" FROM k GROUP BY \"_rowid_\", _rowid_ ORDER BY _rowid_",
+            "SELECT (SELECT \"_rowid_\") FROM k ORDER BY (SELECT _rowid_)",
+            "SELECT DISTINCT \"_rowid_\" FROM k GROUP BY _rowid_ ORDER BY id",
+        ] {
+            assert_eq!(rows(db, sql), ids(), "{sql}");
+        }
+        assert!(error(db, "SELECT DISTINCT \"_rowid_\" FROM k ORDER BY id")
+            .contains("SELECT DISTINCT list"));
+        let last = |sql: &str| -> Vec<Value> {
+            rows(db, sql)
+                .iter()
+                .map(|row| row[row.len() - 1].clone())
+                .collect()
+        };
         assert_eq!(
-            rows(db, "SELECT q FROM vq WHERE a = 1"),
-            [[text("_rowid_")]]
-        );
-        // Over a stored table the quoted name is text; over a derived table
-        // it names the same `_rowid_` column as the bare one
-        for (from, lit) in [
-            ("k", text("_rowid_")),
-            ("(SELECT _rowid_ FROM k) d", text("10")),
-        ] {
-            let sql = format!(
-                "SELECT CAST(\"_rowid_\" AS TEXT) AS lit, CAST(_rowid_ AS TEXT) AS rid FROM {from} \
+            last(
+                "SELECT CAST(\"_rowid_\" AS TEXT) AS lit, CAST(_rowid_ AS TEXT) AS rid FROM k \
                  UNION ALL SELECT 'A', '99' ORDER BY CAST(_rowid_ AS TEXT)"
-            );
-            let sorted = rows(db, &sql);
-            let rid: Vec<Value> = sorted.iter().map(|row| row[1].clone()).collect();
-            assert_eq!(
-                rid,
-                [text("10"), text("20"), text("30"), text("99")],
-                "{sql}"
-            );
-            assert_eq!(sorted[0][0], lit, "{sql}");
-        }
-        for (from, counts) in [
-            ("k", vec![1, 1, 1, 3]),
-            ("(SELECT _rowid_ FROM k) d", vec![1; 6]),
+            ),
+            [text("10"), text("20"), text("30"), text("99")]
+        );
+        for sql in [
+            "SELECT a._rowid_ FROM k a JOIN k b ON a.id = b.id UNION ALL SELECT 99 ORDER BY _rowid_",
+            "SELECT k.id + 0 AS a, _rowid_ + 0 AS b FROM k UNION ALL SELECT 0, 99 ORDER BY _rowid_ + 0",
         ] {
-            for sets in ["(\"_rowid_\"), (_rowid_)", "(_rowid_), (\"_rowid_\")"] {
-                let sql = format!(
-                    "SELECT COUNT(*) FROM {from} GROUP BY GROUPING SETS ({sets}) ORDER BY 1"
-                );
-                let want: Vec<[Value; 1]> = counts.iter().map(|&c| [int(c)]).collect();
-                assert_eq!(rows(db, &sql), want, "{sql}");
-            }
+            assert_eq!(last(sql), [int(10), int(20), int(30), int(99)], "{sql}");
         }
+        assert_eq!(
+            rows(
+                db,
+                "SELECT COUNT(*) FROM k GROUP BY GROUPING SETS ((\"_rowid_\"), (_rowid_))"
+            ),
+            vec![[int(1)]; 6]
+        );
     });
 }
 
@@ -1096,9 +1101,6 @@ fn distinct_matches_an_order_by_rowid_to_the_list_as_written() {
             "SELECT DISTINCT n.* FROM n ORDER BY n._rowid_",
             "SELECT DISTINCT k.* FROM k CROSS JOIN (SELECT _rowid_ FROM n) d ORDER BY k._rowid_",
             "SELECT * FROM (SELECT DISTINCT * FROM n ORDER BY _rowid_) d",
-            "SELECT DISTINCT \"_rowid_\" AS x, a FROM k ORDER BY _rowid_",
-            "SELECT DISTINCT \"_rowid_\" + 1 AS x, a FROM n ORDER BY _rowid_ + 1",
-            "SELECT DISTINCT _rowid_, a FROM k ORDER BY \"_rowid_\"",
         ] {
             assert!(error(db, sql).contains("SELECT DISTINCT list"), "{sql}");
         }
@@ -1109,10 +1111,6 @@ fn distinct_matches_an_order_by_rowid_to_the_list_as_written() {
             "SELECT DISTINCT d.* FROM (SELECT _rowid_ FROM k) d ORDER BY d._rowid_ DESC",
             "WITH c AS (SELECT _rowid_ FROM k) SELECT DISTINCT * FROM c ORDER BY _rowid_ DESC",
             "SELECT DISTINCT * FROM kv ORDER BY _rowid_ DESC",
-            "SELECT DISTINCT d.\"_rowid_\" FROM (SELECT _rowid_ FROM k) d ORDER BY d._rowid_ DESC",
-            "SELECT DISTINCT _rowid_ FROM (SELECT _rowid_ FROM k) d ORDER BY \"_rowid_\" DESC",
-            "WITH c AS (SELECT _rowid_ FROM k) SELECT DISTINCT \"_rowid_\" FROM c ORDER BY _rowid_ DESC",
-            "SELECT DISTINCT \"_rowid_\" FROM kv ORDER BY _rowid_ DESC",
         ] {
             assert_eq!(rows(db, sql), [[int(30)], [int(20)], [int(10)]], "{sql}");
         }

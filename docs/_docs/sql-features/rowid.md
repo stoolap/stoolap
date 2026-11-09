@@ -36,7 +36,7 @@ A `WHERE _rowid_ = ?` or `WHERE _rowid_ IN (...)` reads the rows it names by the
 
 ## Name rules
 
-- A quoted `"_rowid_"` is not the row identity.
+- Quoting does not change the name: `"_rowid_"` reads the row identity as `_rowid_` does.
 - `SELECT *` never shows `_rowid_`.
 - `t._rowid_` reads the identity of table `t`. A bare `_rowid_` over two tables is ambiguous.
 - A derived table, view or CTE has a `_rowid_` only when its query selects one as an output column. A bare `_rowid_` counts it with the tables beside it, so a table joined with such a derived table makes the name ambiguous.
