@@ -917,9 +917,14 @@ fn distinct_matches_an_order_by_rowid_to_the_list_as_written() {
         ] {
             assert_eq!(rows(db, sql), [[int(30)], [int(20)], [int(10)]], "{sql}");
         }
+        db.execute("CREATE TABLE c (a INTEGER)", ()).unwrap();
         for sql in [
             "SELECT 10 IN (SELECT DISTINCT * FROM (SELECT _rowid_ FROM k) d ORDER BY _rowid_)",
             "SELECT EXISTS (SELECT DISTINCT * FROM kv ORDER BY _rowid_)",
+            "SELECT EXISTS (WITH c AS (SELECT _rowid_ FROM k) SELECT 1 FROM c CROSS JOIN (VALUES (1)) v (x) \
+             WHERE EXISTS (SELECT DISTINCT * FROM c ORDER BY _rowid_))",
+            "SELECT EXISTS (WITH c AS (SELECT _rowid_ FROM k) SELECT 1 FROM c CROSS JOIN (VALUES (1)) v (x) \
+             WHERE EXISTS (SELECT DISTINCT * FROM (SELECT * FROM c) d ORDER BY _rowid_))",
         ] {
             assert_eq!(rows(db, sql), [[Value::Boolean(true)]], "{sql}");
         }

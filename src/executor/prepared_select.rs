@@ -2332,7 +2332,7 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<Option<SelectStatement>> {
-        let rowids = self.rowid_entries(stmt, ctx)?;
+        let rowids = self.rowid_entries(stmt, ctx, &[])?;
         distinct_rowid_order(stmt, &rowids)?;
         let mut spelled = |expr: &Expression| -> Result<Option<Expression>> {
             let Some((name, schema)) = rowids.stored(expr) else {
@@ -2367,25 +2367,30 @@ impl Executor {
         Ok((spelled != *stmt).then_some(spelled))
     }
 
-    /// An error when `stmt` is a SELECT DISTINCT whose ORDER BY reads a
-    /// stored table's rowid that only a star covers
-    pub(crate) fn check_distinct_rowid_order(
+    /// An error when `stmt`, under the CTEs `around`, is a SELECT DISTINCT
+    /// whose ORDER BY reads a stored table's rowid that only a star covers
+    fn check_distinct_rowid_order(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
+        around: &[(SmartString, Vec<String>)],
     ) -> Result<()> {
         if !stmt.distinct || stmt.order_by.is_empty() || !names_rowid(stmt) {
             return Ok(());
         }
-        distinct_rowid_order(stmt, &self.rowid_entries(stmt, ctx)?)
+        distinct_rowid_order(stmt, &self.rowid_entries(stmt, ctx, around)?)
     }
 
-    /// `stmt`'s own FROM entries as a rowid reads them
+    /// `stmt`'s own FROM entries as a rowid reads them, a name read as its
+    /// own CTE, then one of `around`, innermost last, then as `ctx` reads it
     fn rowid_entries(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
+        around: &[(SmartString, Vec<String>)],
     ) -> Result<RowidEntries> {
+        let names =
+            |query: &SelectStatement| self.statement_names_under(query, ctx, around.to_vec());
         let mut leaves = Vec::new();
         if let Some(from) = stmt.table_expr.as_deref() {
             from_leaves(from, &mut leaves);
@@ -2394,6 +2399,7 @@ impl Executor {
             let ctes = stmt.with.iter().flat_map(|with| &with.ctes);
             ctes.into_iter().find(|cte| cte.name.value_lower == name)
         };
+        let outer = |name: &str| around.iter().rev().find(|(cte, _)| cte == name);
         // Whether a source's output columns hold a `_rowid_`; unknown ones may
         let holds = |names: Result<Vec<String>>| {
             names.map_or(true, |names| {
@@ -2411,35 +2417,42 @@ impl Executor {
                     others = true;
                     None
                 }
-                Expression::TableSource(ts) => match cte(&ts.name.value_lower) {
-                    Some(cte) if cte.column_names.is_empty() => {
-                        others |= holds(self.statement_names(&cte.query, ctx));
-                        None
-                    }
-                    Some(_) => None,
-                    None => match self.named(ctx, &ts.name.value_lower)? {
-                        Named::Table => self
-                            .engine
-                            .get_table_schema(&ts.name.value_lower)
-                            .ok()
-                            .map(|schema| {
-                                (
-                                    ts.alias.as_ref().unwrap_or(&ts.name).value_lower.clone(),
-                                    schema,
-                                )
-                            }),
-                        Named::Cte((columns, _)) => {
+                Expression::TableSource(ts) => {
+                    match (cte(&ts.name.value_lower), outer(&ts.name.value_lower)) {
+                        (Some(cte), _) if cte.column_names.is_empty() => {
+                            others |= holds(names(&cte.query));
+                            None
+                        }
+                        (Some(_), _) => None,
+                        (None, Some((_, columns))) => {
                             others |= columns.iter().any(|c| c.eq_ignore_ascii_case(ROWID_NAME));
                             None
                         }
-                        Named::View(view) => {
-                            others |= holds(view_names(self, &view, ctx, false));
-                            None
-                        }
-                    },
-                },
+                        (None, None) => match self.named(ctx, &ts.name.value_lower)? {
+                            Named::Table => self
+                                .engine
+                                .get_table_schema(&ts.name.value_lower)
+                                .ok()
+                                .map(|schema| {
+                                    (
+                                        ts.alias.as_ref().unwrap_or(&ts.name).value_lower.clone(),
+                                        schema,
+                                    )
+                                }),
+                            Named::Cte((columns, _)) => {
+                                others |=
+                                    columns.iter().any(|c| c.eq_ignore_ascii_case(ROWID_NAME));
+                                None
+                            }
+                            Named::View(view) => {
+                                others |= holds(view_names(self, &view, ctx, false));
+                                None
+                            }
+                        },
+                    }
+                }
                 Expression::SubquerySource(derived) => {
-                    others |= holds(self.statement_names(&derived.subquery, ctx));
+                    others |= holds(names(&derived.subquery));
                     None
                 }
                 Expression::ValuesSource(_) | Expression::FunctionTableSource(_) => None,
@@ -6790,7 +6803,8 @@ impl Builder<'_> {
         form: Form<'_>,
     ) -> Result<(u16, Vec<Delegated>, bool)> {
         where_without_aggregates(sq.where_clause.as_deref())?;
-        self.executor.check_distinct_rowid_order(sq, self.ctx)?;
+        self.executor
+            .check_distinct_rowid_order(sq, self.ctx, &self.ctes)?;
         // A value block, and a row compared with the block's one row, count
         // its rows
         let counts_rows = matches!(
@@ -12533,13 +12547,23 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<Vec<String>> {
+        self.statement_names_under(stmt, ctx, Vec::new())
+    }
+
+    /// [`Self::statement_names`] with the CTEs `ctes` around it in scope
+    fn statement_names_under(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        ctes: Vec<(SmartString, Vec<String>)>,
+    ) -> Result<Vec<String>> {
         let (_, names, _) = StatementWalk {
             executor: self,
             ctx,
             on: &mut |_| Ok(None),
             runs: false,
             visible: Vec::new(),
-            ctes: Vec::new(),
+            ctes,
         }
         .statement(stmt, &[], 0, Check::Off)?;
         Ok(names)
