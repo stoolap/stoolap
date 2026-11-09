@@ -2343,9 +2343,9 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<Option<SelectStatement>> {
-        let rowids = self.rowid_entries(stmt, ctx, &[])?;
+        let rowids = self.rowid_entries(stmt, stmt.table_expr.as_deref().as_slice(), ctx, &[])?;
         distinct_rowid_order(stmt, &rowids)?;
-        let mut spelled = |expr: &Expression| -> Result<Option<Expression>> {
+        let spell = |rowids: &RowidEntries, expr: &Expression| -> Result<Option<Expression>> {
             rowids.unique(expr)?;
             let Some((name, schema)) = rowids.stored(expr) else {
                 return Ok(None);
@@ -2362,6 +2362,15 @@ impl Executor {
                 None => return Ok(None),
             };
             Ok(Some(qualified_reference(name, column)))
+        };
+        let mut spelled = |expr: &Expression| spell(&rowids, expr);
+        // A join condition reads the entries of its own two sides
+        let mut on = |sides: [&Expression; 2], condition: &Expression| -> Result<Expression> {
+            if !expr_names_rowid(condition) {
+                return Ok(condition.clone());
+            }
+            let rowids = self.rowid_entries(stmt, &sides, ctx, &[])?;
+            rowids_respelled(condition, &mut |expr| spell(&rowids, expr))
         };
         // A set operation's ORDER BY key past a star counts the columns the
         // star shows over the statement's own scope, when that is known
@@ -2381,7 +2390,7 @@ impl Executor {
                 _ => None,
             }
         };
-        let spelled = spelled_statement(stmt, &mut spelled, &shown)?;
+        let spelled = spelled_statement(stmt, &mut spelled, &mut on, &shown)?;
         Ok((spelled != *stmt).then_some(spelled))
     }
 
@@ -2396,21 +2405,27 @@ impl Executor {
         if !stmt.distinct || stmt.order_by.is_empty() || !names_rowid(stmt) {
             return Ok(());
         }
-        distinct_rowid_order(stmt, &self.rowid_entries(stmt, ctx, around)?)
+        let from = stmt.table_expr.as_deref();
+        distinct_rowid_order(
+            stmt,
+            &self.rowid_entries(stmt, from.as_slice(), ctx, around)?,
+        )
     }
 
-    /// `stmt`'s own FROM entries as a rowid reads them, a name read as its
-    /// own CTE, then one of `around`, innermost last, then as `ctx` reads it
+    /// The entries of `from`, part of `stmt`'s FROM, as a rowid reads them,
+    /// a name read as its own CTE, then one of `around`, innermost last,
+    /// then as `ctx` reads it
     fn rowid_entries(
         &self,
         stmt: &SelectStatement,
+        from: &[&Expression],
         ctx: &ExecutionContext,
         around: &[(SmartString, Vec<String>)],
     ) -> Result<RowidEntries> {
         let names =
             |query: &SelectStatement| self.statement_names_under(query, ctx, around.to_vec());
         let mut leaves = Vec::new();
-        if let Some(from) = stmt.table_expr.as_deref() {
+        for from in from {
             from_leaves(from, &mut leaves);
         }
         let cte = |name: &str| {
@@ -2532,16 +2547,18 @@ fn from_leaves<'e>(from: &'e Expression, out: &mut Vec<&'e Expression>) {
 }
 
 /// `stmt` with each rowid outside its subqueries replaced as `spelled` says,
-/// each SELECT item so changed named as written
+/// each join condition as `on` spells it over its two sides, each SELECT
+/// item so changed named as written
 fn spelled_statement(
     stmt: &SelectStatement,
     spelled: &mut dyn FnMut(&Expression) -> Result<Option<Expression>>,
+    on: &mut dyn FnMut([&Expression; 2], &Expression) -> Result<Expression>,
     star_width: &dyn Fn(&Expression) -> Option<usize>,
 ) -> Result<SelectStatement> {
     let mut spell = |expr: &Expression| rowids_respelled(expr, spelled);
     let mut out = stmt.clone();
     if let Some(from) = out.table_expr.as_deref_mut() {
-        spell_join_conditions(from, &mut spell)?;
+        spell_join_conditions(from, on)?;
     }
     for item in &mut out.columns {
         let written = item.clone();
@@ -2611,16 +2628,18 @@ fn spelled_statement(
     Ok(out)
 }
 
-/// Each join condition of `from` replaced by `spell`'s answer for it
+/// Each join condition of `from` replaced by `spell`'s answer for it over
+/// the join's two sides
 fn spell_join_conditions(
     from: &mut Expression,
-    spell: &mut dyn FnMut(&Expression) -> Result<Expression>,
+    spell: &mut dyn FnMut([&Expression; 2], &Expression) -> Result<Expression>,
 ) -> Result<()> {
     if let Expression::JoinSource(join) = from {
         spell_join_conditions(&mut join.left, spell)?;
         spell_join_conditions(&mut join.right, spell)?;
-        if let Some(condition) = join.condition.as_deref_mut() {
-            *condition = spell(condition)?;
+        if let Some(condition) = join.condition.as_deref() {
+            let spelled = spell([&join.left, &join.right], condition)?;
+            join.condition = Some(Box::new(spelled));
         }
     }
     Ok(())

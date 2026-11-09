@@ -774,6 +774,26 @@ fn a_join_reads_a_keyed_side_rowid_and_refuses_a_keyless_one() {
 }
 
 #[test]
+fn a_join_condition_reads_the_rowid_of_its_own_two_sides() {
+    each_layout("join_on", |db| {
+        for sql in [
+            "SELECT k.id FROM k JOIN (VALUES (10)) v (x) ON _rowid_ = v.x CROSS JOIN k j",
+            "SELECT x.id FROM k x JOIN (VALUES (1)) v (y) ON _rowid_ = 10 CROSS JOIN k j",
+            "SELECT k.id FROM k JOIN (VALUES (10)) v (x) ON _rowid_ = v.x CROSS JOIN n",
+            "SELECT k.id FROM k JOIN (SELECT a FROM n) d ON _rowid_ = d.a * 10 JOIN n ON n.a = d.a WHERE d.a = 1",
+        ] {
+            assert_eq!(rows(db, sql)[0], [int(10)], "{sql}");
+        }
+        for sql in [
+            "SELECT k.id FROM k JOIN n ON k.a = n.a JOIN (VALUES (10)) v (x) ON _rowid_ = v.x",
+            "SELECT k.id FROM k JOIN (SELECT _rowid_ FROM n) d ON _rowid_ = 10 CROSS JOIN n",
+        ] {
+            assert!(error(db, sql).contains("ambiguous"), "{sql}");
+        }
+    });
+}
+
+#[test]
 fn a_table_read_as_of_has_no_rowid_alone_or_joined() {
     each_layout("as_of", |db| {
         for sql in [
