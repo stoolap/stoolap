@@ -794,6 +794,24 @@ fn a_join_condition_reads_the_rowid_of_its_own_two_sides() {
 }
 
 #[test]
+fn columns_a_using_join_merges_are_one_rowid() {
+    each_layout("using", |db| {
+        for sql in [
+            "SELECT _rowid_ FROM (SELECT _rowid_ FROM k) a JOIN (SELECT _rowid_ FROM k) b USING (_rowid_) ORDER BY 1",
+            "SELECT _rowid_ FROM (SELECT _rowid_ FROM k) a NATURAL JOIN (SELECT _rowid_ FROM k) b ORDER BY 1",
+            "SELECT (SELECT _rowid_) FROM (SELECT _rowid_ FROM k) a JOIN (SELECT _rowid_ FROM k) b USING (_rowid_) ORDER BY 1",
+        ] {
+            assert_eq!(rows(db, sql), [[int(10)], [int(20)], [int(30)]], "{sql}");
+        }
+        assert!(error(
+            db,
+            "SELECT _rowid_ FROM (SELECT _rowid_, a FROM k) a JOIN (SELECT _rowid_, a FROM k) b USING (a)"
+        )
+        .contains("ambiguous"));
+    });
+}
+
+#[test]
 fn a_table_read_as_of_has_no_rowid_alone_or_joined() {
     each_layout("as_of", |db| {
         for sql in [

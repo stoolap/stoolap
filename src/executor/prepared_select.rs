@@ -2776,10 +2776,20 @@ impl Chain<'_> {
         let rowid = !id.quoted && is_rowid_name(&id.value_lower);
         for (depth, scope) in self.scopes.iter().enumerate() {
             if rowid {
-                match scope.rowids.as_slice() {
-                    [] => continue,
-                    [(_, Some(index))] => return Ok(Some((depth, *index))),
-                    [(_, None)] => return Err(Error::ColumnNotFound(id.value.to_string())),
+                // A pair a USING or NATURAL join merges is one column
+                let merged = |at: &Option<usize>| {
+                    scope.rowids.iter().any(|(_, first)| match (first, at) {
+                        (Some(first), Some(at)) => scope.merged.contains(&(*first, *at)),
+                        _ => false,
+                    })
+                };
+                let mut rowids = scope.rowids.iter().filter(|(_, at)| !merged(at));
+                match (rowids.next(), rowids.next()) {
+                    (None, _) => continue,
+                    (Some((_, Some(index))), None) => return Ok(Some((depth, *index))),
+                    (Some((_, None)), None) => {
+                        return Err(Error::ColumnNotFound(id.value.to_string()))
+                    }
                     _ => return Err(ambiguous_column(&id.value)),
                 }
             }
