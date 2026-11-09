@@ -192,6 +192,12 @@ pub trait TransactionEngineOperations: Send + Sync {
         let _ = txn_id;
     }
 
+    /// Lets go of the referenced keys the transaction holds, once its
+    /// outcome is visible or undone
+    fn release_keys(&self, txn_id: i64) {
+        let _ = txn_id;
+    }
+
     /// Marks every table the transaction writes as publishing, from before
     /// its index updates until the transaction is visible or undone
     fn begin_publish(&self, txn_id: i64, commit_seq: i64) -> super::version_store::PublishHold {
@@ -365,6 +371,11 @@ impl MvccTransaction {
 
         // Remove transaction isolation level from registry
         self.registry.remove_transaction_isolation_level(self.id);
+
+        // Its outcome is visible or undone by now
+        if let Some(ops) = &self.engine_operations {
+            ops.release_keys(self.id);
+        }
     }
 
     /// The transaction's gate when this thread is inside one of its
@@ -1097,6 +1108,7 @@ impl Drop for MvccTransaction {
                     gate.finish_after_statements(Box::new(move || {
                         Self::rollback_ddl(ops.as_ref(), &created, &dropped);
                         ops.rollback_all_tables(id, true);
+                        ops.release_keys(id);
                     }));
                 } else {
                     // Roll back DDL operations (CREATE TABLE / DROP TABLE)

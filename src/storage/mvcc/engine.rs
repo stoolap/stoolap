@@ -3589,6 +3589,8 @@ impl MVCCEngine {
     /// Get a table handle for an existing transaction by txn_id.
     /// This allows FK enforcement to participate in the caller's transaction,
     /// ensuring CASCADE effects are atomic and uncommitted rows are visible.
+    /// It reads as the transaction's isolation does, so a write through it
+    /// is checked at commit against the version the transaction saw
     pub(crate) fn get_table_for_txn(
         &self,
         txn_id: i64,
@@ -3596,6 +3598,58 @@ impl MVCCEngine {
     ) -> Result<Box<dyn crate::storage::traits::Table>> {
         self.operations()
             .get_table_for_transaction(txn_id, table_name, None, None, TableUse::Write)
+    }
+
+    /// The table a foreign key check reads: the newest commits, through a
+    /// view taken now under snapshot isolation. A transaction that has not
+    /// written the table opens no store for it
+    pub(crate) fn get_table_to_check(
+        &self,
+        txn_id: i64,
+        table_name: &str,
+    ) -> Result<Box<dyn crate::storage::traits::Table>> {
+        let view = self
+            .reads_snapshot(txn_id)
+            .then(|| self.registry.capture_view());
+        self.operations().get_table_for_transaction(
+            txn_id,
+            table_name,
+            None,
+            view,
+            TableUse::KeyCheck,
+        )
+    }
+
+    /// Whether `txn_id` reads under snapshot isolation
+    pub(crate) fn reads_snapshot(&self, txn_id: i64) -> bool {
+        self.registry.get_isolation_level(txn_id) == IsolationLevel::SnapshotIsolation
+    }
+
+    /// The table as `txn_id`'s own isolation reads it, where
+    /// [`Self::get_table_to_check`] reads the newest commits
+    pub(crate) fn get_table_as_seen(
+        &self,
+        txn_id: i64,
+        table_name: &str,
+    ) -> Result<Box<dyn crate::storage::traits::Table>> {
+        self.operations()
+            .get_table_for_transaction(txn_id, table_name, None, None, TableUse::Read)
+    }
+
+    /// Holds `value` of `table`'s `column`, by the name the schema gives it,
+    /// for `txn_id` until the transaction ends, alone for a delete or a key
+    /// change, else shared with the other checks; a conflicting hold of an
+    /// open transaction refuses it
+    pub(crate) fn hold_key(
+        &self,
+        txn_id: i64,
+        table: &str,
+        column: &str,
+        value: &Value,
+        alone: bool,
+    ) -> Result<()> {
+        self.operations()
+            .hold_key(txn_id, table, column, value, alone)
     }
 
     /// Find all FK constraints in other tables that reference the given parent table.
@@ -9550,6 +9604,10 @@ struct EngineOperations {
     ddl: Arc<DdlShared>,
     /// The engine's open flag
     open: Arc<AtomicBool>,
+    /// The tables each transaction holds referenced keys of, let go at its end
+    key_holders: parking_lot::Mutex<I64Map<SmallVec<[Arc<VersionStore>; 2]>>>,
+    /// Whether `key_holders` has an entry, so an end without holds skips its lock
+    holding_keys: AtomicBool,
 }
 
 // EngineOperations is Send + Sync because all fields are Arc-wrapped thread-safe types
@@ -9591,7 +9649,41 @@ impl EngineOperations {
             hot_limits: Arc::clone(&engine.hot_limits),
             ddl: Arc::clone(&engine.ddl),
             open: Arc::clone(&engine.open),
+            key_holders: parking_lot::Mutex::new(crate::common::new_i64_map()),
+            holding_keys: AtomicBool::new(false),
         }
+    }
+
+    /// Holds `value` of `table`'s `column`, by the name the schema gives it,
+    /// for `txn_id` until the transaction ends: alone for a delete or a key
+    /// change, else shared with the other checks of the key
+    fn hold_key(
+        &self,
+        txn_id: i64,
+        table: &str,
+        column: &str,
+        value: &Value,
+        alone: bool,
+    ) -> Result<()> {
+        let name = to_lowercase_cow(table);
+        let store = self
+            .version_stores
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&*name)
+            .cloned()
+            .ok_or_else(|| Error::TableNotFound(name.to_string()))?;
+        let first = store
+            .key_holds()
+            .hold(table, column, value, txn_id, alone, |holder| {
+                self.registry.is_open(holder)
+            })?;
+        if first {
+            let mut holders = self.key_holders.lock();
+            holders.entry(txn_id).or_default().push(store);
+            self.holding_keys.store(true, Ordering::Release);
+        }
+        Ok(())
     }
 
     fn schemas(&self) -> &RwLock<FxHashMap<String, CompactArc<Schema>>> {
@@ -9872,7 +9964,7 @@ impl TransactionEngineOperations for EngineOperations {
             // is taken only where the statement cannot write
             let reads_only = || match table_use {
                 TableUse::Write => false,
-                TableUse::Read => true,
+                TableUse::Read | TableUse::KeyCheck => true,
                 TableUse::ReadBesideWrites => version_store.schema().foreign_keys.is_empty(),
             };
             if let Some(cached) = found {
@@ -9949,8 +10041,9 @@ impl TransactionEngineOperations for EngineOperations {
         let table = open(version_store).with_view(view.clone());
         admit(&table)?;
         mgr.check_schema_generation(schema_generation)?;
-        let snapshot_seq = (self.registry.get_isolation_level(txn_id)
-            == crate::IsolationLevel::SnapshotIsolation)
+        let snapshot_seq = (table_use != TableUse::KeyCheck
+            && self.registry.get_isolation_level(txn_id)
+                == crate::IsolationLevel::SnapshotIsolation)
             .then(|| self.registry.get_transaction_begin_sequence(txn_id) as u64);
         // The wrapper admits every statement; the hot table it owns does not
         Ok(Box::new(
@@ -10637,6 +10730,22 @@ impl TransactionEngineOperations for EngineOperations {
         let mgrs = self.segment_managers.read().unwrap();
         for mgr in mgrs.values() {
             mgr.rollback_pending_tombstones(txn_id);
+        }
+    }
+
+    fn release_keys(&self, txn_id: i64) {
+        if !self.holding_keys.load(Ordering::Acquire) {
+            return;
+        }
+        let stores = {
+            let mut holders = self.key_holders.lock();
+            let stores = holders.remove(txn_id);
+            self.holding_keys
+                .store(!holders.is_empty(), Ordering::Release);
+            stores
+        };
+        for store in stores.iter().flatten() {
+            store.key_holds().release(txn_id);
         }
     }
 
