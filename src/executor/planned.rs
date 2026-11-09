@@ -30,7 +30,7 @@ use crate::storage::traits::{Engine, QueryResult};
 
 use super::context::ExecutionContext;
 use super::expression::{ExecuteContext, ExprVM};
-use super::prepared_select::{first_branch_of, prepared_branch, PreparedSelect};
+use super::prepared_select::{first_branch_of, prepared_branch, KeyReadPath, PreparedSelect};
 use super::query_cache::{check_compiled_token, or_normal_path, CompiledExecution};
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::ExecutorResult;
@@ -440,6 +440,10 @@ impl Executor {
                 .fetch_unique_row(plan, params, in_txn, view)
                 .transpose()?,
         };
+        match unique {
+            false => KeyReadPath::PkGet.taken(),
+            true => KeyReadPath::UniqueGet.taken(),
+        }
         or_normal_path(rows.and_then(|rows| self.read_planned(plan, rows, params, transaction)))
     }
 

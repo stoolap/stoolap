@@ -5407,6 +5407,56 @@ impl PreparedComparison {
     }
 }
 
+/// Every path that reads a statement's rows by the keys or row ids it
+/// names instead of a scan. Each notes, under test-failpoints, that it read
+/// them, for the equivalence test against recorded answers
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeyReadPath {
+    /// A planned statement's row read by its primary key
+    PkGet,
+    /// A planned statement's row read by a unique index
+    UniqueGet,
+    /// The rows an IN list on the primary key names, read by its members
+    KeyMembers,
+    /// The rows a WHERE names by `_rowid_`, read by their ids
+    RowIds,
+    /// A subquery block's row read by its primary key equality, as rows
+    BlockPointRows,
+    /// A subquery block's row read by its primary key equality, as a value
+    BlockPointValue,
+}
+
+impl KeyReadPath {
+    #[inline]
+    pub(crate) fn taken(self) {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::key_read_path_taken(self as usize);
+    }
+}
+
+#[cfg(any(test, feature = "test-failpoints"))]
+impl KeyReadPath {
+    pub(crate) const ALL: [KeyReadPath; 6] = [
+        KeyReadPath::PkGet,
+        KeyReadPath::UniqueGet,
+        KeyReadPath::KeyMembers,
+        KeyReadPath::RowIds,
+        KeyReadPath::BlockPointRows,
+        KeyReadPath::BlockPointValue,
+    ];
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            KeyReadPath::PkGet => "pk_get",
+            KeyReadPath::UniqueGet => "unique_get",
+            KeyReadPath::KeyMembers => "key_members",
+            KeyReadPath::RowIds => "row_ids",
+            KeyReadPath::BlockPointRows => "block_point_rows",
+            KeyReadPath::BlockPointValue => "block_point_value",
+        }
+    }
+}
+
 /// The rows the members of `filter`'s IN list name, read by the members:
 /// on the primary key, up to `target` when the list is the whole filter;
 /// on another column, under no LIMIT, by the candidates of a table that
@@ -5431,13 +5481,19 @@ fn member_rows(
     };
     let pk = schema.pk_column_index().map(|pk| &schema.columns[pk]);
     match pk.filter(|pk| pk.name.eq_ignore_ascii_case(column)) {
-        Some(pk) => Executor::rows_of_members(
-            table,
-            &pk.name_lower,
-            list.get_values().iter(),
-            target.is_some(),
-            target.filter(|_| scope.len() == 1),
-        ),
+        Some(pk) => {
+            let rows = Executor::rows_of_members(
+                table,
+                &pk.name_lower,
+                list.get_values().iter(),
+                target.is_some(),
+                target.filter(|_| scope.len() == 1),
+            )?;
+            if rows.is_some() {
+                KeyReadPath::KeyMembers.taken();
+            }
+            Ok(rows)
+        }
         None if !limited && Executor::in_members_eligible(table, column) => {
             Executor::in_member_rows(
                 table,
@@ -15066,6 +15122,7 @@ impl<'a> PreparedRunner<'a> {
             let params = self.blocks[index].buffer.borrow();
             if let Some(Value::Integer(key)) = sq.pushdown[point].value(&params) {
                 let rows = table.fetch_rows_by_ids(&[key], expr)?;
+                KeyReadPath::BlockPointRows.taken();
                 return Ok(self.widened_block(index, Box::new(PointRows { rows, at: None })));
             }
         }
@@ -15819,6 +15876,7 @@ impl<'a> PreparedRunner<'a> {
                             Some(filter) => table.fetch_rows_by_ids(&ids, filter)?,
                             None => table.fetch_rows_by_ids(&ids, &ConstBoolExpr::true_expr())?,
                         };
+                        KeyReadPath::RowIds.taken();
                         break 'read (Some(rows.into_iter()), None, true, false);
                     }
                     // An index reads the values a failed slot does not have
@@ -16894,6 +16952,7 @@ impl PreparedRunner<'_> {
             let mut rows = self.blocks[index].point_rows.borrow_mut();
             rows.clear();
             table.fetch_rows_by_ids_into(&[key], &ConstBoolExpr::true_expr(), &mut rows)?;
+            KeyReadPath::BlockPointValue.taken();
             for (_, row) in rows.iter() {
                 self.take_one(&mut vm, projection, row, &params, &mut value)?;
             }

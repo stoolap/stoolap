@@ -1017,6 +1017,7 @@ thread_local! {
     static JOIN_PATHS_TAKEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static ORDER_LIMIT_PATHS_TAKEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static DISTINCT_PATHS_TAKEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static KEY_READ_PATHS_TAKEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static ONE_SHOT_COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ONE_SHOT_LITERAL_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PROGRAM_COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -1176,6 +1177,32 @@ pub fn reset_distinct_paths() {
 
 pub(crate) fn distinct_path_taken(index: usize) {
     DISTINCT_PATHS_TAKEN.with(|taken| taken.set(taken.get() | 1 << index));
+}
+
+/// The name of every path that reads rows by the keys or row ids named
+pub fn key_read_paths() -> Vec<&'static str> {
+    crate::executor::prepared_select::KeyReadPath::ALL
+        .iter()
+        .map(|path| path.name())
+        .collect()
+}
+
+/// The key read paths that read rows on this thread since the last reset
+pub fn key_read_paths_taken() -> Vec<&'static str> {
+    let taken = KEY_READ_PATHS_TAKEN.with(std::cell::Cell::get);
+    crate::executor::prepared_select::KeyReadPath::ALL
+        .iter()
+        .filter(|path| taken & (1 << **path as u32) != 0)
+        .map(|path| path.name())
+        .collect()
+}
+
+pub fn reset_key_read_paths() {
+    KEY_READ_PATHS_TAKEN.with(|taken| taken.set(0));
+}
+
+pub(crate) fn key_read_path_taken(index: usize) {
+    KEY_READ_PATHS_TAKEN.with(|taken| taken.set(taken.get() | 1 << index));
 }
 
 pub(crate) fn aggregate_path_taken(index: usize) {

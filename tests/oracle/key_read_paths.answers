@@ -1,0 +1,20 @@
+2	3dbd84a2f5383f41	hot: SELECT a FROM k WHERE id IN (10, 30, 40)
+3	1387d5915fd277d1	hot: SELECT a FROM n WHERE a IN (SELECT i.a FROM k i WHERE i.id = n.a * 10)
+2	1f62f8d5b29ef9f9	hot: SELECT a, _rowid_ FROM k WHERE _rowid_ IN (30, 10)
+1	b271be1714df7d87	hot: SELECT a, b FROM k WHERE id = 20
+1	b271be1714df7d87	hot: SELECT a, b FROM k WHERE u = 200
+1	aa9f8da445344046	hot: SELECT a, b, _rowid_ FROM k WHERE _rowid_ = 30
+2	511c4666f46134a3	hot: SELECT b FROM n WHERE _rowid_ IN (1, 3, 9)
+1	2182965f326b29a3	hot: SELECT b, _rowid_ FROM n WHERE _rowid_ = 2
+3	aa351f1196720500	hot: SELECT o.a, (SELECT i.b FROM k i WHERE i.id = o.id AND i.a > 1) FROM k o
+3	93f055411d6b72a3	hot: SELECT o.a, (SELECT i.b FROM k i WHERE i.id = o.id) FROM k o
+2	3dbd84a2f5383f41	sealed: SELECT a FROM k WHERE id IN (10, 30, 40)
+3	1387d5915fd277d1	sealed: SELECT a FROM n WHERE a IN (SELECT i.a FROM k i WHERE i.id = n.a * 10)
+2	1f62f8d5b29ef9f9	sealed: SELECT a, _rowid_ FROM k WHERE _rowid_ IN (30, 10)
+1	b271be1714df7d87	sealed: SELECT a, b FROM k WHERE id = 20
+1	b271be1714df7d87	sealed: SELECT a, b FROM k WHERE u = 200
+1	aa9f8da445344046	sealed: SELECT a, b, _rowid_ FROM k WHERE _rowid_ = 30
+2	511c4666f46134a3	sealed: SELECT b FROM n WHERE _rowid_ IN (1, 3, 9)
+1	2182965f326b29a3	sealed: SELECT b, _rowid_ FROM n WHERE _rowid_ = 2
+3	aa351f1196720500	sealed: SELECT o.a, (SELECT i.b FROM k i WHERE i.id = o.id AND i.a > 1) FROM k o
+3	93f055411d6b72a3	sealed: SELECT o.a, (SELECT i.b FROM k i WHERE i.id = o.id) FROM k o

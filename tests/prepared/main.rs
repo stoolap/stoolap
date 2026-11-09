@@ -25,6 +25,7 @@ mod held_program_retry_test;
 mod held_programs_rebind_test;
 mod insert_plan_cache_test;
 mod insert_plan_rename_test;
+mod key_read_path_equivalence_test;
 mod named_params_test;
 mod old_path_ledger_test;
 mod param_slots_matrix_test;
