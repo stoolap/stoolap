@@ -701,18 +701,19 @@ fn no_column_and_no_alias_takes_the_name_of_the_row_identity() {
     // The storage API changes a table's columns by the same rule
     use stoolap::storage::traits::Engine;
     let mut tx = db.engine().begin_transaction().unwrap();
-    let column = stoolap::core::SchemaColumn::new(
-        2,
-        "_rowid_",
-        stoolap::core::DataType::Integer,
-        true,
-        false,
-    );
-    for refused in [
-        tx.add_table_column("n", column),
-        tx.rename_table_column("n", "a", "_rowid_"),
-    ] {
-        assert!(refused.unwrap_err().to_string().contains("row's identity"));
+    let column = |name: &str| {
+        stoolap::core::SchemaColumn::new(0, name, stoolap::core::DataType::Integer, true, false)
+    };
+    for name in ["_rowid_", "\0rowid"] {
+        for refused in [
+            tx.add_table_column("n", column(name)),
+            tx.rename_table_column("n", "a", name),
+        ] {
+            assert!(refused.unwrap_err().to_string().contains("row's identity"));
+        }
+        let schema = stoolap::core::Schema::new("x", vec![column(name)]);
+        let refused = db.engine().create_table(schema).unwrap_err();
+        assert!(refused.to_string().contains("row's identity"), "{name:?}");
     }
     tx.rollback().unwrap();
     assert_eq!(names(&db, "SELECT * FROM n"), ["a", "b"]);
