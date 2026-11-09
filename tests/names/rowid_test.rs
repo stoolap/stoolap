@@ -939,6 +939,12 @@ fn a_bare_rowid_counts_a_derived_table_column_with_the_tables_beside_it() {
 #[test]
 fn a_quoted_rowid_name_stays_a_name_through_views_keys_and_groups() {
     each_layout("quoted", |db| {
+        db.execute("CREATE VIEW vq AS SELECT \"_rowid_\" AS q, a FROM k", ())
+            .unwrap();
+        assert_eq!(
+            rows(db, "SELECT q FROM vq WHERE a = 1"),
+            [[text("_rowid_")]]
+        );
         // Over a stored table the quoted name is text; over a derived table
         // it names the same `_rowid_` column as the bare one
         for (from, lit) in [

@@ -834,11 +834,13 @@ impl Identifier {
 
 impl fmt::Display for Identifier {
     /// The name as the lexer reads it back as one name: quoted, its quotes
-    /// doubled, when it holds a character a bare name cannot
+    /// doubled, when it holds a character a bare name cannot, or is a
+    /// quoted name of the row identity's spelling, which bare reads the row
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut chars = self.value.chars();
         let bare = chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
-            && chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$');
+            && chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+            && !(self.quoted && crate::core::is_rowid_name(&self.value_lower));
         if bare {
             write!(f, "{}", self.value)
         } else {
