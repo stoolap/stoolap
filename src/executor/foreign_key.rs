@@ -740,27 +740,27 @@ fn reaches_key_cascade_at(
             })
 }
 
-/// An error when a referenced value that changes from `old_value` would
-/// cascade into the primary key of a child row naming it, at any depth;
-/// asked per changed value, before the statement writes
-pub(crate) fn refuse_key_cascade(
+/// The refusal a change of the referenced value `old_value` would meet,
+/// cascading into the primary key of a child row naming it at any depth;
+/// None when it would meet none. Read before the statement takes a fence
+pub(crate) fn key_cascade_refusal(
     engine: &MVCCEngine,
     txn_id: i64,
     old_value: &Value,
     referencing_fks: &[(String, ForeignKeyConstraint)],
-) -> Result<()> {
-    refuse_key_cascade_at(engine, txn_id, old_value, referencing_fks, 0)
+) -> Result<Option<Error>> {
+    key_cascade_refusal_at(engine, txn_id, old_value, referencing_fks, 0)
 }
 
-fn refuse_key_cascade_at(
+fn key_cascade_refusal_at(
     engine: &MVCCEngine,
     txn_id: i64,
     old_value: &Value,
     referencing_fks: &[(String, ForeignKeyConstraint)],
     depth: usize,
-) -> Result<()> {
+) -> Result<Option<Error>> {
     if depth >= MAX_CASCADE_DEPTH {
-        return Ok(());
+        return Ok(None);
     }
     for (child, fk) in referencing_fks {
         if matches!(
@@ -772,12 +772,15 @@ fn refuse_key_cascade_at(
         }
         if matches!(fk.on_update, ForeignKeyAction::Cascade) && cascades_into_key(engine, child, fk)
         {
-            return Err(key_cascade_refused(child, fk, old_value));
+            return Ok(Some(key_cascade_refused(child, fk, old_value)));
         }
         let below = fks_on_column(engine, child, &fk.column_name);
-        refuse_key_cascade_at(engine, txn_id, old_value, &below, depth + 1)?;
+        if let Some(refusal) = key_cascade_refusal_at(engine, txn_id, old_value, &below, depth + 1)?
+        {
+            return Ok(Some(refusal));
+        }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// CASCADE DELETE: delete all child rows referencing the given parent PK value.
