@@ -3168,13 +3168,7 @@ impl Table for MVCCTable {
     ) -> Result<Vec<i64>> {
         // A transaction with writes of its own reads the whole key list
         if self.local().has_local_changes() {
-            let mut ids = self.get_active_row_ids()?;
-            ids.sort_unstable();
-            return Ok(ids
-                .into_iter()
-                .filter(|id| !exclude.contains(*id))
-                .take(limit)
-                .collect());
+            return crate::storage::traits::table::active_ids_excluding(self, exclude, limit);
         }
         Ok(self
             .version_store
