@@ -355,6 +355,27 @@ fn a_kept_aggregate_plan_answers_every_run_of_a_rowid_statement() {
 }
 
 #[test]
+fn a_rowid_filter_after_a_cached_scan_reads_the_rowid() {
+    each_layout("semantic", |db| {
+        for t in ["k", "n"] {
+            assert_eq!(rows(db, &format!("SELECT * FROM {t} WHERE a > 0")).len(), 3);
+        }
+        assert_eq!(
+            rows(db, "SELECT * FROM k WHERE a > 0 AND _rowid_ = 10"),
+            [[int(10), int(1), text("x")]]
+        );
+        assert_eq!(
+            rows(db, "SELECT * FROM n WHERE a > 0 AND _rowid_ = 2"),
+            [[int(2), text("y")]]
+        );
+        assert_eq!(
+            rows(db, "SELECT * FROM n WHERE a > 0 AND _rowid_ > 1"),
+            [[int(2), text("y")], [int(3), text("z")]]
+        );
+    });
+}
+
+#[test]
 fn rowid_reads_alike_in_every_clause() {
     each_layout("clauses", |db| {
         for sql in [

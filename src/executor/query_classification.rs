@@ -144,16 +144,19 @@ pub struct QueryClassification {
     /// Simple scan: no joins, no subqueries, no aggregation, no window functions
     pub is_simple_scan: bool,
 
-    /// Whether the statement, or one inside it, names rowid or _rowid_
+    /// Whether the statement, or one inside it, names `_rowid_` or the row id
+    /// slot a spelled one reads
     pub names_rowid: bool,
 }
 
 impl QueryClassification {
     /// A `SELECT *` whose filtered rows the semantic cache may hold: no
     /// parameters but the literals of its text when `literal_params`, no
-    /// subqueries or volatile functions, and nothing reshaping the rows
+    /// subqueries or volatile functions, and nothing reshaping the rows; no
+    /// rowid, which the cached rows do not carry
     pub fn semantic_cacheable(&self, literal_params: bool) -> bool {
         self.is_select_star
+            && !self.names_rowid
             && !self.has_aggregation
             && !self.has_window_functions
             && !self.has_group_by
