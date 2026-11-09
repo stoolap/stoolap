@@ -410,6 +410,8 @@ pub(crate) struct CompiledUpsert {
     compiled_where: Option<super::expression::SharedProgram>,
     /// CHECK constraints of the updated columns
     compiled_checks: Vec<CompiledCheck>,
+    /// Whether the programs read the row met with its row id past its columns
+    widens: bool,
 }
 
 /// An ON CONFLICT DO UPDATE whose programs are prepared: `upsert` holds
@@ -1233,7 +1235,7 @@ impl Executor {
                                 stmt,
                                 &mut insert_plan,
                                 ctx,
-                                has_returning,
+                                (has_returning, widened),
                                 conflict,
                             ) {
                                 Ok((updated, returned)) => {
@@ -1282,7 +1284,7 @@ impl Executor {
                                         stmt,
                                         &mut insert_plan,
                                         ctx,
-                                        has_returning,
+                                        (has_returning, widened),
                                         conflict,
                                     ) {
                                         Ok((updated, returned)) => {
@@ -1518,7 +1520,7 @@ impl Executor {
                                 stmt,
                                 &mut insert_plan,
                                 ctx,
-                                has_returning,
+                                (has_returning, widened),
                                 conflict,
                             ) {
                                 Ok((updated, returned)) => {
@@ -1568,7 +1570,7 @@ impl Executor {
                                         stmt,
                                         &mut insert_plan,
                                         ctx,
-                                        has_returning,
+                                        (has_returning, widened),
                                         conflict,
                                     ) {
                                         Ok((updated, returned)) => {
@@ -3511,12 +3513,12 @@ impl Executor {
         use crate::functions::registry::global_registry;
 
         let (update_specs, update_where) = Self::conflict_sets(schema, stmt)?;
+        let widens = Self::conflict_widens(schema, stmt);
 
-        let column_names: Vec<String> = schema.column_names_owned().to_vec();
+        let column_names: Vec<String> = super::prepared_select::read_names(schema, widens).to_vec();
 
         // Build EXCLUDED column name list for the second row source.
-        let excluded_columns: Vec<String> = column_names
-            .iter()
+        let excluded_columns: Vec<String> = (schema.column_names_owned().iter())
             .map(|c| qualified("excluded", c))
             .collect();
 
@@ -3563,19 +3565,29 @@ impl Executor {
             None => None,
         };
 
-        Self::upsert_of(schema, compiled_updates, compiled_where)
+        Self::upsert_of(schema, compiled_updates, compiled_where, widens)
+    }
+
+    /// Whether `stmt`'s ON CONFLICT SET values or WHERE read the row id of
+    /// a row met in `schema`'s table, which has no primary key
+    pub(super) fn conflict_widens(schema: &crate::core::Schema, stmt: &InsertStatement) -> bool {
+        let clauses = stmt.update_expressions.iter();
+        schema.rowid_column().is_none()
+            && (clauses.chain(stmt.update_where.as_deref())).any(super::utils::expr_names_rowid)
     }
 
     /// Each ON CONFLICT SET value of `stmt` with the column it writes, and
-    /// its WHERE, a rowid of the row met spelled as its primary key
+    /// its WHERE, a rowid of the row met spelled as the column it reads: the
+    /// primary key, quoted, or the row id slot
     pub(super) fn conflict_sets(
         schema: &crate::core::Schema,
         stmt: &InsertStatement,
     ) -> Result<ConflictClauses> {
         use crate::parser::{Position, Token, TokenType};
-        // A key named as a literal is left to the scope that binds it
-        let key = (schema.rowid_column().map(|at| &schema.columns[at]))
-            .filter(|key| !matches!(key.name_lower.as_str(), "true" | "false"));
+        let key = match schema.rowid_column() {
+            Some(at) => schema.columns[at].name.as_str(),
+            None => ROWID_SLOT,
+        };
         let target = &stmt.table_name.value_lower;
         let spell = |expr: &Expression| {
             super::utils::rowids_respelled(expr, &mut |rowid| {
@@ -3585,10 +3597,12 @@ impl Executor {
                     }
                     _ => true,
                 };
-                Ok(key.filter(|_| met).map(|key| {
-                    let token =
-                        Token::new(TokenType::Identifier, &key.name, Position::new(0, 0, 0));
-                    Expression::Identifier(Identifier::new(token, key.name.clone()))
+                Ok(met.then(|| {
+                    let token = Token::new(TokenType::Identifier, key, Position::new(0, 0, 0));
+                    Expression::Identifier(Identifier {
+                        quoted: true,
+                        ..Identifier::new(token, key.to_string())
+                    })
                 }))
             })
         };
@@ -3609,6 +3623,7 @@ impl Executor {
         schema: &crate::core::Schema,
         compiled_updates: Vec<(usize, DataType, u16, super::expression::SharedProgram)>,
         compiled_where: Option<super::expression::SharedProgram>,
+        widens: bool,
     ) -> Result<CompiledUpsert> {
         // The CHECK constraints reading an updated column, shared immutably:
         // the VM that runs them lives in the setter closure
@@ -3619,6 +3634,7 @@ impl Executor {
             compiled_updates,
             compiled_where,
             compiled_checks,
+            widens,
         })
     }
 
@@ -3627,7 +3643,8 @@ impl Executor {
     /// in update expressions (PostgreSQL-style).
     /// `conflict_column` is the unique constraint column(s) that caused the conflict (comma-separated).
     /// Used to build WHERE clause when the table has no primary key.
-    /// When `capture_row` is true, returns the post-update row for RETURNING clauses.
+    /// When `capture_row` is true, returns the post-update row for RETURNING clauses,
+    /// its row id past its columns when `returns_id`.
     #[allow(clippy::too_many_arguments)]
     fn apply_on_duplicate_update(
         &self,
@@ -3639,7 +3656,7 @@ impl Executor {
         stmt: &InsertStatement,
         insert_plan: &mut InsertPlan<'_>,
         ctx: &ExecutionContext,
-        capture_row: bool,
+        (capture_row, returns_id): (bool, bool),
         conflict: Option<&ConflictRun<'_, '_>>,
     ) -> Result<(bool, Option<Row>)> {
         // Build a WHERE clause to find the specific row
@@ -3710,7 +3727,11 @@ impl Executor {
         let conflict = conflict.map(|conflict| conflict.runner);
 
         // Create a setter function that applies the ON DUPLICATE KEY UPDATE
-        let mut setter = |_: i64, mut row: Row| -> Result<(Row, bool)> {
+        let mut setter = |id: i64, row: Row| -> Result<(Row, bool)> {
+            let mut row = match effective.widens {
+                true => super::prepared_select::widened(row, id),
+                false => row,
+            };
             if let Some(joined) = joined.as_mut() {
                 #[cfg(feature = "test-failpoints")]
                 crate::test_failpoints::prepared_dml_site_ran(
@@ -3731,6 +3752,9 @@ impl Executor {
                     ),
                 };
                 if !vm.execute_bool_checked(program, &exec_ctx)? {
+                    if effective.widens {
+                        row.pop();
+                    }
                     return Ok((row, false));
                 }
             }
@@ -3783,9 +3807,15 @@ impl Executor {
                 }
             }
 
-            // Capture post-update row for RETURNING
+            // The row written has the table's columns; one RETURNING reads has its id too
+            if effective.widens {
+                row.pop();
+            }
             if capture_row {
-                captured_row = Some(row.clone());
+                captured_row = Some(match returns_id {
+                    true => super::prepared_select::widened(row.clone(), id),
+                    false => row.clone(),
+                });
             }
 
             Ok((row, changed))

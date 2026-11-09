@@ -432,6 +432,10 @@ fn rowid_reads_alike_in_every_clause() {
                 "SELECT \"Ö\".*, _rowid_ + 0 AS r FROM {t} AS \"Ö\" UNION ALL SELECT {other} ORDER BY _rowid_ + 0"
             );
             assert_eq!(rows(db, &sql)[0], first, "{sql}");
+            let sql = format!(
+                "SELECT \"ΟΣ\".*, _rowid_ + 0 AS r FROM {t} AS \"ΟΣ\" UNION ALL SELECT {other} ORDER BY _rowid_ + 0"
+            );
+            assert_eq!(rows(db, &sql)[0], first, "{sql}");
         }
         assert_eq!(
             rows(db, "SELECT _rowid_, _rowid_ + 0 FROM nr WHERE a = 10"),
@@ -451,13 +455,13 @@ fn rowid_reads_alike_in_every_clause() {
             ),
             [[int(30)], [int(20)], [int(10)]]
         );
-        assert!(db
-            .query(
-                "INSERT INTO nr VALUES (10) ON CONFLICT (a) DO UPDATE SET a = 10 RETURNING nr._rowid_",
-                ()
-            )
-            .map(|rows| rows.into_iter().any(|row| row.is_err()))
-            .unwrap_or(true));
+        assert_eq!(
+            rows(
+                db,
+                "INSERT INTO nr VALUES (10) ON CONFLICT (a) DO UPDATE SET a = 10 RETURNING nr._rowid_"
+            ),
+            [[int(3)]]
+        );
         assert_eq!(rows(db, "SELECT COUNT(*) FROM nr"), [[int(3)]]);
     });
 }
@@ -760,6 +764,13 @@ fn a_bare_rowid_counts_a_derived_table_column_with_the_tables_beside_it() {
             ),
             [[int(2), int(10)]]
         );
+        assert_eq!(
+            rows(
+                db,
+                "SELECT SUM((SELECT _rowid_)), COUNT(*) FROM (SELECT _rowid_ FROM n) d"
+            ),
+            [[int(6), int(3)]]
+        );
     });
 }
 
@@ -787,6 +798,53 @@ fn an_upsert_reads_the_rowid_of_the_row_met_and_never_writes_it() {
         let sql = format!("{upsert} a = excluded._rowid_");
         let refused = db.execute(&sql, ()).unwrap_err().to_string();
         assert!(refused.contains("not found"), "{sql}: {refused}");
+        for sql in [
+            "CREATE TABLE u (k INTEGER UNIQUE, v INTEGER)",
+            "INSERT INTO u VALUES (5, 0), (6, 0)",
+            "CREATE TABLE p (\"true\" INTEGER PRIMARY KEY, v INTEGER)",
+            "INSERT INTO p VALUES (7, 0)",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        for (t, upsert, id) in [
+            (
+                "u",
+                "INSERT INTO u VALUES (6, 1) ON CONFLICT (k) DO UPDATE SET",
+                2,
+            ),
+            (
+                "p",
+                "INSERT INTO p VALUES (7, 1) ON CONFLICT (\"true\") DO UPDATE SET",
+                7,
+            ),
+        ] {
+            for (set, v) in [
+                (format!("v = _rowid_ + 1 WHERE _rowid_ = {id}"), id + 1),
+                (
+                    format!("v = (SELECT _rowid_) + 2 WHERE (SELECT _rowid_) = {id}"),
+                    id + 2,
+                ),
+                (String::from("v = 0 WHERE _rowid_ = 99"), id + 2),
+            ] {
+                db.execute(&format!("{upsert} {set}"), ())
+                    .unwrap_or_else(|e| panic!("{t} {set}: {e}"));
+                assert_eq!(
+                    rows(db, &format!("SELECT v FROM {t} WHERE _rowid_ = {id}")),
+                    [[int(v)]],
+                    "{t} {set}"
+                );
+            }
+            for (set, v) in [
+                (format!("v = {t}._rowid_ + 3"), id + 3),
+                (String::from("v = (SELECT _rowid_) + 4"), id + 4),
+            ] {
+                assert_eq!(
+                    rows(db, &format!("{upsert} {set} RETURNING _rowid_, v")),
+                    [[int(id), int(v)]],
+                    "{t} {set}"
+                );
+            }
+        }
     });
 }
 

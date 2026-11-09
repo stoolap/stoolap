@@ -1359,6 +1359,10 @@ impl ScopeTable {
     /// primary key, else, when `slot`, a column past its own its rows carry
     fn of_table(name: impl Into<Option<SmartString>>, schema: &Schema, slot: bool) -> Self {
         let mut scope = Self::of(name, schema);
+        debug_assert!(
+            scope.rowids.is_empty(),
+            "a stored table has no _rowid_ column"
+        );
         match schema.rowid_column() {
             Some(key) => scope.rowids.push((0, Some(key))),
             None if slot => {
@@ -2390,10 +2394,7 @@ impl Executor {
                 _ => None,
             },
             Expression::QualifiedStar(star) => (entries.iter().flatten())
-                .find(|(name, _)| {
-                    name.chars()
-                        .eq(star.qualifier.chars().flat_map(char::to_lowercase))
-                })
+                .find(|(name, _)| super::utils::eq_folded(&star.qualifier, name))
                 .map(|(_, schema)| schema.columns.len()),
             _ => None,
         };
@@ -9917,8 +9918,12 @@ impl Executor {
             ),
             (None, None) => return Err(Error::internal("a grouped statement without one table")),
         };
-        let slot = kind == GroupedSource::Table && names_rowid(stmt);
-        let scope = ScopeTable::of_table(scope_name.clone(), &schema, slot);
+        let scope = match kind {
+            GroupedSource::Table => {
+                ScopeTable::of_table(scope_name.clone(), &schema, names_rowid(stmt))
+            }
+            _ => ScopeTable::of(scope_name.clone(), &schema),
+        };
         let prepared = Arc::new(PreparedGrouped::prepare(
             self,
             ctx,
@@ -10254,12 +10259,13 @@ impl PreparedDml {
                 sites.table.clone()
             };
             // A bare name reads the row met; the excluded row only by its name
+            let widens = Executor::conflict_widens(sites.schema, sites.stmt);
             let mut joined = ScopeTable::beside(
-                ScopeTable::of_table(target, sites.schema, false),
+                ScopeTable::of_table(target, sites.schema, widens),
                 ScopeTable::of(excluded, sites.schema),
             )
             .by_position();
-            joined.bare = sites.schema.columns.len();
+            joined.bare = sites.schema.columns.len() + usize::from(widens);
             joined
         });
         let mut conflict_parts = None;
@@ -10370,7 +10376,12 @@ impl PreparedDml {
                     .transpose()?;
                 Some(PreparedConflict {
                     columns: sites.schema.column_names_arc(),
-                    upsert: Arc::new(Executor::upsert_of(sites.schema, updates, where_)?),
+                    upsert: Arc::new(Executor::upsert_of(
+                        sites.schema,
+                        updates,
+                        where_,
+                        Executor::conflict_widens(sites.schema, sites.stmt),
+                    )?),
                     reads_target,
                 })
             }
