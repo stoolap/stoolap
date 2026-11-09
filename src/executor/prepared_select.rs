@@ -2103,7 +2103,11 @@ impl StatementWalk<'_> {
                                     }
                                     other => other,
                                 })?;
-                        ScopeTable::of_table(name, &schema, !joined)
+                        // A table read AS OF has no rowid
+                        match ts.as_of {
+                            Some(_) => ScopeTable::of(name, &schema),
+                            None => ScopeTable::of_table(name, &schema, !joined),
+                        }
                     }
                 }
             }

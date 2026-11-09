@@ -774,6 +774,31 @@ fn a_join_reads_a_keyed_side_rowid_and_refuses_a_keyless_one() {
 }
 
 #[test]
+fn a_table_read_as_of_has_no_rowid_alone_or_joined() {
+    each_layout("as_of", |db| {
+        for sql in [
+            "SELECT _rowid_ FROM k AS OF TIMESTAMP NOW()",
+            "SELECT k._rowid_ FROM k AS OF TIMESTAMP NOW() CROSS JOIN (VALUES (1)) v (x)",
+            "SELECT (SELECT k._rowid_) FROM k AS OF TIMESTAMP NOW() CROSS JOIN (VALUES (1)) v (x)",
+            "SELECT (SELECT x._rowid_) FROM k AS OF TIMESTAMP NOW() x JOIN n ON x.a = n.a",
+            "SELECT k.a FROM k AS OF TIMESTAMP NOW() JOIN n ON k.a = n.a WHERE k._rowid_ > 0",
+            "SELECT * FROM (SELECT k._rowid_ FROM k AS OF TIMESTAMP NOW() CROSS JOIN n) d",
+            "SELECT EXISTS (SELECT 1 FROM k AS OF TIMESTAMP NOW() CROSS JOIN (VALUES (1)) v (x) ORDER BY k._rowid_)",
+            "SELECT EXISTS (SELECT 1 FROM k AS OF TIMESTAMP NOW() x JOIN n ON x.a = n.a ORDER BY x._rowid_)",
+        ] {
+            assert!(error(db, sql).contains("not found"), "{sql}");
+        }
+        assert_eq!(
+            rows(
+                db,
+                "SELECT k._rowid_ FROM k JOIN k AS OF TIMESTAMP NOW() y ON k.a = y.a ORDER BY 1"
+            ),
+            [[int(10)], [int(20)], [int(30)]]
+        );
+    });
+}
+
+#[test]
 fn a_bare_rowid_counts_a_derived_table_column_with_the_tables_beside_it() {
     each_layout("derived", |db| {
         db.execute("CREATE VIEW v AS SELECT _rowid_ FROM n", ())

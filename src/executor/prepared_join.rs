@@ -172,7 +172,8 @@ pub(crate) struct JoinSide {
 }
 
 /// A table of a join side: its name, None for a source without one, its
-/// columns, and whether it is a stored table
+/// columns, and whether it is a stored table read as it is now, whose key a
+/// rowid reads
 pub(crate) type SideLeaf = (Option<SmartString>, CompactArc<Schema>, bool);
 
 impl JoinSide {

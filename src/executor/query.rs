@@ -3472,7 +3472,7 @@ impl Executor {
                 let schema = self.base_table_side_schema(expr, CteNames::Context(ctx))?;
                 let name = get_table_alias_from_expr(expr).map(SmartString::from);
                 Some(JoinSide {
-                    leaves: smallvec::smallvec![(name, schema, true)],
+                    leaves: smallvec::smallvec![(name, schema, false)],
                     rows: true,
                 })
             }
