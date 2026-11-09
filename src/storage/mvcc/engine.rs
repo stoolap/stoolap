@@ -3578,36 +3578,35 @@ impl MVCCEngine {
     /// Get a table handle for an existing transaction by txn_id.
     /// This allows FK enforcement to participate in the caller's transaction,
     /// ensuring CASCADE effects are atomic and uncommitted rows are visible.
-    /// It reads the newest commits: a snapshot reads them through a view taken now
+    /// It reads as the transaction's isolation does, so a write through it
+    /// is checked at commit against the version the transaction saw
     pub(crate) fn get_table_for_txn(
         &self,
         txn_id: i64,
         table_name: &str,
     ) -> Result<Box<dyn crate::storage::traits::Table>> {
-        self.key_table(txn_id, table_name, TableUse::KeyAction)
+        self.operations()
+            .get_table_for_transaction(txn_id, table_name, None, None, TableUse::Write)
     }
 
-    /// [`Self::get_table_for_txn`] for a check that writes no table: a
-    /// transaction that has not written the table opens no store for it
+    /// The table a foreign key check reads: the newest commits, through a
+    /// view taken now under snapshot isolation. A transaction that has not
+    /// written the table opens no store for it
     pub(crate) fn get_table_to_check(
         &self,
         txn_id: i64,
         table_name: &str,
     ) -> Result<Box<dyn crate::storage::traits::Table>> {
-        self.key_table(txn_id, table_name, TableUse::KeyCheck)
-    }
-
-    fn key_table(
-        &self,
-        txn_id: i64,
-        table_name: &str,
-        table_use: TableUse,
-    ) -> Result<Box<dyn crate::storage::traits::Table>> {
         let view = self
             .reads_snapshot(txn_id)
             .then(|| self.registry.capture_view());
-        self.operations()
-            .get_table_for_transaction(txn_id, table_name, None, view, table_use)
+        self.operations().get_table_for_transaction(
+            txn_id,
+            table_name,
+            None,
+            view,
+            TableUse::KeyCheck,
+        )
     }
 
     /// Whether `txn_id` reads under snapshot isolation
@@ -3616,7 +3615,7 @@ impl MVCCEngine {
     }
 
     /// The table as `txn_id`'s own isolation reads it, where
-    /// [`Self::get_table_for_txn`] reads the newest commits
+    /// [`Self::get_table_to_check`] reads the newest commits
     pub(crate) fn get_table_as_seen(
         &self,
         txn_id: i64,
@@ -9949,7 +9948,7 @@ impl TransactionEngineOperations for EngineOperations {
             // A store published later would not reach a read handle, so one
             // is taken only where the statement cannot write
             let reads_only = || match table_use {
-                TableUse::Write | TableUse::KeyAction => false,
+                TableUse::Write => false,
                 TableUse::Read | TableUse::KeyCheck => true,
                 TableUse::ReadBesideWrites => version_store.schema().foreign_keys.is_empty(),
             };
@@ -10027,7 +10026,7 @@ impl TransactionEngineOperations for EngineOperations {
         let table = open(version_store).with_view(view.clone());
         admit(&table)?;
         mgr.check_schema_generation(schema_generation)?;
-        let snapshot_seq = (!matches!(table_use, TableUse::KeyCheck | TableUse::KeyAction)
+        let snapshot_seq = (table_use != TableUse::KeyCheck
             && self.registry.get_isolation_level(txn_id)
                 == crate::IsolationLevel::SnapshotIsolation)
             .then(|| self.registry.get_transaction_begin_sequence(txn_id) as u64);

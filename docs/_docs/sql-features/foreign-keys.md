@@ -233,7 +233,7 @@ COMMIT;
 
 The same holds the other way round: while a transaction that inserted or updated a child of parent 1 is open, a delete of parent 1, or an update of the column the key references, fails with a write conflict. Child rows of the same parent inserted by several transactions at once do not conflict with each other.
 
-FK checks read the newest committed rows, also in a transaction under `SNAPSHOT` isolation. A child insert in such a transaction fails if its parent was deleted after the transaction began. A parent delete or key change finds the children committed after the transaction began: `RESTRICT` refuses it as usual, and a `CASCADE` or `SET NULL` that would change such a child fails with a write conflict, since the transaction's snapshot does not see that row.
+FK checks read the newest committed rows, also in a transaction under `SNAPSHOT` isolation. A child insert in such a transaction fails if its parent was deleted after the transaction began. A parent delete or key change finds the children committed after the transaction began: `RESTRICT` refuses it as usual. A `CASCADE` or `SET NULL` that would change such a child, or a child another transaction changed after this one began, fails with a write conflict, as any write of that row by the transaction would.
 
 ## DDL Interactions
 

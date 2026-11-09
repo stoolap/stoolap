@@ -127,25 +127,36 @@ fn parent_row_exists(
     parent_column: &str,
     value: &Value,
 ) -> Result<bool> {
-    let parent = engine
-        .get_table_to_check(txn_id, parent_table)
-        .map_err(|e| match e {
-            Error::TableNotFound(_) => Error::internal(format!(
-                "foreign key references non-existent table '{}'",
-                parent_table
-            )),
-            e => e,
-        })?;
+    let missing = |e| match e {
+        Error::TableNotFound(_) => Error::internal(format!(
+            "foreign key references non-existent table '{}'",
+            parent_table
+        )),
+        e => e,
+    };
+    let open = || {
+        engine
+            .get_table_to_check(txn_id, parent_table)
+            .map_err(missing)
+    };
+    let mut parent = open()?;
     // The filter's positions come from the handle that reads the rows
-    let parent_schema = parent.schema_arc();
-
-    let ref_idx = referenced_position(&parent_schema, parent_table, parent_column)?;
+    let mut parent_schema = parent.schema_arc();
+    let mut ref_idx = referenced_position(&parent_schema, parent_table, parent_column)?;
 
     // Held before the read: a delete of the key then waits for this
     // transaction, or has committed and the read misses the row
     let key = key_value(&parent_schema, ref_idx, value);
+    #[cfg(feature = "test-failpoints")]
+    crate::test_failpoints::fk_parent_hold_next();
     let column = &parent_schema.columns[ref_idx].name;
     engine.hold_key(txn_id, parent_table, column, &key, false)?;
+    // A snapshot's handle took its view before the hold, so it is taken again
+    if engine.reads_snapshot(txn_id) {
+        parent = open()?;
+        parent_schema = parent.schema_arc();
+        ref_idx = referenced_position(&parent_schema, parent_table, parent_column)?;
+    }
 
     // The storage layer uses the PK fast path (O(1)) or a secondary index
     // (O(log N)) when available

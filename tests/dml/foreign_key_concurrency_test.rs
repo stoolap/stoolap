@@ -261,3 +261,112 @@ fn a_child_insert_while_a_parent_delete_becomes_visible_is_a_write_conflict() {
     assert!(is_conflict(&error), "the insert failed with {error}");
     assert_eq!(orphans(&db), 0);
 }
+
+#[test]
+fn a_snapshot_cascade_over_a_child_updated_after_it_began_is_a_write_conflict() {
+    let cases = [
+        (
+            "pk_cascade",
+            "id INTEGER PRIMARY KEY, n INTEGER",
+            "id",
+            "CASCADE",
+            "(1, 0)",
+        ),
+        (
+            "cascade",
+            "id INTEGER PRIMARY KEY, pid INTEGER, n INTEGER",
+            "pid",
+            "CASCADE",
+            "(1, 1, 0)",
+        ),
+        (
+            "set_null",
+            "id INTEGER PRIMARY KEY, pid INTEGER, n INTEGER",
+            "pid",
+            "SET NULL",
+            "(1, 1, 0)",
+        ),
+    ];
+    for (name, columns, key, on_delete, row) in cases {
+        let db = Database::open(&format!("memory://fk_conc_snapshot_updated_{name}")).unwrap();
+        db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.execute(
+            &format!(
+                "CREATE TABLE c ({columns}, \
+                 FOREIGN KEY ({key}) REFERENCES p (id) ON DELETE {on_delete})"
+            ),
+            (),
+        )
+        .unwrap();
+        db.execute("INSERT INTO p VALUES (1)", ()).unwrap();
+        db.execute(&format!("INSERT INTO c VALUES {row}"), ())
+            .unwrap();
+        let other = db.clone();
+        let mut deleting = other
+            .begin_with_isolation(IsolationLevel::SnapshotIsolation)
+            .unwrap();
+        assert_eq!(
+            deleting
+                .query_one::<i64, _>("SELECT n FROM c WHERE id = 1", ())
+                .unwrap(),
+            0
+        );
+        db.execute("UPDATE c SET n = 1 WHERE id = 1", ()).unwrap();
+
+        let error = match deleting.execute("DELETE FROM p WHERE id = 1", ()) {
+            Ok(_) => deleting.commit().unwrap_err(),
+            Err(error) => {
+                deleting.rollback().unwrap();
+                error
+            }
+        };
+        assert!(is_conflict(&error), "{name}: failed with {error}");
+        assert_eq!(
+            db.query_one::<i64, _>(&format!("SELECT n FROM c WHERE id = 1 AND {key} = 1"), ())
+                .unwrap(),
+            1,
+            "{name}"
+        );
+        assert_eq!(
+            db.query_one::<i64, _>("SELECT COUNT(*) FROM p WHERE id = 1", ())
+                .unwrap(),
+            1,
+            "{name}"
+        );
+    }
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_snapshot_child_check_sees_a_parent_delete_committed_before_its_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = create(
+        Database::open(&format!(
+            "file://{}?checkpoint_interval=0",
+            dir.path().display()
+        ))
+        .unwrap(),
+        "RESTRICT",
+    );
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    assert!(!db.engine().volume_stats().is_empty());
+    let deleting = db.clone();
+    let inserting = db.clone();
+    let mut inserting = inserting
+        .begin_with_isolation(IsolationLevel::SnapshotIsolation)
+        .unwrap();
+    stoolap::test_failpoints::before_fk_parent_hold(move || {
+        deleting.execute("DELETE FROM p WHERE id = 1", ()).unwrap();
+    });
+
+    let error = inserting
+        .execute("INSERT INTO c VALUES (1, 1)", ())
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("does not exist"),
+        "the insert failed with {error}"
+    );
+    inserting.commit().unwrap();
+    assert_eq!(orphans(&db), 0);
+}
