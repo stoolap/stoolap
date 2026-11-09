@@ -15957,7 +15957,7 @@ impl SubqueryExecutor for PreparedRunner<'_> {
 
     fn kept_members(&self, subquery_index: u16) -> Option<&KeptMembers> {
         match self.blocks.get(subquery_index as usize)?.members.get()? {
-            BlockAnswer::Members(set) => Some(set),
+            BlockAnswer::Members(set) => Some(&set.members),
             _ => None,
         }
     }
@@ -16600,7 +16600,10 @@ impl PreparedRunner<'_> {
                 if let Some(e) = rows.last_error() {
                     return Err(e);
                 }
-                KeptMembers::new(member_set(test, row.len(), values, false), None)
+                KeptMembers {
+                    set: member_set(test, row.len(), values, false),
+                    failed: None,
+                }
             }
             Answer::Members(_, members) => {
                 self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller, site)?;
@@ -16679,7 +16682,7 @@ impl PreparedRunner<'_> {
             if !keyed
                 .is_some_and(|plan| self.takes_keyed_set(index, plan) && self.keys_fit(index, plan))
             {
-                let set = CompactArc::new(self.collect_members(index, members, None)?);
+                let set = CompactArc::new(self.collect_members(index, members, None)?.into());
                 self.answer_call(index, call, || {
                     BlockAnswer::Members(CompactArc::clone(&set))
                 });
@@ -16769,8 +16772,8 @@ impl PreparedRunner<'_> {
                     return Err(e);
                 }
                 let set = member_set(test, width, values, true);
-                let members = KeptMembers::new(set, None);
-                Ok(BlockAnswer::Members(CompactArc::new(members)))
+                let members = KeptMembers { set, failed: None };
+                Ok(BlockAnswer::Members(CompactArc::new(members.into())))
             })
         })?;
         let _ = self.blocks[index].members.set(answer);
@@ -16798,7 +16801,7 @@ impl PreparedRunner<'_> {
             self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller, site)?;
             self.kept(kept, || {
                 self.collect_members(index, members, None)
-                    .map(|set| BlockAnswer::Members(CompactArc::new(set)))
+                    .map(|set| BlockAnswer::Members(CompactArc::new(set.into())))
             })
         })?;
         let _ = self.blocks[index].members.set(answer);
@@ -17200,10 +17203,10 @@ impl PreparedRunner<'_> {
                         .collect(),
                     None => values,
                 };
-                return Ok(KeptMembers::new(
-                    member_set(members.test, width, values, true),
-                    None,
-                ));
+                return Ok(KeptMembers {
+                    set: member_set(members.test, width, values, true),
+                    failed: None,
+                });
             }
             let rows = self.group_rows(index, grouping)?;
             let mut vm = self.blocks[index].vm.borrow_mut();
@@ -17220,14 +17223,15 @@ impl PreparedRunner<'_> {
                     failed.get_or_insert(deferred(e)?);
                 }
             }
-            return Ok(KeptMembers::new(
-                member_set(members.test, width, values, true),
+            return Ok(KeptMembers {
+                set: member_set(members.test, width, values, true),
                 failed,
-            ));
+            });
         }
         let mut grouped = self.group_members(index, members, plan)?;
-        Ok(grouped.remove(&[][..]).unwrap_or_else(|| {
-            KeptMembers::new(member_set(members.test, width, Vec::new(), true), None)
+        Ok(grouped.remove(&[][..]).unwrap_or_else(|| KeptMembers {
+            set: member_set(members.test, width, Vec::new(), true),
+            failed: None,
         }))
     }
 
@@ -17260,7 +17264,7 @@ impl PreparedRunner<'_> {
                 }
             }
             let set = member_set(members.test, members.width(), values, true);
-            return Ok(std::iter::once((SmallVec::new(), KeptMembers::new(set, failed))).collect());
+            return Ok(std::iter::once((SmallVec::new(), KeptMembers { set, failed })).collect());
         }
         let mut vm = self.blocks[index].vm.borrow_mut();
         let params = self.blocks[index].buffer.borrow();
@@ -17323,10 +17327,10 @@ impl PreparedRunner<'_> {
             .map(|(key, (values, failed))| {
                 (
                     key,
-                    KeptMembers::new(
-                        member_set(members.test, members.width(), values, plan.is_none()),
+                    KeptMembers {
+                        set: member_set(members.test, members.width(), values, plan.is_none()),
                         failed,
-                    ),
+                    },
                 )
             })
             .collect())

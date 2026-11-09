@@ -316,20 +316,9 @@ pub enum MemberSet {
 pub struct KeptMembers {
     pub set: MemberSet,
     pub failed: Option<crate::core::Error>,
-    /// The row ids a NOT IN read by the primary key leaves out, collected
-    /// once for every run
-    pub left_out: std::sync::OnceLock<crate::common::I64Set>,
 }
 
 impl KeptMembers {
-    pub(crate) fn new(set: MemberSet, failed: Option<crate::core::Error>) -> Self {
-        Self {
-            set,
-            failed,
-            left_out: std::sync::OnceLock::new(),
-        }
-    }
-
     /// `value` tested against the members: a member that settles the test
     /// (TRUE for IN and ANY, FALSE for ALL) wins; else the first error a
     /// candidate raised; else what the members say
@@ -386,6 +375,31 @@ fn one_value_against_rows() -> crate::core::Error {
 /// A correlated IN block's members grouped by key
 pub type MemberKeys = FxHashMap<SmallVec<[Value; 1]>, KeptMembers>;
 
+/// A value block's members as one answer keeps them, and the row ids a
+/// NOT IN read by the primary key leaves out, collected once for every run
+#[derive(Debug)]
+pub struct AnsweredMembers {
+    pub members: KeptMembers,
+    pub left_out: std::sync::OnceLock<crate::common::I64Set>,
+}
+
+impl From<KeptMembers> for AnsweredMembers {
+    fn from(members: KeptMembers) -> Self {
+        Self {
+            members,
+            left_out: std::sync::OnceLock::new(),
+        }
+    }
+}
+
+impl std::ops::Deref for AnsweredMembers {
+    type Target = KeptMembers;
+
+    fn deref(&self) -> &KeptMembers {
+        &self.members
+    }
+}
+
 /// A prepared block's answer for a whole run, or for one call of its parent
 #[derive(Debug, Clone)]
 pub enum BlockAnswer {
@@ -395,7 +409,7 @@ pub enum BlockAnswer {
     Once(bool),
     Keyed(CompactArc<ExistsKeys>),
     /// A value block's members
-    Members(CompactArc<KeptMembers>),
+    Members(CompactArc<AnsweredMembers>),
     KeyedMembers(CompactArc<MemberKeys>),
     /// The candidates a keyed block's probes may still read over tables
     /// unchanged since its stamp, shared by every run that probes them
