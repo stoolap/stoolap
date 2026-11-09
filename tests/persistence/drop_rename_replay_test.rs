@@ -133,6 +133,32 @@ fn a_rename_after_the_last_checkpoint_replays_over_the_moved_files() {
 }
 
 #[test]
+fn a_delete_before_a_rename_after_the_last_checkpoint_holds_over_two_opens() {
+    let dir = tempfile::tempdir().unwrap();
+    run(
+        dir.path(),
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)",
+            "INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)",
+        ],
+    );
+    let db = Database::open(&dsn(dir.path())).unwrap();
+    db.execute("DELETE FROM t WHERE id = 1", ()).unwrap();
+    db.execute("ALTER TABLE t RENAME TO u", ()).unwrap();
+    let image = tempfile::tempdir().unwrap();
+    crash_image(dir.path(), image.path());
+    for open in 1..=2 {
+        let recovered = Database::open(&dsn(image.path())).unwrap();
+        assert_eq!(
+            rows(&recovered, "SELECT id, n FROM u ORDER BY id"),
+            [(2, 2), (3, 3)],
+            "open {open}"
+        );
+        recovered.close().unwrap();
+    }
+}
+
+#[test]
 fn a_rename_to_a_dropped_name_after_the_last_checkpoint_keeps_the_rows_it_moved() {
     let dir = tempfile::tempdir().unwrap();
     run(
@@ -246,5 +272,30 @@ mod failpoints {
         crash_image(dir.path(), image.path());
         let recovered = Database::open(&dsn(image.path())).unwrap();
         assert_eq!(rows(&recovered, "SELECT id, n FROM u"), [(1, 1)]);
+    }
+
+    #[test]
+    fn two_renames_between_the_checkpoint_cut_and_its_catalog_records_reopen() {
+        let _guard = FailpointGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        run(
+            dir.path(),
+            &[
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)",
+                "INSERT INTO t VALUES (1, 1)",
+            ],
+        );
+        let db = Database::open(&dsn(dir.path())).unwrap();
+        let other = db.clone();
+        fp::after_checkpoint_cut_taken(move || {
+            for sql in ["ALTER TABLE t RENAME TO u", "ALTER TABLE u RENAME TO v"] {
+                other.execute(sql, ()).map(drop).unwrap()
+            }
+        });
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        let image = tempfile::tempdir().unwrap();
+        crash_image(dir.path(), image.path());
+        let recovered = Database::open(&dsn(image.path())).unwrap();
+        assert_eq!(rows(&recovered, "SELECT id, n FROM v"), [(1, 1)]);
     }
 }

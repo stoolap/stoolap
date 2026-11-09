@@ -2376,8 +2376,15 @@ impl MVCCEngine {
                     register_pk_index(&schema, &version_store);
 
                     let table_name = schema.table_name_lower.clone();
-                    log.failed_renames
-                        .retain(|(_, _, new, _)| *new != table_name);
+                    // The table restated settles every rename that led to it
+                    let mut renamed = table_name.clone();
+                    while let Some(at) = log
+                        .failed_renames
+                        .iter()
+                        .rposition(|(_, _, new, _)| *new == renamed)
+                    {
+                        renamed = log.failed_renames.remove(at).1;
+                    }
 
                     {
                         let mut schemas = self.schemas.write().unwrap();
@@ -2409,7 +2416,10 @@ impl MVCCEngine {
                 // The segments are set aside: a later rename to this name
                 // takes them back, else they go once the log is read
                 if let Some(mgr) = self.segment_managers.write().unwrap().remove(&table_name) {
-                    log.dropped.push((table_name, mgr));
+                    // A name the open gave moved files leaves them to their own
+                    if mgr.table_name().as_str() == table_name {
+                        log.dropped.push((table_name, mgr));
+                    }
                 }
             }
             WALOperationType::CreateIndex => {
@@ -4127,8 +4137,10 @@ impl MVCCEngine {
             ) {
                 Ok(Some(mgr)) => {
                     // A rename moves the directory before its manifest is
-                    // written again: the directory holds the table's name
-                    if mgr.table_name().as_str() != table_name {
+                    // written again: the directory holds the table's name,
+                    // and the log's records before the rename the written one
+                    let written = mgr.table_name();
+                    if written.as_str() != table_name {
                         mgr.rename(&table_name);
                     }
                     let lsn = mgr.manifest().checkpoint_lsn;
@@ -4139,8 +4151,14 @@ impl MVCCEngine {
 
                     // Store the segment manager so WAL replay can use
                     // is_row_id_in_volume_range() for tombstone creation.
+                    let mgr = Arc::new(mgr);
                     let mut mgrs = self.segment_managers.write().unwrap();
-                    mgrs.insert(table_name, Arc::new(mgr));
+                    if written.as_str() != table_name {
+                        // A directory of that name keeps its own manager
+                        mgrs.entry(written.to_string())
+                            .or_insert_with(|| Arc::clone(&mgr));
+                    }
+                    mgrs.insert(table_name, mgr);
                 }
                 Ok(None) => {
                     // No manifest.bin in this directory, skip
@@ -10028,11 +10046,16 @@ impl TransactionEngineOperations for EngineOperations {
         // open loaded them there, from a manager that holds no rows
         let taken = {
             let mgrs = self.segment_managers.read().unwrap();
-            let moving_rows = mgrs
-                .get(&old_name_lower)
-                .is_some_and(|mgr| mgr.has_segments());
-            mgrs.contains_key(&new_name_lower)
-                && (moving_rows || !self.loading_from_disk.load(Ordering::Acquire))
+            let moving = mgrs.get(&old_name_lower);
+            match mgrs.get(&new_name_lower) {
+                // The open found the files moved and gave them both names
+                Some(new) if moving.is_some_and(|old| Arc::ptr_eq(old, new)) => false,
+                Some(_) => {
+                    moving.is_some_and(|mgr| mgr.has_segments())
+                        || !self.loading_from_disk.load(Ordering::Acquire)
+                }
+                None => false,
+            }
         };
         if taken {
             let schemas = self.schemas().read().unwrap();
