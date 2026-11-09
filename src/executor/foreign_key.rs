@@ -424,9 +424,6 @@ fn fk_tree_needs_precheck_recursive(
             ForeignKeyAction::Restrict | ForeignKeyAction::NoAction => {
                 return true;
             }
-            ForeignKeyAction::Cascade if cascades_into_key(engine, child_table_name, fk) => {
-                return true;
-            }
             ForeignKeyAction::Cascade | ForeignKeyAction::SetNull => {
                 let grandchild_fks = find_referencing_fks(engine, child_table_name);
                 let child_fk_col = &fk.column_name;
@@ -472,9 +469,6 @@ fn pre_check_restrict_recursive(
                         fk.referenced_column, old_value, child_table_name
                     ),
                 ));
-            }
-            ForeignKeyAction::Cascade if cascades_into_key(engine, child_table_name, fk) => {
-                return Err(key_cascade_refused(child_table_name, fk, old_value));
             }
             ForeignKeyAction::Cascade | ForeignKeyAction::SetNull => {
                 // Child rows exist and will be cascaded. Check depth limit
@@ -704,6 +698,86 @@ fn key_cascade_refused(child_table: &str, fk: &ForeignKeyConstraint, old_value: 
             fk.referenced_column, old_value, child_table
         ),
     )
+}
+
+/// The foreign keys of `table` that reference its `column`
+fn fks_on_column(
+    engine: &MVCCEngine,
+    table: &str,
+    column: &str,
+) -> Vec<(String, ForeignKeyConstraint)> {
+    find_referencing_fks(engine, table)
+        .iter()
+        .filter(|(_, fk)| fk.referenced_column == column)
+        .cloned()
+        .collect()
+}
+
+/// Whether the ON UPDATE actions of `referencing_fks`, followed down, reach
+/// a CASCADE into a child's primary key; read from the schemas alone
+pub(crate) fn reaches_key_cascade(
+    engine: &MVCCEngine,
+    referencing_fks: &[(String, ForeignKeyConstraint)],
+) -> bool {
+    reaches_key_cascade_at(engine, referencing_fks, 0)
+}
+
+fn reaches_key_cascade_at(
+    engine: &MVCCEngine,
+    referencing_fks: &[(String, ForeignKeyConstraint)],
+    depth: usize,
+) -> bool {
+    depth < MAX_CASCADE_DEPTH
+        && referencing_fks
+            .iter()
+            .any(|(child, fk)| match fk.on_update {
+                ForeignKeyAction::Restrict | ForeignKeyAction::NoAction => false,
+                ForeignKeyAction::Cascade if cascades_into_key(engine, child, fk) => true,
+                ForeignKeyAction::Cascade | ForeignKeyAction::SetNull => {
+                    let below = fks_on_column(engine, child, &fk.column_name);
+                    reaches_key_cascade_at(engine, &below, depth + 1)
+                }
+            })
+}
+
+/// An error when a referenced value that changes from `old_value` would
+/// cascade into the primary key of a child row naming it, at any depth;
+/// asked per changed value, before the statement writes
+pub(crate) fn refuse_key_cascade(
+    engine: &MVCCEngine,
+    txn_id: i64,
+    old_value: &Value,
+    referencing_fks: &[(String, ForeignKeyConstraint)],
+) -> Result<()> {
+    refuse_key_cascade_at(engine, txn_id, old_value, referencing_fks, 0)
+}
+
+fn refuse_key_cascade_at(
+    engine: &MVCCEngine,
+    txn_id: i64,
+    old_value: &Value,
+    referencing_fks: &[(String, ForeignKeyConstraint)],
+    depth: usize,
+) -> Result<()> {
+    if depth >= MAX_CASCADE_DEPTH {
+        return Ok(());
+    }
+    for (child, fk) in referencing_fks {
+        if matches!(
+            fk.on_update,
+            ForeignKeyAction::Restrict | ForeignKeyAction::NoAction
+        ) || !child_rows_exist(engine, txn_id, child, fk, old_value)?
+        {
+            continue;
+        }
+        if matches!(fk.on_update, ForeignKeyAction::Cascade) && cascades_into_key(engine, child, fk)
+        {
+            return Err(key_cascade_refused(child, fk, old_value));
+        }
+        let below = fks_on_column(engine, child, &fk.column_name);
+        refuse_key_cascade_at(engine, txn_id, old_value, &below, depth + 1)?;
+    }
+    Ok(())
 }
 
 /// CASCADE DELETE: delete all child rows referencing the given parent PK value.

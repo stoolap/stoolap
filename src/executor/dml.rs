@@ -2624,6 +2624,16 @@ impl Executor {
                 FxHashMap::default()
             };
 
+        // The referenced columns whose cascade reaches a child's primary key:
+        // a row that changes one is refused in the setter, before any write
+        let key_cascades: Vec<(usize, &[(String, crate::core::ForeignKeyConstraint)])> =
+            fks_by_ref_col
+                .iter()
+                .filter(|(_, fks)| super::foreign_key::reaches_key_cascade(&self.engine, fks))
+                .map(|(&col, fks)| (col, fks.as_slice()))
+                .collect();
+        let fk_txn_id = table.txn_id();
+
         // Pre-check RESTRICT constraints and CASCADE depth BEFORE writing parent rows.
         // Only scan rows if the FK tree actually has RESTRICT or exceeds depth limits.
         // Pure CASCADE/SET NULL trees within depth limits skip this scan entirely.
@@ -2862,6 +2872,14 @@ impl Executor {
                     for (ci, old_val) in &ref_old_values {
                         if let Some(new_val) = row.get(*ci) {
                             if old_val != new_val {
+                                if let Some((_, fks)) = key_cascades.iter().find(|(c, _)| c == ci) {
+                                    super::foreign_key::refuse_key_cascade(
+                                        &self.engine,
+                                        fk_txn_id,
+                                        old_val,
+                                        fks,
+                                    )?;
+                                }
                                 ref_col_changes.borrow_mut().push((
                                     *ci,
                                     old_val.clone(),

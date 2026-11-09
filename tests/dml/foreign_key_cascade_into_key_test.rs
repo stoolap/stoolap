@@ -75,6 +75,32 @@ fn a_cascade_that_would_change_a_child_key_is_refused_before_any_write() {
 }
 
 #[test]
+fn an_update_that_leaves_a_named_value_as_it_is_goes_through() {
+    each_layout("unchanged", |db| {
+        for sql in [
+            "UPDATE p SET u = u WHERE id = 1",
+            "UPDATE p SET u = 10 WHERE id = 1",
+            "UPDATE p SET u = id * 10 WHERE id <= 2",
+            "UPDATE p SET u = u + 0",
+            "UPDATE p SET u = CASE WHEN id = 3 THEN 31 ELSE u END",
+        ] {
+            db.execute(sql, ()).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+        db.execute("UPDATE p SET u = $1 WHERE id = 2", (20,))
+            .unwrap();
+        let stmt = db.prepare("UPDATE p SET u = $1 WHERE id = $2").unwrap();
+        stmt.execute((10, 1)).unwrap();
+        assert_eq!(
+            rows(db, "SELECT id, u FROM p ORDER BY id"),
+            [[1, 10], [2, 20], [3, 31]]
+        );
+        assert_eq!(rows(db, "SELECT x FROM c WHERE id = 10"), [[100]]);
+        let error = stmt.execute((11, 1)).unwrap_err().to_string();
+        assert!(error.contains("into the primary key of table"), "{error}");
+    });
+}
+
+#[test]
 fn a_parent_value_no_child_names_is_updated() {
     each_layout("unreferenced", |db| {
         db.execute("UPDATE p SET u = 31 WHERE id = 3", ()).unwrap();
