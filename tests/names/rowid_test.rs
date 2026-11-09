@@ -937,6 +937,43 @@ fn a_bare_rowid_counts_a_derived_table_column_with_the_tables_beside_it() {
 }
 
 #[test]
+fn a_quoted_rowid_name_stays_a_name_through_views_keys_and_groups() {
+    each_layout("quoted", |db| {
+        // Over a stored table the quoted name is text; over a derived table
+        // it names the same `_rowid_` column as the bare one
+        for (from, lit) in [
+            ("k", text("_rowid_")),
+            ("(SELECT _rowid_ FROM k) d", text("10")),
+        ] {
+            let sql = format!(
+                "SELECT CAST(\"_rowid_\" AS TEXT) AS lit, CAST(_rowid_ AS TEXT) AS rid FROM {from} \
+                 UNION ALL SELECT 'A', '99' ORDER BY CAST(_rowid_ AS TEXT)"
+            );
+            let sorted = rows(db, &sql);
+            let rid: Vec<Value> = sorted.iter().map(|row| row[1].clone()).collect();
+            assert_eq!(
+                rid,
+                [text("10"), text("20"), text("30"), text("99")],
+                "{sql}"
+            );
+            assert_eq!(sorted[0][0], lit, "{sql}");
+        }
+        for (from, counts) in [
+            ("k", vec![1, 1, 1, 3]),
+            ("(SELECT _rowid_ FROM k) d", vec![1; 6]),
+        ] {
+            for sets in ["(\"_rowid_\"), (_rowid_)", "(_rowid_), (\"_rowid_\")"] {
+                let sql = format!(
+                    "SELECT COUNT(*) FROM {from} GROUP BY GROUPING SETS ({sets}) ORDER BY 1"
+                );
+                let want: Vec<[Value; 1]> = counts.iter().map(|&c| [int(c)]).collect();
+                assert_eq!(rows(db, &sql), want, "{sql}");
+            }
+        }
+    });
+}
+
+#[test]
 fn a_star_never_shows_the_row_id() {
     each_layout("star", |db| {
         db.execute("CREATE TABLE n1 (a INTEGER)", ()).unwrap();

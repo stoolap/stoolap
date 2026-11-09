@@ -2577,10 +2577,11 @@ fn spelled_statement(
     };
     // A set operation's ORDER BY sorts its output: a key names an output
     // column, or is an item's expression, which reads that item's position
-    // in the output, a star counting the columns it shows
+    // in the output, a star counting the columns it shows; both are matched
+    // spelled, where a stored table's identity is its column
     let position = |identity: &ExprKey| -> Option<usize> {
         let mut at = 0;
-        for item in &stmt.columns {
+        for item in &out.columns {
             if ExprKey::of(unaliased(item)) == *identity {
                 return Some(at + 1);
             }
@@ -2600,7 +2601,8 @@ fn spelled_statement(
                     key.expression,
                     Expression::Identifier(_) | Expression::QualifiedIdentifier(_)
                 ) && expr_names_rowid(&key.expression);
-                if let Some(at) = position(&ExprKey::of(&key.expression)).filter(|_| moves) {
+                let spelled = spell(&key.expression)?;
+                if let Some(at) = position(&ExprKey::of(&spelled)).filter(|_| moves) {
                     key.expression = value_to_expression(&Value::Integer(at as i64));
                 }
             }
@@ -2617,6 +2619,10 @@ fn spelled_statement(
         .chain(order_by.iter_mut().map(|o| &mut o.expression))
     {
         *expr = spell(expr)?;
+    }
+    // The sets' distinct expressions, found again among them spelled
+    if let GroupByModifier::GroupingSets(sets) = &out.group_by.modifier {
+        out.group_by.columns = GroupByClause::grouping_sets(sets.clone()).columns;
     }
     for window in &mut out.window_defs {
         let keys = window.order_by.iter_mut().map(|o| &mut o.expression);
