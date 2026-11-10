@@ -1031,6 +1031,11 @@ impl SchemaBuilder {
             .position(|c| c.name.to_lowercase() == lower)
     }
 
+    /// The columns added so far
+    pub fn columns(&self) -> &[SchemaColumn] {
+        &self.columns
+    }
+
     /// Check if a column is nullable by index
     pub fn is_column_nullable(&self, idx: usize) -> bool {
         self.columns.get(idx).is_some_and(|c| c.nullable)

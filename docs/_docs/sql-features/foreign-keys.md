@@ -78,10 +78,16 @@ Referential actions define what happens to child rows when the referenced parent
 
 | Action | Behavior |
 |--------|----------|
-| `RESTRICT` | Block the delete if child rows exist (default) |
+| `RESTRICT` | Block the delete if a child row the statement keeps references the parent (default) |
 | `NO ACTION` | Same as RESTRICT for immediate constraint checking |
 | `CASCADE` | Automatically delete all child rows referencing the parent |
 | `SET NULL` | Set the FK column to NULL in all child rows referencing the parent |
+
+The ON DELETE actions of one statement are worked out from the rows as they were when the statement started, before any row is removed:
+
+- Every row the statement removes is found first: its own rows, and the rows each CASCADE reaches from them, at any depth. A row reached twice is removed once.
+- A RESTRICT key refuses the statement only when a row that stays references a row that goes. A child row that the same statement removes, through a CASCADE or as one of its own rows, does not refuse it.
+- A SET NULL clears only the rows that stay. A row that cannot hold NULL refuses the statement only when it would stay.
 
 ### ON UPDATE Actions
 
@@ -162,7 +168,7 @@ DELETE FROM grandparents WHERE id = 1;
 -- Deletes matching parents AND their children
 ```
 
-A maximum recursion depth of 16 levels is enforced to prevent infinite loops from circular references.
+A DELETE cascade has no depth limit: it removes each row once, so a cycle of keys ends at the rows already removed. An ON UPDATE cascade through more than 16 levels of keys is refused.
 
 ### Mixed Actions in Multi-Level Hierarchies
 
@@ -184,7 +190,7 @@ CREATE TABLE children (
 
 -- This fails: CASCADE would delete parents, but RESTRICT blocks because children exist
 DELETE FROM grandparents WHERE id = 1;
--- Error: cannot cascade-delete row, still referenced by table 'children'
+-- Error: cannot delete row with id = 10, still referenced by table 'children'
 ```
 
 ## Transaction Semantics
@@ -250,7 +256,7 @@ FK checks read the newest committed rows, also in a transaction under `SNAPSHOT`
 
 ### DROP TABLE
 
-DROP TABLE is blocked if any child table has rows with non-NULL FK values referencing the table, regardless of the FK action (RESTRICT, CASCADE, or SET NULL). DDL operations do not cascade to child rows:
+DROP TABLE is blocked if any child table has rows with non-NULL FK values referencing the table, regardless of the FK action (RESTRICT, CASCADE, or SET NULL). Rows of the table itself that reference it go with it and do not block. DDL operations do not cascade to child rows:
 
 ```sql
 -- Blocked: child rows reference this table
@@ -303,9 +309,10 @@ FK constraints are validated at table creation time:
 
 | Check | Error |
 |-------|-------|
-| Parent table must exist | `references non-existent table` |
+| Parent table must exist, or be the table being created | `references non-existent table` |
 | Referenced column must exist in parent | `references non-existent column` |
 | Referenced column must be PRIMARY KEY or UNIQUE | `neither PRIMARY KEY nor UNIQUE` |
+| A column cannot reference itself | `cannot reference itself` |
 | SET NULL requires nullable FK column | `SET NULL but is NOT NULL` |
 
 ```sql
@@ -316,6 +323,26 @@ CREATE TABLE bad (
 );
 -- Error: foreign key column 'parent_id' has ON DELETE SET NULL but is NOT NULL
 ```
+
+## Self-Referencing Keys
+
+A table can reference its own primary key or one of its UNIQUE columns, as a tree of rows does:
+
+```sql
+CREATE TABLE categories (
+    id INTEGER PRIMARY KEY,
+    parent_id INTEGER REFERENCES categories(id) ON DELETE CASCADE,
+    name TEXT
+);
+
+-- A row may name a row of the same statement, before or after it, or itself
+INSERT INTO categories VALUES (1, NULL, 'root'), (2, 3, 'leaf'), (3, 1, 'branch');
+
+-- Removes 1 and every row beneath it, at any depth
+DELETE FROM categories WHERE id = 1;
+```
+
+A key into the row's own table is checked once the statement's rows are written, so an INSERT or COPY may give the parent after the child. The rules above hold unchanged: a RESTRICT key refuses only for a row the statement keeps, so `DELETE FROM categories` removes the whole tree, and DROP TABLE and TRUNCATE ignore the rows that reference their own table.
 
 ## Matching Keys
 
@@ -361,4 +388,3 @@ FK constraints are persisted through both WAL (Write-Ahead Log) and snapshots. A
 ## Limitations
 
 - FK constraints reference single columns (composite FK not yet supported)
-- Self-referencing FK (a table referencing itself) follows the same rules but requires careful ordering of inserts
