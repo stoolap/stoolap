@@ -423,3 +423,27 @@ fn a_set_null_reaches_the_rows_that_reference_the_nulled_column() {
     let x: Option<i64> = db.query_one("SELECT x FROM g", ()).unwrap();
     assert_eq!((k, x), (None, None));
 }
+
+#[test]
+fn a_set_null_leaves_a_column_null_whatever_the_cascades_beside_it_give() {
+    for (sets, name) in [
+        ("a = 4, b = 2, c = 3", "null_last"),
+        ("b = 2, c = 3, a = 4", "null_first"),
+    ] {
+        let db = open(
+            name,
+            &[
+                "CREATE TABLE r (id INTEGER PRIMARY KEY, a INTEGER UNIQUE, b INTEGER UNIQUE, c INTEGER UNIQUE)",
+                "INSERT INTO r VALUES (1, 1, 1, 1)",
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER UNIQUE, \
+                 FOREIGN KEY (k) REFERENCES r(a) ON UPDATE SET NULL, \
+                 FOREIGN KEY (k) REFERENCES r(b) ON UPDATE CASCADE, \
+                 FOREIGN KEY (k) REFERENCES r(c) ON UPDATE CASCADE)",
+                "INSERT INTO t VALUES (1, 1)",
+            ],
+        );
+        db.execute(&format!("UPDATE r SET {sets}"), ()).unwrap();
+        let k: Option<i64> = db.query_one("SELECT k FROM t", ()).unwrap();
+        assert_eq!(k, None, "{sets}");
+    }
+}

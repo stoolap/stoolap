@@ -38,6 +38,7 @@ use crate::common::{I64Map, I64Set};
 use crate::core::{Error, ForeignKeyAction, ForeignKeyConstraint, Result, Schema, Value};
 use crate::storage::expression::Expression as StorageExpression;
 use crate::storage::mvcc::engine::MVCCEngine;
+use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::traits::transaction::StatementTable;
 use crate::storage::traits::{Engine, ScanAccess};
 
@@ -856,6 +857,8 @@ struct Changed {
     /// The actions into the column that have not run yet
     waiting: usize,
     done: bool,
+    /// The child table's store and layout `column` was read from
+    token: Option<LayoutToken>,
 }
 
 /// What one start value of a column becomes
@@ -864,6 +867,9 @@ struct Taken {
     new: Value,
     /// A bit for each key of `Changed::into` whose action gave `new`
     from: u64,
+    /// A value differing from `new` that came in too, refused unless a NULL
+    /// takes the place of both
+    clash: Option<Value>,
     changed: bool,
     written: Cell<bool>,
 }
@@ -885,6 +891,7 @@ impl Taken {
             old,
             new,
             from,
+            clash: None,
             changed: false,
             written: Cell::new(false),
         }
@@ -903,6 +910,7 @@ impl Changed {
             depth: 0,
             waiting: 0,
             done: false,
+            token: None,
         }
     }
 
@@ -917,13 +925,30 @@ impl Changed {
         if !self.values.is_empty() && self.depth > MAX_CASCADE_DEPTH {
             return Err(cascade_depth_exceeded());
         }
+        for taken in &self.values {
+            let (Some(clash), Some(fk)) = (&taken.clash, self.into.first()) else {
+                continue;
+            };
+            if !taken.new.is_null() {
+                return Err(Error::foreign_key_violation(
+                    &self.table,
+                    &fk.column_name,
+                    &fk.referenced_table,
+                    &fk.referenced_column,
+                    format!(
+                        "cannot cascade both {} and {} into column '{}'",
+                        taken.new, clash, fk.column_name
+                    ),
+                ));
+            }
+        }
         self.mark_changed();
         Ok(())
     }
 
     /// Records that `action` gives `value` to the row `row`, which held
     /// `start`. A NULL, no reference, takes the place of any value; two
-    /// values that differ cannot both be the row's
+    /// values that differ cannot both be the row's, which `finish` refuses
     fn take(
         &mut self,
         row: i64,
@@ -939,17 +964,7 @@ impl Changed {
                 } else if value.is_null() {
                     taken.new = value.clone();
                 } else if !same_value(&taken.new, value) {
-                    let fk = &action.fk;
-                    return Err(Error::foreign_key_violation(
-                        &action.child_table,
-                        &fk.column_name,
-                        &fk.referenced_table,
-                        &fk.referenced_column,
-                        format!(
-                            "cannot cascade both {} and {} into column '{}'",
-                            taken.new, value, fk.column_name
-                        ),
-                    ));
+                    taken.clash = Some(value.clone());
                 }
                 taken.from |= bit;
                 at
@@ -1081,6 +1096,14 @@ fn run_update_action(
     let child = engine.get_table_for_txn(txn_id, child_table)?;
     let child_schema = child.schema();
     let col_idx = key_position(child_schema, fk)?;
+    // Every read of the column and its write are of one layout
+    let token = child.layout_token();
+    if col_idx != columns[to].column || columns[to].token.is_some_and(|t| t != token) {
+        return Err(Error::SchemaChanged {
+            table: child_table.to_string(),
+        });
+    }
+    columns[to].token = Some(token);
     let col_name = &child_schema.columns[col_idx].name;
     // The child stores the parent's value in its own column type, checked as stored
     let col_type = child_schema.columns[col_idx].data_type;
@@ -1174,6 +1197,11 @@ fn write_changed(engine: &MVCCEngine, txn_id: i64, columns: &[Changed]) -> Resul
         ids.sort_unstable();
         ids.dedup();
         let mut child = engine.get_table_for_txn(txn_id, table)?;
+        for column in &of_table {
+            if let Some(token) = column.token {
+                super::query_cache::check_compiled_token(&*child, token)?;
+            }
+        }
         let schema = child.schema();
         let checks = super::dml::checks_reading(super::dml::compile_check_programs(schema)?, |c| {
             of_table.iter().any(|column| column.column == c)

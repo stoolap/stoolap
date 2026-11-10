@@ -99,7 +99,7 @@ A parent's primary key can be updated too, and its children follow their ON UPDA
 The ON UPDATE actions of one statement are worked out from the rows as they were when the statement started, and each child row is written once:
 
 - A child row follows the parent row its value named at the start, even when another change of the same statement gives some other parent that value.
-- A column with several foreign keys, each reached by the statement, takes the value they all give it. A SET NULL among them leaves the column NULL. Two keys that give it different values refuse the statement.
+- A column with several foreign keys, each reached by the statement, takes the value they all give it. A SET NULL among them leaves the column NULL, whatever the others give. Otherwise, two keys that give it different values refuse the statement.
 - A SET NULL is a change of the column like any other: the rows that reference the nulled column follow their own ON UPDATE action.
 - Each value a cascade writes is checked against every other foreign key of its column once all the rows are written.
 
