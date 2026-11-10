@@ -374,3 +374,61 @@ fn a_sealed_top_k_builds_few_text_or_float_rows_the_heap_cannot_take() {
         assert!(built <= 1_000, "{sql}: built {built} sealed rows");
     }
 }
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_sealed_top_k_decodes_the_other_columns_of_its_kept_rows_alone() {
+    use stoolap::test_failpoints::take_group_column_decodes;
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}/kept", dir.path().display());
+    let db = Database::open(&dsn).unwrap();
+    db.execute(
+        "CREATE TABLE w (id INTEGER PRIMARY KEY, t TEXT, p TEXT, f INTEGER)",
+        (),
+    )
+    .unwrap();
+    // The first three row groups lead on the key and hold no row the WHERE
+    // passes; the last holds the answer
+    db.execute(
+        "INSERT INTO w SELECT value, \
+         CASE WHEN value <= 196608 THEN 'a' ELSE 'b' END || value, 'payload ' || value, \
+         CASE WHEN value <= 196608 THEN (value % 2) * 2 ELSE 1 END \
+         FROM generate_series(1, 200000)",
+        (),
+    )
+    .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    drop(db);
+    // Reopened, no block of the volume is decoded yet
+    let db = Database::open(&dsn).unwrap();
+    take_group_column_decodes();
+    let rows: Vec<(i64, String, String)> = db
+        .query(
+            "SELECT id, t, p FROM w WHERE f > 0 AND f < 2 ORDER BY t LIMIT 1",
+            (),
+        )
+        .unwrap()
+        .map(|row| {
+            let row = row.unwrap();
+            (
+                row.get(0).unwrap(),
+                row.get(1).unwrap(),
+                row.get(2).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [(196609, "b196609".to_string(), "payload 196609".to_string())]
+    );
+    let decodes = take_group_column_decodes();
+    let groups = |col: usize| {
+        let mut groups: Vec<usize> = decodes.iter().filter(|d| d.0 == col).map(|d| d.1).collect();
+        groups.sort_unstable();
+        groups.dedup();
+        groups
+    };
+    // Every group's key, the payload of the one group holding the row kept
+    assert_eq!(groups(1), [0, 1, 2, 3], "key blocks decoded: {decodes:?}");
+    assert_eq!(groups(2), [3], "payload blocks decoded: {decodes:?}");
+}

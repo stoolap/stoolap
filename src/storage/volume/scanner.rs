@@ -142,6 +142,8 @@ pub struct VolumeScanner {
     current_row: Row,
     /// Row ID of the current row (from segment's row_ids array)
     current_rid: i64,
+    /// Where the current row lies in the volume
+    current_pos: usize,
     /// Whether we have a valid current row
     has_current: bool,
     /// Precomputed column mapping (None = volume matches current schema).
@@ -231,6 +233,11 @@ pub struct VolumeScanner {
 }
 
 impl VolumeScanner {
+    /// Where the row the scanner stands on lies in the volume
+    pub fn position(&self) -> usize {
+        self.current_pos
+    }
+
     /// Rows in the volume's order, from the start (ascending) or from the end
     /// (descending), without the eager dictionary pre-scan over the range
     pub fn set_ordered_walk(&mut self, ascending: bool) {
@@ -469,6 +476,7 @@ impl VolumeScanner {
             if !self.materialize_row(idx)? {
                 continue;
             }
+            self.current_pos = idx;
             self.current_rid = self.volume.meta.row_ids[idx];
             self.has_current = true;
             return Ok(true);
@@ -508,6 +516,7 @@ impl VolumeScanner {
             current_idx: 0,
             current_row: Row::new(),
             current_rid: 0,
+            current_pos: 0,
             has_current: false,
             error: None,
             filter: None,
@@ -575,6 +584,7 @@ impl VolumeScanner {
             end_idx,
             current_row: Row::new(),
             current_rid: 0,
+            current_pos: 0,
             has_current: false,
             error: None,
             filter: None,
@@ -677,6 +687,7 @@ impl VolumeScanner {
             end_idx: 0,
             current_row: Row::new(),
             current_rid: 0,
+            current_pos: 0,
             has_current: false,
             error: None,
             filter: None,
@@ -1656,6 +1667,7 @@ impl VolumeScanner {
                 if let Some(side) = self.side.as_mut() {
                     side.rows += 1;
                 }
+                self.current_pos = idx;
                 self.current_rid = self.volume.meta.row_ids[idx];
                 self.has_current = true;
                 return Ok(true);
@@ -1714,6 +1726,7 @@ impl VolumeScanner {
                 continue;
             }
 
+            self.current_pos = idx;
             self.current_rid = self.volume.meta.row_ids[idx];
             self.has_current = true;
             self.current_idx += 1;

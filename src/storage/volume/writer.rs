@@ -3864,6 +3864,29 @@ impl RowReader {
         Ok(value)
     }
 
+    /// Writes into `row`, the row at `idx` through `mapping`, the schema
+    /// columns `known` does not mark
+    pub fn fill(
+        &mut self,
+        idx: usize,
+        mapping: &ColumnMapping,
+        known: &[bool],
+        row: &mut Row,
+    ) -> std::io::Result<()> {
+        for (ci, value) in row.values_mut().iter_mut().enumerate() {
+            if known.get(ci).copied().unwrap_or(false) {
+                continue;
+            }
+            *value = match mapping.sources.get(ci) {
+                _ if mapping.is_identity => self.cell(ci, idx)?,
+                Some(ColSource::Volume(col_idx)) => self.cell(*col_idx, idx)?,
+                Some(ColSource::Default(default)) => default.clone(),
+                None => continue,
+            };
+        }
+        Ok(())
+    }
+
     /// The row at `idx` through `mapping`, every schema column
     pub fn row(&mut self, idx: usize, mapping: &ColumnMapping) -> std::io::Result<Row> {
         if mapping.is_identity {
