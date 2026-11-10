@@ -241,7 +241,7 @@ thread_local! {
     static CASCADE_TARGETS_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
-/// Run once on this thread after an ON UPDATE cascade reads its child rows, before it writes them.
+/// Run once on this thread after an ON UPDATE or ON DELETE cascade reads its child rows, before it writes them.
 pub fn after_cascade_targets_read(hook: impl FnOnce() + 'static) {
     CASCADE_TARGETS_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }

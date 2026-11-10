@@ -1085,6 +1085,8 @@ impl Executor {
         } else {
             None
         };
+        // Keys into this table whose parent is a later row of the statement
+        let mut pending_parents = Vec::new();
 
         // Create VM for constant expression evaluation (reused for all INSERT values)
         use super::expression::{ExecuteContext, ExprVM};
@@ -1200,11 +1202,12 @@ impl Executor {
 
                 // FK parent validation (zero-cost if no FKs)
                 if let Some(ref fks) = fk_schema {
-                    super::foreign_key::check_parent_exists(
+                    super::foreign_key::check_inserted_parents(
                         &self.engine,
                         table.txn_id(),
                         fks,
                         &row,
+                        &mut pending_parents,
                     )?;
                 }
 
@@ -1350,6 +1353,14 @@ impl Executor {
             if let Some(err) = select_result.last_error() {
                 return Err(err);
             }
+            if let Some(ref fks) = fk_schema {
+                super::foreign_key::check_pending_parents(
+                    &self.engine,
+                    table.txn_id(),
+                    fks,
+                    &pending_parents,
+                )?;
+            }
 
             // Invalidate semantic cache for this table BEFORE commit
             // CRITICAL: Must invalidate before commit to prevent stale data window
@@ -1488,11 +1499,12 @@ impl Executor {
 
                 // FK parent validation (zero-cost if no FKs)
                 if let Some(ref fks) = fk_schema {
-                    super::foreign_key::check_parent_exists(
+                    super::foreign_key::check_inserted_parents(
                         &self.engine,
                         table.txn_id(),
                         fks,
                         &row,
+                        &mut pending_parents,
                     )?;
                 }
 
@@ -1693,11 +1705,12 @@ impl Executor {
 
                 // FK parent validation (zero-cost if no FKs)
                 if let Some(ref fks) = fk_schema {
-                    super::foreign_key::check_parent_exists(
+                    super::foreign_key::check_inserted_parents(
                         &self.engine,
                         table.txn_id(),
                         fks,
                         &row,
+                        &mut pending_parents,
                     )?;
                 }
 
@@ -1711,6 +1724,14 @@ impl Executor {
                 }
                 rows_affected += 1;
             }
+        }
+        if let Some(ref fks) = fk_schema {
+            super::foreign_key::check_pending_parents(
+                &self.engine,
+                table.txn_id(),
+                fks,
+                &pending_parents,
+            )?;
         }
 
         // Invalidate semantic cache for this table BEFORE commit
@@ -2038,6 +2059,8 @@ impl Executor {
         } else {
             None
         };
+        // Keys into this table whose parent is a later row of the statement
+        let mut pending_parents = Vec::new();
 
         // Create VM for constant expression evaluation (reused for all INSERT values)
         use super::expression::{ExecuteContext, ExprVM};
@@ -2133,11 +2156,12 @@ impl Executor {
 
                 // FK parent validation (zero-cost if no FKs)
                 if let Some(ref fks) = fk_schema {
-                    super::foreign_key::check_parent_exists(
+                    super::foreign_key::check_inserted_parents(
                         &self.engine,
                         table.txn_id(),
                         fks,
                         &row,
+                        &mut pending_parents,
                     )?;
                 }
 
@@ -2223,11 +2247,12 @@ impl Executor {
 
                 // FK parent validation (zero-cost if no FKs)
                 if let Some(ref fks) = fk_schema {
-                    super::foreign_key::check_parent_exists(
+                    super::foreign_key::check_inserted_parents(
                         &self.engine,
                         table.txn_id(),
                         fks,
                         &row,
+                        &mut pending_parents,
                     )?;
                 }
 
@@ -2239,6 +2264,14 @@ impl Executor {
                 }
                 rows_affected += 1;
             }
+        }
+        if let Some(ref fks) = fk_schema {
+            super::foreign_key::check_pending_parents(
+                &self.engine,
+                table.txn_id(),
+                fks,
+                &pending_parents,
+            )?;
         }
 
         // CRITICAL: Must invalidate before commit to prevent stale data window
@@ -2468,40 +2501,6 @@ impl Executor {
         } else {
             None
         };
-
-        // Pre-validate constant FK values in explicit transactions to prevent dirty state.
-        // When SET parent_id = <literal>, we can check the parent exists BEFORE modifying rows.
-        // This ensures statement-level atomicity for the most common FK update pattern.
-        // For row-dependent expressions (SET fk = other_col), post-validation is still used.
-        if has_fk_updates && !should_auto_commit {
-            let col_map = schema.column_index_map();
-            for (col_name, expr) in &stmt.updates {
-                let col_lower = col_name.to_lowercase();
-                if let Some(&col_idx) = col_map.get(col_lower.as_str()) {
-                    if let Some(fk) = schema
-                        .foreign_keys
-                        .iter()
-                        .find(|f| f.column_index == col_idx)
-                    {
-                        // The value as the column stores it; one that does not
-                        // convert is left to the update, which reports it
-                        if let Some(Ok(value)) = try_extract_simple_value(expr, ctx)
-                            .map(|v| v.try_into_coerce_to_type(schema.columns[col_idx].data_type))
-                        {
-                            if !value.is_null() {
-                                super::foreign_key::validate_fk_value(
-                                    &self.engine,
-                                    table.txn_id(),
-                                    fk,
-                                    &value,
-                                    table_name,
-                                )?;
-                            }
-                        }
-                    }
-                }
-            }
-        }
 
         // A statement of the prepared family runs through one runner, whose
         // subqueries read the tables as the statement found them
@@ -3318,39 +3317,28 @@ impl Executor {
             // Drop scanner to release borrow
             drop(scanner);
 
-            // Every key is asked whether it refuses before any key acts, so a
-            // refusal leaves the statement having written nothing
-            if has_referencing_fks {
-                let keyed_values: Vec<(&(String, crate::core::ForeignKeyConstraint), Vec<Value>)> =
-                    referencing_fks
-                        .iter()
-                        .zip(&fk_columns)
-                        .zip(fk_values)
-                        .filter_map(|((fk_entry, column), values)| {
-                            column.map(|_| (fk_entry, values))
-                        })
-                        .collect();
-                for (fk_entry, values) in &keyed_values {
-                    let refs: Vec<&Value> = values.iter().collect();
-                    super::foreign_key::pre_check_delete_keys(
-                        &self.engine,
-                        table.txn_id(),
-                        table_name,
-                        &refs,
-                        std::slice::from_ref(*fk_entry),
-                    )?;
-                }
-                for (fk_entry, values) in &keyed_values {
-                    let refs: Vec<&Value> = values.iter().collect();
-                    super::foreign_key::apply_delete_actions(
-                        &self.engine,
-                        table.txn_id(),
-                        table_name,
-                        &refs,
-                        std::slice::from_ref(*fk_entry),
-                    )?;
-                }
-            }
+            // The keys' actions are worked out from the rows as found, and
+            // a refusal comes before any row goes
+            let delete_plan = if has_referencing_fks {
+                let ids: Vec<i64> = rows_to_delete
+                    .iter()
+                    .filter_map(|(pk, _)| match pk {
+                        Value::Integer(id) => Some(*id),
+                        _ => None,
+                    })
+                    .chain(rows_to_delete_by_row_id.iter().map(|(id, _)| *id))
+                    .collect();
+                Some(super::foreign_key::plan_delete_actions(
+                    &self.engine,
+                    table.txn_id(),
+                    table_name,
+                    &ids,
+                    referencing_fks.clone(),
+                    fk_values,
+                )?)
+            } else {
+                None
+            };
 
             // Delete matching rows by primary key
             let mut delete_count = 0;
@@ -3398,6 +3386,9 @@ impl Executor {
                             .filter_map(|(_, row)| row),
                     );
                 }
+            }
+            if let Some(plan) = delete_plan {
+                plan.write(&self.engine, table.txn_id())?;
             }
             delete_count
         } else {

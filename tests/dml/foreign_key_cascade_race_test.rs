@@ -78,3 +78,65 @@ fn a_cascade_refuses_a_child_whose_layout_changed_after_it_was_read() {
     let id: i64 = db.query_one("SELECT id FROM p", ()).unwrap();
     assert_eq!(id, 1);
 }
+
+#[test]
+fn a_delete_cascade_refuses_when_a_child_it_read_moved_to_another_parent() {
+    let _guard = test_failpoints::FailpointGuard::new();
+    let db = Database::open("memory://fk_cascade_race_delete_moved_child").unwrap();
+    for sql in [
+        "CREATE TABLE p (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE CASCADE)",
+        "CREATE TABLE g (id INTEGER PRIMARY KEY, cid INTEGER REFERENCES c(id) ON DELETE CASCADE)",
+        "INSERT INTO p VALUES (1), (3)",
+        "INSERT INTO c VALUES (1, 1)",
+        "INSERT INTO g VALUES (1, 1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let writer = db.clone();
+    test_failpoints::after_cascade_targets_read(move || {
+        std::thread::spawn(move || writer.execute("UPDATE c SET pid = 3 WHERE id = 1", ()))
+            .join()
+            .unwrap()
+            .unwrap();
+    });
+    let error = db
+        .execute("DELETE FROM p WHERE id = 1", ())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("write conflict"), "{error}");
+    for (sql, want) in [
+        ("SELECT COUNT(*) FROM p", 2),
+        ("SELECT pid FROM c WHERE id = 1", 3),
+        ("SELECT COUNT(*) FROM g", 1),
+    ] {
+        assert_eq!(db.query_one::<i64, _>(sql, ()).unwrap(), want, "{sql}");
+    }
+}
+
+#[test]
+fn a_delete_set_null_leaves_a_child_that_moved_to_another_parent_after_it_was_read() {
+    let _guard = test_failpoints::FailpointGuard::new();
+    let db = Database::open("memory://fk_cascade_race_delete_null_moved").unwrap();
+    for sql in [
+        "CREATE TABLE p (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE SET NULL)",
+        "INSERT INTO p VALUES (1), (3)",
+        "INSERT INTO c VALUES (1, 1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let writer = db.clone();
+    test_failpoints::after_cascade_targets_read(move || {
+        std::thread::spawn(move || writer.execute("UPDATE c SET pid = 3 WHERE id = 1", ()))
+            .join()
+            .unwrap()
+            .unwrap();
+    });
+    db.execute("DELETE FROM p WHERE id = 1", ()).unwrap();
+    let pid: i64 = db.query_one("SELECT pid FROM c WHERE id = 1", ()).unwrap();
+    assert_eq!(
+        pid, 3,
+        "the SET NULL cleared a child that no longer named 1"
+    );
+}

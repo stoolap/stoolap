@@ -32,11 +32,15 @@ use crate::storage::traits::{Engine, QueryResult};
 /// Validate a foreign key reference and build a `ForeignKeyConstraint`.
 ///
 /// Checks: parent table exists, referenced column exists and is PK/UNIQUE,
-/// FK column exists in the schema being built.
+/// FK column exists in the schema being built. A key into the table being
+/// created reads its columns from the builder and its UNIQUE columns from
+/// `own_unique`.
 #[allow(clippy::too_many_arguments)]
 fn validate_fk_reference(
     engine: &dyn Engine,
     schema_builder: &SchemaBuilder,
+    own_table_lower: &str,
+    own_unique: &[&str],
     fk_col_name: &str,
     fk_col_display: &str,
     ref_table_lower: &str,
@@ -45,34 +49,50 @@ fn validate_fk_reference(
     on_delete: ForeignKeyAction,
     on_update: ForeignKeyAction,
 ) -> Result<ForeignKeyConstraint> {
+    let own = ref_table_lower == own_table_lower;
     // Validate parent table exists
-    if !engine.table_exists(ref_table_lower)? {
+    if !own && !engine.table_exists(ref_table_lower)? {
         return Err(Error::internal(format!(
             "foreign key on column '{}' references non-existent table '{}'",
             fk_col_display, ref_table_display
         )));
     }
 
-    let parent_schema = engine.get_table_schema(ref_table_lower)?;
+    let parent_schema = match own {
+        true => None,
+        false => Some(engine.get_table_schema(ref_table_lower)?),
+    };
+    let own_column = |name: &str| {
+        let columns = schema_builder.columns();
+        schema_builder
+            .column_index(name)
+            .map(|at| (at, &columns[at]))
+    };
 
     // Resolve referenced column (defaults to PK if not specified)
     let ref_col_name = if let Some(rc) = ref_col_opt {
         rc.to_string()
     } else {
-        parent_schema
-            .pk_column_index()
-            .and_then(|idx| parent_schema.columns.get(idx))
-            .map(|c| c.name.to_lowercase())
-            .ok_or_else(|| {
-                Error::internal(format!(
-                    "table '{}' has no primary key for FK reference default",
-                    ref_table_display
-                ))
-            })?
+        let pk = match &parent_schema {
+            Some(schema) => schema
+                .pk_column_index()
+                .and_then(|idx| schema.columns.get(idx)),
+            None => schema_builder.columns().iter().find(|c| c.primary_key),
+        };
+        pk.map(|c| c.name.to_lowercase()).ok_or_else(|| {
+            Error::internal(format!(
+                "table '{}' has no primary key for FK reference default",
+                ref_table_display
+            ))
+        })?
     };
 
     // Validate referenced column exists and is PK or has unique index
-    let (ref_col_idx, ref_col_def) = parent_schema.find_column(&ref_col_name).ok_or_else(|| {
+    let referenced = match &parent_schema {
+        Some(schema) => schema.find_column(&ref_col_name),
+        None => own_column(&ref_col_name),
+    };
+    let (ref_col_idx, ref_col_def) = referenced.ok_or_else(|| {
         Error::internal(format!(
             "foreign key references non-existent column '{}' in table '{}'",
             ref_col_name, ref_table_display
@@ -80,16 +100,21 @@ fn validate_fk_reference(
     })?;
 
     if !ref_col_def.primary_key {
-        let has_unique = engine
-            .get_all_indexes(ref_table_lower)
-            .map(|indexes| {
-                indexes.iter().any(|idx| {
-                    idx.is_unique()
-                        && idx.column_ids().len() == 1
-                        && idx.column_ids()[0] as usize == ref_col_idx
+        let has_unique = match own {
+            true => own_unique
+                .iter()
+                .any(|c| own_column(c).is_some_and(|(at, _)| at == ref_col_idx)),
+            false => engine
+                .get_all_indexes(ref_table_lower)
+                .map(|indexes| {
+                    indexes.iter().any(|idx| {
+                        idx.is_unique()
+                            && idx.column_ids().len() == 1
+                            && idx.column_ids()[0] as usize == ref_col_idx
+                    })
                 })
-            })
-            .unwrap_or(false);
+                .unwrap_or(false),
+        };
 
         if !has_unique {
             return Err(Error::internal(format!(
@@ -106,6 +131,12 @@ fn validate_fk_reference(
             fk_col_display
         ))
     })?;
+    if own && fk_col_idx == ref_col_idx {
+        return Err(Error::internal(format!(
+            "foreign key column '{}' cannot reference itself",
+            fk_col_display
+        )));
+    }
 
     // Reject SET NULL action on NOT NULL columns (would always fail at runtime)
     if (matches!(on_delete, ForeignKeyAction::SetNull)
@@ -350,6 +381,17 @@ impl Executor {
             }
         }
 
+        // The single columns kept UNIQUE, which a key into this table may name
+        let table_lower = table_name.to_lowercase();
+        let own_unique: Vec<&str> = unique_columns
+            .iter()
+            .map(String::as_str)
+            .chain(stmt.table_constraints.iter().filter_map(|c| match c {
+                TableConstraint::Unique(cols) if cols.len() == 1 => Some(cols[0].value.as_str()),
+                _ => None,
+            }))
+            .collect();
+
         // Collect foreign key constraints from column-level REFERENCES
         for col_def in &stmt.columns {
             for constraint in &col_def.constraints {
@@ -363,6 +405,8 @@ impl Executor {
                     let fk = validate_fk_reference(
                         &*self.engine,
                         &schema_builder,
+                        &table_lower,
+                        &own_unique,
                         col_def.name.value_lower.as_str(),
                         &col_def.name.value,
                         &ref_table.value_lower,
@@ -394,6 +438,8 @@ impl Executor {
                     let fk_constraint = validate_fk_reference(
                         &*self.engine,
                         &schema_builder,
+                        &table_lower,
+                        &own_unique,
                         fk.column.value_lower.as_str(),
                         &fk.column.value,
                         &fk.ref_table.value_lower,

@@ -41,6 +41,7 @@ mod foreign_key_concurrency_test;
 mod foreign_key_cross_type_test;
 mod foreign_key_delete_key_column_test;
 mod foreign_key_rename_parent_test;
+mod foreign_key_self_reference_test;
 mod foreign_key_test;
 mod insert_path_test;
 mod insert_select_dataloss_test;
