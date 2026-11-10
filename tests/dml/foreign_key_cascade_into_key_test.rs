@@ -467,7 +467,9 @@ fn a_set_null_leaves_a_column_null_where_a_cascade_beside_it_cannot_be_stored() 
             name,
             &[
                 &format!(
-                    "CREATE TABLE r (id INTEGER PRIMARY KEY, {float} FLOAT UNIQUE, {int} INTEGER UNIQUE)"
+                    "CREATE TABLE r (id INTEGER PRIMARY KEY, a {} UNIQUE, b {} UNIQUE)",
+                    if float == "a" { "FLOAT" } else { "INTEGER" },
+                    if float == "b" { "FLOAT" } else { "INTEGER" }
                 ),
                 &format!("INSERT INTO r (id, {float}, {int}) VALUES (1, 1.0, 1)"),
                 &format!(
