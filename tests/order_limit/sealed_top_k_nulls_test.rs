@@ -89,17 +89,18 @@ fn read(db: &Database, sql: &str) -> (Vec<String>, Vec<i64>) {
     (keys, ids)
 }
 
-fn taken(db: &Database, sql: &str) -> bool {
+/// Whether the top-k read answered `sql`; None in a build that cannot tell
+fn taken(db: &Database, sql: &str) -> Option<bool> {
     #[cfg(feature = "test-failpoints")]
     {
         stoolap::test_failpoints::reset_order_limit_paths();
         db.query(sql, ()).unwrap().for_each(drop);
-        stoolap::test_failpoints::order_limit_paths_taken().contains(&"prepared_top_k")
+        Some(stoolap::test_failpoints::order_limit_paths_taken().contains(&"prepared_top_k"))
     }
     #[cfg(not(feature = "test-failpoints"))]
     {
         let _ = (db, sql);
-        true
+        None
     }
 }
 
@@ -242,7 +243,7 @@ fn a_sealed_top_k_places_null_and_nan_as_the_sort_does() {
         if got.0 != keys || got.1 != ids {
             wrong.push(format!("{sql}\n  got  {got:?}\n  want ({keys:?}, {ids:?})"));
         }
-        if taken(&db, sql) != top_k {
+        if taken(&db, sql).is_some_and(|taken| taken != top_k) {
             wrong.push(format!("{sql}: top-k read taken is not {top_k}"));
         }
     }
@@ -315,5 +316,9 @@ fn a_hot_top_k_walks_a_prefix_index_when_the_where_bounds_a_nullable_column() {
         read(&db, sql),
         (vec!["20".to_string(), "30".to_string()], vec![1, 5])
     );
-    assert!(taken(&db, sql), "{sql}: the hot index walk answers");
+    assert_ne!(
+        taken(&db, sql),
+        Some(false),
+        "{sql}: the hot index walk answers"
+    );
 }
