@@ -241,7 +241,7 @@ impl VolumeFile {
 
     /// Gives up the kept descriptor and the file's place among the kept,
     /// under the lock a descriptor is kept under
-    fn drop_reader(self: &Arc<Self>) {
+    pub(super) fn drop_reader(self: &Arc<Self>) {
         let mut open = OPEN_READERS.lock();
         if self.reader.lock().take().is_some() {
             open.retain(|weak| !std::ptr::eq(weak.as_ptr(), Arc::as_ptr(self)));
