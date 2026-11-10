@@ -1675,9 +1675,10 @@ impl IndexFile {
         })
     }
 
-    /// The file, checked to still be the generation the directory was read from
-    fn open_checked(&self) -> std::io::Result<std::fs::File> {
-        let file = self.file.open()?;
+    /// The file through its kept descriptor, checked to still be the
+    /// generation the directory was read from
+    fn open_checked(&self) -> std::io::Result<Arc<std::fs::File>> {
+        let file = self.file.block_reader()?;
         let mut header = [0u8; HEADER_LEN as usize];
         read_exact_at(&file, &mut header, 0)?;
         if header[..4] != MAGIC {
