@@ -283,12 +283,10 @@ impl Executor {
         let mut set = Vec::with_capacity(update.updates.len());
         for name in update.updates.keys() {
             let column = super::dml::written_column(schema, &name.to_lowercase())?;
-            // The row id is the primary key's value
+            // The row id is the primary key's value: a key set moves its row,
+            // which the general path does
             if column == Some(pk) {
-                return Err(crate::core::Error::invalid_argument(format!(
-                    "cannot UPDATE primary key column '{}'. Use DELETE + INSERT instead",
-                    schema.columns[pk].name
-                )));
+                return Ok(None);
             }
             set.extend(column);
         }

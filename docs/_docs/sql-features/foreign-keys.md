@@ -92,6 +92,17 @@ Referential actions define what happens to child rows when the referenced parent
 | `CASCADE` | Update the FK column in all child rows to the new PK value |
 | `SET NULL` | Set the FK column to NULL in all child rows referencing the old PK value |
 
+The update of an `INSERT ... ON CONFLICT DO UPDATE` (or `ON DUPLICATE KEY UPDATE`) is checked as an `UPDATE` is: a foreign key value it writes must name an existing parent row, and a referenced value it changes runs the ON UPDATE action of each child that names it. A refusal leaves the statement having written nothing.
+
+A parent's primary key can be updated too, and its children follow their ON UPDATE action. When a child's foreign key column is its own primary key, ON UPDATE CASCADE moves the child row to the new key, at any depth of the cascade.
+
+The ON UPDATE actions of one statement are worked out from the rows as they were when the statement started, and each child row is written once:
+
+- A child row follows the parent row its value named at the start, even when another change of the same statement gives some other parent that value.
+- A column with several foreign keys, each reached by the statement, takes the value they all give it. A SET NULL among them leaves the column NULL, whatever the others give. Otherwise, two keys that give it different values refuse the statement.
+- A SET NULL is a change of the column like any other: the rows that reference the nulled column follow their own ON UPDATE action.
+- Each value a cascade writes is checked against every other foreign key of its column once all the rows are written.
+
 ### Examples
 
 ```sql
@@ -346,5 +357,4 @@ FK constraints are persisted through both WAL (Write-Ahead Log) and snapshots. A
 ## Limitations
 
 - FK constraints reference single columns (composite FK not yet supported)
-- ON UPDATE CASCADE does not change a child's primary key: when the child's FK column is its primary key, an update whose cascade would reach a child row is refused, at any depth of the cascade, and leaves nothing written, inside a transaction too. An update that keeps the value, or changes a value no child row names, goes through.
 - Self-referencing FK (a table referencing itself) follows the same rules but requires careful ordering of inserts

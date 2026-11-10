@@ -83,14 +83,11 @@ fn a_hot_parent_reads_its_sealed_children_outside_the_seal_fence() {
     let _cache = NoGroupCache::set(&db);
     let blocks = block_file_reads();
     let others = (volume_file_reads_by_fence(), side_file_reads());
-    let error = db
-        .execute("UPDATE p SET u = 99999 WHERE x = 1", ())
-        .unwrap_err()
-        .to_string();
+    db.execute("UPDATE p SET u = 99999 WHERE x = 1", ())
+        .unwrap();
     let (outside, under) = delta(block_file_reads(), blocks);
     let volumes_under = delta(volume_file_reads_by_fence(), others.0).1;
     let sides_under = delta(side_file_reads(), others.1).1;
-    assert!(error.contains("into the primary key of table"), "{error}");
     assert_eq!(under, 0, "blocks read under the fence ({outside} outside)");
     assert_eq!(
         (volumes_under, sides_under),
@@ -101,6 +98,16 @@ fn a_hot_parent_reads_its_sealed_children_outside_the_seal_fence() {
     assert_eq!(
         db.query_one::<i64, _>("SELECT u FROM p WHERE id = 7", ())
             .unwrap(),
-        70
+        99999
+    );
+    assert_eq!(
+        db.query_one::<i64, _>("SELECT COUNT(*) FROM c WHERE id IN (70, 99999)", ())
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        db.query_one::<i64, _>("SELECT id FROM c WHERE id = 99999", ())
+            .unwrap(),
+        99999
     );
 }

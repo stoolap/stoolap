@@ -38,9 +38,9 @@ fn test_simple_update() {
     assert_eq!(val, "b");
 }
 
-/// UPDATE on a primary key column must be rejected
+/// UPDATE on a primary key column moves the row to its new key
 #[test]
-fn test_pk_update_rejected() {
+fn test_pk_update_moves_the_row() {
     let db = Database::open("memory://update_pk_reject").expect("Failed to create database");
 
     db.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY, val TEXT)", ())
@@ -49,18 +49,15 @@ fn test_pk_update_rejected() {
     db.execute("INSERT INTO t2 VALUES (1, 'a')", ())
         .expect("Failed to insert");
 
-    let result = db.execute("UPDATE t2 SET id = 2 WHERE id = 1", ());
-    assert!(result.is_err(), "UPDATE on PK should be rejected");
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("primary key"),
-        "Error should mention primary key, got: {}",
-        err
-    );
+    db.execute("UPDATE t2 SET id = 2 WHERE id = 1", ())
+        .expect("UPDATE on PK moves the row");
 
-    // Original row should be untouched
-    let val: String = db.query_one("SELECT val FROM t2 WHERE id = 1", ()).unwrap();
+    let val: String = db.query_one("SELECT val FROM t2 WHERE id = 2", ()).unwrap();
     assert_eq!(val, "a");
+    let left: i64 = db
+        .query_one("SELECT COUNT(*) FROM t2 WHERE id = 1", ())
+        .unwrap();
+    assert_eq!(left, 0, "nothing is left at the old key");
 }
 
 /// Non-PK column updates still work fine
@@ -91,9 +88,9 @@ fn test_non_pk_update_works() {
     assert_eq!(score, 200);
 }
 
-/// PK update must also be rejected through the Transaction API
+/// PK update through the Transaction API moves the row, and a rollback undoes it
 #[test]
-fn test_pk_update_rejected_via_transaction_api() {
+fn test_pk_update_via_transaction_api() {
     let db = Database::open("memory://update_pk_tx_api").expect("Failed to create database");
 
     db.execute("CREATE TABLE t4 (id INTEGER PRIMARY KEY, val TEXT)", ())
@@ -102,20 +99,16 @@ fn test_pk_update_rejected_via_transaction_api() {
         .expect("Failed to insert");
 
     let mut tx = db.begin().unwrap();
-    let result = tx.execute("UPDATE t4 SET id = 2 WHERE id = 1", ());
-    assert!(
-        result.is_err(),
-        "PK update via Transaction API should be rejected"
-    );
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("primary key"),
-        "Error should mention primary key, got: {}",
-        err
-    );
+    tx.execute("UPDATE t4 SET id = 2 WHERE id = 1", ())
+        .expect("PK update via Transaction API moves the row");
     tx.rollback().unwrap();
 
-    // Row should be untouched
     let val: String = db.query_one("SELECT val FROM t4 WHERE id = 1", ()).unwrap();
+    assert_eq!(val, "a");
+
+    let mut tx = db.begin().unwrap();
+    tx.execute("UPDATE t4 SET id = 2 WHERE id = 1", ()).unwrap();
+    tx.commit().unwrap();
+    let val: String = db.query_one("SELECT val FROM t4 WHERE id = 2", ()).unwrap();
     assert_eq!(val, "a");
 }

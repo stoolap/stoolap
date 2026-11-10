@@ -44,11 +44,11 @@ A `WHERE _rowid_ = ?` or `WHERE _rowid_ IN (...)` reads the rows it names by the
 
 ## What _rowid_ does not do
 
-- `_rowid_` is never written: `UPDATE t SET _rowid_ = ...`, `INSERT INTO t (_rowid_, ...)` and `ON CONFLICT DO UPDATE SET _rowid_ = ...` are errors. In a table with a primary key, the key is not updatable either; delete and insert instead.
+- `_rowid_` is never written: `UPDATE t SET _rowid_ = ...`, `INSERT INTO t (_rowid_, ...)` and `ON CONFLICT DO UPDATE SET _rowid_ = ...` are errors. In a table with a primary key, setting the key moves the row, and `_rowid_` reads the new key.
 - In a join, a table without a primary key has no `_rowid_`: the name is an error there. A table with a primary key reads its key as usual.
 - A table read `AS OF` a past point has no `_rowid_`.
 - Under `SELECT DISTINCT`, an `ORDER BY` key is matched to the select list as written: `_rowid_` and the primary key column it reads count as different, and a `*` selects `_rowid_` only from a derived table, view or CTE that has it as a column, so `SELECT DISTINCT id FROM t ORDER BY _rowid_` and `SELECT DISTINCT * FROM t ORDER BY _rowid_` are errors, while `SELECT DISTINCT * FROM (SELECT _rowid_ FROM t) d ORDER BY _rowid_` sorts. Sort by what the list selects.
 
 ## Stability
 
-A row keeps its identity through updates, through being written to disk and compacted, and across restarts. The id of a deleted row is not given to another row while the database stays open. After a restart, a table without a primary key continues from the largest id it still holds, so ids of the newest rows deleted before the restart can be given again. `TRUNCATE` starts the ids again from 1.
+A row keeps its identity through updates that leave its primary key, through being written to disk and compacted, and across restarts. The id of a deleted row is not given to another row while the database stays open. After a restart, a table without a primary key continues from the largest id it still holds, so ids of the newest rows deleted before the restart can be given again. `TRUNCATE` starts the ids again from 1.

@@ -81,7 +81,7 @@ Project id, name
 
 A run inside a transaction, or one while a commit is publishing to the table, takes the read after `else`.
 
-An UPDATE or DELETE whose WHERE is the primary key's equality reads its row the same way, when it has no RETURNING or WITH, keeps no foreign key, and runs no CHECK on a column it sets. Its SET values show in column order:
+An UPDATE or DELETE whose WHERE is the primary key's equality reads its row the same way, when it has no RETURNING or WITH, keeps no foreign key, sets no primary key, and runs no CHECK on a column it sets. Its SET values show in column order:
 
 ```sql
 EXPLAIN UPDATE users SET email = 'new@example.com' WHERE id = 1;

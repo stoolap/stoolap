@@ -581,6 +581,32 @@ pub(crate) fn written_column(schema: &Schema, name: &str) -> Result<Option<usize
     }
 }
 
+/// Moves each row of `moves`, (old row id, row), to the id its primary key
+/// now holds: every old id is deleted first, then every row inserted, so a
+/// key collides only with a row the statement leaves or with another new
+/// key, whatever order the rows were set in; a NULL key is refused before
+/// an insert could generate one
+pub(crate) fn move_rows(table: &mut dyn Table, moves: Vec<(i64, Row)>) -> Result<()> {
+    if moves.is_empty() {
+        return Ok(());
+    }
+    let schema = table.schema();
+    if let Some(pk) = schema.pk_column_index() {
+        if moves
+            .iter()
+            .any(|(_, row)| row.get(pk).is_none_or(Value::is_null))
+        {
+            return Err(Error::not_null_constraint(&schema.columns[pk].name));
+        }
+    }
+    let ids: Vec<i64> = moves.iter().map(|(id, _)| *id).collect();
+    table.delete_by_row_ids(&ids)?;
+    for (_, row) in moves {
+        table.insert_discard(row)?;
+    }
+    Ok(())
+}
+
 /// Compile every CHECK constraint of `schema`, the columns' and the table's.
 ///
 /// Parsing and compiling a constraint costs dozens of allocations. The COPY
@@ -2402,25 +2428,12 @@ impl Executor {
         };
         let has_fk_updates = !fk_cols_in_update.is_empty();
 
-        // Reject UPDATE on primary key columns. The engine assumes row_id == pk_value
-        // throughout ~50 code paths (lookups, range scans, ORDER BY, FK cascade, WAL
-        // recovery, etc.). Allowing PK mutation silently corrupts lookups.
-        // This matches SQLite's behavior for rowid tables.
+        // A row's id is its primary key's value: a row whose key the statement
+        // changes is moved to its new id once every row is set (move_rows)
+        let mut key_set = None;
         for col_name in stmt.updates.keys() {
-            written_column(schema, &col_name.to_lowercase())?;
-        }
-        if let Some(pk_idx) = schema.pk_column_index() {
-            let col_map = schema.column_index_map();
-            for col_name in stmt.updates.keys() {
-                let col_lower = col_name.to_lowercase();
-                if col_map.get(col_lower.as_str()).copied() == Some(pk_idx) {
-                    let pk_col_name = &schema.columns[pk_idx].name;
-                    return Err(crate::core::Error::invalid_argument(format!(
-                        "cannot UPDATE primary key column '{}'. Use DELETE + INSERT instead",
-                        pk_col_name
-                    )));
-                }
-            }
+            let column = written_column(schema, &col_name.to_lowercase())?;
+            key_set = key_set.or(column.filter(|&at| schema.pk_column_index() == Some(at)));
         }
 
         // Check if this table is referenced by child tables via columns being updated.
@@ -2584,6 +2597,8 @@ impl Executor {
         // Use RefCell to collect updated rows for RETURNING clause and FK validation
         use std::cell::RefCell;
         let returning_rows: RefCell<Vec<Row>> = RefCell::new(Vec::new());
+        // (old row id, row) of each row whose primary key the statement changes
+        let moves: RefCell<Vec<(i64, Row)>> = RefCell::new(Vec::new());
         // Collect new FK values and referenced-column old/new pairs from setter
         let fk_new_values: RefCell<Vec<Row>> = RefCell::new(Vec::new());
         // (referenced_col_idx, old_value, new_value) for FK cascade enforcement
@@ -2841,6 +2856,7 @@ impl Executor {
                         Vec::new()
                     };
 
+                let original = key_set.map(|_| row.clone());
                 for (idx, new_value) in updates_to_apply {
                     let _ = row.set(idx, new_value);
                 }
@@ -2875,6 +2891,19 @@ impl Executor {
                 // Collect row for RETURNING clause
                 if changed && has_returning {
                     returning_rows.borrow_mut().push(row.clone());
+                }
+
+                // A row whose key changes is held as it was, claimed for the
+                // statement, and moved once every row is set
+                if let (Some(key), Some(original)) = (key_set, original) {
+                    if row.get(key) != original.get(key) {
+                        let mut row = row;
+                        if widen {
+                            row.pop();
+                        }
+                        moves.borrow_mut().push((row_id, row));
+                        return Ok((original, true));
+                    }
                 }
 
                 Ok((row, changed))
@@ -2919,6 +2948,7 @@ impl Executor {
             };
             rows
         };
+        move_rows(&mut *table, moves.into_inner())?;
 
         // Post-update FK validation: check new FK values reference existing parent rows
         if has_fk_updates {
@@ -2939,17 +2969,24 @@ impl Executor {
         // RESTRICT constraints were already pre-checked above, so this should not
         // fail for RESTRICT. CASCADE/SET NULL failures are propagated as errors.
         if !fks_by_ref_col.is_empty() {
-            let changes = ref_col_changes.into_inner();
-            for (col_idx, old_val, new_val) in &changes {
-                if let Some(fks_for_col) = fks_by_ref_col.get(col_idx) {
-                    super::foreign_key::enforce_update_actions(
-                        &self.engine,
-                        table.txn_id(),
-                        old_val,
-                        new_val,
-                        fks_for_col,
-                    )?;
+            // Each column's changes cascade together, so a child row is
+            // matched by the value the statement found, once
+            let mut by_column: FxHashMap<usize, Vec<(Value, Value)>> = FxHashMap::default();
+            for (col_idx, old_val, new_val) in ref_col_changes.into_inner() {
+                if fks_by_ref_col.contains_key(&col_idx) {
+                    by_column
+                        .entry(col_idx)
+                        .or_default()
+                        .push((old_val, new_val));
                 }
+            }
+            if !by_column.is_empty() {
+                super::foreign_key::enforce_update_actions(
+                    &self.engine,
+                    table.txn_id(),
+                    table_name,
+                    by_column.into_iter().collect(),
+                )?;
             }
         }
 
@@ -3722,6 +3759,28 @@ impl Executor {
         // Capture the post-update row for RETURNING clause
         let mut captured_row: Option<Row> = None;
 
+        // The keys the setter changes are asked after the write: a row whose
+        // foreign key moved, and each value a child references that it gave up
+        let referencing =
+            super::foreign_key::find_referencing_fks(&self.engine, &schema.table_name);
+        let mut fks_by_ref_col: FxHashMap<usize, Vec<(String, crate::core::ForeignKeyConstraint)>> =
+            FxHashMap::default();
+        for (child, fk) in referencing.iter() {
+            if let Some(idx) = schema.get_column_index(&fk.referenced_column) {
+                fks_by_ref_col
+                    .entry(idx)
+                    .or_default()
+                    .push((child.clone(), fk.clone()));
+            }
+        }
+        let mut fk_rows: Vec<Row> = Vec::new();
+        let mut ref_changes: Vec<(usize, Value, Value)> = Vec::new();
+        // A row whose primary key the update changes moves to its new id (move_rows)
+        let key_set = schema
+            .pk_column_index()
+            .filter(|pk| effective.compiled_updates.iter().any(|(at, ..)| at == pk));
+        let mut moves: Vec<(i64, Row)> = Vec::new();
+
         // Prepared programs read the row met and the excluded row as one row
         let mut joined = conflict.map(|conflict| conflict.joined.borrow_mut());
         let conflict = conflict.map(|conflict| conflict.runner);
@@ -3798,7 +3857,15 @@ impl Executor {
 
             // Apply the updates, then each CHECK an updated column reads over the row
             let changed = !updates_to_apply.is_empty();
+            let original = key_set.map(|_| row.clone());
+            let mut fk_moved = false;
             for (idx, new_value) in updates_to_apply {
+                if let Some(old) = row.get(idx).filter(|old| **old != new_value) {
+                    if !old.is_null() && fks_by_ref_col.contains_key(&idx) {
+                        ref_changes.push((idx, old.clone(), new_value.clone()));
+                    }
+                    fk_moved |= schema.foreign_keys.iter().any(|fk| fk.column_index == idx);
+                }
                 let _ = row.set(idx, new_value);
             }
             if changed {
@@ -3811,11 +3878,23 @@ impl Executor {
             if effective.widens {
                 row.pop();
             }
+            if fk_moved {
+                fk_rows.push(row.clone());
+            }
             if capture_row {
                 captured_row = Some(match returns_id {
                     true => super::prepared_select::widened(row.clone(), id),
                     false => row.clone(),
                 });
+            }
+            if let (Some(key), Some(mut original)) = (key_set, original) {
+                if row.get(key) != original.get(key) {
+                    if effective.widens {
+                        original.pop();
+                    }
+                    moves.push((id, row));
+                    return Ok((original, true));
+                }
             }
 
             Ok((row, changed))
@@ -3832,6 +3911,36 @@ impl Executor {
             let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
             table.update(access, where_expr.as_deref(), &mut setter)?
         };
+        move_rows(&mut **table, moves)?;
+
+        let txn_id = table.txn_id();
+        for row in &fk_rows {
+            super::foreign_key::check_parent_exists(&self.engine, txn_id, schema, row)?;
+        }
+        let mut by_column: Vec<(usize, Vec<(Value, Value)>)> = Vec::new();
+        for (idx, old, new) in ref_changes {
+            let Some(fks) = fks_by_ref_col.get(&idx) else {
+                continue;
+            };
+            if super::foreign_key::fk_tree_needs_precheck(&self.engine, fks) {
+                super::foreign_key::pre_check_restrict_for_update(
+                    &self.engine,
+                    txn_id,
+                    &schema.table_name,
+                    &old,
+                    fks,
+                )?;
+            }
+            by_column.push((idx, vec![(old, new)]));
+        }
+        if !by_column.is_empty() {
+            super::foreign_key::enforce_update_actions(
+                &self.engine,
+                txn_id,
+                &schema.table_name,
+                by_column,
+            )?;
+        }
 
         Ok((updated > 0, captured_row))
     }

@@ -49,33 +49,28 @@ fn each_layout(name: &str, check: impl Fn(&Database)) {
     check(&tables(&format!("file://{}", dir.path().display()), true));
 }
 
-fn refused(db: &Database, sql: &str) {
-    let error = db.execute(sql, ()).unwrap_err().to_string();
-    assert!(
-        error.contains("into the primary key of table"),
-        "{sql}: {error}"
-    );
-}
-
 #[test]
-fn a_cascade_that_would_change_a_child_key_is_refused_and_leaves_nothing_written() {
-    each_layout("refused", |db| {
-        refused(db, "UPDATE p SET u = 40 WHERE id = 1");
-        refused(db, "UPDATE p SET u = u + 100");
-        let unchanged = vec![vec![1, 10], vec![2, 20], vec![3, 30]];
-        assert_eq!(rows(db, "SELECT id, u FROM p ORDER BY id"), unchanged);
+fn a_cascade_into_a_child_key_moves_the_child_to_its_new_key() {
+    each_layout("moved", |db| {
+        db.execute("UPDATE p SET u = 40 WHERE id = 1", ()).unwrap();
         assert_eq!(
             rows(db, "SELECT id, x FROM c ORDER BY id"),
-            [[10, 100], [20, 200]]
+            [[20, 200], [40, 100]]
         );
-        // Each child is still found by its key, and its key stays unique
-        assert_eq!(rows(db, "SELECT x FROM c WHERE id = 10"), [[100]]);
-        assert!(db.execute("INSERT INTO c VALUES (20, 9)", ()).is_err());
+        assert_eq!(rows(db, "SELECT x FROM c WHERE id = 40"), [[100]]);
+        assert!(rows(db, "SELECT x FROM c WHERE id = 10").is_empty());
+        assert!(db.execute("INSERT INTO c VALUES (40, 9)", ()).is_err());
+        db.execute("UPDATE p SET u = u + 100", ()).unwrap();
+        assert_eq!(
+            rows(db, "SELECT id, x FROM c ORDER BY id"),
+            [[120, 200], [140, 100]]
+        );
+        assert_eq!(rows(db, "SELECT x FROM c WHERE id = 120"), [[200]]);
     });
 }
 
 #[test]
-fn an_update_that_leaves_a_named_value_as_it_is_goes_through() {
+fn an_update_that_leaves_a_named_value_as_it_is_leaves_the_child_in_place() {
     each_layout("unchanged", |db| {
         for sql in [
             "UPDATE p SET u = u WHERE id = 1",
@@ -95,8 +90,8 @@ fn an_update_that_leaves_a_named_value_as_it_is_goes_through() {
             [[1, 10], [2, 20], [3, 31]]
         );
         assert_eq!(rows(db, "SELECT x FROM c WHERE id = 10"), [[100]]);
-        let error = stmt.execute((11, 1)).unwrap_err().to_string();
-        assert!(error.contains("into the primary key of table"), "{error}");
+        stmt.execute((11, 1)).unwrap();
+        assert_eq!(rows(db, "SELECT x FROM c WHERE id = 11"), [[100]]);
     });
 }
 
@@ -144,6 +139,7 @@ fn an_update_over_a_key_cascade_asks_its_where_once_per_row() {
         "CREATE TABLE p (id INTEGER PRIMARY KEY, u INTEGER UNIQUE)",
         "CREATE TABLE c (id INTEGER PRIMARY KEY REFERENCES p(u) ON UPDATE CASCADE)",
         "INSERT INTO p VALUES (1, 10)",
+        "INSERT INTO c VALUES (10)",
     ] {
         db.execute(sql, ()).unwrap();
     }
@@ -154,6 +150,7 @@ fn an_update_over_a_key_cascade_asks_its_where_once_per_row() {
         .unwrap();
     assert_eq!(updated, 1, "the row the WHERE chose is the row written");
     assert_eq!(rows(&db, "SELECT u FROM p"), [[11]]);
+    assert_eq!(rows(&db, "SELECT id FROM c"), [[11]]);
     assert_eq!(TICKS.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
 
@@ -166,22 +163,30 @@ fn a_parent_value_no_child_names_is_updated() {
 }
 
 #[test]
-fn a_refused_cascade_leaves_an_open_transaction_as_it_was() {
+fn a_moved_child_follows_the_transaction_it_was_moved_in() {
     each_layout("txn", |db| {
         db.execute("BEGIN", ()).unwrap();
-        db.execute("UPDATE p SET u = 33 WHERE id = 3", ()).unwrap();
-        refused(db, "UPDATE p SET u = 40 WHERE id = 1");
+        db.execute("UPDATE p SET u = 40 WHERE id = 1", ()).unwrap();
+        assert!(db.execute("UPDATE p SET u = 20 WHERE id = 1", ()).is_err());
+        assert_eq!(rows(db, "SELECT x FROM c WHERE id = 40"), [[100]]);
+        db.execute("ROLLBACK", ()).unwrap();
+        assert_eq!(
+            rows(db, "SELECT id, x FROM c ORDER BY id"),
+            [[10, 100], [20, 200]]
+        );
+        db.execute("BEGIN", ()).unwrap();
+        db.execute("UPDATE p SET u = 40 WHERE id = 1", ()).unwrap();
         db.execute("COMMIT", ()).unwrap();
         assert_eq!(
             rows(db, "SELECT id, u FROM p ORDER BY id"),
-            [[1, 10], [2, 20], [3, 33]]
+            [[1, 40], [2, 20], [3, 30]]
         );
-        assert_eq!(rows(db, "SELECT x FROM c WHERE id = 10"), [[100]]);
+        assert_eq!(rows(db, "SELECT x FROM c WHERE id = 40"), [[100]]);
     });
 }
 
 #[test]
-fn a_cascade_reaching_a_grandchild_key_is_refused_and_leaves_nothing_written() {
+fn a_cascade_reaching_a_grandchild_key_moves_it_too() {
     let db = Database::open("memory://fk_cascade_into_key_grandchild").unwrap();
     for sql in [
         "CREATE TABLE g (id INTEGER PRIMARY KEY, a INTEGER UNIQUE)",
@@ -193,8 +198,291 @@ fn a_cascade_reaching_a_grandchild_key_is_refused_and_leaves_nothing_written() {
     ] {
         db.execute(sql, ()).unwrap();
     }
-    refused(&db, "UPDATE g SET a = 6 WHERE id = 1");
-    assert_eq!(rows(&db, "SELECT a FROM g"), [[5]]);
-    assert_eq!(rows(&db, "SELECT ga FROM h"), [[5]]);
-    assert_eq!(rows(&db, "SELECT z FROM i WHERE z = 5"), [[5]]);
+    db.execute("UPDATE g SET a = 6 WHERE id = 1", ()).unwrap();
+    assert_eq!(rows(&db, "SELECT a FROM g"), [[6]]);
+    assert_eq!(rows(&db, "SELECT ga FROM h"), [[6]]);
+    assert_eq!(rows(&db, "SELECT z FROM i WHERE z = 6"), [[6]]);
+    assert!(rows(&db, "SELECT z FROM i WHERE z = 5").is_empty());
+}
+
+#[test]
+fn a_cascade_refuses_a_key_another_foreign_key_of_the_child_does_not_find() {
+    let db = Database::open("memory://fk_cascade_into_key_other_parent").unwrap();
+    for sql in [
+        "CREATE TABLE p (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE q (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, \
+         FOREIGN KEY (id) REFERENCES p(id) ON UPDATE CASCADE, \
+         FOREIGN KEY (id) REFERENCES q(id))",
+        "INSERT INTO p VALUES (1)",
+        "INSERT INTO q VALUES (1)",
+        "INSERT INTO c VALUES (1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let error = db
+        .execute("UPDATE p SET id = 2 WHERE id = 1", ())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("does not exist"), "{error}");
+    db.execute("INSERT INTO p VALUES (2)", ()).unwrap();
+    let error = db
+        .execute("UPDATE c SET id = 2 WHERE id = 1", ())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("does not exist"), "{error}");
+    db.execute("DELETE FROM p WHERE id = 2", ()).unwrap();
+    assert_eq!(rows(&db, "SELECT id FROM c"), [[1]]);
+    assert_eq!(rows(&db, "SELECT id FROM p"), [[1]]);
+}
+
+#[test]
+fn a_child_key_two_cascades_reach_is_checked_once_both_are_done() {
+    let db = Database::open("memory://fk_cascade_into_key_two_paths").unwrap();
+    for sql in [
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, u INTEGER UNIQUE)",
+        "CREATE TABLE p (id INTEGER PRIMARY KEY REFERENCES r(id) ON UPDATE CASCADE)",
+        "CREATE TABLE q (id INTEGER PRIMARY KEY REFERENCES r(u) ON UPDATE CASCADE)",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, \
+         FOREIGN KEY (id) REFERENCES p(id) ON UPDATE CASCADE, \
+         FOREIGN KEY (id) REFERENCES q(id) ON UPDATE CASCADE)",
+        "INSERT INTO r VALUES (1, 1)",
+        "INSERT INTO p VALUES (1)",
+        "INSERT INTO q VALUES (1)",
+        "INSERT INTO c VALUES (1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    db.execute("UPDATE r SET id = 2, u = 2", ()).unwrap();
+    db.execute(
+        "INSERT INTO r VALUES (2, 9) ON CONFLICT (id) DO UPDATE SET id = 5, u = 5",
+        (),
+    )
+    .unwrap();
+    for table in ["p", "q", "c"] {
+        assert_eq!(
+            rows(&db, &format!("SELECT id FROM {table}")),
+            [[5]],
+            "{table}"
+        );
+    }
+    let error = db
+        .execute("UPDATE r SET id = 6", ())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("does not exist"), "{error}");
+    assert_eq!(rows(&db, "SELECT id FROM c"), [[5]]);
+}
+
+#[test]
+fn a_child_key_two_cascades_reach_moves_once() {
+    let db = Database::open("memory://fk_cascade_into_key_two_paths_once").unwrap();
+    for sql in [
+        "CREATE TABLE r (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE p (id INTEGER PRIMARY KEY REFERENCES r(id) ON UPDATE CASCADE)",
+        "CREATE TABLE q (id INTEGER PRIMARY KEY REFERENCES r(id) ON UPDATE CASCADE)",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, x INTEGER, \
+         FOREIGN KEY (id) REFERENCES p(id) ON UPDATE CASCADE, \
+         FOREIGN KEY (id) REFERENCES q(id) ON UPDATE CASCADE)",
+        "INSERT INTO r VALUES (1), (2), (3)",
+        "INSERT INTO p VALUES (1), (2), (3)",
+        "INSERT INTO q VALUES (1), (2), (3)",
+        "INSERT INTO c VALUES (1, 10), (3, 30)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    db.execute("UPDATE r SET id = id + 1", ()).unwrap();
+    assert_eq!(
+        rows(&db, "SELECT id, x FROM c ORDER BY id"),
+        [[2, 10], [4, 30]]
+    );
+    db.execute("UPDATE r SET id = id - 1", ()).unwrap();
+    assert_eq!(
+        rows(&db, "SELECT id, x FROM c ORDER BY id"),
+        [[1, 10], [3, 30]]
+    );
+}
+
+fn open(name: &str, sql: &[&str]) -> Database {
+    let db = Database::open(&format!("memory://fk_cascade_graph_{name}")).unwrap();
+    for sql in sql {
+        db.execute(sql, ()).unwrap();
+    }
+    db
+}
+
+#[test]
+fn a_row_two_columns_of_cascades_reach_takes_each_value_once() {
+    let db = open(
+        "two_columns",
+        &[
+            "CREATE TABLE r (id INTEGER PRIMARY KEY, a INTEGER UNIQUE, b INTEGER UNIQUE, d INTEGER UNIQUE)",
+            "INSERT INTO r VALUES (1, 1, 1, 1), (2, 2, 2, 2)",
+            "CREATE TABLE p (k INTEGER PRIMARY KEY REFERENCES r(a) ON UPDATE CASCADE)",
+            "CREATE TABLE q (k INTEGER PRIMARY KEY REFERENCES r(d) ON UPDATE CASCADE)",
+            "INSERT INTO p VALUES (1), (2)",
+            "INSERT INTO q VALUES (1), (2)",
+            "CREATE TABLE c (id INTEGER PRIMARY KEY, k INTEGER UNIQUE, \
+             FOREIGN KEY (id) REFERENCES r(b) ON UPDATE CASCADE, \
+             FOREIGN KEY (k) REFERENCES p(k) ON UPDATE CASCADE, \
+             FOREIGN KEY (k) REFERENCES q(k) ON UPDATE CASCADE)",
+            "INSERT INTO c VALUES (1, 1)",
+        ],
+    );
+    db.execute("UPDATE r SET a = a + 1, b = b + 1, d = d + 1", ())
+        .unwrap();
+    assert_eq!(rows(&db, "SELECT id, k FROM c"), [[2, 2]]);
+}
+
+#[test]
+fn a_set_null_and_a_cascade_into_one_column_leave_it_null() {
+    let db = open(
+        "set_null",
+        &[
+            "CREATE TABLE r (id INTEGER PRIMARY KEY, a INTEGER UNIQUE, b INTEGER UNIQUE)",
+            "INSERT INTO r VALUES (1, 1, 1), (2, 2, 2)",
+            "CREATE TABLE p (id INTEGER PRIMARY KEY REFERENCES r(a) ON UPDATE CASCADE)",
+            "INSERT INTO p VALUES (1)",
+            "CREATE TABLE c (id INTEGER PRIMARY KEY, k INTEGER UNIQUE, \
+             FOREIGN KEY (k) REFERENCES p(id) ON UPDATE CASCADE, \
+             FOREIGN KEY (k) REFERENCES r(b) ON UPDATE SET NULL)",
+            "INSERT INTO c VALUES (1, 1)",
+        ],
+    );
+    db.execute("UPDATE r SET a = a + 1, b = b + 2", ()).unwrap();
+    let k: Option<i64> = db.query_one("SELECT k FROM c", ()).unwrap();
+    assert_eq!(k, None);
+}
+
+#[test]
+fn a_change_no_child_row_held_at_the_start_is_not_cascaded() {
+    let db = open(
+        "start_values",
+        &[
+            "CREATE TABLE r (id INTEGER PRIMARY KEY, a INTEGER UNIQUE, b FLOAT UNIQUE)",
+            "INSERT INTO r VALUES (1, 1, 1.0), (2, 2, 2.0)",
+            "CREATE TABLE p (id INTEGER PRIMARY KEY REFERENCES r(a) ON UPDATE CASCADE)",
+            "CREATE TABLE q (id INTEGER PRIMARY KEY, k FLOAT UNIQUE REFERENCES r(b) ON UPDATE CASCADE)",
+            "INSERT INTO p VALUES (1), (2)",
+            "INSERT INTO q VALUES (1, 1.0), (2, 2.0)",
+            "CREATE TABLE c (id INTEGER PRIMARY KEY, \
+             FOREIGN KEY (id) REFERENCES p(id) ON UPDATE CASCADE, \
+             FOREIGN KEY (id) REFERENCES q(k) ON UPDATE CASCADE)",
+            "INSERT INTO c VALUES (1)",
+        ],
+    );
+    db.execute(
+        "UPDATE r SET a = a + 1, b = CASE WHEN id = 1 THEN 2.0 ELSE 2.5 END",
+        (),
+    )
+    .unwrap();
+    assert_eq!(rows(&db, "SELECT id FROM c"), [[2]]);
+}
+
+#[test]
+fn two_cascades_that_give_a_row_different_values_refuse_the_statement() {
+    let db = open(
+        "disagree",
+        &[
+            "CREATE TABLE r (id INTEGER PRIMARY KEY, a INTEGER UNIQUE)",
+            "INSERT INTO r VALUES (1, 1)",
+            "CREATE TABLE p (id INTEGER PRIMARY KEY REFERENCES r(id) ON UPDATE CASCADE)",
+            "CREATE TABLE q (id INTEGER PRIMARY KEY REFERENCES r(a) ON UPDATE CASCADE)",
+            "INSERT INTO p VALUES (1)",
+            "INSERT INTO q VALUES (1)",
+            "CREATE TABLE c (id INTEGER PRIMARY KEY, \
+             FOREIGN KEY (id) REFERENCES p(id) ON UPDATE CASCADE, \
+             FOREIGN KEY (id) REFERENCES q(id) ON UPDATE CASCADE)",
+            "INSERT INTO c VALUES (1)",
+        ],
+    );
+    let error = db
+        .execute("UPDATE r SET id = 2, a = 3", ())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("cannot cascade both"), "{error}");
+    assert_eq!(rows(&db, "SELECT id FROM c"), [[1]]);
+    assert_eq!(rows(&db, "SELECT id, a FROM r"), [[1, 1]]);
+}
+
+#[test]
+fn a_set_null_reaches_the_rows_that_reference_the_nulled_column() {
+    let db = open(
+        "set_null_beneath",
+        &[
+            "CREATE TABLE r (id INTEGER PRIMARY KEY)",
+            "INSERT INTO r VALUES (1)",
+            "CREATE TABLE c (id INTEGER PRIMARY KEY, k INTEGER UNIQUE REFERENCES r(id) ON UPDATE SET NULL)",
+            "INSERT INTO c VALUES (1, 1)",
+            "CREATE TABLE g (id INTEGER PRIMARY KEY, x INTEGER REFERENCES c(k) ON UPDATE CASCADE)",
+            "INSERT INTO g VALUES (1, 1)",
+        ],
+    );
+    db.execute("UPDATE r SET id = 2", ()).unwrap();
+    let k: Option<i64> = db.query_one("SELECT k FROM c", ()).unwrap();
+    let x: Option<i64> = db.query_one("SELECT x FROM g", ()).unwrap();
+    assert_eq!((k, x), (None, None));
+}
+
+#[test]
+fn a_set_null_leaves_a_column_null_whatever_the_cascades_beside_it_give() {
+    for (null_on, name) in [("a", "null_on_a"), ("b", "null_on_b"), ("c", "null_on_c")] {
+        let key = |column: &str| {
+            let action = if column == null_on {
+                "SET NULL"
+            } else {
+                "CASCADE"
+            };
+            format!("FOREIGN KEY (k) REFERENCES r({column}) ON UPDATE {action}")
+        };
+        let db = open(
+            name,
+            &[
+                "CREATE TABLE r (id INTEGER PRIMARY KEY, a INTEGER UNIQUE, b INTEGER UNIQUE, c INTEGER UNIQUE)",
+                "INSERT INTO r VALUES (1, 1, 1, 1)",
+                &format!(
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER UNIQUE, {}, {}, {})",
+                    key("a"),
+                    key("b"),
+                    key("c")
+                ),
+                "INSERT INTO t VALUES (1, 1)",
+            ],
+        );
+        db.execute("UPDATE r SET a = 4, b = 2, c = 3", ()).unwrap();
+        let k: Option<i64> = db.query_one("SELECT k FROM t", ()).unwrap();
+        assert_eq!(k, None, "SET NULL on {null_on}");
+    }
+}
+
+#[test]
+fn a_set_null_leaves_a_column_null_where_a_cascade_beside_it_cannot_be_stored() {
+    for (null_on, name) in [("a", "unstored_null_on_a"), ("b", "unstored_null_on_b")] {
+        let (float, int) = if null_on == "a" {
+            ("b", "a")
+        } else {
+            ("a", "b")
+        };
+        let db = open(
+            name,
+            &[
+                &format!(
+                    "CREATE TABLE r (id INTEGER PRIMARY KEY, a {} UNIQUE, b {} UNIQUE)",
+                    if float == "a" { "FLOAT" } else { "INTEGER" },
+                    if float == "b" { "FLOAT" } else { "INTEGER" }
+                ),
+                &format!("INSERT INTO r (id, {float}, {int}) VALUES (1, 1.0, 1)"),
+                &format!(
+                    "CREATE TABLE c (id INTEGER PRIMARY KEY, k INTEGER UNIQUE, \
+                     FOREIGN KEY (k) REFERENCES r({float}) ON UPDATE CASCADE, \
+                     FOREIGN KEY (k) REFERENCES r({int}) ON UPDATE SET NULL)"
+                ),
+                "INSERT INTO c VALUES (1, 1)",
+            ],
+        );
+        db.execute(&format!("UPDATE r SET {float} = 2.5, {int} = 2"), ())
+            .unwrap();
+        let k: Option<i64> = db.query_one("SELECT k FROM c", ()).unwrap();
+        assert_eq!(k, None, "SET NULL on {null_on}");
+    }
 }
