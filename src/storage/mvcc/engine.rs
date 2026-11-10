@@ -4869,9 +4869,12 @@ impl MVCCEngine {
         Ok(())
     }
 
-    /// Points every foreign key referencing column `old` of `table_name` at
-    /// its new name, once the rename is recorded
+    /// Points every foreign key referencing column `old` of `table_name`,
+    /// and the holds on its keys, at its new name, once the rename is recorded
     pub(crate) fn rename_referenced_column(&self, table_name: &str, old: &str, new: &str) {
+        if let Ok(store) = self.get_version_store(table_name) {
+            store.key_holds().rename_column(old, new);
+        }
         let (table, old, new) = (
             table_name.to_lowercase(),
             old.to_lowercase(),

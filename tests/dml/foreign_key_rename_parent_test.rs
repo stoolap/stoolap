@@ -160,3 +160,60 @@ fn a_key_follows_its_renamed_columns() {
         db.close().unwrap();
     }
 }
+
+#[test]
+fn a_key_held_by_an_open_delete_stays_held_through_a_rename() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    for sql in [
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, k INTEGER UNIQUE)",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, pk INTEGER REFERENCES p(k))",
+        "INSERT INTO p VALUES (1, 10)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let mut deleting = db.begin().unwrap();
+    deleting.execute("DELETE FROM p WHERE id = 1", ()).unwrap();
+    let other = db.clone();
+    other
+        .execute("ALTER TABLE p RENAME COLUMN k TO k2", ())
+        .unwrap();
+    let inserted = other.execute("INSERT INTO c VALUES (1, 10)", ());
+    deleting.commit().unwrap();
+    assert!(
+        inserted.is_err(),
+        "a child of the key the open delete removes was inserted"
+    );
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM c"), 0);
+}
+
+#[test]
+fn a_key_held_stays_held_when_its_column_takes_a_dropped_column_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    for sql in [
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, k INTEGER UNIQUE, j INTEGER UNIQUE)",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, pk INTEGER REFERENCES p(k))",
+        "CREATE TABLE d (id INTEGER PRIMARY KEY, pj INTEGER REFERENCES p(j))",
+        "INSERT INTO p VALUES (1, 10, 20)",
+        // A key of k was held once, and k is gone before the delete
+        "INSERT INTO c VALUES (1, 10)",
+        "DROP TABLE c",
+        "ALTER TABLE p DROP COLUMN k",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let mut deleting = db.begin().unwrap();
+    deleting.execute("DELETE FROM p WHERE id = 1", ()).unwrap();
+    let other = db.clone();
+    other
+        .execute("ALTER TABLE p RENAME COLUMN j TO k", ())
+        .unwrap();
+    let inserted = other.execute("INSERT INTO d VALUES (1, 20)", ());
+    deleting.commit().unwrap();
+    assert!(
+        inserted.is_err(),
+        "a child of the key the open delete removes was inserted"
+    );
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM d"), 0);
+}

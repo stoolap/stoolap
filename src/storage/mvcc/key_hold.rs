@@ -101,6 +101,21 @@ impl KeyHolds {
         Ok(keys.len() == 1)
     }
 
+    /// The holds on column `old` stay its holds under the name `new` it is
+    /// renamed to; holds left under `new` by a column gone since name none
+    pub fn rename_column(&self, old: &str, new: &str) {
+        let (old, new_lower) = (old.to_lowercase(), new.to_lowercase());
+        let mut holds = self.0.lock();
+        for (column, _) in holds.columns.iter_mut() {
+            let lower = column.to_lowercase();
+            if lower == old {
+                *column = SmartString::from(new);
+            } else if lower == new_lower {
+                *column = SmartString::default();
+            }
+        }
+    }
+
     /// Lets go of every key `txn_id` holds
     pub fn release(&self, txn_id: i64) {
         let mut holds = self.0.lock();
