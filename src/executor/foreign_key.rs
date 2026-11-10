@@ -502,33 +502,71 @@ fn pre_check_restrict_recursive(
     Ok(())
 }
 
-/// A value a cascade wrote into a child column, (child table, another
-/// foreign key of that column, value), checked against its parent once
-/// every cascade of the statement is done
-pub(crate) type ParentCheck = (String, ForeignKeyConstraint, Value);
+/// What the ON UPDATE cascades of one statement share
+#[derive(Default)]
+pub(crate) struct Cascades {
+    /// Per child table and column, the row ids a cascade wrote, which a
+    /// later branch reaching the same column does not match again
+    written: Vec<(String, usize, crate::common::I64Set)>,
+    /// Per child table and another foreign key of a cascaded column, the
+    /// values written there, checked once every cascade is done
+    parent_checks: Vec<(String, ForeignKeyConstraint, Vec<Value>)>,
+}
 
-/// Checks that each parent `parent_checks` names holds its value
-pub(crate) fn check_cascaded_parents(
-    engine: &MVCCEngine,
-    txn_id: i64,
-    parent_checks: &[ParentCheck],
-) -> Result<()> {
-    for (child_table, fk, value) in parent_checks {
-        validate_fk_value(engine, txn_id, fk, value, child_table)?;
+impl Cascades {
+    fn written(&mut self, table: &str, column: usize) -> &mut crate::common::I64Set {
+        let at = match self
+            .written
+            .iter()
+            .position(|(t, c, _)| *c == column && t == table)
+        {
+            Some(at) => at,
+            None => {
+                let ids = crate::common::I64Set::new();
+                self.written.push((table.to_string(), column, ids));
+                self.written.len() - 1
+            }
+        };
+        &mut self.written[at].2
     }
-    Ok(())
+
+    fn parent_values(&mut self, table: &str, fk: &ForeignKeyConstraint) -> &mut Vec<Value> {
+        let at = match self
+            .parent_checks
+            .iter()
+            .position(|(t, f, _)| f == fk && t == table)
+        {
+            Some(at) => at,
+            None => {
+                self.parent_checks
+                    .push((table.to_string(), fk.clone(), Vec::new()));
+                self.parent_checks.len() - 1
+            }
+        };
+        &mut self.parent_checks[at].2
+    }
+
+    /// Checks that each parent holds every value written under its key
+    pub(crate) fn check_parents(&self, engine: &MVCCEngine, txn_id: i64) -> Result<()> {
+        for (child_table, fk, values) in &self.parent_checks {
+            for value in values {
+                validate_fk_value(engine, txn_id, fk, value, child_table)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Enforce referential actions for UPDATE of a referenced column.
 /// RESTRICT is already handled by pre_check_restrict_for_update before
 /// the parent row is written. This function only dispatches CASCADE/SET NULL;
-/// the parent checks its cascades owe go to `parent_checks`.
+/// its cascades share `cascades` with the statement's others.
 pub(crate) fn enforce_update_actions(
     engine: &MVCCEngine,
     txn_id: i64,
     changes: &[(Value, Value)],
     referencing_fks: &[(String, ForeignKeyConstraint)],
-    parent_checks: &mut Vec<ParentCheck>,
+    cascades: &mut Cascades,
 ) -> Result<i32> {
     if referencing_fks.is_empty() || changes.is_empty() {
         return Ok(0);
@@ -556,7 +594,7 @@ pub(crate) fn enforce_update_actions(
             }
             ForeignKeyAction::Cascade => {
                 let affected =
-                    cascade_update(engine, txn_id, child_table_name, fk, changes, parent_checks)?;
+                    cascade_update(engine, txn_id, child_table_name, fk, changes, cascades)?;
                 total_affected = total_affected.saturating_add(affected);
             }
             ForeignKeyAction::SetNull => {
@@ -861,9 +899,9 @@ fn cascade_update(
     child_table: &str,
     fk: &ForeignKeyConstraint,
     changes: &[(Value, Value)],
-    parent_checks: &mut Vec<ParentCheck>,
+    cascades: &mut Cascades,
 ) -> Result<i32> {
-    cascade_update_recursive(engine, txn_id, child_table, fk, changes, 0, parent_checks)
+    cascade_update_recursive(engine, txn_id, child_table, fk, changes, 0, cascades)
 }
 
 fn cascade_update_recursive(
@@ -873,7 +911,7 @@ fn cascade_update_recursive(
     fk: &ForeignKeyConstraint,
     changes: &[(Value, Value)],
     depth: usize,
-    parent_checks: &mut Vec<ParentCheck>,
+    cascades: &mut Cascades,
 ) -> Result<i32> {
     // The changes whose old value a child row names; the others cascade nothing
     let mut named = Vec::with_capacity(changes.len());
@@ -950,7 +988,8 @@ fn cascade_update_recursive(
     let col_type = child_schema.columns[col_idx].data_type;
     // Each child row a change names and that change's place in `named` and
     // `new_values`, read before any is written: a row one change writes is
-    // not met again by the next
+    // not met again by the next, nor by another branch reaching this column
+    let done = cascades.written(child_table, col_idx);
     let mut targets: crate::common::I64Map<usize> = crate::common::I64Map::new();
     let mut new_values = Vec::with_capacity(named.len());
     for (at, (old_value, new_value)) in named.iter().enumerate() {
@@ -978,7 +1017,9 @@ fn cascade_update_recursive(
         let plan = child.index_plan(&expr);
         let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
         for (id, _) in child.collect_access_rows(access, Some(&expr))?.iter() {
-            targets.insert(*id, at);
+            if !done.contains(*id) {
+                targets.insert(*id, at);
+            }
         }
         new_values.push(new_val);
     }
@@ -1006,6 +1047,11 @@ fn cascade_update_recursive(
             return Ok((row, false));
         };
         written[at] = true;
+        let new_id = match into_key {
+            true => new_values[at].as_int64().unwrap_or(id),
+            false => id,
+        };
+        done.insert(new_id);
         let original = into_key.then(|| row.clone());
         let _ = row.set(col_idx, new_values[at].clone());
         for check in &checks {
@@ -1026,9 +1072,10 @@ fn cascade_update_recursive(
         if other.column_index != col_idx || other == fk {
             continue;
         }
+        let values = cascades.parent_values(child_table, other);
         for (value, _) in new_values.iter().zip(&written).filter(|(_, w)| **w) {
             if !value.is_null() {
-                parent_checks.push((child_table.to_string(), other.clone(), value.clone()));
+                values.push(value.clone());
             }
         }
     }
@@ -1049,7 +1096,7 @@ fn cascade_update_recursive(
                         grandchild_fk,
                         &named,
                         depth + 1,
-                        parent_checks,
+                        cascades,
                     )?;
                     total = total.saturating_add(affected);
                 }
@@ -1073,7 +1120,7 @@ fn cascade_update_recursive(
                         grandchild_fk,
                         &to_null,
                         depth + 1,
-                        parent_checks,
+                        cascades,
                     )?;
                     total = total.saturating_add(affected);
                 }

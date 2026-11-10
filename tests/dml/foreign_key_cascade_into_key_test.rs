@@ -273,3 +273,32 @@ fn a_child_key_two_cascades_reach_is_checked_once_both_are_done() {
     assert!(error.contains("does not exist"), "{error}");
     assert_eq!(rows(&db, "SELECT id FROM c"), [[5]]);
 }
+
+#[test]
+fn a_child_key_two_cascades_reach_moves_once() {
+    let db = Database::open("memory://fk_cascade_into_key_two_paths_once").unwrap();
+    for sql in [
+        "CREATE TABLE r (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE p (id INTEGER PRIMARY KEY REFERENCES r(id) ON UPDATE CASCADE)",
+        "CREATE TABLE q (id INTEGER PRIMARY KEY REFERENCES r(id) ON UPDATE CASCADE)",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, x INTEGER, \
+         FOREIGN KEY (id) REFERENCES p(id) ON UPDATE CASCADE, \
+         FOREIGN KEY (id) REFERENCES q(id) ON UPDATE CASCADE)",
+        "INSERT INTO r VALUES (1), (2), (3)",
+        "INSERT INTO p VALUES (1), (2), (3)",
+        "INSERT INTO q VALUES (1), (2), (3)",
+        "INSERT INTO c VALUES (1, 10), (3, 30)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    db.execute("UPDATE r SET id = id + 1", ()).unwrap();
+    assert_eq!(
+        rows(&db, "SELECT id, x FROM c ORDER BY id"),
+        [[2, 10], [4, 30]]
+    );
+    db.execute("UPDATE r SET id = id - 1", ()).unwrap();
+    assert_eq!(
+        rows(&db, "SELECT id, x FROM c ORDER BY id"),
+        [[1, 10], [3, 30]]
+    );
+}
