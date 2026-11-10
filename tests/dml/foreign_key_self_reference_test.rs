@@ -520,3 +520,46 @@ fn a_copy_finds_parents_among_its_own_rows() {
     assert!(copy(&[r#"{"id": 6, "up": 9, "n": 0}"#], "JSON").is_err());
     assert_eq!(rows(&db), want);
 }
+
+#[test]
+fn a_restricting_key_beside_a_cascade_into_a_table_no_key_references_lets_the_row_go() {
+    let db = Database::open("memory://fk_self_reference_leaf_restrict").unwrap();
+    for sql in [
+        "CREATE TABLE p (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, a INTEGER REFERENCES p(id) ON DELETE CASCADE, b INTEGER REFERENCES p(id) ON DELETE RESTRICT)",
+        "INSERT INTO p VALUES (1), (2)",
+        "INSERT INTO c VALUES (1, 1, 1), (2, 2, 1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    assert!(db.execute("DELETE FROM p WHERE id = 1", ()).is_err());
+    db.execute("DELETE FROM p WHERE id = 2", ()).unwrap();
+    db.execute("DELETE FROM p WHERE id = 1", ()).unwrap();
+    assert_eq!(
+        db.query_one::<i64, _>("SELECT COUNT(*) FROM c", ())
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn an_upsert_checks_its_keys_into_its_own_table_as_the_statement_leaves_them() {
+    each_layout(
+        "upsert_end",
+        "REFERENCES s(id)",
+        &["INSERT INTO s VALUES (1, NULL, 0)"],
+        |db| {
+            let upsert = "ON CONFLICT (id) DO UPDATE SET up = EXCLUDED.up";
+            for values in ["(1, 2, 0), (2, NULL, 0)", "(3, 99, 0), (3, NULL, 0)"] {
+                db.execute(&format!("INSERT INTO s VALUES {values} {upsert}"), ())
+                    .unwrap();
+            }
+            assert_eq!(rows(db), [[1, 2], [2, 0], [3, 0]]);
+            for values in ["(1, 98, 0), (4, NULL, 0)", "(4, NULL, 0), (4, 97, 0)"] {
+                let sql = format!("INSERT INTO s VALUES {values} {upsert}");
+                assert!(db.execute(&sql, ()).is_err(), "{sql}");
+                assert_eq!(rows(db), [[1, 2], [2, 0], [3, 0]], "{sql} writes nothing");
+            }
+        },
+    );
+}

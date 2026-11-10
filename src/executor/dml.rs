@@ -1266,6 +1266,7 @@ impl Executor {
                                 ctx,
                                 (has_returning, widened),
                                 conflict,
+                                &mut pending_parents,
                             ) {
                                 Ok((updated, returned)) => {
                                     if let Some(updated_row) = returned {
@@ -1315,6 +1316,7 @@ impl Executor {
                                         ctx,
                                         (has_returning, widened),
                                         conflict,
+                                        &mut pending_parents,
                                     ) {
                                         Ok((updated, returned)) => {
                                             if let Some(updated_row) = returned {
@@ -1560,6 +1562,7 @@ impl Executor {
                                 ctx,
                                 (has_returning, widened),
                                 conflict,
+                                &mut pending_parents,
                             ) {
                                 Ok((updated, returned)) => {
                                     if let Some(updated_row) = returned {
@@ -1610,6 +1613,7 @@ impl Executor {
                                         ctx,
                                         (has_returning, widened),
                                         conflict,
+                                        &mut pending_parents,
                                     ) {
                                         Ok((updated, returned)) => {
                                             if let Some(updated_row) = returned {
@@ -3686,6 +3690,7 @@ impl Executor {
         ctx: &ExecutionContext,
         (capture_row, returns_id): (bool, bool),
         conflict: Option<&ConflictRun<'_, '_>>,
+        pending_parents: &mut Vec<(usize, Value)>,
     ) -> Result<(bool, Option<Row>)> {
         // Build a WHERE clause to find the specific row
         // Use schema's cached pk_column_index for O(1) lookup
@@ -3906,7 +3911,13 @@ impl Executor {
 
         let txn_id = table.txn_id();
         for row in &fk_rows {
-            super::foreign_key::check_parent_exists(&self.engine, txn_id, schema, row)?;
+            super::foreign_key::check_inserted_parents(
+                &self.engine,
+                txn_id,
+                schema,
+                row,
+                pending_parents,
+            )?;
         }
         let mut by_column: Vec<(usize, Vec<(Value, Value)>)> = Vec::new();
         for (idx, old, new) in ref_changes {

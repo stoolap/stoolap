@@ -105,7 +105,8 @@ fn check_parents(
 }
 
 /// Asks again each key [`check_inserted_parents`] left pending, now that
-/// the statement's rows are written
+/// the statement's rows are written. A value no row holds any more, which
+/// a later update of the statement replaced, names nothing
 pub(crate) fn check_pending_parents(
     engine: &MVCCEngine,
     txn_id: i64,
@@ -113,13 +114,17 @@ pub(crate) fn check_pending_parents(
     pending: &[(usize, Value)],
 ) -> Result<()> {
     for (at, value) in pending {
-        validate_fk_value(
+        let fk = &schema.foreign_keys[*at];
+        if !parent_row_exists(
             engine,
             txn_id,
-            &schema.foreign_keys[*at],
+            &fk.referenced_table,
+            &fk.referenced_column,
             value,
-            &schema.table_name,
-        )?;
+        )? && child_rows_exist(engine, txn_id, &schema.table_name, fk, value)?
+        {
+            return Err(missing_parent(&schema.table_name, fk, value));
+        }
     }
     Ok(())
 }
@@ -286,7 +291,7 @@ struct Reached {
     /// Each restricting key into the table and the values it names
     restricted: Vec<(ForeignKeyConstraint, Vec<Value>)>,
     /// Whether the cascades' rows are left unread: no key references the
-    /// table, so `gone` is needed only by a SET NULL into it
+    /// table, so `gone` is needed only by a SET NULL or RESTRICT key of its own
     unread: bool,
 }
 
@@ -450,7 +455,7 @@ impl DeletePlan {
     /// into a column that cannot be NULL of a row that stays
     fn check(&mut self, engine: &MVCCEngine, txn_id: i64) -> Result<()> {
         for reached in &mut self.tables {
-            if reached.unread && !reached.nulled.is_empty() {
+            if reached.unread && !(reached.nulled.is_empty() && reached.restricted.is_empty()) {
                 reached.read_cascaded(engine, txn_id)?;
             }
             let reached = &*reached;
