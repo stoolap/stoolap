@@ -918,11 +918,17 @@ pub struct SealedIndexCleanup {
     pub removed_ids: Vec<i64>,
 }
 
-/// A seal's hot indexes, each with its removal buffers when it has them
-pub type SealIndexCleaners = Vec<(
-    Arc<dyn Index>,
-    Option<crate::storage::traits::RemovalBuffers>,
-)>;
+/// A seal's hot indexes, each with its removal buffers when it has them,
+/// and what the ones without take their keys through, made before the fence
+pub struct SealIndexCleaners {
+    indexes: Vec<(
+        Arc<dyn Index>,
+        Option<crate::storage::traits::RemovalBuffers>,
+    )>,
+    /// Each sealed row's position in the rows the seal passes; empty when
+    /// every index removes by id
+    positions: I64Map<usize>,
+}
 
 /// Held for a table from the first index update of a commit until the
 /// commit is visible or undone; see VersionStore::begin_publish
@@ -5937,24 +5943,33 @@ impl VersionStore {
         // This prevents duplicate version chain entries when both snapshot and WAL
         // contain the same row data (can happen due to race conditions during snapshot)
         // No need to clone tree for single-row lookup - just hold read guard
-        {
+        let replaced = {
             let versions = self.versions.read();
-            if let Some(existing_entry) = versions.get(row_id) {
-                let existing = &existing_entry.version;
-                // Check if data is identical (both deleted status and row data)
-                if existing.is_deleted() == is_deleted && existing.data == row_data {
-                    // Identical data already exists, skip to avoid duplicate
-                    // Still update auto_increment counter
-                    if row_id > 0 {
-                        self.set_auto_increment_counter(row_id);
+            match versions.get(row_id) {
+                Some(existing_entry) => {
+                    let existing = &existing_entry.version;
+                    // Check if data is identical (both deleted status and row data)
+                    if existing.is_deleted() == is_deleted && existing.data == row_data {
+                        // Identical data already exists, skip to avoid duplicate
+                        // Still update auto_increment counter
+                        if row_id > 0 {
+                            self.set_auto_increment_counter(row_id);
+                        }
+                        return;
                     }
-                    return;
+                    (!existing.is_deleted()).then(|| existing.data.clone())
                 }
+                None => None,
             }
-        }
+        };
 
         // Add the version to the store
         self.add_version(row_id, version);
+
+        // The row's keys in the indexes are the version's it replaces
+        if let Some(old_data) = replaced {
+            self.remove_from_indexes(row_id, &old_data);
+        }
 
         // Update auto_increment counter if this row_id is higher
         // This ensures the counter is restored to at least the max seen row_id
@@ -6012,29 +6027,35 @@ impl VersionStore {
 
         // Remove from indexes using old row data
         if let Some(old_data) = old_row {
-            let indexes = self.indexes.read();
-            for index in indexes.values().map(|entry| &entry.index) {
-                let column_ids = index.column_ids();
-                if column_ids.is_empty() {
-                    continue;
+            self.remove_from_indexes(row_id, &old_data);
+        }
+    }
+
+    /// Takes the keys `old_data` gives `row_id` out of every index, during
+    /// recovery: an index finds a row's entry by its key
+    fn remove_from_indexes(&self, row_id: i64, old_data: &Row) {
+        let indexes = self.indexes.read();
+        for index in indexes.values().map(|entry| &entry.index) {
+            let column_ids = index.column_ids();
+            if column_ids.is_empty() {
+                continue;
+            }
+            if column_ids.len() == 1 {
+                let col_id = column_ids[0] as usize;
+                if let Some(value) = old_data.get(col_id) {
+                    let _ = index.remove(std::slice::from_ref(value), row_id, row_id);
                 }
-                if column_ids.len() == 1 {
-                    let col_id = column_ids[0] as usize;
-                    if let Some(value) = old_data.get(col_id) {
-                        let _ = index.remove(std::slice::from_ref(value), row_id, row_id);
-                    }
-                } else {
-                    let values: Vec<crate::core::Value> = column_ids
-                        .iter()
-                        .map(|&col_id| {
-                            old_data
-                                .get(col_id as usize)
-                                .cloned()
-                                .unwrap_or(crate::core::Value::Null(crate::core::DataType::Null))
-                        })
-                        .collect();
-                    let _ = index.remove(&values, row_id, row_id);
-                }
+            } else {
+                let values: Vec<crate::core::Value> = column_ids
+                    .iter()
+                    .map(|&col_id| {
+                        old_data
+                            .get(col_id as usize)
+                            .cloned()
+                            .unwrap_or(crate::core::Value::Null(crate::core::DataType::Null))
+                    })
+                    .collect();
+                let _ = index.remove(&values, row_id, row_id);
             }
         }
     }
@@ -6253,7 +6274,6 @@ impl VersionStore {
                     vec![column_id],
                     vec![data_type],
                     meta.is_unique,
-                    expected_rows,
                 );
                 Arc::new(idx)
             }
@@ -6266,7 +6286,6 @@ impl VersionStore {
                     column_name.clone(),
                     data_type,
                     meta.is_unique,
-                    expected_rows,
                 );
                 Arc::new(idx)
             }
@@ -6532,24 +6551,29 @@ impl VersionStore {
     }
 
     /// The hot indexes a seal cleans, every index but HNSW, each with the
-    /// buffers its cleanup uses for calls of up to `batch_rows` rows. Taken
-    /// under the DDL guard before the fence, so nothing is made under it.
-    pub fn seal_index_cleaners(&self, batch_rows: usize) -> SealIndexCleaners {
-        let indexes: Vec<Arc<dyn Index>> = self
+    /// buffers its cleanup uses for calls of up to `batch_rows` rows, and the
+    /// positions of `rows`, the sealed rows, when an index removes by key.
+    /// Taken under the DDL guard before the fence, so nothing is made under it.
+    pub fn seal_index_cleaners(&self, batch_rows: usize, rows: &RowVec) -> SealIndexCleaners {
+        let indexes: Vec<(
+            Arc<dyn Index>,
+            Option<crate::storage::traits::RemovalBuffers>,
+        )> = self
             .indexes
             .read()
             .values()
             .map(|entry| &entry.index)
             .filter(|idx| idx.index_type() != crate::core::IndexType::Hnsw)
-            .cloned()
+            .map(|index| (Arc::clone(index), index.removal_buffers(batch_rows)))
             .collect();
-        indexes
-            .into_iter()
-            .map(|index| {
-                let buffers = index.removal_buffers(batch_rows);
-                (index, buffers)
-            })
-            .collect()
+        let mut positions = new_i64_map();
+        if indexes.iter().any(|(_, buffers)| buffers.is_none()) {
+            positions.reserve(rows.len());
+            for (pos, (row_id, _)) in rows.iter().enumerate() {
+                positions.insert(*row_id, pos);
+            }
+        }
+        SealIndexCleaners { indexes, positions }
     }
 
     /// Remove stale hot index entries for sealed rows (phase 2 of seal).
@@ -6564,12 +6588,12 @@ impl VersionStore {
         rows: &RowVec,
         cleaners: &mut SealIndexCleaners,
     ) {
-        if cleanup.removed_ids.is_empty() || cleaners.is_empty() {
+        if cleanup.removed_ids.is_empty() || cleaners.indexes.is_empty() {
             return;
         }
 
-        let mut by_id: Option<I64Map<usize>> = None;
-        for (index, buffers) in cleaners.iter_mut() {
+        let positions = &cleaners.positions;
+        for (index, buffers) in cleaners.indexes.iter_mut() {
             if let Some(buffers) = buffers {
                 if index
                     .remove_batch_ids(&cleanup.removed_ids, buffers)
@@ -6578,39 +6602,31 @@ impl VersionStore {
                     continue;
                 }
             }
-            let positions = by_id.get_or_insert_with(|| {
-                let mut map = I64Map::with_capacity(rows.len());
-                for (pos, (row_id, _)) in rows.iter().enumerate() {
-                    map.insert(*row_id, pos);
-                }
-                map
-            });
+            // Every row's key in one buffer, so nothing is allocated per row
             let col_ids = index.column_ids();
-            let owned_entries: Vec<(i64, Vec<crate::core::Value>)> = cleanup
-                .removed_ids
-                .iter()
-                .filter_map(|&row_id| {
-                    let pos = *positions.get(row_id)?;
-                    let row = &rows[pos].1;
-                    let values: Vec<crate::core::Value> = col_ids
+            let mut ids: Vec<i64> = Vec::with_capacity(cleanup.removed_ids.len());
+            let mut keys: Vec<Value> = Vec::with_capacity(ids.capacity() * col_ids.len());
+            for &row_id in &cleanup.removed_ids {
+                let Some(&pos) = positions.get(row_id) else {
+                    continue;
+                };
+                let row = &rows[pos].1;
+                ids.push(row_id);
+                keys.extend(
+                    col_ids
                         .iter()
-                        .map(|&col_id| {
-                            row.get(col_id as usize)
-                                .cloned()
-                                .unwrap_or(crate::core::Value::Null(crate::core::DataType::Null))
-                        })
-                        .collect();
-                    Some((row_id, values))
-                })
-                .collect();
-            if owned_entries.is_empty() {
+                        .map(|&col_id| row.get(col_id as usize).unwrap_or(&NULL_VALUE).clone()),
+                );
+            }
+            if ids.is_empty() || col_ids.is_empty() {
                 continue;
             }
-            let borrowed_entries: Vec<(i64, &[crate::core::Value])> = owned_entries
+            let entries: Vec<(i64, &[Value])> = ids
                 .iter()
-                .map(|(row_id, values)| (*row_id, values.as_slice()))
+                .copied()
+                .zip(keys.chunks(col_ids.len()))
                 .collect();
-            let _ = index.remove_batch_slice(&borrowed_entries);
+            let _ = index.remove_batch_slice(&entries);
         }
     }
 

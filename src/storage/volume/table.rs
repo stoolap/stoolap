@@ -1295,7 +1295,10 @@ impl SegmentedTable {
             .get_index(name)
             .is_some_and(|index| index.index_type() == IndexType::Hnsw);
         if created_hnsw && self.segment_mgr.has_segments() {
-            if let Err(e) = self.populate_index_from_cold(name, columns) {
+            let filled = self
+                .populate_index_from_cold(name, columns)
+                .and_then(|()| self.hot.check_local_rows_unique(name));
+            if let Err(e) = filled {
                 // Roll back the hot index on cold population failure
                 let _ = self.hot.drop_index(name);
                 return Err(e);
@@ -7122,7 +7125,10 @@ impl Table for SegmentedTable {
 
         // Populate from cold segments (HNSW must include all data)
         if self.segment_mgr.has_segments() {
-            if let Err(e) = self.populate_index_from_cold(name, &[column]) {
+            let filled = self
+                .populate_index_from_cold(name, &[column])
+                .and_then(|()| self.hot.check_local_rows_unique(name));
+            if let Err(e) = filled {
                 let _ = self.hot.drop_index(name);
                 return Err(e);
             }

@@ -688,6 +688,50 @@ impl MVCCTable {
             .collect()
     }
 
+    /// Refuses a unique `index` this transaction's own new rows break. The
+    /// rows are not entered: the index holds committed rows, the commit
+    /// enters them as it enters any insert, and reads take local rows apart
+    fn check_local_unique(&self, index: &dyn Index, col_indices: &[usize]) -> Result<()> {
+        if !index.is_unique() {
+            return Ok(());
+        }
+        let hnsw = index.as_any().downcast_ref::<HnswIndex>();
+        let txn_versions = self.local();
+        let mut seen: ahash::AHashSet<Vec<Value>> = ahash::AHashSet::new();
+        for (row_id, version) in txn_versions.iter_local() {
+            if version.is_deleted() || self.version_store.quick_check_row_existence(row_id) {
+                continue;
+            }
+            let key: Vec<Value> = col_indices
+                .iter()
+                .map(|&idx| {
+                    version
+                        .data
+                        .get(idx)
+                        .cloned()
+                        .unwrap_or(Value::Null(DataType::Null))
+                })
+                .collect();
+            if key.iter().any(Value::is_null) {
+                continue;
+            }
+            // An HNSW index answers no equality lookup; it matches vector bytes
+            let taken = match hnsw {
+                Some(hnsw) => hnsw.find_exact_duplicate(&key[0], row_id, None).is_some(),
+                None => !index.get_row_ids_equal(&key).is_empty(),
+            };
+            if seen.contains(&key) || taken {
+                return Err(Error::unique_constraint(
+                    index.name(),
+                    index.column_names().join(", "),
+                    key,
+                ));
+            }
+            seen.insert(key);
+        }
+        Ok(())
+    }
+
     /// The keys a `top_k_walk` plan, `walk`, walks for `expr`: the prefix
     /// its equalities give and the bounds on the walked column; a walk of a
     /// column's own index starts past the NULL keys. None when a key is NULL
@@ -4029,7 +4073,6 @@ impl Table for MVCCTable {
                 column_ids,
                 data_types,
                 is_unique,
-                expected_rows,
             )),
             IndexType::BTree => {
                 // For single-column BTree, use BTreeIndex
@@ -4042,7 +4085,6 @@ impl Table for MVCCTable {
                         column_names[0].clone(),
                         data_types[0],
                         is_unique,
-                        expected_rows,
                     ))
                 } else {
                     Arc::new(MultiColumnIndex::new(
@@ -4139,26 +4181,6 @@ impl Table for MVCCTable {
             }
         }
 
-        // Also collect any local uncommitted data
-        {
-            let txn_versions = self.local();
-            for (row_id, version) in txn_versions.iter_local() {
-                if !version.is_deleted() && !self.version_store.quick_check_row_existence(row_id) {
-                    let values: Vec<Value> = col_indices
-                        .iter()
-                        .map(|&idx| {
-                            version
-                                .data
-                                .get(idx)
-                                .cloned()
-                                .unwrap_or(Value::Null(DataType::Null))
-                        })
-                        .collect();
-                    entries.push((row_id, values));
-                }
-            }
-        }
-
         // Add all entries in a single batch operation
         if !entries.is_empty() {
             let entry_refs: Vec<(i64, &[Value])> = entries
@@ -4167,6 +4189,7 @@ impl Table for MVCCTable {
                 .collect();
             index.add_batch_slice(&entry_refs)?;
         }
+        self.check_local_unique(&*index, &col_indices)?;
 
         // Add to version store
         self.version_store.add_index(name.to_string(), index);
@@ -4248,19 +4271,6 @@ impl Table for MVCCTable {
                 }
             }
         }
-        {
-            let txn_versions = self.local();
-            for (row_id, version) in txn_versions.iter_local() {
-                if !version.is_deleted() && !self.version_store.quick_check_row_existence(row_id) {
-                    let val = version
-                        .data
-                        .get(col_idx)
-                        .cloned()
-                        .unwrap_or(Value::Null(DataType::Null));
-                    entries.push((row_id, vec![val]));
-                }
-            }
-        }
         if !entries.is_empty() {
             let entry_refs: Vec<(i64, &[Value])> = entries
                 .iter()
@@ -4268,9 +4278,24 @@ impl Table for MVCCTable {
                 .collect();
             index.add_batch_slice(&entry_refs)?;
         }
+        self.check_local_unique(&*index, &[col_idx])?;
 
         self.version_store.add_index(name.to_string(), index);
         Ok(())
+    }
+
+    fn check_local_rows_unique(&self, name: &str) -> Result<()> {
+        let Some(index) = self.version_store.get_index(name) else {
+            return Ok(());
+        };
+        let schema = self.version_store.schema();
+        let col_indices = index
+            .column_names()
+            .iter()
+            .map(|c| schema.find_column(c).map(|(i, _)| i))
+            .collect::<Option<Vec<usize>>>()
+            .ok_or_else(|| Error::internal(format!("index '{name}' names a missing column")))?;
+        self.check_local_unique(&*index, &col_indices)
     }
 
     fn drop_index(&self, name: &str) -> Result<()> {
@@ -4517,8 +4542,6 @@ impl Table for MVCCTable {
             }
         }
 
-        // Create the btree index with capacity hint
-        let expected_rows = self.version_store.row_count();
         let index = BTreeIndex::new(
             index_name.clone(),
             self.name().to_string(),
@@ -4526,7 +4549,6 @@ impl Table for MVCCTable {
             column_name.to_string(),
             col.data_type,
             is_unique,
-            expected_rows,
         );
 
         // Populate the index with existing data using batch_slice
@@ -4546,21 +4568,6 @@ impl Table for MVCCTable {
             }
         }
 
-        // Also collect any local uncommitted data
-        {
-            let txn_versions = self.local();
-            for (row_id, version) in txn_versions.iter_local() {
-                if !version.is_deleted() {
-                    if let Some(value) = version.data.get(col_idx) {
-                        // Skip if already added from global store
-                        if !self.version_store.quick_check_row_existence(row_id) {
-                            entries.push((row_id, vec![value.clone()]));
-                        }
-                    }
-                }
-            }
-        }
-
         // Add all entries in a single batch operation
         if !entries.is_empty() {
             let entry_refs: Vec<(i64, &[Value])> = entries
@@ -4569,6 +4576,7 @@ impl Table for MVCCTable {
                 .collect();
             index.add_batch_slice(&entry_refs)?;
         }
+        self.check_local_unique(&index, &[col_idx])?;
 
         // Add to version store
         self.version_store.add_index(index_name, Arc::new(index));
@@ -4644,29 +4652,6 @@ impl Table for MVCCTable {
             }
         }
 
-        // Also collect any local uncommitted data
-        {
-            let txn_versions = self.local();
-            for (row_id, version) in txn_versions.iter_local() {
-                if !version.is_deleted() {
-                    // Skip if already added from global store
-                    if !self.version_store.quick_check_row_existence(row_id) {
-                        let values: Vec<Value> = col_indices
-                            .iter()
-                            .map(|&idx| {
-                                version
-                                    .data
-                                    .get(idx)
-                                    .cloned()
-                                    .unwrap_or(Value::Null(DataType::Null))
-                            })
-                            .collect();
-                        entries.push((row_id, values));
-                    }
-                }
-            }
-        }
-
         // Add all entries in a single batch operation
         if !entries.is_empty() {
             let entry_refs: Vec<(i64, &[Value])> = entries
@@ -4675,6 +4660,7 @@ impl Table for MVCCTable {
                 .collect();
             index.add_batch_slice(&entry_refs)?;
         }
+        self.check_local_unique(&index, &col_indices)?;
 
         // Add to version store
         self.version_store

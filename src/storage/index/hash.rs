@@ -36,24 +36,6 @@
 //! ## Implementation:
 //! Uses `ahash` for fast hashing, avoiding O(strlen) comparisons
 //! that would occur with each B-tree node comparison.
-//!
-//! ## Known Limitations:
-//!
-//! ### Paired Lock Pattern for Write Operations
-//! The `add` and `remove` methods acquire both RwLock write locks simultaneously:
-//! - `row_to_hash`: Maps row_id -> hash for efficient removal
-//! - `hash_to_values`: Maps hash -> values for collision handling
-//!
-//! This pattern ensures atomicity but can cause write contention under high
-//! concurrent write load. Read operations (`find`) only acquire a single read lock.
-//!
-//! **Impact**: Under heavy concurrent INSERTs/UPDATEs to the same indexed column,
-//! writers will serialize. This is acceptable for most workloads where writes are
-//! less frequent than reads.
-//!
-//! **Alternative considered**: Using a single RwLock<struct> would have similar
-//! contention characteristics. A concurrent map could help for truly concurrent writes
-//! but would complicate atomicity across the two maps.
 
 use parking_lot::RwLock;
 use std::hash::{BuildHasher, Hash, Hasher};
@@ -66,7 +48,7 @@ use super::id_list::IdList;
 use crate::common::{CompactArc, I64Map};
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::{ComparisonExpr, Expression, InListExpr};
-use crate::storage::traits::{Index, RemovalBuffers};
+use crate::storage::traits::Index;
 
 /// Fixed seeds for deterministic hashing across add/find operations
 const HASH_SEEDS: [u64; 4] = [
@@ -119,10 +101,6 @@ pub struct HashIndex {
 pub struct HashData {
     closed: AtomicBool,
 
-    /// Row ID -> hash mapping for efficient removal
-    /// Uses I64Map for fast O(1) lookups (optimized for i64 keys)
-    row_to_hash: RwLock<I64Map<u64>>,
-
     /// Full values storage for hash collision handling and unique constraint checking
     /// Maps hash -> (values as CompactArc<Value>, row_ids) for collision resolution
     /// Uses CompactArc<Value> to share references with ValueArena (8 bytes per value)
@@ -155,7 +133,7 @@ impl HashIndex {
     /// Create a new HashIndex
     ///
     /// # Arguments
-    /// * `expected_rows` - Hint for initial capacity of row_to_hash map.
+    /// * `expected_rows` - Hint for initial capacity of the value map.
     ///   Pass 0 if unknown; the map will grow automatically.
     pub fn new(
         name: String,
@@ -175,11 +153,6 @@ impl HashIndex {
             is_unique,
             data: Arc::new(HashData {
                 closed: AtomicBool::new(false),
-                row_to_hash: RwLock::new(if expected_rows > 0 {
-                    I64Map::with_capacity(expected_rows)
-                } else {
-                    I64Map::new()
-                }),
                 hash_to_values: RwLock::new(if expected_rows > 0 {
                     FxHashMap::with_capacity_and_hasher(expected_rows, Default::default())
                 } else {
@@ -286,46 +259,10 @@ impl Index for HashIndex {
 
         let hash = hash_values(values);
 
-        // Acquire all write locks to ensure atomic operation
-        let mut row_to_hash = self.row_to_hash.write();
         let mut hash_to_values = self.hash_to_values.write();
-
-        // Check if row already exists (for updates)
-        if let Some(&old_hash) = row_to_hash.get(row_id) {
-            if old_hash == hash {
-                // Same hash - but could be hash collision with different values!
-                // Must compare actual values to determine if this is a no-op
-                if let Some(entries) = hash_to_values.get(&old_hash) {
-                    let old_values_match = entries.iter().any(|(stored_values, row_ids)| {
-                        row_ids.contains(row_id) && Self::values_match(stored_values, values)
-                    });
-                    if old_values_match {
-                        // Truly the same values - no update needed
-                        return Ok(());
-                    }
-                }
-                // Hash collision: different values with same hash
-                // Fall through to remove old and add new
-            }
-
-            // Different hash (or same hash with different values) - remove old entry
-            // Remove from values storage
-            if let Some(entries) = hash_to_values.get_mut(&old_hash) {
-                for (_, row_ids) in entries.iter_mut() {
-                    row_ids.remove(row_id);
-                }
-                entries.retain(|(_, row_ids)| !row_ids.is_empty());
-                if entries.is_empty() {
-                    hash_to_values.remove(&old_hash);
-                }
-            }
-        }
 
         // Check uniqueness constraint
         self.check_unique_constraint(values, row_id, hash, &hash_to_values)?;
-
-        // Add to row_to_hash
-        row_to_hash.insert(row_id, hash);
 
         // Add to hash_to_values for collision handling
         // Use CompactArc<Value> via arena for memory efficiency
@@ -366,11 +303,7 @@ impl Index for HashIndex {
 
         let hash = hash_values(values);
 
-        let mut row_to_hash = self.row_to_hash.write();
         let mut hash_to_values = self.hash_to_values.write();
-
-        // Remove from row_to_hash
-        row_to_hash.remove(row_id);
 
         // Remove from hash_to_values (row_ids are sorted, use binary search)
         if let Some(entries) = hash_to_values.get_mut(&hash) {
@@ -411,12 +344,10 @@ impl Index for HashIndex {
 
         let num_cols = self.column_ids.len();
 
-        // Acquire all write locks ONCE for entire batch
-        let mut row_to_hash = self.row_to_hash.write();
+        // Acquire the write lock ONCE for entire batch
         let mut hash_to_values = self.hash_to_values.write();
 
         // Reserve capacity to reduce reallocations
-        row_to_hash.reserve(entries.len());
         hash_to_values.reserve(entries.len());
 
         // For unique indexes: pre-check all entries before modifying
@@ -469,39 +400,6 @@ impl Index for HashIndex {
 
             let hash = hash_values(values);
 
-            // Handle existing row (update case)
-            if let Some(&old_hash) = row_to_hash.get(row_id) {
-                if old_hash == hash {
-                    // Same hash - but could be hash collision with different values!
-                    // Must compare actual values to determine if this is a no-op
-                    let old_values_match = if let Some(entries) = hash_to_values.get(&old_hash) {
-                        entries.iter().any(|(stored_values, row_ids)| {
-                            row_ids.contains(row_id) && Self::values_match(stored_values, values)
-                        })
-                    } else {
-                        false
-                    };
-                    if old_values_match {
-                        continue; // Truly the same values - no update needed
-                    }
-                    // Hash collision: different values with same hash - fall through to update
-                }
-
-                // Different hash (or same hash with different values) - remove old entry
-                if let Some(val_entries) = hash_to_values.get_mut(&old_hash) {
-                    for (_, row_ids) in val_entries.iter_mut() {
-                        row_ids.remove(row_id);
-                    }
-                    val_entries.retain(|(_, row_ids)| !row_ids.is_empty());
-                    if val_entries.is_empty() {
-                        hash_to_values.remove(&old_hash);
-                    }
-                }
-            }
-
-            // Add to row_to_hash
-            row_to_hash.insert(row_id, hash);
-
             // Add to hash_to_values
             let val_entries = hash_to_values.entry(hash).or_default();
             let mut found = false;
@@ -536,15 +434,11 @@ impl Index for HashIndex {
             return Err(Error::IndexClosed);
         }
 
-        // Acquire all write locks ONCE for entire batch
-        let mut row_to_hash = self.row_to_hash.write();
+        // Acquire the write lock ONCE for entire batch
         let mut hash_to_values = self.hash_to_values.write();
 
         for &(row_id, values) in entries {
             let hash = hash_values(values);
-
-            // Remove from row_to_hash
-            row_to_hash.remove(row_id);
 
             // Remove from hash_to_values
             if let Some(val_entries) = hash_to_values.get_mut(&hash) {
@@ -562,49 +456,6 @@ impl Index for HashIndex {
         }
 
         Ok(())
-    }
-
-    fn removal_buffers(&self, _batch_rows: usize) -> Option<RemovalBuffers> {
-        Some(Box::new(I64Map::<u64>::new()))
-    }
-
-    fn remove_batch_ids(
-        &self,
-        row_ids: &[i64],
-        buffers: &mut RemovalBuffers,
-    ) -> Option<Result<()>> {
-        let fresh = buffers.downcast_mut::<I64Map<u64>>()?;
-        if self.closed.load(AtomicOrdering::Acquire) {
-            return Some(Err(Error::IndexClosed));
-        }
-        let mut row_to_hash = self.row_to_hash.write();
-        let mut hash_to_values = self.hash_to_values.write();
-        // The rows sorted by hash and id: each hash's ids leave its bucket
-        // in one pass per value
-        let mut removed: Vec<(u64, i64)> = Vec::with_capacity(row_ids.len());
-        for &row_id in row_ids {
-            if let Some(hash) = row_to_hash.remove_keeping_capacity(row_id) {
-                removed.push((hash, row_id));
-            }
-        }
-        row_to_hash.swap_if_empty(fresh);
-        removed.sort_unstable();
-        let mut ids: Vec<i64> = Vec::with_capacity(removed.len());
-        for run in removed.chunk_by(|a, b| a.0 == b.0) {
-            let hash = run[0].0;
-            ids.clear();
-            ids.extend(run.iter().map(|(_, row_id)| *row_id));
-            if let Some(val_entries) = hash_to_values.get_mut(&hash) {
-                for (_, bucket) in val_entries.iter_mut() {
-                    bucket.remove_sorted(&ids);
-                }
-                val_entries.retain(|(_, bucket)| !bucket.is_empty());
-                if val_entries.is_empty() {
-                    hash_to_values.remove(&hash);
-                }
-            }
-        }
-        Some(Ok(()))
     }
 
     fn column_ids(&self) -> &[i32] {
@@ -879,7 +730,6 @@ impl Index for HashIndex {
     }
 
     fn clear(&self) -> Result<()> {
-        self.row_to_hash.write().clear();
         self.hash_to_values.write().clear();
         Ok(())
     }
@@ -1043,7 +893,10 @@ mod tests {
             .add(&[Value::Text("old@example.com".into())], 1, 0)
             .unwrap();
 
-        // Update to new value (same row_id, different value)
+        // Update to new value: the old key leaves, the new one comes
+        index
+            .remove(&[Value::Text("old@example.com".into())], 1, 0)
+            .unwrap();
         index
             .add(&[Value::Text("new@example.com".into())], 1, 0)
             .unwrap();

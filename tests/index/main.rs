@@ -30,6 +30,7 @@ mod hash_candidate_cap_test;
 mod hash_index_sql_test;
 mod in_equality_candidates_test;
 mod index_count_test;
+mod index_created_in_transaction_test;
 mod index_join_rule_test;
 mod index_name_case_test;
 mod index_operations_test;

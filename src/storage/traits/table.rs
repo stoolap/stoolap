@@ -920,6 +920,13 @@ pub trait Table: Send + Sync {
         ))
     }
 
+    /// Refuses the unique index `name` when this transaction's own new rows
+    /// break it against what the index holds now, as after a later fill
+    fn check_local_rows_unique(&self, name: &str) -> Result<()> {
+        let _ = name;
+        Ok(())
+    }
+
     /// Drops an index from the table
     ///
     /// # Arguments

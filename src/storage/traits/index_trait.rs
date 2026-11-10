@@ -197,11 +197,11 @@ pub trait Index: Send + Sync {
         None
     }
 
-    /// Removes the entries of `row_ids` using the index's own row-to-key map,
-    /// so the caller needs no row values; a seal's cleanup, with the buffers
-    /// from `removal_buffers`. The row map keeps its capacity, and a map left
-    /// empty is swapped for the buffers' small one, the old table staying in
-    /// the buffers. None when the index cannot.
+    /// Removes the entries of `row_ids` by id alone, for an index whose key
+    /// is the row id, so the caller needs no row values; a seal's cleanup,
+    /// with the buffers from `removal_buffers`. A set left empty is swapped
+    /// for the buffers' small one, the old one staying in the buffers. None
+    /// when the index cannot.
     fn remove_batch_ids(
         &self,
         row_ids: &[i64],

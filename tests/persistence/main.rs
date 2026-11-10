@@ -21,6 +21,7 @@ mod drop_rename_replay_test;
 mod durability_test;
 mod failpoint_io_test;
 mod file_lock_integration_test;
+mod index_replay_test;
 mod migration_v037_test;
 mod open_session_test;
 mod open_unreadable_volume_test;

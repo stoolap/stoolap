@@ -70,30 +70,36 @@ fn fill(index: &dyn Index, rows: &[(i64, Vec<Value>)]) {
     index.add_batch_slice(&entries).unwrap();
 }
 
+/// Allocations of removing the rows of `ids` by their keys, the entries made
+/// before the count as a seal's cleanup makes them
+fn allocations_of_removal(index: &dyn Index, rows: &[(i64, Vec<Value>)], ids: &[i64]) -> usize {
+    let entries: Vec<(i64, &[Value])> = ids
+        .iter()
+        .map(|&id| (id, rows[id as usize - 1].1.as_slice()))
+        .collect();
+    let before = ALLOCATIONS.with(Cell::get);
+    index.remove_batch_slice(&entries).unwrap();
+    ALLOCATIONS.with(Cell::get) - before
+}
+
 /// Allocations of two batch removals, 2,000 rows then 10,000, each given in
 /// descending id order as a clustered seal can give them
-fn allocations_of_removals(index: &dyn Index) -> (usize, usize) {
-    let mut buffers = index.removal_buffers(10_000).unwrap();
+fn allocations_of_removals(index: &dyn Index, rows: &[(i64, Vec<Value>)]) -> (usize, usize) {
     let mut counts = [0; 2];
     for (i, range) in [(1..=2_000i64), (2_001..=12_000)].into_iter().enumerate() {
         let ids: Vec<i64> = range.rev().collect();
-        let before = ALLOCATIONS.with(Cell::get);
-        index.remove_batch_ids(&ids, &mut buffers).unwrap().unwrap();
-        counts[i] = ALLOCATIONS.with(Cell::get) - before;
+        counts[i] = allocations_of_removal(index, rows, &ids);
     }
     (counts[0], counts[1])
 }
 
-/// Allocations of a seal's two 10,000-row cleanup calls over rows `first`
-/// onwards, the second emptying the index, with the buffers made before
-fn allocations_of_a_seal_cleanup(index: &dyn Index, first: i64) -> (usize, usize) {
-    let mut buffers = index.removal_buffers(10_000).unwrap();
+/// Allocations of a seal's two 10,000-row cleanup calls over rows 1 onwards,
+/// the second emptying the index
+fn allocations_of_a_seal_cleanup(index: &dyn Index, rows: &[(i64, Vec<Value>)]) -> (usize, usize) {
     let mut counts = [0; 2];
-    for (i, start) in [first, first + 10_000].into_iter().enumerate() {
+    for (i, start) in [1, 10_001].into_iter().enumerate() {
         let ids: Vec<i64> = (start..start + 10_000).collect();
-        let before = ALLOCATIONS.with(Cell::get);
-        index.remove_batch_ids(&ids, &mut buffers).unwrap().unwrap();
-        counts[i] = ALLOCATIONS.with(Cell::get) - before;
+        counts[i] = allocations_of_removal(index, rows, &ids);
     }
     (counts[0], counts[1])
 }
@@ -114,10 +120,10 @@ fn a_btree_batch_removal_allocates_a_fixed_number_of_times() {
         "k".into(),
         DataType::Integer,
         false,
-        0,
     );
-    fill(&index, &rows(1));
-    assert_bounded("btree", allocations_of_removals(&index));
+    let rows = rows(1);
+    fill(&index, &rows);
+    assert_bounded("btree", allocations_of_removals(&index, &rows));
     assert_eq!(
         index.get_row_ids_equal(&[Value::Integer(3)]).len(),
         800,
@@ -136,8 +142,9 @@ fn a_hash_batch_removal_allocates_a_fixed_number_of_times() {
         false,
         0,
     );
-    fill(&index, &rows(1));
-    assert_bounded("hash", allocations_of_removals(&index));
+    let rows = rows(1);
+    fill(&index, &rows);
+    assert_bounded("hash", allocations_of_removals(&index, &rows));
     assert_eq!(index.get_row_ids_equal(&[Value::Integer(3)]).len(), 800);
 }
 
@@ -152,7 +159,8 @@ fn a_multi_column_batch_removal_allocates_a_fixed_number_of_times() {
         false,
         0,
     );
-    fill(&index, &rows(3));
+    let rows = rows(3);
+    fill(&index, &rows);
     // Every structure built: the sorted keys and both prefixes
     let key = [Value::Integer(3), Value::Integer(1), Value::Integer(1)];
     assert_eq!(index.find(&key[..1]).unwrap().len(), 2_000);
@@ -161,7 +169,7 @@ fn a_multi_column_batch_removal_allocates_a_fixed_number_of_times() {
         index.find_range(&key, &key, true, true).unwrap().len(),
         2_000
     );
-    assert_bounded("multi-column", allocations_of_removals(&index));
+    assert_bounded("multi-column", allocations_of_removals(&index, &rows));
     assert_eq!(index.find(&key).unwrap().len(), 800);
     assert_eq!(index.find(&key[..1]).unwrap().len(), 800);
     assert_eq!(index.find(&key[..2]).unwrap().len(), 800);
@@ -176,7 +184,6 @@ fn a_seal_cleanup_that_empties_an_index_allocates_nothing_more() {
         "k".into(),
         DataType::Integer,
         false,
-        0,
     );
     let hash = HashIndex::new(
         "idx".into(),
@@ -201,8 +208,9 @@ fn a_seal_cleanup_that_empties_an_index_allocates_nothing_more() {
         ("hash", &hash, 1),
         ("multi-column", &multi, 3),
     ] {
-        fill(index, &rows(columns));
-        let (first, emptying) = allocations_of_a_seal_cleanup(index, 1);
+        let rows = rows(columns);
+        fill(index, &rows);
+        let (first, emptying) = allocations_of_a_seal_cleanup(index, &rows);
         assert_eq!(first, emptying, "{name}: the emptying call allocated more");
     }
 }
@@ -216,16 +224,28 @@ fn a_seal_cleanup_of_a_bitmap_or_pk_index_allocates_nothing() {
         vec![1],
         vec![DataType::Integer],
         false,
-        0,
     );
-    fill(&bitmap, &rows(1));
-    assert_eq!(allocations_of_a_seal_cleanup(&bitmap, 1), (0, 0), "bitmap");
+    let rows = rows(1);
+    fill(&bitmap, &rows);
+    assert_eq!(
+        allocations_of_a_seal_cleanup(&bitmap, &rows),
+        (0, 0),
+        "bitmap"
+    );
 
     let pk = PkIndex::new("pk".into(), "t".into(), 0, "id".into());
-    // Past the bitset, in the overflow set
+    // Past the bitset, in the overflow set; the PK index removes by id
     let first = 10_000_000;
     for id in first..first + ROWS {
         pk.add(&[Value::Integer(id)], id, id).unwrap();
     }
-    assert_eq!(allocations_of_a_seal_cleanup(&pk, first), (0, 0), "pk");
+    let mut buffers = pk.removal_buffers(10_000).unwrap();
+    let mut counts = [0; 2];
+    for (i, start) in [first, first + 10_000].into_iter().enumerate() {
+        let ids: Vec<i64> = (start..start + 10_000).collect();
+        let before = ALLOCATIONS.with(Cell::get);
+        pk.remove_batch_ids(&ids, &mut buffers).unwrap().unwrap();
+        counts[i] = ALLOCATIONS.with(Cell::get) - before;
+    }
+    assert_eq!(counts, [0, 0], "pk");
 }
