@@ -436,6 +436,14 @@ WHERE category IN (
 );
 ```
 
+#### Updating the Primary Key
+
+An UPDATE may set the primary key. A row whose key changes moves to the new key, and its `_rowid_` changes with it. Keys collide only with the keys the statement leaves in place, checked once every row is set, so a shift such as `SET id = id + 1` over every row and a swap of two keys go through. A key that collides, is NULL or is not an INTEGER refuses the statement, which writes nothing. Child rows that reference the key follow their ON UPDATE action, and a child whose own primary key is the reference moves the same way. The update of an `INSERT ... ON CONFLICT DO UPDATE` may set the key too.
+
+```sql
+UPDATE orders SET id = id + 1000 WHERE id < 1000;
+```
+
 ### DELETE
 
 The DELETE statement removes rows from a table.

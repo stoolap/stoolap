@@ -94,6 +94,8 @@ Referential actions define what happens to child rows when the referenced parent
 
 The update of an `INSERT ... ON CONFLICT DO UPDATE` (or `ON DUPLICATE KEY UPDATE`) is checked as an `UPDATE` is: a foreign key value it writes must name an existing parent row, and a referenced value it changes runs the ON UPDATE action of each child that names it. A refusal leaves the statement having written nothing.
 
+A parent's primary key can be updated too, and its children follow their ON UPDATE action. When a child's foreign key column is its own primary key, ON UPDATE CASCADE moves the child row to the new key, at any depth of the cascade.
+
 ### Examples
 
 ```sql
@@ -348,5 +350,4 @@ FK constraints are persisted through both WAL (Write-Ahead Log) and snapshots. A
 ## Limitations
 
 - FK constraints reference single columns (composite FK not yet supported)
-- ON UPDATE CASCADE does not change a child's primary key: when the child's FK column is its primary key, an update whose cascade would reach a child row is refused, at any depth of the cascade, and leaves nothing written, inside a transaction too. An update that keeps the value, or changes a value no child row names, goes through.
 - Self-referencing FK (a table referencing itself) follows the same rules but requires careful ordering of inserts

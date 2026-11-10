@@ -48,6 +48,7 @@ mod literal_write_rule_test;
 mod on_duplicate_key_update_test;
 mod pk_write_where_test;
 mod plain_dml_family_test;
+mod primary_key_update_test;
 mod table_level_primary_key_test;
 mod update_arithmetic_test;
 mod update_correlated_restrict_test;

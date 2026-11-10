@@ -698,7 +698,7 @@ fn test_fk_set_null_rollback_atomicity() {
 // =====================================================================
 
 #[test]
-fn test_fk_cascade_update_pk_rejected() {
+fn test_fk_cascade_update_pk_moves_parent_and_children_follow() {
     let db = setup();
     setup_parent_child(&db);
     db.execute(
@@ -708,20 +708,13 @@ fn test_fk_cascade_update_pk_rejected() {
     db.execute("INSERT INTO children VALUES (1, 1, 'Child1')", ())
         .unwrap();
 
-    // PK updates are rejected (row_id == pk_value invariant)
-    let result = db.execute("UPDATE parents SET id = 100 WHERE id = 1", ());
-    assert!(result.is_err(), "UPDATE on PK should be rejected");
-    let err = result.unwrap_err().to_string();
-    assert!(
-        err.contains("primary key"),
-        "Error should mention primary key, got: {}",
-        err
-    );
+    db.execute("UPDATE parents SET id = 100 WHERE id = 1", ())
+        .unwrap();
 
-    // Data should be unchanged
-    assert_eq!(count(&db, "SELECT COUNT(*) FROM parents WHERE id = 1"), 1);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM parents WHERE id = 1"), 0);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM parents WHERE id = 100"), 1);
     assert_eq!(
-        count(&db, "SELECT COUNT(*) FROM children WHERE parent_id = 1"),
+        count(&db, "SELECT COUNT(*) FROM children WHERE parent_id = 100"),
         1
     );
 }

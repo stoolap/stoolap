@@ -49,33 +49,28 @@ fn each_layout(name: &str, check: impl Fn(&Database)) {
     check(&tables(&format!("file://{}", dir.path().display()), true));
 }
 
-fn refused(db: &Database, sql: &str) {
-    let error = db.execute(sql, ()).unwrap_err().to_string();
-    assert!(
-        error.contains("into the primary key of table"),
-        "{sql}: {error}"
-    );
-}
-
 #[test]
-fn a_cascade_that_would_change_a_child_key_is_refused_and_leaves_nothing_written() {
-    each_layout("refused", |db| {
-        refused(db, "UPDATE p SET u = 40 WHERE id = 1");
-        refused(db, "UPDATE p SET u = u + 100");
-        let unchanged = vec![vec![1, 10], vec![2, 20], vec![3, 30]];
-        assert_eq!(rows(db, "SELECT id, u FROM p ORDER BY id"), unchanged);
+fn a_cascade_into_a_child_key_moves_the_child_to_its_new_key() {
+    each_layout("moved", |db| {
+        db.execute("UPDATE p SET u = 40 WHERE id = 1", ()).unwrap();
         assert_eq!(
             rows(db, "SELECT id, x FROM c ORDER BY id"),
-            [[10, 100], [20, 200]]
+            [[20, 200], [40, 100]]
         );
-        // Each child is still found by its key, and its key stays unique
-        assert_eq!(rows(db, "SELECT x FROM c WHERE id = 10"), [[100]]);
-        assert!(db.execute("INSERT INTO c VALUES (20, 9)", ()).is_err());
+        assert_eq!(rows(db, "SELECT x FROM c WHERE id = 40"), [[100]]);
+        assert!(rows(db, "SELECT x FROM c WHERE id = 10").is_empty());
+        assert!(db.execute("INSERT INTO c VALUES (40, 9)", ()).is_err());
+        db.execute("UPDATE p SET u = u + 100", ()).unwrap();
+        assert_eq!(
+            rows(db, "SELECT id, x FROM c ORDER BY id"),
+            [[120, 200], [140, 100]]
+        );
+        assert_eq!(rows(db, "SELECT x FROM c WHERE id = 120"), [[200]]);
     });
 }
 
 #[test]
-fn an_update_that_leaves_a_named_value_as_it_is_goes_through() {
+fn an_update_that_leaves_a_named_value_as_it_is_leaves_the_child_in_place() {
     each_layout("unchanged", |db| {
         for sql in [
             "UPDATE p SET u = u WHERE id = 1",
@@ -95,8 +90,8 @@ fn an_update_that_leaves_a_named_value_as_it_is_goes_through() {
             [[1, 10], [2, 20], [3, 31]]
         );
         assert_eq!(rows(db, "SELECT x FROM c WHERE id = 10"), [[100]]);
-        let error = stmt.execute((11, 1)).unwrap_err().to_string();
-        assert!(error.contains("into the primary key of table"), "{error}");
+        stmt.execute((11, 1)).unwrap();
+        assert_eq!(rows(db, "SELECT x FROM c WHERE id = 11"), [[100]]);
     });
 }
 
@@ -144,6 +139,7 @@ fn an_update_over_a_key_cascade_asks_its_where_once_per_row() {
         "CREATE TABLE p (id INTEGER PRIMARY KEY, u INTEGER UNIQUE)",
         "CREATE TABLE c (id INTEGER PRIMARY KEY REFERENCES p(u) ON UPDATE CASCADE)",
         "INSERT INTO p VALUES (1, 10)",
+        "INSERT INTO c VALUES (10)",
     ] {
         db.execute(sql, ()).unwrap();
     }
@@ -154,6 +150,7 @@ fn an_update_over_a_key_cascade_asks_its_where_once_per_row() {
         .unwrap();
     assert_eq!(updated, 1, "the row the WHERE chose is the row written");
     assert_eq!(rows(&db, "SELECT u FROM p"), [[11]]);
+    assert_eq!(rows(&db, "SELECT id FROM c"), [[11]]);
     assert_eq!(TICKS.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
 
@@ -166,22 +163,30 @@ fn a_parent_value_no_child_names_is_updated() {
 }
 
 #[test]
-fn a_refused_cascade_leaves_an_open_transaction_as_it_was() {
+fn a_moved_child_follows_the_transaction_it_was_moved_in() {
     each_layout("txn", |db| {
         db.execute("BEGIN", ()).unwrap();
-        db.execute("UPDATE p SET u = 33 WHERE id = 3", ()).unwrap();
-        refused(db, "UPDATE p SET u = 40 WHERE id = 1");
+        db.execute("UPDATE p SET u = 40 WHERE id = 1", ()).unwrap();
+        assert!(db.execute("UPDATE p SET u = 20 WHERE id = 1", ()).is_err());
+        assert_eq!(rows(db, "SELECT x FROM c WHERE id = 40"), [[100]]);
+        db.execute("ROLLBACK", ()).unwrap();
+        assert_eq!(
+            rows(db, "SELECT id, x FROM c ORDER BY id"),
+            [[10, 100], [20, 200]]
+        );
+        db.execute("BEGIN", ()).unwrap();
+        db.execute("UPDATE p SET u = 40 WHERE id = 1", ()).unwrap();
         db.execute("COMMIT", ()).unwrap();
         assert_eq!(
             rows(db, "SELECT id, u FROM p ORDER BY id"),
-            [[1, 10], [2, 20], [3, 33]]
+            [[1, 40], [2, 20], [3, 30]]
         );
-        assert_eq!(rows(db, "SELECT x FROM c WHERE id = 10"), [[100]]);
+        assert_eq!(rows(db, "SELECT x FROM c WHERE id = 40"), [[100]]);
     });
 }
 
 #[test]
-fn a_cascade_reaching_a_grandchild_key_is_refused_and_leaves_nothing_written() {
+fn a_cascade_reaching_a_grandchild_key_moves_it_too() {
     let db = Database::open("memory://fk_cascade_into_key_grandchild").unwrap();
     for sql in [
         "CREATE TABLE g (id INTEGER PRIMARY KEY, a INTEGER UNIQUE)",
@@ -193,8 +198,9 @@ fn a_cascade_reaching_a_grandchild_key_is_refused_and_leaves_nothing_written() {
     ] {
         db.execute(sql, ()).unwrap();
     }
-    refused(&db, "UPDATE g SET a = 6 WHERE id = 1");
-    assert_eq!(rows(&db, "SELECT a FROM g"), [[5]]);
-    assert_eq!(rows(&db, "SELECT ga FROM h"), [[5]]);
-    assert_eq!(rows(&db, "SELECT z FROM i WHERE z = 5"), [[5]]);
+    db.execute("UPDATE g SET a = 6 WHERE id = 1", ()).unwrap();
+    assert_eq!(rows(&db, "SELECT a FROM g"), [[6]]);
+    assert_eq!(rows(&db, "SELECT ga FROM h"), [[6]]);
+    assert_eq!(rows(&db, "SELECT z FROM i WHERE z = 6"), [[6]]);
+    assert!(rows(&db, "SELECT z FROM i WHERE z = 5").is_empty());
 }
