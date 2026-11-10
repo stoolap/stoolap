@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A new key of a B-tree index costs its id list and its share of the
-//! tree's nodes, and nothing for the key itself
+//! A new key of a B-tree index with one row costs its share of the tree's
+//! nodes and nothing of its own: no copy of the key, no id list
 
 // The jemalloc feature, on by default, sets the library's own global allocator
 #![cfg(not(feature = "jemalloc"))]
@@ -66,7 +66,7 @@ fn keys(data_type: DataType) -> Vec<Value> {
 }
 
 #[test]
-fn a_new_btree_key_allocates_no_copy_of_itself() {
+fn a_new_btree_key_with_one_row_allocates_nothing_of_its_own() {
     let mut wrong = Vec::new();
     for data_type in [DataType::Integer, DataType::Text] {
         for unique in [false, true] {
@@ -92,7 +92,8 @@ fn a_new_btree_key_allocates_no_copy_of_itself() {
             let batch_added = ALLOCATIONS.with(Cell::get) - before - usize::from(unique);
 
             for (path, count) in [("add", added), ("add_batch_slice", batch_added)] {
-                if count * 2 > KEYS * 3 {
+                // A node holds 64 keys: under one allocation per ten keys
+                if count * 10 > KEYS {
                     wrong.push(format!(
                         "{data_type:?}, unique {unique}, {path}: {count} allocations for {KEYS} keys"
                     ));

@@ -30,6 +30,7 @@ pub mod hnsw;
 pub mod id_list;
 pub mod multi_column;
 pub mod pk;
+pub(crate) mod value_tree;
 
 // Re-export main types
 pub use bitmap::BitmapIndex;

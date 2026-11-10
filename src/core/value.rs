@@ -1223,20 +1223,52 @@ impl Ord for Value {
 }
 
 impl Value {
+    /// Number of ranks `type_rank` gives
+    pub(crate) const TYPE_RANKS: usize = 6;
+
+    /// Rank of a type among the others; INTEGER and FLOAT share one so they
+    /// sort together by value, and NULL is first
+    #[inline]
+    pub(crate) fn type_rank(&self) -> u8 {
+        match self {
+            Value::Null(_) => 0,
+            Value::Boolean(_) => 1,
+            Value::Integer(_) | Value::Float(_) => 2,
+            Value::Text(_) => 3,
+            Value::Timestamp(_) => 4,
+            Value::Extension(_) => 5,
+        }
+    }
+
+    /// A word whose unsigned order never contradicts `cmp` between two values
+    /// of one rank, two TEXT values sharing their first `skip` bytes: `a <= b`
+    /// gives `a.order_word_at(skip) <= b.order_word_at(skip)`. Equal words
+    /// decide nothing; `cmp` orders them. INTEGER, TIMESTAMP and TEXT take
+    /// it inline, every other case `order_word_other`
+    #[inline(always)]
+    pub(crate) fn order_word_at(&self, skip: usize) -> u64 {
+        match self {
+            Value::Integer(i) => signed_word(*i),
+            Value::Timestamp(t) => signed_word(t.timestamp_micros()),
+            Value::Text(s) => text_word(s.as_str().as_bytes().get(skip..).unwrap_or_default()),
+            _ => self.order_word_other(skip),
+        }
+    }
+
+    #[inline(never)]
+    fn order_word_other(&self, skip: usize) -> u64 {
+        match self {
+            Value::Integer(_) | Value::Timestamp(_) | Value::Text(_) => self.order_word_at(skip),
+            Value::Float(f) if f.is_nan() => u64::MAX,
+            // Saturating: below i64 it is word 0, from 2^63 the top word
+            Value::Float(f) => signed_word(f.floor() as i64),
+            Value::Boolean(b) => u64::from(*b),
+            Value::Null(_) | Value::Extension(_) => 0,
+        }
+    }
+
     #[inline(never)]
     fn cmp_other(&self, other: &Self) -> Ordering {
-        /// Rank of a type among the others; INTEGER and FLOAT share one so
-        /// they sort together by value, and NULL is first
-        fn type_rank(v: &Value) -> u8 {
-            match v {
-                Value::Null(_) => 0,
-                Value::Boolean(_) => 1,
-                Value::Integer(_) | Value::Float(_) => 2,
-                Value::Text(_) => 3,
-                Value::Timestamp(_) => 4,
-                Value::Extension(_) => 5,
-            }
-        }
         match (self, other) {
             (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
             (Value::Extension(a), Value::Extension(b)) => a.cmp(b),
@@ -1246,7 +1278,7 @@ impl Value {
             (Value::Float(f), Value::Integer(i)) => cmp_i64_f64(*i, *f)
                 .map(Ordering::reverse)
                 .unwrap_or(Ordering::Greater),
-            _ => type_rank(self).cmp(&type_rank(other)),
+            _ => self.type_rank().cmp(&other.type_rank()),
         }
     }
 }
@@ -1702,6 +1734,36 @@ pub fn compare_order_key(
             } else {
                 Ordering::Greater
             }
+        }
+    }
+}
+
+/// An order word of a signed number: the sign bit flipped, so unsigned
+/// order is signed order
+#[inline(always)]
+fn signed_word(i: i64) -> u64 {
+    i as u64 ^ (1 << 63)
+}
+
+/// The first eight bytes of `bytes` as a big-endian word, zero-padded. A
+/// shorter tail is read in overlapping pieces, which agree where they meet
+#[inline(always)]
+fn text_word(bytes: &[u8]) -> u64 {
+    let len = bytes.len();
+    if let Some(word) = bytes.first_chunk::<8>() {
+        return u64::from_be_bytes(*word);
+    }
+    if let (Some(head), Some(tail)) = (bytes.first_chunk::<4>(), bytes.last_chunk::<4>()) {
+        let head = u64::from(u32::from_be_bytes(*head)) << 32;
+        return head | u64::from(u32::from_be_bytes(*tail)) << (64 - 8 * len);
+    }
+    match bytes {
+        [] => 0,
+        [first, ..] => {
+            let (mid, last) = (bytes[len / 2], bytes[len - 1]);
+            u64::from(*first) << 56
+                | u64::from(mid) << (56 - 8 * (len / 2))
+                | u64::from(last) << (56 - 8 * (len - 1))
         }
     }
 }
@@ -2384,5 +2446,123 @@ mod tests {
         // NaN ordering: NaN last, both directions consistent
         assert_eq!(Value::Integer(0).cmp(&Value::Float(f64::NAN)), Less);
         assert_eq!(Value::Float(f64::NAN).cmp(&Value::Integer(0)), Greater);
+    }
+
+    #[test]
+    fn a_text_word_is_its_first_eight_bytes_zero_padded() {
+        let bytes: Vec<u8> = (1..=12u8).map(|b| b.wrapping_mul(37) | 1).collect();
+        for len in 0..=bytes.len() {
+            let mut padded = [0u8; 8];
+            let n = len.min(8);
+            padded[..n].copy_from_slice(&bytes[..n]);
+            assert_eq!(
+                text_word(&bytes[..len]),
+                u64::from_be_bytes(padded),
+                "{len} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn an_order_word_never_contradicts_cmp_within_a_rank() {
+        let ts = |secs: i64, nanos: u32| {
+            Value::Timestamp(DateTime::from_timestamp(secs, nanos).unwrap_or_default())
+        };
+        let mut pool = vec![
+            Value::Null(DataType::Null),
+            Value::Null(DataType::Integer),
+            Value::Boolean(false),
+            Value::Boolean(true),
+            ts(i64::MIN / 1_000_000_000, 0),
+            ts(-1, 999_999_999),
+            ts(0, 0),
+            ts(0, 1),
+            ts(0, 999),
+            ts(0, 1_000),
+            ts(1_700_000_000, 5),
+            ts(8_000_000_000_000, 0),
+            Value::Extension(CompactArc::from(&[7u8, 1, 2][..])),
+            Value::Extension(CompactArc::from(&[7u8, 1, 3][..])),
+        ];
+        for i in [
+            i64::MIN,
+            i64::MIN + 1,
+            -1_000,
+            -2,
+            -1,
+            0,
+            1,
+            2,
+            1_000,
+            i64::MAX - 1,
+            i64::MAX,
+        ] {
+            pool.push(Value::Integer(i));
+        }
+        for f in [
+            f64::NEG_INFINITY,
+            -1e300,
+            -9_223_372_036_854_777_856.0,
+            -2.5,
+            -1.0,
+            -0.5,
+            -0.0,
+            0.0,
+            0.5,
+            1.0,
+            1.5,
+            999.999,
+            9_223_372_036_854_775_808.0,
+            1e300,
+            f64::INFINITY,
+            f64::NAN,
+        ] {
+            pool.push(Value::Float(f));
+        }
+        for s in [
+            "",
+            "\0",
+            "a",
+            "a\0",
+            "a\0\0\0\0\0\0\0x",
+            "ab",
+            "abcdefgh",
+            "abcdefgh\0",
+            "abcdefghi",
+            "abcdefgi",
+            "b",
+            "row-0000000000000000000000000000000001",
+            "row-0000000000000000000000000000000002",
+            "row-0000000000000000000000000000000010",
+            "row-00000000000000000000000000000000",
+            "row-1",
+            "\u{7f}",
+            "\u{80}",
+            "\u{ffff}",
+        ] {
+            pool.push(Value::text(s));
+        }
+        let shares = |a: &Value, b: &Value, skip: usize| match (a, b) {
+            (Value::Text(x), Value::Text(y)) => {
+                let (x, y) = (x.as_str().as_bytes(), y.as_str().as_bytes());
+                x.len() >= skip && y.len() >= skip && x[..skip] == y[..skip]
+            }
+            _ => skip == 0,
+        };
+        for skip in [0, 1, 4, 8, 20, 36] {
+            for a in &pool {
+                for b in &pool {
+                    if a.type_rank() == b.type_rank()
+                        && shares(a, b, skip)
+                        && a.cmp(b) != Ordering::Greater
+                    {
+                        assert!(
+                            a.order_word_at(skip) <= b.order_word_at(skip),
+                            "{a:?} <= {b:?} but its word past {skip} bytes is greater"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
