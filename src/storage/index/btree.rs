@@ -375,8 +375,15 @@ impl Index for BTreeIndex {
             }
         }
 
-        // All checks passed - now add all entries; an insert that does not
-        // check uniqueness refuses nothing
+        // All checks passed. An empty index is built from the entries
+        if sorted_values.len() == 0 {
+            let pairs = entries
+                .iter()
+                .filter_map(|&(row_id, values)| Some((values.first()?, row_id)));
+            *sorted_values = ValueTree::from_entries(pairs.collect());
+            return Ok(());
+        }
+        // An insert that does not check uniqueness refuses nothing
         for &(row_id, values) in entries {
             if let Some(value) = values.first() {
                 let _ = sorted_values.insert(value, row_id, false);
@@ -958,19 +965,20 @@ impl OrderedIds {
         }
     }
 
-    /// Takes a key's rows: whether more are wanted
+    /// Takes a key's rows: whether more are wanted. A full walk takes no
+    /// more, whichever key comes next
     fn take(&mut self, rows: &Ids) -> bool {
         for row_id in rows.iter() {
+            if self.ids.len() >= self.limit {
+                return false;
+            }
             if self.skip > 0 {
                 self.skip -= 1;
                 continue;
             }
             self.ids.push(row_id);
-            if self.ids.len() >= self.limit {
-                return false;
-            }
         }
-        true
+        self.ids.len() < self.limit
     }
 }
 
@@ -1333,6 +1341,67 @@ mod tests {
 
         index.remove_batch(&to_remove).unwrap();
         assert_eq!(index.entry_count(), 1);
+    }
+
+    #[test]
+    fn a_batch_built_into_an_empty_index_holds_what_one_by_one_adds_hold() {
+        // NULLs, repeated keys, INTEGER and FLOAT keys that compare equal,
+        // and words FLOAT values share
+        let values: Vec<Value> = (0..5_000i64)
+            .map(|i| match i % 5 {
+                0 => Value::Null(DataType::Integer),
+                1 => Value::Integer((i * 7_919) % 600),
+                2 => Value::Float(((i * 104_729) % 600) as f64),
+                3 => Value::Float((i % 997) as f64 * 0.37),
+                _ => Value::Integer(-(i % 31)),
+            })
+            .collect();
+        let entries: Vec<(i64, &[Value])> = values
+            .iter()
+            .enumerate()
+            .map(|(id, v)| (id as i64, std::slice::from_ref(v)))
+            .collect();
+        let batched = create_test_index();
+        batched.add_batch_slice(&entries).unwrap();
+        let one_by_one = create_test_index();
+        for &(id, v) in &entries {
+            one_by_one.add(v, id, id).unwrap();
+        }
+        assert_eq!(
+            batched.get_grouped_row_ids(),
+            one_by_one.get_grouped_row_ids()
+        );
+        assert_eq!(batched.entry_count(), values.len());
+    }
+
+    #[test]
+    fn an_ordered_walk_stops_at_its_limit_on_either_side_of_the_nulls() {
+        let index = create_test_index();
+        index.add(&[Value::Integer(1)], 1, 1).unwrap();
+        index.add(&[Value::Integer(2)], 3, 3).unwrap();
+        index.add(&[Value::Null(DataType::Integer)], 2, 2).unwrap();
+        // (ascending, nulls_first, limit, offset) and the ids in order
+        let cases = [
+            ((true, false, 1, 0), vec![1]),
+            ((true, false, 2, 0), vec![1, 3]),
+            ((true, false, 1, 2), vec![2]),
+            ((true, false, 3, 1), vec![3, 2]),
+            ((true, true, 1, 0), vec![2]),
+            ((false, true, 1, 0), vec![2]),
+            ((false, true, 2, 1), vec![3, 1]),
+            ((false, false, 2, 0), vec![3, 1]),
+            ((false, false, 1, 2), vec![2]),
+            ((true, false, 0, 0), vec![]),
+        ];
+        for ((ascending, nulls_first, limit, offset), want) in cases {
+            assert_eq!(
+                index
+                    .get_row_ids_ordered(ascending, nulls_first, limit, offset)
+                    .unwrap(),
+                want,
+                "ascending {ascending}, nulls first {nulls_first}, limit {limit}, offset {offset}"
+            );
+        }
     }
 
     #[test]

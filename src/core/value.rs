@@ -1249,7 +1249,7 @@ impl Value {
     pub(crate) fn order_word_at(&self, skip: usize) -> u64 {
         match self {
             Value::Integer(i) => signed_word(*i),
-            Value::Timestamp(t) => signed_word(t.timestamp_micros()),
+            Value::Timestamp(t) => signed_word(timestamp_word(t)),
             Value::Text(s) => text_word(s.as_str().as_bytes().get(skip..).unwrap_or_default()),
             _ => self.order_word_other(skip),
         }
@@ -1743,6 +1743,31 @@ pub fn compare_order_key(
 #[inline(always)]
 fn signed_word(i: i64) -> u64 {
     i as u64 ^ (1 << 63)
+}
+
+/// An order word of a FLOAT among FLOATs alone, equal only where `cmp` is:
+/// IEEE bits with the sign handled, -0.0 taken as 0.0, every NaN on top
+pub(crate) fn float_word(f: f64) -> u64 {
+    if f.is_nan() {
+        return u64::MAX;
+    }
+    let bits = (f + 0.0).to_bits();
+    if bits >> 63 == 1 {
+        !bits
+    } else {
+        bits | 1 << 63
+    }
+}
+
+/// Microseconds of `t`, a leap second's held at the last of its minute's
+/// second: chrono keeps one as more than a second of nanoseconds, which
+/// sorts before the next minute
+#[inline(always)]
+fn timestamp_word(t: &DateTime<Utc>) -> i64 {
+    let nanos = t.timestamp_subsec_nanos().min(999_999_999);
+    t.timestamp()
+        .saturating_mul(1_000_000)
+        .saturating_add(i64::from(nanos / 1_000))
 }
 
 /// The first eight bytes of `bytes` as a big-endian word, zero-padded. A
@@ -2481,6 +2506,12 @@ mod tests {
             ts(0, 1_000),
             ts(1_700_000_000, 5),
             ts(8_000_000_000_000, 0),
+            // 2016-12-31 23:59:59.999999999, the leap second 23:59:60.5, then
+            // 2017-01-01 00:00:00 and 00:00:01
+            ts(1_483_228_799, 999_999_999),
+            ts(1_483_228_799, 1_500_000_000),
+            ts(1_483_228_800, 0),
+            ts(1_483_228_801, 0),
             Value::Extension(CompactArc::from(&[7u8, 1, 2][..])),
             Value::Extension(CompactArc::from(&[7u8, 1, 3][..])),
         ];
@@ -2505,13 +2536,17 @@ mod tests {
             -9_223_372_036_854_777_856.0,
             -2.5,
             -1.0,
+            -0.75,
             -0.5,
             -0.0,
             0.0,
+            0.25,
             0.5,
+            0.62,
             1.0,
             1.5,
             999.999,
+            4_503_599_627_370_495.5,
             9_223_372_036_854_775_808.0,
             1e300,
             f64::INFINITY,
@@ -2560,6 +2595,13 @@ mod tests {
                             a.order_word_at(skip) <= b.order_word_at(skip),
                             "{a:?} <= {b:?} but its word past {skip} bytes is greater"
                         );
+                        if let (Value::Float(x), Value::Float(y)) = (a, b) {
+                            assert_eq!(
+                                float_word(*x).cmp(&float_word(*y)),
+                                a.cmp(b),
+                                "{a:?} and {b:?} disagree with their float words"
+                            );
+                        }
                     }
                 }
             }

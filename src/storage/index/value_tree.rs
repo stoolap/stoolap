@@ -22,6 +22,7 @@ use std::mem;
 use std::ops::Bound;
 
 use crate::common::smart_string::cmp_bytes;
+use crate::core::value::float_word;
 use crate::core::{DataType, Value};
 
 use super::id_list::{GroupIds, IdList};
@@ -33,6 +34,17 @@ const INNER_MAX: usize = 64;
 /// A node below a quarter of its width merges into a sibling it fits beside
 fn underfull(len: usize, max: usize) -> bool {
     len < max / 4
+}
+
+/// The sizes of the fewest nodes of at most `per` that hold `n`, as even as
+/// they come: none of them below half of `per` unless there is one
+fn spread(n: usize, per: usize) -> impl Iterator<Item = usize> {
+    let count = n.div_ceil(per);
+    let (base, extra) = match count {
+        0 => (0, 0),
+        _ => (n / count, n % count),
+    };
+    (0..count).map(move |i| base + usize::from(i < extra))
 }
 
 /// The row ids of one key, a single one inline
@@ -340,6 +352,16 @@ impl<const CAP: usize, V: Blank> Keys<CAP, V> {
         if i == 0 || i == n {
             self.refresh();
         }
+    }
+
+    /// Appends `key`, greater than every key here, without its word: a
+    /// build appends a node's keys and then rewrites it once
+    fn push(&mut self, key: Value, value: V) {
+        let n = self.len;
+        self.slots[n] = n as u8;
+        self.keys[n] = key;
+        self.values[n] = value;
+        self.len += 1;
     }
 
     /// Takes out the key at position `i`; the last slot moves into its slot
@@ -689,6 +711,105 @@ impl ValueTree {
             roots: Default::default(),
             keys: 0,
         }
+    }
+
+    /// A tree of `entries` in any order. They are sorted by rank, order word
+    /// and id, a TEXT word taken past the bytes every TEXT key here shares
+    /// and a FLOAT word exact when no INTEGER is here, so the sort reads no
+    /// value; a run of one word holding more than one key is sorted by `cmp`
+    pub fn from_entries(entries: Vec<(&Value, i64)>) -> Self {
+        let mut first_text: Option<&Value> = None;
+        let mut skip = PREFIX;
+        let mut integers = false;
+        for &(value, _) in &entries {
+            match value {
+                Value::Text(_) if skip > 0 => {
+                    let first = *first_text.get_or_insert(value);
+                    skip = skip.min(shared_prefix(first, value));
+                }
+                Value::Integer(_) => integers = true,
+                _ => {}
+            }
+        }
+        let word = |value: &Value| match value {
+            Value::Float(f) if !integers => float_word(*f),
+            _ => value.order_word_at(skip),
+        };
+        let mut sorted: Vec<(u8, u64, &Value, i64)> = entries
+            .into_iter()
+            .map(|(value, id)| (value.type_rank(), word(value), value, id))
+            .collect();
+        sorted.sort_unstable_by_key(|&(rank, word, _, id)| (rank, word, id));
+        for run in sorted.chunk_by_mut(|a, b| (a.0, a.1) == (b.0, b.1)) {
+            if run
+                .windows(2)
+                .any(|w| w[0].2.cmp(w[1].2) != Ordering::Equal)
+            {
+                run.sort_unstable_by(|a, b| a.2.cmp(b.2).then(a.3.cmp(&b.3)));
+            }
+        }
+        let pairs: Vec<(&Value, i64)> = sorted.iter().map(|&(_, _, v, id)| (v, id)).collect();
+        Self::from_sorted(&pairs)
+    }
+
+    /// A tree of `entries`, sorted by key in `Value::cmp` order and then by
+    /// id, built bottom-up: each node filled once, three quarters full, with
+    /// no search and no shift per key
+    fn from_sorted(entries: &[(&Value, i64)]) -> Self {
+        debug_assert!(entries
+            .windows(2)
+            .all(|w| w[0].0.cmp(w[1].0).then(w[0].1.cmp(&w[1].1)) != Ordering::Greater));
+        let mut tree = ValueTree::new();
+        let mut keys: Vec<(Value, Ids)> = Vec::new();
+        for of_rank in entries.chunk_by(|a, b| a.0.type_rank() == b.0.type_rank()) {
+            keys.clear();
+            for run in of_rank.chunk_by(|a, b| a.0.cmp(b.0) == Ordering::Equal) {
+                let one = run[0].1;
+                let ids = if run.iter().all(|&(_, id)| id == one) {
+                    Ids::One(one)
+                } else {
+                    let mut ids: Vec<i64> = run.iter().map(|&(_, id)| id).collect();
+                    ids.dedup();
+                    Ids::Many(Box::new(IdList::from_sorted(ids)))
+                };
+                keys.push((run[0].0.clone(), ids));
+            }
+            tree.keys += keys.len();
+            tree.roots[usize::from(of_rank[0].0.type_rank())] = Self::build(&mut keys);
+        }
+        tree
+    }
+
+    /// One rank's tree of `keys`, sorted, which it takes
+    fn build(keys: &mut Vec<(Value, Ids)>) -> Option<Node> {
+        let mut level: Vec<(Value, Node)> = Vec::new();
+        let mut taken = keys.drain(..);
+        for size in spread(taken.len(), LEAF_MAX * 3 / 4) {
+            let mut leaf = Leaf::new();
+            for (key, ids) in taken.by_ref().take(size) {
+                leaf.keys.push(key, ids);
+            }
+            leaf.keys.rewrite();
+            level.push((leaf.keys.first().clone(), Node::Leaf(leaf)));
+        }
+        // Each node above is entered by its least key
+        while level.len() > 1 {
+            let mut nodes = mem::take(&mut level).into_iter();
+            for size in spread(nodes.len(), INNER_MAX * 3 / 4 + 1) {
+                let mut group = nodes.by_ref().take(size);
+                let (least, first) = group.next()?;
+                let mut children = Children::new();
+                children.push(first);
+                let mut inner = Inner::new(children);
+                for (key, node) in group {
+                    inner.keys.push(key, ());
+                    inner.children.push(node);
+                }
+                inner.keys.rewrite();
+                level.push((least, Node::Inner(inner)));
+            }
+        }
+        level.pop().map(|(_, node)| node)
     }
 
     /// Distinct keys
@@ -1207,6 +1328,102 @@ mod tests {
             }
             assert!(tree.len() == 0 && tree.roots.iter().all(Option::is_none));
         }
+    }
+
+    #[test]
+    fn a_tree_built_from_entries_matches_the_model_and_takes_more_writes() {
+        for (seed, n, spread) in [
+            (11u64, 0usize, 10u64),
+            (12, 1, 10),
+            (13, 47, 1_000),
+            (14, 48, 1_000),
+            (15, 49, 1_000),
+            (16, 5_000, 40),
+            (17, 60_000, 60_000),
+        ] {
+            let mut rng = Lcg(seed);
+            let mut probes = Lcg(seed + 100);
+            let mut probe = || key(&mut probes, spread);
+            let mut model = Model::new();
+            let keys: Vec<Value> = (0..n).map(|_| key(&mut rng, spread)).collect();
+            let entries: Vec<(&Value, i64)> = keys
+                .iter()
+                .zip(0..)
+                .map(|(k, id)| (k, id % 7_000))
+                .collect();
+            for &(k, id) in &entries {
+                model.entry(k.clone()).or_default().insert(id);
+            }
+            let mut tree = ValueTree::from_entries(entries);
+            check(&tree, &model, &mut probe);
+            for step in 0..4_000i64 {
+                let k = key(&mut rng, spread);
+                let id = step % 9;
+                if rng.below(2) == 0 {
+                    assert_eq!(
+                        tree.insert(&k, id, false),
+                        Ok(model.entry(k).or_default().insert(id))
+                    );
+                } else {
+                    let removed = model.get_mut(&k).is_some_and(|ids| ids.remove(&id));
+                    if model.get(&k).is_some_and(BTreeSet::is_empty) {
+                        model.remove(&k);
+                    }
+                    assert_eq!(tree.remove(&k, id), removed);
+                }
+            }
+            check(&tree, &model, &mut probe);
+        }
+    }
+
+    #[test]
+    fn a_tree_of_floats_alone_built_from_entries_matches_the_model() {
+        let float = |rng: &mut Lcg| {
+            let n = rng.below(400);
+            match n % 8 {
+                0 => Value::Float(
+                    [f64::NAN, -0.0, 0.0, f64::INFINITY, f64::NEG_INFINITY][n as usize % 5],
+                ),
+                _ => Value::Float(n as f64 * 0.37 - 70.0),
+            }
+        };
+        let mut rng = Lcg(21);
+        let mut probes = Lcg(22);
+        let mut probe = || float(&mut probes);
+        let keys: Vec<Value> = (0..20_000).map(|_| float(&mut rng)).collect();
+        let mut model = Model::new();
+        let entries: Vec<(&Value, i64)> = keys.iter().zip(0..).collect();
+        for &(k, id) in &entries {
+            model.entry(k.clone()).or_default().insert(id);
+        }
+        let tree = ValueTree::from_entries(entries);
+        check(&tree, &model, &mut probe);
+    }
+
+    #[test]
+    fn a_leap_second_sorts_between_its_minute_and_the_next() {
+        let ts = |secs: i64, nanos: u32| {
+            Value::Timestamp(
+                chrono::DateTime::from_timestamp(secs, nanos).expect("a valid timestamp"),
+            )
+        };
+        let (before, leap, midnight, after) = (
+            ts(1_483_228_799, 0),
+            ts(1_483_228_799, 1_500_000_000),
+            ts(1_483_228_800, 0),
+            ts(1_483_228_801, 0),
+        );
+        let mut tree = ValueTree::new();
+        for (id, key) in [&midnight, &after, &before, &leap].into_iter().enumerate() {
+            assert_eq!(tree.insert(key, id as i64, false), Ok(true));
+        }
+        check_structure(&tree);
+        let walked: Vec<Value> = walked(&tree, Bound::Included(&leap), true)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(walked, [leap.clone(), midnight.clone(), after]);
+        assert_eq!(tree.get(&midnight).map(|ids| ids.len()), Some(1));
     }
 
     #[test]
