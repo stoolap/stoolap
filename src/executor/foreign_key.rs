@@ -867,9 +867,14 @@ struct Taken {
     new: Value,
     /// A bit for each key of `Changed::into` whose action gave `new`
     from: u64,
+    /// Whether an action gave `new`; until one does it is `old`
+    given: bool,
     /// A value differing from `new` that came in too, refused unless a NULL
     /// takes the place of both
     clash: Option<Value>,
+    /// Why a value that came in cannot be stored, refused unless a NULL
+    /// takes its place
+    refused: Option<Error>,
     changed: bool,
     written: Cell<bool>,
 }
@@ -891,7 +896,9 @@ impl Taken {
             old,
             new,
             from,
+            given: true,
             clash: None,
+            refused: None,
             changed: false,
             written: Cell::new(false),
         }
@@ -925,11 +932,14 @@ impl Changed {
         if !self.values.is_empty() && self.depth > MAX_CASCADE_DEPTH {
             return Err(cascade_depth_exceeded());
         }
-        for taken in &self.values {
-            let (Some(clash), Some(fk)) = (&taken.clash, self.into.first()) else {
+        for taken in &mut self.values {
+            if taken.new.is_null() {
                 continue;
-            };
-            if !taken.new.is_null() {
+            }
+            if let Some(error) = taken.refused.take() {
+                return Err(error);
+            }
+            if let (Some(clash), Some(fk)) = (&taken.clash, self.into.first()) {
                 return Err(Error::foreign_key_violation(
                     &self.table,
                     &fk.column_name,
@@ -948,36 +958,42 @@ impl Changed {
 
     /// Records that `action` gives `value` to the row `row`, which held
     /// `start`. A NULL, no reference, takes the place of any value; two
-    /// values that differ cannot both be the row's, which `finish` refuses
-    fn take(
-        &mut self,
-        row: i64,
-        start: &Value,
-        value: &Value,
-        action: &UpdateAction,
-    ) -> Result<()> {
+    /// values that differ, or one the column cannot store, are refused by
+    /// `finish` unless a NULL takes their place
+    fn take(&mut self, row: i64, start: &Value, value: &Result<Value>, action: &UpdateAction) {
         let bit = if action.bit < 64 { 1 << action.bit } else { 0 };
         let at = match self.by_value.get(start) {
-            Some(&at) => {
-                let taken = &mut self.values[at];
-                if taken.new.is_null() {
-                } else if value.is_null() {
-                    taken.new = value.clone();
-                } else if !same_value(&taken.new, value) {
-                    taken.clash = Some(value.clone());
-                }
-                taken.from |= bit;
-                at
-            }
+            Some(&at) => at,
             None => {
-                self.values
-                    .push(Taken::new(start.clone(), value.clone(), bit));
+                // Until a value comes, the row keeps its own
+                let mut taken = Taken::new(start.clone(), start.clone(), 0);
+                taken.given = false;
+                self.values.push(taken);
                 self.by_value.insert(start.clone(), self.values.len() - 1);
                 self.values.len() - 1
             }
         };
+        let taken = &mut self.values[at];
+        match value {
+            _ if taken.given && taken.new.is_null() => {}
+            Err(error) => {
+                if taken.refused.is_none() {
+                    taken.refused = Some(error.clone());
+                }
+            }
+            Ok(value) if value.is_null() || !taken.given => {
+                taken.new = value.clone();
+                taken.given = true;
+                taken.from |= bit;
+            }
+            Ok(value) => {
+                if !same_value(&taken.new, value) {
+                    taken.clash = Some(value.clone());
+                }
+                taken.from |= bit;
+            }
+        }
         self.rows.insert(row, at);
-        Ok(())
     }
 }
 
@@ -1127,36 +1143,38 @@ fn run_update_action(
                     ),
                 ));
             }
-            Value::null(col_type)
+            Ok(Value::null(col_type))
         } else {
-            let new_val = new_value.try_coerce_to_type(col_type)?;
-            super::dml::validate_coercion(
-                new_value,
-                &new_val,
-                col_name,
-                col_type,
-                child_schema.columns[col_idx].vector_dimensions,
-            )?;
-            if !new_val.is_null() && !same_value(&new_val, new_value) {
-                return Err(Error::foreign_key_violation(
-                    child_table,
-                    &fk.column_name,
-                    &fk.referenced_table,
-                    &fk.referenced_column,
-                    format!(
-                        "cannot cascade {} = {} into column '{}' of type {:?}",
-                        fk.referenced_column, new_value, fk.column_name, col_type
-                    ),
-                ));
-            }
-            new_val
+            // A value the column cannot store is refused only if it is the one kept
+            new_value.try_coerce_to_type(col_type).and_then(|new_val| {
+                super::dml::validate_coercion(
+                    new_value,
+                    &new_val,
+                    col_name,
+                    col_type,
+                    child_schema.columns[col_idx].vector_dimensions,
+                )?;
+                if !new_val.is_null() && !same_value(&new_val, new_value) {
+                    return Err(Error::foreign_key_violation(
+                        child_table,
+                        &fk.column_name,
+                        &fk.referenced_table,
+                        &fk.referenced_column,
+                        format!(
+                            "cannot cascade {} = {} into column '{}' of type {:?}",
+                            fk.referenced_column, new_value, fk.column_name, col_type
+                        ),
+                    ));
+                }
+                Ok(new_val)
+            })
         };
         let expr = key_filter(child_schema, col_idx, old_value);
         let plan = child.index_plan(&expr);
         let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
         for (id, row) in child.collect_access_rows(access, Some(&expr))?.iter() {
             if let Some(start) = row.get(col_idx) {
-                columns[to].take(*id, start, &new_val, action)?;
+                columns[to].take(*id, start, &new_val, action);
                 reached = true;
             }
         }

@@ -426,24 +426,61 @@ fn a_set_null_reaches_the_rows_that_reference_the_nulled_column() {
 
 #[test]
 fn a_set_null_leaves_a_column_null_whatever_the_cascades_beside_it_give() {
-    for (sets, name) in [
-        ("a = 4, b = 2, c = 3", "null_last"),
-        ("b = 2, c = 3, a = 4", "null_first"),
-    ] {
+    for (null_on, name) in [("a", "null_on_a"), ("b", "null_on_b"), ("c", "null_on_c")] {
+        let key = |column: &str| {
+            let action = if column == null_on {
+                "SET NULL"
+            } else {
+                "CASCADE"
+            };
+            format!("FOREIGN KEY (k) REFERENCES r({column}) ON UPDATE {action}")
+        };
         let db = open(
             name,
             &[
                 "CREATE TABLE r (id INTEGER PRIMARY KEY, a INTEGER UNIQUE, b INTEGER UNIQUE, c INTEGER UNIQUE)",
                 "INSERT INTO r VALUES (1, 1, 1, 1)",
-                "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER UNIQUE, \
-                 FOREIGN KEY (k) REFERENCES r(a) ON UPDATE SET NULL, \
-                 FOREIGN KEY (k) REFERENCES r(b) ON UPDATE CASCADE, \
-                 FOREIGN KEY (k) REFERENCES r(c) ON UPDATE CASCADE)",
+                &format!(
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER UNIQUE, {}, {}, {})",
+                    key("a"),
+                    key("b"),
+                    key("c")
+                ),
                 "INSERT INTO t VALUES (1, 1)",
             ],
         );
-        db.execute(&format!("UPDATE r SET {sets}"), ()).unwrap();
+        db.execute("UPDATE r SET a = 4, b = 2, c = 3", ()).unwrap();
         let k: Option<i64> = db.query_one("SELECT k FROM t", ()).unwrap();
-        assert_eq!(k, None, "{sets}");
+        assert_eq!(k, None, "SET NULL on {null_on}");
+    }
+}
+
+#[test]
+fn a_set_null_leaves_a_column_null_where_a_cascade_beside_it_cannot_be_stored() {
+    for (null_on, name) in [("a", "unstored_null_on_a"), ("b", "unstored_null_on_b")] {
+        let (float, int) = if null_on == "a" {
+            ("b", "a")
+        } else {
+            ("a", "b")
+        };
+        let db = open(
+            name,
+            &[
+                &format!(
+                    "CREATE TABLE r (id INTEGER PRIMARY KEY, {float} FLOAT UNIQUE, {int} INTEGER UNIQUE)"
+                ),
+                &format!("INSERT INTO r (id, {float}, {int}) VALUES (1, 1.0, 1)"),
+                &format!(
+                    "CREATE TABLE c (id INTEGER PRIMARY KEY, k INTEGER UNIQUE, \
+                     FOREIGN KEY (k) REFERENCES r({float}) ON UPDATE CASCADE, \
+                     FOREIGN KEY (k) REFERENCES r({int}) ON UPDATE SET NULL)"
+                ),
+                "INSERT INTO c VALUES (1, 1)",
+            ],
+        );
+        db.execute(&format!("UPDATE r SET {float} = 2.5, {int} = 2"), ())
+            .unwrap();
+        let k: Option<i64> = db.query_one("SELECT k FROM c", ()).unwrap();
+        assert_eq!(k, None, "SET NULL on {null_on}");
     }
 }
