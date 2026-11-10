@@ -25,6 +25,9 @@
 
 use std::sync::Arc;
 
+use crate::common::smart_string::cmp_bytes;
+use crate::common::SmartString;
+use crate::core::value::float_word;
 use crate::core::{Error, Result, Row, Value};
 use crate::storage::expression::passes;
 use crate::storage::mvcc::registry::{CommitCut, StatementView};
@@ -59,6 +62,13 @@ struct ColumnPredicate {
 
 /// Decoded blocks of one row group, by volume column
 type GroupBlocks = smallvec::SmallVec<[(usize, Arc<super::column::ColumnData>); 4]>;
+
+/// A skip key of a column whose raw cells are not `i64`
+enum OtherKey {
+    /// A FLOAT by its order word
+    Float(u64),
+    Text(SmartString),
+}
 
 /// Cache holding decompressed columns for a single row group.
 /// Avoids decompressing the entire column when only a few groups are needed.
@@ -207,6 +217,8 @@ pub struct VolumeScanner {
     /// Pass over, without building it, a row whose raw key is past this
     /// bound; the same form as `stop_key`, for a column in any order
     skip_key: Option<(usize, i64, bool)>,
+    /// `skip_key` for a FLOAT or TEXT column
+    skip_other: Option<(usize, OtherKey, bool)>,
     /// Rows of the current group that pass the dictionary filters, ascending,
     /// found in one pass over the raw ids; consumed from the back on a
     /// reverse walk
@@ -238,9 +250,17 @@ impl VolumeScanner {
     /// Pass over each row whose key is past `bound`, as `set_stop_key`
     /// decides it, without building the row; the column may be in any order
     pub fn set_skip_key(&mut self, col_idx: usize, bound: &Value, ascending: bool) {
+        use crate::core::DataType;
         if let Some(key) = self.raw_key(col_idx, bound, ascending) {
             self.skip_key = Some(key);
+            return;
         }
+        let other = match (bound, self.volume.columns.data_type(col_idx)) {
+            (Value::Float(f), DataType::Float) => OtherKey::Float(float_word(*f)),
+            (Value::Text(text), DataType::Text) => OtherKey::Text(text.clone()),
+            _ => return,
+        };
+        self.skip_other = Some((col_idx, other, ascending));
     }
 
     /// `bound` as the raw key of an integer or timestamp column
@@ -265,7 +285,31 @@ impl VolumeScanner {
 
     /// True when the row at `idx` lies past the skip key
     fn past_skip_key(&self, idx: usize) -> Result<bool> {
-        self.past_key(self.skip_key, idx)
+        match self.skip_key {
+            Some(_) => self.past_key(self.skip_key, idx),
+            None => self.past_other_key(idx),
+        }
+    }
+
+    /// `past_skip_key` for a FLOAT or TEXT column
+    #[inline(never)]
+    fn past_other_key(&self, idx: usize) -> Result<bool> {
+        let Some((col_idx, target, ascending)) = &self.skip_other else {
+            return Ok(false);
+        };
+        let (col, local) = self.col_and_idx(*col_idx, idx)?;
+        if col.is_null(local) {
+            return Ok(false);
+        }
+        let order = match target {
+            OtherKey::Float(target) => float_word(col.get_f64(local)).cmp(target),
+            OtherKey::Text(target) => cmp_bytes(col.get_str(local).as_bytes(), target.as_bytes()),
+        };
+        Ok(if *ascending {
+            order.is_gt()
+        } else {
+            order.is_lt()
+        })
     }
 
     fn past_key(&self, key: Option<(usize, i64, bool)>, idx: usize) -> Result<bool> {
@@ -488,6 +532,7 @@ impl VolumeScanner {
             ordered_walk: false,
             stop_key: None,
             skip_key: None,
+            skip_other: None,
             group_candidates: Vec::new(),
             candidates_group: None,
             reverse_group: None,
@@ -554,6 +599,7 @@ impl VolumeScanner {
             ordered_walk: false,
             stop_key: None,
             skip_key: None,
+            skip_other: None,
             group_candidates: Vec::new(),
             candidates_group: None,
             reverse_group: None,
@@ -655,6 +701,7 @@ impl VolumeScanner {
             ordered_walk: false,
             stop_key: None,
             skip_key: None,
+            skip_other: None,
             group_candidates: Vec::new(),
             candidates_group: None,
             reverse_group: None,

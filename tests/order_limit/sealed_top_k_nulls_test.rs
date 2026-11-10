@@ -322,3 +322,55 @@ fn a_hot_top_k_walks_a_prefix_index_when_the_where_bounds_a_nullable_column() {
         "{sql}: the hot index walk answers"
     );
 }
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_sealed_top_k_builds_few_text_or_float_rows_the_heap_cannot_take() {
+    use stoolap::test_failpoints::top_k_cold_rows;
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?checkpoint_on_close=off",
+        dir.path().display()
+    ))
+    .unwrap();
+    db.execute(
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, t TEXT, f FLOAT)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO r SELECT value, 'k' || ((value * 7919) % 20000), \
+         ((value * 7919) % 20000) * 0.5 FROM generate_series(1, 20000)",
+        (),
+    )
+    .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let cases: [(&str, [&str; 10]); 3] = [
+        (
+            "SELECT id, t FROM r ORDER BY t LIMIT 10",
+            [
+                "k0", "k1", "k10", "k100", "k1000", "k10000", "k10001", "k10002", "k10003",
+                "k10004",
+            ],
+        ),
+        (
+            "SELECT id, t FROM r ORDER BY t DESC LIMIT 10",
+            [
+                "k9999", "k9998", "k9997", "k9996", "k9995", "k9994", "k9993", "k9992", "k9991",
+                "k9990",
+            ],
+        ),
+        (
+            "SELECT id, f FROM r ORDER BY f LIMIT 10",
+            ["0", "0.5", "1", "1.5", "2", "2.5", "3", "3.5", "4", "4.5"],
+        ),
+    ];
+    for (sql, want) in cases {
+        let before = top_k_cold_rows();
+        let (keys, _) = read(&db, sql);
+        let built = top_k_cold_rows() - before;
+        assert_eq!(keys, want, "{sql}");
+        // Of 20,000 scrambled sealed rows, the heap takes a few hundred
+        assert!(built <= 1_000, "{sql}: built {built} sealed rows");
+    }
+}
