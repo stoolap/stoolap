@@ -35,6 +35,7 @@ mod dml_where_context_test;
 mod drop_primary_key_test;
 mod foreign_key_cascade_into_key_test;
 mod foreign_key_cascade_key_fence_test;
+mod foreign_key_cascade_once_test;
 mod foreign_key_concurrency_test;
 mod foreign_key_cross_type_test;
 mod foreign_key_delete_key_column_test;

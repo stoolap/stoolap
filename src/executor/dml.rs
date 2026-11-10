@@ -2939,14 +2939,21 @@ impl Executor {
         // RESTRICT constraints were already pre-checked above, so this should not
         // fail for RESTRICT. CASCADE/SET NULL failures are propagated as errors.
         if !fks_by_ref_col.is_empty() {
-            let changes = ref_col_changes.into_inner();
-            for (col_idx, old_val, new_val) in &changes {
+            // Each column's changes cascade together, so a child row is
+            // matched by the value the statement found, once
+            let mut by_column: FxHashMap<usize, Vec<(Value, Value)>> = FxHashMap::default();
+            for (col_idx, old_val, new_val) in ref_col_changes.into_inner() {
+                by_column
+                    .entry(col_idx)
+                    .or_default()
+                    .push((old_val, new_val));
+            }
+            for (col_idx, changes) in &by_column {
                 if let Some(fks_for_col) = fks_by_ref_col.get(col_idx) {
                     super::foreign_key::enforce_update_actions(
                         &self.engine,
                         table.txn_id(),
-                        old_val,
-                        new_val,
+                        changes,
                         fks_for_col,
                     )?;
                 }
