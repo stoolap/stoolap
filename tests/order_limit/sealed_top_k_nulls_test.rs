@@ -249,6 +249,53 @@ fn a_sealed_top_k_places_null_and_nan_as_the_sort_does() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// The ids a statement returns, in order
+fn ids(db: &Database, sql: &str) -> Vec<i64> {
+    db.query(sql, ())
+        .unwrap()
+        .map(|row| row.unwrap().get::<i64>(0).unwrap())
+        .collect()
+}
+
+#[test]
+fn a_sealed_top_k_takes_no_bound_from_a_json_or_vector_zone_map() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?checkpoint_on_close=off",
+        dir.path().display()
+    ))
+    .unwrap();
+    db.execute(
+        "CREATE TABLE x (id INTEGER PRIMARY KEY, j JSON, k JSON NOT NULL, v VECTOR(2))",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO x VALUES (1, '9', '9', '[1.0, 0.0]'), (2, '1', '1', '[0.5, 0.0]')",
+        (),
+    )
+    .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("INSERT INTO x VALUES (3, '5', '5', '[9.0, 0.0]')", ())
+        .unwrap();
+    let cases: [(&str, &[i64]); 6] = [
+        ("SELECT id FROM x ORDER BY j LIMIT 1", &[2]),
+        ("SELECT id FROM x ORDER BY j DESC LIMIT 1", &[1]),
+        ("SELECT id FROM x ORDER BY k LIMIT 1", &[2]),
+        ("SELECT id FROM x ORDER BY k DESC LIMIT 1", &[1]),
+        ("SELECT id FROM x ORDER BY v LIMIT 1", &[2]),
+        ("SELECT id FROM x ORDER BY v DESC LIMIT 1", &[1]),
+    ];
+    let wrong: Vec<String> = cases
+        .iter()
+        .filter_map(|&(sql, want)| {
+            let got = ids(&db, sql);
+            (got != want).then(|| format!("{sql}: got {got:?}, want {want:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 #[test]
 fn a_hot_top_k_walks_a_prefix_index_when_the_where_bounds_a_nullable_column() {
     let db = Database::open("memory://sealed_top_k_nulls_prefix").unwrap();

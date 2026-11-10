@@ -384,7 +384,7 @@ impl TopK {
         let best = if self.ascending { &zone.min } else { &zone.max };
         match (best.is_null(), zone.null_count < zone.row_count) {
             (false, _) => ZoneBound::Key(best),
-            // Values the zone map does not bound: NaN, an extension type
+            // NaN, which no zone map bounds
             (true, true) => ZoneBound::Unbounded,
             (true, false) if null_free => ZoneBound::Empty,
             (true, false) => ZoneBound::Key(&NULL),
@@ -6952,6 +6952,7 @@ impl Table for SegmentedTable {
         }
         let null_free = !schema.columns[col_idx].nullable
             || where_expr.is_some_and(|w| index_plan::excludes_null(w, schema, column_name));
+        let bounded = self.bounds_order(Some(col_idx));
 
         self.newest_across_seals(|generation| {
             #[cfg(any(test, feature = "test-failpoints"))]
@@ -6999,8 +7000,8 @@ impl Table for SegmentedTable {
                     return Ok(Some(None));
                 };
                 let bound = match vol.meta.zone_maps.get(vcol) {
-                    Some(zm) => keep.zone_bound(zm, null_free),
-                    None => ZoneBound::Unbounded,
+                    Some(zm) if bounded => keep.zone_bound(zm, null_free),
+                    _ => ZoneBound::Unbounded,
                 };
                 match bound {
                     ZoneBound::Empty => {}
@@ -7062,12 +7063,12 @@ impl Table for SegmentedTable {
                     .iter()
                     .filter_map(|rg| {
                         let bound = match rg.zone_maps.get(vcol) {
-                            Some(zm) => match keep.zone_bound(zm, null_free) {
+                            Some(zm) if bounded => match keep.zone_bound(zm, null_free) {
                                 ZoneBound::Empty => return None,
                                 ZoneBound::Unbounded => None,
                                 ZoneBound::Key(key) => Some(key),
                             },
-                            None => None,
+                            _ => None,
                         };
                         Some((rg.start_idx as usize, rg.end_idx as usize, bound))
                     })
