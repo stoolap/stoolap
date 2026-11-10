@@ -1086,7 +1086,7 @@ impl Executor {
             None
         };
         // Keys into this table whose parent is a later row of the statement
-        let mut pending_parents = Vec::new();
+        let mut pending_parents = super::foreign_key::PendingParents::new(table_name);
 
         // Create VM for constant expression evaluation (reused for all INSERT values)
         use super::expression::{ExecuteContext, ExprVM};
@@ -1355,14 +1355,7 @@ impl Executor {
             if let Some(err) = select_result.last_error() {
                 return Err(err);
             }
-            if let Some(ref fks) = fk_schema {
-                super::foreign_key::check_pending_parents(
-                    &self.engine,
-                    table.txn_id(),
-                    fks,
-                    &pending_parents,
-                )?;
-            }
+            pending_parents.check(&self.engine, table.txn_id())?;
 
             // Invalidate semantic cache for this table BEFORE commit
             // CRITICAL: Must invalidate before commit to prevent stale data window
@@ -1729,14 +1722,7 @@ impl Executor {
                 rows_affected += 1;
             }
         }
-        if let Some(ref fks) = fk_schema {
-            super::foreign_key::check_pending_parents(
-                &self.engine,
-                table.txn_id(),
-                fks,
-                &pending_parents,
-            )?;
-        }
+        pending_parents.check(&self.engine, table.txn_id())?;
 
         // Invalidate semantic cache for this table BEFORE commit
         // CRITICAL: Must invalidate before commit to prevent stale data window
@@ -2064,7 +2050,7 @@ impl Executor {
             None
         };
         // Keys into this table whose parent is a later row of the statement
-        let mut pending_parents = Vec::new();
+        let mut pending_parents = super::foreign_key::PendingParents::new(table_name);
 
         // Create VM for constant expression evaluation (reused for all INSERT values)
         use super::expression::{ExecuteContext, ExprVM};
@@ -2269,14 +2255,7 @@ impl Executor {
                 rows_affected += 1;
             }
         }
-        if let Some(ref fks) = fk_schema {
-            super::foreign_key::check_pending_parents(
-                &self.engine,
-                table.txn_id(),
-                fks,
-                &pending_parents,
-            )?;
-        }
+        pending_parents.check(&self.engine, table.txn_id())?;
 
         // CRITICAL: Must invalidate before commit to prevent stale data window
         if rows_affected > 0 {
@@ -2989,6 +2968,7 @@ impl Executor {
                     table.txn_id(),
                     table_name,
                     by_column.into_iter().collect(),
+                    None,
                 )?;
             }
         }
@@ -3690,7 +3670,7 @@ impl Executor {
         ctx: &ExecutionContext,
         (capture_row, returns_id): (bool, bool),
         conflict: Option<&ConflictRun<'_, '_>>,
-        pending_parents: &mut Vec<(usize, Value)>,
+        pending_parents: &mut super::foreign_key::PendingParents<'_>,
     ) -> Result<(bool, Option<Row>)> {
         // Build a WHERE clause to find the specific row
         // Use schema's cached pk_column_index for O(1) lookup
@@ -3941,6 +3921,7 @@ impl Executor {
                 txn_id,
                 &schema.table_name,
                 by_column,
+                Some(pending_parents),
             )?;
         }
 

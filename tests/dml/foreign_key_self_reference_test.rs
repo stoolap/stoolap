@@ -563,3 +563,38 @@ fn an_upsert_checks_its_keys_into_its_own_table_as_the_statement_leaves_them() {
         },
     );
 }
+
+#[test]
+fn an_upsert_checks_a_cascaded_key_into_its_own_table_as_the_statement_leaves_it() {
+    let db = Database::open("memory://fk_self_reference_upsert_cascade").unwrap();
+    for sql in [
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, u INTEGER UNIQUE, up INTEGER UNIQUE REFERENCES s(u) ON UPDATE CASCADE, FOREIGN KEY (up) REFERENCES s(id))",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, x INTEGER UNIQUE REFERENCES s(u) ON UPDATE CASCADE, FOREIGN KEY (x) REFERENCES s(id))",
+        "INSERT INTO s VALUES (1, 10, NULL), (10, 20, 10)",
+        "INSERT INTO c VALUES (1, 10)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let upsert = "ON CONFLICT (id) DO UPDATE SET u = EXCLUDED.u";
+    let all = |db: &Database| -> Vec<[i64; 4]> {
+        db.query(
+            "SELECT s.id, s.u, COALESCE(s.up, 0), COALESCE(c.x, 0) FROM s LEFT JOIN c ON c.id = s.id ORDER BY s.id",
+            (),
+        )
+        .unwrap()
+        .map(|row| {
+            let row = row.unwrap();
+            [0, 1, 2, 3].map(|i| row.get::<i64>(i).unwrap())
+        })
+        .collect()
+    };
+    let sql = format!("INSERT INTO s VALUES (1, 50, NULL) {upsert}");
+    assert!(db.execute(&sql, ()).is_err(), "{sql}");
+    assert_eq!(all(&db), [[1, 10, 0, 10], [10, 20, 10, 0]]);
+    db.execute(
+        &format!("INSERT INTO s VALUES (1, 30, NULL), (30, 40, NULL) {upsert}"),
+        (),
+    )
+    .unwrap();
+    assert_eq!(all(&db), [[1, 30, 0, 30], [10, 20, 30, 0], [30, 40, 0, 0]]);
+}

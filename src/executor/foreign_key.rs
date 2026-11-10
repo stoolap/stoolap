@@ -58,15 +58,78 @@ pub(crate) fn check_parent_exists(
     check_parents(engine, txn_id, schema, row, None)
 }
 
-/// [`check_parent_exists`] for a row an INSERT is about to write. A key into
-/// the row's own table that finds no row yet goes to `pending`, asked by
-/// [`check_pending_parents`] once the statement's rows are written
+/// The keys into the table a statement inserts into, `table` in lower
+/// case, that found no parent row yet: a later row of the statement may be
+/// it. Each is a child table, its key and the value, asked by
+/// [`PendingParents::check`] once the statement's rows are written
+pub(crate) struct PendingParents<'t> {
+    table: &'t str,
+    keys: Vec<(String, ForeignKeyConstraint, Value)>,
+}
+
+impl<'t> PendingParents<'t> {
+    pub(crate) fn new(table: &'t str) -> Self {
+        PendingParents {
+            table,
+            keys: Vec::new(),
+        }
+    }
+
+    /// Checks that `value` of the key `fk` of `child_table` names a parent
+    /// row, keeping it for later when the parent is the statement's table
+    fn ask(
+        &mut self,
+        engine: &MVCCEngine,
+        txn_id: i64,
+        child_table: &str,
+        fk: &ForeignKeyConstraint,
+        value: &Value,
+    ) -> Result<()> {
+        if parent_row_exists(
+            engine,
+            txn_id,
+            &fk.referenced_table,
+            &fk.referenced_column,
+            value,
+        )? {
+            return Ok(());
+        }
+        if fk.referenced_table != self.table {
+            return Err(missing_parent(child_table, fk, value));
+        }
+        self.keys
+            .push((child_table.to_string(), fk.clone(), value.clone()));
+        Ok(())
+    }
+
+    /// Asks again each key left pending, now that the statement's rows are
+    /// written. A value no row holds any more, which a later update of the
+    /// statement replaced, names nothing
+    pub(crate) fn check(&self, engine: &MVCCEngine, txn_id: i64) -> Result<()> {
+        for (child_table, fk, value) in &self.keys {
+            if !parent_row_exists(
+                engine,
+                txn_id,
+                &fk.referenced_table,
+                &fk.referenced_column,
+                value,
+            )? && child_rows_exist(engine, txn_id, child_table, fk, value)?
+            {
+                return Err(missing_parent(child_table, fk, value));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// [`check_parent_exists`] for a row an INSERT or the update of an upsert
+/// writes, leaving a key into the statement's own table to `pending`
 pub(crate) fn check_inserted_parents(
     engine: &MVCCEngine,
     txn_id: i64,
     schema: &Schema,
     row: &crate::core::Row,
-    pending: &mut Vec<(usize, Value)>,
+    pending: &mut PendingParents<'_>,
 ) -> Result<()> {
     check_parents(engine, txn_id, schema, row, Some(pending))
 }
@@ -76,54 +139,16 @@ fn check_parents(
     txn_id: i64,
     schema: &Schema,
     row: &crate::core::Row,
-    mut pending: Option<&mut Vec<(usize, Value)>>,
+    mut pending: Option<&mut PendingParents<'_>>,
 ) -> Result<()> {
-    for (at, fk) in schema.foreign_keys.iter().enumerate() {
+    for fk in &schema.foreign_keys {
         let fk_value = match row.get(fk.column_index) {
             Some(v) if !v.is_null() => v,
             _ => continue, // NULL FK is allowed (no reference)
         };
-
-        if !parent_row_exists(
-            engine,
-            txn_id,
-            &fk.referenced_table,
-            &fk.referenced_column,
-            fk_value,
-        )? {
-            if let Some(pending) = pending
-                .as_deref_mut()
-                .filter(|_| fk.referenced_table == schema.table_name_lower)
-            {
-                pending.push((at, fk_value.clone()));
-                continue;
-            }
-            return Err(missing_parent(&schema.table_name, fk, fk_value));
-        }
-    }
-    Ok(())
-}
-
-/// Asks again each key [`check_inserted_parents`] left pending, now that
-/// the statement's rows are written. A value no row holds any more, which
-/// a later update of the statement replaced, names nothing
-pub(crate) fn check_pending_parents(
-    engine: &MVCCEngine,
-    txn_id: i64,
-    schema: &Schema,
-    pending: &[(usize, Value)],
-) -> Result<()> {
-    for (at, value) in pending {
-        let fk = &schema.foreign_keys[*at];
-        if !parent_row_exists(
-            engine,
-            txn_id,
-            &fk.referenced_table,
-            &fk.referenced_column,
-            value,
-        )? && child_rows_exist(engine, txn_id, &schema.table_name, fk, value)?
-        {
-            return Err(missing_parent(&schema.table_name, fk, value));
+        match pending.as_deref_mut() {
+            Some(pending) => pending.ask(engine, txn_id, &schema.table_name, fk, fk_value)?,
+            None => validate_fk_value(engine, txn_id, fk, fk_value, &schema.table_name)?,
         }
     }
     Ok(())
@@ -906,6 +931,7 @@ pub(crate) fn enforce_update_actions(
     txn_id: i64,
     table: &str,
     changes: Vec<(usize, Vec<(Value, Value)>)>,
+    pending: Option<&mut PendingParents<'_>>,
 ) -> Result<()> {
     let roots = changes.len();
     let mut columns: Vec<Changed> = changes
@@ -946,7 +972,7 @@ pub(crate) fn enforce_update_actions(
     #[cfg(feature = "test-failpoints")]
     crate::test_failpoints::cascade_targets_read();
     write_changed(engine, txn_id, &columns[roots..])?;
-    check_changed(engine, txn_id, &columns[roots..])
+    check_changed(engine, txn_id, &columns[roots..], pending)
 }
 
 /// A column that the ON UPDATE actions of one statement change
@@ -1379,7 +1405,12 @@ fn write_changed(engine: &MVCCEngine, txn_id: i64, columns: &[Changed]) -> Resul
 
 /// Checks each value written into `columns` against every key of its
 /// column whose own action did not give it
-fn check_changed(engine: &MVCCEngine, txn_id: i64, columns: &[Changed]) -> Result<()> {
+fn check_changed(
+    engine: &MVCCEngine,
+    txn_id: i64,
+    columns: &[Changed],
+    mut pending: Option<&mut PendingParents<'_>>,
+) -> Result<()> {
     let checked = |t: &Taken| t.changed && t.written.get() && !t.new.is_null();
     for column in columns {
         if !column.values.iter().any(checked) {
@@ -1396,7 +1427,10 @@ fn check_changed(engine: &MVCCEngine, txn_id: i64, columns: &[Changed]) -> Resul
                 if bit.is_some_and(|b| b < 64 && taken.from & (1 << b) != 0) {
                     continue;
                 }
-                validate_fk_value(engine, txn_id, fk, &taken.new, &column.table)?;
+                match pending.as_deref_mut() {
+                    Some(pending) => pending.ask(engine, txn_id, &column.table, fk, &taken.new)?,
+                    None => validate_fk_value(engine, txn_id, fk, &taken.new, &column.table)?,
+                }
             }
         }
     }

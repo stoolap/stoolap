@@ -163,7 +163,7 @@ impl Executor {
         };
 
         // Keys into this table whose parent is a later row of the file
-        let mut pending = Vec::new();
+        let mut pending = super::foreign_key::PendingParents::new(table_name);
         let rows_affected = match stmt.format {
             CopyFormat::Csv => self.copy_from_csv(
                 stmt,
@@ -189,9 +189,7 @@ impl Executor {
                 (&fk_schema, &mut pending),
             )?,
         };
-        if let Some(ref fks) = fk_schema {
-            super::foreign_key::check_pending_parents(&self.engine, table.txn_id(), fks, &pending)?;
-        }
+        pending.check(&self.engine, table.txn_id())?;
 
         // Invalidate caches and commit
         if rows_affected > 0 {
@@ -215,7 +213,7 @@ impl Executor {
         all_vector_dims: &[u16],
         defaults: &CopyDefaults,
         check_programs: &[super::dml::CompiledCheck],
-        (fk_schema, pending): ParentChecks<'_>,
+        (fk_schema, pending): ParentChecks<'_, '_>,
     ) -> Result<i64> {
         let file = std::fs::File::open(&stmt.file_path).map_err(|e| {
             Error::InvalidArgument(format!("cannot open file '{}': {}", stmt.file_path, e))
@@ -338,7 +336,7 @@ impl Executor {
         all_vector_dims: &[u16],
         defaults: &CopyDefaults,
         check_programs: &[super::dml::CompiledCheck],
-        (fk_schema, pending): ParentChecks<'_>,
+        (fk_schema, pending): ParentChecks<'_, '_>,
     ) -> Result<i64> {
         let null_str = stmt.null_string.as_deref();
         let use_columns = !stmt.columns.is_empty();
@@ -420,7 +418,7 @@ impl Executor {
         all_vector_dims: &[u16],
         null_str: Option<&str>,
         check_programs: &[super::dml::CompiledCheck],
-        (fk_schema, pending): ParentChecks<'_>,
+        (fk_schema, pending): ParentChecks<'_, '_>,
     ) -> Result<()> {
         let mut row_values = defaults.template.clone();
         let JsonRowState {
@@ -489,7 +487,10 @@ impl Executor {
 
 /// The table's foreign keys, and the keys into the table itself whose
 /// parent a later row of the file may be
-type ParentChecks<'a> = (&'a Option<CompactArc<Schema>>, &'a mut Vec<(usize, Value)>);
+type ParentChecks<'a, 't> = (
+    &'a Option<CompactArc<Schema>>,
+    &'a mut super::foreign_key::PendingParents<'t>,
+);
 
 /// What a JSON COPY reuses from object to object: the columns an object
 /// gives, and the VM and row its defaults and CHECKs run with
