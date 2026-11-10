@@ -1208,8 +1208,23 @@ impl PartialOrd for Value {
 /// return UNKNOWN. Besides the indexes, every ORDER BY, MIN, MAX, GREATEST
 /// and LEAST orders values by it, through `compare_order_key`.
 impl Ord for Value {
-    #[inline]
+    /// Two values of a key column's usual type compare inline, in the
+    /// caller's loop; every other pair takes `cmp_other`
+    #[inline(always)]
     fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
+            (Value::Float(a), Value::Float(b)) => compare_floats(*a, *b),
+            (Value::Text(a), Value::Text(b)) => a.cmp(b),
+            (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
+            _ => self.cmp_other(other),
+        }
+    }
+}
+
+impl Value {
+    #[inline(never)]
+    fn cmp_other(&self, other: &Self) -> Ordering {
         /// Rank of a type among the others; INTEGER and FLOAT share one so
         /// they sort together by value, and NULL is first
         fn type_rank(v: &Value) -> u8 {
@@ -1223,11 +1238,7 @@ impl Ord for Value {
             }
         }
         match (self, other) {
-            (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
-            (Value::Float(a), Value::Float(b)) => compare_floats(*a, *b),
-            (Value::Text(a), Value::Text(b)) => a.cmp(b),
             (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
-            (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
             (Value::Extension(a), Value::Extension(b)) => a.cmp(b),
             // Exact, consistent with PartialEq where Integer(5) == Float(5.0)
             // as the BTree indexes need; NaN orders after every number

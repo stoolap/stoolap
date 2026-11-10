@@ -760,8 +760,31 @@ impl PartialOrd for SmartString {
 impl Ord for SmartString {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
-        self.as_str().cmp(other.as_str())
+        cmp_bytes(self.as_str().as_bytes(), other.as_str().as_bytes())
     }
+}
+
+/// Byte order, as `<[u8]>::cmp`, eight bytes at a time as big-endian words:
+/// a short key costs no call out to `memcmp`. Past eight bytes the last word
+/// overlaps the one before it, which compared equal
+#[inline]
+fn cmp_bytes(a: &[u8], b: &[u8]) -> Ordering {
+    let n = a.len().min(b.len());
+    let (a, b, same_length) = (&a[..n], &b[..n], a.len().cmp(&b.len()));
+    let be = |w: &[u8; 8]| u64::from_be_bytes(*w);
+    let (a_words, a_tail) = a.as_chunks::<8>();
+    let (b_words, b_tail) = b.as_chunks::<8>();
+    for (x, y) in a_words.iter().zip(b_words) {
+        if x != y {
+            return be(x).cmp(&be(y));
+        }
+    }
+    let word = |bytes: &[u8]| bytes.iter().fold(0u64, |w, &b| (w << 8) | u64::from(b));
+    let tail = match (a.last_chunk::<8>(), b.last_chunk::<8>()) {
+        (Some(x), Some(y)) => be(x).cmp(&be(y)),
+        _ => word(a_tail).cmp(&word(b_tail)),
+    };
+    tail.then(same_length)
 }
 
 impl Hash for SmartString {
@@ -854,6 +877,29 @@ mod tests {
     fn test_size() {
         assert_eq!(size_of::<SmartString>(), 16);
         assert_eq!(size_of::<Option<SmartString>>(), 16);
+    }
+
+    #[test]
+    fn bytes_compare_as_slices_do_at_every_length_and_difference() {
+        let mut pool: Vec<Vec<u8>> = Vec::new();
+        for len in 0..20usize {
+            let base: Vec<u8> = (0..len).map(|i| b'a' + (i % 7) as u8).collect();
+            pool.push(base.clone());
+            for at in [0, len / 2, len.saturating_sub(8), len.saturating_sub(1)] {
+                for byte in [0x00, 0x7f, 0x80, 0xff] {
+                    if at < len {
+                        let mut changed = base.clone();
+                        changed[at] = byte;
+                        pool.push(changed);
+                    }
+                }
+            }
+        }
+        for a in &pool {
+            for b in &pool {
+                assert_eq!(cmp_bytes(a, b), a.cmp(b), "{a:?} against {b:?}");
+            }
+        }
     }
 
     #[test]
