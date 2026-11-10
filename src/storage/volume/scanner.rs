@@ -213,6 +213,9 @@ pub struct VolumeScanner {
     group_candidates: Vec<usize>,
     /// The group `group_candidates` was computed for
     candidates_group: Option<usize>,
+    /// The group a reverse walk last entered: pruned, filtered and loaded
+    /// once, not again for each of its rows
+    reverse_group: Option<usize>,
 }
 
 impl VolumeScanner {
@@ -349,41 +352,45 @@ impl VolumeScanner {
             let idx = self.end_idx - 1;
             let group_idx = idx >> self.group_shift;
             let group_start = group_idx << self.group_shift;
-            let cached = self.group_cache.as_ref().map(|c| c.group_idx);
-            if cached != Some(group_idx) {
-                if let Some(ref skips) = self.row_group_skips {
-                    if group_idx < skips.len() && skips[group_idx] {
-                        self.end_idx = group_start.max(self.current_idx);
-                        continue;
+            if self.reverse_group != Some(group_idx) {
+                let cached = self.group_cache.as_ref().map(|c| c.group_idx);
+                if cached != Some(group_idx) {
+                    if let Some(ref skips) = self.row_group_skips {
+                        if group_idx < skips.len() && skips[group_idx] {
+                            self.end_idx = group_start.max(self.current_idx);
+                            continue;
+                        }
                     }
                 }
-            }
-            let mut blocks = GroupBlocks::new();
-            if !self.dict_filters.is_empty() && self.candidates_group != Some(group_idx) {
-                let lo = group_start.max(self.current_idx);
-                let (found, filter_blocks) =
-                    self.dictionary_candidates(group_idx, lo, self.end_idx)?;
-                blocks = filter_blocks;
-                match found {
-                    Some(candidates) => {
-                        self.group_candidates = candidates;
-                        self.candidates_group = Some(group_idx);
-                    }
-                    None => {
-                        self.group_candidates.clear();
-                        self.candidates_group = None;
+                let mut blocks = GroupBlocks::new();
+                if !self.dict_filters.is_empty() && self.candidates_group != Some(group_idx) {
+                    let lo = group_start.max(self.current_idx);
+                    let (found, filter_blocks) =
+                        self.dictionary_candidates(group_idx, lo, self.end_idx)?;
+                    blocks = filter_blocks;
+                    match found {
+                        Some(candidates) => {
+                            self.group_candidates = candidates;
+                            self.candidates_group = Some(group_idx);
+                        }
+                        None => {
+                            self.group_candidates.clear();
+                            self.candidates_group = None;
+                        }
                     }
                 }
-            }
-            if cached != Some(group_idx)
-                && use_group_cache
-                && !(self.candidates_group == Some(group_idx) && self.group_candidates.is_empty())
-            {
-                self.load_group_cache_with(group_idx, blocks);
-                if self.error.is_some() {
-                    self.has_current = false;
-                    return Ok(false);
+                if cached != Some(group_idx)
+                    && use_group_cache
+                    && !(self.candidates_group == Some(group_idx)
+                        && self.group_candidates.is_empty())
+                {
+                    self.load_group_cache_with(group_idx, blocks);
+                    if self.error.is_some() {
+                        self.has_current = false;
+                        return Ok(false);
+                    }
                 }
+                self.reverse_group = Some(group_idx);
             }
             let idx = if self.candidates_group == Some(group_idx) {
                 match self.group_candidates.pop() {
@@ -397,7 +404,7 @@ impl VolumeScanner {
             } else {
                 idx
             };
-            if self.past_stop_key(idx)? {
+            if self.stop_key.is_some() && self.past_stop_key(idx)? {
                 self.end_idx = self.current_idx;
                 self.has_current = false;
                 return Ok(false);
@@ -483,6 +490,7 @@ impl VolumeScanner {
             skip_key: None,
             group_candidates: Vec::new(),
             candidates_group: None,
+            reverse_group: None,
         };
         if !s.is_full_projection && s.volume.columns.should_use_group_cache() {
             let mut mask = vec![false; s.volume.columns.len()];
@@ -548,6 +556,7 @@ impl VolumeScanner {
             skip_key: None,
             group_candidates: Vec::new(),
             candidates_group: None,
+            reverse_group: None,
         };
         if !s.is_full_projection && s.volume.columns.should_use_group_cache() {
             let mut mask = vec![false; s.volume.columns.len()];
@@ -648,6 +657,7 @@ impl VolumeScanner {
             skip_key: None,
             group_candidates: Vec::new(),
             candidates_group: None,
+            reverse_group: None,
         }
     }
 

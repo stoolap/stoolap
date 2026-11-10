@@ -39,7 +39,7 @@ use crate::functions::aggregate::{CompiledAggregate, GroupedAggregates};
 use crate::storage::expression::{passes, Expression};
 use crate::storage::index::id_list::GroupIds;
 use crate::storage::mvcc::commit_log::ReadPoint;
-use crate::storage::mvcc::index_plan::IndexPlan;
+use crate::storage::mvcc::index_plan::{self, IndexPlan};
 use crate::storage::mvcc::registry::{CommitCut, StatementView};
 use crate::storage::mvcc::txn_gate::{GateRef, TxnGate};
 use crate::storage::mvcc::version_store::{
@@ -50,6 +50,7 @@ use crate::storage::traits::{
     CapturedGroups, ColdChange, Index, PlannedUpdate, QueryResult, Scanner, Table,
 };
 
+use super::column::ZoneMap;
 use super::manifest::SegmentManager;
 use super::scanner::{RowVecScanner, VolumeScanner};
 use super::side_index::{resolve, ByteRange, Capability, Domain, KeyKind, Resolved, SideIndexDef};
@@ -187,20 +188,38 @@ struct Ranked {
     row_id: i64,
     row: Row,
     ascending: bool,
+    nulls_first: bool,
 }
 
 impl Ranked {
     fn beats(&self, other: &Self) -> std::cmp::Ordering {
-        if self.ascending {
-            self.key
-                .cmp(&other.key)
-                .then(self.row_id.cmp(&other.row_id))
-        } else {
-            other
-                .key
-                .cmp(&self.key)
-                .then(other.row_id.cmp(&self.row_id))
-        }
+        rank_order(
+            self.ascending,
+            self.nulls_first,
+            (&self.key, self.row_id),
+            (&other.key, other.row_id),
+        )
+    }
+}
+
+/// Which of two `(key, row id)` rows a top-k keeps first: by the ORDER BY
+/// rule, ties by row id (the newest first on DESC, the oldest on ASC)
+fn rank_order(
+    ascending: bool,
+    nulls_first: bool,
+    (key, row_id): (&Value, i64),
+    (other_key, other_id): (&Value, i64),
+) -> std::cmp::Ordering {
+    let order = crate::core::value::compare_order_key(
+        Some(key),
+        Some(other_key),
+        ascending,
+        Some(nulls_first),
+    );
+    if ascending {
+        order.then(row_id.cmp(&other_id))
+    } else {
+        order.then(other_id.cmp(&row_id))
     }
 }
 
@@ -230,6 +249,7 @@ struct TopK {
     k: usize,
     col: usize,
     ascending: bool,
+    nulls_first: bool,
     /// The first k rows, heaped only when a row better than their worst
     /// arrives: rows that come best first never need the heap
     filling: Vec<Ranked>,
@@ -239,11 +259,12 @@ struct TopK {
 }
 
 impl TopK {
-    fn new(k: usize, col: usize, ascending: bool) -> Self {
+    fn new(k: usize, col: usize, ascending: bool, nulls_first: bool) -> Self {
         Self {
             k,
             col,
             ascending,
+            nulls_first,
             filling: Vec::with_capacity(k.saturating_add(1).min(4096)),
             worst: 0,
             heap: std::collections::BinaryHeap::new(),
@@ -251,19 +272,21 @@ impl TopK {
     }
 
     fn offer(&mut self, row_id: i64, row: Row) {
-        let Some(key) = row.get(self.col).cloned() else {
+        let Some(key) = row.get(self.col) else {
             return;
         };
-        if key.is_null() {
+        if !self.admits(key, row_id) {
             return;
         }
+        let filling = self.heap.is_empty() && self.filling.len() < self.k;
         let candidate = Ranked {
-            key,
+            key: key.clone(),
             row_id,
             row,
             ascending: self.ascending,
+            nulls_first: self.nulls_first,
         };
-        if self.heap.is_empty() && self.filling.len() < self.k {
+        if filling {
             if self
                 .filling
                 .get(self.worst)
@@ -274,17 +297,27 @@ impl TopK {
             self.filling.push(candidate);
             return;
         }
-        if self
-            .worst()
-            .is_none_or(|worst| candidate.cmp(worst) != std::cmp::Ordering::Less)
-        {
-            return;
-        }
         if self.heap.is_empty() {
             self.heap = std::mem::take(&mut self.filling).into();
         }
         self.heap.pop();
         self.heap.push(candidate);
+    }
+
+    /// Whether a row of `key` would be kept: fewer than k are held, or it
+    /// beats the worst of them
+    fn admits(&self, key: &Value, row_id: i64) -> bool {
+        if self.heap.is_empty() && self.filling.len() < self.k {
+            return true;
+        }
+        self.worst().is_some_and(|worst| {
+            rank_order(
+                self.ascending,
+                self.nulls_first,
+                (key, row_id),
+                (&worst.key, worst.row_id),
+            ) == std::cmp::Ordering::Less
+        })
     }
 
     /// The worst of the k rows, once k are held
@@ -303,13 +336,28 @@ impl TopK {
         self.worst().map(|r| &r.key)
     }
 
+    /// Which of two keys comes first in the statement's order
+    fn order(&self, a: &Value, b: &Value) -> std::cmp::Ordering {
+        crate::core::value::compare_order_key(
+            Some(a),
+            Some(b),
+            self.ascending,
+            Some(self.nulls_first),
+        )
+    }
+
+    /// Which of two zones to read first: one without a bound, then by bound
+    fn bound_order(&self, a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
+        match (a, b) {
+            (Some(a), Some(b)) => self.order(a, b),
+            (a, b) => b.is_none().cmp(&a.is_none()),
+        }
+    }
+
     /// True once k rows are held and no row bounded by `bound` can beat the worst
     fn cannot_improve(&self, bound: &Value) -> bool {
-        match self.worst() {
-            Some(worst) if self.ascending => bound.cmp(&worst.key) == std::cmp::Ordering::Greater,
-            Some(worst) => bound.cmp(&worst.key) == std::cmp::Ordering::Less,
-            None => false,
-        }
+        self.worst()
+            .is_some_and(|worst| self.order(bound, &worst.key) == std::cmp::Ordering::Greater)
     }
 
     /// The rows in order, the first `offset` dropped
@@ -325,6 +373,33 @@ impl TopK {
             .map(|r| (r.row_id, r.row))
             .collect()
     }
+
+    /// The best key a row of `zone` can hold in this order, NULL when one of
+    /// its NULLs comes first; `null_free` when the WHERE keeps NULL out
+    fn zone_bound<'z>(&self, zone: &'z ZoneMap, null_free: bool) -> ZoneBound<'z> {
+        const NULL: Value = Value::Null(DataType::Null);
+        if self.nulls_first && !null_free && zone.null_count > 0 {
+            return ZoneBound::Key(&NULL);
+        }
+        let best = if self.ascending { &zone.min } else { &zone.max };
+        match (best.is_null(), zone.null_count < zone.row_count) {
+            (false, _) => ZoneBound::Key(best),
+            // NaN, which no zone map bounds
+            (true, true) => ZoneBound::Unbounded,
+            (true, false) if null_free => ZoneBound::Empty,
+            (true, false) => ZoneBound::Key(&NULL),
+        }
+    }
+}
+
+/// What a zone map says of the rows a top-k read can take from its zone
+enum ZoneBound<'z> {
+    /// None of them
+    Empty,
+    /// Any of them may come first
+    Unbounded,
+    /// None comes before this key
+    Key(&'z Value),
 }
 
 /// A table backed by immutable segments (historical) + an MVCCTable (hot buffer).
@@ -6823,6 +6898,7 @@ impl Table for SegmentedTable {
         where_expr: Option<&dyn Expression>,
         column_name: &str,
         ascending: bool,
+        nulls_first: bool,
         limit: usize,
         offset: usize,
     ) -> Result<Option<RowVec>> {
@@ -6840,9 +6916,15 @@ impl Table for SegmentedTable {
             let begun = self.segment_mgr.destructions_begun();
             let generation = self.segment_mgr.seal_generation();
             if !self.segment_mgr.is_destruction_in_progress() {
-                let answer =
-                    self.hot
-                        .scan_top_k(walk, where_expr, column_name, ascending, limit, offset)?;
+                let answer = self.hot.scan_top_k(
+                    walk,
+                    where_expr,
+                    column_name,
+                    ascending,
+                    nulls_first,
+                    limit,
+                    offset,
+                )?;
                 if self.segment_mgr.seal_generation() == generation
                     && !self.destruction_since(begun)
                     && !self.segment_mgr.has_segments()
@@ -6864,12 +6946,13 @@ impl Table for SegmentedTable {
         else {
             return Ok(None);
         };
-        // A float column may hold NaN, which the zone maps leave out but the
-        // sort puts last, so a volume's finite bound is not a bound at all
-        if schema.columns[col_idx].nullable || schema.columns[col_idx].data_type == DataType::Float
-        {
+        // NaN, which no zone map bounds, comes first descending
+        if !ascending && schema.columns[col_idx].data_type == DataType::Float {
             return Ok(None);
         }
+        let null_free = !schema.columns[col_idx].nullable
+            || where_expr.is_some_and(|w| index_plan::excludes_null(w, schema, column_name));
+        let bounded = self.bounds_order(Some(col_idx));
 
         self.newest_across_seals(|generation| {
             #[cfg(any(test, feature = "test-failpoints"))]
@@ -6878,9 +6961,15 @@ impl Table for SegmentedTable {
             // best rows are read, and a sealed copy of a hot row is recognised
             // per candidate instead of through a set of every matching hot row
             let cut = self.read_cut();
-            let hot_top =
-                self.hot
-                    .scan_top_k(walk, where_expr, column_name, ascending, needed, 0)?;
+            let hot_top = self.hot.scan_top_k(
+                walk,
+                where_expr,
+                column_name,
+                ascending,
+                nulls_first,
+                needed,
+                0,
+            )?;
             let sealed_copies_checked = hot_top.is_some();
             let hot_rows = match hot_top {
                 Some(rows) => rows,
@@ -6888,7 +6977,7 @@ impl Table for SegmentedTable {
             };
             let mut hot_skip: FxHashSet<i64> =
                 FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
-            let mut keep = TopK::new(needed, col_idx, ascending);
+            let mut keep = TopK::new(needed, col_idx, ascending, nulls_first);
             for (row_id, row) in hot_rows {
                 hot_skip.insert(row_id);
                 keep.offer(row_id, row);
@@ -6899,8 +6988,10 @@ impl Table for SegmentedTable {
                 .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
 
             let volumes = self.segment_mgr.get_volumes_newest_first_lazy();
-            // Every volume must carry the column and a zone map without NULLs
-            let mut ordered: Vec<(usize, usize, Value)> = Vec::with_capacity(volumes.len());
+            // Every volume must carry the column: one sealed before it was
+            // added reads its default, which no zone map bounds
+            let mut ordered: Vec<(usize, usize, Option<&Value>)> =
+                Vec::with_capacity(volumes.len());
             for (i, (_, cs)) in volumes.iter().enumerate() {
                 let vol = &cs.volume;
                 // Through the mapping, so a renamed column's bounds and stop
@@ -6908,24 +6999,17 @@ impl Table for SegmentedTable {
                 let Some(vcol) = cs.mapping.volume_column(vol, &col_lower) else {
                     return Ok(Some(None));
                 };
-                let Some(zm) = vol.meta.zone_maps.get(vcol) else {
-                    return Ok(Some(None));
+                let bound = match vol.meta.zone_maps.get(vcol) {
+                    Some(zm) if bounded => keep.zone_bound(zm, null_free),
+                    _ => ZoneBound::Unbounded,
                 };
-                if zm.null_count > 0 {
-                    return Ok(Some(None));
+                match bound {
+                    ZoneBound::Empty => {}
+                    ZoneBound::Unbounded => ordered.push((i, vcol, None)),
+                    ZoneBound::Key(key) => ordered.push((i, vcol, Some(key))),
                 }
-                let bound = if ascending {
-                    zm.min.clone()
-                } else {
-                    zm.max.clone()
-                };
-                ordered.push((i, vcol, bound));
             }
-            if ascending {
-                ordered.sort_by(|a, b| a.2.cmp(&b.2));
-            } else {
-                ordered.sort_by(|a, b| b.2.cmp(&a.2));
-            }
+            ordered.sort_by(|a, b| keep.bound_order(a.2, b.2));
 
             let comparisons = where_expr
                 .map(|e| e.collect_comparisons())
@@ -6947,7 +7031,7 @@ impl Table for SegmentedTable {
             });
 
             for (i, vcol, bound) in ordered {
-                if keep.cannot_improve(&bound) {
+                if bound.is_some_and(|bound| keep.cannot_improve(bound)) {
                     break;
                 }
                 let (seg_id, cs) = &volumes[i];
@@ -6977,15 +7061,19 @@ impl Table for SegmentedTable {
                     .meta
                     .row_groups
                     .iter()
-                    .map(|rg| {
-                        let bound =
-                            rg.zone_maps
-                                .get(vcol)
-                                .map(|zm| if ascending { &zm.min } else { &zm.max });
-                        (rg.start_idx as usize, rg.end_idx as usize, bound)
+                    .filter_map(|rg| {
+                        let bound = match rg.zone_maps.get(vcol) {
+                            Some(zm) if bounded => match keep.zone_bound(zm, null_free) {
+                                ZoneBound::Empty => return None,
+                                ZoneBound::Unbounded => None,
+                                ZoneBound::Key(key) => Some(key),
+                            },
+                            _ => None,
+                        };
+                        Some((rg.start_idx as usize, rg.end_idx as usize, bound))
                     })
                     .collect();
-                if groups.is_empty() {
+                if vol.meta.row_groups.is_empty() {
                     groups.push((0, vol.meta.row_count, None));
                 }
                 for group in &mut groups {
@@ -6995,18 +7083,7 @@ impl Table for SegmentedTable {
                 groups.retain(|g| g.0 < g.1);
                 // Bound order, not physical order: a volume written out of time order
                 // has its best group anywhere. A group without a bound goes first.
-                groups.sort_by(|a, b| match (&a.2, &b.2) {
-                    (None, None) => std::cmp::Ordering::Equal,
-                    (None, Some(_)) => std::cmp::Ordering::Less,
-                    (Some(_), None) => std::cmp::Ordering::Greater,
-                    (Some(x), Some(y)) => {
-                        if ascending {
-                            x.cmp(y)
-                        } else {
-                            y.cmp(x)
-                        }
-                    }
-                });
+                groups.sort_by(|a, b| keep.bound_order(a.2, b.2));
 
                 for (start, end, group_bound) in groups {
                     if let Some(bound) = group_bound {
@@ -7049,10 +7126,16 @@ impl Table for SegmentedTable {
                     while scanner.next() {
                         #[cfg(feature = "test-failpoints")]
                         crate::test_failpoints::top_k_cold_row_built();
-                        let (row_id, row) = scanner.take_row_with_id();
-                        if sealed_copies_checked && self.hot.has_row_id(row_id)? {
+                        // Taken only when kept, so a passed row leaves its buffer
+                        let row_id = scanner.current_row_id();
+                        let kept = scanner
+                            .row()
+                            .get(col_idx)
+                            .is_some_and(|key| keep.admits(key, row_id));
+                        if !kept || sealed_copies_checked && self.hot.has_row_id(row_id)? {
                             continue;
                         }
+                        let (row_id, row) = scanner.take_row_with_id();
                         keep.offer(row_id, row);
                         if let Some(worst) = keep.worst_key() {
                             if sorted {
@@ -8516,7 +8599,7 @@ mod tests {
 
     /// A top-k over `(key, row id)` offers, on column 0
     fn top_k(k: usize, ascending: bool, offers: &[(i64, i64)]) -> TopK {
-        let mut keep = TopK::new(k, 0, ascending);
+        let mut keep = TopK::new(k, 0, ascending, !ascending);
         for &(key, row_id) in offers {
             keep.offer(row_id, Row::from_values(vec![Value::Integer(key)]));
         }
@@ -8576,7 +8659,7 @@ mod tests {
                     ((mix % 5) as i64, i as i64)
                 })
                 .collect();
-            let mut keep = TopK::new(k, 0, ascending);
+            let mut keep = TopK::new(k, 0, ascending, !ascending);
             for (seen, &(key, row_id)) in offers.iter().enumerate() {
                 keep.offer(row_id, Row::from_values(vec![Value::Integer(key)]));
                 let held = best_first(ascending, &offers[..=seen]);

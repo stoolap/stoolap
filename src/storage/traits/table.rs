@@ -1270,19 +1270,30 @@ pub trait Table: Send + Sync {
     }
 
     /// The first `limit` rows after `offset` in the order of `column_name`,
-    /// with `where_expr` applied, from a table that can find them without
-    /// reading every row, its hot rows by `walk`. None when the table cannot
-    /// answer in that order and the caller must sort a full scan.
+    /// NULLs first when `nulls_first`, with `where_expr` applied, from a
+    /// table that can find them without reading every row, its hot rows by
+    /// `walk`. None when the table cannot answer in that order and the
+    /// caller must sort a full scan.
+    #[allow(clippy::too_many_arguments)]
     fn scan_top_k(
         &self,
         walk: Option<&IndexPlan>,
         where_expr: Option<&dyn Expression>,
         column_name: &str,
         ascending: bool,
+        nulls_first: bool,
         limit: usize,
         offset: usize,
     ) -> Result<Option<RowVec>> {
-        let _ = (walk, where_expr, column_name, ascending, limit, offset);
+        let _ = (
+            walk,
+            where_expr,
+            column_name,
+            ascending,
+            nulls_first,
+            limit,
+            offset,
+        );
         Ok(None)
     }
 
