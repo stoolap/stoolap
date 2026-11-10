@@ -302,3 +302,124 @@ fn a_child_key_two_cascades_reach_moves_once() {
         [[1, 10], [3, 30]]
     );
 }
+
+fn open(name: &str, sql: &[&str]) -> Database {
+    let db = Database::open(&format!("memory://fk_cascade_graph_{name}")).unwrap();
+    for sql in sql {
+        db.execute(sql, ()).unwrap();
+    }
+    db
+}
+
+#[test]
+fn a_row_two_columns_of_cascades_reach_takes_each_value_once() {
+    let db = open(
+        "two_columns",
+        &[
+            "CREATE TABLE r (id INTEGER PRIMARY KEY, a INTEGER UNIQUE, b INTEGER UNIQUE, d INTEGER UNIQUE)",
+            "INSERT INTO r VALUES (1, 1, 1, 1), (2, 2, 2, 2)",
+            "CREATE TABLE p (k INTEGER PRIMARY KEY REFERENCES r(a) ON UPDATE CASCADE)",
+            "CREATE TABLE q (k INTEGER PRIMARY KEY REFERENCES r(d) ON UPDATE CASCADE)",
+            "INSERT INTO p VALUES (1), (2)",
+            "INSERT INTO q VALUES (1), (2)",
+            "CREATE TABLE c (id INTEGER PRIMARY KEY, k INTEGER UNIQUE, \
+             FOREIGN KEY (id) REFERENCES r(b) ON UPDATE CASCADE, \
+             FOREIGN KEY (k) REFERENCES p(k) ON UPDATE CASCADE, \
+             FOREIGN KEY (k) REFERENCES q(k) ON UPDATE CASCADE)",
+            "INSERT INTO c VALUES (1, 1)",
+        ],
+    );
+    db.execute("UPDATE r SET a = a + 1, b = b + 1, d = d + 1", ())
+        .unwrap();
+    assert_eq!(rows(&db, "SELECT id, k FROM c"), [[2, 2]]);
+}
+
+#[test]
+fn a_set_null_and_a_cascade_into_one_column_leave_it_null() {
+    let db = open(
+        "set_null",
+        &[
+            "CREATE TABLE r (id INTEGER PRIMARY KEY, a INTEGER UNIQUE, b INTEGER UNIQUE)",
+            "INSERT INTO r VALUES (1, 1, 1), (2, 2, 2)",
+            "CREATE TABLE p (id INTEGER PRIMARY KEY REFERENCES r(a) ON UPDATE CASCADE)",
+            "INSERT INTO p VALUES (1)",
+            "CREATE TABLE c (id INTEGER PRIMARY KEY, k INTEGER UNIQUE, \
+             FOREIGN KEY (k) REFERENCES p(id) ON UPDATE CASCADE, \
+             FOREIGN KEY (k) REFERENCES r(b) ON UPDATE SET NULL)",
+            "INSERT INTO c VALUES (1, 1)",
+        ],
+    );
+    db.execute("UPDATE r SET a = a + 1, b = b + 2", ()).unwrap();
+    let k: Option<i64> = db.query_one("SELECT k FROM c", ()).unwrap();
+    assert_eq!(k, None);
+}
+
+#[test]
+fn a_change_no_child_row_held_at_the_start_is_not_cascaded() {
+    let db = open(
+        "start_values",
+        &[
+            "CREATE TABLE r (id INTEGER PRIMARY KEY, a INTEGER UNIQUE, b FLOAT UNIQUE)",
+            "INSERT INTO r VALUES (1, 1, 1.0), (2, 2, 2.0)",
+            "CREATE TABLE p (id INTEGER PRIMARY KEY REFERENCES r(a) ON UPDATE CASCADE)",
+            "CREATE TABLE q (id INTEGER PRIMARY KEY, k FLOAT UNIQUE REFERENCES r(b) ON UPDATE CASCADE)",
+            "INSERT INTO p VALUES (1), (2)",
+            "INSERT INTO q VALUES (1, 1.0), (2, 2.0)",
+            "CREATE TABLE c (id INTEGER PRIMARY KEY, \
+             FOREIGN KEY (id) REFERENCES p(id) ON UPDATE CASCADE, \
+             FOREIGN KEY (id) REFERENCES q(k) ON UPDATE CASCADE)",
+            "INSERT INTO c VALUES (1)",
+        ],
+    );
+    db.execute(
+        "UPDATE r SET a = a + 1, b = CASE WHEN id = 1 THEN 2.0 ELSE 2.5 END",
+        (),
+    )
+    .unwrap();
+    assert_eq!(rows(&db, "SELECT id FROM c"), [[2]]);
+}
+
+#[test]
+fn two_cascades_that_give_a_row_different_values_refuse_the_statement() {
+    let db = open(
+        "disagree",
+        &[
+            "CREATE TABLE r (id INTEGER PRIMARY KEY, a INTEGER UNIQUE)",
+            "INSERT INTO r VALUES (1, 1)",
+            "CREATE TABLE p (id INTEGER PRIMARY KEY REFERENCES r(id) ON UPDATE CASCADE)",
+            "CREATE TABLE q (id INTEGER PRIMARY KEY REFERENCES r(a) ON UPDATE CASCADE)",
+            "INSERT INTO p VALUES (1)",
+            "INSERT INTO q VALUES (1)",
+            "CREATE TABLE c (id INTEGER PRIMARY KEY, \
+             FOREIGN KEY (id) REFERENCES p(id) ON UPDATE CASCADE, \
+             FOREIGN KEY (id) REFERENCES q(id) ON UPDATE CASCADE)",
+            "INSERT INTO c VALUES (1)",
+        ],
+    );
+    let error = db
+        .execute("UPDATE r SET id = 2, a = 3", ())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("cannot cascade both"), "{error}");
+    assert_eq!(rows(&db, "SELECT id FROM c"), [[1]]);
+    assert_eq!(rows(&db, "SELECT id, a FROM r"), [[1, 1]]);
+}
+
+#[test]
+fn a_set_null_reaches_the_rows_that_reference_the_nulled_column() {
+    let db = open(
+        "set_null_beneath",
+        &[
+            "CREATE TABLE r (id INTEGER PRIMARY KEY)",
+            "INSERT INTO r VALUES (1)",
+            "CREATE TABLE c (id INTEGER PRIMARY KEY, k INTEGER UNIQUE REFERENCES r(id) ON UPDATE SET NULL)",
+            "INSERT INTO c VALUES (1, 1)",
+            "CREATE TABLE g (id INTEGER PRIMARY KEY, x INTEGER REFERENCES c(k) ON UPDATE CASCADE)",
+            "INSERT INTO g VALUES (1, 1)",
+        ],
+    );
+    db.execute("UPDATE r SET id = 2", ()).unwrap();
+    let k: Option<i64> = db.query_one("SELECT k FROM c", ()).unwrap();
+    let x: Option<i64> = db.query_one("SELECT x FROM g", ()).unwrap();
+    assert_eq!((k, x), (None, None));
+}

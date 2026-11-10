@@ -28,10 +28,13 @@
 //! - Cached reverse FK mapping (rebuilt only on schema_epoch change)
 //! - Index-based parent lookups (no table scans when index exists)
 
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use crate::common::I64Set;
+use rustc_hash::FxHashMap;
+
+use crate::common::{I64Map, I64Set};
 use crate::core::{Error, ForeignKeyAction, ForeignKeyConstraint, Result, Schema, Value};
 use crate::storage::expression::Expression as StorageExpression;
 use crate::storage::mvcc::engine::MVCCEngine;
@@ -502,113 +505,6 @@ fn pre_check_restrict_recursive(
     Ok(())
 }
 
-/// What the ON UPDATE cascades of one statement share
-#[derive(Default)]
-pub(crate) struct Cascades {
-    /// Per child table and column, the row ids a cascade wrote, which a
-    /// later branch reaching the same column does not match again
-    written: Vec<(String, usize, crate::common::I64Set)>,
-    /// Per child table and another foreign key of a cascaded column, the
-    /// values written there, checked once every cascade is done
-    parent_checks: Vec<(String, ForeignKeyConstraint, Vec<Value>)>,
-}
-
-impl Cascades {
-    fn written(&mut self, table: &str, column: usize) -> &mut crate::common::I64Set {
-        let at = match self
-            .written
-            .iter()
-            .position(|(t, c, _)| *c == column && t == table)
-        {
-            Some(at) => at,
-            None => {
-                let ids = crate::common::I64Set::new();
-                self.written.push((table.to_string(), column, ids));
-                self.written.len() - 1
-            }
-        };
-        &mut self.written[at].2
-    }
-
-    fn parent_values(&mut self, table: &str, fk: &ForeignKeyConstraint) -> &mut Vec<Value> {
-        let at = match self
-            .parent_checks
-            .iter()
-            .position(|(t, f, _)| f == fk && t == table)
-        {
-            Some(at) => at,
-            None => {
-                self.parent_checks
-                    .push((table.to_string(), fk.clone(), Vec::new()));
-                self.parent_checks.len() - 1
-            }
-        };
-        &mut self.parent_checks[at].2
-    }
-
-    /// Checks that each parent holds every value written under its key
-    pub(crate) fn check_parents(&self, engine: &MVCCEngine, txn_id: i64) -> Result<()> {
-        for (child_table, fk, values) in &self.parent_checks {
-            for value in values {
-                validate_fk_value(engine, txn_id, fk, value, child_table)?;
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Enforce referential actions for UPDATE of a referenced column.
-/// RESTRICT is already handled by pre_check_restrict_for_update before
-/// the parent row is written. This function only dispatches CASCADE/SET NULL;
-/// its cascades share `cascades` with the statement's others.
-pub(crate) fn enforce_update_actions(
-    engine: &MVCCEngine,
-    txn_id: i64,
-    changes: &[(Value, Value)],
-    referencing_fks: &[(String, ForeignKeyConstraint)],
-    cascades: &mut Cascades,
-) -> Result<i32> {
-    if referencing_fks.is_empty() || changes.is_empty() {
-        return Ok(0);
-    }
-
-    for (_, fk) in referencing_fks {
-        hold_alone(
-            engine,
-            txn_id,
-            &fk.referenced_table,
-            fk,
-            changes.iter().map(|(old, _)| old),
-        )?;
-    }
-
-    let mut total_affected = 0i32;
-
-    for (child_table_name, fk) in referencing_fks {
-        let action = fk.on_update;
-
-        match action {
-            ForeignKeyAction::Restrict | ForeignKeyAction::NoAction => {
-                // RESTRICT is already enforced by pre_check_restrict_for_update
-                // before the parent row is written. Nothing to do here.
-            }
-            ForeignKeyAction::Cascade => {
-                let affected =
-                    cascade_update(engine, txn_id, child_table_name, fk, changes, cascades)?;
-                total_affected = total_affected.saturating_add(affected);
-            }
-            ForeignKeyAction::SetNull => {
-                for (old, _) in changes {
-                    let affected = set_null_on_delete(engine, txn_id, child_table_name, fk, old)?;
-                    total_affected = total_affected.saturating_add(affected);
-                }
-            }
-        }
-    }
-
-    Ok(total_affected)
-}
-
 /// Check if any child rows in the child table reference the given parent PK value.
 ///
 /// Uses `collect_rows_with_limit_unordered(limit=1)` with a ComparisonExpr filter
@@ -719,16 +615,19 @@ fn key_position(child_schema: &Schema, fk: &ForeignKeyConstraint) -> Result<usiz
     child_schema
         .foreign_keys
         .iter()
-        .find(|key| {
-            key.column_name == fk.column_name
-                && key.referenced_table == fk.referenced_table
-                && key.referenced_column == fk.referenced_column
-        })
+        .find(|key| same_key(key, fk))
         .map(|key| key.column_index)
         .filter(|&at| at < child_schema.columns.len())
         .ok_or_else(|| Error::SchemaChanged {
             table: child_schema.table_name.clone(),
         })
+}
+
+/// Whether `a` and `b` are one key: its column and the column it references
+fn same_key(a: &ForeignKeyConstraint, b: &ForeignKeyConstraint) -> bool {
+    a.column_name == b.column_name
+        && a.referenced_table == b.referenced_table
+        && a.referenced_column == b.referenced_column
 }
 
 /// Maximum CASCADE recursion depth to prevent infinite loops from circular FK references.
@@ -889,246 +788,466 @@ fn cascade_delete_recursive(
     Ok(total)
 }
 
-/// CASCADE UPDATE of every (old, new) value of `changes`, which one
-/// statement made to the column `fk` references, into `child_table`.
-/// Recursively cascades to grandchild tables (up to MAX_CASCADE_DEPTH).
-/// Operates within the caller's transaction (no independent commit).
-fn cascade_update(
+/// Carries out the ON UPDATE actions of the changes one statement made to
+/// `table`, each changed column with its (old, new) values. Every child row
+/// the actions reach is found by the value it held at the statement's
+/// start and written once, with the value all its keys agree on; the keys
+/// of each written column are checked once every row is written.
+pub(crate) fn enforce_update_actions(
     engine: &MVCCEngine,
     txn_id: i64,
-    child_table: &str,
-    fk: &ForeignKeyConstraint,
-    changes: &[(Value, Value)],
-    cascades: &mut Cascades,
-) -> Result<i32> {
-    cascade_update_recursive(engine, txn_id, child_table, fk, changes, 0, cascades)
+    table: &str,
+    changes: Vec<(usize, Vec<(Value, Value)>)>,
+) -> Result<()> {
+    let roots = changes.len();
+    let mut columns: Vec<Changed> = changes
+        .into_iter()
+        .map(|(column, values)| {
+            let mut root = Changed::new(table, column);
+            root.done = true;
+            root.values = values
+                .into_iter()
+                .map(|(old, new)| Taken::new(old, new, 0))
+                .collect();
+            root.mark_changed();
+            root
+        })
+        .collect();
+    let actions = find_update_actions(engine, &mut columns)?;
+    // Each column's actions run once every action into it has
+    let mut ready: Vec<usize> = (0..roots).collect();
+    while let Some(at) = ready.pop() {
+        if at >= roots {
+            columns[at].finish()?;
+        }
+        for action in actions.iter().filter(|a| a.from == at) {
+            run_update_action(engine, txn_id, &mut columns, action, at < roots)?;
+            if let Some(to) = action.to {
+                let into = &mut columns[to];
+                into.waiting -= 1;
+                if into.waiting == 0 && !into.done {
+                    into.done = true;
+                    ready.push(to);
+                }
+            }
+        }
+    }
+    if columns.iter().any(|c| !c.done && !c.values.is_empty()) {
+        return Err(cascade_depth_exceeded());
+    }
+    #[cfg(feature = "test-failpoints")]
+    crate::test_failpoints::cascade_targets_read();
+    write_changed(engine, txn_id, &columns[roots..])?;
+    check_changed(engine, txn_id, &columns[roots..])
 }
 
-fn cascade_update_recursive(
+/// A column that the ON UPDATE actions of one statement change
+struct Changed {
+    table: String,
+    column: usize,
+    /// Each distinct value the column's rows held at the statement's start
+    values: Vec<Taken>,
+    by_value: FxHashMap<Value, usize>,
+    /// Each row an action reached and the place of its start value in `values`
+    rows: I64Map<usize>,
+    /// The keys whose action writes into the column, each a bit of `Taken::from`
+    into: Vec<ForeignKeyConstraint>,
+    depth: usize,
+    /// The actions into the column that have not run yet
+    waiting: usize,
+    done: bool,
+}
+
+/// What one start value of a column becomes
+struct Taken {
+    old: Value,
+    new: Value,
+    /// A bit for each key of `Changed::into` whose action gave `new`
+    from: u64,
+    changed: bool,
+    written: Cell<bool>,
+}
+
+/// An ON UPDATE key of a changed column. `to` is the changed column of the
+/// child it writes, None for a key that refuses the change
+struct UpdateAction {
+    from: usize,
+    to: Option<usize>,
+    /// The key's bit in the `into` of its `to`
+    bit: usize,
+    child_table: String,
+    fk: ForeignKeyConstraint,
+}
+
+impl Taken {
+    fn new(old: Value, new: Value, from: u64) -> Self {
+        Taken {
+            old,
+            new,
+            from,
+            changed: false,
+            written: Cell::new(false),
+        }
+    }
+}
+
+impl Changed {
+    fn new(table: &str, column: usize) -> Self {
+        Changed {
+            table: table.to_string(),
+            column,
+            values: Vec::new(),
+            by_value: FxHashMap::default(),
+            rows: I64Map::new(),
+            into: Vec::new(),
+            depth: 0,
+            waiting: 0,
+            done: false,
+        }
+    }
+
+    fn mark_changed(&mut self) {
+        for taken in &mut self.values {
+            taken.changed = taken.new.is_null() || !same_value(&taken.new, &taken.old);
+        }
+    }
+
+    /// Settles the column once every action into it has run
+    fn finish(&mut self) -> Result<()> {
+        if !self.values.is_empty() && self.depth > MAX_CASCADE_DEPTH {
+            return Err(cascade_depth_exceeded());
+        }
+        self.mark_changed();
+        Ok(())
+    }
+
+    /// Records that `action` gives `value` to the row `row`, which held
+    /// `start`. A NULL, no reference, takes the place of any value; two
+    /// values that differ cannot both be the row's
+    fn take(
+        &mut self,
+        row: i64,
+        start: &Value,
+        value: &Value,
+        action: &UpdateAction,
+    ) -> Result<()> {
+        let bit = if action.bit < 64 { 1 << action.bit } else { 0 };
+        let at = match self.by_value.get(start) {
+            Some(&at) => {
+                let taken = &mut self.values[at];
+                if taken.new.is_null() {
+                } else if value.is_null() {
+                    taken.new = value.clone();
+                } else if !same_value(&taken.new, value) {
+                    let fk = &action.fk;
+                    return Err(Error::foreign_key_violation(
+                        &action.child_table,
+                        &fk.column_name,
+                        &fk.referenced_table,
+                        &fk.referenced_column,
+                        format!(
+                            "cannot cascade both {} and {} into column '{}'",
+                            taken.new, value, fk.column_name
+                        ),
+                    ));
+                }
+                taken.from |= bit;
+                at
+            }
+            None => {
+                self.values
+                    .push(Taken::new(start.clone(), value.clone(), bit));
+                self.by_value.insert(start.clone(), self.values.len() - 1);
+                self.values.len() - 1
+            }
+        };
+        self.rows.insert(row, at);
+        Ok(())
+    }
+}
+
+fn same_value(a: &Value, b: &Value) -> bool {
+    matches!(a.compare(b), Ok(Ordering::Equal))
+}
+
+fn cascade_depth_exceeded() -> Error {
+    Error::internal(format!(
+        "foreign key CASCADE depth limit ({}) exceeded — possible circular reference",
+        MAX_CASCADE_DEPTH
+    ))
+}
+
+/// Every ON UPDATE key beneath the changed columns of `columns`, adding
+/// to it each child column a CASCADE or SET NULL key writes
+fn find_update_actions(
+    engine: &MVCCEngine,
+    columns: &mut Vec<Changed>,
+) -> Result<Vec<UpdateAction>> {
+    let mut actions = Vec::new();
+    let mut next = 0;
+    while next < columns.len() {
+        let table = columns[next].table.clone();
+        let column = columns[next].column;
+        let schema = engine.get_table_schema(&table)?;
+        for (child_table, fk) in find_referencing_fks(engine, &table).iter() {
+            if referenced_position(&schema, &table, &fk.referenced_column).ok() != Some(column) {
+                continue;
+            }
+            let (to, bit) = match fk.on_update {
+                ForeignKeyAction::Restrict | ForeignKeyAction::NoAction => (None, 0),
+                ForeignKeyAction::Cascade | ForeignKeyAction::SetNull => {
+                    let child_schema = engine.get_table_schema(child_table)?;
+                    let child_column = key_position(&child_schema, fk)?;
+                    let at = match columns
+                        .iter()
+                        .position(|c| c.column == child_column && c.table == *child_table)
+                    {
+                        Some(at) => at,
+                        None => {
+                            columns.push(Changed::new(child_table, child_column));
+                            columns.len() - 1
+                        }
+                    };
+                    let into = &mut columns[at];
+                    into.into.push(fk.clone());
+                    into.waiting += 1;
+                    (Some(at), into.into.len() - 1)
+                }
+            };
+            actions.push(UpdateAction {
+                from: next,
+                to,
+                bit,
+                child_table: child_table.clone(),
+                fk: fk.clone(),
+            });
+        }
+        next += 1;
+    }
+    Ok(actions)
+}
+
+/// Runs `action` over the changed values of its column, recording what each
+/// child row it reaches takes; a RESTRICT key refuses a change a row names
+fn run_update_action(
     engine: &MVCCEngine,
     txn_id: i64,
-    child_table: &str,
-    fk: &ForeignKeyConstraint,
-    changes: &[(Value, Value)],
-    depth: usize,
-    cascades: &mut Cascades,
-) -> Result<i32> {
-    // The changes whose old value a child row names; the others cascade nothing
-    let mut named = Vec::with_capacity(changes.len());
-    for change in changes {
-        if child_rows_exist(engine, txn_id, child_table, fk, &change.0)? {
-            named.push(change.clone());
-        }
-    }
-    if named.is_empty() {
-        return Ok(0);
-    }
-
-    // Child rows exist. Check depth limit before doing any work.
-    if depth >= MAX_CASCADE_DEPTH {
-        return Err(Error::internal(format!(
-            "foreign key CASCADE depth limit ({}) exceeded — possible circular reference",
-            MAX_CASCADE_DEPTH
-        )));
-    }
-    for (old_value, _) in &named {
-        check_children_seen(engine, txn_id, child_table, fk, old_value)?;
-    }
-
-    // Find grandchild FKs that reference the column being updated
-    let grandchild_fks = find_referencing_fks(engine, child_table);
-    let child_fk_col = &fk.column_name;
-
-    let relevant_grandchild_fks: Vec<_> = grandchild_fks
+    columns: &mut [Changed],
+    action: &UpdateAction,
+    from_root: bool,
+) -> Result<()> {
+    let fk = &action.fk;
+    let child_table = action.child_table.as_str();
+    let from = &columns[action.from];
+    let changes: Vec<(Value, Value)> = from
+        .values
         .iter()
-        .filter(|(_, gfk)| gfk.referenced_column == *child_fk_col)
+        .filter(|t| t.changed)
+        .map(|t| (t.old.clone(), t.new.clone()))
         .collect();
-
-    for (_, grandchild_fk) in &relevant_grandchild_fks {
-        hold_alone(
-            engine,
-            txn_id,
-            child_table,
-            grandchild_fk,
-            named.iter().map(|(old, _)| old),
-        )?;
+    if changes.is_empty() {
+        return Ok(());
     }
-
-    // Pre-check: verify grandchild RESTRICT constraints BEFORE updating child rows
-    for (grandchild_table, grandchild_fk) in &relevant_grandchild_fks {
-        if !matches!(
-            grandchild_fk.on_update,
-            ForeignKeyAction::Restrict | ForeignKeyAction::NoAction
-        ) {
-            continue;
+    let depth = from.depth + 1;
+    hold_alone(
+        engine,
+        txn_id,
+        &fk.referenced_table,
+        fk,
+        changes.iter().map(|(old, _)| old),
+    )?;
+    let Some(to) = action.to else {
+        // The root's own keys were asked before its rows were written
+        if from_root {
+            return Ok(());
         }
-        for (old_value, _) in &named {
-            if child_rows_exist(engine, txn_id, grandchild_table, grandchild_fk, old_value)? {
+        for (old_value, _) in &changes {
+            if child_rows_exist(engine, txn_id, child_table, fk, old_value)? {
                 return Err(Error::foreign_key_violation(
-                    grandchild_table,
-                    &grandchild_fk.column_name,
                     child_table,
-                    &grandchild_fk.referenced_column,
+                    &fk.column_name,
+                    &fk.referenced_table,
+                    &fk.referenced_column,
                     format!(
                         "cannot cascade-update row with {} = {} — still referenced by table '{}'",
-                        grandchild_fk.referenced_column, old_value, grandchild_table
+                        fk.referenced_column, old_value, child_table
                     ),
                 ));
             }
         }
-    }
+        return Ok(());
+    };
 
-    // Now update the matching child rows (safe — RESTRICT checks passed above)
-    let mut child = engine.get_table_for_txn(txn_id, child_table)?;
-
+    let child = engine.get_table_for_txn(txn_id, child_table)?;
     let child_schema = child.schema();
     let col_idx = key_position(child_schema, fk)?;
     let col_name = &child_schema.columns[col_idx].name;
     // The child stores the parent's value in its own column type, checked as stored
     let col_type = child_schema.columns[col_idx].data_type;
-    // Each child row a change names and that change's place in `named` and
-    // `new_values`, read before any is written: a row one change writes is
-    // not met again by the next, nor by another branch reaching this column
-    let done = cascades.written(child_table, col_idx);
-    let mut targets: crate::common::I64Map<usize> = crate::common::I64Map::new();
-    let mut new_values = Vec::with_capacity(named.len());
-    for (at, (old_value, new_value)) in named.iter().enumerate() {
-        let new_val = new_value.try_coerce_to_type(col_type)?;
-        super::dml::validate_coercion(
-            new_value,
-            &new_val,
-            col_name,
-            col_type,
-            child_schema.columns[col_idx].vector_dimensions,
-        )?;
-        if !new_val.is_null() && !matches!(new_val.compare(new_value), Ok(Ordering::Equal)) {
-            return Err(Error::foreign_key_violation(
-                child_table,
-                &fk.column_name,
-                &fk.referenced_table,
-                &fk.referenced_column,
-                format!(
-                    "cannot cascade {} = {} into column '{}' of type {:?}",
-                    fk.referenced_column, new_value, fk.column_name, col_type
-                ),
-            ));
+    let set_null = fk.on_update == ForeignKeyAction::SetNull;
+    let mut reached = false;
+    for (old_value, new_value) in &changes {
+        if !child_rows_exist(engine, txn_id, child_table, fk, old_value)? {
+            continue;
         }
+        check_children_seen(engine, txn_id, child_table, fk, old_value)?;
+        let new_val = if set_null {
+            if !child_schema.columns[col_idx].nullable {
+                return Err(Error::foreign_key_violation(
+                    child_table,
+                    &fk.column_name,
+                    &fk.referenced_table,
+                    &fk.referenced_column,
+                    format!(
+                        "cannot SET NULL on non-nullable column '{}'",
+                        fk.column_name
+                    ),
+                ));
+            }
+            Value::null(col_type)
+        } else {
+            let new_val = new_value.try_coerce_to_type(col_type)?;
+            super::dml::validate_coercion(
+                new_value,
+                &new_val,
+                col_name,
+                col_type,
+                child_schema.columns[col_idx].vector_dimensions,
+            )?;
+            if !new_val.is_null() && !same_value(&new_val, new_value) {
+                return Err(Error::foreign_key_violation(
+                    child_table,
+                    &fk.column_name,
+                    &fk.referenced_table,
+                    &fk.referenced_column,
+                    format!(
+                        "cannot cascade {} = {} into column '{}' of type {:?}",
+                        fk.referenced_column, new_value, fk.column_name, col_type
+                    ),
+                ));
+            }
+            new_val
+        };
         let expr = key_filter(child_schema, col_idx, old_value);
         let plan = child.index_plan(&expr);
         let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-        for (id, _) in child.collect_access_rows(access, Some(&expr))?.iter() {
-            if !done.contains(*id) {
-                targets.insert(*id, at);
+        for (id, row) in child.collect_access_rows(access, Some(&expr))?.iter() {
+            if let Some(start) = row.get(col_idx) {
+                columns[to].take(*id, start, &new_val, action)?;
+                reached = true;
             }
         }
-        new_values.push(new_val);
     }
-    #[cfg(feature = "test-failpoints")]
-    crate::test_failpoints::cascade_targets_read();
-    let mut ids: Vec<i64> = targets.keys().collect();
-    ids.sort_unstable();
-    let checks =
-        super::dml::checks_reading(super::dml::compile_check_programs(child_schema)?, |c| {
-            c == col_idx
-        });
-    let mut vm = super::expression::ExprVM::new();
+    if reached {
+        let into = &mut columns[to];
+        // A column whose actions all ran already is reached again only round a cycle
+        if into.done {
+            return Err(cascade_depth_exceeded());
+        }
+        into.depth = into.depth.max(depth);
+    }
+    Ok(())
+}
 
-    // A child whose primary key is the foreign key moves to its new id, as an
-    // UPDATE of its key does, all of the statement's moves at once
-    let into_key = child_schema.pk_column_index() == Some(col_idx);
-    let mut moves = Vec::new();
-    let mut written = vec![false; named.len()];
-    let count = child.update_by_row_ids(&ids, &mut |id, mut row| {
-        // A row that no longer names the old value since it was read is left
-        let Some(&at) = targets.get(id).filter(|&&at| {
-            row.get(col_idx)
-                .is_some_and(|v| matches!(v.compare(&named[at].0), Ok(Ordering::Equal)))
-        }) else {
-            return Ok((row, false));
-        };
-        written[at] = true;
-        let new_id = match into_key {
-            true => new_values[at].as_int64().unwrap_or(id),
-            false => id,
-        };
-        done.insert(new_id);
-        let original = into_key.then(|| row.clone());
-        let _ = row.set(col_idx, new_values[at].clone());
-        for check in &checks {
-            super::dml::run_check(&mut vm, check, &row)?;
+/// Writes every child row of `columns` once, with all the values its
+/// columns take. A row that no longer holds a column's start value keeps
+/// that column; a row whose primary key changes moves to its new id
+fn write_changed(engine: &MVCCEngine, txn_id: i64, columns: &[Changed]) -> Result<()> {
+    let mut tables: Vec<&str> = Vec::new();
+    for column in columns {
+        if column.values.iter().any(|t| t.changed) && !tables.contains(&column.table.as_str()) {
+            tables.push(&column.table);
         }
-        match original {
-            Some(original) => {
-                moves.push((id, row));
-                Ok((original, true))
+    }
+    for table in tables {
+        let of_table: Vec<&Changed> = columns.iter().filter(|c| c.table == table).collect();
+        let mut ids: Vec<i64> = Vec::new();
+        for column in &of_table {
+            ids.extend(
+                column
+                    .rows
+                    .iter()
+                    .filter(|(_, &at)| column.values[at].changed)
+                    .map(|(id, _)| id),
+            );
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        let mut child = engine.get_table_for_txn(txn_id, table)?;
+        let schema = child.schema();
+        let checks = super::dml::checks_reading(super::dml::compile_check_programs(schema)?, |c| {
+            of_table.iter().any(|column| column.column == c)
+        });
+        let pk = schema.pk_column_index();
+        let mut vm = super::expression::ExprVM::new();
+        let mut moves = Vec::new();
+        let mut apply: Vec<(usize, &Taken)> = Vec::new();
+        child.update_by_row_ids(&ids, &mut |id, mut row| {
+            apply.clear();
+            for column in &of_table {
+                let Some(&at) = column.rows.get(id) else {
+                    continue;
+                };
+                let taken = &column.values[at];
+                if taken.changed
+                    && row
+                        .get(column.column)
+                        .is_some_and(|v| same_value(v, &taken.old))
+                {
+                    apply.push((column.column, taken));
+                }
             }
-            None => Ok((row, true)),
-        }
-    })?;
-    super::dml::move_rows(&mut *child, moves)?;
-    // The column's other foreign keys check each value it now holds once
-    // the statement's cascades are done, since a sibling cascade may add it
-    for other in child.schema().foreign_keys.iter() {
-        if other.column_index != col_idx || other == fk {
+            if apply.is_empty() {
+                return Ok((row, false));
+            }
+            let original = apply
+                .iter()
+                .any(|(at, _)| Some(*at) == pk)
+                .then(|| row.clone());
+            for (at, taken) in &apply {
+                let _ = row.set(*at, taken.new.clone());
+                taken.written.set(true);
+            }
+            for check in &checks {
+                super::dml::run_check(&mut vm, check, &row)?;
+            }
+            match original {
+                Some(original) => {
+                    moves.push((id, row));
+                    Ok((original, true))
+                }
+                None => Ok((row, true)),
+            }
+        })?;
+        super::dml::move_rows(&mut *child, moves)?;
+    }
+    Ok(())
+}
+
+/// Checks each value written into `columns` against every key of its
+/// column whose own action did not give it
+fn check_changed(engine: &MVCCEngine, txn_id: i64, columns: &[Changed]) -> Result<()> {
+    let checked = |t: &Taken| t.changed && t.written.get() && !t.new.is_null();
+    for column in columns {
+        if !column.values.iter().any(checked) {
             continue;
         }
-        let values = cascades.parent_values(child_table, other);
-        for (value, _) in new_values.iter().zip(&written).filter(|(_, w)| **w) {
-            if !value.is_null() {
-                values.push(value.clone());
+        let schema = engine.get_table_schema(&column.table)?;
+        for fk in schema
+            .foreign_keys
+            .iter()
+            .filter(|k| k.column_index == column.column)
+        {
+            let bit = column.into.iter().position(|k| same_key(k, fk));
+            for taken in column.values.iter().filter(|t| checked(t)) {
+                if bit.is_some_and(|b| b < 64 && taken.from & (1 << b) != 0) {
+                    continue;
+                }
+                validate_fk_value(engine, txn_id, fk, &taken.new, &column.table)?;
             }
         }
     }
-
-    let mut total = count;
-
-    if !relevant_grandchild_fks.is_empty() && count > 0 {
-        for (grandchild_table, grandchild_fk) in &relevant_grandchild_fks {
-            match grandchild_fk.on_update {
-                ForeignKeyAction::Restrict | ForeignKeyAction::NoAction => {
-                    // Already checked above
-                }
-                ForeignKeyAction::Cascade => {
-                    let affected = cascade_update_recursive(
-                        engine,
-                        txn_id,
-                        grandchild_table,
-                        grandchild_fk,
-                        &named,
-                        depth + 1,
-                        cascades,
-                    )?;
-                    total = total.saturating_add(affected);
-                }
-                ForeignKeyAction::SetNull => {
-                    // SET NULL changes the grandchild's FK column from old_value to NULL.
-                    // Deeper descendants that reference the grandchild's column must see
-                    // this as an update from old_value → NULL and be cascaded accordingly.
-                    let grandchild_schema = engine.get_table_schema(grandchild_table)?;
-                    let null_val = Value::null(
-                        grandchild_schema.columns[key_position(&grandchild_schema, grandchild_fk)?]
-                            .data_type,
-                    );
-                    let to_null: Vec<(Value, Value)> = named
-                        .iter()
-                        .map(|(old, _)| (old.clone(), null_val.clone()))
-                        .collect();
-                    let affected = cascade_update_recursive(
-                        engine,
-                        txn_id,
-                        grandchild_table,
-                        grandchild_fk,
-                        &to_null,
-                        depth + 1,
-                        cascades,
-                    )?;
-                    total = total.saturating_add(affected);
-                }
-            }
-        }
-    }
-
-    Ok(total)
+    Ok(())
 }
 
 /// SET NULL: set FK column to NULL in all child rows referencing the given parent PK value.

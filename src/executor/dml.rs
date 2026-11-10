@@ -2973,24 +2973,21 @@ impl Executor {
             // matched by the value the statement found, once
             let mut by_column: FxHashMap<usize, Vec<(Value, Value)>> = FxHashMap::default();
             for (col_idx, old_val, new_val) in ref_col_changes.into_inner() {
-                by_column
-                    .entry(col_idx)
-                    .or_default()
-                    .push((old_val, new_val));
-            }
-            let mut cascades = super::foreign_key::Cascades::default();
-            for (col_idx, changes) in &by_column {
-                if let Some(fks_for_col) = fks_by_ref_col.get(col_idx) {
-                    super::foreign_key::enforce_update_actions(
-                        &self.engine,
-                        table.txn_id(),
-                        changes,
-                        fks_for_col,
-                        &mut cascades,
-                    )?;
+                if fks_by_ref_col.contains_key(&col_idx) {
+                    by_column
+                        .entry(col_idx)
+                        .or_default()
+                        .push((old_val, new_val));
                 }
             }
-            cascades.check_parents(&self.engine, table.txn_id())?;
+            if !by_column.is_empty() {
+                super::foreign_key::enforce_update_actions(
+                    &self.engine,
+                    table.txn_id(),
+                    table_name,
+                    by_column.into_iter().collect(),
+                )?;
+            }
         }
 
         // Invalidate semantic cache for this table BEFORE commit
@@ -3920,7 +3917,7 @@ impl Executor {
         for row in &fk_rows {
             super::foreign_key::check_parent_exists(&self.engine, txn_id, schema, row)?;
         }
-        let mut cascades = super::foreign_key::Cascades::default();
+        let mut by_column: Vec<(usize, Vec<(Value, Value)>)> = Vec::new();
         for (idx, old, new) in ref_changes {
             let Some(fks) = fks_by_ref_col.get(&idx) else {
                 continue;
@@ -3934,15 +3931,16 @@ impl Executor {
                     fks,
                 )?;
             }
+            by_column.push((idx, vec![(old, new)]));
+        }
+        if !by_column.is_empty() {
             super::foreign_key::enforce_update_actions(
                 &self.engine,
                 txn_id,
-                &[(old, new)],
-                fks,
-                &mut cascades,
+                &schema.table_name,
+                by_column,
             )?;
         }
-        cascades.check_parents(&self.engine, txn_id)?;
 
         Ok((updated > 0, captured_row))
     }
