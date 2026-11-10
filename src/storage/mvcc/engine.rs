@@ -8461,7 +8461,8 @@ impl MVCCEngine {
             // segments + remove hot rows + remove hot index entries.
             // DML operations hold the shared fence, so they cannot race
             // between cold constraint checks and hot publication.
-            let mut cleaners = store.seal_index_cleaners(all_row_ids.len().min(REMOVE_BATCH_SIZE));
+            let mut cleaners =
+                store.seal_index_cleaners(all_row_ids.len().min(REMOVE_BATCH_SIZE), &all_rows);
             let published = {
                 // A preparation the segments moved past publishes nothing:
                 // the fence is let go before the preparation is, and it is

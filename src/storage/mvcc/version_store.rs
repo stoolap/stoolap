@@ -918,11 +918,17 @@ pub struct SealedIndexCleanup {
     pub removed_ids: Vec<i64>,
 }
 
-/// A seal's hot indexes, each with its removal buffers when it has them
-pub type SealIndexCleaners = Vec<(
-    Arc<dyn Index>,
-    Option<crate::storage::traits::RemovalBuffers>,
-)>;
+/// A seal's hot indexes, each with its removal buffers when it has them,
+/// and what the ones without take their keys through, made before the fence
+pub struct SealIndexCleaners {
+    indexes: Vec<(
+        Arc<dyn Index>,
+        Option<crate::storage::traits::RemovalBuffers>,
+    )>,
+    /// Each sealed row's position in the rows the seal passes; empty when
+    /// every index removes by id
+    positions: I64Map<usize>,
+}
 
 /// Held for a table from the first index update of a commit until the
 /// commit is visible or undone; see VersionStore::begin_publish
@@ -6545,24 +6551,29 @@ impl VersionStore {
     }
 
     /// The hot indexes a seal cleans, every index but HNSW, each with the
-    /// buffers its cleanup uses for calls of up to `batch_rows` rows. Taken
-    /// under the DDL guard before the fence, so nothing is made under it.
-    pub fn seal_index_cleaners(&self, batch_rows: usize) -> SealIndexCleaners {
-        let indexes: Vec<Arc<dyn Index>> = self
+    /// buffers its cleanup uses for calls of up to `batch_rows` rows, and the
+    /// positions of `rows`, the sealed rows, when an index removes by key.
+    /// Taken under the DDL guard before the fence, so nothing is made under it.
+    pub fn seal_index_cleaners(&self, batch_rows: usize, rows: &RowVec) -> SealIndexCleaners {
+        let indexes: Vec<(
+            Arc<dyn Index>,
+            Option<crate::storage::traits::RemovalBuffers>,
+        )> = self
             .indexes
             .read()
             .values()
             .map(|entry| &entry.index)
             .filter(|idx| idx.index_type() != crate::core::IndexType::Hnsw)
-            .cloned()
+            .map(|index| (Arc::clone(index), index.removal_buffers(batch_rows)))
             .collect();
-        indexes
-            .into_iter()
-            .map(|index| {
-                let buffers = index.removal_buffers(batch_rows);
-                (index, buffers)
-            })
-            .collect()
+        let mut positions = new_i64_map();
+        if indexes.iter().any(|(_, buffers)| buffers.is_none()) {
+            positions.reserve(rows.len());
+            for (pos, (row_id, _)) in rows.iter().enumerate() {
+                positions.insert(*row_id, pos);
+            }
+        }
+        SealIndexCleaners { indexes, positions }
     }
 
     /// Remove stale hot index entries for sealed rows (phase 2 of seal).
@@ -6577,12 +6588,12 @@ impl VersionStore {
         rows: &RowVec,
         cleaners: &mut SealIndexCleaners,
     ) {
-        if cleanup.removed_ids.is_empty() || cleaners.is_empty() {
+        if cleanup.removed_ids.is_empty() || cleaners.indexes.is_empty() {
             return;
         }
 
-        let mut by_id: Option<I64Map<usize>> = None;
-        for (index, buffers) in cleaners.iter_mut() {
+        let positions = &cleaners.positions;
+        for (index, buffers) in cleaners.indexes.iter_mut() {
             if let Some(buffers) = buffers {
                 if index
                     .remove_batch_ids(&cleanup.removed_ids, buffers)
@@ -6591,13 +6602,6 @@ impl VersionStore {
                     continue;
                 }
             }
-            let positions = by_id.get_or_insert_with(|| {
-                let mut map = I64Map::with_capacity(rows.len());
-                for (pos, (row_id, _)) in rows.iter().enumerate() {
-                    map.insert(*row_id, pos);
-                }
-                map
-            });
             // Every row's key in one buffer, so nothing is allocated per row
             let col_ids = index.column_ids();
             let mut ids: Vec<i64> = Vec::with_capacity(cleanup.removed_ids.len());

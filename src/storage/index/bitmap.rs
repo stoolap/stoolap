@@ -259,20 +259,25 @@ impl BitmapIndex {
     /// For single-column indexes, wraps the value in Arc
     /// For multi-column indexes, creates a composite key
     fn value_to_arc_key(&self, values: &[Value]) -> CompactArc<Value> {
+        CompactArc::new(Self::lookup_key(values).into_owned())
+    }
+
+    /// The key `values` are kept under: a single column's value as it is,
+    /// borrowed, so a lookup or removal by it allocates nothing
+    fn lookup_key(values: &[Value]) -> std::borrow::Cow<'_, Value> {
         if values.len() == 1 {
-            CompactArc::new(values[0].clone())
+            std::borrow::Cow::Borrowed(&values[0])
         } else {
             // For multi-column bitmap index, create a composite key
             // This is less common but supported
-            let composite = Value::Text(
+            std::borrow::Cow::Owned(Value::Text(
                 values
                     .iter()
                     .map(|v| format!("{:?}", v))
                     .collect::<Vec<_>>()
                     .join("||")
                     .into(),
-            );
-            CompactArc::new(composite)
+            ))
         }
     }
 
@@ -411,16 +416,15 @@ impl Index for BitmapIndex {
 
         let row_id_u64 = bit_of(row_id);
 
-        // Intern value to get Arc key for lookup
-        let arc_key = self.value_to_arc_key(values);
+        let key = Self::lookup_key(values);
 
         let mut bitmaps = self.bitmaps.write();
 
         // Remove from bitmap
-        if let Some(bitmap) = bitmaps.get_mut(&arc_key) {
+        if let Some(bitmap) = bitmaps.get_mut(&*key) {
             bitmap.remove(row_id_u64);
             if bitmap.is_empty() {
-                bitmaps.remove(&arc_key);
+                bitmaps.remove(&*key);
                 self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
             }
         }
@@ -542,13 +546,13 @@ impl Index for BitmapIndex {
         for &(row_id, values) in entries {
             let row_id_u64 = bit_of(row_id);
 
-            let arc_key = self.value_to_arc_key(values);
+            let key = Self::lookup_key(values);
 
             // Remove from bitmap
-            if let Some(bitmap) = bitmaps.get_mut(&arc_key) {
+            if let Some(bitmap) = bitmaps.get_mut(&*key) {
                 bitmap.remove(row_id_u64);
                 if bitmap.is_empty() {
-                    bitmaps.remove(&arc_key);
+                    bitmaps.remove(&*key);
                     self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
                 }
             }
