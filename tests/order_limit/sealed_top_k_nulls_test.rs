@@ -89,17 +89,18 @@ fn read(db: &Database, sql: &str) -> (Vec<String>, Vec<i64>) {
     (keys, ids)
 }
 
-fn taken(db: &Database, sql: &str) -> bool {
+/// Whether the top-k read answered `sql`; None in a build that cannot tell
+fn taken(db: &Database, sql: &str) -> Option<bool> {
     #[cfg(feature = "test-failpoints")]
     {
         stoolap::test_failpoints::reset_order_limit_paths();
         db.query(sql, ()).unwrap().for_each(drop);
-        stoolap::test_failpoints::order_limit_paths_taken().contains(&"prepared_top_k")
+        Some(stoolap::test_failpoints::order_limit_paths_taken().contains(&"prepared_top_k"))
     }
     #[cfg(not(feature = "test-failpoints"))]
     {
         let _ = (db, sql);
-        true
+        None
     }
 }
 
@@ -242,7 +243,7 @@ fn a_sealed_top_k_places_null_and_nan_as_the_sort_does() {
         if got.0 != keys || got.1 != ids {
             wrong.push(format!("{sql}\n  got  {got:?}\n  want ({keys:?}, {ids:?})"));
         }
-        if taken(&db, sql) != top_k {
+        if taken(&db, sql).is_some_and(|taken| taken != top_k) {
             wrong.push(format!("{sql}: top-k read taken is not {top_k}"));
         }
     }
@@ -315,5 +316,119 @@ fn a_hot_top_k_walks_a_prefix_index_when_the_where_bounds_a_nullable_column() {
         read(&db, sql),
         (vec!["20".to_string(), "30".to_string()], vec![1, 5])
     );
-    assert!(taken(&db, sql), "{sql}: the hot index walk answers");
+    assert_ne!(
+        taken(&db, sql),
+        Some(false),
+        "{sql}: the hot index walk answers"
+    );
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_sealed_top_k_builds_few_text_or_float_rows_the_heap_cannot_take() {
+    use stoolap::test_failpoints::top_k_cold_rows;
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?checkpoint_on_close=off",
+        dir.path().display()
+    ))
+    .unwrap();
+    db.execute(
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, t TEXT, f FLOAT)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO r SELECT value, 'k' || ((value * 7919) % 20000), \
+         ((value * 7919) % 20000) * 0.5 FROM generate_series(1, 20000)",
+        (),
+    )
+    .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let cases: [(&str, [&str; 10]); 3] = [
+        (
+            "SELECT id, t FROM r ORDER BY t LIMIT 10",
+            [
+                "k0", "k1", "k10", "k100", "k1000", "k10000", "k10001", "k10002", "k10003",
+                "k10004",
+            ],
+        ),
+        (
+            "SELECT id, t FROM r ORDER BY t DESC LIMIT 10",
+            [
+                "k9999", "k9998", "k9997", "k9996", "k9995", "k9994", "k9993", "k9992", "k9991",
+                "k9990",
+            ],
+        ),
+        (
+            "SELECT id, f FROM r ORDER BY f LIMIT 10",
+            ["0", "0.5", "1", "1.5", "2", "2.5", "3", "3.5", "4", "4.5"],
+        ),
+    ];
+    for (sql, want) in cases {
+        let before = top_k_cold_rows();
+        let (keys, _) = read(&db, sql);
+        let built = top_k_cold_rows() - before;
+        assert_eq!(keys, want, "{sql}");
+        // Of 20,000 scrambled sealed rows, the heap takes a few hundred
+        assert!(built <= 1_000, "{sql}: built {built} sealed rows");
+    }
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_sealed_top_k_decodes_the_other_columns_of_its_kept_rows_alone() {
+    use stoolap::test_failpoints::take_group_column_decodes;
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}/kept", dir.path().display());
+    let db = Database::open(&dsn).unwrap();
+    db.execute(
+        "CREATE TABLE w (id INTEGER PRIMARY KEY, t TEXT, p TEXT, f INTEGER)",
+        (),
+    )
+    .unwrap();
+    // The first three row groups lead on the key and hold no row the WHERE
+    // passes; the last holds the answer
+    db.execute(
+        "INSERT INTO w SELECT value, \
+         CASE WHEN value <= 196608 THEN 'a' ELSE 'b' END || value, 'payload ' || value, \
+         CASE WHEN value <= 196608 THEN (value % 2) * 2 ELSE 1 END \
+         FROM generate_series(1, 200000)",
+        (),
+    )
+    .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    drop(db);
+    // Reopened, no block of the volume is decoded yet
+    let db = Database::open(&dsn).unwrap();
+    take_group_column_decodes();
+    let rows: Vec<(i64, String, String)> = db
+        .query(
+            "SELECT id, t, p FROM w WHERE f > 0 AND f < 2 ORDER BY t LIMIT 1",
+            (),
+        )
+        .unwrap()
+        .map(|row| {
+            let row = row.unwrap();
+            (
+                row.get(0).unwrap(),
+                row.get(1).unwrap(),
+                row.get(2).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [(196609, "b196609".to_string(), "payload 196609".to_string())]
+    );
+    let decodes = take_group_column_decodes();
+    let groups = |col: usize| {
+        let mut groups: Vec<usize> = decodes.iter().filter(|d| d.0 == col).map(|d| d.1).collect();
+        groups.sort_unstable();
+        groups.dedup();
+        groups
+    };
+    // Every group's key, the payload of the one group holding the row kept
+    assert_eq!(groups(1), [0, 1, 2, 3], "key blocks decoded: {decodes:?}");
+    assert_eq!(groups(2), [3], "payload blocks decoded: {decodes:?}");
 }

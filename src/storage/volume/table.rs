@@ -186,9 +186,18 @@ fn start_walk(plan: &super::secondary::SidePlan) -> Result<Option<super::seconda
 struct Ranked {
     key: Value,
     row_id: i64,
-    row: Row,
+    row: Held,
     ascending: bool,
     nulls_first: bool,
+}
+
+/// A row [`TopK`] holds: whole, or a sealed row with only its key and
+/// WHERE columns, the rest read once it is kept
+enum Held {
+    Row(Row),
+    /// The volume, by its place in the read's list, the row's position, and
+    /// the columns read so far
+    Sealed(usize, usize, Row),
 }
 
 impl Ranked {
@@ -275,12 +284,17 @@ impl TopK {
         let Some(key) = row.get(self.col) else {
             return;
         };
-        if !self.admits(key, row_id) {
-            return;
+        if self.admits(key, row_id) {
+            let key = key.clone();
+            self.keep(key, row_id, Held::Row(row));
         }
+    }
+
+    /// Keeps a row the caller found `admits` takes, by its key
+    fn keep(&mut self, key: Value, row_id: i64, row: Held) {
         let filling = self.heap.is_empty() && self.filling.len() < self.k;
         let candidate = Ranked {
-            key: key.clone(),
+            key,
             row_id,
             row,
             ascending: self.ascending,
@@ -360,18 +374,39 @@ impl TopK {
             .is_some_and(|worst| self.order(bound, &worst.key) == std::cmp::Ordering::Greater)
     }
 
-    /// The rows in order, the first `offset` dropped
-    fn into_rows(self, offset: usize) -> RowVec {
-        let mut rows = if self.heap.is_empty() {
+    /// The rows in order, the first `offset` dropped, a sealed one completed
+    /// by `fill` from its volume and position; sealed rows are completed in
+    /// volume and position order, so a reader decodes each group once
+    fn into_rows(
+        self,
+        offset: usize,
+        mut fill: impl FnMut(usize, usize, &mut Row) -> Result<()>,
+    ) -> Result<RowVec> {
+        let mut ranked = if self.heap.is_empty() {
             self.filling
         } else {
             self.heap.into_vec()
         };
-        rows.sort_unstable();
-        rows.into_iter()
-            .skip(offset)
-            .map(|r| (r.row_id, r.row))
-            .collect()
+        ranked.sort_unstable();
+        let mut rows = RowVec::with_capacity(ranked.len().saturating_sub(offset));
+        let mut sealed: Vec<(usize, usize, usize)> = Vec::new();
+        for (at, kept) in ranked.into_iter().skip(offset).enumerate() {
+            let row = match kept.row {
+                Held::Row(row) => row,
+                Held::Sealed(volume, position, row) => {
+                    sealed.push((volume, position, at));
+                    row
+                }
+            };
+            rows.push((kept.row_id, row));
+        }
+        sealed.sort_unstable();
+        for (volume, position, at) in sealed {
+            if let Some((_, row)) = rows.get_mut(at) {
+                fill(volume, position, row)?;
+            }
+        }
+        Ok(rows)
     }
 
     /// The best key a row of `zone` can hold in this order, NULL when one of
@@ -388,6 +423,29 @@ impl TopK {
             (true, true) => ZoneBound::Unbounded,
             (true, false) if null_free => ZoneBound::Empty,
             (true, false) => ZoneBound::Key(&NULL),
+        }
+    }
+}
+
+/// Completes the sealed rows a top-k read keeps, which come in volume and
+/// position order: one volume's reader is held at a time, and its decoded
+/// groups go when the next volume's rows begin
+struct KeptRows<'a> {
+    volumes: &'a [(Arc<FrozenVolume>, super::writer::ColumnMapping)],
+    /// The schema columns the scan already read
+    known: &'a [bool],
+    reader: Option<(usize, super::writer::RowReader)>,
+}
+
+impl KeptRows<'_> {
+    fn fill(&mut self, volume: usize, position: usize, row: &mut Row) -> Result<()> {
+        let (vol, mapping) = &self.volumes[volume];
+        if self.reader.as_ref().is_none_or(|(at, _)| *at != volume) {
+            self.reader = Some((volume, super::writer::RowReader::new(Arc::clone(vol))));
+        }
+        match self.reader.as_mut() {
+            Some((_, reader)) => Ok(reader.fill(position, mapping, self.known, row)?),
+            None => Ok(()),
         }
     }
 }
@@ -7029,6 +7087,23 @@ impl Table for SegmentedTable {
                 filter.prepare_for_schema(current_schema);
                 filter
             });
+            // A sealed row is built from the key and the WHERE's columns, and
+            // whole only once kept; whole from the start when the WHERE's
+            // columns are not known
+            let mut read_cols = vec![col_idx];
+            let key_first = prepared_filter
+                .as_ref()
+                .is_none_or(|filter| filter.collect_column_indices(&mut read_cols));
+            let needed: Option<Vec<bool>> = key_first.then(|| {
+                let mut mask = vec![false; current_schema.columns.len()];
+                for &ci in &read_cols {
+                    if let Some(read) = mask.get_mut(ci) {
+                        *read = true;
+                    }
+                }
+                mask
+            });
+            let mut kept_from: Vec<(Arc<FrozenVolume>, super::writer::ColumnMapping)> = Vec::new();
 
             for (i, vcol, bound) in ordered {
                 if bound.is_some_and(|bound| keep.cannot_improve(bound)) {
@@ -7055,6 +7130,11 @@ impl Table for SegmentedTable {
                     &cs.volume
                 };
                 let sorted = vol.is_sorted(vcol);
+                let mapping = self.segment_mgr.get_volume_mapping(*seg_id, current_schema);
+                let slot = kept_from.len();
+                if needed.is_some() {
+                    kept_from.push((Arc::clone(vol), mapping.clone()));
+                }
                 // Row groups in bound order, clipped to the narrowed range; a
                 // volume without group metadata is one group
                 let mut groups: Vec<(usize, usize, Option<&Value>)> = vol
@@ -7102,9 +7182,10 @@ impl Table for SegmentedTable {
                     scanner.set_visibility_bitmap(cs.visible.clone());
                     scanner.view = self.view.clone();
                     scanner.cut = cut.clone();
-                    scanner.set_column_mapping(
-                        self.segment_mgr.get_volume_mapping(*seg_id, current_schema),
-                    );
+                    scanner.set_column_mapping(mapping.clone());
+                    if let Some(mask) = &needed {
+                        scanner.set_needed_cols(mask);
+                    }
                     // In a sorted volume the rows come in key order: walk from the
                     // best end and stop at the first key the heap cannot use
                     // Otherwise unusable rows pass unbuilt; DESC walks newest first
@@ -7128,15 +7209,24 @@ impl Table for SegmentedTable {
                         crate::test_failpoints::top_k_cold_row_built();
                         // Taken only when kept, so a passed row leaves its buffer
                         let row_id = scanner.current_row_id();
-                        let kept = scanner
+                        let Some(key) = scanner
                             .row()
                             .get(col_idx)
-                            .is_some_and(|key| keep.admits(key, row_id));
-                        if !kept || sealed_copies_checked && self.hot.has_row_id(row_id)? {
+                            .filter(|key| keep.admits(key, row_id))
+                        else {
+                            continue;
+                        };
+                        if sealed_copies_checked && self.hot.has_row_id(row_id)? {
                             continue;
                         }
-                        let (row_id, row) = scanner.take_row_with_id();
-                        keep.offer(row_id, row);
+                        if needed.is_some() {
+                            let (key, position) = (key.clone(), scanner.position());
+                            let (row_id, row) = scanner.take_row_with_id();
+                            keep.keep(key, row_id, Held::Sealed(slot, position, row));
+                        } else {
+                            let (row_id, row) = scanner.take_row_with_id();
+                            keep.offer(row_id, row);
+                        }
                         if let Some(worst) = keep.worst_key() {
                             if sorted {
                                 scanner.set_stop_key(vcol, worst, ascending);
@@ -7151,7 +7241,14 @@ impl Table for SegmentedTable {
                 }
             }
             self.check_cold()?;
-            Ok(Some(Some(keep.into_rows(offset))))
+            let mut kept = KeptRows {
+                volumes: &kept_from,
+                known: needed.as_deref().unwrap_or_default(),
+                reader: None,
+            };
+            let rows =
+                keep.into_rows(offset, |slot, position, row| kept.fill(slot, position, row))?;
+            Ok(Some(Some(rows)))
         })
     }
 
@@ -8606,6 +8703,52 @@ mod tests {
         keep
     }
 
+    /// The row ids `keep` gives past `offset`, every row of it built
+    fn built(keep: TopK, offset: usize) -> Vec<i64> {
+        let rows = keep.into_rows(offset, |_, _, _| panic!("no sealed row is held"));
+        rows.unwrap().into_iter().map(|(id, _)| id).collect()
+    }
+
+    #[test]
+    fn kept_rows_let_a_volume_go_when_the_next_one_begins() {
+        use super::super::writer::{ColSource, ColumnMapping};
+        let schema = test_schema();
+        let volume = |ids: [i64; 2]| {
+            let mut builder = VolumeBuilder::with_capacity(&schema, 2);
+            for id in ids {
+                let row = Row::from_values(vec![Value::Integer(id), Value::Float(id as f64)]);
+                builder.add_row(id, &row);
+            }
+            Arc::new(builder.finish().unwrap())
+        };
+        let identity = ColumnMapping {
+            sources: vec![ColSource::Volume(0), ColSource::Volume(1)],
+            names: Vec::new(),
+            is_identity: true,
+        };
+        let volumes = vec![
+            (volume([1, 2]), identity.clone()),
+            (volume([10, 11]), identity),
+        ];
+        let mut kept = KeptRows {
+            volumes: &volumes,
+            known: &[true, false],
+            reader: None,
+        };
+        let mut row = Row::from_values(vec![Value::Integer(2), Value::Null(DataType::Float)]);
+        kept.fill(0, 1, &mut row).unwrap();
+        assert_eq!(row.get(1), Some(&Value::Float(2.0)));
+        assert_eq!(Arc::strong_count(&volumes[0].0), 2, "the reader holds it");
+        let mut row = Row::from_values(vec![Value::Integer(10), Value::Null(DataType::Float)]);
+        kept.fill(1, 0, &mut row).unwrap();
+        assert_eq!(row.get(1), Some(&Value::Float(10.0)));
+        assert_eq!(
+            Arc::strong_count(&volumes[0].0),
+            1,
+            "the first volume's reader went with its groups"
+        );
+    }
+
     /// The offers' row ids as the full sort orders them: key, then row id
     fn best_first(ascending: bool, offers: &[(i64, i64)]) -> Vec<(i64, i64)> {
         let mut sorted = offers.to_vec();
@@ -8624,7 +8767,7 @@ mod tests {
             let keep = top_k(5, ascending, &offers);
             assert!(keep.heap.is_empty(), "ascending {ascending}");
             let want: Vec<i64> = offers[..5].iter().map(|&(_, id)| id).collect();
-            let got: Vec<i64> = keep.into_rows(0).into_iter().map(|(id, _)| id).collect();
+            let got: Vec<i64> = built(keep, 0);
             assert_eq!(got, want, "ascending {ascending}");
         }
     }
@@ -8638,7 +8781,7 @@ mod tests {
         assert_eq!(keep.heap.len(), 3);
         assert!(keep.filling.is_empty());
         assert_eq!(keep.worst_key(), Some(&Value::Integer(20)));
-        let got: Vec<i64> = keep.into_rows(0).into_iter().map(|(id, _)| id).collect();
+        let got: Vec<i64> = built(keep, 0);
         assert_eq!(got, [1, 5, 2]);
     }
 
@@ -8685,11 +8828,7 @@ mod tests {
                 .skip(offset)
                 .map(|(_, id)| id)
                 .collect();
-            let got: Vec<i64> = keep
-                .into_rows(offset)
-                .into_iter()
-                .map(|(id, _)| id)
-                .collect();
+            let got: Vec<i64> = built(keep, offset);
             assert_eq!(got, want, "case {case}: k {k}, ascending {ascending}");
         }
     }
