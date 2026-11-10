@@ -677,6 +677,29 @@ fn key_position(child_schema: &Schema, fk: &ForeignKeyConstraint) -> Result<usiz
 /// Maximum CASCADE recursion depth to prevent infinite loops from circular FK references.
 const MAX_CASCADE_DEPTH: usize = 16;
 
+/// Whether `fk`'s column is its child table's primary key, which an ON
+/// UPDATE CASCADE would change in place under the row's old id
+fn cascades_into_key(engine: &MVCCEngine, child_table: &str, fk: &ForeignKeyConstraint) -> bool {
+    engine.get_table_schema(child_table).is_ok_and(|schema| {
+        key_position(&schema, fk).is_ok_and(|at| schema.pk_column_index() == Some(at))
+    })
+}
+
+/// The error for an ON UPDATE CASCADE that would change `child_table`'s
+/// primary key
+fn key_cascade_refused(child_table: &str, fk: &ForeignKeyConstraint, old_value: &Value) -> Error {
+    Error::foreign_key_violation(
+        child_table,
+        &fk.column_name,
+        &fk.referenced_table,
+        &fk.referenced_column,
+        format!(
+            "cannot cascade {} = {} into the primary key of table '{}': a primary key is not updated",
+            fk.referenced_column, old_value, child_table
+        ),
+    )
+}
+
 /// CASCADE DELETE: delete all child rows referencing the given parent PK value.
 /// Operates within the caller's transaction (no independent commit).
 /// Recursively cascades to grandchild tables (up to MAX_CASCADE_DEPTH).
@@ -869,6 +892,9 @@ fn cascade_update_recursive(
         )));
     }
     check_children_seen(engine, txn_id, child_table, fk, old_value)?;
+    if cascades_into_key(engine, child_table, fk) {
+        return Err(key_cascade_refused(child_table, fk, old_value));
+    }
 
     // Find grandchild FKs that reference the column being updated
     let grandchild_fks = find_referencing_fks(engine, child_table);

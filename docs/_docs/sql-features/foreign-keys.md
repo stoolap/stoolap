@@ -346,5 +346,5 @@ FK constraints are persisted through both WAL (Write-Ahead Log) and snapshots. A
 ## Limitations
 
 - FK constraints reference single columns (composite FK not yet supported)
-- ON UPDATE CASCADE does not recursively cascade to grandchild tables when the child's FK column is also its PK
+- ON UPDATE CASCADE does not change a child's primary key: when the child's FK column is its primary key, an update whose cascade would reach a child row is refused, at any depth of the cascade, and leaves nothing written, inside a transaction too. An update that keeps the value, or changes a value no child row names, goes through.
 - Self-referencing FK (a table referencing itself) follows the same rules but requires careful ordering of inserts
