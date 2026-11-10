@@ -15,56 +15,37 @@
 //! B-tree Index implementation for range queries and ordered access
 //!
 //! Provides a B-tree based index optimized for:
-//! - Range queries (O(log n + k) with BTreeMap)
+//! - Range queries (O(log n + k) with a [`ValueTree`])
 //! - Ordered access (ORDER BY, MIN, MAX)
 //! - Efficient column scans
-//! - Aggregation operations (min/max from the map's ends)
-//!
-//! ## Performance Optimizations
-//!
-//! 1. **BTreeMap for sorted value storage**: Enables O(log n + k) range queries
-//!    instead of O(n) full scans
-//! 2. **SmallVec for row IDs**: Reduces memory for values with few rows
+//! - Aggregation operations (min/max from the tree's ends)
 //!
 //! B-tree index implementation for single-column indexing
 
 use parking_lot::RwLock;
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
+use super::value_tree::{Ids, ValueTree};
 use crate::common::I64Map;
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
 use crate::storage::index::id_list::GroupIds;
 use crate::storage::traits::Index;
 
-/// Sorted row ids per value, paged once large
-type RowIdSet = super::id_list::IdList;
-
-/// Enters `row_id` in the list of `value`, making the key when it is new
-fn insert_row(sorted_values: &mut BTreeMap<Value, RowIdSet>, value: &Value, row_id: i64) {
-    sorted_values
-        .entry(value.clone())
-        .or_default()
-        .insert(row_id);
-}
+/// The one NULL key: every NULL compares equal to it
+const NULL: Value = Value::Null(DataType::Null);
 
 /// B-tree index for efficient range queries and ordered access
 ///
-/// This index stores column values in sorted order using BTreeMap for:
+/// This index stores column values in sorted order in a [`ValueTree`] for:
 /// - O(log n + k) range queries (k = number of matching values)
-/// - O(log n) point lookups via BTreeMap
-/// - O(log n) MIN/MAX queries from the map's ends
+/// - O(log n) point lookups
+/// - O(log n) MIN/MAX queries from the tree's ends
 /// - Efficient IN list queries
 /// - NULL handling
-///
-/// ## Memory Optimization
-///
-/// - Keys are the values themselves; a value clones without allocating.
-/// - Uses SmallVec<[i64; 4]> for row IDs per value. Since most values have
-///   few duplicate rows, this avoids heap allocation for the common case.
 ///
 /// B-tree index for single-column ordered access and range queries
 pub struct BTreeIndex {
@@ -90,8 +71,7 @@ pub struct BTreeData {
     closed: AtomicBool,
 
     /// Sorted value to row IDs mapping (main index for range and equality queries)
-    /// BTreeMap provides O(log n) lookups and efficient range iteration
-    sorted_values: RwLock<BTreeMap<Value, RowIdSet>>,
+    sorted_values: RwLock<ValueTree>,
 
     /// Reference ID counter
     next_ref_id: RwLock<i64>,
@@ -126,12 +106,7 @@ impl BTreeIndex {
         for run in removed.chunk_by(|a, b| a.0 == b.0) {
             ids.clear();
             ids.extend(run.iter().map(|(_, row_id)| *row_id));
-            if let Some(rows) = sorted_values.get_mut(run[0].0) {
-                rows.remove_sorted(&ids);
-                if rows.is_empty() {
-                    sorted_values.remove(run[0].0);
-                }
-            }
+            sorted_values.remove_sorted(run[0].0, &ids);
         }
         Ok(())
     }
@@ -154,7 +129,7 @@ impl BTreeIndex {
             unique,
             data: Arc::new(BTreeData {
                 closed: AtomicBool::new(false),
-                sorted_values: RwLock::new(BTreeMap::new()),
+                sorted_values: RwLock::new(ValueTree::new()),
                 next_ref_id: RwLock::new(0),
             }),
         }
@@ -200,17 +175,26 @@ impl BTreeIndex {
     /// Returns the total number of entries (row IDs) in the index
     pub fn entry_count(&self) -> usize {
         let sorted_values = self.sorted_values.read();
-        sorted_values.values().map(RowIdSet::len).sum()
+        let mut count = 0;
+        sorted_values.walk(Bound::Unbounded, true, &mut |_, rows| {
+            count += rows.len();
+            true
+        });
+        count
     }
 
-    /// Gets all values (sorted by BTreeMap ordering)
+    /// Gets all values in key order
     pub fn get_all_values(&self) -> Vec<Value> {
         let sorted_values = self.sorted_values.read();
-        sorted_values.keys().cloned().collect()
+        let mut values = Vec::with_capacity(sorted_values.len());
+        sorted_values.walk(Bound::Unbounded, true, &mut |key, _| {
+            values.push(key.clone());
+            true
+        });
+        values
     }
 
     /// Gets all row IDs for a specific value
-    /// Uses the BTreeMap for O(log n) lookup
     pub fn get_row_ids_for_value(&self, value: &Value) -> Vec<i64> {
         let sorted_values = self.sorted_values.read();
         sorted_values
@@ -220,89 +204,44 @@ impl BTreeIndex {
     }
 
     /// Checks if a value exists in the index
-    /// Uses BTreeMap for O(log n) lookup
     pub fn contains_value(&self, value: &Value) -> bool {
         let sorted_values = self.sorted_values.read();
-        // Use Borrow trait - no allocation needed
-        sorted_values.contains_key(value)
+        sorted_values.get(value).is_some()
     }
 
     /// Internal method to find row IDs matching an operator
-    /// Uses BTreeMap for O(log n + k) range queries instead of O(n) full scans
     fn find_with_op(&self, op: Operator, value: &Value) -> Option<Vec<i64>> {
         let sorted_values = self.sorted_values.read();
-
-        Some(match op {
-            // Equality uses BTreeMap for O(log n) lookup via Borrow trait
-            Operator::Eq | Operator::In => sorted_values
-                .get(value)
-                .map(|rows| rows.iter().collect())
-                .unwrap_or_default(),
-
-            Operator::Lt => {
-                // range(..value) gives us all values < value
-                let capacity = sorted_values.len() / 4; // Estimate
-                let mut results = Vec::with_capacity(capacity);
-                for (_, rows) in sorted_values.range(..value) {
+        let mut results = Vec::new();
+        // The rows of every key from `from` up while `keep` holds for it
+        let mut collect = |from: Bound<&Value>, keep: &dyn Fn(&Value) -> bool| {
+            sorted_values.walk(from, true, &mut |key, rows| {
+                if !keep(key) {
+                    return false;
+                }
+                rows.copy_into(&mut results);
+                true
+            })
+        };
+        match op {
+            Operator::Eq | Operator::In => {
+                if let Some(rows) = sorted_values.get(value) {
                     rows.copy_into(&mut results);
                 }
-                results
             }
-
-            Operator::Lte => {
-                // range(..=value) gives us all values <= value
-                let capacity = sorted_values.len() / 4;
-                let mut results = Vec::with_capacity(capacity);
-                for (_, rows) in sorted_values.range(..=value) {
-                    rows.copy_into(&mut results);
-                }
-                results
-            }
-
-            Operator::Gt => {
-                // range((Excluded(value), Unbounded)) gives us all values > value
-                let capacity = sorted_values.len() / 4;
-                let mut results = Vec::with_capacity(capacity);
-                for (_, rows) in sorted_values.range((Bound::Excluded(value), Bound::Unbounded)) {
-                    rows.copy_into(&mut results);
-                }
-                results
-            }
-
-            Operator::Gte => {
-                // range(value..) gives us all values >= value
-                let capacity = sorted_values.len() / 4;
-                let mut results = Vec::with_capacity(capacity);
-                for (_, rows) in sorted_values.range(value..) {
-                    rows.copy_into(&mut results);
-                }
-                results
-            }
-
-            // NULL operators need to check all values
+            Operator::Lt => collect(Bound::Unbounded, &|key| key.cmp(value) == Ordering::Less),
+            Operator::Lte => collect(Bound::Unbounded, &|key| key.cmp(value) != Ordering::Greater),
+            Operator::Gt => collect(Bound::Excluded(value), &|_| true),
+            Operator::Gte => collect(Bound::Included(value), &|_| true),
             Operator::IsNull => {
-                let mut results = Vec::new();
-                for (v, rows) in sorted_values.iter() {
-                    if v.is_null() {
-                        rows.copy_into(&mut results);
-                    }
+                if let Some(rows) = sorted_values.get(&NULL) {
+                    rows.copy_into(&mut results);
                 }
-                results
             }
-
-            Operator::IsNotNull => {
-                let capacity = sorted_values.len();
-                let mut results = Vec::with_capacity(capacity);
-                for (v, rows) in sorted_values.iter() {
-                    if !v.is_null() {
-                        rows.copy_into(&mut results);
-                    }
-                }
-                results
-            }
-
+            Operator::IsNotNull => collect(Bound::Excluded(&NULL), &|_| true),
             _ => return None,
-        })
+        }
+        Some(results)
     }
 }
 
@@ -334,18 +273,15 @@ impl Index for BTreeIndex {
         // Hold the write lock for the entire operation to prevent race conditions
         // (read-then-write pattern is unsafe with concurrent modifications)
         let mut sorted_values = self.sorted_values.write();
-        let rows = sorted_values.entry(value.clone()).or_default();
-
-        // A key another row holds; a refused key is never the empty new one
-        if self.unique && !value.is_null() && rows.iter().any(|id| id != row_id) {
-            return Err(Error::unique_constraint(
+        let unique = self.unique && !value.is_null();
+        match sorted_values.insert(value, row_id, unique) {
+            Ok(_) => Ok(()),
+            Err(_) => Err(Error::unique_constraint(
                 &self.name,
                 &self.column_name,
                 vec![value.clone()],
-            ));
+            )),
         }
-        rows.insert(row_id);
-        Ok(())
     }
 
     fn add_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
@@ -363,13 +299,7 @@ impl Index for BTreeIndex {
         let Some(value) = values.first() else {
             return Ok(());
         };
-        let mut sorted_values = self.sorted_values.write();
-        if let Some(rows) = sorted_values.get_mut(value) {
-            rows.remove(row_id);
-            if rows.is_empty() {
-                sorted_values.remove(value);
-            }
-        }
+        self.sorted_values.write().remove(value, row_id);
         Ok(())
     }
 
@@ -445,13 +375,19 @@ impl Index for BTreeIndex {
             }
         }
 
-        // All checks passed - now add all entries
+        // All checks passed. An empty index is built from the entries
+        if sorted_values.len() == 0 {
+            let pairs = entries
+                .iter()
+                .filter_map(|&(row_id, values)| Some((values.first()?, row_id)));
+            *sorted_values = ValueTree::from_entries(pairs.collect());
+            return Ok(());
+        }
+        // An insert that does not check uniqueness refuses nothing
         for &(row_id, values) in entries {
-            if values.is_empty() {
-                continue;
+            if let Some(value) = values.first() {
+                let _ = sorted_values.insert(value, row_id, false);
             }
-
-            insert_row(&mut sorted_values, &values[0], row_id);
         }
         Ok(())
     }
@@ -504,7 +440,6 @@ impl Index for BTreeIndex {
 
         let value = &values[0];
         let sorted_values = self.sorted_values.read();
-        // Use Borrow trait - no allocation needed for equality lookup
         let entries = sorted_values
             .get(value)
             .map(|rows| {
@@ -550,22 +485,17 @@ impl Index for BTreeIndex {
             Bound::Excluded(max_val)
         };
 
-        // Estimate capacity based on range
-        let capacity = sorted_values.len() / 4;
-        let mut entries = Vec::with_capacity(capacity);
-
-        // Use BTreeMap range for O(log n + k) instead of O(n)
-        for (key, rows) in sorted_values.range((min_bound, Bound::Unbounded)) {
+        let mut entries = Vec::new();
+        sorted_values.walk(min_bound, true, &mut |key, rows| {
             if past_end(&key, &max_bound) {
-                break;
+                return false;
             }
-            for row_id in rows.iter() {
-                entries.push(IndexEntry {
-                    row_id,
-                    ref_id: row_id,
-                });
-            }
-        }
+            entries.extend(rows.iter().map(|row_id| IndexEntry {
+                row_id,
+                ref_id: row_id,
+            }));
+            true
+        });
 
         Ok(entries)
     }
@@ -598,9 +528,7 @@ impl Index for BTreeIndex {
 
         let value = &values[0];
         let sorted_values = self.sorted_values.read();
-        // Use Borrow trait - no allocation needed for equality lookup
         if let Some(rows) = sorted_values.get(value) {
-            // Optimization: extend_from_slice uses memcpy for efficient bulk copy
             rows.copy_into(buffer);
         }
     }
@@ -611,8 +539,7 @@ impl Index for BTreeIndex {
         buffer: &mut Vec<i64>,
     ) {
         let sorted_values = self.sorted_values.read();
-        let mut found: smallvec::SmallVec<[(*const RowIdSet, &RowIdSet); 16]> =
-            smallvec::SmallVec::new();
+        let mut found: smallvec::SmallVec<[(*const Ids, &Ids); 16]> = smallvec::SmallVec::new();
         for value in members {
             if let Some(rows) = sorted_values.get(value) {
                 found.push((rows, rows));
@@ -682,12 +609,13 @@ impl Index for BTreeIndex {
             Bound::Excluded(max_val)
         };
 
-        for (key, rows) in sorted_values.range((min_bound, Bound::Unbounded)) {
+        sorted_values.walk(min_bound, true, &mut |key, rows| {
             if past_end(&key, &max_bound) {
-                break;
+                return false;
             }
             rows.copy_into(buffer);
-        }
+            true
+        });
     }
 
     fn get_filtered_row_ids(&self, expr: &dyn Expression) -> RowIdVec {
@@ -781,12 +709,13 @@ impl Index for BTreeIndex {
         // Fallback: evaluate the expression once per value, taking its rows
         let sorted_values = self.sorted_values.read();
         let mut results = RowIdVec::new();
-        for (value, rows) in sorted_values.iter() {
+        sorted_values.walk(Bound::Unbounded, true, &mut |value, rows| {
             let row = crate::core::Row::from_values(vec![value.clone()]);
             if expr.evaluate(&row).unwrap_or(false) {
                 results.extend(rows.iter());
             }
-        }
+            true
+        });
         results
     }
 
@@ -796,7 +725,12 @@ impl Index for BTreeIndex {
             return None;
         }
         let sorted_values = self.sorted_values.read();
-        sorted_values.keys().find(|v| !v.is_null()).cloned()
+        let mut min = None;
+        sorted_values.walk(Bound::Excluded(&NULL), true, &mut |key, _| {
+            min = Some(key.clone());
+            false
+        });
+        min
     }
 
     /// Returns the maximum value in the index
@@ -805,20 +739,19 @@ impl Index for BTreeIndex {
             return None;
         }
         let sorted_values = self.sorted_values.read();
-        sorted_values
-            .keys()
-            .next_back()
-            .filter(|v| !v.is_null())
-            .cloned()
+        let mut max = None;
+        sorted_values.walk(Bound::Unbounded, false, &mut |key, _| {
+            max = (!key.is_null()).then(|| key.clone());
+            false
+        });
+        max
     }
 
     fn get_all_values(&self) -> Vec<Value> {
         if self.closed.load(AtomicOrdering::Acquire) {
             return Vec::new();
         }
-        // Use sorted_values for deterministic ordering
-        let sorted_values = self.sorted_values.read();
-        sorted_values.keys().cloned().collect()
+        BTreeIndex::get_all_values(self)
     }
 
     fn get_distinct_count_excluding_null(&self) -> Option<usize> {
@@ -826,9 +759,8 @@ impl Index for BTreeIndex {
             return None;
         }
         let sorted_values = self.sorted_values.read();
-        // Count non-null values without cloning
-        let count = sorted_values.keys().filter(|v| !v.is_null()).count();
-        Some(count)
+        let nulls = usize::from(sorted_values.get(&NULL).is_some());
+        Some(sorted_values.len() - nulls)
     }
 
     fn get_row_ids_ordered(
@@ -843,27 +775,32 @@ impl Index for BTreeIndex {
         }
 
         let sorted_values = self.sorted_values.read();
+        let mut ordered = OrderedIds::new(limit, offset);
 
-        // NULL is the first key of the map: in the map's order when the
-        // caller wants it there, otherwise moved to the other end
-        let null_rows = sorted_values
-            .first_key_value()
-            .filter(|(key, _)| key.is_null())
-            .map(|(_, row_ids)| row_ids);
-        let keys = sorted_values.values();
-        let others = sorted_values.len().saturating_sub(1);
-        Some(match (null_rows, ascending, nulls_first) {
-            (Some(nulls), true, false) => {
-                ordered_row_ids(keys.skip(1).chain(Some(nulls)), limit, offset)
+        // NULL is the first key of the tree: in its order when the caller
+        // wants it there, otherwise moved to the other end
+        let nulls = sorted_values.get(&NULL);
+        match (ascending, nulls_first) {
+            (true, false) => {
+                sorted_values.walk(Bound::Excluded(&NULL), true, &mut |_, rows| {
+                    ordered.take(rows)
+                });
+                if let Some(nulls) = nulls {
+                    ordered.take(nulls);
+                }
             }
-            (Some(nulls), false, true) => ordered_row_ids(
-                Some(nulls).into_iter().chain(keys.rev().take(others)),
-                limit,
-                offset,
-            ),
-            (_, true, _) => ordered_row_ids(keys, limit, offset),
-            (_, false, _) => ordered_row_ids(keys.rev(), limit, offset),
-        })
+            (false, true) => {
+                if nulls.is_none_or(|nulls| ordered.take(nulls)) {
+                    sorted_values.walk(Bound::Unbounded, false, &mut |key, rows| {
+                        !key.is_null() && ordered.take(rows)
+                    });
+                }
+            }
+            (_, _) => sorted_values.walk(Bound::Unbounded, ascending, &mut |_, rows| {
+                ordered.take(rows)
+            }),
+        }
+        Some(ordered.ids)
     }
 
     /// Walks the whole key, so only an empty prefix. Each chunk of row ids is
@@ -900,7 +837,7 @@ impl Index for BTreeIndex {
             let mut full = false;
             {
                 let sorted_values = self.sorted_values.read();
-                let mut take = |key: &Value, rows: &RowIdSet, after: Option<i64>| {
+                let mut take = |key: &Value, rows: &Ids, after: Option<i64>| {
                     let before = ids.len();
                     rows.copy_past_into(after, ascending, chunk - before, &mut ids);
                     if ids.len() > before {
@@ -914,25 +851,21 @@ impl Index for BTreeIndex {
                     }
                 }
                 if !full && ascending {
-                    for (key, rows) in sorted_values.range((start.clone(), Bound::Unbounded)) {
+                    sorted_values.walk(start.as_ref(), true, &mut |key, rows| {
                         if past_end(key, &end) {
-                            break;
+                            return false;
                         }
-                        if take(key, rows, None) {
-                            full = true;
-                            break;
-                        }
-                    }
+                        full = take(key, rows, None);
+                        !full
+                    });
                 } else if !full {
-                    for (key, rows) in sorted_values.range((Bound::Unbounded, end.clone())).rev() {
+                    sorted_values.walk(end.as_ref(), false, &mut |key, rows| {
                         if before_start(key, &start) {
-                            break;
+                            return false;
                         }
-                        if take(key, rows, None) {
-                            full = true;
-                            break;
-                        }
-                    }
+                        full = take(key, rows, None);
+                        !full
+                    });
                 }
             }
             debug_assert_eq!(room, (ids.capacity(), keys.capacity()));
@@ -966,13 +899,11 @@ impl Index for BTreeIndex {
         }
 
         let sorted_values = self.sorted_values.read();
-
-        // Convert BTreeMap entries to (Value, Vec<i64>) pairs in sorted order
-        let result: Vec<(Value, Vec<i64>)> = sorted_values
-            .iter()
-            .map(|(value, row_ids)| (value.clone(), row_ids.iter().collect()))
-            .collect();
-
+        let mut result: Vec<(Value, Vec<i64>)> = Vec::with_capacity(sorted_values.len());
+        sorted_values.walk(Bound::Unbounded, true, &mut |value, row_ids| {
+            result.push((value.clone(), row_ids.iter().collect()));
+            true
+        });
         Some(result)
     }
 
@@ -986,22 +917,24 @@ impl Index for BTreeIndex {
 
         let sorted_values = self.sorted_values.read();
 
-        // Iterate through groups in sorted order without collecting
-        for (value, row_ids) in sorted_values.iter() {
-            // One call per whole group, borrowed - no allocation
-            match callback(value, GroupIds::List(row_ids)) {
-                Ok(true) => continue,          // Continue to next group
-                Ok(false) => break,            // Early termination requested
-                Err(e) => return Some(Err(e)), // Propagate error
-            }
-        }
-
-        Some(Ok(()))
+        // One call per whole group in key order, borrowed: no allocation
+        let mut outcome = Ok(());
+        sorted_values.walk(
+            Bound::Unbounded,
+            true,
+            &mut |value, row_ids| match callback(value, row_ids.as_group()) {
+                Ok(more) => more,
+                Err(e) => {
+                    outcome = Err(e);
+                    false
+                }
+            },
+        );
+        Some(outcome)
     }
 
     fn clear(&self) -> Result<()> {
-        let mut sorted_values = self.sorted_values.write();
-        sorted_values.clear();
+        self.sorted_values.write().clear();
         Ok(())
     }
 
@@ -1015,33 +948,38 @@ impl Index for BTreeIndex {
     }
 }
 
-/// The row ids of `keys` in order, past the first `offset`, up to `limit`
-fn ordered_row_ids<'a>(
-    keys: impl Iterator<Item = &'a RowIdSet>,
+/// The row ids of keys taken in order, past the first `offset`, up to
+/// `limit`
+struct OrderedIds {
+    ids: Vec<i64>,
     limit: usize,
-    offset: usize,
-) -> Vec<i64> {
-    // Pre-allocate with expected capacity
-    let mut result = Vec::with_capacity(limit.min(128));
-    let mut skipped = 0;
+    skip: usize,
+}
 
-    'outer: for row_ids in keys {
-        for row_id in row_ids.iter() {
-            // Handle offset
-            if skipped < offset {
-                skipped += 1;
-                continue;
-            }
-
-            result.push(row_id);
-
-            // Check limit
-            if result.len() >= limit {
-                break 'outer;
-            }
+impl OrderedIds {
+    fn new(limit: usize, offset: usize) -> Self {
+        OrderedIds {
+            ids: Vec::with_capacity(limit.min(128)),
+            limit,
+            skip: offset,
         }
     }
-    result
+
+    /// Takes a key's rows: whether more are wanted. A full walk takes no
+    /// more, whichever key comes next
+    fn take(&mut self, rows: &Ids) -> bool {
+        for row_id in rows.iter() {
+            if self.ids.len() >= self.limit {
+                return false;
+            }
+            if self.skip > 0 {
+                self.skip -= 1;
+                continue;
+            }
+            self.ids.push(row_id);
+        }
+        self.ids.len() < self.limit
+    }
 }
 
 /// Whether `key` lies past `end` in the map's own `Ord`. A range is walked
@@ -1403,6 +1341,67 @@ mod tests {
 
         index.remove_batch(&to_remove).unwrap();
         assert_eq!(index.entry_count(), 1);
+    }
+
+    #[test]
+    fn a_batch_built_into_an_empty_index_holds_what_one_by_one_adds_hold() {
+        // NULLs, repeated keys, INTEGER and FLOAT keys that compare equal,
+        // and words FLOAT values share
+        let values: Vec<Value> = (0..5_000i64)
+            .map(|i| match i % 5 {
+                0 => Value::Null(DataType::Integer),
+                1 => Value::Integer((i * 7_919) % 600),
+                2 => Value::Float(((i * 104_729) % 600) as f64),
+                3 => Value::Float((i % 997) as f64 * 0.37),
+                _ => Value::Integer(-(i % 31)),
+            })
+            .collect();
+        let entries: Vec<(i64, &[Value])> = values
+            .iter()
+            .enumerate()
+            .map(|(id, v)| (id as i64, std::slice::from_ref(v)))
+            .collect();
+        let batched = create_test_index();
+        batched.add_batch_slice(&entries).unwrap();
+        let one_by_one = create_test_index();
+        for &(id, v) in &entries {
+            one_by_one.add(v, id, id).unwrap();
+        }
+        assert_eq!(
+            batched.get_grouped_row_ids(),
+            one_by_one.get_grouped_row_ids()
+        );
+        assert_eq!(batched.entry_count(), values.len());
+    }
+
+    #[test]
+    fn an_ordered_walk_stops_at_its_limit_on_either_side_of_the_nulls() {
+        let index = create_test_index();
+        index.add(&[Value::Integer(1)], 1, 1).unwrap();
+        index.add(&[Value::Integer(2)], 3, 3).unwrap();
+        index.add(&[Value::Null(DataType::Integer)], 2, 2).unwrap();
+        // (ascending, nulls_first, limit, offset) and the ids in order
+        let cases = [
+            ((true, false, 1, 0), vec![1]),
+            ((true, false, 2, 0), vec![1, 3]),
+            ((true, false, 1, 2), vec![2]),
+            ((true, false, 3, 1), vec![3, 2]),
+            ((true, true, 1, 0), vec![2]),
+            ((false, true, 1, 0), vec![2]),
+            ((false, true, 2, 1), vec![3, 1]),
+            ((false, false, 2, 0), vec![3, 1]),
+            ((false, false, 1, 2), vec![2]),
+            ((true, false, 0, 0), vec![]),
+        ];
+        for ((ascending, nulls_first, limit, offset), want) in cases {
+            assert_eq!(
+                index
+                    .get_row_ids_ordered(ascending, nulls_first, limit, offset)
+                    .unwrap(),
+                want,
+                "ascending {ascending}, nulls first {nulls_first}, limit {limit}, offset {offset}"
+            );
+        }
     }
 
     #[test]

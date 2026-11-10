@@ -768,7 +768,7 @@ impl Ord for SmartString {
 /// a short key costs no call out to `memcmp`. Past eight bytes the last word
 /// overlaps the one before it, which compared equal
 #[inline]
-fn cmp_bytes(a: &[u8], b: &[u8]) -> Ordering {
+pub(crate) fn cmp_bytes(a: &[u8], b: &[u8]) -> Ordering {
     let n = a.len().min(b.len());
     let (a, b, same_length) = (&a[..n], &b[..n], a.len().cmp(&b.len()));
     let be = |w: &[u8; 8]| u64::from_be_bytes(*w);
