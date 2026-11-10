@@ -800,8 +800,8 @@ Stoolap automatically selects the optimal index type based on column data type:
 
 | Data Type | Index Type | Best For |
 |-----------|------------|----------|
-| INTEGER, FLOAT, TIMESTAMP | B-tree | Range queries, equality, sorting |
-| TEXT, JSON | Hash | Equality lookups, IN clauses |
+| INTEGER, FLOAT, TIMESTAMP, TEXT | B-tree | Range queries, equality, sorting, `LIKE 'prefix%'` on TEXT |
+| JSON | Hash | Equality lookups, IN clauses |
 | BOOLEAN | Bitmap | Low-cardinality columns |
 | VECTOR | HNSW | Nearest neighbor search |
 

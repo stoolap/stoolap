@@ -15,12 +15,12 @@ Stoolap supports five primary index types, each optimized for different query pa
 
 ### 1. B-tree Indexes
 
-B-tree indexes are the default for numeric and timestamp columns:
+B-tree indexes are the default for numeric, timestamp and text columns:
 
 - **Design**: Balanced tree structure with sorted values
 - **Strengths**: Range queries, equality lookups, sorting, prefix matching
-- **Default For**: `INTEGER`, `FLOAT`, `TIMESTAMP` columns
-- **Use Cases**: Price ranges, date ranges, numeric comparisons
+- **Default For**: `INTEGER`, `FLOAT`, `TIMESTAMP`, `TEXT` columns
+- **Use Cases**: Price ranges, date ranges, numeric comparisons, name prefixes
 
 ```sql
 -- Auto-selected for INTEGER column
@@ -42,13 +42,10 @@ Hash indexes provide O(1) equality lookups:
 
 - **Design**: Hash table mapping values to row IDs
 - **Strengths**: Fast equality lookups, O(1) average case
-- **Default For**: `TEXT`, `JSON` columns
-- **Use Cases**: Email lookups, username searches, exact string matches
+- **Default For**: `JSON` columns
+- **Use Cases**: Exact matches on a column never ranged, sorted or prefix-matched
 
 ```sql
--- Auto-selected for TEXT column
-CREATE INDEX idx_email ON users(email);
-
 -- Explicitly specify Hash
 CREATE INDEX idx_status ON orders(status) USING HASH;
 ```
@@ -128,7 +125,7 @@ When you create an index without specifying a type, Stoolap automatically select
 | `INTEGER` | B-tree | Range queries common on numbers |
 | `FLOAT` | B-tree | Range queries common on decimals |
 | `TIMESTAMP` | B-tree | Date range queries common |
-| `TEXT` | Hash | O(1) equality lookups for strings |
+| `TEXT` | B-tree | Ranges, prefixes, ordering and MIN/MAX on strings |
 | `JSON` | Hash | O(1) equality lookups for JSON |
 | `BOOLEAN` | Bitmap | Only two values, perfect for bitmap |
 | `VECTOR` | HNSW | Nearest neighbor search |
@@ -192,7 +189,7 @@ SELECT * FROM orders WHERE customer_id = 100;
 When multiple indexes exist on different columns, Stoolap can combine them:
 
 ```sql
--- If idx_category (Hash) and idx_price (B-tree) exist:
+-- If idx_category and idx_price exist:
 SELECT * FROM products WHERE category = 'Electronics' AND price > 500;
 -- Both indexes used, results intersected
 ```
@@ -286,7 +283,8 @@ ANALYZE orders;
 |--------------|-------------------|
 | `WHERE id = value` | B-tree or Hash |
 | `WHERE price > 100` | B-tree |
-| `WHERE email = value` | Hash (default for TEXT) |
+| `WHERE email = value` | B-tree (default for TEXT) or Hash |
+| `WHERE name LIKE 'ab%'` | B-tree |
 | `WHERE active = true` | Bitmap (default for BOOLEAN) |
 | `WHERE cat = x AND brand = y` | Multi-column |
 | `ORDER BY date` | B-tree |
