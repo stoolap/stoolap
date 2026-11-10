@@ -30,6 +30,7 @@ mod order_limit_test;
 mod ordered_limited_scan_test;
 mod outer_order_key_test;
 mod range_top_k_test;
+mod sealed_top_k_nulls_test;
 mod sort_order_rule_test;
 mod top_k_added_column_test;
 mod values_sort_key_test;

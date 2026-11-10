@@ -3612,12 +3612,14 @@ impl Table for MVCCTable {
         )
     }
 
+    // A walk that keeps NULL out has no NULLs to place
     fn scan_top_k(
         &self,
         walk: Option<&IndexPlan>,
         where_expr: Option<&dyn Expression>,
         column_name: &str,
         ascending: bool,
+        _nulls_first: bool,
         limit: usize,
         offset: usize,
     ) -> Result<Option<RowVec>> {
@@ -3648,10 +3650,8 @@ impl Table for MVCCTable {
             return Ok(None);
         };
         let column = &schema.columns[col_idx];
-        // NULL and NaN sort by rules the key order does not follow; a bound on
-        // the column keeps NULL out of a walk of its own B-tree
-        let bounded = plan.lower.is_some() || plan.upper.is_some();
-        let null_free = !column.nullable || (plan.prefix.is_empty() && bounded);
+        // NULL and NaN sort by rules the key order does not follow
+        let null_free = !column.nullable || index_plan::excludes_null(expr, schema, column_name);
         if !null_free || column.data_type == DataType::Float {
             return Ok(None);
         }

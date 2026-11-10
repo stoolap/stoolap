@@ -15662,6 +15662,7 @@ impl<'a> PreparedRunner<'a> {
             storage_expr.as_deref(),
             column,
             ascending,
+            crate::core::value::nulls_first(ascending, nulls_first),
             limit,
             offset,
         )?;

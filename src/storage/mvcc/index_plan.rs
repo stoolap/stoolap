@@ -413,6 +413,24 @@ fn decide_scope<T: IndexTerm + ?Sized>(
     }
 }
 
+/// Whether no row whose `column` is NULL passes `where_`: one of its
+/// conjuncts compares the column, and every comparison but IS NULL is
+/// unknown on NULL
+pub fn excludes_null<T: IndexTerm + ?Sized>(where_: &T, schema: &Schema, column: &str) -> bool {
+    let mut scope = SmallVec::new();
+    conjuncts(where_, schema, &mut scope);
+    scope.iter().any(|conjunct| match conjunct.term(schema) {
+        Term::Compare {
+            column: c,
+            operator,
+        } => operator != Operator::IsNull && c.eq_ignore_ascii_case(column),
+        Term::Between { column: c } | Term::In { column: c } | Term::LikePrefix { column: c } => {
+            c.eq_ignore_ascii_case(column)
+        }
+        Term::And | Term::Or | Term::Other => false,
+    })
+}
+
 /// The index a top-k read of `column` walks in key order under `where_`, a
 /// conjunction of comparisons: a multi-column index its equalities lead,
 /// walked on its next column, or the column's own index under bounds on it

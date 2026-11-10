@@ -1,0 +1,272 @@
+// Copyright 2025 Stoolap Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! A top-k read over sealed and hot rows of a nullable or FLOAT column
+//! places NULL and NaN as the whole sort does
+
+use stoolap::Database;
+
+/// Two volumes, the second with `i` all NULL and `f` NaN or NULL, then hot
+/// rows, a sealed row updated and a sealed row deleted
+fn sealed(dir: &std::path::Path) -> Database {
+    let db = Database::open(&format!("file://{}?checkpoint_on_close=off", dir.display())).unwrap();
+    db.execute(
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, i INTEGER, t TEXT, f FLOAT, ts TIMESTAMP)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX s_i ON s (i)", ()).unwrap();
+    let row = |id: i64, i: &str, t: &str, f: &str, ts: &str| {
+        format!("INSERT INTO s VALUES ({id}, {i}, {t}, {f}, {ts})")
+    };
+    let day = |d: i64| format!("'2024-01-{d:02} 00:00:00'");
+    for id in 1..=10 {
+        let i = if id == 3 {
+            "NULL".into()
+        } else {
+            (id * 10).to_string()
+        };
+        let t = if id == 4 {
+            "NULL".into()
+        } else {
+            format!("'t{id:02}'")
+        };
+        let f = match id {
+            5 => "CAST('NaN' AS FLOAT)".into(),
+            6 => "NULL".into(),
+            _ => format!("{id}.5"),
+        };
+        let ts = if id == 7 { "NULL".into() } else { day(id + 1) };
+        db.execute(&row(id, &i, &t, &f, &ts), ()).unwrap();
+    }
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    for id in 11..=15 {
+        let f = if id < 13 {
+            "NULL"
+        } else {
+            "CAST('NaN' AS FLOAT)"
+        };
+        db.execute(&row(id, "NULL", &format!("'t{id}'"), f, &day(id + 1)), ())
+            .unwrap();
+    }
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute(&row(16, "5", "'a16'", "0.25", &day(1)), ())
+        .unwrap();
+    db.execute(
+        &row(17, "155", "'t99'", "CAST('NaN' AS FLOAT)", &day(30)),
+        (),
+    )
+    .unwrap();
+    db.execute(&row(18, "NULL", "NULL", "NULL", "NULL"), ())
+        .unwrap();
+    db.execute("UPDATE s SET i = 1 WHERE id = 10", ()).unwrap();
+    db.execute("DELETE FROM s WHERE id = 9", ()).unwrap();
+    db
+}
+
+/// The sort column's values in order, and the ids, sorted: rows tied on
+/// the key may come in any order
+fn read(db: &Database, sql: &str) -> (Vec<String>, Vec<i64>) {
+    let mut keys = Vec::new();
+    let mut ids = Vec::new();
+    for row in db.query(sql, ()).unwrap() {
+        let row = row.unwrap();
+        ids.push(row.get::<i64>(0).unwrap());
+        keys.push(row.get_value(1).unwrap().to_string());
+    }
+    ids.sort_unstable();
+    (keys, ids)
+}
+
+fn taken(db: &Database, sql: &str) -> bool {
+    #[cfg(feature = "test-failpoints")]
+    {
+        stoolap::test_failpoints::reset_order_limit_paths();
+        db.query(sql, ()).unwrap().for_each(drop);
+        stoolap::test_failpoints::order_limit_paths_taken().contains(&"prepared_top_k")
+    }
+    #[cfg(not(feature = "test-failpoints"))]
+    {
+        let _ = (db, sql);
+        true
+    }
+}
+
+/// The statement, whether the top-k read answers it, the sort column's
+/// values and the ids
+type Case = (&'static str, bool, &'static [&'static str], &'static [i64]);
+
+const CASES: &[Case] = &[
+    // NULLs last ascending, first descending, unless written
+    (
+        "SELECT id, i FROM s ORDER BY i LIMIT 3",
+        true,
+        &["1", "5", "10"],
+        &[1, 10, 16],
+    ),
+    (
+        "SELECT id, i FROM s ORDER BY i DESC LIMIT 9",
+        true,
+        &[
+            "NULL", "NULL", "NULL", "NULL", "NULL", "NULL", "NULL", "155", "80",
+        ],
+        &[3, 8, 11, 12, 13, 14, 15, 17, 18],
+    ),
+    (
+        "SELECT id, i FROM s ORDER BY i DESC NULLS LAST LIMIT 3",
+        true,
+        &["155", "80", "70"],
+        &[7, 8, 17],
+    ),
+    (
+        "SELECT id, i FROM s ORDER BY i NULLS FIRST LIMIT 9",
+        true,
+        &[
+            "NULL", "NULL", "NULL", "NULL", "NULL", "NULL", "NULL", "1", "5",
+        ],
+        &[3, 10, 11, 12, 13, 14, 15, 16, 18],
+    ),
+    // Fewer values than the limit: the NULLs follow
+    (
+        "SELECT id, i FROM s ORDER BY i LIMIT 17",
+        true,
+        &[
+            "1", "5", "10", "20", "40", "50", "60", "70", "80", "155", "NULL", "NULL", "NULL",
+            "NULL", "NULL", "NULL", "NULL",
+        ],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+    ),
+    // A WHERE on the column keeps every NULL out
+    (
+        "SELECT id, i FROM s WHERE i > 15 ORDER BY i DESC LIMIT 3",
+        true,
+        &["155", "80", "70"],
+        &[7, 8, 17],
+    ),
+    (
+        "SELECT id, i FROM s WHERE i > 15 ORDER BY i LIMIT 2 OFFSET 1",
+        true,
+        &["40", "50"],
+        &[4, 5],
+    ),
+    // NaN after every number, NULL after NaN ascending
+    (
+        "SELECT id, f FROM s ORDER BY f LIMIT 3",
+        true,
+        &["0.25", "1.5", "2.5"],
+        &[1, 2, 16],
+    ),
+    (
+        "SELECT id, f FROM s ORDER BY f LIMIT 13",
+        true,
+        &[
+            "0.25", "1.5", "2.5", "3.5", "4.5", "7.5", "8.5", "10.5", "NaN", "NaN", "NaN", "NaN",
+            "NaN",
+        ],
+        &[1, 2, 3, 4, 5, 7, 8, 10, 13, 14, 15, 16, 17],
+    ),
+    (
+        "SELECT id, f FROM s ORDER BY f LIMIT 17",
+        true,
+        &[
+            "0.25", "1.5", "2.5", "3.5", "4.5", "7.5", "8.5", "10.5", "NaN", "NaN", "NaN", "NaN",
+            "NaN", "NULL", "NULL", "NULL", "NULL",
+        ],
+        &[1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+    ),
+    (
+        "SELECT id, f FROM s WHERE f > 3 ORDER BY f LIMIT 2",
+        true,
+        &["3.5", "4.5"],
+        &[3, 4],
+    ),
+    // Descending, NaN comes first and no zone map bounds it: the sort answers
+    (
+        "SELECT id, f FROM s ORDER BY f DESC LIMIT 9",
+        false,
+        &[
+            "NULL", "NULL", "NULL", "NULL", "NaN", "NaN", "NaN", "NaN", "NaN",
+        ],
+        &[5, 6, 11, 12, 13, 14, 15, 17, 18],
+    ),
+    (
+        "SELECT id, t FROM s ORDER BY t LIMIT 2",
+        true,
+        &["a16", "t01"],
+        &[1, 16],
+    ),
+    (
+        "SELECT id, t FROM s ORDER BY t DESC LIMIT 4",
+        true,
+        &["NULL", "NULL", "t99", "t15"],
+        &[4, 15, 17, 18],
+    ),
+    (
+        "SELECT id, t FROM s WHERE t >= 't12' ORDER BY t DESC LIMIT 2",
+        true,
+        &["t99", "t15"],
+        &[15, 17],
+    ),
+    (
+        "SELECT id, ts FROM s ORDER BY ts DESC LIMIT 3",
+        true,
+        &["NULL", "NULL", "2024-01-30T00:00:00+00:00"],
+        &[7, 17, 18],
+    ),
+    (
+        "SELECT id, ts FROM s ORDER BY ts LIMIT 2",
+        true,
+        &["2024-01-01T00:00:00+00:00", "2024-01-02T00:00:00+00:00"],
+        &[1, 16],
+    ),
+];
+
+#[test]
+fn a_sealed_top_k_places_null_and_nan_as_the_sort_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = sealed(dir.path());
+    let mut wrong = Vec::new();
+    for &(sql, top_k, keys, ids) in CASES {
+        let got = read(&db, sql);
+        if got.0 != keys || got.1 != ids {
+            wrong.push(format!("{sql}\n  got  {got:?}\n  want ({keys:?}, {ids:?})"));
+        }
+        if taken(&db, sql) != top_k {
+            wrong.push(format!("{sql}: top-k read taken is not {top_k}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_hot_top_k_walks_a_prefix_index_when_the_where_bounds_a_nullable_column() {
+    let db = Database::open("memory://sealed_top_k_nulls_prefix").unwrap();
+    db.execute(
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX p_gv ON p (g, v)", ()).unwrap();
+    db.execute(
+        "INSERT INTO p VALUES (1, 1, 30), (2, 1, NULL), (3, 1, 10), (4, 2, 5), (5, 1, 20)",
+        (),
+    )
+    .unwrap();
+    let sql = "SELECT id, v FROM p WHERE g = 1 AND v > 10 ORDER BY v LIMIT 2";
+    assert_eq!(
+        read(&db, sql),
+        (vec!["20".to_string(), "30".to_string()], vec![1, 5])
+    );
+    assert!(taken(&db, sql), "{sql}: the hot index walk answers");
+}
