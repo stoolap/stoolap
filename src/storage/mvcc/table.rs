@@ -695,6 +695,7 @@ impl MVCCTable {
         if !index.is_unique() {
             return Ok(());
         }
+        let hnsw = index.as_any().downcast_ref::<HnswIndex>();
         let txn_versions = self.local();
         let mut seen: ahash::AHashSet<Vec<Value>> = ahash::AHashSet::new();
         for (row_id, version) in txn_versions.iter_local() {
@@ -714,7 +715,12 @@ impl MVCCTable {
             if key.iter().any(Value::is_null) {
                 continue;
             }
-            if seen.contains(&key) || !index.get_row_ids_equal(&key).is_empty() {
+            // An HNSW index answers no equality lookup; it matches vector bytes
+            let taken = match hnsw {
+                Some(hnsw) => hnsw.find_exact_duplicate(&key[0], row_id, None).is_some(),
+                None => !index.get_row_ids_equal(&key).is_empty(),
+            };
+            if seen.contains(&key) || taken {
                 return Err(Error::unique_constraint(
                     index.name(),
                     index.column_names().join(", "),
@@ -4276,6 +4282,20 @@ impl Table for MVCCTable {
 
         self.version_store.add_index(name.to_string(), index);
         Ok(())
+    }
+
+    fn check_local_rows_unique(&self, name: &str) -> Result<()> {
+        let Some(index) = self.version_store.get_index(name) else {
+            return Ok(());
+        };
+        let schema = self.version_store.schema();
+        let col_indices = index
+            .column_names()
+            .iter()
+            .map(|c| schema.find_column(c).map(|(i, _)| i))
+            .collect::<Option<Vec<usize>>>()
+            .ok_or_else(|| Error::internal(format!("index '{name}' names a missing column")))?;
+        self.check_local_unique(&*index, &col_indices)
     }
 
     fn drop_index(&self, name: &str) -> Result<()> {

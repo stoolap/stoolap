@@ -15,6 +15,7 @@
 //! An index created inside a transaction holds that transaction's own rows
 //! by the keys they commit with, and refuses a unique key they break
 
+use stoolap::storage::index::HnswDistanceMetric;
 use stoolap::storage::traits::{Engine, ScanAccess};
 use stoolap::{Database, IndexType, Row, Value};
 
@@ -113,4 +114,40 @@ fn a_unique_index_created_in_a_transaction_refuses_its_own_duplicate_rows() {
             tx.rollback().unwrap();
         }
     }
+}
+
+#[test]
+fn a_unique_hnsw_index_created_in_a_transaction_refuses_a_row_that_repeats_a_committed_vector() {
+    let mut wrong = Vec::new();
+    for sealed in [false, true] {
+        for custom in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+            db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v VECTOR(3))", ())
+                .unwrap();
+            db.execute("INSERT INTO t VALUES (1, '[1, 2, 3]')", ())
+                .unwrap();
+            if sealed {
+                db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+            }
+            let mut tx = db.engine().begin_transaction().unwrap();
+            let mut t = tx.get_table("t").unwrap();
+            t.insert(Row::from_values(vec![
+                Value::Integer(2),
+                Value::vector(vec![1.0, 2.0, 3.0]),
+            ]))
+            .unwrap();
+            let created = if custom {
+                t.create_hnsw_index("ix", "v", true, 16, 64, 64, HnswDistanceMetric::L2)
+            } else {
+                t.create_index_with_type("ix", &["v"], true, Some(IndexType::Hnsw))
+            };
+            if !matches!(&created, Err(e) if e.to_string().contains("unique")) {
+                wrong.push(format!("sealed {sealed}, custom {custom}: {created:?}"));
+            }
+            drop(t);
+            tx.rollback().unwrap();
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
