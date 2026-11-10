@@ -30,7 +30,8 @@ fn table(name: &str) -> Database {
         (),
     )
     .unwrap();
-    db.execute("CREATE INDEX t_name ON t(name)", ()).unwrap();
+    db.execute("CREATE INDEX t_name ON t(name) USING HASH", ())
+        .unwrap();
     db.execute("CREATE INDEX t_active ON t(active)", ())
         .unwrap();
     for id in 1..=50i64 {

@@ -165,8 +165,8 @@ CREATE INDEX idx_name_created ON products (name, created_at);
 
 Stoolap supports multiple index implementations:
 
-1. **B-tree Indexes** - For numeric and timestamp columns, supporting equality and range queries
-2. **Hash Indexes** - For text and JSON columns, optimized for equality lookups
+1. **B-tree Indexes** - For numeric, timestamp and text columns, supporting equality, range queries and ordering
+2. **Hash Indexes** - For JSON columns, or any column with `USING HASH`, optimized for equality lookups
 3. **Bitmap Indexes** - For boolean columns and low-cardinality data
 4. **HNSW Indexes** - For vector columns, approximate nearest neighbor search (see [Vector Search]({% link _docs/data-types/vector-search.md %}))
 5. **Multi-column Indexes** - For queries that filter on multiple columns together

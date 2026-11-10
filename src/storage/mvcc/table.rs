@@ -509,7 +509,8 @@ impl MVCCTable {
     /// Auto-selects the optimal index type based on column data types
     ///
     /// # Type-Based Index Selection Rules:
-    /// - TEXT/JSON columns → Hash index (avoids O(strlen) comparisons per B-tree node)
+    /// - TEXT columns → BTree index (ranges, prefixes, ordering, MIN/MAX)
+    /// - JSON columns → Hash index (equality only)
     /// - BOOLEAN columns → Bitmap index (only 2 values, fast AND/OR operations)
     /// - INTEGER/FLOAT/TIMESTAMP columns → BTree index (supports range queries)
     /// - Mixed types → BTree as safe default
@@ -543,8 +544,11 @@ impl MVCCTable {
 
         // Check the primary (first) column type
         match data_types[0] {
-            // TEXT/JSON - use Hash for O(1) lookups, avoid O(strlen) comparisons
-            DataType::Text | DataType::Json => IndexType::Hash,
+            // TEXT - BTree, for ranges, prefixes, ordering and MIN/MAX as well
+            DataType::Text => IndexType::BTree,
+
+            // JSON - Hash, as its order serves no query
+            DataType::Json => IndexType::Hash,
 
             // BOOLEAN - use Bitmap for fast AND/OR/NOT operations
             DataType::Boolean => IndexType::Bitmap,

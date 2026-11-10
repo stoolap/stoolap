@@ -57,6 +57,7 @@ mod side_index_dictionary_test;
 mod side_index_float_test;
 mod side_index_matrix_test;
 mod sorted_equality_test;
+mod text_default_index_test;
 mod unique_check_lock_order_test;
 mod unique_conflict_message_test;
 mod unique_get_test;
