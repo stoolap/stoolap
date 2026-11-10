@@ -293,6 +293,10 @@ ALTER TABLE parents RENAME TO families;
 INSERT INTO children VALUES (2, 1, 'Second');
 ```
 
+### RENAME COLUMN
+
+Renaming a column a foreign key names renames it in the key too: a referenced column of the parent in every child's key, and a key column of the child in its own key. The keys keep their checks and actions, also after the database is opened again.
+
 ## CREATE TABLE Validation
 
 FK constraints are validated at table creation time:

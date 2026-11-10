@@ -1275,6 +1275,11 @@ impl Executor {
                         change.finish();
                         return Err(error);
                     }
+                    self.engine.rename_referenced_column(
+                        table_name,
+                        &old_name.value,
+                        &new_name.value,
+                    );
 
                     // Propagate rename alias to cold volumes
                     self.engine.propagate_column_alias(

@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A foreign key follows its parent table through a rename, live and after
-//! the database opens again from its log or from a checkpoint
+//! A foreign key follows its parent table and the columns it names through
+//! a rename, live and after the database opens again from its log or from a
+//! checkpoint
 
 use stoolap::Database;
 
@@ -97,4 +98,65 @@ fn a_failed_rename_leaves_no_child_lookup_of_the_new_name() {
         "c still references p's row 1"
     );
     assert_eq!(count(&db, "SELECT COUNT(*) FROM p"), 1);
+}
+
+#[test]
+fn a_key_follows_its_renamed_columns() {
+    for reopen in ["live", "log", "checkpoint"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = open(&dir);
+        for sql in [
+            "CREATE TABLE p (id INTEGER PRIMARY KEY, k INTEGER UNIQUE)",
+            "CREATE TABLE c (id INTEGER PRIMARY KEY, \
+             pk INTEGER UNIQUE REFERENCES p(k) ON UPDATE CASCADE)",
+            "CREATE TABLE g (id INTEGER PRIMARY KEY, cpk INTEGER REFERENCES c(pk) ON UPDATE CASCADE)",
+            "INSERT INTO p VALUES (1, 10), (2, 30)",
+            "INSERT INTO c VALUES (100, 10)",
+            "INSERT INTO g VALUES (1000, 10)",
+            "ALTER TABLE p RENAME COLUMN k TO k2",
+            "ALTER TABLE c RENAME COLUMN pk TO pk2",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        if reopen != "live" {
+            if reopen == "checkpoint" {
+                db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+            }
+            db.close().unwrap();
+            db = open(&dir);
+        }
+        let shown: String = db
+            .query("SHOW CREATE TABLE c", ())
+            .unwrap()
+            .map(|row| row.unwrap().get::<String>(1).unwrap())
+            .collect();
+        assert!(
+            shown.contains("FOREIGN KEY (pk2) REFERENCES p(k2)"),
+            "{reopen}: {shown}"
+        );
+        db.execute("INSERT INTO c VALUES (101, 30)", ())
+            .unwrap_or_else(|e| panic!("{reopen}: child insert: {e}"));
+        for refused in [
+            "INSERT INTO c VALUES (102, 99)",
+            "DELETE FROM p WHERE id = 1",
+        ] {
+            assert!(
+                db.execute(refused, ()).is_err(),
+                "{reopen}: {refused} must be refused"
+            );
+        }
+        db.execute("UPDATE p SET k2 = 20 WHERE id = 1", ())
+            .unwrap_or_else(|e| panic!("{reopen}: parent update: {e}"));
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM c WHERE pk2 = 20"),
+            1,
+            "{reopen}: the child follows the cascade"
+        );
+        assert_eq!(
+            count(&db, "SELECT COUNT(*) FROM g WHERE cpk = 20"),
+            1,
+            "{reopen}: the grandchild follows the child's renamed column"
+        );
+        db.close().unwrap();
+    }
 }
