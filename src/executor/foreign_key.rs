@@ -60,11 +60,12 @@ pub(crate) fn check_parent_exists(
 
 /// The keys into the table a statement inserts into, `table` in lower
 /// case, that found no parent row yet: a later row of the statement may be
-/// it. Each is a child table, its key and the value, asked by
-/// [`PendingParents::check`] once the statement's rows are written
+/// it. Each value waits under its child table and key, kept once in
+/// `keys`, and is asked by [`PendingParents::check`] once the rows are written
 pub(crate) struct PendingParents<'t> {
     table: &'t str,
-    keys: Vec<(String, ForeignKeyConstraint, Value)>,
+    keys: Vec<(String, ForeignKeyConstraint)>,
+    values: Vec<(usize, Value)>,
 }
 
 impl<'t> PendingParents<'t> {
@@ -72,6 +73,7 @@ impl<'t> PendingParents<'t> {
         PendingParents {
             table,
             keys: Vec::new(),
+            values: Vec::new(),
         }
     }
 
@@ -97,8 +99,15 @@ impl<'t> PendingParents<'t> {
         if fk.referenced_table != self.table {
             return Err(missing_parent(child_table, fk, value));
         }
-        self.keys
-            .push((child_table.to_string(), fk.clone(), value.clone()));
+        let known = self
+            .keys
+            .iter()
+            .position(|(table, key)| table == child_table && same_key(key, fk));
+        let at = known.unwrap_or_else(|| {
+            self.keys.push((child_table.to_string(), fk.clone()));
+            self.keys.len() - 1
+        });
+        self.values.push((at, value.clone()));
         Ok(())
     }
 
@@ -106,7 +115,8 @@ impl<'t> PendingParents<'t> {
     /// written. A value no row holds any more, which a later update of the
     /// statement replaced, names nothing
     pub(crate) fn check(&self, engine: &MVCCEngine, txn_id: i64) -> Result<()> {
-        for (child_table, fk, value) in &self.keys {
+        for (at, value) in &self.values {
+            let (child_table, fk) = &self.keys[*at];
             if !parent_row_exists(
                 engine,
                 txn_id,
