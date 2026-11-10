@@ -305,3 +305,36 @@ fn a_shared_key_hold_moves_down_with_its_column_across_a_drop() {
     );
     assert_eq!(count(&db, "SELECT COUNT(*) FROM p"), 1);
 }
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_check_holds_its_key_where_a_drop_moved_the_column() {
+    use stoolap::IsolationLevel::{ReadCommitted, SnapshotIsolation};
+    for isolation in [ReadCommitted, SnapshotIsolation] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(&dir);
+        for sql in [
+            "CREATE TABLE p (id INTEGER PRIMARY KEY, k INTEGER, j INTEGER UNIQUE)",
+            "CREATE TABLE d (id INTEGER PRIMARY KEY, pj INTEGER REFERENCES p(j))",
+            "INSERT INTO p VALUES (1, 10, 20)",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        let mut inserting = db.clone().begin_with_isolation(isolation).unwrap();
+        let dropping = db.clone();
+        stoolap::test_failpoints::before_fk_parent_hold(move || {
+            dropping.execute("ALTER TABLE p DROP COLUMN k", ()).unwrap();
+        });
+        let inserted = inserting.execute("INSERT INTO d VALUES (1, 20)", ());
+        let _ = db.clone().execute("DELETE FROM p WHERE id = 1", ());
+        let committed = inserting.commit();
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM d WHERE pj NOT IN (SELECT j FROM p)"
+            ),
+            0,
+            "{isolation:?}: insert {inserted:?}, commit {committed:?}: a child without its parent"
+        );
+    }
+}

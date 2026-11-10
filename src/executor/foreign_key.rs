@@ -155,11 +155,20 @@ fn parent_row_exists(
     crate::test_failpoints::fk_parent_hold_next();
     let column = &parent_schema.columns[ref_idx].name;
     engine.hold_key(txn_id, parent_table, (column, ref_idx), &key, false)?;
-    // A snapshot's handle took its view before the hold, so it is taken again
+    // A snapshot's handle took its view before the hold, so it is taken again,
+    // and a drop meanwhile that moved the column has its new position held
     if engine.reads_snapshot(txn_id) {
-        parent = open()?;
-        parent_schema = parent.schema_arc();
-        ref_idx = referenced_position(&parent_schema, parent_table, parent_column)?;
+        loop {
+            parent = open()?;
+            parent_schema = parent.schema_arc();
+            let at = referenced_position(&parent_schema, parent_table, parent_column)?;
+            if at == ref_idx {
+                break;
+            }
+            ref_idx = at;
+            let column = &parent_schema.columns[ref_idx].name;
+            engine.hold_key(txn_id, parent_table, (column, ref_idx), &key, false)?;
+        }
     }
 
     // The storage layer uses the PK fast path (O(1)) or a secondary index
