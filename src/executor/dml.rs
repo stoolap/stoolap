@@ -2978,6 +2978,7 @@ impl Executor {
                     .or_default()
                     .push((old_val, new_val));
             }
+            let mut parent_checks = Vec::new();
             for (col_idx, changes) in &by_column {
                 if let Some(fks_for_col) = fks_by_ref_col.get(col_idx) {
                     super::foreign_key::enforce_update_actions(
@@ -2985,9 +2986,15 @@ impl Executor {
                         table.txn_id(),
                         changes,
                         fks_for_col,
+                        &mut parent_checks,
                     )?;
                 }
             }
+            super::foreign_key::check_cascaded_parents(
+                &self.engine,
+                table.txn_id(),
+                &parent_checks,
+            )?;
         }
 
         // Invalidate semantic cache for this table BEFORE commit
@@ -3917,6 +3924,7 @@ impl Executor {
         for row in &fk_rows {
             super::foreign_key::check_parent_exists(&self.engine, txn_id, schema, row)?;
         }
+        let mut parent_checks = Vec::new();
         for (idx, old, new) in ref_changes {
             let Some(fks) = fks_by_ref_col.get(&idx) else {
                 continue;
@@ -3930,8 +3938,15 @@ impl Executor {
                     fks,
                 )?;
             }
-            super::foreign_key::enforce_update_actions(&self.engine, txn_id, &[(old, new)], fks)?;
+            super::foreign_key::enforce_update_actions(
+                &self.engine,
+                txn_id,
+                &[(old, new)],
+                fks,
+                &mut parent_checks,
+            )?;
         }
+        super::foreign_key::check_cascaded_parents(&self.engine, txn_id, &parent_checks)?;
 
         Ok((updated > 0, captured_row))
     }

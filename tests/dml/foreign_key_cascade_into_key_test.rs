@@ -235,3 +235,41 @@ fn a_cascade_refuses_a_key_another_foreign_key_of_the_child_does_not_find() {
     assert_eq!(rows(&db, "SELECT id FROM c"), [[1]]);
     assert_eq!(rows(&db, "SELECT id FROM p"), [[1]]);
 }
+
+#[test]
+fn a_child_key_two_cascades_reach_is_checked_once_both_are_done() {
+    let db = Database::open("memory://fk_cascade_into_key_two_paths").unwrap();
+    for sql in [
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, u INTEGER UNIQUE)",
+        "CREATE TABLE p (id INTEGER PRIMARY KEY REFERENCES r(id) ON UPDATE CASCADE)",
+        "CREATE TABLE q (id INTEGER PRIMARY KEY REFERENCES r(u) ON UPDATE CASCADE)",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, \
+         FOREIGN KEY (id) REFERENCES p(id) ON UPDATE CASCADE, \
+         FOREIGN KEY (id) REFERENCES q(id) ON UPDATE CASCADE)",
+        "INSERT INTO r VALUES (1, 1)",
+        "INSERT INTO p VALUES (1)",
+        "INSERT INTO q VALUES (1)",
+        "INSERT INTO c VALUES (1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    db.execute("UPDATE r SET id = 2, u = 2", ()).unwrap();
+    db.execute(
+        "INSERT INTO r VALUES (2, 9) ON CONFLICT (id) DO UPDATE SET id = 5, u = 5",
+        (),
+    )
+    .unwrap();
+    for table in ["p", "q", "c"] {
+        assert_eq!(
+            rows(&db, &format!("SELECT id FROM {table}")),
+            [[5]],
+            "{table}"
+        );
+    }
+    let error = db
+        .execute("UPDATE r SET id = 6", ())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("does not exist"), "{error}");
+    assert_eq!(rows(&db, "SELECT id FROM c"), [[5]]);
+}
