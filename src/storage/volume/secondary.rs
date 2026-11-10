@@ -1675,19 +1675,26 @@ impl IndexFile {
         })
     }
 
-    /// The file, checked to still be the generation the directory was read from
-    fn open_checked(&self) -> std::io::Result<std::fs::File> {
-        let file = self.file.open()?;
-        let mut header = [0u8; HEADER_LEN as usize];
-        read_exact_at(&file, &mut header, 0)?;
-        if header[..4] != MAGIC {
-            return Err(invalid("bad magic"));
+    /// The file through its kept descriptor, checked to still be the
+    /// generation the directory was read from. A descriptor kept from a
+    /// file since written over at the path goes, and the path is opened again
+    fn open_checked(&self) -> std::io::Result<Arc<std::fs::File>> {
+        for reopened in [false, true] {
+            let file = self.file.block_reader()?;
+            let mut header = [0u8; HEADER_LEN as usize];
+            read_exact_at(&file, &mut header, 0)?;
+            if header[..4] != MAGIC {
+                return Err(invalid("bad magic"));
+            }
+            let generation = u64::from_le_bytes(header[8..16].try_into().expect("8 bytes"));
+            if generation == self.directory.generation {
+                return Ok(file);
+            }
+            if !reopened {
+                self.file.drop_reader();
+            }
         }
-        let generation = u64::from_le_bytes(header[8..16].try_into().expect("8 bytes"));
-        if generation != self.directory.generation {
-            return Err(invalid("generation changed"));
-        }
-        Ok(file)
+        Err(invalid("generation changed"))
     }
 
     /// Reads one page's raw bytes into `buf`, whose capacity the caller
@@ -5521,6 +5528,9 @@ mod tests {
         let file = IndexFile::open(&path, 1).unwrap();
         assert!(file.directory().entry(22).is_none());
         assert_eq!(file.directory().entry(11).unwrap().n_positions, 100_000);
+        // Read through the file written over the one read above
+        let (start, end) = file.equal(11, key).unwrap().unwrap();
+        assert!(end > start);
     }
 
     /// Builds `columns` at `path` with the entries `copies` copied first

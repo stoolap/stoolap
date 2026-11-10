@@ -71,3 +71,51 @@ fn a_scan_opens_each_volume_file_once() {
         "a second scan opened the files again {again} times"
     );
 }
+
+#[test]
+fn point_reads_through_side_files_open_each_file_once() {
+    let _opens = OPENS.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!(
+        "file://{}?checkpoint_on_close=off&checkpoint_interval=0&compact_threshold=100",
+        dir.path().display()
+    );
+    let rows = 2 * ROWS_PER_VOLUME;
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, k INTEGER)", ())
+            .unwrap();
+        db.execute("CREATE INDEX s_k ON s (k)", ()).unwrap();
+        for volume in 0..2 {
+            db.execute(
+                &format!(
+                    "INSERT INTO s SELECT g.value, (g.value * 7919) % {rows} \
+                     FROM generate_series({}, {}) g",
+                    volume * ROWS_PER_VOLUME + 1,
+                    (volume + 1) * ROWS_PER_VOLUME
+                ),
+                (),
+            )
+            .unwrap();
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        db.close().unwrap();
+    }
+    let db = Database::open(&dsn).unwrap();
+    // Far less page cache than the side files: most probes read their
+    // pages from the file
+    db.execute("PRAGMA INDEX_CACHE_MB = 1", ()).unwrap();
+    let before = volume_file_opens();
+    for i in 0..50i64 {
+        let k = (i * 104_729) % rows;
+        let ids: Vec<i64> = db
+            .query("SELECT id FROM s WHERE k = $1", (k,))
+            .unwrap()
+            .map(|row| row.unwrap().get(0).unwrap())
+            .collect();
+        assert_eq!(ids.len(), 1, "k = {k}");
+    }
+    let opens = volume_file_opens() - before;
+    // Two volume files and their two side files
+    assert!(opens <= 4, "50 point reads opened the files {opens} times");
+}

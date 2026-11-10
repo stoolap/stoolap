@@ -190,7 +190,7 @@ impl VolumeFile {
     /// A descriptor for block reads, kept while the file is among the
     /// `KEPT_READERS` read most recently; a rename or a retire leaves an
     /// open descriptor reading the same file
-    fn block_reader(self: &Arc<Self>) -> std::io::Result<Arc<std::fs::File>> {
+    pub(super) fn block_reader(self: &Arc<Self>) -> std::io::Result<Arc<std::fs::File>> {
         use std::sync::atomic::Ordering;
         let now = READ_CLOCK.fetch_add(1, Ordering::Relaxed);
         self.last_read.store(now, Ordering::Relaxed);
@@ -241,7 +241,7 @@ impl VolumeFile {
 
     /// Gives up the kept descriptor and the file's place among the kept,
     /// under the lock a descriptor is kept under
-    fn drop_reader(self: &Arc<Self>) {
+    pub(super) fn drop_reader(self: &Arc<Self>) {
         let mut open = OPEN_READERS.lock();
         if self.reader.lock().take().is_some() {
             open.retain(|weak| !std::ptr::eq(weak.as_ptr(), Arc::as_ptr(self)));
