@@ -154,12 +154,21 @@ fn parent_row_exists(
     #[cfg(feature = "test-failpoints")]
     crate::test_failpoints::fk_parent_hold_next();
     let column = &parent_schema.columns[ref_idx].name;
-    engine.hold_key(txn_id, parent_table, column, &key, false)?;
-    // A snapshot's handle took its view before the hold, so it is taken again
+    engine.hold_key(txn_id, parent_table, (column, ref_idx), &key, false)?;
+    // A snapshot's handle took its view before the hold, so it is taken again,
+    // and a drop meanwhile that moved the column has its new position held
     if engine.reads_snapshot(txn_id) {
-        parent = open()?;
-        parent_schema = parent.schema_arc();
-        ref_idx = referenced_position(&parent_schema, parent_table, parent_column)?;
+        loop {
+            parent = open()?;
+            parent_schema = parent.schema_arc();
+            let at = referenced_position(&parent_schema, parent_table, parent_column)?;
+            if at == ref_idx {
+                break;
+            }
+            ref_idx = at;
+            let column = &parent_schema.columns[ref_idx].name;
+            engine.hold_key(txn_id, parent_table, (column, ref_idx), &key, false)?;
+        }
     }
 
     // The storage layer uses the PK fast path (O(1)) or a secondary index
@@ -204,7 +213,7 @@ fn hold_alone<'v>(
     let at = referenced_position(&schema, parent_table, &fk.referenced_column)?;
     let column = &schema.columns[at].name;
     for value in values.into_iter().filter(|v| !v.is_null()) {
-        engine.hold_key(txn_id, parent_table, column, value, true)?;
+        engine.hold_key(txn_id, parent_table, (column, at), value, true)?;
     }
     Ok(())
 }

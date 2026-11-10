@@ -324,24 +324,40 @@ fn retarget_fk_references(
     from: &str,
     to: &str,
 ) {
+    retarget_fks(
+        schemas,
+        version_stores,
+        |fk| fk.referenced_table == from,
+        |fk| fk.referenced_table = to.to_string(),
+    );
+}
+
+/// Apply `retarget` to every FK constraint `matches` in the schemas map and
+/// each affected VersionStore's schema; the names of the tables changed.
+/// Caller must hold schemas as write-locked and version_stores as read-locked.
+fn retarget_fks(
+    schemas: &mut FxHashMap<String, CompactArc<Schema>>,
+    version_stores: &FxHashMap<String, Arc<VersionStore>>,
+    matches: impl Fn(&ForeignKeyConstraint) -> bool,
+    retarget: impl Fn(&mut ForeignKeyConstraint),
+) -> Vec<String> {
+    let mut changed = Vec::new();
     for (name, schema_arc) in schemas.iter_mut() {
-        if !schema_arc
-            .foreign_keys
-            .iter()
-            .any(|fk| fk.referenced_table == from)
-        {
+        if !schema_arc.foreign_keys.iter().any(&matches) {
             continue;
         }
         let schema = CompactArc::make_mut(schema_arc);
-        for fk in &mut schema.foreign_keys {
-            if fk.referenced_table == from {
-                fk.referenced_table = to.to_string();
-            }
-        }
+        schema
+            .foreign_keys
+            .iter_mut()
+            .filter(|fk| matches(fk))
+            .for_each(&retarget);
         if let Some(vs) = version_stores.get(name.as_str()) {
             *vs.schema_mut() = schema_arc.clone();
         }
+        changed.push(name.clone());
     }
+    changed
 }
 
 /// The most bytes a name or a text the schema keeps may take: the file
@@ -3636,7 +3652,7 @@ impl MVCCEngine {
             .get_table_for_transaction(txn_id, table_name, None, None, TableUse::Read)
     }
 
-    /// Holds `value` of `table`'s `column`, by the name the schema gives it,
+    /// Holds `value` of `table`'s column at position `at`, named `column`,
     /// for `txn_id` until the transaction ends, alone for a delete or a key
     /// change, else shared with the other checks; a conflicting hold of an
     /// open transaction refuses it
@@ -3644,12 +3660,12 @@ impl MVCCEngine {
         &self,
         txn_id: i64,
         table: &str,
-        column: &str,
+        (column, at): (&str, usize),
         value: &Value,
         alone: bool,
     ) -> Result<()> {
         self.operations()
-            .hold_key(txn_id, table, column, value, alone)
+            .hold_key(txn_id, table, (column, at), value, alone)
     }
 
     /// Find all FK constraints in other tables that reference the given parent table.
@@ -4730,6 +4746,7 @@ impl MVCCEngine {
                 }
             }
         }
+        self.rename_referenced_column(table_name, old_name, new_name);
 
         change.finish();
         Ok(())
@@ -4850,6 +4867,30 @@ impl MVCCEngine {
         self.get_version_store(table_name)?
             .rename_index_column(old, new);
         Ok(())
+    }
+
+    /// Points every foreign key referencing column `old` of `table_name` at
+    /// its new name, once the rename is recorded
+    pub(crate) fn rename_referenced_column(&self, table_name: &str, old: &str, new: &str) {
+        let (table, old, new) = (
+            table_name.to_lowercase(),
+            old.to_lowercase(),
+            new.to_lowercase(),
+        );
+        let changed = {
+            let mut schemas = self.schemas.write().unwrap();
+            let stores = self.version_stores.read().unwrap();
+            retarget_fks(
+                &mut schemas,
+                &stores,
+                |fk| fk.referenced_table == table && fk.referenced_column == old,
+                |fk| fk.referenced_column = new.clone(),
+            )
+        };
+        if !changed.is_empty() {
+            self.ddl
+                .changed(&changed.iter().map(String::as_str).collect::<Vec<_>>());
+        }
     }
 
     pub(crate) fn restore_column_schema(
@@ -9655,14 +9696,14 @@ impl EngineOperations {
         }
     }
 
-    /// Holds `value` of `table`'s `column`, by the name the schema gives it,
+    /// Holds `value` of `table`'s column at position `at`, named `column`,
     /// for `txn_id` until the transaction ends: alone for a delete or a key
     /// change, else shared with the other checks of the key
     fn hold_key(
         &self,
         txn_id: i64,
         table: &str,
-        column: &str,
+        (column, at): (&str, usize),
         value: &Value,
         alone: bool,
     ) -> Result<()> {
@@ -9674,11 +9715,12 @@ impl EngineOperations {
             .get(&*name)
             .cloned()
             .ok_or_else(|| Error::TableNotFound(name.to_string()))?;
-        let first = store
-            .key_holds()
-            .hold(table, column, value, txn_id, alone, |holder| {
-                self.registry.is_open(holder)
-            })?;
+        let first =
+            store
+                .key_holds()
+                .hold(table, (column, at), value, txn_id, alone, |holder| {
+                    self.registry.is_open(holder)
+                })?;
         if first {
             let mut holders = self.key_holders.lock();
             holders.entry(txn_id).or_default().push(store);

@@ -1752,12 +1752,13 @@ impl VersionStore {
 
     /// Takes out the indexes over the column a drop removes and binds the
     /// indexes after it one position down, each keeping its data and
-    /// identity. A reader that trusts an index's order stands down across
-    /// the swap, as across a commit's publication
+    /// identity, as the key holds are. A reader that trusts an index's order
+    /// stands down across the swap, as across a commit's publication
     pub fn rebind_indexes_for_drop(&self) {
         let Some(at) = *self.pending_cut.lock() else {
             return;
         };
+        self.key_holds.drop_column(at);
         let at = at as i32;
         let current: Vec<(String, Arc<dyn Index>)> = self
             .indexes

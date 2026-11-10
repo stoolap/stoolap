@@ -846,6 +846,13 @@ impl Schema {
         }
 
         self.columns[idx].name_lower = new_name.to_lowercase();
+        for fk in self
+            .foreign_keys
+            .iter_mut()
+            .filter(|fk| fk.column_index == idx)
+        {
+            fk.column_name = self.columns[idx].name_lower.clone();
+        }
         self.columns[idx].name = new_name;
         self.mark_updated();
         self.rebuild_caches();
