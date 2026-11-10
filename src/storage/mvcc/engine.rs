@@ -3652,7 +3652,7 @@ impl MVCCEngine {
             .get_table_for_transaction(txn_id, table_name, None, None, TableUse::Read)
     }
 
-    /// Holds `value` of `table`'s `column`, by the name the schema gives it,
+    /// Holds `value` of `table`'s column at position `at`, named `column`,
     /// for `txn_id` until the transaction ends, alone for a delete or a key
     /// change, else shared with the other checks; a conflicting hold of an
     /// open transaction refuses it
@@ -3660,12 +3660,12 @@ impl MVCCEngine {
         &self,
         txn_id: i64,
         table: &str,
-        column: &str,
+        (column, at): (&str, usize),
         value: &Value,
         alone: bool,
     ) -> Result<()> {
         self.operations()
-            .hold_key(txn_id, table, column, value, alone)
+            .hold_key(txn_id, table, (column, at), value, alone)
     }
 
     /// Find all FK constraints in other tables that reference the given parent table.
@@ -4869,12 +4869,9 @@ impl MVCCEngine {
         Ok(())
     }
 
-    /// Points every foreign key referencing column `old` of `table_name`,
-    /// and the holds on its keys, at its new name, once the rename is recorded
+    /// Points every foreign key referencing column `old` of `table_name` at
+    /// its new name, once the rename is recorded
     pub(crate) fn rename_referenced_column(&self, table_name: &str, old: &str, new: &str) {
-        if let Ok(store) = self.get_version_store(table_name) {
-            store.key_holds().rename_column(old, new);
-        }
         let (table, old, new) = (
             table_name.to_lowercase(),
             old.to_lowercase(),
@@ -9699,14 +9696,14 @@ impl EngineOperations {
         }
     }
 
-    /// Holds `value` of `table`'s `column`, by the name the schema gives it,
+    /// Holds `value` of `table`'s column at position `at`, named `column`,
     /// for `txn_id` until the transaction ends: alone for a delete or a key
     /// change, else shared with the other checks of the key
     fn hold_key(
         &self,
         txn_id: i64,
         table: &str,
-        column: &str,
+        (column, at): (&str, usize),
         value: &Value,
         alone: bool,
     ) -> Result<()> {
@@ -9718,11 +9715,12 @@ impl EngineOperations {
             .get(&*name)
             .cloned()
             .ok_or_else(|| Error::TableNotFound(name.to_string()))?;
-        let first = store
-            .key_holds()
-            .hold(table, column, value, txn_id, alone, |holder| {
-                self.registry.is_open(holder)
-            })?;
+        let first =
+            store
+                .key_holds()
+                .hold(table, (column, at), value, txn_id, alone, |holder| {
+                    self.registry.is_open(holder)
+                })?;
         if first {
             let mut holders = self.key_holders.lock();
             holders.entry(txn_id).or_default().push(store);

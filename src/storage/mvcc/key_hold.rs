@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
-use crate::common::{new_i64_map, I64Map, SmartString};
+use crate::common::{new_i64_map, I64Map};
 use crate::core::{Error, Result, Value};
 
 /// The transactions holding one key
@@ -32,8 +32,9 @@ struct Hold {
 }
 
 struct Holds {
-    /// Each referenced column with the holds on its keys
-    columns: SmallVec<[(SmartString, FxHashMap<Value, Hold>); 1]>,
+    /// Each referenced column, by its position in the table, which a rename
+    /// keeps, with the holds on its keys; a dropped column's is `usize::MAX`
+    columns: SmallVec<[(usize, FxHashMap<Value, Hold>); 1]>,
     /// The keys each transaction holds, by column position, for its release
     by_txn: I64Map<SmallVec<[(usize, Value); 1]>>,
 }
@@ -51,13 +52,14 @@ impl Default for KeyHolds {
 }
 
 impl KeyHolds {
-    /// Holds `value` of `column` for `txn_id`, alone or shared. A hold that
-    /// conflicts refuses it while `open` says its transaction has not ended.
-    /// True when it is the transaction's first hold on this table
+    /// Holds `value` of the column at position `at`, named `column`, for
+    /// `txn_id`, alone or shared. A hold that conflicts refuses it while
+    /// `open` says its transaction has not ended. True when it is the
+    /// transaction's first hold on this table
     pub fn hold(
         &self,
         table: &str,
-        column: &str,
+        (column, at): (&str, usize),
         value: &Value,
         txn_id: i64,
         alone: bool,
@@ -65,12 +67,10 @@ impl KeyHolds {
     ) -> Result<bool> {
         let mut holds = self.0.lock();
         let holds = &mut *holds;
-        let slot = match holds.columns.iter().position(|(c, _)| c.as_str() == column) {
+        let slot = match holds.columns.iter().position(|(p, _)| *p == at) {
             Some(slot) => slot,
             None => {
-                holds
-                    .columns
-                    .push((SmartString::from(column), FxHashMap::default()));
+                holds.columns.push((at, FxHashMap::default()));
                 holds.columns.len() - 1
             }
         };
@@ -101,17 +101,15 @@ impl KeyHolds {
         Ok(keys.len() == 1)
     }
 
-    /// The holds on column `old` stay its holds under the name `new` it is
-    /// renamed to; holds left under `new` by a column gone since name none
-    pub fn rename_column(&self, old: &str, new: &str) {
-        let (old, new_lower) = (old.to_lowercase(), new.to_lowercase());
+    /// The column at position `at` is dropped: its holds name no column, and
+    /// the columns after it move one position down with theirs
+    pub fn drop_column(&self, at: usize) {
         let mut holds = self.0.lock();
-        for (column, _) in holds.columns.iter_mut() {
-            let lower = column.to_lowercase();
-            if lower == old {
-                *column = SmartString::from(new);
-            } else if lower == new_lower {
-                *column = SmartString::default();
+        for (position, _) in holds.columns.iter_mut() {
+            if *position == at {
+                *position = usize::MAX;
+            } else if *position > at && *position != usize::MAX {
+                *position -= 1;
             }
         }
     }

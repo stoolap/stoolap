@@ -217,3 +217,91 @@ fn a_key_held_stays_held_when_its_column_takes_a_dropped_column_name() {
     );
     assert_eq!(count(&db, "SELECT COUNT(*) FROM d"), 0);
 }
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_key_held_stays_held_for_a_check_that_read_the_old_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    for sql in [
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, k INTEGER UNIQUE)",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, pk INTEGER REFERENCES p(k))",
+        "INSERT INTO p VALUES (1, 10)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let mut deleting = db.begin().unwrap();
+    deleting.execute("DELETE FROM p WHERE id = 1", ()).unwrap();
+    let renaming = db.clone();
+    stoolap::test_failpoints::before_fk_parent_hold(move || {
+        renaming
+            .execute("ALTER TABLE p RENAME COLUMN k TO k2", ())
+            .unwrap();
+    });
+    let inserted = db.clone().execute("INSERT INTO c VALUES (1, 10)", ());
+    deleting.commit().unwrap();
+    assert!(
+        inserted.is_err(),
+        "a child of the key the open delete removes was inserted"
+    );
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM c"), 0);
+}
+
+#[test]
+fn a_key_held_stays_held_when_a_dropped_column_name_returns_in_another_case() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    for sql in [
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, \"K\" INTEGER UNIQUE)",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, pk INTEGER REFERENCES p(\"K\"))",
+        "INSERT INTO p VALUES (1, 10)",
+        "INSERT INTO c VALUES (1, 10)",
+        "DROP TABLE c",
+        "ALTER TABLE p DROP COLUMN \"K\"",
+        "ALTER TABLE p ADD COLUMN k INTEGER",
+        "CREATE UNIQUE INDEX p_k ON p(k)",
+        "UPDATE p SET k = 10",
+        "CREATE TABLE d (id INTEGER PRIMARY KEY, pk INTEGER REFERENCES p(k))",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let mut deleting = db.begin().unwrap();
+    deleting.execute("DELETE FROM p WHERE id = 1", ()).unwrap();
+    let other = db.clone();
+    other
+        .execute("ALTER TABLE p RENAME COLUMN k TO k2", ())
+        .unwrap();
+    let inserted = other.execute("INSERT INTO d VALUES (1, 10)", ());
+    deleting.commit().unwrap();
+    assert!(
+        inserted.is_err(),
+        "a child of the key the open delete removes was inserted"
+    );
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM d"), 0);
+}
+
+#[test]
+fn a_shared_key_hold_moves_down_with_its_column_across_a_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir);
+    for sql in [
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, k INTEGER, j INTEGER UNIQUE)",
+        "CREATE TABLE d (id INTEGER PRIMARY KEY, pj INTEGER REFERENCES p(j))",
+        "INSERT INTO p VALUES (1, 10, 20)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let mut inserting = db.begin().unwrap();
+    inserting
+        .execute("INSERT INTO d VALUES (1, 20)", ())
+        .unwrap();
+    let other = db.clone();
+    other.execute("ALTER TABLE p DROP COLUMN k", ()).unwrap();
+    let deleted = other.execute("DELETE FROM p WHERE id = 1", ());
+    inserting.commit().unwrap();
+    assert!(
+        deleted.is_err(),
+        "the parent of the child an open insert added was deleted"
+    );
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM p"), 1);
+}

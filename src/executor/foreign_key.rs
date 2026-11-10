@@ -154,7 +154,7 @@ fn parent_row_exists(
     #[cfg(feature = "test-failpoints")]
     crate::test_failpoints::fk_parent_hold_next();
     let column = &parent_schema.columns[ref_idx].name;
-    engine.hold_key(txn_id, parent_table, column, &key, false)?;
+    engine.hold_key(txn_id, parent_table, (column, ref_idx), &key, false)?;
     // A snapshot's handle took its view before the hold, so it is taken again
     if engine.reads_snapshot(txn_id) {
         parent = open()?;
@@ -204,7 +204,7 @@ fn hold_alone<'v>(
     let at = referenced_position(&schema, parent_table, &fk.referenced_column)?;
     let column = &schema.columns[at].name;
     for value in values.into_iter().filter(|v| !v.is_null()) {
-        engine.hold_key(txn_id, parent_table, column, value, true)?;
+        engine.hold_key(txn_id, parent_table, (column, at), value, true)?;
     }
     Ok(())
 }
