@@ -3729,6 +3729,23 @@ impl Executor {
         // Capture the post-update row for RETURNING clause
         let mut captured_row: Option<Row> = None;
 
+        // The keys the setter changes are asked after the write: a row whose
+        // foreign key moved, and each value a child references that it gave up
+        let referencing =
+            super::foreign_key::find_referencing_fks(&self.engine, &schema.table_name);
+        let mut fks_by_ref_col: FxHashMap<usize, Vec<(String, crate::core::ForeignKeyConstraint)>> =
+            FxHashMap::default();
+        for (child, fk) in referencing.iter() {
+            if let Some(idx) = schema.get_column_index(&fk.referenced_column) {
+                fks_by_ref_col
+                    .entry(idx)
+                    .or_default()
+                    .push((child.clone(), fk.clone()));
+            }
+        }
+        let mut fk_rows: Vec<Row> = Vec::new();
+        let mut ref_changes: Vec<(usize, Value, Value)> = Vec::new();
+
         // Prepared programs read the row met and the excluded row as one row
         let mut joined = conflict.map(|conflict| conflict.joined.borrow_mut());
         let conflict = conflict.map(|conflict| conflict.runner);
@@ -3805,7 +3822,14 @@ impl Executor {
 
             // Apply the updates, then each CHECK an updated column reads over the row
             let changed = !updates_to_apply.is_empty();
+            let mut fk_moved = false;
             for (idx, new_value) in updates_to_apply {
+                if let Some(old) = row.get(idx).filter(|old| **old != new_value) {
+                    if !old.is_null() && fks_by_ref_col.contains_key(&idx) {
+                        ref_changes.push((idx, old.clone(), new_value.clone()));
+                    }
+                    fk_moved |= schema.foreign_keys.iter().any(|fk| fk.column_index == idx);
+                }
                 let _ = row.set(idx, new_value);
             }
             if changed {
@@ -3817,6 +3841,9 @@ impl Executor {
             // The row written has the table's columns; one RETURNING reads has its id too
             if effective.widens {
                 row.pop();
+            }
+            if fk_moved {
+                fk_rows.push(row.clone());
             }
             if capture_row {
                 captured_row = Some(match returns_id {
@@ -3839,6 +3866,26 @@ impl Executor {
             let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
             table.update(access, where_expr.as_deref(), &mut setter)?
         };
+
+        let txn_id = table.txn_id();
+        for row in &fk_rows {
+            super::foreign_key::check_parent_exists(&self.engine, txn_id, schema, row)?;
+        }
+        for (idx, old, new) in ref_changes {
+            let Some(fks) = fks_by_ref_col.get(&idx) else {
+                continue;
+            };
+            if super::foreign_key::fk_tree_needs_precheck(&self.engine, fks) {
+                super::foreign_key::pre_check_restrict_for_update(
+                    &self.engine,
+                    txn_id,
+                    &schema.table_name,
+                    &old,
+                    fks,
+                )?;
+            }
+            super::foreign_key::enforce_update_actions(&self.engine, txn_id, &[(old, new)], fks)?;
+        }
 
         Ok((updated > 0, captured_row))
     }

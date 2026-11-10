@@ -92,6 +92,8 @@ Referential actions define what happens to child rows when the referenced parent
 | `CASCADE` | Update the FK column in all child rows to the new PK value |
 | `SET NULL` | Set the FK column to NULL in all child rows referencing the old PK value |
 
+The update of an `INSERT ... ON CONFLICT DO UPDATE` (or `ON DUPLICATE KEY UPDATE`) is checked as an `UPDATE` is: a foreign key value it writes must name an existing parent row, and a referenced value it changes runs the ON UPDATE action of each child that names it. A refusal leaves the statement having written nothing.
+
 ### Examples
 
 ```sql

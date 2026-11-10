@@ -55,6 +55,7 @@ mod update_parentheses_test;
 mod update_path_test;
 mod update_set_default_test;
 mod update_test;
+mod upsert_foreign_key_test;
 mod upsert_where_test;
 mod values_clause_test;
 mod write_path_rule_test;
