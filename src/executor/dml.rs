@@ -584,15 +584,25 @@ pub(crate) fn written_column(schema: &Schema, name: &str) -> Result<Option<usize
 /// Moves each row of `moves`, (old row id, row), to the id its primary key
 /// now holds: every old id is deleted first, then every row inserted, so a
 /// key collides only with a row the statement leaves or with another new
-/// key, whatever order the rows were set in
+/// key, whatever order the rows were set in; a NULL key is refused before
+/// an insert could generate one
 pub(crate) fn move_rows(table: &mut dyn Table, moves: Vec<(i64, Row)>) -> Result<()> {
     if moves.is_empty() {
         return Ok(());
     }
+    let schema = table.schema();
+    if let Some(pk) = schema.pk_column_index() {
+        if moves
+            .iter()
+            .any(|(_, row)| row.get(pk).is_none_or(Value::is_null))
+        {
+            return Err(Error::not_null_constraint(&schema.columns[pk].name));
+        }
+    }
     let ids: Vec<i64> = moves.iter().map(|(id, _)| *id).collect();
     table.delete_by_row_ids(&ids)?;
     for (_, row) in moves {
-        table.insert(row)?;
+        table.insert_discard(row)?;
     }
     Ok(())
 }

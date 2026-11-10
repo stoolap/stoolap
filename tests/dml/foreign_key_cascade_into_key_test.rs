@@ -204,3 +204,34 @@ fn a_cascade_reaching_a_grandchild_key_moves_it_too() {
     assert_eq!(rows(&db, "SELECT z FROM i WHERE z = 6"), [[6]]);
     assert!(rows(&db, "SELECT z FROM i WHERE z = 5").is_empty());
 }
+
+#[test]
+fn a_cascade_refuses_a_key_another_foreign_key_of_the_child_does_not_find() {
+    let db = Database::open("memory://fk_cascade_into_key_other_parent").unwrap();
+    for sql in [
+        "CREATE TABLE p (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE q (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, \
+         FOREIGN KEY (id) REFERENCES p(id) ON UPDATE CASCADE, \
+         FOREIGN KEY (id) REFERENCES q(id))",
+        "INSERT INTO p VALUES (1)",
+        "INSERT INTO q VALUES (1)",
+        "INSERT INTO c VALUES (1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let error = db
+        .execute("UPDATE p SET id = 2 WHERE id = 1", ())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("does not exist"), "{error}");
+    db.execute("INSERT INTO p VALUES (2)", ()).unwrap();
+    let error = db
+        .execute("UPDATE c SET id = 2 WHERE id = 1", ())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("does not exist"), "{error}");
+    db.execute("DELETE FROM p WHERE id = 2", ()).unwrap();
+    assert_eq!(rows(&db, "SELECT id FROM c"), [[1]]);
+    assert_eq!(rows(&db, "SELECT id FROM p"), [[1]]);
+}

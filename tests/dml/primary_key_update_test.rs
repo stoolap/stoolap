@@ -241,3 +241,25 @@ fn an_upsert_moves_the_row_whose_key_it_sets() {
         assert_eq!(rows(db, "SELECT tid FROM n"), [[None]]);
     });
 }
+
+#[test]
+fn a_null_key_is_refused_where_an_insert_would_generate_one() {
+    let db = Database::open("memory://pk_update_null_auto_increment").unwrap();
+    for sql in [
+        "CREATE TABLE a (id INTEGER PRIMARY KEY AUTO_INCREMENT, u INTEGER UNIQUE)",
+        "INSERT INTO a VALUES (1, 10), (2, 20)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    db.execute("UPDATE a SET id = NULL WHERE id = 1", ())
+        .unwrap_err();
+    db.execute(
+        "INSERT INTO a VALUES (5, 20) ON CONFLICT (u) DO UPDATE SET id = NULL",
+        (),
+    )
+    .unwrap_err();
+    assert_eq!(
+        rows(&db, "SELECT id, u FROM a ORDER BY id"),
+        [[Some(1), Some(10)], [Some(2), Some(20)]]
+    );
+}

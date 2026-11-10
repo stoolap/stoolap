@@ -238,6 +238,22 @@ pub(crate) fn trim_lock_starting() {
 }
 
 thread_local! {
+    static CASCADE_TARGETS_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread after an ON UPDATE cascade reads its child rows, before it writes them.
+pub fn after_cascade_targets_read(hook: impl FnOnce() + 'static) {
+    CASCADE_TARGETS_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn cascade_targets_read() {
+    let hook = CASCADE_TARGETS_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static TRANSACTION_BEGUN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 

@@ -926,10 +926,12 @@ fn cascade_update_recursive(
     let col_name = &child_schema.columns[col_idx].name;
     // The child stores the parent's value in its own column type, checked as stored
     let col_type = child_schema.columns[col_idx].data_type;
-    // Each child row a change names and the value it takes, read before any
-    // is written: a row one change writes is not met again by the next
-    let mut targets: crate::common::I64Map<Value> = crate::common::I64Map::new();
-    for (old_value, new_value) in &named {
+    // Each child row a change names and that change's place in `named` and
+    // `new_values`, read before any is written: a row one change writes is
+    // not met again by the next
+    let mut targets: crate::common::I64Map<usize> = crate::common::I64Map::new();
+    let mut new_values = Vec::with_capacity(named.len());
+    for (at, (old_value, new_value)) in named.iter().enumerate() {
         let new_val = new_value.try_coerce_to_type(col_type)?;
         super::dml::validate_coercion(
             new_value,
@@ -954,9 +956,12 @@ fn cascade_update_recursive(
         let plan = child.index_plan(&expr);
         let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
         for (id, _) in child.collect_access_rows(access, Some(&expr))?.iter() {
-            targets.insert(*id, new_val.clone());
+            targets.insert(*id, at);
         }
+        new_values.push(new_val);
     }
+    #[cfg(feature = "test-failpoints")]
+    crate::test_failpoints::cascade_targets_read();
     let mut ids: Vec<i64> = targets.keys().collect();
     ids.sort_unstable();
     let checks =
@@ -969,12 +974,18 @@ fn cascade_update_recursive(
     // UPDATE of its key does, all of the statement's moves at once
     let into_key = child_schema.pk_column_index() == Some(col_idx);
     let mut moves = Vec::new();
+    let mut written = vec![false; named.len()];
     let count = child.update_by_row_ids(&ids, &mut |id, mut row| {
-        let Some(new_val) = targets.get(id) else {
+        // A row that no longer names the old value since it was read is left
+        let Some(&at) = targets.get(id).filter(|&&at| {
+            row.get(col_idx)
+                .is_some_and(|v| matches!(v.compare(&named[at].0), Ok(Ordering::Equal)))
+        }) else {
             return Ok((row, false));
         };
+        written[at] = true;
         let original = into_key.then(|| row.clone());
-        let _ = row.set(col_idx, new_val.clone());
+        let _ = row.set(col_idx, new_values[at].clone());
         for check in &checks {
             super::dml::run_check(&mut vm, check, &row)?;
         }
@@ -987,6 +998,17 @@ fn cascade_update_recursive(
         }
     })?;
     super::dml::move_rows(&mut *child, moves)?;
+    // The column's other foreign keys check each value it now holds
+    for other in child.schema().foreign_keys.iter() {
+        if other.column_index != col_idx || other == fk {
+            continue;
+        }
+        for (value, _) in new_values.iter().zip(&written).filter(|(_, w)| **w) {
+            if !value.is_null() {
+                validate_fk_value(engine, txn_id, other, value, child_table)?;
+            }
+        }
+    }
 
     let mut total = count;
 
