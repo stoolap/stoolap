@@ -427,6 +427,29 @@ impl TopK {
     }
 }
 
+/// Completes the sealed rows a top-k read keeps, which come in volume and
+/// position order: one volume's reader is held at a time, and its decoded
+/// groups go when the next volume's rows begin
+struct KeptRows<'a> {
+    volumes: &'a [(Arc<FrozenVolume>, super::writer::ColumnMapping)],
+    /// The schema columns the scan already read
+    known: &'a [bool],
+    reader: Option<(usize, super::writer::RowReader)>,
+}
+
+impl KeptRows<'_> {
+    fn fill(&mut self, volume: usize, position: usize, row: &mut Row) -> Result<()> {
+        let (vol, mapping) = &self.volumes[volume];
+        if self.reader.as_ref().is_none_or(|(at, _)| *at != volume) {
+            self.reader = Some((volume, super::writer::RowReader::new(Arc::clone(vol))));
+        }
+        match self.reader.as_mut() {
+            Some((_, reader)) => Ok(reader.fill(position, mapping, self.known, row)?),
+            None => Ok(()),
+        }
+    }
+}
+
 /// What a zone map says of the rows a top-k read can take from its zone
 enum ZoneBound<'z> {
     /// None of them
@@ -7218,15 +7241,13 @@ impl Table for SegmentedTable {
                 }
             }
             self.check_cold()?;
-            let mut readers: Vec<Option<super::writer::RowReader>> =
-                kept_from.iter().map(|_| None).collect();
-            let known = needed.as_deref().unwrap_or_default();
-            let rows = keep.into_rows(offset, |slot, position, row| {
-                let (vol, mapping) = &kept_from[slot];
-                let reader = readers[slot]
-                    .get_or_insert_with(|| super::writer::RowReader::new(Arc::clone(vol)));
-                Ok(reader.fill(position, mapping, known, row)?)
-            })?;
+            let mut kept = KeptRows {
+                volumes: &kept_from,
+                known: needed.as_deref().unwrap_or_default(),
+                reader: None,
+            };
+            let rows =
+                keep.into_rows(offset, |slot, position, row| kept.fill(slot, position, row))?;
             Ok(Some(Some(rows)))
         })
     }
@@ -8686,6 +8707,46 @@ mod tests {
     fn built(keep: TopK, offset: usize) -> Vec<i64> {
         let rows = keep.into_rows(offset, |_, _, _| panic!("no sealed row is held"));
         rows.unwrap().into_iter().map(|(id, _)| id).collect()
+    }
+
+    #[test]
+    fn kept_rows_let_a_volume_go_when_the_next_one_begins() {
+        use super::super::writer::{ColSource, ColumnMapping};
+        let schema = test_schema();
+        let volume = |ids: [i64; 2]| {
+            let mut builder = VolumeBuilder::with_capacity(&schema, 2);
+            for id in ids {
+                let row = Row::from_values(vec![Value::Integer(id), Value::Float(id as f64)]);
+                builder.add_row(id, &row);
+            }
+            Arc::new(builder.finish().unwrap())
+        };
+        let identity = ColumnMapping {
+            sources: vec![ColSource::Volume(0), ColSource::Volume(1)],
+            names: Vec::new(),
+            is_identity: true,
+        };
+        let volumes = vec![
+            (volume([1, 2]), identity.clone()),
+            (volume([10, 11]), identity),
+        ];
+        let mut kept = KeptRows {
+            volumes: &volumes,
+            known: &[true, false],
+            reader: None,
+        };
+        let mut row = Row::from_values(vec![Value::Integer(2), Value::Null(DataType::Float)]);
+        kept.fill(0, 1, &mut row).unwrap();
+        assert_eq!(row.get(1), Some(&Value::Float(2.0)));
+        assert_eq!(Arc::strong_count(&volumes[0].0), 2, "the reader holds it");
+        let mut row = Row::from_values(vec![Value::Integer(10), Value::Null(DataType::Float)]);
+        kept.fill(1, 0, &mut row).unwrap();
+        assert_eq!(row.get(1), Some(&Value::Float(10.0)));
+        assert_eq!(
+            Arc::strong_count(&volumes[0].0),
+            1,
+            "the first volume's reader went with its groups"
+        );
     }
 
     /// The offers' row ids as the full sort orders them: key, then row id
