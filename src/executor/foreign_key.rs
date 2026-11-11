@@ -968,7 +968,7 @@ pub(crate) fn enforce_update_actions(
             root
         })
         .collect();
-    let actions = find_update_actions(engine, &mut columns)?;
+    let actions = find_update_actions(engine, &mut columns, roots)?;
     // Each column's actions run once every action into it has
     let mut ready: Vec<usize> = (0..roots).collect();
     while let Some(at) = ready.pop() {
@@ -977,7 +977,7 @@ pub(crate) fn enforce_update_actions(
         }
         for action in actions.iter().filter(|a| a.from == at) {
             run_update_action(engine, txn_id, &mut columns, action, at < roots)?;
-            if let Some(to) = action.to {
+            if let Some(to) = action.to.filter(|_| action.counted) {
                 let into = &mut columns[to];
                 into.waiting -= 1;
                 if into.waiting == 0 && !into.done {
@@ -1114,6 +1114,8 @@ struct UpdateAction {
     to: Option<usize>,
     /// The key's bit in the `into` of its `to`
     bit: usize,
+    /// Whether `to` waits for it: a key no path leads back from
+    counted: bool,
     child_table: String,
     fk: ForeignKeyConstraint,
 }
@@ -1237,10 +1239,13 @@ fn cascade_depth_exceeded() -> Error {
 }
 
 /// Every ON UPDATE key beneath the changed columns of `columns`, adding
-/// to it each child column a CASCADE or SET NULL key writes
+/// to it each child column a CASCADE or SET NULL key writes. A key into
+/// one of the first `roots`, the columns the statement changed, writes a
+/// column of its own: the statement's values are not the key's
 fn find_update_actions(
     engine: &MVCCEngine,
     columns: &mut Vec<Changed>,
+    roots: usize,
 ) -> Result<Vec<UpdateAction>> {
     let mut actions = Vec::new();
     let mut next = 0;
@@ -1257,11 +1262,11 @@ fn find_update_actions(
                 ForeignKeyAction::Cascade | ForeignKeyAction::SetNull => {
                     let child_schema = engine.get_table_schema(child_table)?;
                     let child_column = key_position(&child_schema, fk)?;
-                    let at = match columns
+                    let at = match columns[roots..]
                         .iter()
                         .position(|c| c.column == child_column && c.table == *child_table)
                     {
-                        Some(at) => at,
+                        Some(at) => roots + at,
                         None => {
                             columns.push(Changed::new(child_table, child_column));
                             columns.len() - 1
@@ -1269,7 +1274,6 @@ fn find_update_actions(
                     };
                     let into = &mut columns[at];
                     into.into.push(fk.clone());
-                    into.waiting += 1;
                     (Some(at), into.into.len() - 1)
                 }
             };
@@ -1277,13 +1281,40 @@ fn find_update_actions(
                 from: next,
                 to,
                 bit,
+                counted: false,
                 child_table: child_table.clone(),
                 fk: fk.clone(),
             });
         }
         next += 1;
     }
+    // A key round a cycle is not waited for: reaching a row through it is refused
+    for at in 0..actions.len() {
+        let Some(to) = actions[at].to else {
+            continue;
+        };
+        if !leads(&actions, columns.len(), to, actions[at].from) {
+            actions[at].counted = true;
+            columns[to].waiting += 1;
+        }
+    }
     Ok(actions)
+}
+
+/// Whether a path of `actions` leads from column `from` to column `to`
+fn leads(actions: &[UpdateAction], columns: usize, from: usize, to: usize) -> bool {
+    let mut seen = vec![false; columns];
+    let mut stack = vec![from];
+    while let Some(at) = stack.pop() {
+        if at == to {
+            return true;
+        }
+        if std::mem::replace(&mut seen[at], true) {
+            continue;
+        }
+        stack.extend(actions.iter().filter(|a| a.from == at).filter_map(|a| a.to));
+    }
+    false
 }
 
 /// Runs `action` over the changed values of its column, recording what each

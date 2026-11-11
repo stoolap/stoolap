@@ -268,3 +268,78 @@ fn a_value_an_upsert_changes_back_cascades_into_no_column() {
         "the row ends as it started"
     );
 }
+
+/// The rows of `s` after a statement, in id order
+type Final = &'static [[Option<i64>; 4]];
+
+#[test]
+fn an_action_into_a_column_the_statement_changes_writes_that_column() {
+    let schema = "CREATE TABLE s (id INTEGER PRIMARY KEY, a INTEGER UNIQUE, \
+                  b INTEGER UNIQUE REFERENCES s(a) ON UPDATE {action}, \
+                  c INTEGER REFERENCES s(b) ON UPDATE CASCADE)";
+    let cases: [(&str, &str, &str, &str, Final); 2] = [
+        (
+            "set_null",
+            "SET NULL",
+            "INSERT INTO s VALUES (1, 1, 1, NULL)",
+            "INSERT INTO s VALUES (1, 2, 2, NULL), (1, 1, 1, NULL)",
+            &[[Some(1), Some(1), None, None]],
+        ),
+        (
+            "cascade",
+            "CASCADE",
+            "INSERT INTO s VALUES (1, 1, NULL, NULL), (2, 2, 2, NULL), (3, 3, 1, NULL), (4, 4, NULL, 1)",
+            "INSERT INTO s VALUES (1, 5, NULL, NULL), (2, 2, 3, NULL)",
+            &[
+                [Some(1), Some(5), None, None],
+                [Some(2), Some(2), Some(3), None],
+                [Some(3), Some(3), Some(5), None],
+                [Some(4), Some(4), None, Some(5)],
+            ],
+        ),
+    ];
+    for (name, action, rows, upsert, expected) in cases {
+        let db = Database::open(&format!(
+            "memory://fk_actions_after_blocks_into_root_{name}"
+        ))
+        .unwrap();
+        db.execute(&schema.replace("{action}", action), ()).unwrap();
+        db.execute(rows, ()).unwrap();
+        db.execute(
+            &format!("{upsert} ON CONFLICT (id) DO UPDATE SET a = excluded.a, b = excluded.b"),
+            (),
+        )
+        .unwrap();
+        let got: Vec<[Option<i64>; 4]> = db
+            .query("SELECT id, a, b, c FROM s ORDER BY id", ())
+            .unwrap()
+            .map(|row| {
+                let row = row.unwrap();
+                std::array::from_fn(|i| row.get::<Option<i64>>(i).unwrap())
+            })
+            .collect();
+        assert_eq!(
+            got, expected,
+            "{action}: a's action reaches b, which the statement sets"
+        );
+    }
+}
+
+#[test]
+fn a_cascade_round_a_cycle_of_keys_ends_where_it_reaches_no_row() {
+    let db = Database::open("memory://fk_actions_after_blocks_cycle").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER UNIQUE REFERENCES t(b) ON UPDATE CASCADE, \
+         b INTEGER UNIQUE REFERENCES t(a) ON UPDATE CASCADE)",
+        "INSERT INTO t VALUES (1, NULL, NULL)",
+        "UPDATE t SET a = 1, b = 1 WHERE id = 1",
+        "INSERT INTO t VALUES (1, 3, 3) ON CONFLICT (id) DO UPDATE SET a = excluded.a",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    assert_eq!(
+        ints(db.query("SELECT a, b FROM t", ()).unwrap()),
+        [[3, 3]],
+        "a's 3 cascades into b, and b's back into a finds a already 3"
+    );
+}
