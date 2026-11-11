@@ -3686,6 +3686,9 @@ impl MVCCEngine {
             std::sync::LazyLock::new(|| Arc::new(Vec::new()));
 
         let current_epoch = self.ddl.schema_epoch.load(Ordering::Acquire);
+        // The map is keyed by the lower case names the keys store
+        let parent_table = to_lowercase_cow(parent_table);
+        let parent_table = parent_table.as_ref();
 
         // Fast path: check if cache is valid (read lock only)
         {
@@ -10181,8 +10184,11 @@ impl TransactionEngineOperations for EngineOperations {
         }
         {
             let mut stores = self.version_stores().write().unwrap();
-            stores.insert(table_name, Arc::clone(&version_store));
+            stores.insert(table_name.clone(), Arc::clone(&version_store));
         }
+        // The caches keyed by the schema epoch, the foreign key map among them, see the table
+        self.ddl
+            .changed_table(&self.schemas().read().unwrap(), &table_name);
 
         // Create transaction version store with txn_id 0 (will be set by caller)
         let txn_versions = TransactionVersionStore::new(Arc::clone(&version_store), 0);

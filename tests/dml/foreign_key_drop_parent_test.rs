@@ -148,6 +148,41 @@ fn a_refused_drop_and_a_cascade_hold_after_a_reopen() {
 }
 
 #[test]
+fn a_parent_named_in_another_case_keeps_its_keys() {
+    let db = Database::open("memory://fk_drop_parent_case").unwrap();
+    tables(&db, &["(1, 1)"]);
+    assert_refused(&db, "DROP TABLE P");
+    assert!(db.execute("TRUNCATE TABLE P", ()).is_err());
+    db.execute("DELETE FROM P WHERE id = 1", ()).unwrap();
+    assert_eq!(
+        db.query_one::<i64, _>("SELECT COUNT(*) FROM c", ())
+            .unwrap(),
+        0,
+        "the delete skipped its ON DELETE CASCADE"
+    );
+    db.execute("DROP TABLE P CASCADE", ()).unwrap();
+    assert!(!create_c(&db).contains("REFERENCES"));
+}
+
+#[test]
+fn a_key_created_inside_a_transaction_blocks_the_drop() {
+    let db = Database::open("memory://fk_drop_parent_created_in_tx").unwrap();
+    db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO p VALUES (1), (2)", ()).unwrap();
+    db.execute("DELETE FROM p WHERE id = 0", ()).unwrap();
+    db.execute("BEGIN", ()).unwrap();
+    db.execute(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE CASCADE)",
+        (),
+    )
+    .unwrap();
+    assert_refused(&db, "DROP TABLE p");
+    db.execute("COMMIT", ()).unwrap();
+    assert_refused(&db, "DROP TABLE p");
+}
+
+#[test]
 fn drop_table_cascade_is_written_back_as_it_was_parsed() {
     let statement = stoolap::parser::parse_sql("DROP TABLE IF EXISTS p CASCADE").unwrap();
     assert_eq!(statement[0].to_string(), "DROP TABLE IF EXISTS p CASCADE");
