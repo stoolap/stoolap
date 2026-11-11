@@ -3857,9 +3857,9 @@ impl MVCCEngine {
     /// An error when a column of table `name` takes the row identity's name;
     /// a name the engine holds no table of is no error here
     pub(crate) fn check_reserved_table(&self, name: &str) -> Result<()> {
-        match self.get_version_store(name) {
-            Ok(store) if store.has_reserved_name() => store.schema().check_column_names(),
-            _ => Ok(()),
+        match self.get_table_schema(name) {
+            Ok(schema) => schema.check_column_names(),
+            Err(_) => Ok(()),
         }
     }
 
@@ -4071,32 +4071,16 @@ impl MVCCEngine {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
-        refresh_schema(&self.version_stores, &self.schemas, &self.ddl, table_name)?;
-        // A table a DDL left without a column of the row identity's name
-        // serves every statement again
-        let store = self.get_version_store(table_name)?;
-        if store.has_reserved_name() {
-            store.note_reserved_name();
-        }
-        Ok(())
+        refresh_schema(&self.version_stores, &self.schemas, &self.ddl, table_name)
     }
 
-    /// Notes each table whose column takes the row identity's name, as only
-    /// an older build let one, and warns of it: the table serves DDL alone
+    /// Notes whether a table's column takes the row identity's name, as only
+    /// an older build let one, and warns of each: such a table serves DDL alone
     fn note_reserved_names(&self) {
-        let stores: Vec<Arc<VersionStore>> = self
-            .version_stores
-            .read()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect();
-        for store in stores {
-            if store.note_reserved_name() {
+        for schema in self.schemas.read().unwrap().values() {
+            if let Err(e) = schema.check_column_names() {
                 self.any_reserved_name.store(true, Ordering::Release);
-                if let Err(e) = store.schema().check_column_names() {
-                    eprintln!("Warning: {e}");
-                }
+                eprintln!("Warning: {e}");
             }
         }
     }
@@ -6166,12 +6150,20 @@ impl MVCCEngine {
         // before the destructive step. Without this, a corrupt .vol would fail after
         // WAL/volumes are already deleted, causing total data loss.
         for (table_name, path) in &snapshot_files {
-            if let Err(e) = super::snapshot::SnapshotReader::open(path) {
-                self.registry.start_accepting_transactions();
-                return Err(Error::internal(format!(
-                    "Snapshot validation failed for table {}: {}",
-                    table_name, e
-                )));
+            match super::snapshot::SnapshotReader::open(path) {
+                // A table of the row identity's name serves DDL alone from the
+                // moment it loads, should the restore stop after it
+                Ok(reader) if reader.schema().check_column_names().is_err() => {
+                    self.any_reserved_name.store(true, Ordering::Release);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    self.registry.start_accepting_transactions();
+                    return Err(Error::internal(format!(
+                        "Snapshot validation failed for table {}: {}",
+                        table_name, e
+                    )));
+                }
             }
             // Also validate companion .vol if it exists (will be used by load_table_snapshot_as_volume)
             let vol_path = path.with_extension("vol");
@@ -6336,6 +6328,11 @@ impl MVCCEngine {
                     .and_then(|loaded| loaded)
             } else {
                 self.load_table_snapshot(table_name, snapshot_path)
+            };
+            #[cfg(feature = "test-failpoints")]
+            let load_result = match crate::test_failpoints::restore_load_fails() {
+                true => Err(Error::internal("injected restore load failure")),
+                false => load_result,
             };
 
             match load_result {

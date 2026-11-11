@@ -89,8 +89,20 @@ fn a_table_with_a_column_named_after_the_row_identity_serves_ddl_alone() {
             "INSERT INTO u SELECT a + 10, a FROM t",
             "EXPLAIN SELECT a FROM t",
             "CREATE TABLE t2 AS SELECT a FROM t",
+            "WITH t AS (SELECT a FROM t) SELECT a FROM t",
+            "SELECT a FROM t WHERE EXISTS (WITH t AS (SELECT 1 AS a) SELECT a FROM t)",
         ] {
             refused(&db, sql);
+        }
+        for (sql, answer) in [
+            ("WITH t AS (SELECT 7 AS a) SELECT a FROM t", 7),
+            (
+                "WITH RECURSIVE t(a) AS (SELECT 1 UNION ALL SELECT a + 1 FROM t WHERE a < 3) \
+                 SELECT COUNT(*) FROM t",
+                3,
+            ),
+        ] {
+            assert_eq!(db.query_one::<i64, _>(sql, ()).unwrap(), answer, "{sql}");
         }
         refused(&db, "SELECT x FROM v");
         let created = db
@@ -189,4 +201,36 @@ fn a_snapshot_with_a_column_named_after_the_row_identity_restores_to_ddl_alone()
         pairs(&db, "SELECT a, c FROM t ORDER BY a"),
         [(1, 10), (2, 20)]
     );
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_failed_rename_of_the_column_leaves_the_table_serving_ddl_alone() {
+    use std::sync::atomic::Ordering;
+    let (_dir, dsn) = copied("column_named_rowid");
+    let db = Database::open(&dsn).unwrap();
+    stoolap::test_failpoints::WAL_WRITE_FAIL.store(true, Ordering::Release);
+    let renamed = db.execute("ALTER TABLE t RENAME COLUMN _rowid_ TO b", ());
+    stoolap::test_failpoints::WAL_WRITE_FAIL.store(false, Ordering::Release);
+    assert!(renamed.is_err(), "the rename went through");
+    refused(&db, "SELECT a FROM t");
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_restore_stopped_after_a_table_of_the_reserved_name_leaves_it_serving_ddl_alone() {
+    use std::sync::atomic::Ordering;
+    let (_dir, dsn) = copied("snapshot_named_rowid_twice");
+    let db = Database::open(&dsn).unwrap();
+    assert_eq!(
+        pairs(&db, "SELECT a, b FROM t ORDER BY a"),
+        [(1, 10), (2, 20)]
+    );
+    stoolap::test_failpoints::RESTORE_LOADS_BEFORE_FAIL.store(2, Ordering::Release);
+    let restored = db.execute("PRAGMA RESTORE", ());
+    stoolap::test_failpoints::RESTORE_LOADS_BEFORE_FAIL.store(0, Ordering::Release);
+    assert!(restored.is_err(), "the restore went through");
+    for table in ["t", "t2"] {
+        refused(&db, &format!("SELECT a FROM {table}"));
+    }
 }

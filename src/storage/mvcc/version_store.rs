@@ -1259,9 +1259,6 @@ pub struct VersionStore {
     /// Whether the open left one of the table's listed volumes unloaded; the
     /// reads that take no table handle check it here, beside the hot rows
     cold_unavailable: AtomicBool,
-    /// Whether a column takes the row identity's name, as only an older
-    /// build let one: the table serves DDL alone until it no longer does
-    reserved_name: AtomicBool,
     /// Auto-increment counter for tables without explicit PK
     auto_increment_counter: AtomicI64,
     /// Track which transaction has uncommitted changes to each row
@@ -1476,7 +1473,6 @@ impl VersionStore {
             indexes: RwLock::new(FxHashMap::default()),
             closed: AtomicBool::new(false),
             cold_unavailable: AtomicBool::new(false),
-            reserved_name: AtomicBool::new(false),
             auto_increment_counter: AtomicI64::new(0),
             uncommitted_writes: RwLock::new(new_i64_map()),
             key_holds: KeyHolds::default(),
@@ -1519,7 +1515,6 @@ impl VersionStore {
             indexes: RwLock::new(FxHashMap::default()),
             closed: AtomicBool::new(false),
             cold_unavailable: AtomicBool::new(false),
-            reserved_name: AtomicBool::new(false),
             auto_increment_counter: AtomicI64::new(0),
             uncommitted_writes: RwLock::new(new_i64_map()),
             key_holds: KeyHolds::default(),
@@ -5922,20 +5917,6 @@ impl VersionStore {
     #[inline]
     pub(crate) fn is_cold_unavailable(&self) -> bool {
         self.cold_unavailable.load(Ordering::Acquire)
-    }
-
-    /// Whether a column of the table takes the row identity's name
-    #[inline]
-    pub(crate) fn has_reserved_name(&self) -> bool {
-        self.reserved_name.load(Ordering::Acquire)
-    }
-
-    /// Notes whether the table's schema holds a column of the row
-    /// identity's name; true when it does
-    pub(crate) fn note_reserved_name(&self) -> bool {
-        let reserved = self.schema().check_column_names().is_err();
-        self.reserved_name.store(reserved, Ordering::Release);
-        reserved
     }
 
     // =========================================================================

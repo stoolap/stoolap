@@ -163,6 +163,14 @@ pub(crate) fn snapshot_rename_fails() -> bool {
     counted_down(&SNAPSHOT_RENAMES_BEFORE_FAIL)
 }
 
+/// The n-th table a restore loads fails to load; zero leaves the loads alone
+pub static RESTORE_LOADS_BEFORE_FAIL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn restore_load_fails() -> bool {
+    counted_down(&RESTORE_LOADS_BEFORE_FAIL)
+}
+
 /// Whether this call is the one `counter` counts down to, zero for none
 // fetch_update is deprecated in 1.99; try_update is stable only from 1.95, above the 1.88 MSRV
 #[allow(deprecated)]
@@ -3566,6 +3574,7 @@ pub fn reset_all() {
     SNAPSHOT_WRITE_FAIL.store(false, Release);
     SNAPSHOT_SYNC_FAIL.store(false, Release);
     SNAPSHOT_RENAMES_BEFORE_FAIL.store(0, Release);
+    RESTORE_LOADS_BEFORE_FAIL.store(0, Release);
     CHECKPOINT_WRITE_FAIL.store(false, Release);
     RETIRED_WAL_SYNC_FAIL.store(false, Release);
     MANIFEST_WRITE_FAIL.store(false, Release);

@@ -20,3 +20,7 @@ db.lock files were left out.
    sealed into volumes as the database closed. Written at the same commit by
    generator_beside.rs.txt, placed at examples/rowid_fixture2.rs and run
    as cargo run --example rowid_fixture2 -- <out>.
+4. snapshot_named_rowid_twice: tables t and t2, each (a INTEGER,
+   _rowid_ INTEGER) with rows (1, 10) and (2, 20), PRAGMA SNAPSHOT, then
+   both columns renamed to b, closed. Written at the same commit by
+   generator_twice.rs.txt, placed at examples/rowid_fixture3.rs.

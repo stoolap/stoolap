@@ -1087,7 +1087,7 @@ impl Executor {
         >,
         compiled: Option<&NestedPlan>,
     ) -> Result<Box<dyn QueryResult>> {
-        self.check_reserved_reads(statement)?;
+        self.check_reserved_reads(statement, &ctx)?;
         // If there's an active transaction, inject the transaction ID into the context
         // This enables CURRENT_TRANSACTION_ID() function to return the correct value
         // and the statement's view goes into the same context: one the caller
@@ -1414,7 +1414,7 @@ impl Executor {
         ctx: std::borrow::Cow<'_, ExecutionContext>,
     ) -> Result<Box<dyn QueryResult>> {
         check_param_count(&plan.params, ctx.params().len())?;
-        self.check_reserved_reads(&plan.statement)?;
+        self.check_reserved_reads(&plan.statement, &ctx)?;
         // The compiled fast paths run only a plan a run here has filled
         if plan.compiled.checked().get().is_none() {
             utils::statement_form_error(&plan.statement, crate::functions::global_registry())?;
