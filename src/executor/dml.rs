@@ -3141,8 +3141,10 @@ impl Executor {
         // Check if this table is referenced by child tables (for FK enforcement)
         let referencing_fks = super::foreign_key::find_referencing_fks(&self.engine, table_name);
 
-        // Get schema info for RETURNING clause processing
-        let column_names_owned = schema.column_names_owned().to_vec();
+        // Schema of the handle the rows are read through (CompactArc ref-count
+        // bump), held past the table's mutable borrows for RETURNING
+        let schema_arc = table.schema_arc();
+        let column_names_owned = schema_arc.column_names_owned();
         let column_count = schema.columns.len();
         // Use schema's cached pk_column_index for O(1) lookup
         let pk_col_idx = schema.pk_column_index();
@@ -3153,24 +3155,18 @@ impl Executor {
         let rows_affected = if needs_memory_filter || has_returning || has_referencing_fks {
             // Complex WHERE expression, RETURNING, or FK enforcement - need to scan rows first
             // Scan all rows, filter with evaluator, collect for RETURNING, delete matching ones by primary key
-            // Schema of the handle the rows are read through (CompactArc ref-count bump)
-            let schema_arc = table.schema_arc();
-
-            // Build column names with effective prefix (alias or table name)
-            // This allows WHERE clauses to reference columns using the alias
-            // OPTIMIZATION: Only build when needed (memory filter or RETURNING)
-            let column_names_with_prefix: Vec<String> = column_names_owned
-                .iter()
-                .map(|c| qualified(effective_name, c))
-                .collect();
 
             // The WHERE the prepared family does not ask, compiled once over
-            // the prefixed columns, so it reads alias.column; a failure to
-            // compile is the error of a row reaching it
+            // the columns prefixed with the alias or table name, so it reads
+            // alias.column; a failure to compile is the error of a row reaching it
             use super::expression::{ExecuteContext, ExprVM};
             let mut delete_vm = ExprVM::new();
             let params = ctx.params();
             let memory_where_program = memory_where_clause.as_ref().map(|expr| {
+                let column_names_with_prefix: Vec<String> = column_names_owned
+                    .iter()
+                    .map(|c| qualified(effective_name, c))
+                    .collect();
                 super::aggregation::compile_over_slots(
                     expr,
                     &column_names_with_prefix,
@@ -3400,7 +3396,7 @@ impl Executor {
             return statement_rollback.finish(self.finish_returning(
                 &stmt.returning,
                 returning_rows,
-                &column_names_owned,
+                column_names_owned,
                 ctx,
                 standalone_tx,
                 dml_run.as_ref(),

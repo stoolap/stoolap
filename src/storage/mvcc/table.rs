@@ -580,12 +580,12 @@ impl MVCCTable {
     /// transaction or of the store holds is a sealed row, deleted by a
     /// marker so the log records it; with `judged` given such an id is a
     /// row gone since the ids were found, left alone, a version committed
-    /// since the cut is deleted only when the judge passes it, and the ids
-    /// deleted are added to the set.
+    /// since the cut is deleted only when the judge passes it, and the set
+    /// receives the ids deleted unless every id was.
     fn delete_rows_by_id(
         &mut self,
         row_ids: &[i64],
-        judged: Option<(&mut I64Set, &CommitCut, &mut RowJudge<'_>)>,
+        judged: Option<(&mut Option<I64Set>, &CommitCut, &mut RowJudge<'_>)>,
     ) -> Result<i32> {
         let schema = &self.cached_schema;
         // Step 1: Check local versions first
@@ -614,19 +614,14 @@ impl MVCCTable {
         }
 
         // Step 2: Batch fetch remaining from version store
-        let mut rows_with_originals: Vec<(i64, Row, crate::storage::mvcc::RowVersion)> =
-            Vec::with_capacity(remaining_row_ids.len());
-        // Track which remaining row_ids have hot versions (cold-only rows won't)
-        let mut found_ids = rustc_hash::FxHashSet::default();
-        if !remaining_row_ids.is_empty() {
-            let batch_rows = self
+        let mut rows_with_originals = match remaining_row_ids.is_empty() {
+            true => Vec::new(),
+            false => self
                 .version_store
-                .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
-            for (row_id, row, version) in batch_rows {
-                found_ids.insert(row_id);
-                let row = self.normalize_row_to_schema(row, schema);
-                rows_with_originals.push((row_id, row, version));
-            }
+                .get_visible_versions_for_update(&remaining_row_ids, self.txn_id),
+        };
+        for (_, row, _) in &mut rows_with_originals {
+            *row = self.normalize_row_to_schema(std::mem::take(row), schema);
         }
         self.check_read()?;
 
@@ -648,15 +643,23 @@ impl MVCCTable {
                 if let Some(error) = failed {
                     return Err(error);
                 }
-                deleted.extend(local_deletes.iter().map(|(row_id, _)| *row_id));
-                deleted.extend(rows_with_originals.iter().map(|(row_id, ..)| *row_id));
+                if local_deletes.len() + rows_with_originals.len() != row_ids.len() {
+                    let local = local_deletes.iter().map(|(row_id, _)| *row_id);
+                    let hot = rows_with_originals.iter().map(|(row_id, ..)| *row_id);
+                    *deleted = Some(local.chain(hot).collect());
+                }
                 Vec::new()
             }
-            None => remaining_row_ids
-                .iter()
-                .filter(|id| !found_ids.contains(id))
-                .copied()
-                .collect(),
+            // Every remaining id has a hot version: the store returns one per id
+            None if rows_with_originals.len() == remaining_row_ids.len() => Vec::new(),
+            None => {
+                let found_ids: I64Set = rows_with_originals.iter().map(|(id, ..)| *id).collect();
+                remaining_row_ids
+                    .iter()
+                    .filter(|id| !found_ids.contains(**id))
+                    .copied()
+                    .collect()
+            }
         };
 
         // Step 3: Claim cold-only rows before acquiring txn_versions lock.
@@ -3189,9 +3192,9 @@ impl Table for MVCCTable {
         judge: &mut RowJudge<'_>,
     ) -> Result<i32> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
-        let mut deleted = I64Set::new();
+        let mut deleted = None;
         let count = self.delete_rows_by_id(row_ids, Some((&mut deleted, found, judge)))?;
-        if deleted.len() != row_ids.len() {
+        if let Some(deleted) = deleted {
             row_ids.retain(|id| deleted.contains(*id));
         }
         Ok(count)
