@@ -36,6 +36,8 @@ fn fill(db: &Database) {
         "INSERT INTO p3 VALUES (3)",
         "CREATE TABLE p4 (k INTEGER)",
         "INSERT INTO p4 VALUES (4)",
+        "CREATE TABLE ri (id INTEGER PRIMARY KEY)",
+        "INSERT INTO ri VALUES (1), (2), (3)",
         "CREATE TABLE tx (k TEXT)",
         "INSERT INTO tx VALUES ('a key longer than inline 1'), ('a key longer than inline 2')",
         "CREATE TABLE ux (k TEXT)",
@@ -265,6 +267,18 @@ fn a_merged_column_reads_the_side_its_join_kind_keeps() {
         (
             "SELECT COUNT(_rowid_) FROM (SELECT _rowid_ FROM t WHERE k = 1 + $1) a \
              FULL JOIN (SELECT _rowid_ FROM t WHERE k = 2) b USING (_rowid_)",
+            ints(&[&[s(2)]]),
+        ),
+        (
+            "SELECT COUNT(_rowid_) FROM (SELECT _rowid_ FROM ri WHERE id = 1 + $1) a \
+             FULL JOIN (SELECT _rowid_ FROM ri WHERE id = 2) b USING (_rowid_) \
+             FULL JOIN (SELECT _rowid_ FROM ri WHERE id = 3) c USING (_rowid_)",
+            ints(&[&[s(3)]]),
+        ),
+        (
+            "SELECT COUNT(_rowid_) FROM (SELECT _rowid_ FROM ri WHERE id = 1 + $1) a \
+             RIGHT JOIN (SELECT _rowid_ FROM ri WHERE id = 2) b USING (_rowid_) \
+             FULL JOIN (SELECT _rowid_ FROM ri WHERE id = 3) c USING (_rowid_)",
             ints(&[&[s(2)]]),
         ),
         (

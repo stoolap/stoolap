@@ -5649,8 +5649,9 @@ impl Executor {
             None
         };
 
-        // Execute join using JoinExecutor (takes ownership of rows)
-        let join_executor = JoinExecutor::new();
+        // Execute join using JoinExecutor (takes ownership of rows), each row
+        // made with room for a full join's merged columns
+        let join_executor = JoinExecutor::with_room(coalesced.len());
         let join_request = super::join_executor::JoinRequest {
             left_rows,
             right_rows,

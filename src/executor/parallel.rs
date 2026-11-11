@@ -627,7 +627,7 @@ fn sequential_probe(
     join_type: &JoinType,
     probe_col_count: usize,
     build_col_count: usize,
-    swapped: bool,
+    (swapped, room): (bool, usize),
     build_matched: &Option<BuildMatchedTracker>,
 ) -> (Vec<Row>, Vec<Row>) {
     let mut matched_rows = Vec::new();
@@ -650,7 +650,7 @@ fn sequential_probe(
                         build_row,
                         probe_col_count,
                         build_col_count,
-                        swapped,
+                        (swapped, room),
                     );
                     matched_rows.push(Row::from_compact_vec(combined));
                 }
@@ -658,7 +658,8 @@ fn sequential_probe(
         }
 
         if !matched && needs_unmatched_probe {
-            let values = combine_with_nulls(probe_row, probe_col_count, build_col_count, swapped);
+            let shape = (swapped, room);
+            let values = combine_with_nulls(probe_row, probe_col_count, build_col_count, shape);
             matched_rows.push(Row::from_compact_vec(values));
         }
     }
@@ -693,6 +694,28 @@ pub fn parallel_hash_join(
     join_type: JoinType,
     probe_col_count: usize,
     build_col_count: usize,
+    swapped: bool,
+    config: &ParallelConfig,
+) -> ParallelJoinResult {
+    parallel_hash_join_with_room(
+        probe_rows,
+        build_rows,
+        (probe_key_indices, build_key_indices),
+        join_type,
+        (probe_col_count, build_col_count, 0),
+        swapped,
+        config,
+    )
+}
+
+/// [`parallel_hash_join`], each joined row made with room for as many values
+/// more as the last of `counts`, after the probe and the build columns
+pub(crate) fn parallel_hash_join_with_room(
+    probe_rows: &[Row],
+    build_rows: &[Row],
+    (probe_key_indices, build_key_indices): (&[usize], &[usize]),
+    join_type: JoinType,
+    (probe_col_count, build_col_count, room): (usize, usize, usize),
     swapped: bool,
     config: &ParallelConfig,
 ) -> ParallelJoinResult {
@@ -744,7 +767,7 @@ pub fn parallel_hash_join(
                                             build_row,
                                             probe_col_count,
                                             build_col_count,
-                                            swapped,
+                                            (swapped, room),
                                         );
                                         local_results.push(Row::from_compact_vec(combined));
                                     }
@@ -789,7 +812,7 @@ pub fn parallel_hash_join(
                                             build_row,
                                             probe_col_count,
                                             build_col_count,
-                                            swapped,
+                                            (swapped, room),
                                         );
                                         matched_results.push(Row::from_compact_vec(combined));
                                     }
@@ -801,7 +824,7 @@ pub fn parallel_hash_join(
                                     probe_row,
                                     probe_col_count,
                                     build_col_count,
-                                    swapped,
+                                    (swapped, room),
                                 );
                                 unmatched_results.push(Row::from_compact_vec(values));
                             }
@@ -839,7 +862,7 @@ pub fn parallel_hash_join(
                     &join_type,
                     probe_col_count,
                     build_col_count,
-                    swapped,
+                    (swapped, room),
                     &build_matched,
                 )
             }
@@ -855,7 +878,7 @@ pub fn parallel_hash_join(
                 &join_type,
                 probe_col_count,
                 build_col_count,
-                swapped,
+                (swapped, room),
                 &build_matched,
             )
         }
@@ -869,8 +892,9 @@ pub fn parallel_hash_join(
     if let Some(ref tracker) = build_matched {
         for (build_idx, build_row) in build_rows.iter().enumerate() {
             if !tracker.was_matched(build_idx) {
+                let shape = (swapped, room);
                 let values =
-                    combine_build_with_nulls(build_row, build_col_count, probe_col_count, swapped);
+                    combine_build_with_nulls(build_row, build_col_count, probe_col_count, shape);
                 result_rows.push(Row::from_compact_vec(values));
             }
         }
@@ -887,18 +911,19 @@ pub fn parallel_hash_join(
     }
 }
 
-/// Combine probe and build rows into a single row, respecting swap order
+/// Combine probe and build rows into a single row, respecting swap order,
+/// with room for `room` values more
 #[inline]
 fn combine_join_rows(
     probe_row: &Row,
     build_row: &Row,
     probe_col_count: usize,
     build_col_count: usize,
-    swapped: bool,
+    (swapped, room): (bool, usize),
 ) -> CompactVec<Value> {
     // Use CompactVec directly to avoid Vec→CompactVec conversion in Row::from_values
     let mut combined: CompactVec<Value> =
-        CompactVec::with_capacity(probe_col_count + build_col_count);
+        CompactVec::with_capacity(probe_col_count + build_col_count + room);
     if swapped {
         // Build was originally left, probe was originally right
         for i in 0..build_col_count {
@@ -919,17 +944,18 @@ fn combine_join_rows(
     combined
 }
 
-/// Combine probe row with NULLs for unmatched probe side in OUTER joins
+/// Combine probe row with NULLs for unmatched probe side in OUTER joins,
+/// with room for `room` values more
 #[inline]
 fn combine_with_nulls(
     probe_row: &Row,
     probe_col_count: usize,
     build_col_count: usize,
-    swapped: bool,
+    (swapped, room): (bool, usize),
 ) -> CompactVec<Value> {
     // Use CompactVec directly to avoid Vec→CompactVec conversion in Row::from_values
     let mut combined: CompactVec<Value> =
-        CompactVec::with_capacity(probe_col_count + build_col_count);
+        CompactVec::with_capacity(probe_col_count + build_col_count + room);
     if swapped {
         // Build (left) is NULL, probe (right) has values
         combined.extend(std::iter::repeat_n(NULL_VALUE, build_col_count));
@@ -946,17 +972,18 @@ fn combine_with_nulls(
     combined
 }
 
-/// Combine build row with NULLs for unmatched build side in OUTER joins
+/// Combine build row with NULLs for unmatched build side in OUTER joins,
+/// with room for `room` values more
 #[inline]
 fn combine_build_with_nulls(
     build_row: &Row,
     build_col_count: usize,
     probe_col_count: usize,
-    swapped: bool,
+    (swapped, room): (bool, usize),
 ) -> CompactVec<Value> {
     // Use CompactVec directly to avoid Vec→CompactVec conversion in Row::from_values
     let mut combined: CompactVec<Value> =
-        CompactVec::with_capacity(probe_col_count + build_col_count);
+        CompactVec::with_capacity(probe_col_count + build_col_count + room);
     if swapped {
         // Build (left) has values, probe (right) is NULL
         for i in 0..build_col_count {

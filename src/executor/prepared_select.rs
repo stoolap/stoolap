@@ -2907,21 +2907,19 @@ impl Chain<'_> {
         let rowid = !id.quoted && is_rowid_name(&id.value_lower);
         for (depth, scope) in self.scopes.iter().enumerate() {
             if rowid {
-                // A pair of `_rowid_` columns a USING or NATURAL join merges is
-                // one column; merged keys of two tables stay two identities
-                let merged = |at: &Option<usize>| {
-                    scope.rowids.iter().any(|(_, first)| match (first, at) {
-                        (Some(first), Some(at)) => {
-                            is_rowid_name(&scope.lower[*at])
-                                && scope
-                                    .merged
-                                    .iter()
-                                    .any(|&(l, r, _)| (l, r) == (*first, *at))
-                        }
-                        _ => false,
-                    })
+                // The `_rowid_` columns a chain of USING or NATURAL joins merges
+                // are one column, the one at its end; merged keys of two tables
+                // stay two identities
+                let end = |at: &Option<usize>| match at {
+                    Some(at) if is_rowid_name(&scope.lower[*at]) => Some(scope.merged_at(*at)),
+                    _ => None,
                 };
-                let mut rowids = scope.rowids.iter().filter(|(_, at)| !merged(at));
+                let merged = |i: usize, at: &Option<usize>| {
+                    end(at).is_some() && scope.rowids[..i].iter().any(|(_, b)| end(b) == end(at))
+                };
+                let mut rowids = (scope.rowids.iter().enumerate())
+                    .filter(|&(i, (_, at))| !merged(i, at))
+                    .map(|(_, rowid)| rowid);
                 match (rowids.next(), rowids.next()) {
                     (None, _) => continue,
                     // A merged pair of `_rowid_` columns reads as its merge does
