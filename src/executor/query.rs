@@ -623,7 +623,11 @@ fn merged_columns(
     } else {
         let mut columns = all_columns.to_vec();
         let mut rows = filtered_rows;
-        for (_, read, base_name) in join_col_renames {
+        // A full join's merged column is its own, named bare already
+        let appended = join_col_renames
+            .iter()
+            .filter(|(_, read, name)| all_columns[*read] != *name);
+        for (_, read, base_name) in appended {
             columns.push(base_name.clone());
             for (_, row) in rows.iter_mut() {
                 let value = row.get(*read).cloned().unwrap_or_else(Value::null_unknown);
@@ -670,9 +674,13 @@ fn side_pairs(
         .iter()
         .any(|c| matches!(c, Expression::QualifiedStar(_)));
     let mut in_place: Vec<(usize, String)> = Vec::new();
-    for (left, right, _) in held.side_merges() {
+    for (left, right, slot) in held.side_merges() {
         if star {
             excluded.push(right);
+            // A full join's merged column shows in its left column's place
+            if slot != left && slot != right {
+                excluded.push(slot);
+            }
         }
         // A merge over another reads the column at the end of their chain,
         // named once there, the outer join's merge included
@@ -747,19 +755,23 @@ fn names_bare(stmt: &SelectStatement, name: &str) -> bool {
 /// Each column a join merges: its place, the column it reads, its bare name
 type MergedRenames = Vec<(usize, usize, String)>;
 
+/// The pairs a join merges, each its left and right column in the joined row
+/// and the one its merged column reads, past the row for a full join's
+type MergedPairs = Vec<(usize, usize, usize)>;
+
 /// The equalities a NATURAL join or a USING list makes of the sides'
-/// columns, each spelled by `column(right, index)`, the right columns
-/// SELECT * leaves out, and each merged column's place, the column it reads
-/// and its unqualified name; none for any other join
+/// columns, each spelled by `column(right, index)`, the columns SELECT *
+/// leaves out, each merged column's place, the column it reads and its
+/// unqualified name, and the pairs; none for any other join
 fn natural_join_condition(
     join_type: &str,
     join_source: &JoinTableSource,
     left_columns: &[String],
     right_columns: &[String],
     column: impl Fn(bool, usize) -> Expression,
-) -> (Option<Expression>, Vec<usize>, MergedRenames) {
+) -> (Option<Expression>, Vec<usize>, MergedRenames, MergedPairs) {
     if !join_type.contains("NATURAL") && join_source.using_columns.is_empty() {
-        return (None, Vec::new(), Vec::new());
+        return (None, Vec::new(), Vec::new(), Vec::new());
     }
     // Find common columns between left and right tables
     // For this, we extract the base column name (without table qualifier)
@@ -798,20 +810,25 @@ fn natural_join_condition(
             .position(|c| split_qualified(c).is_none() && extract_base_column_name(c) == name);
         bare.or_else(|| base.iter().find(|(_, b)| b == name).map(|(at, _)| *at))
     };
-    for (left_place, left_base) in &left_base_cols {
-        // For NATURAL JOIN, match all common columns
-        // For USING, only match specified columns
-        let named = using_col_names.is_empty() || using_col_names.contains(left_base);
-        if !named
-            || join_column_renames
-                .iter()
-                .any(|(_, _, name)| name == left_base)
+    // The names it merges in the order its scope takes them: the USING
+    // list's, else the left side's columns'
+    let names: Vec<&str> = match using_col_names.is_empty() {
+        true => left_base_cols.iter().map(|(_, b)| b.as_str()).collect(),
+        false => using_col_names.iter().map(String::as_str).collect(),
+    };
+    let width = left_columns.len() + right_columns.len();
+    let mut pairs: MergedPairs = Vec::new();
+    for left_base in names {
+        if join_column_renames
+            .iter()
+            .any(|(_, _, name)| name.as_str() == left_base)
         {
             continue;
         }
-        let (Some(left_idx), Some(right_idx)) = (
+        let (Some(left_idx), Some(right_idx), Some(&(left_place, _))) = (
             side_column(left_columns, &left_base_cols, left_base),
             side_column(right_columns, &right_base_cols, left_base),
+            left_base_cols.iter().find(|(_, b)| b.as_str() == left_base),
         ) else {
             continue;
         };
@@ -821,9 +838,14 @@ fn natural_join_condition(
         let right_at = left_columns.len() + right_idx;
         excluded_right_indices.push(right_at);
         // The merged column, in the left side's first column's place, under
-        // its bare name
-        let read = super::prepared_select::merged_slot(join_type, left_idx, right_at);
-        join_column_renames.push((*left_place, read, left_base.clone()));
+        // its bare name; a full join's past the joined row, which no star shows
+        let past = width + pairs.iter().filter(|p| p.2 >= width).count();
+        let read = super::prepared_select::merged_slot(join_type, left_idx, right_at, past);
+        if read == past {
+            excluded_right_indices.push(read);
+        }
+        pairs.push((left_idx, right_at, read));
+        join_column_renames.push((left_place, read, left_base.to_string()));
 
         // Create equality condition: left_col = right_col
         conditions.push(Expression::Infix(InfixExpression::new(
@@ -835,8 +857,8 @@ fn natural_join_condition(
     }
 
     match combine_predicates_with_and(conditions) {
-        None => (None, Vec::new(), Vec::new()),
-        combined => (combined, excluded_right_indices, join_column_renames),
+        None => (None, Vec::new(), Vec::new(), Vec::new()),
+        combined => (combined, excluded_right_indices, join_column_renames, pairs),
     }
 }
 
@@ -3535,12 +3557,19 @@ impl Executor {
                 })
             }
             // Its rows lay out each table's columns in turn, both of a pair
-            // a NATURAL or USING join merges among them
+            // a NATURAL or USING join merges among them, then a full join's
+            // merged columns
             Expression::JoinSource(join) => {
+                let sides = [
+                    self.join_side(&join.left, ctx, runs)?,
+                    self.join_side(&join.right, ctx, runs)?,
+                ];
+                let merged = super::prepared_select::merged_leaf(join, &sides).ok()?;
                 let mut leaves = smallvec::SmallVec::new();
-                for side in [&join.left, &join.right] {
-                    leaves.extend(self.join_side(side, ctx, runs)?.leaves);
+                for side in sides {
+                    leaves.extend(side.leaves);
                 }
+                leaves.extend(merged);
                 Some(JoinSide { leaves, rows: true })
             }
             _ => None,
@@ -3732,9 +3761,14 @@ impl Executor {
         let [left_side, right_side] = sides;
         prepared.join_blocks(|| {
             // The WHERE's SELECT aliases open over the columns the sides lay
-            // out, as the decision to run blocks read them
+            // out, as the decision to run blocks read them, then a full
+            // join's merged columns
+            let merged = super::prepared_select::merged_leaf(join_source, sides)?;
+            let merged_names = (merged.iter())
+                .flat_map(|(_, schema, _)| schema.columns.iter().map(|c| c.name.clone()));
             let columns: Vec<String> = (left_side.column_texts())
                 .chain(right_side.column_texts())
+                .chain(merged_names)
                 .collect();
             // The equalities of a NATURAL join or a USING list stand for its
             // ON, each column read by its place, as two sides without a name
@@ -5488,15 +5522,24 @@ impl Executor {
         all_columns.extend(right_columns.clone());
 
         // A joined side whose pairs the blocks hold apart keys a merge with its
-        // own merged column, the one each of its pairs reads
+        // own merged column, the one each of its pairs reads, the only one of
+        // their columns named bare
         let keyed_left: std::borrow::Cow<'_, [String]> =
             match blocks.as_deref().filter(|_| side_merged && !apart) {
                 Some(held) => {
                     let mut named = left_columns.clone();
                     let left_width = left_columns.len();
-                    for (left, ..) in held.side_merges().filter(|&(l, ..)| l < left_width) {
+                    let merges = || held.side_merges().filter(|&(l, ..)| l < left_width);
+                    for (left, right, read) in merges() {
+                        for at in [left, right, read] {
+                            if split_qualified(&named[at]).is_none() {
+                                named[at] = format!("\u{0}merged#{at}");
+                            }
+                        }
+                    }
+                    for (left, ..) in merges() {
                         let read = held.side_merged_at(left);
-                        named[read] = bare_name(&named[read]).to_string();
+                        named[read] = bare_name(&left_columns[read]).to_string();
                     }
                     std::borrow::Cow::Owned(named)
                 }
@@ -5513,7 +5556,7 @@ impl Executor {
                 let name = if right {
                     &right_columns[i]
                 } else {
-                    &left_columns[i]
+                    &keyed_left[i]
                 };
                 Expression::Identifier(Identifier::new(
                     Token::new(TokenType::Identifier, name.clone(), Position::default()),
@@ -5523,8 +5566,19 @@ impl Executor {
         );
 
         // Destructure the tuple: (condition, excluded_column_indices, column_renames)
-        let (natural_join_cond, mut excluded_column_indices, mut join_col_renames) =
+        let (natural_join_cond, mut excluded_column_indices, mut join_col_renames, pairs) =
             natural_join_condition;
+        // A full join's merged columns follow the sides', each under its bare name
+        let width = all_columns.len();
+        let coalesced: smallvec::SmallVec<[(usize, usize); 1]> = (pairs.iter())
+            .filter(|p| p.2 >= width)
+            .map(|&(left, right, _)| (left, right))
+            .collect();
+        all_columns.extend(
+            (join_col_renames.iter())
+                .filter(|(_, read, _)| *read >= width)
+                .map(|(_, _, name)| name.clone()),
+        );
         // Run apart, it keeps both columns of each pair it merges
         if apart || output_apart {
             excluded_column_indices.clear();
@@ -5537,6 +5591,29 @@ impl Executor {
             }
             None => Vec::new(),
         };
+        // Shown merged, a bare name reads only the column at the end of each
+        // chain of merges, its sides' held apart and its own
+        if !apart {
+            let held = blocks.as_deref().filter(|_| side_merged);
+            let side = held.into_iter().flat_map(JoinBlocks::side_merges);
+            let merges: smallvec::SmallVec<[(usize, usize, usize); 2]> =
+                side.chain(pairs.iter().copied()).collect();
+            let end = |mut at: usize| {
+                for &(left, right, read) in &merges {
+                    if at == left || at == right {
+                        at = read;
+                    }
+                }
+                at
+            };
+            for &(left, right, read) in &merges {
+                for at in [left, right, read].into_iter().filter(|&at| end(at) != at) {
+                    if split_qualified(&all_columns[at]).is_none() {
+                        all_columns[at] = format!("\u{0}merged#{at}");
+                    }
+                }
+            }
+        }
 
         // Use natural join condition if present, otherwise use explicit
         // condition, whose subqueries were read at the top of the function
@@ -5572,12 +5649,13 @@ impl Executor {
             None
         };
 
-        // Execute join using JoinExecutor (takes ownership of rows)
-        let join_executor = JoinExecutor::new();
+        // Execute join using JoinExecutor (takes ownership of rows), each row
+        // made with room for a full join's merged columns
+        let join_executor = JoinExecutor::with_room(coalesced.len());
         let join_request = super::join_executor::JoinRequest {
             left_rows,
             right_rows,
-            left_columns: &left_columns,
+            left_columns: &keyed_left,
             right_columns: &right_columns,
             condition: effective_condition,
             join_type: &join_type,
@@ -5590,7 +5668,18 @@ impl Executor {
         };
 
         let join_result = join_executor.execute(join_request)?;
-        let result_rows = join_result.rows;
+        let mut result_rows = join_result.rows;
+        if !coalesced.is_empty() {
+            for (_, row) in result_rows.iter_mut() {
+                for &(left, right) in &coalesced {
+                    let value = match row.get(left) {
+                        Some(value) if !value.is_null() => value.clone(),
+                        _ => row.get(right).cloned().unwrap_or_else(Value::null_unknown),
+                    };
+                    row.push(value);
+                }
+            }
+        }
 
         // Apply remaining WHERE clause if present (after filter pushdown)
         // IMPORTANT: When predicates were pushed to left/right (left_filter or right_filter is Some),

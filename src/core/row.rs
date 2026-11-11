@@ -242,8 +242,14 @@ impl Row {
     /// Result uses Owned storage (optimal for intermediate results)
     #[inline]
     pub fn from_combined(left: &Row, right: &Row) -> Self {
+        Self::from_combined_with_room(left, right, 0)
+    }
+
+    /// [`Self::from_combined`], with room for `room` values more
+    #[inline]
+    pub(crate) fn from_combined_with_room(left: &Row, right: &Row, room: usize) -> Self {
         let total_len = left.len() + right.len();
-        let mut values = CompactVec::with_capacity(total_len);
+        let mut values = CompactVec::with_capacity(total_len + room);
         // Use extend_clone to avoid Cloned iterator adapter overhead
         values.extend_clone(left.as_slice());
         values.extend_clone(right.as_slice());
@@ -333,10 +339,16 @@ impl Row {
     /// Combine two owned rows (for JOINs) - moves values without cloning
     #[inline]
     pub fn from_combined_owned(left: Row, right: Row) -> Self {
+        Self::from_combined_owned_with_room(left, right, 0)
+    }
+
+    /// [`Self::from_combined_owned`], with room for `room` values more
+    #[inline]
+    pub(crate) fn from_combined_owned_with_room(left: Row, right: Row, room: usize) -> Self {
         // Fast path: both Owned
         match (left.storage, right.storage) {
             (RowStorage::Owned(mut left_vec), RowStorage::Owned(right_vec)) => {
-                left_vec.reserve(right_vec.len());
+                left_vec.reserve(right_vec.len() + room);
                 left_vec.extend(right_vec);
                 Self {
                     storage: RowStorage::Owned(left_vec),
@@ -345,7 +357,7 @@ impl Row {
             (left_storage, right_storage) => {
                 let left_len = left_storage.len();
                 let right_len = right_storage.len();
-                let mut values = CompactVec::with_capacity(left_len + right_len);
+                let mut values = CompactVec::with_capacity(left_len + right_len + room);
                 // Use extend_clone to avoid Cloned iterator adapter overhead
                 match left_storage {
                     RowStorage::Owned(v) => values.extend(v),

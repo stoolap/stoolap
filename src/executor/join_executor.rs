@@ -88,7 +88,7 @@ use crate::executor::operator::{MaterializedOperator, Operator};
 use crate::executor::operators::hash_join::{HashJoinOperator, JoinSide, JoinType};
 use crate::executor::operators::nested_loop_join::NestedLoopJoinOperator;
 use crate::executor::parallel::{
-    parallel_hash_join, ParallelConfig, DEFAULT_PARALLEL_JOIN_THRESHOLD,
+    parallel_hash_join_with_room, ParallelConfig, DEFAULT_PARALLEL_JOIN_THRESHOLD,
 };
 use crate::executor::prepared_join::{BuiltPrograms, Held, JoinProgramKey, PreparedJoin};
 use crate::executor::prepared_select::{JoinBlocks, PreparedRunner, SiteRunner};
@@ -329,12 +329,21 @@ fn residual_filters(
 /// - Streaming probe side (no full materialization)
 /// - Early termination for LIMIT
 /// - Residual filter application during iteration
-pub struct JoinExecutor {}
+pub struct JoinExecutor {
+    /// The values its caller appends to each joined row, which each row is
+    /// made with room for
+    room: usize,
+}
 
 impl JoinExecutor {
     /// Create a new join executor.
     pub fn new() -> Self {
-        Self {}
+        Self::with_room(0)
+    }
+
+    /// A join executor making each joined row with room for `room` values more
+    pub(crate) fn with_room(room: usize) -> Self {
+        Self { room }
     }
 
     /// Execute a join operation.
@@ -779,14 +788,12 @@ impl JoinExecutor {
         };
 
         // Execute parallel hash join
-        let result = parallel_hash_join(
+        let result = parallel_hash_join_with_room(
             probe_slice,
             build_slice,
-            probe_key_indices,
-            build_key_indices,
+            (probe_key_indices, build_key_indices),
             analysis.join_type,
-            probe_col_count,
-            build_col_count,
+            (probe_col_count, build_col_count, self.room),
             swapped,
             &config,
         );
@@ -952,8 +959,9 @@ impl JoinExecutor {
         }
 
         // Create nested loop join operator
-        let mut nl_op =
-            NestedLoopJoinOperator::new(left_op, right_op, join_type, filter).with_blocks(site);
+        let mut nl_op = NestedLoopJoinOperator::new(left_op, right_op, join_type, filter)
+            .with_blocks(site)
+            .with_room(self.room);
 
         // Execute with Volcano model
         self.execute_operator_with_filter(&mut nl_op, limit, &[], None)
@@ -975,7 +983,7 @@ impl JoinExecutor {
         let has_filters = !residual_filters.is_empty();
 
         while let Some(row_ref) = op.next()? {
-            let row = row_ref.into_owned();
+            let row = row_ref.into_owned_with_room(self.room);
 
             // Apply residual filters - specialized unrolling for common cases (1-4 filters)
             if has_filters {

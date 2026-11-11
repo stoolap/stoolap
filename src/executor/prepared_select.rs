@@ -1471,7 +1471,8 @@ impl ScopeTable {
 
     /// The scope of `join` of `left` and `right`, each name its USING list or
     /// a NATURAL join merges one column: the column the left side's bare name
-    /// reads with the right side's, a side that is a join reading its own merge
+    /// reads with the right side's, a side that is a join reading its own
+    /// merge. A full join's merged columns follow the sides' under no table
     fn joined(join: &JoinTableSource, left: Self, right: Self) -> Self {
         let (left_names, right_names) = (&left.lower[..left.bare], &right.lower[..right.bare]);
         let natural = join.join_type.to_uppercase().contains("NATURAL");
@@ -1480,6 +1481,7 @@ impl ScopeTable {
             .iter()
             .map(|c| c.value_lower.as_str())
             .chain(left_names.iter().map(String::as_str).filter(|_| natural));
+        let width = left.lower.len() + right.lower.len();
         let mut merged: SmallVec<[(usize, usize, usize); 1]> = SmallVec::new();
         for name in names {
             let at = |names: &[String]| names.iter().position(|c| c == name);
@@ -1489,13 +1491,44 @@ impl ScopeTable {
                     .iter()
                     .any(|&(left, right, _)| (left, right) == (l, r))
                 {
-                    merged.push((l, r, merged_slot(&join.join_type, l, r)));
+                    let past = width + merged.iter().filter(|m| m.2 >= width).count();
+                    merged.push((l, r, merged_slot(&join.join_type, l, r, past)));
                 }
             }
         }
         let mut scope = Self::beside(left, right);
         scope.merged.extend(merged);
+        scope.with_merged_columns(width);
         scope
+    }
+
+    /// This scope with a column after its first `width` for each pair whose
+    /// merged column reads there, under the pair's left column's name and
+    /// the type its two columns share
+    fn with_merged_columns(&mut self, width: usize) {
+        let pairs: SmallVec<[(usize, usize); 1]> = (self.merged.iter())
+            .filter(|m| m.2 >= width)
+            .map(|&(l, r, _)| (l, r))
+            .collect();
+        if pairs.is_empty() {
+            return;
+        }
+        let appended = |names: &[String]| {
+            let past = pairs.iter().map(|&(l, _)| names[l].clone());
+            CompactArc::new(names.iter().cloned().chain(past).collect::<Vec<_>>())
+        };
+        self.tables.push((None, width));
+        self.columns = appended(&self.columns);
+        self.lower = appended(&self.lower);
+        for &(l, r) in &pairs {
+            let shared = self.types[l] == self.types[r];
+            self.types.push(if shared {
+                self.types[l]
+            } else {
+                DataType::Null
+            });
+        }
+        self.bare = self.lower.len();
     }
 
     /// The scope of the FROM entry `side`, its tables `leaves` in turn and
@@ -1512,7 +1545,13 @@ impl ScopeTable {
                 let Some(right) = Self::of_side(&join.right, leaves)? else {
                     return Ok(None);
                 };
-                Ok(Some(Self::joined(join, left, right)))
+                let width = left.lower.len() + right.lower.len();
+                let scope = Self::joined(join, left, right);
+                // Its merged columns are a leaf of their own, which it lays out
+                if scope.lower.len() > width && leaves.next().transpose()?.is_none() {
+                    return Ok(None);
+                }
+                Ok(Some(scope))
             }
             _ => leaves.next().transpose(),
         }
@@ -1792,12 +1831,35 @@ pub(crate) fn merged_condition(
     ))
 }
 
+/// The leaf, after its tables', holding the merged columns of `join` over
+/// `sides` when it is a side of another join: a full join's, under no name;
+/// None for another join
+pub(crate) fn merged_leaf(join: &JoinTableSource, sides: &JoinSides) -> Result<Option<SideLeaf>> {
+    if !join.join_type.to_uppercase().contains("FULL") {
+        return Ok(None);
+    }
+    let Some([left, right]) = side_scopes(join, sides)? else {
+        return Ok(None);
+    };
+    let width = left.lower.len() + right.lower.len();
+    let scope = ScopeTable::joined(join, left, right);
+    let columns: Vec<SchemaColumn> = (width..scope.lower.len())
+        .enumerate()
+        .map(|(i, at)| SchemaColumn::new(i, &scope.columns[at], scope.types[at], true, false))
+        .collect();
+    Ok((!columns.is_empty()).then(|| (None, CompactArc::new(Schema::new("", columns)), false)))
+}
+
 /// The column of a `join_type` join's pair `left`, `right` its merged
-/// column reads: a right join's right side's, else the left side's
-pub(crate) fn merged_slot(join_type: &str, left: usize, right: usize) -> usize {
-    match join_type.to_uppercase().contains("RIGHT") {
-        true => right,
-        false => left,
+/// column reads: a full join's `past`, a column after the joined row's
+/// holding the pair's first value not NULL, a right join's right side's,
+/// else the left side's
+pub(crate) fn merged_slot(join_type: &str, left: usize, right: usize, past: usize) -> usize {
+    let join_type = join_type.to_uppercase();
+    match (join_type.contains("FULL"), join_type.contains("RIGHT")) {
+        (true, _) => past,
+        (false, true) => right,
+        (false, false) => left,
     }
 }
 
@@ -2845,21 +2907,19 @@ impl Chain<'_> {
         let rowid = !id.quoted && is_rowid_name(&id.value_lower);
         for (depth, scope) in self.scopes.iter().enumerate() {
             if rowid {
-                // A pair of `_rowid_` columns a USING or NATURAL join merges is
-                // one column; merged keys of two tables stay two identities
-                let merged = |at: &Option<usize>| {
-                    scope.rowids.iter().any(|(_, first)| match (first, at) {
-                        (Some(first), Some(at)) => {
-                            is_rowid_name(&scope.lower[*at])
-                                && scope
-                                    .merged
-                                    .iter()
-                                    .any(|&(l, r, _)| (l, r) == (*first, *at))
-                        }
-                        _ => false,
-                    })
+                // The `_rowid_` columns a chain of USING or NATURAL joins merges
+                // are one column, the one at its end; merged keys of two tables
+                // stay two identities
+                let end = |at: &Option<usize>| match at {
+                    Some(at) if is_rowid_name(&scope.lower[*at]) => Some(scope.merged_at(*at)),
+                    _ => None,
                 };
-                let mut rowids = scope.rowids.iter().filter(|(_, at)| !merged(at));
+                let merged = |i: usize, at: &Option<usize>| {
+                    end(at).is_some() && scope.rowids[..i].iter().any(|(_, b)| end(b) == end(at))
+                };
+                let mut rowids = (scope.rowids.iter().enumerate())
+                    .filter(|&(i, (_, at))| !merged(i, at))
+                    .map(|(_, rowid)| rowid);
                 match (rowids.next(), rowids.next()) {
                     (None, _) => continue,
                     // A merged pair of `_rowid_` columns reads as its merge does
@@ -8102,7 +8162,7 @@ fn star_width(scope: &ScopeTable, width: usize) -> usize {
 
 /// Whether a `*` over `scope` shows its column `at`
 fn star_shows(scope: &ScopeTable, at: usize) -> bool {
-    !scope.merged.iter().any(|&(_, right, _)| right == at)
+    !(scope.merged.iter()).any(|&(left, right, read)| right == at || (read == at && left != at))
         && (at >= scope.lower.len() || !scope.is_slot(at))
 }
 
@@ -11033,6 +11093,7 @@ impl JoinBlocks {
             return Ok(None);
         };
         let left_width = left_scope.columns.len();
+        let sides_width = left_width + right_scope.columns.len();
         let inner_merges = left_scope.merged.len() + right_scope.merged.len();
         let scope = ScopeTable::joined(join, left_scope, right_scope).by_position();
         if scope.columns.len() != width {
@@ -11297,7 +11358,7 @@ impl JoinBlocks {
             return Ok(None);
         };
         let left = scope.columns[..left_width].to_vec();
-        let right = scope.columns[left_width..].to_vec();
+        let right = scope.columns[left_width..sides_width].to_vec();
         let pair_ctx = CompileContext::bound_pair(registry, left_width as u32);
         let position = |hole: &Expression| match hole {
             Expression::Column(c) => Some(match (c.index as usize).checked_sub(left_width) {

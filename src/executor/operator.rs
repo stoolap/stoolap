@@ -173,11 +173,22 @@ impl RowRef {
     /// For `Composite` and `DirectBuildComposite`, this materializes the combined row.
     #[inline]
     pub fn into_owned(self) -> Row {
+        self.into_owned_with_room(0)
+    }
+
+    /// [`Self::into_owned`], with room for `room` values more
+    #[inline]
+    pub(crate) fn into_owned_with_room(self, room: usize) -> Row {
         match self {
-            RowRef::Owned(row) => row,
+            RowRef::Owned(mut row) => {
+                if room > 0 {
+                    row.reserve(room);
+                }
+                row
+            }
             // Use materialize_owned to move values instead of cloning
-            RowRef::Composite(comp) => comp.materialize_owned(),
-            RowRef::DirectBuildComposite(direct) => direct.materialize_owned(),
+            RowRef::Composite(comp) => comp.materialize_owned_with_room(room),
+            RowRef::DirectBuildComposite(direct) => direct.materialize_owned_with_room(room),
         }
     }
 
@@ -312,7 +323,13 @@ impl CompositeRow {
     /// Use this instead of `materialize()` when you no longer need the CompositeRow.
     #[inline]
     pub fn materialize_owned(self) -> Row {
-        Row::from_combined_owned(self.left, self.right)
+        self.materialize_owned_with_room(0)
+    }
+
+    /// [`Self::materialize_owned`], with room for `room` values more
+    #[inline]
+    pub(crate) fn materialize_owned_with_room(self, room: usize) -> Row {
+        Row::from_combined_owned_with_room(self.left, self.right, room)
     }
 
     /// Decompose into the left and right rows.
@@ -441,10 +458,16 @@ impl DirectBuildCompositeRow {
     /// - Clones build values (shared reference)
     #[inline]
     pub fn materialize_owned(self) -> Row {
+        self.materialize_owned_with_room(0)
+    }
+
+    /// [`Self::materialize_owned`], with room for `room` values more
+    #[inline]
+    pub(crate) fn materialize_owned_with_room(self, room: usize) -> Row {
         let build_row = &self.build_rows[self.build_idx];
         let total = self.probe_cols + build_row.len();
 
-        let mut values: CompactVec<Value> = CompactVec::with_capacity(total);
+        let mut values: CompactVec<Value> = CompactVec::with_capacity(total + room);
         if self.probe_is_left {
             // Use extend_into_compact_vec to avoid intermediate Vec allocation
             self.probe.extend_into_compact_vec(&mut values);
