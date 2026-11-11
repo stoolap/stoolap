@@ -359,6 +359,13 @@ impl TopK {
         }
     }
 
+    /// Whether k rows are held and the worst has a key a side file holds:
+    /// then no NULL or NaN row can beat it, both sorting after every key
+    fn worst_is_keyed(&self) -> bool {
+        self.worst_key()
+            .is_some_and(|key| !key.is_null() && !matches!(key, Value::Float(f) if f.is_nan()))
+    }
+
     /// The row ids held from the read's volume `slot`, into `out` sorted
     fn held_from(&self, slot: usize, out: &mut Vec<i64>) {
         out.clear();
@@ -2443,11 +2450,11 @@ impl SegmentedTable {
         range.map(Some).map_err(side_error)
     }
 
-    /// Offers a volume's rows to a top-k through the side file of its order
-    /// column, by position ranges of the entry in key order: k positions,
-    /// twice as many each round after, none past the worst once k are held.
-    /// False when the volume must still be scanned: a refused reader, more
-    /// rows than the scan share, or rows the entry leaves out (`unkeyed`).
+    /// Offers a volume's rows to a top-k by its side file's ranges in key
+    /// order: k positions, then twice as many a round, none past the worst
+    /// once k are held; a round is false when its scanner read the volume
+    /// whole. False when the volume must still be scanned: a refused reader,
+    /// the scan share passed, or `unkeyed` rows while the worst is no key.
     fn top_k_side_rounds(
         &self,
         cs: &super::manifest::ColdSegment,
@@ -2455,7 +2462,7 @@ impl SegmentedTable {
         comparisons: &[(&str, crate::core::Operator, &Value)],
         unkeyed: bool,
         keep: &mut TopK,
-        round: &mut dyn FnMut(&mut TopK, super::secondary::SidePlan) -> Result<()>,
+        round: &mut dyn FnMut(&mut TopK, super::secondary::SidePlan) -> Result<bool>,
     ) -> Result<bool> {
         use super::secondary::SidePlan;
         use crate::core::Operator;
@@ -2496,7 +2503,7 @@ impl SegmentedTable {
                     (from.max(low), high)
                 };
                 if low >= high {
-                    return Ok(true);
+                    break;
                 }
             }
             let take = chunk.min(high - low);
@@ -2509,7 +2516,9 @@ impl SegmentedTable {
             } else {
                 (high - take, high)
             };
-            round(keep, SidePlan::new(Arc::clone(side), def.identity, range))?;
+            if !round(keep, SidePlan::new(Arc::clone(side), def.identity, range))? {
+                return Ok(true);
+            }
             if keep.ascending {
                 low += take;
             } else {
@@ -2517,7 +2526,7 @@ impl SegmentedTable {
             }
             chunk = take.saturating_mul(2);
         }
-        Ok(!unkeyed || keep.missing() == 0)
+        Ok(!unkeyed || keep.worst_is_keyed())
     }
 
     /// The non-PK unique keys whose every column the comparisons set by an
@@ -7394,7 +7403,8 @@ impl Table for SegmentedTable {
                                 let mut scanner =
                                     open_scanner(vol, cs, &mapping, rows, Some(walk), None)?;
                                 keep.held_from(slot, &mut held_here);
-                                take_rows(&mut scanner, keep, (slot, vcol, sorted), &held_here)
+                                take_rows(&mut scanner, keep, (slot, vcol, sorted), &held_here)?;
+                                Ok(scanner.side_walked())
                             },
                         )?;
                         if done {

@@ -1186,6 +1186,12 @@ impl VolumeScanner {
         self.matching_indices = None;
     }
 
+    /// Whether the side plan set on the scanner is still what it reads:
+    /// false once the walk's reader was refused and the range was scanned
+    pub fn side_walked(&self) -> bool {
+        self.side.is_some()
+    }
+
     /// Reads only these positions, ascending, with every skip rule and the
     /// filter applied to each. Set before the filter, so the filter's
     /// dictionary pre-scan does not replace them

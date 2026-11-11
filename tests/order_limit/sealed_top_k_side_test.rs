@@ -401,6 +401,84 @@ fn a_sealed_top_k_through_side_files_answers_as_the_sort_does() {
     }
 }
 
+#[test]
+fn a_sealed_top_k_held_full_by_hot_nulls_still_takes_the_sealed_nans() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?checkpoint_on_close=off&checkpoint_interval=0&compact_threshold=100",
+        dir.path().display()
+    ))
+    .unwrap();
+    db.execute("CREATE TABLE n (id INTEGER PRIMARY KEY, f FLOAT)", ())
+        .unwrap();
+    db.execute("CREATE INDEX n_f ON n(f) USING BTREE", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO n SELECT value, CASE WHEN value = 7 THEN 2.5 WHEN value = 9 THEN 1.5 \
+         ELSE CAST('NaN' AS FLOAT) END FROM generate_series(1, 3000)",
+        (),
+    )
+    .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute(
+        "INSERT INTO n SELECT value, NULL FROM generate_series(3001, 3010)",
+        (),
+    )
+    .unwrap();
+    let rows: Vec<(i64, String)> = db
+        .query("SELECT id, f FROM n ORDER BY f LIMIT 10", ())
+        .unwrap()
+        .map(|row| {
+            let row = row.unwrap();
+            (row.get(0).unwrap(), row.get_value(1).unwrap().to_string())
+        })
+        .collect();
+    let keys: Vec<&str> = rows.iter().map(|(_, f)| f.as_str()).collect();
+    assert_eq!(
+        keys,
+        ["1.5", "2.5", "NaN", "NaN", "NaN", "NaN", "NaN", "NaN", "NaN", "NaN"]
+    );
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_side_file_round_whose_walk_is_refused_reads_the_volume_once() {
+    use stoolap::test_failpoints::{refuse_side_walks, top_k_side_rounds};
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?checkpoint_on_close=off&checkpoint_interval=0&compact_threshold=100",
+        dir.path().display()
+    ))
+    .unwrap();
+    db.execute("CREATE TABLE w (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE INDEX w_k ON w(k) USING BTREE", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO w SELECT value, (value * 7919) % 200000 FROM generate_series(1, 200000)",
+        (),
+    )
+    .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let before = top_k_side_rounds();
+    refuse_side_walks(usize::MAX);
+    let keys: Vec<i64> = db
+        .query(
+            "SELECT k FROM w WHERE k IN (49999, 149999) ORDER BY k LIMIT 5",
+            (),
+        )
+        .unwrap()
+        .map(|row| row.unwrap().get(0).unwrap())
+        .collect();
+    refuse_side_walks(0);
+    assert_eq!(keys, [49_999, 149_999]);
+    assert_eq!(
+        top_k_side_rounds() - before,
+        1,
+        "the round that scanned the volume was followed by more"
+    );
+}
+
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn a_sealed_top_k_through_a_side_file_loads_few_row_groups() {
