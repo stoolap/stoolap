@@ -5493,7 +5493,8 @@ impl Executor {
                 Some(held) => {
                     let mut named = left_columns.clone();
                     let left_width = left_columns.len();
-                    for (_, _, read) in held.side_merges().filter(|&(l, ..)| l < left_width) {
+                    for (left, ..) in held.side_merges().filter(|&(l, ..)| l < left_width) {
+                        let read = held.merged_at(left);
                         named[read] = bare_name(&named[read]).to_string();
                     }
                     std::borrow::Cow::Owned(named)

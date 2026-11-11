@@ -26,6 +26,14 @@ fn fill(db: &Database) {
         "INSERT INTO u VALUES (2, 200), (3, 300)",
         "CREATE TABLE w (k INTEGER, c INTEGER)",
         "INSERT INTO w VALUES (3, 3000), (4, 4000)",
+        "CREATE TABLE y (k INTEGER)",
+        "INSERT INTO y VALUES (3)",
+        "CREATE TABLE p1 (k INTEGER)",
+        "INSERT INTO p1 VALUES (1)",
+        "CREATE TABLE p2 (k INTEGER)",
+        "INSERT INTO p2 VALUES (2)",
+        "CREATE TABLE p3 (k INTEGER)",
+        "INSERT INTO p3 VALUES (3)",
     ] {
         db.execute(sql, ()).unwrap();
     }
@@ -153,6 +161,16 @@ fn a_merged_column_reads_the_side_its_join_kind_keeps() {
                 &[s(3), N, s(300), s(3000), s(9), s(1)],
                 &[s(4), N, N, s(4000), s(9), s(2)],
             ]),
+        ),
+        (
+            "SELECT *, ROW_NUMBER() OVER (ORDER BY c) FROM t RIGHT JOIN u USING (k) \
+             RIGHT JOIN w USING (k) JOIN y USING (k) WHERE c > $1",
+            ints(&[&[s(3), N, s(300), s(3000), s(1)]]),
+        ),
+        (
+            "SELECT *, ROW_NUMBER() OVER () FROM p1 RIGHT JOIN p2 USING (k) \
+             RIGHT JOIN p3 USING (k) JOIN y USING (k) WHERE k > $1",
+            ints(&[&[s(3), s(1)]]),
         ),
         (
             "SELECT k, a, b FROM w RIGHT JOIN (SELECT * FROM t RIGHT JOIN u USING (k)) x \
