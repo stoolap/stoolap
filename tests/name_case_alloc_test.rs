@@ -143,3 +143,30 @@ fn a_cold_unique_check_on_a_sigma_column_copies_no_name() {
         "{per_row} more allocations per row for the UNIQUE column \"Σx\" than for sx"
     );
 }
+
+#[test]
+fn a_cold_insert_into_a_table_keyed_by_a_sigma_column_copies_no_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?checkpoint_interval=3600",
+        dir.path().display()
+    ))
+    .unwrap();
+    for (table, key) in [("ka", "sx"), ("kb", "\"Σx\"")] {
+        db.execute(
+            &format!("CREATE TABLE {table} ({key} INTEGER PRIMARY KEY, v INTEGER)"),
+            (),
+        )
+        .unwrap();
+        db.execute(&format!("INSERT INTO {table} VALUES (1, 1)"), ())
+            .unwrap();
+    }
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let ascii = insert(&db, "ka", 10);
+    let other = insert(&db, "kb", 10);
+    let per_row = extra_per_row(ascii, other);
+    assert!(
+        per_row <= LIMIT,
+        "{per_row} more allocations per row for the key \"Σx\" than for sx"
+    );
+}

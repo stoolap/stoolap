@@ -4434,7 +4434,7 @@ impl Table for MVCCTable {
         let pk_col = self
             .cached_schema
             .pk_column_index()
-            .map(|i| &self.cached_schema.columns[i].name_lower);
+            .map(|i| &self.cached_schema.columns[i].name);
         let mut unique = smallvec::SmallVec::<[Arc<dyn Index>; 4]>::new();
         let indexes = self.version_store.indexes_read();
         for idx in indexes.values().map(|entry| &entry.index) {
@@ -4463,7 +4463,7 @@ impl Table for MVCCTable {
         let pk_col = self
             .cached_schema
             .pk_column_index()
-            .map(|i| &self.cached_schema.columns[i].name_lower);
+            .map(|i| &self.cached_schema.columns[i].name);
         let indexes = self.version_store.indexes_read();
         indexes.values().map(|entry| &entry.index).any(|idx| {
             if !idx.is_unique() {

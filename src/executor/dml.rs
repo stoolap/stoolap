@@ -130,9 +130,11 @@ fn conflict_matches_target(conflict_target: &[Identifier], schema: &Schema, erro
         }
         Error::UniqueConstraint { column, .. } => {
             // `column` is comma-separated (e.g. "a" or "a, b"), each as the index spells it
-            let mut violated = column.split(", ").map(str::trim);
-            column.split(", ").count() == target_set.len()
-                && violated.all(|v| target_set.iter().any(|t| eq_names(v, t)))
+            let violated = || column.split(", ").map(str::trim);
+            violated().all(|v| target_set.iter().any(|t| eq_names(v, t)))
+                && target_set
+                    .iter()
+                    .all(|t| violated().any(|v| eq_names(v, t)))
         }
         _ => false,
     }

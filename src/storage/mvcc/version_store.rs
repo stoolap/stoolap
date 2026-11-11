@@ -5734,9 +5734,7 @@ impl VersionStore {
     /// Used by commit-time cold revalidation.
     pub fn get_unique_non_pk_index_columns(&self) -> Vec<(Vec<usize>, Vec<String>)> {
         let schema = self.schema();
-        let pk_col = schema
-            .pk_column_index()
-            .map(|i| &schema.columns[i].name_lower);
+        let pk_col = schema.pk_column_index().map(|i| &schema.columns[i].name);
         let indexes = self.indexes.read();
         let mut result = Vec::new();
         for idx in indexes.values().map(|entry| &entry.index) {
@@ -5811,10 +5809,7 @@ impl VersionStore {
             };
             let mut components: smallvec::SmallVec<[Component; 4]> = smallvec::SmallVec::new();
             for name in idx.column_names() {
-                let Some(column) = schema
-                    .columns
-                    .iter()
-                    .position(|c| eq_names(&c.name_lower, name))
+                let Some(column) = schema.columns.iter().position(|c| eq_names(&c.name, name))
                 else {
                     continue 'indexes;
                 };

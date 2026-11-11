@@ -247,6 +247,23 @@ fn on_conflict_names_a_unique_column_with_uppercase_letters() {
 }
 
 #[test]
+fn on_conflict_raises_a_violation_of_an_index_repeating_one_target_column() {
+    let db = Database::open("memory://on_conflict_repeated_column").unwrap();
+    run(
+        &db,
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+    );
+    run(&db, "CREATE UNIQUE INDEX uaa ON u (a, a)");
+    run(&db, "CREATE UNIQUE INDEX uab ON u (a, b)");
+    run(&db, "INSERT INTO u VALUES (1, 1, 1)");
+    let sql = "INSERT INTO u VALUES (2, 1, 2) ON CONFLICT (a, b) DO NOTHING";
+    assert!(
+        db.execute(sql, ()).is_err(),
+        "the (a, a) violation is outside the target (a, b)"
+    );
+}
+
+#[test]
 fn a_savepoint_name_ignores_case() {
     let db = Database::open("memory://savepoint_name_case").unwrap();
     run(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY)");
