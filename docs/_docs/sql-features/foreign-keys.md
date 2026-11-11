@@ -303,6 +303,18 @@ INSERT INTO children VALUES (2, 1, 'Second');
 
 Renaming a column a foreign key names renames it in the key too: a referenced column of the parent in every child's key, and a key column of the child in its own key. The keys keep their checks and actions, also after the database is opened again.
 
+### DROP COLUMN
+
+A column another table's foreign key references cannot be dropped; the error names the referencing key. Drop the child table first, or the key's column in it. Dropping a child's key column drops its foreign key with it:
+
+```sql
+-- Refused while a child's foreign key references parents(code)
+ALTER TABLE parents DROP COLUMN code;
+
+-- The foreign key goes with its column
+ALTER TABLE children DROP COLUMN parent_id;
+```
+
 ## CREATE TABLE Validation
 
 FK constraints are validated at table creation time:
