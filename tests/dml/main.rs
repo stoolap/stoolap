@@ -18,6 +18,7 @@
 #[path = "../oracle/mod.rs"]
 mod oracle;
 
+mod add_column_not_null_test;
 mod auto_increment_test;
 mod bug_composite_unique_upsert_test;
 mod bug_conflict_target_test;

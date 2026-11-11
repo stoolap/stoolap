@@ -1253,6 +1253,21 @@ impl Executor {
                     #[cfg(feature = "test-failpoints")]
                     crate::test_failpoints::add_column_published();
 
+                    // A NOT NULL column with no default has no value for a row already there
+                    if !nullable && column.default_value.is_none() {
+                        let refused = match self.engine.added_column_finds_rows(table_name) {
+                            Ok(true) => Err(Error::not_null_constraint(&column.name)),
+                            Ok(false) => Ok(()),
+                            Err(error) => Err(error),
+                        };
+                        if let Err(error) = refused {
+                            self.engine
+                                .reopen_after_refused_add(table_name, previous_schema)?;
+                            change.finish();
+                            return Err(error);
+                        }
+                    }
+
                     // Record ALTER TABLE ADD COLUMN to WAL for persistence
                     let vector_dimensions = if data_type == DataType::Vector {
                         crate::executor::utils::parse_vector_dimension(&col_def.data_type)

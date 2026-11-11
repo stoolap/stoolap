@@ -4934,6 +4934,33 @@ impl MVCCEngine {
         self.refresh_column_mappings(table_name)
     }
 
+    /// Whether `table_name`, closed by an added column, holds a committed
+    /// row once every commit that began publishing before the close is done
+    pub(crate) fn added_column_finds_rows(&self, table_name: &str) -> Result<bool> {
+        const SETTLE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+        let name = to_lowercase_cow(table_name);
+        let store = self.get_version_store(&name)?;
+        if !store.wait_until_quiet(Instant::now() + SETTLE_WAIT) {
+            return Err(Error::TableHasOpenTransactionRows {
+                table: name.to_string(),
+            });
+        }
+        let mgr = self
+            .segment_managers
+            .read()
+            .map_err(|_| Error::internal("segment managers lock poisoned"))?
+            .get(name.as_ref())
+            .cloned();
+        let Some(mgr) = mgr else {
+            return Ok(store.committed_row_count() > 0);
+        };
+        let _seal = mgr.acquire_seal_read();
+        let hot = store
+            .committed_row_count()
+            .saturating_sub(mgr.seal_overlap());
+        Ok(hot + mgr.deduped_row_count()? > 0)
+    }
+
     /// Moves a table's hot rows to its schema's layout, once a column
     /// added or dropped is recorded
     pub(crate) fn lay_out_rows(&self, table_name: &str) -> Result<()> {
