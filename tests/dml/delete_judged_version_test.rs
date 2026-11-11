@@ -20,13 +20,22 @@
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Mutex, MutexGuard};
 
 use stoolap::functions::{
     global_registry, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType,
     ScalarFunction,
 };
-use stoolap::test_failpoints::{after_delete_rows_scanned, under_seal_fence};
+use stoolap::test_failpoints::{after_commit_counted, after_delete_rows_scanned, under_seal_fence};
 use stoolap::{Database, Value};
+
+/// The tests that count the judge's calls run one at a time
+fn serial() -> MutexGuard<'static, ()> {
+    static SERIAL: Mutex<()> = Mutex::new(());
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// `t` of three rows, two of them with `v = 10`, on the hot store and then sealed
 fn each_layout(name: &str, extra: &[&str], check: impl Fn(&Database)) {
@@ -246,6 +255,7 @@ impl ScalarFunction for DeleteJudgedFence {
 
 #[test]
 fn a_changed_row_is_judged_outside_the_seal_fence() {
+    let _guard = serial();
     let _ = global_registry().register_scalar::<DeleteJudgedFence>();
     each_layout("outside_fence", &[], |db| {
         JUDGED.store(0, Ordering::Relaxed);
@@ -302,4 +312,72 @@ fn a_changed_row_is_judged_with_its_row_id_without_a_returning() {
             .collect();
         assert_eq!(left, [2, 3], "{dsn}");
     }
+}
+
+#[test]
+fn a_changed_row_is_judged_before_any_row_of_the_delete_goes() {
+    each_layout("own_deletes", &[], |db| {
+        db.execute("BEGIN", ()).unwrap();
+        let fired = commit_between(db, "UPDATE t SET s = 'z' WHERE id = 1");
+        let returned: Vec<i64> = db
+            .query(
+                "DELETE FROM t WHERE id = 2 OR v = (SELECT q.v FROM t q WHERE q.id = t.id + 1) RETURNING id",
+                (),
+            )
+            .unwrap()
+            .map(|row| row.unwrap().get(0).unwrap())
+            .collect();
+        db.execute("COMMIT", ()).unwrap();
+        assert!(fired.get(), "the commit did not come between");
+        assert_eq!(returned, [1, 2]);
+        assert_eq!(rows(db), [(3, 30, "c".into())]);
+    });
+}
+
+#[test]
+fn a_sealed_row_a_commit_in_flight_elsewhere_sealed_over_is_not_judged() {
+    let _guard = serial();
+    let _ = global_registry().register_scalar::<DeleteJudgedFence>();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, s TEXT)",
+        "INSERT INTO t VALUES (1, 10, 'a'), (2, 10, 'b'), (3, 30, 'c')",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    // A commit into another table holds its sequence while `t` is sealed
+    let (entered, in_flight) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let other = db.clone();
+    let holder = std::thread::spawn(move || {
+        after_commit_counted(move || {
+            entered.send(()).unwrap();
+            released.recv().unwrap();
+        });
+        other.execute("INSERT INTO u VALUES (1)", ()).unwrap();
+    });
+    in_flight.recv().unwrap();
+    db.engine().seal_for_test().unwrap();
+    JUDGED.store(0, Ordering::Relaxed);
+    after_delete_rows_scanned(|| JUDGING.store(true, Ordering::Relaxed));
+    let returned: Result<Vec<i64>, String> = db
+        .query(
+            "DELETE FROM t WHERE DELETE_JUDGED_FENCE(v) = 10 RETURNING id",
+            (),
+        )
+        .map_err(|e| e.to_string())
+        .and_then(|rows| {
+            rows.map(|row| {
+                row.map(|row| row.get(0).unwrap())
+                    .map_err(|e| e.to_string())
+            })
+            .collect()
+        });
+    JUDGING.store(false, Ordering::Relaxed);
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    assert_eq!(returned, Ok(vec![1, 2]));
+    assert_eq!(JUDGED.load(Ordering::Relaxed), 0, "no row was asked again");
 }

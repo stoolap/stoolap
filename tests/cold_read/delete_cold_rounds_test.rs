@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use stoolap::core::Error;
 use stoolap::storage::mvcc::registry::CommitCut;
-use stoolap::storage::traits::{Engine, ScanAccess};
+use stoolap::storage::traits::{Engine, FoundVersions, ScanAccess, VersionMark};
 use stoolap::test_failpoints::{
     after_cold_round_prepared, after_delete_rows_scanned, block_file_reads,
     block_store_drops_by_fence, volume_file_drops_by_fence, volume_file_reads_by_fence,
@@ -215,7 +215,7 @@ fn a_delete_of_scanned_rows_reads_no_file_under_the_fence() {
         let mut txn = db.engine().begin_transaction().unwrap();
         let mut table = txn.get_table("t").unwrap();
         let deleted = table
-            .delete_found(&mut vec![1, 3], &CommitCut::every(), &mut Vec::new())
+            .delete_found(&mut vec![1, 3], &found_all(), &mut Vec::new())
             .unwrap();
         drop(table);
         txn.commit().unwrap();
@@ -456,7 +456,7 @@ fn a_scanned_id_named_twice_is_deleted_once() {
     let mut table = txn.get_table("t").unwrap();
     let mut ids = vec![1, 3, 1];
     let deleted = table
-        .delete_found(&mut ids, &CommitCut::every(), &mut Vec::new())
+        .delete_found(&mut ids, &found_all(), &mut Vec::new())
         .unwrap();
     drop(table);
     txn.commit().unwrap();
@@ -465,7 +465,7 @@ fn a_scanned_id_named_twice_is_deleted_once() {
 }
 
 #[test]
-fn a_sealed_row_of_a_volume_sealed_past_the_cut_is_handed_back_in_place() {
+fn a_sealed_row_not_taken_as_found_holds_the_delete_back_until_judged() {
     let _guard = FailpointGuard::new();
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path());
@@ -474,27 +474,57 @@ fn a_sealed_row_of_a_volume_sealed_past_the_cut_is_handed_back_in_place() {
     let mut table = txn.get_table("t").unwrap();
     let mut ids = vec![1, 2, 3];
     let mut changed = Vec::new();
-    let deleted = table
-        .delete_found(&mut ids, &CommitCut::through(0), &mut changed)
-        .unwrap();
-    drop(table);
-    txn.commit().unwrap();
-    assert_eq!(deleted, 0);
-    assert!(ids.is_empty(), "{ids:?}");
-    let mut changed: Vec<_> = changed
-        .into_iter()
-        .map(|(id, row)| (id, row.get(2).cloned()))
+    let mut found = FoundVersions::new(CommitCut::through(0), Vec::new());
+    let deleted = table.delete_found(&mut ids, &found, &mut changed).unwrap();
+    assert_eq!((deleted, &ids[..]), (0, &[1, 2, 3][..]));
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM t"), 3);
+    let mut handed: Vec<_> = changed
+        .iter()
+        .map(|(id, row, _)| (*id, row.get(2).cloned()))
         .collect();
-    changed.sort_by_key(|(id, _)| *id);
+    handed.sort_by_key(|(id, _)| *id);
     assert_eq!(
-        changed,
+        handed,
         [
             (1, Some(stoolap::core::Value::Integer(10))),
             (2, Some(stoolap::core::Value::Integer(20))),
             (3, Some(stoolap::core::Value::Integer(30)))
         ]
     );
-    assert_eq!(count(&db, "SELECT COUNT(*) FROM t"), 3);
+    for (id, _, mark) in changed.drain(..) {
+        assert!(matches!(mark, VersionMark::Sealed(_)), "{mark:?}");
+        found.judged.insert(id, mark);
+    }
+    let deleted = table.delete_found(&mut ids, &found, &mut changed).unwrap();
+    drop(table);
+    txn.commit().unwrap();
+    assert_eq!((deleted, &ids[..]), (3, &[1, 2, 3][..]));
+    assert!(changed.is_empty());
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM t"), 0);
+}
+
+#[test]
+fn a_sealed_row_of_a_volume_held_when_the_rows_were_found_is_taken_as_found() {
+    let _guard = FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    seal_rows(&db, &[(1, 10), (2, 20), (3, 30)]);
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let mut table = txn.get_table("t").unwrap();
+    let found = FoundVersions::new(CommitCut::through(0), table.sealed_volume_ids());
+    let mut ids = vec![1, 3];
+    let mut changed = Vec::new();
+    let deleted = table.delete_found(&mut ids, &found, &mut changed).unwrap();
+    drop(table);
+    txn.commit().unwrap();
+    assert_eq!((deleted, &ids[..]), (2, &[1, 3][..]));
+    assert!(changed.is_empty());
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM t"), 1);
+}
+
+/// Every version taken as found: a cut past every commit
+fn found_all() -> FoundVersions {
+    FoundVersions::new(CommitCut::every(), Vec::new())
 }
 
 #[test]

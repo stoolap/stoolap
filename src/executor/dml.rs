@@ -3179,8 +3179,12 @@ impl Executor {
             });
             let transaction_id = ctx.transaction_id();
 
-            // The commits complete before a row is found: a version they made is the one found
-            let found = self.engine.registry_ref().commit_cut();
+            // The commits complete and the volumes held before a row is found:
+            // a version they made or hold is the one found
+            let mut found = crate::storage::traits::FoundVersions::new(
+                self.engine.registry_ref().commit_cut(),
+                table.sealed_volume_ids(),
+            );
             // The ids of the rows to delete: an integer primary key is the row id
             let mut row_ids: Vec<i64> = Vec::new();
             // A RETURNING reads each row found, the row id past its columns when it reads that
@@ -3357,47 +3361,48 @@ impl Executor {
                 // The rows go in one call, read once from the volumes they sit in
                 #[cfg(any(test, feature = "test-failpoints"))]
                 crate::test_failpoints::delete_rows_scanned();
-                // Taken before each call reads: the cut of the call after it
-                let mut next_cut = self.engine.registry_ref().commit_cut();
-                let mut changed: Vec<(i64, Row)> = Vec::new();
-                delete_count = table.delete_found(&mut row_ids, &found, &mut changed)?;
-                // The rows changed since they were found are judged outside
-                // the storage call, then named again under the cut taken
-                // before the versions judged were read
-                let mut rejudged: Vec<i64> = Vec::new();
+                // A row changed since it was found holds the whole delete back,
+                // so the WHERE never reads a row this statement deleted: it is
+                // judged outside the storage call, its version marked, and
+                // every row is named again
+                let mut changed = Vec::new();
                 // Rounds the changed rows may take before the delete gives up
                 const CHANGED_ROUNDS: usize = 3;
                 let mut rounds = 0;
-                while !changed.is_empty() {
+                loop {
+                    delete_count = table.delete_found(&mut row_ids, &found, &mut changed)?;
+                    if changed.is_empty() {
+                        break;
+                    }
                     rounds += 1;
                     if rounds > CHANGED_ROUNDS {
                         return Err(Error::internal(format!(
                             "write conflict: the rows of table '{table_name}' kept changing while the delete read them"
                         )));
                     }
-                    let mut passing: Vec<i64> = Vec::with_capacity(changed.len());
-                    for (row_id, row) in changed.drain(..) {
-                        if judge(row_id, &row)? {
-                            passing.push(row_id);
+                    let mut refused: Option<I64Set> = None;
+                    for (row_id, row, mark) in changed.drain(..) {
+                        match judge(row_id, &row)? {
+                            true => {
+                                found.judged.insert(row_id, mark);
+                            }
+                            false => {
+                                refused.get_or_insert_with(I64Set::new).insert(row_id);
+                            }
                         }
                     }
-                    if passing.is_empty() {
+                    if let Some(refused) = refused {
+                        row_ids.retain(|id| !refused.contains(*id));
+                    }
+                    if row_ids.is_empty() {
                         break;
                     }
-                    let cut =
-                        std::mem::replace(&mut next_cut, self.engine.registry_ref().commit_cut());
-                    delete_count += table.delete_found(&mut passing, &cut, &mut changed)?;
-                    rejudged.extend(passing);
                 }
                 // In the order the rows were found, as deleted; a row gone or
                 // no longer passing since then was not deleted and is not returned
-                let rejudged: Option<I64Set> =
-                    (!rejudged.is_empty()).then(|| rejudged.into_iter().collect());
                 let mut deleted = row_ids.iter().peekable();
                 for (row_id, row) in found_rows {
                     if deleted.next_if_eq(&&row_id).is_some() {
-                        returning_rows.push(row);
-                    } else if rejudged.as_ref().is_some_and(|ids| ids.contains(row_id)) {
                         returning_rows.push(returned.remove(&row_id).unwrap_or(row));
                     }
                 }

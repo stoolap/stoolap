@@ -240,6 +240,52 @@ impl PlannedUpdate {
     }
 }
 
+/// A version of a row by what identifies it: the transaction that wrote a
+/// hot one, the volume that holds a sealed one
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionMark {
+    Hot(i64),
+    Sealed(u64),
+}
+
+/// The versions a delete of rows found earlier takes as the ones found
+pub struct FoundVersions {
+    /// The commits complete before the rows were found
+    pub cut: CommitCut,
+    /// The sealed volumes the table held then, sorted
+    pub volumes: Vec<u64>,
+    /// The version each row judged since was judged in
+    pub judged: FxHashMap<i64, VersionMark>,
+}
+
+impl FoundVersions {
+    pub fn new(cut: CommitCut, mut volumes: Vec<u64>) -> Self {
+        volumes.sort_unstable();
+        Self {
+            cut,
+            volumes,
+            judged: FxHashMap::default(),
+        }
+    }
+
+    /// Whether a hot version made by `txn_id`, stamped `stamp`, is the one found
+    pub fn hot(&self, row_id: i64, txn_id: i64, stamp: i64) -> bool {
+        match self.judged.get(&row_id) {
+            Some(mark) => *mark == VersionMark::Hot(txn_id),
+            None => self.cut.sees(stamp),
+        }
+    }
+
+    /// Whether a sealed row of volume `seg_id` is the one found; `covered`
+    /// says whether every commit the volume holds was complete at the cut
+    pub fn sealed(&self, row_id: i64, seg_id: u64, covered: impl FnOnce() -> bool) -> bool {
+        match self.judged.get(&row_id) {
+            Some(mark) => *mark == VersionMark::Sealed(seg_id),
+            None => self.volumes.binary_search(&seg_id).is_ok() || covered(),
+        }
+    }
+}
+
 pub trait Table: Send + Sync {
     /// Returns the name of the table
     fn name(&self) -> &str;
@@ -432,18 +478,25 @@ pub trait Table: Send + Sync {
     /// The number of rows deleted
     fn delete_by_row_ids(&mut self, row_ids: &[i64]) -> Result<i32>;
 
-    /// Deletes the rows of `row_ids` that hold the version they were found
-    /// in: one this transaction wrote, a hot one a commit `found` sees made,
-    /// or a sealed one in a volume of commits complete at `found`. Any other
-    /// row is left in place and handed to `changed` as it is now, for the
-    /// caller to judge outside this call; one deleted since is neither. On
-    /// return `row_ids` holds the ids deleted, in the order given.
+    /// Deletes the rows of `row_ids` when each still holds the version
+    /// `found` takes as found: one this transaction wrote, or one
+    /// [`FoundVersions::hot`] or [`FoundVersions::sealed`] accepts. Otherwise
+    /// nothing is deleted, `row_ids` is left as given, and the other rows go
+    /// to `changed` as they are now with their marks, for the caller to judge
+    /// outside this call. A row deleted since is neither deleted nor handed
+    /// back. On a delete `row_ids` holds the ids deleted, in the order given.
     fn delete_found(
         &mut self,
         row_ids: &mut Vec<i64>,
-        found: &CommitCut,
-        changed: &mut Vec<(i64, Row)>,
+        found: &FoundVersions,
+        changed: &mut Vec<(i64, Row, VersionMark)>,
     ) -> Result<i32>;
+
+    /// The ids of the sealed volumes this table holds now; empty for a table
+    /// without any, which a delete then judges by the commit cut alone
+    fn sealed_volume_ids(&self) -> Vec<u64> {
+        Vec::new()
+    }
 
     /// Returns all active row IDs visible to the current transaction.
     /// Used for NOT IN (anti-join) optimization.

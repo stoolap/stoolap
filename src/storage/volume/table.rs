@@ -48,7 +48,8 @@ use crate::storage::mvcc::version_store::{
 };
 use crate::storage::traits::table::ScanAccess;
 use crate::storage::traits::{
-    CapturedGroups, ColdChange, Index, PlannedUpdate, QueryResult, Scanner, Table,
+    CapturedGroups, ColdChange, FoundVersions, Index, PlannedUpdate, QueryResult, Scanner, Table,
+    VersionMark,
 };
 
 use super::column::ZoneMap;
@@ -4306,10 +4307,25 @@ impl SegmentedTable {
     /// `hot_half` gets the prepared rows the transaction changed since
     fn apply_cold_deletes(
         &mut self,
-        mut deletes: ColdDeleteRows,
+        deletes: ColdDeleteRows,
         seen: RoundSeen,
         hot_half: impl FnOnce(&mut Box<dyn Table>, &[i64]) -> Result<i32>,
     ) -> Result<i32> {
+        let count = self.apply_cold_deletes_unless_held(deletes, seen, |hot, own| {
+            hot_half(hot, own).map(Some)
+        })?;
+        Ok(count.unwrap_or_default())
+    }
+
+    /// [`Self::apply_cold_deletes`], where a hot half answering None holds
+    /// the whole delete back: no sealed row is deleted, the claims taken
+    /// here go, and None is the answer
+    fn apply_cold_deletes_unless_held(
+        &mut self,
+        mut deletes: ColdDeleteRows,
+        seen: RoundSeen,
+        hot_half: impl FnOnce(&mut Box<dyn Table>, &[i64]) -> Result<Option<i32>>,
+    ) -> Result<Option<i32>> {
         Self::claim_prepared(
             self.hot.as_ref(),
             &self.segment_mgr,
@@ -4330,12 +4346,12 @@ impl SegmentedTable {
             deletes.retain(|d| changed.binary_search(&d.row_id).is_err());
         }
         let hot_count = match hot_half(&mut self.hot, &changed) {
-            Ok(count) => count,
-            Err(e) => {
+            Ok(Some(count)) => count,
+            held => {
                 for d in &deletes {
                     self.hot.release_claim(d.row_id);
                 }
-                return Err(e);
+                return held;
             }
         };
         let txn_id = self.txn_id();
@@ -4343,7 +4359,7 @@ impl SegmentedTable {
         for d in deletes {
             Self::delete_claimed_cold_row(&mut self.hot, &self.segment_mgr, txn_id, d)?;
         }
-        Ok(hot_count + cold_count)
+        Ok(Some(hot_count + cold_count))
     }
 
     /// Deletes a sealed row the statement prepared and claimed
@@ -4763,55 +4779,73 @@ impl Table for SegmentedTable {
     fn delete_found(
         &mut self,
         row_ids: &mut Vec<i64>,
-        found: &CommitCut,
-        changed: &mut Vec<(i64, Row)>,
+        found: &FoundVersions,
+        changed: &mut Vec<(i64, Row, VersionMark)>,
     ) -> Result<i32> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         let mgr = Arc::clone(&self.segment_mgr);
+        let handed = changed.len();
         // A sealed row the snapshot still holds is there to delete; a row
         // it does not is the hot store's, deleted if still visible
         let mut prepared = self.prepare_cold_deletes(&mgr, Some(row_ids), None, true)?;
         let Some(mut hot_ids) = prepared.hot_ids else {
-            return self.apply_cold_deletes(prepared.deletes, prepared.seen, |hot, _| {
-                hot.delete_found(row_ids, found, changed)
-            });
+            let count =
+                self.apply_cold_deletes_unless_held(prepared.deletes, prepared.seen, |hot, _| {
+                    let count = hot.delete_found(row_ids, found, changed)?;
+                    Ok((changed.len() == handed).then_some(count))
+                })?;
+            return Ok(count.unwrap_or_default());
         };
-        // A sealed row is the version found when every commit its volume
-        // holds was complete at the cut; seal_seq bounds those commits
-        let mut gone: Option<I64Set> = None;
+        // A sealed row in a volume the table held when the rows were found,
+        // or in one whose seal_seq the cut covers, which bounds the commits
+        // of every row it holds, is the version found
         if !prepared.deletes.is_empty() {
             let manifest = mgr.manifest();
-            prepared.deletes.retain(|d| {
-                let same = manifest
-                    .segments
-                    .iter()
-                    .find(|meta| meta.segment_id == d.seg_id)
-                    .is_some_and(|meta| found.sees_through(meta.seal_seq as i64));
-                if !same {
-                    gone.get_or_insert_with(I64Set::new).insert(d.row_id);
-                    changed.push((d.row_id, std::mem::take(&mut d.old_row)));
+            for d in prepared.deletes.iter_mut() {
+                let covered = || {
+                    manifest
+                        .segments
+                        .iter()
+                        .find(|meta| meta.segment_id == d.seg_id)
+                        .is_some_and(|meta| found.cut.sees_through(meta.seal_seq as i64))
+                };
+                if !found.sealed(d.row_id, d.seg_id, covered) {
+                    let row = std::mem::take(&mut d.old_row);
+                    changed.push((d.row_id, row, VersionMark::Sealed(d.seg_id)));
                 }
-                same
-            });
-        }
-        let mut offered = None;
-        let count = self.apply_cold_deletes(prepared.deletes, prepared.seen, |hot, own| {
-            hot_ids.extend_from_slice(own);
-            if hot_ids.is_empty() {
+            }
+            if changed.len() != handed {
                 return Ok(0);
             }
-            offered = Some(hot_ids.clone());
-            hot.delete_found(&mut hot_ids, found, changed)
-        })?;
+        }
+        let mut offered = None;
+        let count =
+            self.apply_cold_deletes_unless_held(prepared.deletes, prepared.seen, |hot, own| {
+                hot_ids.extend_from_slice(own);
+                if hot_ids.is_empty() {
+                    return Ok(Some(0));
+                }
+                offered = Some(hot_ids.clone());
+                let count = hot.delete_found(&mut hot_ids, found, changed)?;
+                Ok((changed.len() == handed).then_some(count))
+            })?;
+        let Some(count) = count else {
+            return Ok(0);
+        };
         if let Some(offered) = offered.filter(|offered| hot_ids.len() != offered.len()) {
             let kept: I64Set = hot_ids.iter().copied().collect();
-            let gone = gone.get_or_insert_with(I64Set::new);
-            gone.extend(offered.iter().copied().filter(|id| !kept.contains(*id)));
-        }
-        if let Some(gone) = gone {
+            let gone: I64Set = offered
+                .iter()
+                .copied()
+                .filter(|id| !kept.contains(*id))
+                .collect();
             row_ids.retain(|id| !gone.contains(*id));
         }
         Ok(count)
+    }
+
+    fn sealed_volume_ids(&self) -> Vec<u64> {
+        self.segment_mgr.segments_raw().keys().copied().collect()
     }
 
     fn get_active_row_ids(&self) -> Result<Vec<i64>> {
@@ -9384,8 +9418,8 @@ mod tests {
         fn delete_found(
             &mut self,
             _: &mut Vec<i64>,
-            _: &CommitCut,
-            _: &mut Vec<(i64, Row)>,
+            _: &FoundVersions,
+            _: &mut Vec<(i64, Row, VersionMark)>,
         ) -> Result<i32> {
             Ok(0)
         }

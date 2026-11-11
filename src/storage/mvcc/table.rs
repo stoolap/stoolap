@@ -41,7 +41,9 @@ use crate::storage::mvcc::version_store::Reader;
 use crate::storage::mvcc::version_store::TxnStoreWrite;
 use crate::storage::mvcc::RowVersion;
 use crate::storage::mvcc::{TransactionVersionStore, TxnTableStore, VersionStore};
-use crate::storage::traits::{Index, PlannedUpdate, QueryResult, ScanAccess, Scanner, Table};
+use crate::storage::traits::{
+    FoundVersions, Index, PlannedUpdate, QueryResult, ScanAccess, Scanner, Table, VersionMark,
+};
 use crate::storage::volume::side_index::{resolve_all, Domain, Resolved};
 use crate::storage::MemoryResult;
 
@@ -184,12 +186,12 @@ fn first_equals(key: &[Value], value: &Value) -> bool {
 /// A bound on a column's values with its inclusiveness, None for no bound
 type KeyBound<'a> = Option<(&'a Value, bool)>;
 
-/// A delete of rows found under a cut: the ids deleted unless every id
-/// was, the cut, and the rows changed since, handed back in place
+/// A delete of rows found earlier: the ids deleted unless every id was, the
+/// versions taken as found, and the rows changed since, handed back in place
 type FoundDelete<'a> = (
     &'a mut Option<I64Set>,
-    &'a CommitCut,
-    &'a mut Vec<(i64, Row)>,
+    &'a FoundVersions,
+    &'a mut Vec<(i64, Row, VersionMark)>,
 );
 
 /// Whether `value` lies within the bounds
@@ -585,9 +587,9 @@ impl MVCCTable {
     /// Deletes `row_ids`. With `found` None an id no version of this
     /// transaction or of the store holds is a sealed row, deleted by a
     /// marker so the log records it; with `found` given such an id is a row
-    /// gone since the ids were found, left alone, a version committed since
-    /// the cut is left in place and handed to the rows changed, and the set
-    /// receives the ids deleted unless every id was.
+    /// gone since the ids were found, left alone, a version not taken as
+    /// found holds every row back and is handed to the rows changed, and
+    /// the set receives the ids deleted unless every id was.
     fn delete_rows_by_id(
         &mut self,
         row_ids: &[i64],
@@ -636,14 +638,21 @@ impl MVCCTable {
         // tombstone recovery on restart.
         let cold_only_ids: Vec<i64> = match found {
             Some((deleted, found, changed)) => {
-                // The version found unless committed since
-                rows_with_originals.retain_mut(|(row_id, row, version)| {
-                    let same = found.sees(version.create_time);
-                    if !same {
-                        changed.push((*row_id, std::mem::take(row)));
+                let same = |row_id: i64, version: &RowVersion| {
+                    found.hot(row_id, version.txn_id, version.create_time)
+                };
+                // One version not the one found holds the whole delete back
+                if rows_with_originals
+                    .iter()
+                    .any(|(row_id, _, version)| !same(*row_id, version))
+                {
+                    for (row_id, row, version) in rows_with_originals {
+                        if !same(row_id, &version) {
+                            changed.push((row_id, row, VersionMark::Hot(version.txn_id)));
+                        }
                     }
-                    same
-                });
+                    return Ok(0);
+                }
                 if local_deletes.len() + rows_with_originals.len() != row_ids.len() {
                     let local = local_deletes.iter().map(|(row_id, _)| *row_id);
                     let hot = rows_with_originals.iter().map(|(row_id, ..)| *row_id);
@@ -3189,8 +3198,8 @@ impl Table for MVCCTable {
     fn delete_found(
         &mut self,
         row_ids: &mut Vec<i64>,
-        found: &CommitCut,
-        changed: &mut Vec<(i64, Row)>,
+        found: &FoundVersions,
+        changed: &mut Vec<(i64, Row, VersionMark)>,
     ) -> Result<i32> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         let mut deleted = None;
