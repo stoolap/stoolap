@@ -1237,6 +1237,8 @@ impl SegmentedTable {
         } else {
             self.segment_mgr.get_volumes_newest_first()?
         };
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::cold_view_taken();
         self.hot.collect_hot_row_ids_into(hot_skip);
         self.segment_mgr
             .insert_pending_tombstones_into(self.txn_id(), hot_skip);

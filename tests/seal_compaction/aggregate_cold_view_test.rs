@@ -22,8 +22,8 @@ use std::rc::Rc;
 use std::sync::{Mutex, MutexGuard};
 
 use stoolap::test_failpoints::{
-    after_cold_view_begun, block_file_reads, side_file_reads, volume_file_reads_by_fence,
-    FailpointGuard,
+    after_cold_view_begun, after_cold_view_taken, block_file_reads, side_file_reads,
+    volume_file_reads_by_fence, FailpointGuard,
 };
 use stoolap::Database;
 
@@ -97,7 +97,7 @@ fn an_aggregate_whose_volumes_a_compaction_replaces_mid_read_reads_their_columns
     let want: i64 = (11..=200).sum();
     let compacted = Rc::new(Cell::new(false));
     let (other, ran) = (db.clone(), Rc::clone(&compacted));
-    after_cold_view_begun(move || {
+    after_cold_view_taken(move || {
         other.engine().compact_for_test().unwrap();
         ran.set(true);
     });

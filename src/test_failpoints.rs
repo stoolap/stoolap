@@ -427,6 +427,7 @@ thread_local! {
     static TRUNCATE_COLD_CLEARED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static DESTRUCTION_WAIT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static HOT_COLD_READS_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static COLD_VIEW_BEGUN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static COLD_VIEW_TAKEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static UNSEALED_READ_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static CLEAR_GENERATION_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
@@ -590,12 +591,25 @@ pub(crate) fn hot_and_cold_reads_split() {
 }
 
 /// Run once on this thread when its next aggregate over the volumes has
-/// taken its first piece of their state, before the rest
+/// taken their tombstones, before their list
 pub fn after_cold_view_begun(hook: impl FnOnce() + 'static) {
-    COLD_VIEW_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    COLD_VIEW_BEGUN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
 pub(crate) fn cold_view_begun() {
+    let hook = COLD_VIEW_BEGUN_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next aggregate over the volumes has
+/// taken their list, before it reads them
+pub fn after_cold_view_taken(hook: impl FnOnce() + 'static) {
+    COLD_VIEW_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn cold_view_taken() {
     let hook = COLD_VIEW_TAKEN_HOOK.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
         hook();
@@ -3650,6 +3664,7 @@ pub fn reset_all() {
     TRUNCATE_COLD_CLEARED_HOOK.with(|slot| *slot.borrow_mut() = None);
     DESTRUCTION_WAIT_HOOK.with(|slot| *slot.borrow_mut() = None);
     HOT_COLD_READS_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COLD_VIEW_BEGUN_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_VIEW_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     UNSEALED_READ_HOOK.with(|slot| *slot.borrow_mut() = None);
     CLEAR_GENERATION_HOOK.with(|slot| *slot.borrow_mut() = None);
