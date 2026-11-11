@@ -1308,7 +1308,10 @@ impl SegmentedTable {
                 Some(values) => {
                     distinct.extend(values.into_iter().filter(|v| with_null || !v.is_null()))
                 }
-                None if self.hot.row_count()? > 0 => return Ok(Some(None)),
+                // Local writes leave the count blind to a row over a deleted id
+                None if self.hot.has_local_changes() || self.hot.row_count()? > 0 => {
+                    return Ok(Some(None))
+                }
                 None => {}
             }
             #[cfg(feature = "test-failpoints")]

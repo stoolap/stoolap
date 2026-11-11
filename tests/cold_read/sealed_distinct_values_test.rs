@@ -251,6 +251,39 @@ fn a_snapshot_distinct_answers_with_the_values_it_began_with() {
     reader.rollback().unwrap();
 }
 
+#[test]
+fn a_sealed_distinct_counts_a_row_its_transaction_wrote_over_a_deleted_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?checkpoint_on_close=off&checkpoint_interval=0",
+        dir.path().display()
+    ))
+    .unwrap();
+    for sql in [
+        "CREATE TABLE x (id INTEGER PRIMARY KEY, v INTEGER, s TEXT)",
+        "CREATE INDEX x_v ON x (v)",
+        "INSERT INTO x VALUES (1, 10, 'a')",
+        "PRAGMA CHECKPOINT",
+        "INSERT INTO x VALUES (2, 20, 'b')",
+        "DELETE FROM x WHERE id = 2",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    // The deleted hot version of id 2 is still held when the transaction writes id 2
+    let mut tx = db.begin().unwrap();
+    tx.execute("INSERT INTO x VALUES (2, 30, 'c')", ()).unwrap();
+    for (sql, want) in [
+        ("SELECT COUNT(DISTINCT v) FROM x", 2),
+        ("SELECT COUNT(DISTINCT s) FROM x", 2),
+        ("SELECT COUNT(*) FROM (SELECT DISTINCT v FROM x) AS d", 2),
+        ("SELECT COUNT(*) FROM (SELECT DISTINCT s FROM x) AS d", 2),
+    ] {
+        let got: i64 = tx.query_one(sql, ()).unwrap();
+        assert_eq!(got, want, "{sql}");
+    }
+    tx.rollback().unwrap();
+}
+
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn a_sealed_text_distinct_that_hides_no_row_reads_no_block() {
