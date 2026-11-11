@@ -1351,24 +1351,6 @@ pub trait Table: Send + Sync {
         Ok(None) // Default implementation - override in concrete tables
     }
 
-    /// Compute distinct values for a column, NULL included when a visible row
-    /// holds it, by exploiting cold volume
-    /// metadata. For dictionary-encoded TEXT columns with no tombstones, this
-    /// extracts dictionary entries directly (O(unique values) per volume, no
-    /// row scan). Falls back to None when the fast path is not applicable.
-    ///
-    /// # Arguments
-    /// * `col_idx` - Schema column index
-    ///
-    /// # Returns
-    /// Some(Vec<Value>) with distinct values, or None if fast path unavailable
-    ///
-    /// # Errors
-    /// Returns a storage error if the required rows or columns cannot be read.
-    fn compute_distinct_values(&self, _col_idx: usize) -> Result<Option<Vec<Value>>> {
-        Ok(None)
-    }
-
     /// Get the count of distinct non-null values from an indexed column.
     /// Used for COUNT(DISTINCT col) optimization without cloning all values.
     ///

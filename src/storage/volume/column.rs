@@ -410,6 +410,103 @@ impl ColumnData {
         self.len() == 0
     }
 
+    /// The first of `positions` holding each distinct stored value, and the
+    /// first holding NULL. Equal stored values read as equal values, so
+    /// `get_value` at these positions gives every value the positions hold
+    pub fn first_of_each(
+        &self,
+        positions: impl Iterator<Item = usize>,
+    ) -> (Vec<usize>, Option<usize>) {
+        use ahash::AHashSet;
+        use rustc_hash::FxHashSet;
+        /// Stored words seen, the recent ones in a direct-mapped table that
+        /// answers a repeat before the set is probed
+        #[derive(Default)]
+        struct Seen {
+            recent: Vec<u64>,
+            set: FxHashSet<u64>,
+        }
+        impl Seen {
+            const RECENT: usize = 4096;
+            #[inline(always)]
+            fn insert(&mut self, word: u64) -> bool {
+                // fmix64, one-to-one: floats and timestamps repeat their low bits
+                let mut mixed = word ^ (word >> 33);
+                mixed = mixed.wrapping_mul(0xff51_afd7_ed55_8ccd);
+                mixed ^= mixed >> 33;
+                mixed = mixed.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+                mixed ^= mixed >> 33;
+                let slot = mixed as usize & (Self::RECENT - 1);
+                match self.recent.get_mut(slot) {
+                    Some(recent) if *recent == word => false,
+                    Some(recent) => {
+                        *recent = word;
+                        self.set.insert(mixed)
+                    }
+                    None => {
+                        self.recent = vec![word; Self::RECENT];
+                        self.set.insert(mixed)
+                    }
+                }
+            }
+        }
+        fn firsts(
+            positions: impl Iterator<Item = usize>,
+            nulls: &[bool],
+            mut new: impl FnMut(usize) -> bool,
+        ) -> (Vec<usize>, Option<usize>) {
+            let (mut firsts, mut null) = (Vec::new(), None);
+            for i in positions {
+                if nulls[i] {
+                    null.get_or_insert(i);
+                } else if new(i) {
+                    firsts.push(i);
+                }
+            }
+            (firsts, null)
+        }
+        match self {
+            ColumnData::Int64 { values, nulls } | ColumnData::TimestampNanos { values, nulls } => {
+                let mut seen = Seen::default();
+                firsts(positions, nulls, |i| seen.insert(values[i] as u64))
+            }
+            ColumnData::Float64 { values, nulls } => {
+                let mut seen = Seen::default();
+                firsts(positions, nulls, |i| seen.insert(values[i].to_bits()))
+            }
+            ColumnData::Boolean { values, nulls } => {
+                let mut seen = [false; 2];
+                firsts(positions, nulls, |i| {
+                    !std::mem::replace(&mut seen[values[i] as usize], true)
+                })
+            }
+            ColumnData::Dictionary {
+                ids,
+                dictionary,
+                nulls,
+            } => {
+                let mut seen = vec![false; dictionary.len()];
+                firsts(positions, nulls, |i| {
+                    seen.get_mut(ids[i] as usize)
+                        .is_none_or(|seen| !std::mem::replace(seen, true))
+                })
+            }
+            ColumnData::Bytes {
+                data,
+                offsets,
+                nulls,
+                ..
+            } => {
+                let mut seen: AHashSet<&[u8]> = AHashSet::default();
+                firsts(positions, nulls, |i| {
+                    let (start, len) = offsets[i];
+                    let bytes = data.get(start as usize..start.saturating_add(len) as usize);
+                    bytes.is_none_or(|bytes| seen.insert(bytes))
+                })
+            }
+        }
+    }
+
     /// Check if a specific row is null.
     #[inline]
     pub fn is_null(&self, idx: usize) -> bool {

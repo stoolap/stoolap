@@ -47,6 +47,7 @@ mod row_group_prune_test;
 mod scan_access_test;
 mod scanner_group_cache_test;
 mod sealed_count_side_file_test;
+mod sealed_distinct_values_test;
 mod sealed_primary_key_read_test;
 mod small_row_groups_test;
 mod snapshot_cold_fetch_test;

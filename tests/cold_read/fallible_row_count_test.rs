@@ -135,7 +135,7 @@ fn distinct_values_propagates_cold_reload_failure() {
         .to_string()
         .contains("cold volume reload failed"));
     assert_eq!(
-        format!("{:?}", table.compute_distinct_values(1)),
+        format!("{:?}", table.get_partition_values("v")),
         format!("{expected:?}")
     );
 }
