@@ -427,6 +427,8 @@ thread_local! {
     static TRUNCATE_COLD_CLEARED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static DESTRUCTION_WAIT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static HOT_COLD_READS_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static COLD_VIEW_BEGUN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static COLD_VIEW_TAKEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static UNSEALED_READ_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static CLEAR_GENERATION_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static TRUNCATE_MARKED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
@@ -583,6 +585,32 @@ pub fn between_hot_and_cold_reads(hook: impl FnOnce() + 'static) {
 
 pub(crate) fn hot_and_cold_reads_split() {
     let hook = HOT_COLD_READS_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next aggregate over the volumes has
+/// taken their tombstones, before their list
+pub fn after_cold_view_begun(hook: impl FnOnce() + 'static) {
+    COLD_VIEW_BEGUN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn cold_view_begun() {
+    let hook = COLD_VIEW_BEGUN_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next aggregate over the volumes has
+/// taken their list, before it reads them
+pub fn after_cold_view_taken(hook: impl FnOnce() + 'static) {
+    COLD_VIEW_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn cold_view_taken() {
+    let hook = COLD_VIEW_TAKEN_HOOK.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
         hook();
     }
@@ -2533,6 +2561,7 @@ thread_local! {
     static ROW_ID_ORDER_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TOP_K_COLD_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TOP_K_SIDE_ROUNDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SEAL_RETRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static HOT_TOP_K_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static KEPT_MEMBER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static INNER_FETCH_FILTERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -3300,6 +3329,15 @@ pub(crate) fn top_k_side_round() {
     TOP_K_SIDE_ROUNDS.with(|n| n.set(n.get() + 1));
 }
 
+/// Reads this thread took again because a seal published across them
+pub fn seal_retries() -> usize {
+    SEAL_RETRIES.with(std::cell::Cell::get)
+}
+
+pub(crate) fn seal_retried() {
+    SEAL_RETRIES.with(|n| n.set(n.get() + 1));
+}
+
 /// The most row ids one chunk of this thread's B-tree walks copied under the
 /// index lock, and the largest room it had for them; resets both
 pub fn take_btree_walk_chunk_max() -> (usize, usize) {
@@ -3626,6 +3664,8 @@ pub fn reset_all() {
     TRUNCATE_COLD_CLEARED_HOOK.with(|slot| *slot.borrow_mut() = None);
     DESTRUCTION_WAIT_HOOK.with(|slot| *slot.borrow_mut() = None);
     HOT_COLD_READS_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COLD_VIEW_BEGUN_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COLD_VIEW_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     UNSEALED_READ_HOOK.with(|slot| *slot.borrow_mut() = None);
     CLEAR_GENERATION_HOOK.with(|slot| *slot.borrow_mut() = None);
     TRUNCATE_MARKED_HOOK.with(|slot| *slot.borrow_mut() = None);

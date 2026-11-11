@@ -64,6 +64,30 @@ enum SideDecision {
     Walk(Box<super::secondary::SidePlan>),
 }
 
+/// A sealed row found by its id, with the segment map it was found in, so
+/// the row reads through the mapping of the segment that holds it
+struct SegmentRow {
+    segs: Arc<rustc_hash::FxHashMap<u64, super::manifest::ColdSegment>>,
+    seg_id: u64,
+    volume: Arc<FrozenVolume>,
+    idx: usize,
+}
+
+impl SegmentRow {
+    fn mapping(&self) -> Result<&super::writer::ColumnMapping> {
+        self.segs
+            .get(&self.seg_id)
+            .map(|cs| &cs.mapping)
+            .ok_or_else(|| crate::core::Error::internal("a found row's segment left its map"))
+    }
+}
+
+/// The tombstones and the volumes an aggregate reads, taken together
+type ColdView = (
+    Arc<rustc_hash::FxHashMap<i64, u64>>,
+    Arc<Vec<(u64, super::manifest::ColdSegment)>>,
+);
+
 /// What a volume's built unique index decided for a read: nothing, and the
 /// side file decides; no candidate; or the candidates' positions, ascending
 enum UniqueDecision {
@@ -1178,11 +1202,17 @@ impl SegmentedTable {
                 self.wait_out_destruction();
                 continue;
             }
-            if let Some(out) = read(generation)? {
-                if !self.destruction_since(begun) {
-                    return Ok(out);
+            match read(generation)? {
+                Some(out) => {
+                    if !self.destruction_since(begun) {
+                        return Ok(out);
+                    }
+                    self.view_held()?;
                 }
-                self.view_held()?;
+                #[cfg(feature = "test-failpoints")]
+                None => crate::test_failpoints::seal_retried(),
+                #[cfg(not(feature = "test-failpoints"))]
+                None => {}
             }
             self.wait_out_destruction();
         }
@@ -1191,6 +1221,28 @@ impl SegmentedTable {
     /// Whether a seal published a volume since `generation` was read
     fn seal_moved(&self, generation: u64) -> bool {
         self.segment_mgr.seal_generation() != generation
+    }
+
+    /// The sealed state an aggregate reads: the tombstones before the
+    /// volumes, since a compaction removes those it applied only after it
+    /// published, then into `hot_skip` the hot ids that hide sealed copies.
+    /// `lazy` leaves cold volumes unloaded. The caller checks the seal
+    /// generation after it
+    fn cold_view(&self, hot_skip: &mut FxHashSet<i64>, lazy: bool) -> Result<ColdView> {
+        let tombstones = self.segment_mgr.tombstone_set_arc();
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::cold_view_begun();
+        let volumes = if lazy {
+            self.segment_mgr.get_volumes_newest_first_lazy()
+        } else {
+            self.segment_mgr.get_volumes_newest_first()?
+        };
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::cold_view_taken();
+        self.hot.collect_hot_row_ids_into(hot_skip);
+        self.segment_mgr
+            .insert_pending_tombstones_into(self.txn_id(), hot_skip);
+        Ok((tombstones, volumes))
     }
 
     /// Cold rows read through this handle's mappings are in its schema
@@ -1206,7 +1258,17 @@ impl SegmentedTable {
         view: &super::manifest::ColdSnapshot,
         seg_id: u64,
     ) -> Result<Option<Arc<super::writer::FrozenVolume>>> {
-        match view.file(seg_id) {
+        self.load_captured(seg_id, view.file(seg_id))
+    }
+
+    /// Loads a captured segment's volume through the file it captured, so a
+    /// segment the map has since dropped still loads
+    fn load_captured(
+        &self,
+        seg_id: u64,
+        file: Option<&Arc<super::writer::VolumeFile>>,
+    ) -> Result<Option<Arc<super::writer::FrozenVolume>>> {
+        match file {
             Some(handle) => self.segment_mgr.ensure_pinned_volume(seg_id, handle),
             None => self.segment_mgr.ensure_volume(seg_id),
         }
@@ -1388,11 +1450,11 @@ impl SegmentedTable {
         self.segment_mgr
             .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
 
-        for (seg_id, cs) in volumes.iter() {
+        for (_, cs) in volumes.iter() {
             let vol = &cs.volume;
             // Use column mapping to translate schema indices to physical volume indices.
             // After DROP COLUMN + ADD COLUMN, schema positions may not match volume layout.
-            let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
+            let mapping = &cs.mapping;
             let row_ids = vol.row_ids()?;
             let Some(start) = (0..vol.meta.row_count).find(|&i| {
                 cs.is_visible(i)
@@ -1494,10 +1556,10 @@ impl SegmentedTable {
         let cut = self.published_cut();
         let volumes = self.segment_mgr.get_volumes_newest_first()?;
         let ts = self.segment_mgr.tombstone_set_arc();
-        for (seg_id, cs) in volumes.iter() {
+        for (_, cs) in volumes.iter() {
             let vol = &cs.volume;
             // Use column mapping to translate schema indices to physical volume indices.
-            let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
+            let mapping = &cs.mapping;
             let row_ids = vol.row_ids()?;
             let Some(start) = (0..vol.meta.row_count)
                 .find(|&i| cs.is_visible(i) && !self.is_row_tombstoned(&ts, row_ids[i], &cut))
@@ -4318,7 +4380,7 @@ impl SegmentedTable {
         Ok(())
     }
 
-    fn find_segment_row(&self, row_id: i64) -> Result<Option<(u64, Arc<FrozenVolume>, usize)>> {
+    fn find_segment_row(&self, row_id: i64) -> Result<Option<SegmentRow>> {
         let cut = self.read_cut();
         // A hot version this transaction sees decides the row; a newer one it
         // does not see leaves the sealed copy to the tombstones below
@@ -4358,31 +4420,38 @@ impl SegmentedTable {
             let Some(cold) = segs.get(&seg_id) else {
                 continue;
             };
-            let vol = &cold.volume;
-            if let Some(idx) = cold.locate_authoritative(row_id) {
-                if vol.is_cold() {
-                    drop(segs);
-                    if let Some(loaded) = self.segment_mgr.ensure_volume(seg_id)? {
-                        return Ok(Some((seg_id, loaded, idx)));
-                    }
-                    // ensure_volume returned None: compaction removed this
-                    // segment. Row now lives in a newer compacted volume.
-                    // Retry once with fresh manifest state.
-                    return self.find_segment_row_retry(row_id);
+            let Some(idx) = cold.locate_authoritative(row_id) else {
+                continue;
+            };
+            if cold.volume.is_cold() {
+                if let Some(volume) = self.segment_mgr.ensure_volume(seg_id)? {
+                    return Ok(Some(SegmentRow {
+                        segs,
+                        seg_id,
+                        volume,
+                        idx,
+                    }));
                 }
-                vol.mark_accessed();
-                return Ok(Some((seg_id, Arc::clone(vol), idx)));
+                // ensure_volume returned None: compaction removed this
+                // segment. Row now lives in a newer compacted volume.
+                // Retry once with fresh manifest state.
+                return self.find_segment_row_retry(row_id);
             }
+            cold.volume.mark_accessed();
+            let volume = Arc::clone(&cold.volume);
+            return Ok(Some(SegmentRow {
+                segs,
+                seg_id,
+                volume,
+                idx,
+            }));
         }
         Ok(None)
     }
 
     /// Retry find_segment_row with a fresh consistent snapshot.
     /// Called when ensure_volume returns None (compaction removed the segment).
-    fn find_segment_row_retry(
-        &self,
-        row_id: i64,
-    ) -> Result<Option<(u64, Arc<FrozenVolume>, usize)>> {
+    fn find_segment_row_retry(&self, row_id: i64) -> Result<Option<SegmentRow>> {
         // ensure_columns before manifest lock to avoid deadlock
         // (ensure_columns may need manifest.write via reload_cold_volumes).
         let segs = self.segment_mgr.segments_snapshot()?;
@@ -4399,11 +4468,16 @@ impl SegmentedTable {
             let Some(cold) = segs.get(&seg_id) else {
                 continue;
             };
-            let vol = &cold.volume;
             if let Some(idx) = cold.locate_authoritative(row_id) {
                 // segments_snapshot fails closed, so vol is never cold here.
-                vol.mark_accessed();
-                return Ok(Some((seg_id, Arc::clone(vol), idx)));
+                cold.volume.mark_accessed();
+                let volume = Arc::clone(&cold.volume);
+                return Ok(Some(SegmentRow {
+                    segs,
+                    seg_id,
+                    volume,
+                    idx,
+                }));
             }
         }
         Ok(None)
@@ -4932,7 +5006,6 @@ impl Table for SegmentedTable {
             return result;
         }
 
-        let schema = self.hot.schema().clone();
         // An id decided hot before a seal and read after it finds nothing,
         // so the read is settled: a seal landing across it starts it over
         self.settled_across_seals(|| {
@@ -4941,14 +5014,15 @@ impl Table for SegmentedTable {
             let mut cached: Option<(super::writer::RowReader, super::writer::ColumnMapping)> = None;
 
             for &row_id in row_ids {
-                if let Some((seg_id, vol, idx)) = self.find_segment_row(row_id)? {
+                if let Some(found) = self.find_segment_row(row_id)? {
+                    let idx = found.idx;
                     if !cached
                         .as_ref()
-                        .is_some_and(|(reader, _)| Arc::ptr_eq(reader.volume(), &vol))
+                        .is_some_and(|(reader, _)| Arc::ptr_eq(reader.volume(), &found.volume))
                     {
                         cached = Some((
-                            super::writer::RowReader::new(Arc::clone(&vol)),
-                            self.segment_mgr.get_volume_mapping(seg_id, &schema),
+                            super::writer::RowReader::new(Arc::clone(&found.volume)),
+                            found.mapping()?.clone(),
                         ));
                     }
                     let (reader, mapping) = cached
@@ -4998,7 +5072,6 @@ impl Table for SegmentedTable {
             return result;
         }
 
-        let schema = self.hot.schema();
         let fallible = filter.can_fail();
         // An id decided hot before a seal and read after it finds nothing,
         // so the read is settled: a seal landing across it starts it over
@@ -5008,14 +5081,15 @@ impl Table for SegmentedTable {
             let mut cached: Option<(super::writer::RowReader, super::writer::ColumnMapping)> = None;
 
             for &row_id in row_ids {
-                if let Some((seg_id, vol, idx)) = self.find_segment_row(row_id)? {
+                if let Some(found) = self.find_segment_row(row_id)? {
+                    let idx = found.idx;
                     if !cached
                         .as_ref()
-                        .is_some_and(|(reader, _)| Arc::ptr_eq(reader.volume(), &vol))
+                        .is_some_and(|(reader, _)| Arc::ptr_eq(reader.volume(), &found.volume))
                     {
                         cached = Some((
-                            super::writer::RowReader::new(Arc::clone(&vol)),
-                            self.segment_mgr.get_volume_mapping(seg_id, schema),
+                            super::writer::RowReader::new(Arc::clone(&found.volume)),
+                            found.mapping()?.clone(),
                         ));
                     }
                     let (reader, mapping) = cached
@@ -5415,24 +5489,23 @@ impl Table for SegmentedTable {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.sum_column");
         // The volume stats count rows a snapshot or a view may not see
-        self.newest_clear_of_destruction(|| {
+        self.newest_across_seals(|generation| {
             let cut = self.read_cut();
-            let _seal_guard = self.segment_mgr.acquire_seal_read();
             let hot_result = self.hot.sum_column(col_idx)?;
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::hot_and_cold_reads_split();
 
             if !self.segment_mgr.has_segments() {
-                return Ok(hot_result);
+                return Ok((!self.seal_moved(generation)).then_some(hot_result));
             }
 
             // During seal, hot+cold overlap — can't reliably sum
             if self.segment_mgr.seal_overlap() > 0 {
-                return Ok(None);
+                return Ok(Some(None));
             }
 
             let Some(mut total) = hot_result else {
-                return Ok(None);
+                return Ok(Some(None));
             };
 
             // Resolve column name for per-volume physical index lookup.
@@ -5446,7 +5519,7 @@ impl Table for SegmentedTable {
                 declared,
                 Some(DataType::Integer) | Some(DataType::Float) | Some(DataType::Boolean)
             ) {
-                return Ok(Some(total));
+                return Ok(Some(Some(total)));
             }
             let as_float = declared == Some(DataType::Float);
 
@@ -5482,10 +5555,13 @@ impl Table for SegmentedTable {
                 // exact integer part. Use segments_raw (metadata only, no
                 // cold volume reload).
                 let segs = self.segment_mgr.segments_raw();
+                if self.seal_moved(generation) {
+                    return Ok(None);
+                }
                 let mut cold = SumAccumulator::default();
                 let mut stats_cover = true;
-                for (seg_id, cs) in segs.iter() {
-                    let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
+                for cs in segs.values() {
+                    let mapping = &cs.mapping;
                     let phys = if col_idx < mapping.sources.len() {
                         match &mapping.sources[col_idx] {
                             super::writer::ColSource::Volume(vi) => Some(*vi),
@@ -5515,20 +5591,19 @@ impl Table for SegmentedTable {
                 if stats_cover {
                     total.merge(&cold);
                     self.check_cold()?;
-                    return Ok(Some(total));
+                    return Ok(Some(Some(total)));
                 }
             }
 
             // Tombstones exist: scan columnar data with dedup (avoids full Row materialization)
-            let volumes = self.segment_mgr.get_volumes_newest_first()?;
-            let tombstones_arc = self.segment_mgr.tombstone_set_arc();
             let mut hot_skip: FxHashSet<i64> =
                 FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-            self.hot.collect_hot_row_ids_into(&mut hot_skip);
-            self.segment_mgr
-                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+            let (tombstones_arc, volumes) = self.cold_view(&mut hot_skip, false)?;
+            if self.seal_moved(generation) {
+                return Ok(None);
+            }
 
-            for (seg_id, cs) in volumes.iter() {
+            for (_, cs) in volumes.iter() {
                 let vol = &cs.volume;
                 let row_ids = vol.row_ids()?;
                 let Some(start) = (0..vol.meta.row_count).find(|&i| {
@@ -5538,7 +5613,7 @@ impl Table for SegmentedTable {
                 }) else {
                     continue;
                 };
-                let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
+                let mapping = &cs.mapping;
                 let phys = if col_idx < mapping.sources.len() {
                     match &mapping.sources[col_idx] {
                         super::writer::ColSource::Volume(vi) => Some(*vi),
@@ -5578,33 +5653,31 @@ impl Table for SegmentedTable {
                 }
             }
             self.check_cold()?;
-            Ok(Some(total))
+            Ok(Some(Some(total)))
         })
     }
 
     fn min_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.min_column");
-        self.newest_clear_of_destruction(|| {
+        self.newest_across_seals(|generation| {
             let cut = self.read_cut();
-            let _seal_guard = self.segment_mgr.acquire_seal_read();
             let hot_result = self.hot.min_column(col_idx)?;
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::hot_and_cold_reads_split();
 
             if !self.segment_mgr.has_segments() {
-                return Ok(hot_result);
+                return Ok((!self.seal_moved(generation)).then_some(hot_result));
             }
 
             if self.segment_mgr.seal_overlap() > 0 || !self.bounds_order(Some(col_idx)) {
-                return Ok(None);
+                return Ok(Some(None));
             }
 
             let Some(hot_min) = hot_result else {
-                return Ok(None);
+                return Ok(Some(None));
             };
 
-            let schema = self.hot.schema();
             // Column resolution uses mapping (handles renames/drops) not col_name.
             let default_val = self.column_default(col_idx);
             let has_non_null_default = !default_val.is_null();
@@ -5619,11 +5692,14 @@ impl Table for SegmentedTable {
             if can_use_stats {
                 // Fast path: use pre-computed volume stats (zone map min)
                 let segs = self.segment_mgr.segments_raw();
+                if self.seal_moved(generation) {
+                    return Ok(None);
+                }
                 let nan = Value::Float(f64::NAN);
                 let mut stats_cover = true;
-                for (seg_id, cs) in segs.iter() {
+                for cs in segs.values() {
                     let vol = &cs.volume;
-                    let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
+                    let mapping = &cs.mapping;
                     let phys = if col_idx < mapping.sources.len() {
                         match &mapping.sources[col_idx] {
                             super::writer::ColSource::Volume(vi) => Some(*vi),
@@ -5668,40 +5744,25 @@ impl Table for SegmentedTable {
                 }
                 if stats_cover {
                     self.check_cold()?;
-                    return Ok(Some(overall_min));
+                    return Ok(Some(Some(overall_min)));
                 }
             }
 
-            // Zone-map fast path: when there are no tombstones/pending tombstones
-            // but overlap exists (total_row_count != deduped_row_count), the
-            // visibility bitmap correctly deduplicates rows. Zone-map min/max across
-            // all volumes is a lower/upper bound; the actual min visible across all
-            // volumes is >= zone-map-min. We can use zone maps to prune volumes
-            // that cannot contain a better candidate.
-            let no_tombstones = self.segment_mgr.is_tombstone_set_empty()
-                && !self.segment_mgr.has_pending_tombstones(self.txn_id());
-
-            // Scan columnar data with dedup (typed direct access, no Value alloc)
-            let volumes = self.segment_mgr.get_volumes_newest_first()?;
-            let tombstones_arc = if no_tombstones {
-                None
-            } else {
-                Some(self.segment_mgr.tombstone_set_arc())
-            };
+            // Scan columnar data with dedup (typed direct access, no Value
+            // alloc). Zone maps prune the volumes that cannot hold a better
+            // candidate: the visible minimum is at least the zone minimum
             let mut hot_skip: FxHashSet<i64> =
                 FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-            self.hot.collect_hot_row_ids_into(&mut hot_skip);
-            if !no_tombstones {
-                self.segment_mgr
-                    .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+            let (tombstones_arc, volumes) = self.cold_view(&mut hot_skip, false)?;
+            if self.seal_moved(generation) {
+                return Ok(None);
             }
+            let tombstones_ref = &*tombstones_arc;
+            let no_tombstones = tombstones_ref.is_empty();
 
-            let empty_tombstones: FxHashMap<i64, u64> = FxHashMap::default();
-            let tombstones_ref = tombstones_arc.as_deref().unwrap_or(&empty_tombstones);
-
-            for (seg_id, cs) in volumes.iter() {
+            for (_, cs) in volumes.iter() {
                 let vol = &cs.volume;
-                let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
+                let mapping = &cs.mapping;
                 let phys = if col_idx < mapping.sources.len() {
                     match &mapping.sources[col_idx] {
                         super::writer::ColSource::Volume(vi) => Some(*vi),
@@ -5910,33 +5971,31 @@ impl Table for SegmentedTable {
                 }
             }
             self.check_cold()?;
-            Ok(Some(overall_min))
+            Ok(Some(Some(overall_min)))
         })
     }
 
     fn max_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.max_column");
-        self.newest_clear_of_destruction(|| {
+        self.newest_across_seals(|generation| {
             let cut = self.read_cut();
-            let _seal_guard = self.segment_mgr.acquire_seal_read();
             let hot_result = self.hot.max_column(col_idx)?;
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::hot_and_cold_reads_split();
 
             if !self.segment_mgr.has_segments() {
-                return Ok(hot_result);
+                return Ok((!self.seal_moved(generation)).then_some(hot_result));
             }
 
             if self.segment_mgr.seal_overlap() > 0 || !self.bounds_order(Some(col_idx)) {
-                return Ok(None);
+                return Ok(Some(None));
             }
 
             let Some(hot_max) = hot_result else {
-                return Ok(None);
+                return Ok(Some(None));
             };
 
-            let schema = self.hot.schema();
             // Column resolution uses mapping (handles renames/drops) not col_name.
             let default_val = self.column_default(col_idx);
             let has_non_null_default = !default_val.is_null();
@@ -5952,11 +6011,14 @@ impl Table for SegmentedTable {
                 // Fast path: use pre-computed volume stats (zone map max)
                 // Use segments_raw (metadata only, no cold volume reload).
                 let segs = self.segment_mgr.segments_raw();
+                if self.seal_moved(generation) {
+                    return Ok(None);
+                }
                 let nan = Value::Float(f64::NAN);
                 let mut stats_cover = true;
-                for (seg_id, cs) in segs.iter() {
+                for cs in segs.values() {
                     let vol = &cs.volume;
-                    let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
+                    let mapping = &cs.mapping;
                     let phys = if col_idx < mapping.sources.len() {
                         match &mapping.sources[col_idx] {
                             super::writer::ColSource::Volume(vi) => Some(*vi),
@@ -6001,34 +6063,23 @@ impl Table for SegmentedTable {
                 }
                 if stats_cover {
                     self.check_cold()?;
-                    return Ok(Some(overall_max));
+                    return Ok(Some(Some(overall_max)));
                 }
             }
 
             // See min_column: same zone-map + typed scan strategy for MAX.
-            let no_tombstones = self.segment_mgr.is_tombstone_set_empty()
-                && !self.segment_mgr.has_pending_tombstones(self.txn_id());
-
-            let volumes = self.segment_mgr.get_volumes_newest_first()?;
-            let tombstones_arc = if no_tombstones {
-                None
-            } else {
-                Some(self.segment_mgr.tombstone_set_arc())
-            };
             let mut hot_skip: FxHashSet<i64> =
                 FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-            self.hot.collect_hot_row_ids_into(&mut hot_skip);
-            if !no_tombstones {
-                self.segment_mgr
-                    .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+            let (tombstones_arc, volumes) = self.cold_view(&mut hot_skip, false)?;
+            if self.seal_moved(generation) {
+                return Ok(None);
             }
+            let tombstones_ref = &*tombstones_arc;
+            let no_tombstones = tombstones_ref.is_empty();
 
-            let empty_tombstones: FxHashMap<i64, u64> = FxHashMap::default();
-            let tombstones_ref = tombstones_arc.as_deref().unwrap_or(&empty_tombstones);
-
-            for (seg_id, cs) in volumes.iter() {
+            for (_, cs) in volumes.iter() {
                 let vol = &cs.volume;
-                let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
+                let mapping = &cs.mapping;
                 let phys = if col_idx < mapping.sources.len() {
                     match &mapping.sources[col_idx] {
                         super::writer::ColSource::Volume(vi) => Some(*vi),
@@ -6235,7 +6286,7 @@ impl Table for SegmentedTable {
                 }
             }
             self.check_cold()?;
-            Ok(Some(overall_max))
+            Ok(Some(Some(overall_max)))
         })
     }
 
@@ -6244,28 +6295,28 @@ impl Table for SegmentedTable {
     // =========================================================================
 
     fn get_partition_count(&self, column_name: &str) -> Result<Option<usize>> {
-        self.newest_clear_of_destruction(|| {
+        self.newest_across_seals(|generation| {
             let cut = self.read_cut();
-            let _seal_guard = self.segment_mgr.acquire_seal_read();
             if !self.segment_mgr.has_segments() {
-                return self.hot.get_partition_count(column_name);
+                let hot = self.hot.get_partition_count(column_name)?;
+                return Ok((!self.seal_moved(generation)).then_some(hot));
             }
 
             // During seal, hot+cold overlap — can't reliably count
             if self.segment_mgr.seal_overlap() > 0 {
-                return Ok(None);
+                return Ok(Some(None));
             }
 
             let schema = self.hot.schema();
             let Some(&col_idx) = schema.column_index_map().get(&column_name.to_lowercase()) else {
-                return Ok(None);
+                return Ok(Some(None));
             };
 
             // Collect hot distinct values from index. If no index exists on this
             // column, bail — we can't enumerate hot values without a full scan.
             let mut distinct: ValueSet = ValueSet::default();
             let Some(hot_values) = self.hot.get_partition_values(column_name)? else {
-                return Ok(None);
+                return Ok(Some(None));
             };
             for v in hot_values {
                 if !v.is_null() {
@@ -6276,19 +6327,18 @@ impl Table for SegmentedTable {
             crate::test_failpoints::hot_and_cold_reads_split();
 
             // Build skip set: hot row_ids + tombstones + pending tombstones
-            let volumes = self.segment_mgr.get_volumes_newest_first()?;
-            let tombstones_arc = self.segment_mgr.tombstone_set_arc();
             let mut hot_skip: FxHashSet<i64> =
                 FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-            self.hot.collect_hot_row_ids_into(&mut hot_skip);
-            self.segment_mgr
-                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+            let (tombstones_arc, volumes) = self.cold_view(&mut hot_skip, false)?;
+            if self.seal_moved(generation) {
+                return Ok(None);
+            }
 
             // Scan cold volumes columnar-only (no Row materialization)
             // Column resolution uses mapping (handles renames/drops) not col_name.
             let default_val = self.column_default(col_idx);
             let has_non_null_default = !default_val.is_null();
-            for (seg_id, cs) in volumes.iter() {
+            for (_, cs) in volumes.iter() {
                 let vol = &cs.volume;
                 let row_ids = vol.row_ids()?;
                 let Some(start) = (0..vol.meta.row_count).find(|&i| {
@@ -6298,7 +6348,7 @@ impl Table for SegmentedTable {
                 }) else {
                     continue;
                 };
-                let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
+                let mapping = &cs.mapping;
                 let phys = if col_idx < mapping.sources.len() {
                     match &mapping.sources[col_idx] {
                         super::writer::ColSource::Volume(vi) => Some(*vi),
@@ -6327,7 +6377,7 @@ impl Table for SegmentedTable {
             }
 
             self.check_cold()?;
-            Ok(Some(distinct.len()))
+            Ok(Some(Some(distinct.len())))
         })
     }
 
@@ -6377,7 +6427,7 @@ impl Table for SegmentedTable {
 
             // Column resolution uses mapping (handles renames/drops) not col_name.
             let default_val = self.column_default(col_idx);
-            for (seg_id, cs) in volumes.iter() {
+            for (_, cs) in volumes.iter() {
                 let vol = &cs.volume;
                 let row_ids = vol.row_ids()?;
                 let Some(start) = (0..vol.meta.row_count).find(|&i| {
@@ -6387,7 +6437,7 @@ impl Table for SegmentedTable {
                 }) else {
                     continue;
                 };
-                let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
+                let mapping = &cs.mapping;
                 let phys = if col_idx < mapping.sources.len() {
                     match &mapping.sources[col_idx] {
                         super::writer::ColSource::Volume(vi) => Some(*vi),
@@ -6476,9 +6526,9 @@ impl Table for SegmentedTable {
             let schema = self.hot.schema();
             let default_val = self.column_default(col_idx);
 
-            for (seg_id, cs) in volumes.iter() {
+            for (_, cs) in volumes.iter() {
                 let vol = &cs.volume;
-                let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
+                let mapping = &cs.mapping;
                 let phys = if col_idx < mapping.sources.len() {
                     match &mapping.sources[col_idx] {
                         super::writer::ColSource::Volume(vi) => Some(*vi),
@@ -6560,40 +6610,39 @@ impl Table for SegmentedTable {
         &self,
         column_name: &str,
     ) -> Result<Option<Vec<(Value, RowVec)>>> {
-        self.newest_clear_of_destruction(|| {
+        self.newest_across_seals(|generation| {
             let cut = self.read_cut();
-            let _seal_guard = self.segment_mgr.acquire_seal_read();
             if !self.segment_mgr.has_segments() {
-                return self.hot.collect_rows_grouped_by_partition(column_name);
+                let hot = self.hot.collect_rows_grouped_by_partition(column_name)?;
+                return Ok((!self.seal_moved(generation)).then_some(hot));
             }
 
             if self.segment_mgr.seal_overlap() > 0 {
-                return Ok(None);
+                return Ok(Some(None));
             }
 
             let schema = self.hot.schema();
             let Some(&col_idx) = schema.column_index_map().get(&column_name.to_lowercase()) else {
-                return Ok(None);
+                return Ok(Some(None));
             };
 
             // Start from hot grouped data; a hot side that cannot answer,
             // with local writes among others, leaves the whole to the scan
             let mut groups: ValueMap<RowVec> = ValueMap::default();
             let Some(hot_groups) = self.hot.collect_rows_grouped_by_partition(column_name)? else {
-                return Ok(None);
+                return Ok(Some(None));
             };
             for (val, rows) in hot_groups {
                 groups.insert(val, rows);
             }
 
             // Build hot_skip: hot row_ids + tombstones + pending tombstones
-            let volumes = self.segment_mgr.get_volumes_newest_first()?;
-            let tombstones_arc = self.segment_mgr.tombstone_set_arc();
             let mut hot_skip: FxHashSet<i64> =
                 FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-            self.hot.collect_hot_row_ids_into(&mut hot_skip);
-            self.segment_mgr
-                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+            let (tombstones_arc, volumes) = self.cold_view(&mut hot_skip, false)?;
+            if self.seal_moved(generation) {
+                return Ok(None);
+            }
 
             let default_val = self.column_default(col_idx);
             for (_seg_id, cs) in volumes.iter() {
@@ -6638,7 +6687,7 @@ impl Table for SegmentedTable {
             }
 
             self.check_cold()?;
-            Ok(Some(groups.into_iter().collect()))
+            Ok(Some(Some(groups.into_iter().collect())))
         })
     }
 
@@ -6647,23 +6696,23 @@ impl Table for SegmentedTable {
         column_name: &str,
         partition_value: &Value,
     ) -> Result<Option<RowVec>> {
-        self.newest_clear_of_destruction(|| {
+        self.newest_across_seals(|generation| {
             let cut = self.read_cut();
-            let _seal_guard = self.segment_mgr.acquire_seal_read();
             if !self.segment_mgr.has_segments() {
-                return self
+                let hot = self
                     .hot
-                    .get_rows_for_partition_value(column_name, partition_value);
+                    .get_rows_for_partition_value(column_name, partition_value)?;
+                return Ok((!self.seal_moved(generation)).then_some(hot));
             }
 
             if self.segment_mgr.seal_overlap() > 0 {
-                return Ok(None);
+                return Ok(Some(None));
             }
 
             let schema = self.hot.schema();
             let col_idx = match schema.column_index_map().get(&column_name.to_lowercase()) {
                 Some(&idx) => idx,
-                None => return Ok(None),
+                None => return Ok(Some(None)),
             };
 
             // Get hot rows for this partition value; a hot side that cannot
@@ -6672,18 +6721,17 @@ impl Table for SegmentedTable {
                 .hot
                 .get_rows_for_partition_value(column_name, partition_value)?
             else {
-                return Ok(None);
+                return Ok(Some(None));
             };
 
             // Build hot_skip: hot row_ids + tombstones + pending tombstones
             // Lazy: prune by zone maps on the partition column before loading cold volumes.
-            let volumes = self.segment_mgr.get_volumes_newest_first_lazy();
-            let tombstones_arc = self.segment_mgr.tombstone_set_arc();
             let mut hot_skip: FxHashSet<i64> =
                 FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-            self.hot.collect_hot_row_ids_into(&mut hot_skip);
-            self.segment_mgr
-                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+            let (tombstones_arc, volumes) = self.cold_view(&mut hot_skip, true)?;
+            if self.seal_moved(generation) {
+                return Ok(None);
+            }
 
             let default_val = self.column_default(col_idx);
             let wants_null = partition_value.is_null();
@@ -6725,10 +6773,11 @@ impl Table for SegmentedTable {
                 }) else {
                     continue;
                 };
-                // Load cold volume on demand after pruning.
+                // Load cold volume on demand after pruning, through the file
+                // the view captured
                 let loaded;
                 let vol: &Arc<FrozenVolume> = if vol.is_cold() {
-                    loaded = match self.segment_mgr.ensure_volume(*seg_id)? {
+                    loaded = match self.load_captured(*seg_id, cs.file.as_ref())? {
                         Some(v) => v,
                         None => continue,
                     };
@@ -6766,7 +6815,7 @@ impl Table for SegmentedTable {
             }
 
             self.check_cold()?;
-            Ok(Some(result))
+            Ok(Some(Some(result)))
         })
     }
 
@@ -6876,13 +6925,13 @@ impl Table for SegmentedTable {
             }
 
             let mut vol_sources: Vec<VolSource> = Vec::with_capacity(volumes.len());
-            for (seg_id, cs) in volumes.iter() {
+            for (_, cs) in volumes.iter() {
                 // Filter out empty or fully-skipped volumes early via zone-map on row_id range.
                 let vol = &cs.volume;
                 if vol.meta.row_count == 0 {
                     continue;
                 }
-                let mapping = self.segment_mgr.get_volume_mapping(*seg_id, &schema);
+                let mapping = cs.mapping.clone();
                 vol_sources.push(VolSource {
                     row_ids: vol.row_ids()?,
                     order: vol.row_order(),
@@ -7394,7 +7443,7 @@ impl Table for SegmentedTable {
                     &cs.volume
                 };
                 let sorted = vol.is_sorted(vcol);
-                let mapping = self.segment_mgr.get_volume_mapping(*seg_id, current_schema);
+                let mapping = cs.mapping.clone();
                 let slot = kept_from.len();
                 if needed.is_some() {
                     kept_from.push((Arc::clone(vol), mapping.clone()));
@@ -8095,87 +8144,87 @@ impl Table for SegmentedTable {
     ) -> Result<Option<Vec<Value>>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.compute_filtered_aggregates");
+        // Bail out: only conjunctive-simple filters can be evaluated on raw arrays
+        if !where_expr.is_conjunctive_simple() {
+            return Ok(None);
+        }
+        let comparisons = where_expr.collect_comparisons();
+        if comparisons.is_empty() {
+            return Ok(None);
+        }
+
+        let schema = self.hot.schema().clone();
+        if !typed_aggregates_answer(&schema, aggregates) {
+            return Ok(None);
+        }
+
+        // --- Type-resolve predicates -----------------------------------------
+        // For each comparison, resolve to (schema_col_idx, operator, typed_target).
+        // If any comparison cannot be resolved to a typed target, bail out.
+        enum TypedTarget {
+            Int64(i64),
+            Float64(f64),
+            DictEq(crate::common::SmartString), // text equality via dictionary lookup
+        }
+        struct ResolvedPred {
+            schema_col_idx: usize,
+            op: crate::core::Operator,
+            target: TypedTarget,
+            is_timestamp: bool,
+        }
+
+        let mut preds: Vec<ResolvedPred> = Vec::with_capacity(comparisons.len());
+        for (col_name, op, value) in &comparisons {
+            let Some(&col_idx) = schema.column_index_map().get(&col_name.to_lowercase()) else {
+                return Ok(None);
+            };
+            let col_type = schema.columns[col_idx].data_type;
+            let target = match (col_type, value) {
+                (DataType::Integer, Value::Integer(i)) => TypedTarget::Int64(*i),
+                // A float on an integer column, or an integer on a float
+                // column, is typed only when the other type holds it exactly
+                (DataType::Integer, Value::Float(f)) => {
+                    match crate::core::value::cmp_i64_f64(*f as i64, *f) {
+                        Some(std::cmp::Ordering::Equal) => TypedTarget::Int64(*f as i64),
+                        _ => return Ok(None),
+                    }
+                }
+                // A bound nanoseconds cannot hold is left to the general path
+                (DataType::Timestamp, Value::Timestamp(t)) => match t.timestamp_nanos_opt() {
+                    Some(nanos) => TypedTarget::Int64(nanos),
+                    None => return Ok(None),
+                },
+                (DataType::Timestamp, Value::Integer(i)) => TypedTarget::Int64(*i),
+                (DataType::Float, Value::Float(f)) => TypedTarget::Float64(*f),
+                (DataType::Float, Value::Integer(i)) => {
+                    match crate::core::value::lossless_f64_from_i64(*i) {
+                        Some(f) => TypedTarget::Float64(f),
+                        None => return Ok(None),
+                    }
+                }
+                (DataType::Text, Value::Text(s)) if *op == crate::core::Operator::Eq => {
+                    TypedTarget::DictEq(crate::common::SmartString::from(s.as_str()))
+                }
+                _ => return Ok(None), // unsupported type combination
+            };
+            preds.push(ResolvedPred {
+                schema_col_idx: col_idx,
+                op: *op,
+                target,
+                is_timestamp: col_type == DataType::Timestamp,
+            });
+        }
+
         // The volume stats count rows a snapshot or a view may not see
-        self.newest_clear_of_destruction(|| {
+        self.newest_across_seals(|generation| {
             let cut = self.read_cut();
-            let _seal_guard = self.segment_mgr.acquire_seal_read();
             // Bail out: during seal, hot+cold overlap makes aggregation unreliable
             if self.segment_mgr.seal_overlap() > 0 {
-                return Ok(None);
+                return Ok(Some(None));
             }
             // Bail out: no cold volumes — let the regular path handle hot-only data
             if !self.segment_mgr.has_segments() {
-                return Ok(None);
-            }
-            // Bail out: only conjunctive-simple filters can be evaluated on raw arrays
-            if !where_expr.is_conjunctive_simple() {
-                return Ok(None);
-            }
-            let comparisons = where_expr.collect_comparisons();
-            if comparisons.is_empty() {
-                return Ok(None);
-            }
-
-            let schema = self.hot.schema().clone();
-            if !typed_aggregates_answer(&schema, aggregates) {
-                return Ok(None);
-            }
-
-            // --- Type-resolve predicates -----------------------------------------
-            // For each comparison, resolve to (schema_col_idx, operator, typed_target).
-            // If any comparison cannot be resolved to a typed target, bail out.
-            enum TypedTarget {
-                Int64(i64),
-                Float64(f64),
-                DictEq(crate::common::SmartString), // text equality via dictionary lookup
-            }
-            struct ResolvedPred {
-                schema_col_idx: usize,
-                op: crate::core::Operator,
-                target: TypedTarget,
-                is_timestamp: bool,
-            }
-
-            let mut preds: Vec<ResolvedPred> = Vec::with_capacity(comparisons.len());
-            for (col_name, op, value) in &comparisons {
-                let Some(&col_idx) = schema.column_index_map().get(&col_name.to_lowercase()) else {
-                    return Ok(None);
-                };
-                let col_type = schema.columns[col_idx].data_type;
-                let target = match (col_type, value) {
-                    (DataType::Integer, Value::Integer(i)) => TypedTarget::Int64(*i),
-                    // A float on an integer column, or an integer on a float
-                    // column, is typed only when the other type holds it exactly
-                    (DataType::Integer, Value::Float(f)) => {
-                        match crate::core::value::cmp_i64_f64(*f as i64, *f) {
-                            Some(std::cmp::Ordering::Equal) => TypedTarget::Int64(*f as i64),
-                            _ => return Ok(None),
-                        }
-                    }
-                    // A bound nanoseconds cannot hold is left to the general path
-                    (DataType::Timestamp, Value::Timestamp(t)) => match t.timestamp_nanos_opt() {
-                        Some(nanos) => TypedTarget::Int64(nanos),
-                        None => return Ok(None),
-                    },
-                    (DataType::Timestamp, Value::Integer(i)) => TypedTarget::Int64(*i),
-                    (DataType::Float, Value::Float(f)) => TypedTarget::Float64(*f),
-                    (DataType::Float, Value::Integer(i)) => {
-                        match crate::core::value::lossless_f64_from_i64(*i) {
-                            Some(f) => TypedTarget::Float64(f),
-                            None => return Ok(None),
-                        }
-                    }
-                    (DataType::Text, Value::Text(s)) if *op == crate::core::Operator::Eq => {
-                        TypedTarget::DictEq(crate::common::SmartString::from(s.as_str()))
-                    }
-                    _ => return Ok(None), // unsupported type combination
-                };
-                preds.push(ResolvedPred {
-                    schema_col_idx: col_idx,
-                    op: *op,
-                    target,
-                    is_timestamp: col_type == DataType::Timestamp,
-                });
+                return Ok(Some(None));
             }
 
             // --- Hot buffer rows -------------------------------------------------
@@ -8190,14 +8239,12 @@ impl Table for SegmentedTable {
                 aggregate_row(&mut groups, &[], aggregates, row.as_slice());
             }
 
-            // Add remaining hot row IDs (not in filtered set) to skip set
-            self.hot.collect_hot_row_ids_into(&mut hot_skip);
-
             // --- Cold volumes (THE FAST PATH) ------------------------------------
-            let volumes = self.segment_mgr.get_volumes_newest_first()?;
-            let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-            self.segment_mgr
-                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+            // The remaining hot ids join the skip set
+            let (tombstones_arc, volumes) = self.cold_view(&mut hot_skip, false)?;
+            if self.seal_moved(generation) {
+                return Ok(None);
+            }
 
             // Physical-predicate and physical-aggregate structs used per volume.
             struct PhysPred {
@@ -8271,14 +8318,14 @@ impl Table for SegmentedTable {
             let hot_skip_ref = &hot_skip;
             let tombstones_ref = &tombstones_arc;
 
-            let process_volume = |(seg_id, cs): &(u64, super::manifest::ColdSegment)| -> Result<
+            let process_volume = |(_, cs): &(u64, super::manifest::ColdSegment)| -> Result<
                 Option<GroupedAggregates>,
             > {
                     if bail.load(std::sync::atomic::Ordering::Relaxed) {
                         return Ok(None);
                     }
                     let vol = &cs.volume;
-                    let mapping = self.segment_mgr.get_volume_mapping(*seg_id, &schema);
+                    let mapping = &cs.mapping;
 
                     // Resolve predicates to physical column indices via mapping.
                     let mut phys_preds: Vec<PhysPred> = Vec::with_capacity(preds.len());
@@ -8513,7 +8560,7 @@ impl Table for SegmentedTable {
                             }
 
                             if inputs.is_none() {
-                                let Some(resolved) = ColdInput::resolve(vol, &mapping, aggregates)?
+                                let Some(resolved) = ColdInput::resolve(vol, mapping, aggregates)?
                                 else {
                                     bail.store(true, std::sync::atomic::Ordering::Relaxed);
                                     return Ok(None);
@@ -8557,7 +8604,7 @@ impl Table for SegmentedTable {
                 .collect::<Result<_>>()?;
 
             if bail.load(std::sync::atomic::Ordering::Relaxed) {
-                return Ok(None);
+                return Ok(Some(None));
             }
 
             // The volumes' runs merge in volume order into the hot rows' run
@@ -8566,11 +8613,11 @@ impl Table for SegmentedTable {
             }
             let results = match groups.into_rows()?.into_iter().next() {
                 Some((_, row)) => row.into_values(),
-                None => return Ok(None),
+                None => return Ok(Some(None)),
             };
 
             self.check_cold()?;
-            Ok(Some(results))
+            Ok(Some(Some(results)))
         })
     }
 
@@ -8585,25 +8632,41 @@ impl Table for SegmentedTable {
         if group_by_indices.len() != 1 {
             return Ok(None);
         }
-        self.newest_clear_of_destruction(|| {
+        self.newest_across_seals(|generation| {
             let cut = self.read_cut();
-            let _seal_guard = self.segment_mgr.acquire_seal_read();
             if !self.segment_mgr.has_segments() {
-                return self
+                let hot = self
                     .hot
-                    .compute_grouped_aggregates(group_by_indices, aggregates);
+                    .compute_grouped_aggregates(group_by_indices, aggregates)?;
+                return Ok((!self.seal_moved(generation)).then_some(hot));
             }
 
             // During seal, hot+cold overlap — can't reliably aggregate
             if self.segment_mgr.seal_overlap() > 0 {
-                return Ok(None);
+                return Ok(Some(None));
             }
 
             let gb_idx = group_by_indices[0];
 
             let current_schema = self.hot.schema();
             if !typed_aggregates_answer(current_schema, aggregates) {
-                return Ok(None);
+                return Ok(Some(None));
+            }
+
+            // Determine GROUP BY column type from schema.
+            let gb_data_type = if gb_idx < current_schema.columns.len() {
+                current_schema.columns[gb_idx].data_type
+            } else {
+                return Ok(Some(None));
+            };
+
+            // Only support Dictionary (Text), Int64 (Integer), and TimestampNanos (Timestamp).
+            // Float, Boolean, Bytes: bail to regular executor path.
+            let gb_is_dict = gb_data_type == DataType::Text;
+            let gb_is_i64 =
+                gb_data_type == DataType::Integer || gb_data_type == DataType::Timestamp;
+            if !gb_is_dict && !gb_is_i64 {
+                return Ok(Some(None));
             }
 
             let mut groups = grouped_aggregates(group_by_indices, aggregates);
@@ -8617,27 +8680,10 @@ impl Table for SegmentedTable {
             }
 
             // ---- Process cold volumes (columnar fast path) ----
-            let volumes = self.segment_mgr.get_volumes_newest_first()?;
-            let tombstones_arc = self.segment_mgr.tombstone_set_arc();
             let mut hot_skip: FxHashSet<i64> =
                 FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-            self.hot.collect_hot_row_ids_into(&mut hot_skip);
-            self.segment_mgr
-                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
-
-            // Determine GROUP BY column type from schema.
-            let gb_data_type = if gb_idx < current_schema.columns.len() {
-                current_schema.columns[gb_idx].data_type
-            } else {
-                return Ok(None);
-            };
-
-            // Only support Dictionary (Text), Int64 (Integer), and TimestampNanos (Timestamp).
-            // Float, Boolean, Bytes: bail to regular executor path.
-            let gb_is_dict = gb_data_type == DataType::Text;
-            let gb_is_i64 =
-                gb_data_type == DataType::Integer || gb_data_type == DataType::Timestamp;
-            if !gb_is_dict && !gb_is_i64 {
+            let (tombstones_arc, volumes) = self.cold_view(&mut hot_skip, false)?;
+            if self.seal_moved(generation) {
                 return Ok(None);
             }
 
@@ -8647,11 +8693,11 @@ impl Table for SegmentedTable {
             // Runs one volume's visible rows into `groups`; false when the
             // volume's layout cannot answer. A key's group is looked up once
             // per volume, at the key's first row
-            let process_volume = |(seg_id, cs): &(u64, super::manifest::ColdSegment),
+            let process_volume = |(_, cs): &(u64, super::manifest::ColdSegment),
                                   groups: &mut GroupedAggregates|
              -> Result<bool> {
                 let vol = &cs.volume;
-                let mapping = self.segment_mgr.get_volume_mapping(*seg_id, current_schema);
+                let mapping = &cs.mapping;
                 if gb_idx >= mapping.sources.len() {
                     return Ok(false);
                 }
@@ -8666,7 +8712,7 @@ impl Table for SegmentedTable {
                     return Ok(true);
                 };
 
-                let Some(inputs) = ColdInput::resolve(vol, &mapping, aggregates)? else {
+                let Some(inputs) = ColdInput::resolve(vol, mapping, aggregates)? else {
                     return Ok(false);
                 };
 
@@ -8787,20 +8833,20 @@ impl Table for SegmentedTable {
                     for part in parts {
                         match part {
                             Some(part) => groups.merge(part),
-                            None => return Ok(None),
+                            None => return Ok(Some(None)),
                         }
                     }
                 }
             } else {
                 for volume in volumes.iter() {
                     if !process_volume(volume, &mut groups)? {
-                        return Ok(None);
+                        return Ok(Some(None));
                     }
                 }
             }
 
             self.check_cold()?;
-            Ok(Some(groups))
+            Ok(Some(Some(groups)))
         })
     }
 }
@@ -9570,8 +9616,8 @@ mod tests {
 
         for id in 1..=3 {
             assert!(mgr.row_exists(id).unwrap(), "row {id} not found");
-            let (_, vol, idx) = table.find_segment_row(id).unwrap().unwrap();
-            let row = vol.get_row(idx).unwrap();
+            let found = table.find_segment_row(id).unwrap().unwrap();
+            let row = found.volume.get_row(found.idx).unwrap();
             assert_eq!(
                 row.get(0),
                 Some(&Value::Integer(id)),

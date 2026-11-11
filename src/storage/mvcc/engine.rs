@@ -5568,9 +5568,9 @@ impl MVCCEngine {
 
                 let schema_cols = schema.columns.len();
 
-                for (seg_id, cs) in volumes.iter() {
+                for (_, cs) in volumes.iter() {
                     let vol = &cs.volume;
-                    let mapping = mgr.get_volume_mapping(*seg_id, schema);
+                    let mapping = &cs.mapping;
 
                     let row_ids = match vol.row_ids() {
                         Ok(ids) => ids,
@@ -5599,7 +5599,7 @@ impl MVCCEngine {
                         let row = if mapping.is_identity {
                             vol.get_row(i)
                         } else {
-                            vol.get_row_mapped(i, &mapping)
+                            vol.get_row_mapped(i, mapping)
                         };
                         let mut row = match row {
                             Ok(row) => row,
@@ -9221,7 +9221,6 @@ impl MVCCEngine {
         if result.len() < row_ids.len() {
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::pk_hot_rows_fetched();
-            let schema = store.schema();
             let mgr = self.get_or_create_segment_manager(table_name);
             // Hot rows found before the truncate count are read again after
             // it, and a truncate around the cold read is waited out and retried;
@@ -9249,7 +9248,7 @@ impl MVCCEngine {
                         result.iter().map(|(id, _)| *id).collect();
                     for &rid in row_ids {
                         if !found_ids.contains(&rid) {
-                            if let Some(row) = mgr.get_cold_row_normalized(rid, &schema, needed)? {
+                            if let Some(row) = mgr.get_cold_row_normalized(rid, needed)? {
                                 result.push((rid, row));
                             }
                         }
