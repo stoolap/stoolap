@@ -350,6 +350,26 @@ impl TopK {
         self.worst().map(|r| &r.key)
     }
 
+    /// Rows still to take before k are held
+    fn missing(&self) -> usize {
+        if self.heap.is_empty() {
+            self.k.saturating_sub(self.filling.len())
+        } else {
+            0
+        }
+    }
+
+    /// The row ids held from the read's volume `slot`, into `out` sorted
+    fn held_from(&self, slot: usize, out: &mut Vec<i64>) {
+        out.clear();
+        for ranked in self.filling.iter().chain(self.heap.iter()) {
+            if matches!(ranked.row, Held::Sealed(at, ..) if at == slot) {
+                out.push(ranked.row_id);
+            }
+        }
+        out.sort_unstable();
+    }
+
     /// Which of two keys comes first in the statement's order
     fn order(&self, a: &Value, b: &Value) -> std::cmp::Ordering {
         crate::core::value::compare_order_key(
@@ -2372,6 +2392,132 @@ impl SegmentedTable {
             def.identity,
             range,
         ))))
+    }
+
+    /// The single-column ordered index on schema column `column`, the one of
+    /// smaller identity among several
+    fn order_side_def(&self, column: usize) -> Option<SideIndexDef> {
+        let domain = Domain::of(self.hot.schema().columns.get(column)?.data_type)?;
+        let mut found: Option<SideIndexDef> = None;
+        self.hot.for_each_side_index_def(&mut |def| {
+            let ordered = matches!(def.kind, KeyKind::OrderedI64 | KeyKind::OrderedBytes);
+            let on_column = matches!(def.components.as_slice(),
+                [only] if only.column as usize == column && only.domain == domain);
+            if ordered && on_column && found.as_ref().is_none_or(|f| def.identity < f.identity) {
+                found = Some(def);
+            }
+        });
+        found
+    }
+
+    /// The position range of `def`'s keys in `side` that meet the
+    /// comparisons, the whole entry when they bound none; None when the
+    /// reader is refused
+    fn side_positions(
+        &self,
+        side: &Arc<super::secondary::IndexFile>,
+        def: &SideIndexDef,
+        comparisons: &[(&str, crate::core::Operator, &Value)],
+    ) -> Result<Option<(u64, u64)>> {
+        use super::secondary::{is_refused, READS};
+        let reader = match side.reader(def.identity, 1) {
+            Ok(reader) => reader,
+            Err(error) if is_refused(&error) => {
+                READS.count(&READS.refused, 1);
+                return Ok(None);
+            }
+            Err(error) => return Err(side_error(error)),
+        };
+        let schema = self.hot.schema();
+        let range = match def.kind {
+            KeyKind::OrderedI64 => {
+                let (low, high) =
+                    Self::i64_bounds(schema, comparisons, def).unwrap_or((i64::MIN, i64::MAX));
+                positions_of(&reader, KeyRange::I64(low, high))
+            }
+            _ => match Self::byte_bounds(schema, comparisons, def) {
+                Some((range, _)) => reader.range_bytes(range.lower(), range.upper()),
+                None => reader.range_bytes(&[], None),
+            },
+        };
+        range.map(Some).map_err(side_error)
+    }
+
+    /// Offers a volume's rows to a top-k through the side file of its order
+    /// column, by position ranges of the entry in key order: k positions,
+    /// twice as many each round after, none past the worst once k are held.
+    /// False when the volume must still be scanned: a refused reader, more
+    /// rows than the scan share, or rows the entry leaves out (`unkeyed`).
+    fn top_k_side_rounds(
+        &self,
+        cs: &super::manifest::ColdSegment,
+        def: &SideIndexDef,
+        comparisons: &[(&str, crate::core::Operator, &Value)],
+        unkeyed: bool,
+        keep: &mut TopK,
+        round: &mut dyn FnMut(&mut TopK, super::secondary::SidePlan) -> Result<()>,
+    ) -> Result<bool> {
+        use super::secondary::SidePlan;
+        use crate::core::Operator;
+        let Some(side) = cs.side_for(def, Capability::Range) else {
+            return Ok(false);
+        };
+        let schema = self.hot.schema();
+        let Some(column) = def
+            .leading()
+            .and_then(|c| schema.columns.get(c.column as usize))
+        else {
+            return Ok(false);
+        };
+        let Some((mut low, mut high)) = self.side_positions(side, def, comparisons)? else {
+            return Ok(false);
+        };
+        let share = cs.volume.meta.row_count as u64 / SIDE_SCAN_SHARE;
+        let (mut walked, mut chunk) = (0, keep.k as u64);
+        while low < high {
+            // Once k are held, only the keys up to the worst, ties included
+            if keep.missing() == 0 {
+                let worst = keep.worst_key().cloned();
+                let mut up_to_worst = comparisons.to_vec();
+                if let Some(worst) = &worst {
+                    let op = if keep.ascending {
+                        Operator::Lte
+                    } else {
+                        Operator::Gte
+                    };
+                    up_to_worst.push((column.name_lower.as_str(), op, worst));
+                }
+                let Some((from, to)) = self.side_positions(side, def, &up_to_worst)? else {
+                    return Ok(false);
+                };
+                (low, high) = if keep.ascending {
+                    (low, to.min(high))
+                } else {
+                    (from.max(low), high)
+                };
+                if low >= high {
+                    return Ok(true);
+                }
+            }
+            let take = chunk.min(high - low);
+            walked += take;
+            if walked > share {
+                return Ok(false);
+            }
+            let range = if keep.ascending {
+                (low, low + take)
+            } else {
+                (high - take, high)
+            };
+            round(keep, SidePlan::new(Arc::clone(side), def.identity, range))?;
+            if keep.ascending {
+                low += take;
+            } else {
+                high -= take;
+            }
+            chunk = take.saturating_mul(2);
+        }
+        Ok(!unkeyed || keep.missing() == 0)
     }
 
     /// The non-PK unique keys whose every column the comparisons set by an
@@ -7104,6 +7250,95 @@ impl Table for SegmentedTable {
                 mask
             });
             let mut kept_from: Vec<(Arc<FrozenVolume>, super::writer::ColumnMapping)> = Vec::new();
+            // A volume's best keys come from its side file first when the WHERE
+            // reads the order column alone: other columns prune by row group.
+            // A scan after the rounds passes the rows they kept, which only a
+            // key-first read tells apart by volume
+            let order_def = (needed.is_some() && read_cols.iter().all(|&c| c == col_idx))
+                .then(|| self.order_side_def(col_idx))
+                .flatten();
+            let mut held_here: Vec<i64> = Vec::new();
+            let open_scanner = |vol: &Arc<FrozenVolume>,
+                                cs: &super::manifest::ColdSegment,
+                                mapping: &super::writer::ColumnMapping,
+                                (start, end): (usize, usize),
+                                walk: Option<super::secondary::SidePlan>,
+                                ordered: Option<bool>|
+             -> Result<VolumeScanner> {
+                let mut scanner =
+                    VolumeScanner::with_range(Arc::clone(vol), all_cols.clone(), start, end, None)?;
+                scanner.set_skip_sets(Arc::clone(&tombstones_arc), Arc::clone(&hot_skip_arc));
+                scanner.set_visibility_bitmap(cs.visible.clone());
+                scanner.view = self.view.clone();
+                scanner.cut = cut.clone();
+                scanner.set_column_mapping(mapping.clone());
+                if let Some(mask) = &needed {
+                    scanner.set_needed_cols(mask);
+                }
+                if let Some(walk) = walk {
+                    scanner.set_side_plan(walk);
+                }
+                if let Some(ascending) = ordered {
+                    scanner.set_ordered_walk(ascending);
+                }
+                if let Some(filter) = &prepared_filter {
+                    scanner.set_filter(filter.clone_box());
+                }
+                Ok(scanner)
+            };
+            // Offers the scanner's rows; `held` names the rows of its volume
+            // already kept, which a scan after the volume's side rounds meets again
+            let take_rows = |scanner: &mut VolumeScanner,
+                             keep: &mut TopK,
+                             (slot, vcol, sorted): (usize, usize, bool),
+                             held: &[i64]|
+             -> Result<()> {
+                if let Some(worst) = keep.worst_key() {
+                    if sorted {
+                        scanner.set_stop_key(vcol, worst, ascending);
+                    } else {
+                        scanner.set_skip_key(vcol, worst, ascending);
+                    }
+                }
+                while scanner.next() {
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::top_k_cold_row_built();
+                    // Taken only when kept, so a passed row leaves its buffer
+                    let row_id = scanner.current_row_id();
+                    let Some(key) = scanner
+                        .row()
+                        .get(col_idx)
+                        .filter(|key| keep.admits(key, row_id))
+                    else {
+                        continue;
+                    };
+                    if sealed_copies_checked && self.hot.has_row_id(row_id)? {
+                        continue;
+                    }
+                    if held.binary_search(&row_id).is_ok() {
+                        continue;
+                    }
+                    if needed.is_some() {
+                        let (key, position) = (key.clone(), scanner.position());
+                        let (row_id, row) = scanner.take_row_with_id();
+                        keep.keep(key, row_id, Held::Sealed(slot, position, row));
+                    } else {
+                        let (row_id, row) = scanner.take_row_with_id();
+                        keep.offer(row_id, row);
+                    }
+                    if let Some(worst) = keep.worst_key() {
+                        if sorted {
+                            scanner.set_stop_key(vcol, worst, ascending);
+                        } else {
+                            scanner.set_skip_key(vcol, worst, ascending);
+                        }
+                    }
+                }
+                match scanner.err() {
+                    Some(e) => Err(e.clone()),
+                    None => Ok(()),
+                }
+            };
 
             for (i, vcol, bound) in ordered {
                 if bound.is_some_and(|bound| keep.cannot_improve(bound)) {
@@ -7134,6 +7369,39 @@ impl Table for SegmentedTable {
                 let slot = kept_from.len();
                 if needed.is_some() {
                     kept_from.push((Arc::clone(vol), mapping.clone()));
+                }
+                held_here.clear();
+                if let Some(def) = order_def.as_ref().filter(|_| !sorted) {
+                    let nulls = !null_free
+                        && vol
+                            .meta
+                            .zone_maps
+                            .get(vcol)
+                            .is_none_or(|zm| zm.null_count > 0);
+                    // A NULL first comes before every key the side file holds
+                    if !(nulls_first && nulls) {
+                        let unkeyed = nulls || Self::may_hold_unkeyed_nan(cs, def);
+                        let done = self.top_k_side_rounds(
+                            cs,
+                            def,
+                            &comparisons,
+                            unkeyed,
+                            &mut keep,
+                            &mut |keep, walk| {
+                                #[cfg(feature = "test-failpoints")]
+                                crate::test_failpoints::top_k_side_round();
+                                let rows = (0, vol.meta.row_count);
+                                let mut scanner =
+                                    open_scanner(vol, cs, &mapping, rows, Some(walk), None)?;
+                                keep.held_from(slot, &mut held_here);
+                                take_rows(&mut scanner, keep, (slot, vcol, sorted), &held_here)
+                            },
+                        )?;
+                        if done {
+                            continue;
+                        }
+                        keep.held_from(slot, &mut held_here);
+                    }
                 }
                 // Row groups in bound order, clipped to the narrowed range; a
                 // volume without group metadata is one group
@@ -7171,73 +7439,13 @@ impl Table for SegmentedTable {
                             break;
                         }
                     }
-                    let mut scanner = VolumeScanner::with_range(
-                        Arc::clone(vol),
-                        all_cols.clone(),
-                        start,
-                        end,
-                        None,
-                    )?;
-                    scanner.set_skip_sets(Arc::clone(&tombstones_arc), Arc::clone(&hot_skip_arc));
-                    scanner.set_visibility_bitmap(cs.visible.clone());
-                    scanner.view = self.view.clone();
-                    scanner.cut = cut.clone();
-                    scanner.set_column_mapping(mapping.clone());
-                    if let Some(mask) = &needed {
-                        scanner.set_needed_cols(mask);
-                    }
                     // In a sorted volume the rows come in key order: walk from the
                     // best end and stop at the first key the heap cannot use
                     // Otherwise unusable rows pass unbuilt; DESC walks newest first
-                    if sorted {
-                        scanner.set_ordered_walk(ascending);
-                    } else if !ascending {
-                        scanner.set_ordered_walk(false);
-                    }
-                    if let Some(worst) = keep.worst_key() {
-                        if sorted {
-                            scanner.set_stop_key(vcol, worst, ascending);
-                        } else {
-                            scanner.set_skip_key(vcol, worst, ascending);
-                        }
-                    }
-                    if let Some(filter) = &prepared_filter {
-                        scanner.set_filter(filter.clone_box());
-                    }
-                    while scanner.next() {
-                        #[cfg(feature = "test-failpoints")]
-                        crate::test_failpoints::top_k_cold_row_built();
-                        // Taken only when kept, so a passed row leaves its buffer
-                        let row_id = scanner.current_row_id();
-                        let Some(key) = scanner
-                            .row()
-                            .get(col_idx)
-                            .filter(|key| keep.admits(key, row_id))
-                        else {
-                            continue;
-                        };
-                        if sealed_copies_checked && self.hot.has_row_id(row_id)? {
-                            continue;
-                        }
-                        if needed.is_some() {
-                            let (key, position) = (key.clone(), scanner.position());
-                            let (row_id, row) = scanner.take_row_with_id();
-                            keep.keep(key, row_id, Held::Sealed(slot, position, row));
-                        } else {
-                            let (row_id, row) = scanner.take_row_with_id();
-                            keep.offer(row_id, row);
-                        }
-                        if let Some(worst) = keep.worst_key() {
-                            if sorted {
-                                scanner.set_stop_key(vcol, worst, ascending);
-                            } else {
-                                scanner.set_skip_key(vcol, worst, ascending);
-                            }
-                        }
-                    }
-                    if let Some(e) = scanner.err() {
-                        return Err(e.clone());
-                    }
+                    let walk_order = (sorted || !ascending).then_some(sorted && ascending);
+                    let mut scanner =
+                        open_scanner(vol, cs, &mapping, (start, end), None, walk_order)?;
+                    take_rows(&mut scanner, &mut keep, (slot, vcol, sorted), &held_here)?;
                 }
             }
             self.check_cold()?;

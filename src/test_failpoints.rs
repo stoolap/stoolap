@@ -2524,6 +2524,7 @@ thread_local! {
     static SEGMENT_MAP_CLONES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ROW_ID_ORDER_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TOP_K_COLD_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TOP_K_SIDE_ROUNDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static HOT_TOP_K_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static KEPT_MEMBER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static INNER_FETCH_FILTERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -3278,6 +3279,15 @@ pub fn top_k_cold_rows() -> usize {
 
 pub(crate) fn top_k_cold_row_built() {
     TOP_K_COLD_ROWS.with(|n| n.set(n.get() + 1));
+}
+
+/// Position ranges this thread's top-k reads took from side files, so far
+pub fn top_k_side_rounds() -> usize {
+    TOP_K_SIDE_ROUNDS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn top_k_side_round() {
+    TOP_K_SIDE_ROUNDS.with(|n| n.set(n.get() + 1));
 }
 
 /// The most row ids one chunk of this thread's B-tree walks copied under the
