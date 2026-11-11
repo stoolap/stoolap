@@ -8254,6 +8254,18 @@ impl Table for SegmentedTable {
                 dict_id: Option<u32>, // resolved dict_id for DictEq (per-volume)
                 is_timestamp: bool,
             }
+            // Whether row `i` of `col` passes the predicate
+            #[inline(always)]
+            fn pred_passes(pp: &PhysPred, col: &super::column::ColumnData, i: usize) -> bool {
+                !col.is_null(i)
+                    && match &pp.target {
+                        TypedTarget::Int64(target) => compare_i64(col.get_i64(i), *target, pp.op),
+                        TypedTarget::Float64(target) => compare_f64(col.get_f64(i), *target, pp.op),
+                        TypedTarget::DictEq(_) => {
+                            col.get_dict_id(i) == pp.dict_id.unwrap_or(u32::MAX)
+                        }
+                    }
+            }
             // Build a zone-map probe Value from a TypedTarget.
             // Timestamps stored as i64 nanos must become Value::Timestamp for correct comparison.
             #[inline]
@@ -8317,6 +8329,14 @@ impl Table for SegmentedTable {
             let bail = std::sync::atomic::AtomicBool::new(false);
             let hot_skip_ref = &hot_skip;
             let tombstones_ref = &tombstones_arc;
+            // A COUNT(*) alone reads no column, so a side file over an ordered
+            // key the comparisons bound names the only rows it must look at
+            let count_ask = aggregates
+                .iter()
+                .all(|&(op, _)| op == AggregateOp::CountStar)
+                .then(|| self.side_ask(&comparisons))
+                .flatten()
+                .filter(|ask| matches!(ask.keys, AskKeys::I64(..)));
 
             let process_volume = |(_, cs): &(u64, super::manifest::ColdSegment)| -> Result<
                 Option<GroupedAggregates>,
@@ -8463,6 +8483,12 @@ impl Table for SegmentedTable {
                         Vec::new()
                     };
 
+                    let walk = match self.side_decision(cs, count_ask.as_ref())? {
+                        SideDecision::Empty => return Ok(None),
+                        SideDecision::Scan => None,
+                        SideDecision::Walk(plan) => start_walk(&plan)?,
+                    };
+
                     // Inner loop: the volume's own run of every call, its
                     // inputs resolved at the first row that passes
                     let mut part = groups.empty_like();
@@ -8472,6 +8498,108 @@ impl Table for SegmentedTable {
                     let row_count = vol.meta.row_count;
                     let rg_size = vol.meta.group_rows;
                     let num_groups = row_count.div_ceil(rg_size);
+                    // Feeds a passing row to the calls; false when the volume
+                    // cannot answer and the statement reads the rows instead
+                    #[inline(always)]
+                    fn take<'v>(
+                        vol: &'v FrozenVolume,
+                        mapping: &super::writer::ColumnMapping,
+                        aggregates: &[(AggregateOp, usize)],
+                        bail: &std::sync::atomic::AtomicBool,
+                        part: &mut GroupedAggregates,
+                        inputs: &mut Option<(usize, Vec<ColdInput<'v>>)>,
+                        i: usize,
+                    ) -> Result<bool> {
+                        if inputs.is_none() {
+                            let Some(resolved) = ColdInput::resolve(vol, mapping, aggregates)?
+                            else {
+                                bail.store(true, std::sync::atomic::Ordering::Relaxed);
+                                return Ok(false);
+                            };
+                            let Some(group) = part.group(&[] as &[Value]) else {
+                                return Ok(false);
+                            };
+                            *inputs = Some((group, resolved));
+                        }
+                        if let Some((group, inputs)) = inputs {
+                            accumulate_columnar(part.aggregates(*group), inputs, i);
+                        }
+                        Ok(true)
+                    }
+                    // The side file names the candidates; each passes every
+                    // predicate, read from its row group, before it is
+                    // counted. Out of line, so the scan below is built without it
+                    #[inline(never)]
+                    #[allow(clippy::too_many_arguments)]
+                    fn count_candidates<'v>(
+                        table: &SegmentedTable,
+                        cs: &'v super::manifest::ColdSegment,
+                        preds: &[PhysPred],
+                        walk: &mut super::secondary::SideWalk,
+                        (tombstones, hot_skip, cut): (&FxHashMap<i64, u64>, &FxHashSet<i64>, &CommitCut),
+                        (mapping, aggregates, bail): (
+                            &super::writer::ColumnMapping,
+                            &[(AggregateOp, usize)],
+                            &std::sync::atomic::AtomicBool,
+                        ),
+                        part: &mut GroupedAggregates,
+                        inputs: &mut Option<(usize, Vec<ColdInput<'v>>)>,
+                    ) -> Result<bool> {
+                        let vol: &'v FrozenVolume = &cs.volume;
+                        let row_ids = vol.row_ids()?;
+                        let shift = vol.meta.group_shift();
+                        let mut held: Vec<Option<(usize, Arc<super::column::ColumnData>)>> =
+                            vec![None; preds.len()];
+                        while let Some(i) = walk.next_position().map_err(side_error)? {
+                            if !table.shows_cold_row(cs, i, row_ids[i], tombstones, hot_skip, cut) {
+                                continue;
+                            }
+                            let mut all_pass = true;
+                            for (pp, held) in preds.iter().zip(held.iter_mut()) {
+                                let passes = match vol.columns.resident(pp.phys_col) {
+                                    Some(col) => pred_passes(pp, col, i),
+                                    None => {
+                                        let group = i >> shift;
+                                        if held.as_ref().is_none_or(|(at, _)| *at != group) {
+                                            let store =
+                                                vol.columns.compressed_store().ok_or_else(|| {
+                                                    crate::core::Error::internal(
+                                                        "column data is not loaded",
+                                                    )
+                                                })?;
+                                            *held = Some((group, store.group_column(pp.phys_col, group)?));
+                                        }
+                                        held.as_ref().is_some_and(|(_, col)| {
+                                            pred_passes(pp, col, i - (group << shift))
+                                        })
+                                    }
+                                };
+                                if !passes {
+                                    all_pass = false;
+                                    break;
+                                }
+                            }
+                            if all_pass && !take(vol, mapping, aggregates, bail, part, inputs, i)? {
+                                return Ok(false);
+                            }
+                        }
+                        Ok(true)
+                    }
+                    if let Some(mut walk) = walk {
+                        let view = (&**tombstones_ref, hot_skip_ref, &cut);
+                        let calls = (mapping, aggregates, &bail);
+                        let walked = count_candidates(
+                            self,
+                            cs,
+                            &phys_preds,
+                            &mut walk,
+                            view,
+                            calls,
+                            &mut part,
+                            &mut inputs,
+                        )?;
+                        return Ok(walked.then_some(part));
+                    }
 
                     for gi in 0..num_groups {
                         if gi < row_group_skips.len() && row_group_skips[gi] {
@@ -8519,59 +8647,23 @@ impl Table for SegmentedTable {
                         };
 
                         while let Some(i) = next_row() {
-                            if !cs.is_visible(i) {
+                            if !self.shows_cold_row(cs, i, row_ids[i], tombstones_ref, hot_skip_ref, &cut) {
                                 continue;
                             }
-                            let row_id = row_ids[i];
-                            if self.is_row_tombstoned(tombstones_ref, row_id, &cut)
-                                || hot_skip_ref.contains(&row_id)
-                            {
-                                continue;
-                            }
-
                             let mut all_pass = true;
                             for pp in &phys_preds {
                                 if prefiltered && matches!(pp.target, TypedTarget::DictEq(_)) {
                                     continue;
                                 }
-                                let col = vol.columns.get(pp.phys_col)?;
-                                if col.is_null(i) {
-                                    all_pass = false;
-                                    break;
-                                }
-                                let passes = match &pp.target {
-                                    TypedTarget::Int64(target) => {
-                                        compare_i64(col.get_i64(i), *target, pp.op)
-                                    }
-                                    TypedTarget::Float64(target) => {
-                                        compare_f64(col.get_f64(i), *target, pp.op)
-                                    }
-                                    TypedTarget::DictEq(_) => {
-                                        col.get_dict_id(i) == pp.dict_id.unwrap_or(u32::MAX)
-                                    }
-                                };
-                                if !passes {
+                                if !pred_passes(pp, vol.columns.get(pp.phys_col)?, i) {
                                     all_pass = false;
                                     break;
                                 }
                             }
-                            if !all_pass {
-                                continue;
-                            }
-
-                            if inputs.is_none() {
-                                let Some(resolved) = ColdInput::resolve(vol, mapping, aggregates)?
-                                else {
-                                    bail.store(true, std::sync::atomic::Ordering::Relaxed);
-                                    return Ok(None);
-                                };
-                                let Some(group) = part.group(&[] as &[Value]) else {
-                                    return Ok(None);
-                                };
-                                inputs = Some((group, resolved));
-                            }
-                            if let Some((group, inputs)) = &inputs {
-                                accumulate_columnar(part.aggregates(*group), inputs, i);
+                            if all_pass
+                                && !take(vol, mapping, aggregates, &bail, &mut part, &mut inputs, i)?
+                            {
+                                return Ok(None);
                             }
                         }
                     }
