@@ -36,24 +36,28 @@ fn fill(db: &Database) {
         "INSERT INTO p3 VALUES (3)",
         "CREATE TABLE p4 (k INTEGER)",
         "INSERT INTO p4 VALUES (4)",
+        "CREATE TABLE tx (k TEXT)",
+        "INSERT INTO tx VALUES ('a key longer than inline 1'), ('a key longer than inline 2')",
+        "CREATE TABLE ux (k TEXT)",
+        "INSERT INTO ux VALUES ('a key longer than inline 2'), ('a key longer than inline 3')",
     ] {
         db.execute(sql, ()).unwrap();
     }
 }
 
 /// Each row as its columns' values, NULL as None
-fn rows(db: &Database, sql: &str, prepared: bool) -> Vec<Vec<Option<i64>>> {
+fn rows(db: &Database, sql: &str, prepared: bool) -> Result<Vec<Vec<Option<i64>>>, String> {
     let result = match prepared {
-        true => db.prepare(sql).unwrap().query((0,)),
+        true => db.prepare(sql).and_then(|p| p.query((0,))),
         false => db.query(sql, (0,)),
     }
-    .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    .map_err(|e| e.to_string())?;
     let width = result.columns().len();
     result
         .map(|row| {
-            let row = row.unwrap();
+            let row = row.map_err(|e| e.to_string())?;
             (0..width)
-                .map(|i| row.get::<Option<i64>>(i).unwrap())
+                .map(|i| row.get::<Option<i64>>(i).map_err(|e| e.to_string()))
                 .collect()
         })
         .collect()
@@ -81,7 +85,8 @@ fn a_merged_column_reads_the_side_its_join_kind_keeps() {
     sealed.execute("PRAGMA CHECKPOINT", ()).unwrap();
     let hot = Database::open("memory://merged_using_kind").unwrap();
     fill(&hot);
-    let cases: Vec<(&str, Vec<Vec<Option<i64>>>)> = vec![
+    let cases: Vec<(&str, Vec<Vec<Option<i64>>>)> =
+        vec![
         // The kinds that keep the left side read its column
         (
             "SELECT k FROM t JOIN u USING (k) WHERE k > $1 ORDER BY k",
@@ -194,13 +199,169 @@ fn a_merged_column_reads_the_side_its_join_kind_keeps() {
              USING (k) WHERE b > $1 ORDER BY k",
             ints(&[&[s(2), s(20), s(200)], &[s(3), N, s(300)]]),
         ),
+        // A full join reads the side that has the row
+        (
+            "SELECT k FROM t FULL JOIN u USING (k) WHERE k > $1 ORDER BY k",
+            ints(&[&[s(1)], &[s(2)], &[s(3)]]),
+        ),
+        (
+            "SELECT * FROM t FULL JOIN u USING (k) WHERE k > $1 ORDER BY k",
+            ints(&[&[s(1), s(10), N], &[s(2), s(20), s(200)], &[s(3), N, s(300)]]),
+        ),
+        (
+            "SELECT u.*, k FROM t FULL JOIN u USING (k) WHERE k > $1 ORDER BY k",
+            ints(&[&[N, N, s(1)], &[s(2), s(200), s(2)], &[s(3), s(300), s(3)]]),
+        ),
+        (
+            "SELECT t.k, u.k, k FROM t FULL JOIN u USING (k) WHERE k > $1 ORDER BY 3",
+            ints(&[&[s(1), N, s(1)], &[s(2), s(2), s(2)], &[N, s(3), s(3)]]),
+        ),
+        (
+            "SELECT COUNT(*) FROM t FULL JOIN u USING (k) WHERE k = 3 + $1",
+            ints(&[&[s(1)]]),
+        ),
+        (
+            "SELECT COUNT(*) FROM t FULL JOIN u USING (k) WHERE k IS NULL OR k = $1",
+            ints(&[&[s(0)]]),
+        ),
+        (
+            "SELECT k FROM t FULL JOIN u USING (k) WHERE k IN (1, 3) AND k > $1 ORDER BY k",
+            ints(&[&[s(1)], &[s(3)]]),
+        ),
+        (
+            "SELECT SUM(k), MAX(k) FROM t FULL JOIN u USING (k) WHERE k > $1",
+            ints(&[&[s(6), s(3)]]),
+        ),
+        (
+            "SELECT k, COUNT(*) FROM t FULL JOIN u USING (k) WHERE k > $1 GROUP BY k \
+             HAVING k > 1 ORDER BY k",
+            ints(&[&[s(2), s(1)], &[s(3), s(1)]]),
+        ),
+        (
+            "SELECT DISTINCT k FROM t FULL JOIN u USING (k) WHERE k > $1 ORDER BY k DESC",
+            ints(&[&[s(3)], &[s(2)], &[s(1)]]),
+        ),
+        (
+            "SELECT k, ROW_NUMBER() OVER (PARTITION BY k > 1 ORDER BY k) \
+             FROM t FULL JOIN u USING (k) WHERE k > $1 ORDER BY k",
+            ints(&[&[s(1), s(1)], &[s(2), s(1)], &[s(3), s(2)]]),
+        ),
+        (
+            "SELECT k, (SELECT ww.c FROM (SELECT k AS kk, c FROM w) ww WHERE ww.kk = k + $1) \
+             FROM t FULL JOIN u USING (k) ORDER BY k",
+            ints(&[&[s(1), N], &[s(2), N], &[s(3), s(3000)]]),
+        ),
+        (
+            "SELECT k FROM t FULL JOIN u USING (k) \
+             WHERE EXISTS (SELECT 1 FROM (SELECT c FROM w) ww WHERE ww.c = k * 1000 + $1) \
+             ORDER BY k",
+            ints(&[&[s(3)]]),
+        ),
+        (
+            "SELECT k FROM (SELECT * FROM t) x FULL JOIN (SELECT * FROM u) y USING (k) \
+             WHERE k > $1 ORDER BY k",
+            ints(&[&[s(1)], &[s(2)], &[s(3)]]),
+        ),
+        (
+            "SELECT COUNT(_rowid_) FROM (SELECT _rowid_ FROM t WHERE k = 1 + $1) a \
+             FULL JOIN (SELECT _rowid_ FROM t WHERE k = 2) b USING (_rowid_)",
+            ints(&[&[s(2)]]),
+        ),
+        (
+            "SELECT COUNT(*) FROM tx FULL JOIN ux USING (k) \
+             WHERE k = 'a key longer than inline 3' AND $1 = 0",
+            ints(&[&[s(1)]]),
+        ),
+        // A join over a full join's merged column keys on the side that has it
+        (
+            "SELECT k, a, b, c FROM t FULL JOIN u USING (k) FULL JOIN w USING (k) \
+             WHERE k > $1 ORDER BY k",
+            ints(&[
+                &[s(1), s(10), N, N],
+                &[s(2), s(20), s(200), N],
+                &[s(3), N, s(300), s(3000)],
+                &[s(4), N, N, s(4000)],
+            ]),
+        ),
+        (
+            "SELECT * FROM t FULL JOIN u USING (k) FULL JOIN w USING (k) WHERE k > $1 ORDER BY k",
+            ints(&[
+                &[s(1), s(10), N, N],
+                &[s(2), s(20), s(200), N],
+                &[s(3), N, s(300), s(3000)],
+                &[s(4), N, N, s(4000)],
+            ]),
+        ),
+        (
+            "SELECT k, COUNT(*) FROM t FULL JOIN u USING (k) FULL JOIN w USING (k) \
+             WHERE k > $1 GROUP BY k ORDER BY k",
+            ints(&[&[s(1), s(1)], &[s(2), s(1)], &[s(3), s(1)], &[s(4), s(1)]]),
+        ),
+        (
+            "SELECT k, a, b, c FROM t FULL JOIN u USING (k) LEFT JOIN w USING (k) \
+             WHERE $1 = 0 ORDER BY k",
+            ints(&[
+                &[s(1), s(10), N, N],
+                &[s(2), s(20), s(200), N],
+                &[s(3), N, s(300), s(3000)],
+            ]),
+        ),
+        (
+            "SELECT k, a, b, c FROM t LEFT JOIN u USING (k) FULL JOIN w USING (k) \
+             WHERE $1 = 0 ORDER BY k",
+            ints(&[
+                &[s(1), s(10), N, N],
+                &[s(2), s(20), s(200), N],
+                &[s(3), N, N, s(3000)],
+                &[s(4), N, N, s(4000)],
+            ]),
+        ),
+        (
+            "SELECT k, a, b, c FROM t RIGHT JOIN u USING (k) FULL JOIN w USING (k) \
+             WHERE $1 = 0 ORDER BY k",
+            ints(&[
+                &[s(2), s(20), s(200), N],
+                &[s(3), N, s(300), s(3000)],
+                &[s(4), N, N, s(4000)],
+            ]),
+        ),
+        (
+            "SELECT k, a, b, c FROM t FULL JOIN u USING (k) RIGHT JOIN w USING (k) \
+             WHERE $1 = 0 ORDER BY k",
+            ints(&[&[s(3), N, s(300), s(3000)], &[s(4), N, N, s(4000)]]),
+        ),
+        (
+            "SELECT *, ROW_NUMBER() OVER () FROM t FULL JOIN u USING (k) JOIN y USING (k) \
+             WHERE k > $1",
+            ints(&[&[s(3), N, s(300), s(1)]]),
+        ),
+        (
+            "SELECT p3.*, k, ROW_NUMBER() OVER (ORDER BY k) FROM p1 FULL JOIN p2 USING (k) \
+             FULL JOIN p3 USING (k) FULL JOIN p4 USING (k) WHERE k > 2 + $1 ORDER BY k",
+            ints(&[&[s(3), s(3), s(1)], &[N, s(4), s(2)]]),
+        ),
+        (
+            "SELECT SUM(k), COUNT(*) FROM p1 FULL JOIN p2 USING (k) FULL JOIN p3 USING (k) \
+             FULL JOIN p4 USING (k) WHERE k > $1",
+            ints(&[&[s(10), s(4)]]),
+        ),
+        (
+            "SELECT k, a, b FROM w FULL JOIN (SELECT * FROM t FULL JOIN u USING (k)) x \
+             USING (k) WHERE $1 = 0 ORDER BY k",
+            ints(&[
+                &[s(1), s(10), N],
+                &[s(2), s(20), s(200)],
+                &[s(3), N, s(300)],
+                &[s(4), N, N],
+            ]),
+        ),
     ];
     let mut wrong = Vec::new();
     for (context, db) in [("hot", &hot), ("sealed", &sealed)] {
         for (sql, want) in &cases {
             for prepared in [false, true] {
                 let got = rows(db, sql, prepared);
-                if got != *want {
+                if got.as_ref() != Ok(want) {
                     wrong.push(format!(
                         "{context}, prepared {prepared}: {sql}\n  got  {got:?}\n  want {want:?}"
                     ));

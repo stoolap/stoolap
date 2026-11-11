@@ -106,7 +106,7 @@ const AROUND: &[(&str, &str, &str)] = &[
 
 /// Each statement over `{f}`, `{id}` the merged column; the bare name stands
 /// for the column the merge reads, as at the top: the left table's, a right
-/// join's right one
+/// join's right one, a full join's first not NULL
 const SHAPES: &[&str] = &[
     "SELECT {id}, t.id, u.id, u.x, r.x FROM {f} WHERE COALESCE(u.x, 0) < (SELECT MAX(y) FROM w) + 100",
     "SELECT * FROM {f} WHERE COALESCE(t.b, 0) < (SELECT MAX(y) FROM w) * 100",
@@ -170,9 +170,10 @@ fn check_shapes(db: &Database, context: &str, shapes: &[&str], wrong: &mut Vec<S
     for (merging, as_on, kinds) in MERGING {
         for kind in kinds.iter() {
             let (merging, as_on) = (merging.replace("{j}", kind), as_on.replace("{j}", kind));
-            let merged = match kind.contains("RIGHT") {
-                true => "u.id",
-                false => "t.id",
+            let merged = match (kind.contains("FULL"), kind.contains("RIGHT")) {
+                (true, _) => "COALESCE(t.id, u.id)",
+                (false, true) => "u.id",
+                (false, false) => "t.id",
             };
             for (around, around_on, others) in AROUND {
                 let from = around.replace("{m}", &merging);

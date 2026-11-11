@@ -126,9 +126,9 @@ FROM orders
 JOIN returns USING (order_id, product_id);
 ```
 
-The merged column of an inner or left join reads the left table's column, and that of a right join the right table's: in `t RIGHT JOIN u USING (id)`, a row only `u` has shows `u.id` as its `id`, in `*`, the `SELECT` list, `WHERE`, `GROUP BY` and every other clause. `t.id` and `u.id` keep reading their own table.
+The merged column of an inner or left join reads the left table's column, that of a right join the right table's, and that of a full join the first of the two that is not NULL, `COALESCE(t.id, u.id)`: in `t RIGHT JOIN u USING (id)` or `t FULL JOIN u USING (id)`, a row only `u` has shows `u.id` as its `id`, in `*`, the `SELECT` list, `WHERE`, `GROUP BY` and every other clause. `t.id` and `u.id` keep reading their own table.
 
-When a side is itself a join holding two columns of the name, a `USING` or `NATURAL` join merges the first of them, the one its bare name reads: in `t LEFT JOIN u ON u.id = t.id JOIN s USING (id)` the condition is `s.id = t.id`, so a `t` row without a `u` row still joins. When the side is a `USING` or `NATURAL` join itself, the merge reads its merged column: in `t RIGHT JOIN u USING (id) JOIN s USING (id)` the condition is `s.id = u.id`.
+When a side is itself a join holding two columns of the name, a `USING` or `NATURAL` join merges the first of them, the one its bare name reads: in `t LEFT JOIN u ON u.id = t.id JOIN s USING (id)` the condition is `s.id = t.id`, so a `t` row without a `u` row still joins. When the side is a `USING` or `NATURAL` join itself, the merge reads its merged column: in `t RIGHT JOIN u USING (id) JOIN s USING (id)` the condition is `s.id = u.id`, and in `t FULL JOIN u USING (id) FULL JOIN s USING (id)` it is `s.id = COALESCE(t.id, u.id)`.
 
 A `USING` or `NATURAL` join that is a side of another join keeps its tables' columns their own. In `t LEFT JOIN u USING (id) JOIN s ON s.id = t.id`, `t.id` and `u.id` are each their table's column, `u.id` is NULL where `u` has no row, `u.*` and `t.*` each hold their table's `id`, and `*` shows the merged column once:
 
