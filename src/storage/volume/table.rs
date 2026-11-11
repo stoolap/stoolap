@@ -8554,27 +8554,13 @@ impl Table for SegmentedTable {
                         let vol: &'v FrozenVolume = &cs.volume;
                         let row_ids = vol.row_ids()?;
                         let shift = vol.meta.group_shift();
-                        let mut held: Vec<Held> = vec![None; preds.len()];
-                        // The calls that read no column of the volume, fixed for every row
-                        let mut fixed: Vec<Option<ColdInput<'v>>> = Vec::with_capacity(aggregates.len());
-                        let mut columns: Vec<Option<usize>> = Vec::with_capacity(aggregates.len());
-                        for &(op, col_idx) in aggregates {
-                            let (input, column) = match (op, mapping.sources.get(col_idx)) {
-                                (AggregateOp::CountStar, _) => (Some(ColdInput::Star), None),
-                                (_, Some(super::writer::ColSource::Volume(phys))) => (None, Some(*phys)),
-                                (_, Some(super::writer::ColSource::Default(value))) => {
-                                    (Some(ColdInput::Default(value.clone())), None)
-                                }
-                                (_, None) => {
-                                    bail.store(true, std::sync::atomic::Ordering::Relaxed);
-                                    return Ok(false);
-                                }
-                            };
-                            fixed.push(input);
-                            columns.push(column);
+                        // A call fixed for every row, or the volume column it reads
+                        enum Call<'v> {
+                            Fixed(ColdInput<'v>),
+                            Column(usize, Held),
                         }
-                        let mut held_calls: Vec<Held> = vec![None; aggregates.len()];
-                        let mut group = None;
+                        let mut held: Vec<Held> = vec![None; preds.len()];
+                        let mut calls: Option<(usize, Vec<Call<'v>>)> = None;
                         while let Some(i) = walk.next_position().map_err(side_error)? {
                             if !table.shows_cold_row(cs, i, row_ids[i], tombstones, hot_skip, cut) {
                                 continue;
@@ -8598,28 +8584,43 @@ impl Table for SegmentedTable {
                             if !all_pass {
                                 continue;
                             }
-                            let group = match group {
-                                Some(group) => group,
-                                None => {
-                                    let Some(found) = part.group(&[] as &[Value]) else {
-                                        return Ok(false);
-                                    };
-                                    *group.insert(found)
+                            if calls.is_none() {
+                                let mut resolved = Vec::with_capacity(aggregates.len());
+                                for &(op, col_idx) in aggregates {
+                                    resolved.push(match (op, mapping.sources.get(col_idx)) {
+                                        (AggregateOp::CountStar, _) => Call::Fixed(ColdInput::Star),
+                                        (_, Some(super::writer::ColSource::Volume(phys))) => {
+                                            Call::Column(*phys, None)
+                                        }
+                                        (_, Some(super::writer::ColSource::Default(value))) => {
+                                            Call::Fixed(ColdInput::Default(value.clone()))
+                                        }
+                                        (_, None) => {
+                                            bail.store(true, std::sync::atomic::Ordering::Relaxed);
+                                            return Ok(false);
+                                        }
+                                    });
                                 }
+                                let Some(group) = part.group(&[] as &[Value]) else {
+                                    return Ok(false);
+                                };
+                                calls = Some((group, resolved));
+                            }
+                            let Some((group, calls)) = calls.as_mut() else {
+                                continue;
                             };
-                            let runs = part.aggregates(group);
-                            for (k, held) in held_calls.iter_mut().enumerate() {
+                            let runs = part.aggregates(*group);
+                            for (k, call) in calls.iter_mut().enumerate() {
                                 let run = &mut runs[k..=k];
-                                match (&fixed[k], columns[k]) {
-                                    (Some(input), _) => {
+                                match call {
+                                    Call::Fixed(input) => {
                                         accumulate_columnar(run, std::slice::from_ref(input), 0)
                                     }
-                                    (None, Some(column)) => {
-                                        let (data, local) = at(vol, held, column, i, shift)?;
+                                    Call::Column(column, held) => {
+                                        let (data, local) = at(vol, held, *column, i, shift)?;
                                         let input = ColdInput::of(aggregates[k].0, data);
                                         accumulate_columnar(run, std::slice::from_ref(&input), local);
                                     }
-                                    (None, None) => {}
                                 }
                             }
                         }

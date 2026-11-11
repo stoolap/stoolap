@@ -160,6 +160,10 @@ const CASES: &[Case] = &[
     }),
     ("t = 'k0002x'", |r| r.t.as_deref() == Some("k0002x")),
     ("t = 'nowhere'", |r| r.t.as_deref() == Some("nowhere")),
+    // A text present in the volume, but not on the rows the INTEGER key walks
+    ("i = 17 AND t = 'k0018'", |r| {
+        r.i == Some(17) && r.t.as_deref() == Some("k0018")
+    }),
     // Keys of id 2, whose key an update moved, and of id 50, deleted
     ("t = 'k0338'", |r| r.t.as_deref() == Some("k0338")),
     ("t = 'k0450'", |r| r.t.as_deref() == Some("k0450")),
