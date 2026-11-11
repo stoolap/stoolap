@@ -6785,12 +6785,11 @@ impl MVCCEngine {
                 })
                 .collect()
         };
-        // Every candidate of every table first, in table order, a volume
-        // with no side file before one whose side file is of an earlier
-        // format, each in segment order, so what is left is counted whole;
-        // the sequence starts after the table, side state and segment the
-        // last pass examined and wraps, so a volume that cannot be built
-        // in one table does not hold the rest, in any table, forever
+        // Every candidate of every table first, in table, side state, then
+        // segment order, so what is left is counted whole; the sequence
+        // starts after the candidate the last pass examined and wraps, so
+        // a volume that cannot be built in one table does not hold the
+        // rest, in any table, forever
         let mut work: Vec<(usize, u64, bool)> = Vec::new();
         let mut identities_of: Vec<(Vec<crate::storage::volume::side_index::SideIndexDef>, u64)> =
             Vec::with_capacity(tables.len());
@@ -6811,36 +6810,33 @@ impl MVCCEngine {
                     .filter_map(|seg_id| {
                         let cs = snapshot.segs.get(&seg_id)?;
                         let wanted = wanted_of(cs, &identities);
-                        // A side file of an earlier format records every
-                        // entry, and is a candidate all the same: the pass
-                        // rebuilds it in the current one
-                        let covered = cs.side.is_some();
-                        let served = covered
-                            && cs
-                                .side
-                                .as_ref()
-                                .is_some_and(|side| serves_all(side, &wanted));
-                        (!wanted.is_empty() && !served).then_some((seg_id, covered))
+                        // A file of an earlier format is rewritten even when it records every entry
+                        let has_side = cs.side.is_some();
+                        let served = cs
+                            .side
+                            .as_ref()
+                            .is_some_and(|side| serves_all(side, &wanted));
+                        (!wanted.is_empty() && !served).then_some((seg_id, has_side))
                     })
                     .collect()
             };
             // The volume the query path cannot serve at all comes first
-            candidates.sort_unstable_by_key(|&(id, covered)| (covered, id));
+            candidates.sort_unstable_by_key(|&(id, has_side)| (has_side, id));
             work.extend(
                 candidates
                     .into_iter()
-                    .map(|(id, covered)| (index, id, covered)),
+                    .map(|(id, has_side)| (index, id, has_side)),
             );
             identities_of.push((identities, definition));
         }
-        if let Some((table, covered, segment)) = self.backfill_cursor.lock().unwrap().clone() {
+        if let Some((table, had_side, segment)) = self.backfill_cursor.lock().unwrap().clone() {
             let at = work.partition_point(|&(index, id, has_side)| {
-                (tables[index].0.as_str(), has_side, id) <= (table.as_str(), covered, segment)
+                (tables[index].0.as_str(), has_side, id) <= (table.as_str(), had_side, segment)
             });
             work.rotate_left(at);
         }
         let pending = work.len();
-        for (index, seg_id, covered) in work {
+        for (index, seg_id, has_side) in work {
             if report.examined >= limit || self.closing.load(Ordering::Acquire) {
                 break;
             }
@@ -6854,7 +6850,7 @@ impl MVCCEngine {
                 break;
             }
             report.examined += 1;
-            *self.backfill_cursor.lock().unwrap() = Some((name.clone(), covered, seg_id));
+            *self.backfill_cursor.lock().unwrap() = Some((name.clone(), has_side, seg_id));
             let snapshot = mgr.cold_snapshot();
             let Some(cs) = snapshot.segs.get(&seg_id) else {
                 report.discarded += 1;

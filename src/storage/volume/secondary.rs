@@ -5060,8 +5060,7 @@ fn rewrite_in_legacy_layout(path: &Path, version: u32) {
 /// of `wanted` that `before` records, and one at least that it does not,
 /// or it is of a newer format than `before`
 pub fn advances(built: &IndexFile, before: Option<&IndexFile>, wanted: &[SideTarget]) -> bool {
-    // A file of an earlier format gives way to the current one even when
-    // it records every entry the new one does: the format is the gain
+    // A file of an earlier format gives way to the current one: the format is the gain
     let mut gained = before.is_some_and(|before| before.version() < built.version());
     for target in wanted {
         let had = before.is_some_and(|before| before.records(target));
@@ -5739,8 +5738,7 @@ mod tests {
             "the rewrite left an older format"
         );
         assert!(earlier.records(&a), "the older file records the entry");
-        // The same entry again, copied into the current format: nothing is
-        // added, and the format is the gain
+        // The same entry copied into the current format: the format is the gain
         build_with_copies(&fresh, &[(&earlier, &a)], Vec::new()).unwrap();
         let rebuilt = IndexFile::open(&fresh, 3).unwrap();
         assert_eq!(rebuilt.version(), VERSION);

@@ -286,7 +286,7 @@ fn a_side_file_that_does_not_open_is_replaced_by_a_pass() {
 }
 
 /// A side file of an older format is served as it was written, and a pass
-/// rebuilds it in the current one — after the volumes with no side file at
+/// rebuilds it in the current one, after the volumes with no side file at
 /// all, although those are the later volumes.
 #[cfg(feature = "test-failpoints")]
 #[test]
