@@ -1295,6 +1295,21 @@ impl Executor {
                                 check.text
                             )));
                         }
+                        // A column another table's foreign key references stays
+                        let referencing = super::foreign_key::find_referencing_fks(
+                            &self.engine,
+                            &schema.table_name_lower,
+                        );
+                        let lower = &schema.columns[idx].name_lower;
+                        if let Some((child, fk)) = referencing
+                            .iter()
+                            .find(|(_, fk)| fk.referenced_column == *lower)
+                        {
+                            return Err(Error::invalid_argument(format!(
+                                "cannot drop column {own}: the foreign key on {child}({}) references it",
+                                fk.column_name
+                            )));
+                        }
                     }
                     let mut change = self.engine.begin_column_change(table_name)?;
                     change.mark_changed();

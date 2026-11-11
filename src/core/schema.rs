@@ -763,7 +763,8 @@ impl Schema {
                 *key -= 1;
             }
         }
-        // A foreign key names its column by position too
+        // A foreign key names its column by position too, and goes with it
+        self.foreign_keys.retain(|fk| fk.column_index != idx);
         for fk in &mut self.foreign_keys {
             if fk.column_index > idx {
                 fk.column_index -= 1;

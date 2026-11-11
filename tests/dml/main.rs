@@ -40,6 +40,7 @@ mod foreign_key_cascade_race_test;
 mod foreign_key_concurrency_test;
 mod foreign_key_cross_type_test;
 mod foreign_key_delete_key_column_test;
+mod foreign_key_drop_column_test;
 mod foreign_key_rename_parent_test;
 mod foreign_key_self_reference_test;
 mod foreign_key_test;
