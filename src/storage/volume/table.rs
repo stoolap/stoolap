@@ -48,7 +48,7 @@ use crate::storage::mvcc::version_store::{
 };
 use crate::storage::traits::table::ScanAccess;
 use crate::storage::traits::{
-    CapturedGroups, ColdChange, Index, PlannedUpdate, QueryResult, Scanner, Table,
+    CapturedGroups, ColdChange, Index, PlannedUpdate, QueryResult, RowJudge, Scanner, Table,
 };
 
 use super::column::ZoneMap;
@@ -4760,17 +4760,39 @@ impl Table for SegmentedTable {
         })
     }
 
-    fn delete_scanned_rows(&mut self, row_ids: &mut Vec<i64>) -> Result<i32> {
+    fn delete_judged(
+        &mut self,
+        row_ids: &mut Vec<i64>,
+        found: &CommitCut,
+        judge: &mut RowJudge<'_>,
+    ) -> Result<i32> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         let mgr = Arc::clone(&self.segment_mgr);
         // A sealed row the snapshot still holds is there to delete; a row
         // it does not is the hot store's, deleted if still visible
-        let prepared = self.prepare_cold_deletes(&mgr, Some(row_ids), None, true)?;
+        let mut prepared = self.prepare_cold_deletes(&mgr, Some(row_ids), None, true)?;
         let Some(mut hot_ids) = prepared.hot_ids else {
             return self.apply_cold_deletes(prepared.deletes, prepared.seen, |hot, _| {
-                hot.delete_scanned_rows(row_ids)
+                hot.delete_judged(row_ids, found, judge)
             });
         };
+        // A sealed row is judged as the snapshot holds it, before anything is written
+        let mut gone = I64Set::new();
+        let mut failed = None;
+        prepared.deletes.retain(|d| {
+            let passes = failed.is_none()
+                && judge(d.row_id, &d.old_row).unwrap_or_else(|error| {
+                    failed = Some(error);
+                    false
+                });
+            if !passes {
+                gone.insert(d.row_id);
+            }
+            passes
+        });
+        if let Some(error) = failed {
+            return Err(error);
+        }
         let mut offered = None;
         let count = self.apply_cold_deletes(prepared.deletes, prepared.seen, |hot, changed| {
             hot_ids.extend_from_slice(changed);
@@ -4778,15 +4800,13 @@ impl Table for SegmentedTable {
                 return Ok(0);
             }
             offered = Some(hot_ids.clone());
-            hot.delete_scanned_rows(&mut hot_ids)
+            hot.delete_judged(&mut hot_ids, found, judge)
         })?;
         if let Some(offered) = offered.filter(|offered| hot_ids.len() != offered.len()) {
             let kept: I64Set = hot_ids.iter().copied().collect();
-            let gone: I64Set = offered
-                .iter()
-                .copied()
-                .filter(|id| !kept.contains(*id))
-                .collect();
+            gone.extend(offered.iter().copied().filter(|id| !kept.contains(*id)));
+        }
+        if !gone.is_empty() {
             row_ids.retain(|id| !gone.contains(*id));
         }
         Ok(count)
@@ -9357,6 +9377,14 @@ mod tests {
             Ok(0)
         }
         fn delete_by_row_ids(&mut self, _: &[i64]) -> Result<i32> {
+            Ok(0)
+        }
+        fn delete_judged(
+            &mut self,
+            _: &mut Vec<i64>,
+            _: &CommitCut,
+            _: &mut RowJudge<'_>,
+        ) -> Result<i32> {
             Ok(0)
         }
         fn get_active_row_ids(&self) -> Result<Vec<i64>> {

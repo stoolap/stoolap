@@ -25,6 +25,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use stoolap::core::Error;
+use stoolap::storage::mvcc::registry::CommitCut;
 use stoolap::storage::traits::{Engine, ScanAccess};
 use stoolap::test_failpoints::{
     after_cold_round_prepared, after_delete_rows_scanned, block_file_reads,
@@ -213,7 +214,11 @@ fn a_delete_of_scanned_rows_reads_no_file_under_the_fence() {
     let (deleted, reads) = reads_of(|db| {
         let mut txn = db.engine().begin_transaction().unwrap();
         let mut table = txn.get_table("t").unwrap();
-        let deleted = table.delete_scanned_rows(&mut vec![1, 3]).unwrap();
+        let deleted = table
+            .delete_judged(&mut vec![1, 3], &CommitCut::through(0), &mut |_, _| {
+                Ok(true)
+            })
+            .unwrap();
         drop(table);
         txn.commit().unwrap();
         i64::from(deleted)
@@ -452,10 +457,44 @@ fn a_scanned_id_named_twice_is_deleted_once() {
     let mut txn = db.engine().begin_transaction().unwrap();
     let mut table = txn.get_table("t").unwrap();
     let mut ids = vec![1, 3, 1];
-    let deleted = table.delete_scanned_rows(&mut ids).unwrap();
+    let deleted = table
+        .delete_judged(&mut ids, &CommitCut::through(0), &mut |_, _| Ok(true))
+        .unwrap();
     drop(table);
     txn.commit().unwrap();
     assert_eq!(deleted, 2);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM t"), 1);
+}
+
+#[test]
+fn a_sealed_row_its_judge_refuses_is_not_deleted() {
+    let _guard = FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    seal_rows(&db, &[(1, 10), (2, 20), (3, 30)]);
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let mut table = txn.get_table("t").unwrap();
+    let mut ids = vec![1, 2, 3];
+    let mut judged = Vec::new();
+    let deleted = table
+        .delete_judged(&mut ids, &CommitCut::through(0), &mut |id, row| {
+            judged.push((id, row.get(2).cloned()));
+            Ok(id != 2)
+        })
+        .unwrap();
+    drop(table);
+    txn.commit().unwrap();
+    assert_eq!(deleted, 2);
+    assert_eq!(ids, [1, 3]);
+    judged.sort_by_key(|(id, _)| *id);
+    assert_eq!(
+        judged,
+        [
+            (1, Some(stoolap::core::Value::Integer(10))),
+            (2, Some(stoolap::core::Value::Integer(20))),
+            (3, Some(stoolap::core::Value::Integer(30)))
+        ]
+    );
     assert_eq!(count(&db, "SELECT COUNT(*) FROM t"), 1);
 }
 

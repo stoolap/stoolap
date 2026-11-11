@@ -41,7 +41,9 @@ use crate::storage::mvcc::version_store::Reader;
 use crate::storage::mvcc::version_store::TxnStoreWrite;
 use crate::storage::mvcc::RowVersion;
 use crate::storage::mvcc::{TransactionVersionStore, TxnTableStore, VersionStore};
-use crate::storage::traits::{Index, PlannedUpdate, QueryResult, ScanAccess, Scanner, Table};
+use crate::storage::traits::{
+    Index, PlannedUpdate, QueryResult, RowJudge, ScanAccess, Scanner, Table,
+};
 use crate::storage::volume::side_index::{resolve_all, Domain, Resolved};
 use crate::storage::MemoryResult;
 
@@ -574,12 +576,17 @@ impl MVCCTable {
         normalize_row_to_schema(row, schema)
     }
 
-    /// Deletes `row_ids`. With `scanned` None an id no version of this
+    /// Deletes `row_ids`. With `judged` None an id no version of this
     /// transaction or of the store holds is a sealed row, deleted by a
-    /// marker so the log records it; with `scanned` given such an id is a
-    /// row gone since the scan that found it, left alone, and the ids
-    /// deleted are added to `scanned`.
-    fn delete_rows_by_id(&mut self, row_ids: &[i64], scanned: Option<&mut I64Set>) -> Result<i32> {
+    /// marker so the log records it; with `judged` given such an id is a
+    /// row gone since the ids were found, left alone, a version committed
+    /// since the cut is deleted only when the judge passes it, and the ids
+    /// deleted are added to the set.
+    fn delete_rows_by_id(
+        &mut self,
+        row_ids: &[i64],
+        judged: Option<(&mut I64Set, &CommitCut, &mut RowJudge<'_>)>,
+    ) -> Result<i32> {
         let schema = &self.cached_schema;
         // Step 1: Check local versions first
         // Use get_local_version to distinguish "no local version" from "locally deleted"
@@ -626,12 +633,23 @@ impl MVCCTable {
         // Cold-only row_ids: not in local versions and not in the hot version store.
         // Create phantom delete markers so the WAL records the deletion, enabling
         // tombstone recovery on restart.
-        let cold_only_ids: Vec<i64> = match scanned {
-            Some(scanned) => {
-                for (row_id, _) in &local_deletes {
-                    scanned.insert(*row_id);
+        let cold_only_ids: Vec<i64> = match judged {
+            Some((deleted, found, judge)) => {
+                let mut failed = None;
+                // The version found unless committed since: only that one is asked
+                rows_with_originals.retain(|(row_id, row, version)| {
+                    found.sees(version.create_time)
+                        || failed.is_none()
+                            && judge(*row_id, row).unwrap_or_else(|error| {
+                                failed = Some(error);
+                                false
+                            })
+                });
+                if let Some(error) = failed {
+                    return Err(error);
                 }
-                scanned.extend(found_ids.iter().copied());
+                deleted.extend(local_deletes.iter().map(|(row_id, _)| *row_id));
+                deleted.extend(rows_with_originals.iter().map(|(row_id, ..)| *row_id));
                 Vec::new()
             }
             None => remaining_row_ids
@@ -3164,10 +3182,15 @@ impl Table for MVCCTable {
         self.delete_rows_by_id(row_ids, None)
     }
 
-    fn delete_scanned_rows(&mut self, row_ids: &mut Vec<i64>) -> Result<i32> {
+    fn delete_judged(
+        &mut self,
+        row_ids: &mut Vec<i64>,
+        found: &CommitCut,
+        judge: &mut RowJudge<'_>,
+    ) -> Result<i32> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         let mut deleted = I64Set::new();
-        let count = self.delete_rows_by_id(row_ids, Some(&mut deleted))?;
+        let count = self.delete_rows_by_id(row_ids, Some((&mut deleted, found, judge)))?;
         if deleted.len() != row_ids.len() {
             row_ids.retain(|id| deleted.contains(*id));
         }
