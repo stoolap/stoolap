@@ -9254,6 +9254,12 @@ mod tests {
         fn schema(&self) -> &Schema {
             &self.schema
         }
+        fn for_each_unique_non_pk_index(
+            &self,
+            _: &mut dyn FnMut(&dyn Index) -> Result<()>,
+        ) -> Result<()> {
+            Ok(())
+        }
         fn txn_id(&self) -> i64 {
             1
         }

@@ -1124,13 +1124,11 @@ pub trait Table: Send + Sync {
     /// Iterate unique non-PK indexes by reference, avoiding per-call String allocations.
     ///
     /// The callback receives each index, whose `column_ids` are its columns'
-    /// schema positions. The default has no indexes.
+    /// schema positions.
     fn for_each_unique_non_pk_index(
         &self,
-        _f: &mut dyn FnMut(&dyn Index) -> Result<()>,
-    ) -> Result<()> {
-        Ok(())
-    }
+        f: &mut dyn FnMut(&dyn Index) -> Result<()>,
+    ) -> Result<()>;
 
     /// Check if the table has any unique indexes that are NOT the PK column.
     /// Used as a fast bail-out to avoid allocating get_unique_indexes().
