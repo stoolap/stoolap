@@ -277,6 +277,8 @@ pub enum TableUse {
     KeyCheck,
     /// It changes or drops the table's definition, and may write the table
     Ddl,
+    /// It reads the table's definition and none of its rows
+    Metadata,
 }
 
 /// The query executor's table for its own statements on the thread that

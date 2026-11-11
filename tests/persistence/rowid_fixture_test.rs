@@ -76,6 +76,11 @@ fn a_table_with_a_column_named_after_the_row_identity_serves_ddl_alone() {
         let db = Database::open(&dsn).unwrap();
         assert_eq!(pairs(&db, "SELECT id, v FROM u"), [(1, 100)]);
         db.execute("INSERT INTO u VALUES (2, 200)", ()).unwrap();
+        assert!(db.table_exists("t").unwrap(), "t does not exist");
+        for sql in ["SHOW CREATE TABLE t", "SHOW INDEXES FROM t", "DESCRIBE t"] {
+            let rows = db.query(sql, ()).unwrap_or_else(|e| panic!("{sql}: {e}"));
+            assert!(rows.count() > 0, "{sql} showed nothing");
+        }
         for sql in [
             "SELECT a FROM t",
             "SELECT COUNT(*) FROM t",
@@ -243,4 +248,27 @@ fn a_restore_stopped_after_a_table_of_the_reserved_name_leaves_it_serving_ddl_al
         refused(&db, &format!("SELECT a FROM {table}"));
         refused(&db, &format!("INSERT INTO {table} VALUES (3, 30)"));
     }
+}
+
+#[test]
+fn an_index_of_a_table_with_a_column_named_after_the_row_identity_drops() {
+    let (_dir, dsn) = copied("column_named_rowid_beside");
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute("DROP INDEX uk ON t", ()).unwrap();
+        db.close().unwrap();
+    }
+    let db = Database::open(&dsn).unwrap();
+    for sql in [
+        "DROP VIEW v",
+        "ALTER TABLE t RENAME COLUMN _rowid_ TO b",
+        "INSERT INTO t VALUES (1, 30)",
+    ] {
+        db.execute(sql, ()).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    assert_eq!(count_of(&db, "SELECT COUNT(*) FROM t WHERE a = 1"), 2);
+}
+
+fn count_of(db: &Database, sql: &str) -> i64 {
+    db.query_one(sql, ()).unwrap()
 }

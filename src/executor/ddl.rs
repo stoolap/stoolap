@@ -1093,14 +1093,16 @@ impl Executor {
             return Err(Error::IndexNotFound(index_name.to_string()));
         };
 
+        // The table is opened before the drop is recorded: a refusal records nothing
+        let tx = self.begin_transaction()?;
+        let table = tx.get_ddl_table(&table_name)?;
+
         // Record index drop to WAL BEFORE applying in-memory change.
         // This prevents ghost state where the index is removed from memory
         // but still exists in WAL (would reappear after crash recovery).
         self.engine.record_drop_index(&table_name, &index_name)?;
 
         // Now apply the in-memory change
-        let tx = self.begin_transaction()?;
-        let table = tx.get_statement_table(&table_name)?;
         table.drop_index(&index_name)?;
         self.engine.discard_uncovered_side_files(&table_name);
         self.engine.index_changed(&table_name);

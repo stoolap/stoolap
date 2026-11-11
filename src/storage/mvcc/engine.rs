@@ -10013,7 +10013,7 @@ impl TransactionEngineOperations for EngineOperations {
             .cloned()
             .ok_or_else(|| Error::TableNotFound(table_name_lower.to_string()))?;
         drop(stores);
-        if table_use != TableUse::Ddl {
+        if !matches!(table_use, TableUse::Ddl | TableUse::Metadata) {
             self.ddl.check_reserved(&version_store)?;
         }
 
@@ -10037,7 +10037,7 @@ impl TransactionEngineOperations for EngineOperations {
             // is taken only where the statement cannot write
             let reads_only = || match table_use {
                 TableUse::Write | TableUse::Ddl => false,
-                TableUse::Read | TableUse::KeyCheck => true,
+                TableUse::Read | TableUse::KeyCheck | TableUse::Metadata => true,
                 TableUse::ReadBesideWrites => version_store.schema().foreign_keys.is_empty(),
             };
             if let Some(cached) = found {
