@@ -34,6 +34,8 @@ fn fill(db: &Database) {
         "INSERT INTO p2 VALUES (2)",
         "CREATE TABLE p3 (k INTEGER)",
         "INSERT INTO p3 VALUES (3)",
+        "CREATE TABLE p4 (k INTEGER)",
+        "INSERT INTO p4 VALUES (4)",
     ] {
         db.execute(sql, ()).unwrap();
     }
@@ -176,6 +178,16 @@ fn a_merged_column_reads_the_side_its_join_kind_keeps() {
             "SELECT *, ROW_NUMBER() OVER () FROM p1 RIGHT JOIN p2 USING (k) \
              RIGHT JOIN p3 USING (k) WHERE k > $1",
             ints(&[&[s(3), s(1)]]),
+        ),
+        (
+            "SELECT p3.*, k, ROW_NUMBER() OVER () FROM p1 RIGHT JOIN p2 USING (k) \
+             RIGHT JOIN p3 USING (k) RIGHT JOIN p4 USING (k) WHERE k > $1",
+            ints(&[&[N, s(4), s(1)]]),
+        ),
+        (
+            "SELECT SUM(k) FROM p1 RIGHT JOIN p2 USING (k) RIGHT JOIN p3 USING (k) \
+             RIGHT JOIN p4 USING (k) WHERE k > $1",
+            ints(&[&[s(4)]]),
         ),
         (
             "SELECT k, a, b FROM w RIGHT JOIN (SELECT * FROM t RIGHT JOIN u USING (k)) x \

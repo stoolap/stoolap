@@ -674,12 +674,13 @@ fn side_pairs(
         if star {
             excluded.push(right);
         }
-        // A merge over another reads the column at the end of their chain
+        // A merge over another reads the column at the end of their chain,
+        // named once there, the outer join's merge included
         let read = held.side_merged_at(left);
         let name = bare_name(&columns[left]);
         let named = renames
             .iter()
-            .any(|(place, at, _)| *place == left || *at == read)
+            .any(|(place, at, _)| held.side_merged_at(*place) == read || *at == read)
             || in_place.iter().any(|(at, _)| *at == read);
         if named || !(star || names_bare(stmt, name)) {
             continue;

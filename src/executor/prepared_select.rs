@@ -1764,6 +1764,9 @@ pub(crate) fn merged_condition(
     join: &JoinTableSource,
     sides: &JoinSides,
 ) -> Result<Option<Expression>> {
+    if join.using_columns.is_empty() && !join.join_type.to_uppercase().contains("NATURAL") {
+        return Ok(None);
+    }
     let Some([left, right]) = side_scopes(join, sides)? else {
         return Ok(None);
     };
