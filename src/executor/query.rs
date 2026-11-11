@@ -123,6 +123,22 @@ impl OutputLayout {
         }
     }
 
+    /// The input column the sort reads a plain key, `qualifier` and `name`,
+    /// from when no output column `sources` lay out over `input_columns`
+    /// carries it, as [`Self::position_over`] finds one; None when one does
+    fn uncarried_input(
+        sources: &[ColumnSource],
+        input_columns: &[String],
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Option<usize> {
+        let key = OrderKey::Input(qualifier, name);
+        match Self::position_over(sources, input_columns, &key) {
+            Some(_) => None,
+            None => input_column_index(input_columns, qualifier, name),
+        }
+    }
+
     /// Each name `stmt`'s sort keys read, into `slots` at the column this
     /// layout gives it; an error for a qualified name no input column
     /// answers, which no output name stands in for
@@ -2859,7 +2875,6 @@ impl Executor {
     }
 
     /// Check if ORDER BY or DISTINCT ON references columns not in SELECT
-    /// OPTIMIZATION: Use HashSet for O(1) lookup and eq_ignore_ascii_case to avoid allocations
     fn order_by_needs_extra_columns(&self, stmt: &SelectStatement, all_columns: &[String]) -> bool {
         if stmt.order_by.is_empty() && stmt.distinct_on.is_empty() {
             return false;
@@ -2897,31 +2912,6 @@ impl Executor {
             return false;
         }
 
-        // Get SELECT column names (lowercase) using HashSet for O(1) lookup
-        // Include both unqualified and fully qualified names for disambiguation
-        let mut select_columns: FxHashSet<String> = stmt
-            .columns
-            .iter()
-            .filter_map(|expr| self.extract_select_column_name(expr))
-            .map(|s| s.to_lowercase())
-            .collect();
-        // Also add qualified names for join column disambiguation
-        for expr in &stmt.columns {
-            match expr {
-                Expression::QualifiedIdentifier(qi) => {
-                    select_columns
-                        .insert(qualified(&qi.qualifier.value_lower, &qi.name.value_lower));
-                }
-                Expression::Aliased(a) => {
-                    if let Expression::QualifiedIdentifier(qi) = &*a.expression {
-                        select_columns
-                            .insert(qualified(&qi.qualifier.value_lower, &qi.name.value_lower));
-                    }
-                }
-                _ => {}
-            }
-        }
-
         // A correlated subquery in a sort key reads the parent row, all of
         // it, so every column is carried until the sort has run
         if sort_keys(stmt).any(Self::has_correlated_subqueries) {
@@ -2929,25 +2919,20 @@ impl Executor {
         }
 
         // Check if any ORDER BY or DISTINCT ON key is not in SELECT
+        let mut sources = None;
         for key in sort_keys(stmt) {
             match key {
-                Expression::Identifier(id)
-                    if !select_columns.contains(id.value_lower.as_str())
-                        && all_columns
-                            .iter()
-                            .any(|c| c.eq_ignore_ascii_case(id.value_lower.as_str())) =>
-                {
-                    return true;
-                }
-                Expression::QualifiedIdentifier(qi)
-                    if reads_input(stmt.table_expr.as_deref(), qi) =>
-                {
-                    let full_name = qualified(&qi.qualifier.value_lower, &qi.name.value_lower);
-                    if !select_columns.contains(full_name.as_str())
-                        && all_columns.iter().any(|c| {
-                            c.eq_ignore_ascii_case(&full_name)
-                                || c.eq_ignore_ascii_case(qi.name.value_lower.as_str())
-                        })
+                // A name is carried when the sort finds the input column it
+                // binds to in an output column, by the rule the sort reads it
+                Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => {
+                    let OrderKey::Input(qualifier, name) = bind_order_key(key, stmt) else {
+                        continue;
+                    };
+                    let sources = sources.get_or_insert_with(|| {
+                        Self::select_sources(&stmt.columns, all_columns, None)
+                    });
+                    if OutputLayout::uncarried_input(sources, all_columns, qualifier, name)
+                        .is_some()
                     {
                         return true;
                     }
@@ -2956,12 +2941,7 @@ impl Executor {
                 // An expression is read from a column of its own, unless a
                 // SELECT item computes it. A subquery reads
                 // the parent row per row, which the sort does for itself
-                other
-                    if !matches!(
-                        other,
-                        Expression::Identifier(_) | Expression::QualifiedIdentifier(_)
-                    ) && !Self::has_subqueries(other) =>
-                {
+                other if !Self::has_subqueries(other) => {
                     let key = ExprKey::of(other);
                     if !stmt
                         .columns
@@ -2989,18 +2969,6 @@ impl Executor {
         }
 
         false
-    }
-
-    /// Extract column name from expression for ORDER BY handling
-    #[allow(clippy::only_used_in_recursion)]
-    fn extract_select_column_name(&self, expr: &Expression) -> Option<String> {
-        match expr {
-            Expression::Identifier(id) => Some(id.value.to_string()),
-            Expression::QualifiedIdentifier(qid) => Some(qid.name.value.to_string()),
-            Expression::Aliased(aliased) => self.extract_select_column_name(&aliased.expression),
-            Expression::Star(_) | Expression::QualifiedStar(_) => None, // SELECT * or t.* includes all columns
-            _ => None,
-        }
     }
 
     /// The distinct values of `column`, lowercase, the table keeps in its
@@ -8107,31 +8075,14 @@ impl Executor {
         // The names below are read for the keys only
         let keyed = !order_by.is_empty() || !distinct_on.is_empty();
 
-        // Get SELECT column names (lowercase) for checking duplicates
-        let select_column_names: Vec<String> = select_exprs
-            .iter()
-            .filter(|_| keyed)
-            .flat_map(|expr| {
-                let mut names = Vec::new();
-                // Add unqualified name
-                if let Some(name) = self.extract_select_column_name(expr) {
-                    names.push(name.to_lowercase());
-                }
-                // Also add fully qualified name for disambiguation
-                match expr {
-                    Expression::QualifiedIdentifier(qi) => {
-                        names.push(qualified(&qi.qualifier.value_lower, &qi.name.value_lower));
-                    }
-                    Expression::Aliased(a) => {
-                        if let Expression::QualifiedIdentifier(qi) = &*a.expression {
-                            names.push(qualified(&qi.qualifier.value_lower, &qi.name.value_lower));
-                        }
-                    }
-                    _ => {}
-                }
-                names
-            })
-            .collect();
+        // Where each SELECT item reads from, which carries a key it reads
+        let sources = match keyed {
+            true => Self::select_sources(select_exprs, all_columns, None),
+            false => LayoutSources::new(),
+        };
+        let uncarried = |qualifier: Option<&str>, name: &str| {
+            OutputLayout::uncarried_input(&sources, all_columns, qualifier, name)
+        };
 
         // The names the projection alone brings into scope
         let select_aliases: FxHashSet<String> = select_exprs
@@ -8155,30 +8106,19 @@ impl Executor {
             .chain(distinct_on.iter().map(|expr| (expr, true)));
         for (expr, distinct) in keys {
             match expr {
-                Expression::Identifier(id)
-                    if !select_column_names
-                        .iter()
-                        .any(|s| s == id.value_lower.as_str()) =>
-                {
-                    if let Some(&idx) = col_index_map_lower.get(id.value_lower.as_str()) {
+                Expression::Identifier(id) => {
+                    if let Some(idx) = uncarried(None, &id.value_lower) {
                         if !extra_order_indices.contains(&idx) {
                             extra_order_indices.push(idx);
                         }
                     }
                 }
                 Expression::QualifiedIdentifier(qi) if reads_input(from, qi) => {
-                    let full_name = qualified(&qi.qualifier.value_lower, &qi.name.value_lower);
-                    // Only match against full qualified name in SELECT to avoid ambiguity
-                    if !select_column_names.contains(&full_name) {
-                        let idx_opt = qualified_index(
-                            &col_index_map_lower,
-                            &qi.qualifier.value_lower,
-                            &qi.name.value_lower,
-                        );
-                        if let Some(idx) = idx_opt {
-                            if !extra_order_indices.contains(&idx) {
-                                extra_order_indices.push(idx);
-                            }
+                    if let Some(idx) =
+                        uncarried(Some(&qi.qualifier.value_lower), &qi.name.value_lower)
+                    {
+                        if !extra_order_indices.contains(&idx) {
+                            extra_order_indices.push(idx);
                         }
                     }
                 }
