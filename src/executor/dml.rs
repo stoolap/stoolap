@@ -129,12 +129,10 @@ fn conflict_matches_target(conflict_target: &[Identifier], schema: &Schema, erro
             target_set == pk_cols
         }
         Error::UniqueConstraint { column, .. } => {
-            // `column` is comma-separated (e.g. "a" or "a, b")
-            let violated_cols: rustc_hash::FxHashSet<&str> =
-                column.split(", ").map(|s| s.trim()).collect();
-            // Compare lowercase: conflict_target is already lowered by Identifier::new;
-            // UniqueConstraint.column comes from index column_names which are lowercase
-            target_set == violated_cols
+            // `column` is comma-separated (e.g. "a" or "a, b"), each as the index spells it
+            let mut violated = column.split(", ").map(str::trim);
+            column.split(", ").count() == target_set.len()
+                && violated.all(|v| target_set.iter().any(|t| eq_names(v, t)))
         }
         _ => false,
     }

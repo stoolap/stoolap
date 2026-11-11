@@ -535,7 +535,7 @@ struct ColdPrepare {
     shadowed: FxHashSet<i64>,
     /// The volumes walked whole at a settled generation
     seen_segments: FxHashSet<u64>,
-    unique_indexes: Option<Vec<(String, Vec<String>)>>,
+    unique_indexes: Option<Vec<ColdUnique>>,
     changes: Vec<ColdChange>,
     /// The ids named by the statement that no cold volume holds
     hot_ids: Vec<i64>,
@@ -571,6 +571,19 @@ struct ColdDelete {
 
 /// The sealed rows of one DELETE: one row, the `pk = k` case, stays inline
 type ColdDeleteRows = smallvec::SmallVec<[ColdDelete; 1]>;
+
+/// A UNIQUE index cold rows are checked against: its name, its columns as
+/// it spells them, and their positions, resolved once per statement
+type ColdUnique = (String, Vec<String>, smallvec::SmallVec<[usize; 4]>);
+
+/// The positions of the columns `names` spells, None when one is missing
+fn unique_positions(schema: &Schema, names: &[String]) -> Option<smallvec::SmallVec<[usize; 4]>> {
+    let at: smallvec::SmallVec<[usize; 4]> = names
+        .iter()
+        .filter_map(|name| schema.columns.iter().position(|c| eq_names(&c.name, name)))
+        .collect();
+    (at.len() == names.len()).then_some(at)
+}
 
 /// What a DELETE has prepared so far, across the rounds a landing seal
 /// makes it take
@@ -2239,20 +2252,13 @@ impl SegmentedTable {
         exclude_row_id: i64,
         snap: Option<&super::manifest::StatementSnapshot>,
         shadowed: &FxHashSet<i64>,
-        unique_indexes: &mut Option<Vec<(String, Vec<String>)>>,
+        unique_indexes: &mut Option<Vec<ColdUnique>>,
     ) -> Result<()> {
         if unique_indexes.is_none() {
             *unique_indexes = Some(self.cold_unique_indexes()?);
         }
         let schema = self.hot.schema();
-        for (idx_name, col_names) in unique_indexes.iter().flatten() {
-            let col_indices: smallvec::SmallVec<[usize; 4]> = col_names
-                .iter()
-                .filter_map(|name| schema.columns.iter().position(|c| eq_names(&c.name, name)))
-                .collect();
-            if col_indices.len() != col_names.len() {
-                continue;
-            }
+        for (idx_name, col_names, col_indices) in unique_indexes.iter().flatten() {
             let coerced: smallvec::SmallVec<[Value; 4]> = col_indices
                 .iter()
                 .filter_map(|&idx| {
@@ -2268,9 +2274,9 @@ impl SegmentedTable {
 
             let found = match snap {
                 Some(snap) => {
-                    self.find_segment_row_id_by_values_in_stmt(snap, &col_indices, &values)?
+                    self.find_segment_row_id_by_values_in_stmt(snap, col_indices, &values)?
                 }
-                None => self.find_segment_row_id_by_values(&col_indices, &values)?,
+                None => self.find_segment_row_id_by_values(col_indices, &values)?,
             };
             if let Some(found_id) = found {
                 if found_id != exclude_row_id && !shadowed.contains(&found_id) {
@@ -2287,11 +2293,14 @@ impl SegmentedTable {
         Ok(())
     }
 
-    fn cold_unique_indexes(&self) -> Result<Vec<(String, Vec<String>)>> {
+    fn cold_unique_indexes(&self) -> Result<Vec<ColdUnique>> {
+        let schema = self.hot.schema();
         let mut indexes = Vec::new();
         self.hot
             .for_each_unique_non_pk_index(&mut |name, columns| {
-                indexes.push((name.to_owned(), columns.to_vec()));
+                if let Some(at) = unique_positions(schema, columns) {
+                    indexes.push((name.to_owned(), columns.to_vec(), at));
+                }
                 Ok(())
             })?;
         Ok(indexes)
@@ -2302,7 +2311,7 @@ impl SegmentedTable {
         snapshot: &super::manifest::ColdSnapshot,
         loads: &super::manifest::ColdLoads,
         row: &Row,
-        unique_indexes: Option<&[(String, Vec<String>)]>,
+        unique_indexes: Option<&[ColdUnique]>,
     ) -> Result<()> {
         let schema = self.hot.schema();
 
@@ -2329,14 +2338,7 @@ impl SegmentedTable {
         if unique_indexes.map_or_else(|| !self.hot.has_unique_non_pk_indexes(), |v| v.is_empty()) {
             return Ok(());
         }
-        let mut check_unique = |idx_name: &str, col_names: &[String]| {
-            let col_indices: smallvec::SmallVec<[usize; 4]> = col_names
-                .iter()
-                .filter_map(|name| schema.columns.iter().position(|c| eq_names(&c.name, name)))
-                .collect();
-            if col_indices.len() != col_names.len() {
-                return Ok(());
-            }
+        let check_unique = |idx_name: &str, col_names: &[String], col_indices: &[usize]| {
             // Coerce values to schema column types before comparing with cold segments.
             // Prepared statements may pass TEXT for TIMESTAMP columns — the row is
             // coerced later in prepare_insert, but we need the correct types NOW for
@@ -2357,7 +2359,7 @@ impl SegmentedTable {
             if let Some(conflict_row_id) = self.find_segment_row_id_by_values_with_snapshot(
                 snapshot,
                 Some(loads),
-                &col_indices,
+                col_indices,
                 &values,
             )? {
                 drop(values);
@@ -2371,12 +2373,18 @@ impl SegmentedTable {
             Ok(())
         };
         if let Some(indexes) = unique_indexes {
-            for (name, columns) in indexes {
-                check_unique(name, columns)?;
+            for (name, columns, at) in indexes {
+                check_unique(name, columns, at)?;
             }
             Ok(())
         } else {
-            self.hot.for_each_unique_non_pk_index(&mut check_unique)
+            self.hot
+                .for_each_unique_non_pk_index(&mut |name, columns| match unique_positions(
+                    schema, columns,
+                ) {
+                    Some(at) => check_unique(name, columns, &at),
+                    None => Ok(()),
+                })
         }
     }
 

@@ -311,11 +311,7 @@ fn input_column_index(columns: &[String], qualifier: Option<&str>, name: &str) -
 /// `name` as `eq_folded` takes it: borrowed when ASCII, which it compares
 /// ignoring case, or when lowercasing changes none of its characters
 fn folded(name: &str) -> std::borrow::Cow<'_, str> {
-    let changes = |c: char| {
-        let mut lower = c.to_lowercase();
-        lower.next() != Some(c) || lower.next().is_some()
-    };
-    if !name.is_ascii() && name.chars().any(changes) {
+    if !name.is_ascii() && name.chars().any(crate::common::names::changes_lowercased) {
         std::borrow::Cow::Owned(name.to_lowercase())
     } else {
         std::borrow::Cow::Borrowed(name)

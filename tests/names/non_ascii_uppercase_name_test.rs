@@ -201,6 +201,52 @@ fn sealed_rows_keep_a_unique_column_with_uppercase_letters_unique() {
 }
 
 #[test]
+fn a_commit_rechecks_a_unique_column_with_uppercase_letters_against_sealed_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}?checkpoint_interval=3600", dir.path().display());
+    let db = Database::open(&dsn).unwrap();
+    run(
+        &db,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, \"Ab\" INTEGER UNIQUE)",
+    );
+    run(&db, "INSERT INTO t VALUES (1, 10)");
+    run(&db, "PRAGMA CHECKPOINT");
+    let mut txn = db.begin().unwrap();
+    txn.execute("INSERT INTO t VALUES (2, 7)", ()).unwrap();
+    run(&db, "INSERT INTO t VALUES (3, 7)");
+    run(&db, "PRAGMA CHECKPOINT");
+    let committed = txn.commit();
+    assert!(
+        matches!(
+            committed,
+            Err(stoolap::core::Error::UniqueConstraint { row_id: 3, .. })
+        ),
+        "{committed:?}"
+    );
+}
+
+#[test]
+fn on_conflict_names_a_unique_column_with_uppercase_letters() {
+    let db = Database::open("memory://on_conflict_name_case").unwrap();
+    run(
+        &db,
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, \"Ab\" INTEGER UNIQUE, \"Äc\" INTEGER UNIQUE)",
+    );
+    run(&db, "INSERT INTO u VALUES (1, 1, 1)");
+    for (target, row) in [
+        ("\"Ab\"", "2, 1, 2"),
+        ("ab", "3, 1, 3"),
+        ("\"äC\"", "4, 4, 1"),
+    ] {
+        run(
+            &db,
+            &format!("INSERT INTO u VALUES ({row}) ON CONFLICT ({target}) DO NOTHING"),
+        );
+    }
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM u"), 1);
+}
+
+#[test]
 fn a_savepoint_name_ignores_case() {
     let db = Database::open("memory://savepoint_name_case").unwrap();
     run(&db, "CREATE TABLE t (id INTEGER PRIMARY KEY)");

@@ -5753,7 +5753,7 @@ impl VersionStore {
             }
             let col_indices: Vec<usize> = names
                 .iter()
-                .filter_map(|name| schema.columns.iter().position(|c| c.name_lower == *name))
+                .filter_map(|name| schema.columns.iter().position(|c| eq_names(&c.name, name)))
                 .collect();
             if col_indices.len() == names.len() {
                 result.push((col_indices, names.to_vec()));
