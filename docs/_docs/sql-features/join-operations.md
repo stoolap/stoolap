@@ -86,7 +86,15 @@ SELECT * FROM employees NATURAL LEFT JOIN departments;
 
 -- NATURAL RIGHT JOIN (preserves all rows from right table)
 SELECT * FROM employees NATURAL RIGHT JOIN departments;
+
+-- NATURAL FULL JOIN (preserves all rows from both tables)
+SELECT * FROM employees NATURAL FULL JOIN departments;
+
+-- NATURAL INNER JOIN, the same as NATURAL JOIN
+SELECT * FROM employees NATURAL INNER JOIN departments;
 ```
+
+`OUTER` may follow `LEFT`, `RIGHT` and `FULL`, as in `NATURAL FULL OUTER JOIN`.
 
 No `ON` or `USING` clause is needed. If both tables have columns `id` and `dept_id`, the join matches on both.
 

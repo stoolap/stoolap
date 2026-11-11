@@ -747,7 +747,16 @@ impl Parser<'_> {
                         self.next_token();
                     }
                     "NATURAL RIGHT"
+                } else if self.peek_token_is_keyword(Keyword::Full) {
+                    self.next_token();
+                    if self.peek_token_is_keyword(Keyword::Outer) {
+                        self.next_token();
+                    }
+                    "NATURAL FULL"
                 } else {
+                    if self.peek_token_is_keyword(Keyword::Inner) {
+                        self.next_token();
+                    }
                     "NATURAL"
                 };
                 if !self.expect_keyword(Keyword::Join) {

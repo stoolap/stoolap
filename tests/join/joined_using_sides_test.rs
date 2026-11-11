@@ -59,7 +59,7 @@ const MERGING: &[(&str, &str, &[&str])] = &[
     (
         "t NATURAL {j} u",
         "t {j} u ON u.id = t.id",
-        &["JOIN", "LEFT JOIN", "RIGHT JOIN"],
+        &["JOIN", "INNER JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN"],
     ),
 ];
 
