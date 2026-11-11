@@ -2029,6 +2029,9 @@ pub struct VolumeMeta {
     pub locator: Option<LocatorPlace>,
     /// Whether the time/integer columns are sorted (enables binary search)
     pub sorted_columns: Vec<bool>,
+    /// The column whose cells the writer found equal to `row_ids`, none
+    /// NULL; its cells are read from the ids, never decoded
+    pub row_id_column: Option<usize>,
     /// Precomputed lowercase column name -> index map for O(1) lookup.
     /// Built once at construction; replaces O(C) linear scan in column_index().
     pub column_name_map: AHashMap<SmartString, usize>,
@@ -2241,6 +2244,16 @@ impl VolumeMeta {
         self.group_rows.trailing_zeros()
     }
 
+    /// The cell at `row_idx` of `col_idx` from the row ids, when that is
+    /// the column the writer found equal to them
+    #[inline]
+    pub fn row_id_cell(&self, col_idx: usize, row_idx: usize) -> Option<Value> {
+        if self.row_id_column != Some(col_idx) {
+            return None;
+        }
+        self.row_ids.get(row_idx).map(|&id| Value::Integer(id))
+    }
+
     /// NaN cells of a physical column: the zone map counts them among its
     /// rows, the stats never count them. Zero for a non-FLOAT column, None
     /// when the column has no zone map or stats.
@@ -2404,6 +2417,8 @@ pub struct VolumeBuilder {
     // Sort tracking
     last_values: Vec<Option<i64>>,
     sorted: Vec<bool>,
+    /// The primary key column while every flushed cell of it equals its row id
+    row_id_column: Option<usize>,
     // Row count
     row_count: usize,
     /// Bloom filters fed as the cells arrive, when the producer asked for
@@ -2932,6 +2947,7 @@ impl VolumeBuilder {
             any_row_order: false,
             last_values,
             sorted,
+            row_id_column: schema.pk_column_index(),
             row_count: 0,
             bloom: None,
             row_groups: Vec::new(),
@@ -3013,11 +3029,28 @@ impl VolumeBuilder {
             end_idx: self.row_count as u32,
             zone_maps,
         });
+        self.check_row_id_column();
         self.flushed_rows = self.row_count;
         self.feed_group_blooms();
         spare.clear();
         std::mem::swap(&mut self.acc, spare);
         Ok(rows)
+    }
+
+    /// Drops `row_id_column` when a cell of the accumulated group is NULL
+    /// or differs from the row id at its position
+    fn check_row_id_column(&mut self) {
+        let Some(col_idx) = self.row_id_column else {
+            return;
+        };
+        let ids = &self.row_ids[self.flushed_rows..self.row_count];
+        let equal = match self.acc.cells(col_idx) {
+            TypedCells::Int64 { values, nulls } => values == ids && !nulls.contains(&true),
+            _ => false,
+        };
+        if !equal {
+            self.row_id_column = None;
+        }
     }
 
     /// Adds every stored cell of the accumulated group to the fed bloom
@@ -3145,6 +3178,7 @@ impl VolumeBuilder {
             row_order: std::sync::OnceLock::from(row_order),
             locator: None,
             sorted_columns: std::mem::take(&mut self.sorted),
+            row_id_column: self.row_id_column,
             column_name_map,
             row_groups,
             group_rows,
@@ -3692,6 +3726,7 @@ impl VolumeBuilder {
             ));
         }
         self.feed_group_blooms();
+        self.check_row_id_column();
         let mut columns = Vec::with_capacity(self.num_cols);
         let mut sorted_columns = Vec::with_capacity(self.num_cols);
 
@@ -3808,6 +3843,7 @@ impl VolumeBuilder {
                 row_order: std::sync::OnceLock::from(row_order),
                 locator: None,
                 sorted_columns,
+                row_id_column: self.row_id_column,
                 column_name_map,
                 row_groups,
                 group_rows: super::column::ROW_GROUP_SIZE,
@@ -3847,6 +3883,9 @@ impl RowReader {
     fn cell(&mut self, col_idx: usize, row_idx: usize) -> std::io::Result<Value> {
         if let Some(column) = self.volume.columns.resident(col_idx) {
             return Ok(column.get_value(row_idx));
+        }
+        if let Some(value) = self.volume.meta.row_id_cell(col_idx, row_idx) {
+            return Ok(value);
         }
         let shift = self.volume.meta.group_shift();
         let start = row_idx >> shift << shift;
@@ -4606,6 +4645,9 @@ impl FrozenVolume {
         if let Some(column) = self.columns.resident(col_idx) {
             return Ok(column.get_value(row_idx));
         }
+        if let Some(value) = self.meta.row_id_cell(col_idx, row_idx) {
+            return Ok(value);
+        }
         let store = self.columns.compressed_store().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "column data is not loaded")
         })?;
@@ -4989,8 +5031,8 @@ mod tests {
             assert_eq!(row[0], Value::Integer(i as i64));
         }
         let decoded = store.decoded_groups() - before;
-        // Two groups, two columns: each decoded once
-        assert_eq!(decoded, 4, "groups decoded {decoded} times");
+        // Two groups of `name`, each decoded once; `id` is read from the row ids
+        assert_eq!(decoded, 2, "groups decoded {decoded} times");
     }
 
     #[test]

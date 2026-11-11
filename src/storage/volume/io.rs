@@ -94,13 +94,15 @@ pub fn write_volume_to_disk(
         ));
     }
     let mut schema = crate::core::SchemaBuilder::new(table_name);
-    for (name, &data_type) in volume
+    for (i, (name, &data_type)) in volume
         .meta
         .column_names
         .iter()
         .zip(&volume.meta.column_types)
+        .enumerate()
     {
-        schema = schema.column(name, data_type, true, false);
+        let row_ids = volume.meta.row_id_column == Some(i);
+        schema = schema.column(name, data_type, !row_ids, row_ids);
     }
     let schema = schema.build();
     let rows = volume.meta.row_count;
@@ -531,6 +533,7 @@ fn file_volume(
             row_order: std::sync::OnceLock::new(),
             locator,
             sorted_columns: meta.col_sorted,
+            row_id_column: meta.row_id_column,
             column_name_map: meta.column_name_map,
             row_groups: meta.row_groups,
             group_rows: group_size,

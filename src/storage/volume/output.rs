@@ -1541,4 +1541,39 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn a_primary_key_equal_to_its_row_ids_is_read_from_them_after_a_reopen() {
+        let schema = schema();
+        let rows = ROW_GROUP_SIZE as i64 + 100;
+        // The key differs from its row id at `odd`, or nowhere
+        for (odd, want) in [(None, Some(0)), (Some(rows - 7), None), (Some(3), None)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut writer =
+                VolumeFileWriter::new(dir.path(), "t", 1, &schema, rows as usize, true).unwrap();
+            for i in 0..rows {
+                let mut cells = row(i);
+                if Some(i) == odd {
+                    cells.values_mut()[0] = Value::Integer(-i);
+                }
+                writer.add_row(i, &cells).unwrap();
+            }
+            let (volume, path) = writer.finish().unwrap();
+            assert_eq!(volume.meta.row_id_column, want, "{odd:?}");
+            let reread = read_volume_from_disk(&path).unwrap();
+            assert_eq!(reread.meta.row_id_column, want, "{odd:?}");
+            for i in [0, 3, ROW_GROUP_SIZE as i64, rows - 7, rows - 1] {
+                let key = if Some(i) == odd { -i } else { i };
+                assert_eq!(
+                    reread.cell(0, i as usize).unwrap(),
+                    Value::Integer(key),
+                    "{odd:?} at {i}"
+                );
+                assert_eq!(
+                    reread.get_row(i as usize).unwrap().get(0),
+                    Some(&Value::Integer(key))
+                );
+            }
+        }
+    }
 }
