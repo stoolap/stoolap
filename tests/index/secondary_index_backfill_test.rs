@@ -961,7 +961,7 @@ fn readable(path: &Path, yes: bool) {
 }
 
 /// A volume whose build keeps failing does not keep the newer ones from
-/// their turn: the next pass starts after it.
+/// their turn: the next pass takes them before it.
 #[cfg(unix)]
 #[test]
 fn a_failing_volume_does_not_starve_the_newer_ones() {
@@ -997,8 +997,51 @@ fn a_failing_volume_does_not_starve_the_newer_ones() {
     assert_eq!(served(&db, 100, 103), (2, 0));
 }
 
+/// A volume with no side file that cannot be built waits behind the
+/// volumes whose file lacks an index created since, so those are built.
+#[cfg(unix)]
+#[test]
+fn a_failing_volume_with_no_side_file_does_not_starve_a_file_missing_an_index() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "");
+    // Table a sorts first; its only volume has no side file and cannot be read
+    db.execute(
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER NOT NULL)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO a VALUES (1, 1), (2, 2)", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("CREATE INDEX idx_a_k ON a(k)", ()).unwrap();
+    create(&db);
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    seal_volumes(&db, 1);
+    db.close().unwrap();
+    let db = open(dir.path(), "");
+    // t's current file covers k, not the index on v created now
+    db.execute("CREATE INDEX idx_t_v ON t(v)", ()).unwrap();
+    let a_volume = std::fs::read_dir(dir.path().join("volumes").join("a"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("vol"))
+        .unwrap();
+    readable(&a_volume, false);
+    let first = backfill(&db, Some(1));
+    assert_eq!((first["failed"], first["left"]), (1, 1), "{first:?}");
+    let second = backfill(&db, Some(1));
+    readable(&a_volume, true);
+    assert_eq!(
+        (second["examined"], second["built"]),
+        (1, 1),
+        "t's file takes its turn: {second:?}"
+    );
+}
+
 /// A volume that cannot be built in one table does not keep another
-/// table's volumes from their turn either: the cursor spans the tables.
+/// table's volumes from their turn either: it waits behind every table's.
 #[cfg(unix)]
 #[test]
 fn a_failing_volume_does_not_starve_another_table() {

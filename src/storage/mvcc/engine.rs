@@ -1051,10 +1051,9 @@ pub struct MVCCEngine {
     /// Set when close begins: no pass starts, a running one stops at its
     /// next volume, and close waits for it before letting the files go
     closing: AtomicBool,
-    /// The table and segment a pass last examined, of the volumes with no
-    /// side file and of those with an older one, so a volume that cannot be
-    /// built, in any table, does not keep the rest of its kind from their turn
-    backfill_cursor: Mutex<[Option<(String, u64)>; 2]>,
+    /// The volumes passes examined and did not build, by table and segment,
+    /// the longest waiting first: a pass takes every other volume before them
+    backfill_deferred: Mutex<Vec<(String, u64)>>,
     /// Global epoch counter for volume eviction. Incremented each checkpoint
     /// cycle. Volumes whose last_access_epoch < eviction_epoch are idle.
     #[cfg(not(target_arch = "wasm32"))]
@@ -1275,7 +1274,7 @@ impl MVCCEngine {
             compaction_running: Arc::new(AtomicBool::new(false)),
             backfill_running: AtomicBool::new(false),
             closing: AtomicBool::new(false),
-            backfill_cursor: Mutex::new([None, None]),
+            backfill_deferred: Mutex::new(Vec::new()),
             #[cfg(not(target_arch = "wasm32"))]
             eviction_epoch: AtomicU64::new(0),
         }
@@ -6785,11 +6784,10 @@ impl MVCCEngine {
                 })
                 .collect()
         };
-        // Every candidate of every table first, the volumes with no side
-        // file before those with an older one, each kind in table then
-        // segment order, so what is left is counted whole; each kind starts
-        // after the volume of its kind the last pass examined and wraps, so
-        // a volume that cannot be built does not hold the rest forever
+        // Every candidate of every table first, so what is left is counted
+        // whole: the volumes with no side file, then those with one, each
+        // in table then segment order, then the volumes earlier passes
+        // could not build, longest waiting first
         let mut work: Vec<(usize, u64, bool)> = Vec::new();
         let mut identities_of: Vec<(Vec<crate::storage::volume::side_index::SideIndexDef>, u64)> =
             Vec::with_capacity(tables.len());
@@ -6827,21 +6825,21 @@ impl MVCCEngine {
             );
             identities_of.push((identities, definition));
         }
-        // The volumes the query path cannot serve at all come first, in every table
-        work.sort_unstable_by_key(|&(index, id, has_side)| (has_side, index, id));
-        let older = work.partition_point(|&(_, _, has_side)| !has_side);
-        let cursors = self.backfill_cursor.lock().unwrap().clone();
-        let (none, old) = work.split_at_mut(older);
-        for (kind, cursor) in [(none, &cursors[0]), (old, &cursors[1])] {
-            if let Some((table, segment)) = cursor {
-                let at = kind.partition_point(|&(index, id, _)| {
-                    (tables[index].0.as_str(), id) <= (table.as_str(), *segment)
-                });
-                kind.rotate_left(at);
-            }
-        }
+        let mut deferred = self.backfill_deferred.lock().unwrap();
+        deferred.retain(|(table, segment)| {
+            work.iter()
+                .any(|&(index, id, _)| id == *segment && tables[index].0 == *table)
+        });
+        let waiting = |index: usize, id: u64| {
+            let at = deferred
+                .iter()
+                .position(|(table, segment)| *segment == id && *table == tables[index].0);
+            at.map_or(0, |at| at + 1)
+        };
+        work.sort_by_cached_key(|&(index, id, has_side)| (waiting(index, id), has_side, index, id));
+        drop(deferred);
         let pending = work.len();
-        for (index, seg_id, has_side) in work {
+        for (index, seg_id, _) in work {
             if report.examined >= limit || self.closing.load(Ordering::Acquire) {
                 break;
             }
@@ -6855,7 +6853,11 @@ impl MVCCEngine {
                 break;
             }
             report.examined += 1;
-            self.backfill_cursor.lock().unwrap()[has_side as usize] = Some((name.clone(), seg_id));
+            // Waits behind the rest until it is built and leaves the candidates
+            let mut deferred = self.backfill_deferred.lock().unwrap();
+            deferred.retain(|(table, segment)| !(*segment == seg_id && table == name));
+            deferred.push((name.clone(), seg_id));
+            drop(deferred);
             let snapshot = mgr.cold_snapshot();
             let Some(cs) = snapshot.segs.get(&seg_id) else {
                 report.discarded += 1;
@@ -6973,6 +6975,9 @@ impl MVCCEngine {
             match mgr.attach_side(seg_id, side) {
                 Some(before) => {
                     report.built += 1;
+                    let mut deferred = self.backfill_deferred.lock().unwrap();
+                    deferred.retain(|(table, segment)| !(*segment == seg_id && table == name));
+                    drop(deferred);
                     if let Some(before) = before {
                         before.handle().retire();
                     }
