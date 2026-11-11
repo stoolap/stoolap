@@ -16,11 +16,9 @@
 //! while none of them changes; a view's query runs under its own plan
 
 use crate::common::SmartString;
-use crate::core::Result;
 use crate::parser::ast::*;
 use crate::storage::traits::Engine;
 
-use super::context::ExecutionContext;
 use super::query_cache::PlanValidity;
 use super::Executor;
 
@@ -62,63 +60,10 @@ impl Executor {
         })
     }
 
-    /// An error when `statement` names a table whose column takes the row
-    /// identity's name, which serves DDL alone, itself or through a view;
-    /// walked only while such a table is
-    pub(crate) fn check_reserved_reads(
-        &self,
-        statement: &Statement,
-        ctx: &ExecutionContext,
-    ) -> Result<()> {
-        if !self.engine.has_reserved_names() {
-            return Ok(());
-        }
-        let mut reads = Reads {
-            executor: self,
-            names: Vec::new(),
-            ctes: Vec::new(),
-            tables: Vec::new(),
-        };
-        let mut statement = statement;
-        while let Statement::Explain(explain) = statement {
-            statement = &explain.statement;
-        }
-        match statement {
-            Statement::Select(stmt) => reads.select(stmt),
-            Statement::Insert(stmt) => reads.insert(stmt),
-            Statement::Update(stmt) => reads.update(stmt),
-            Statement::Delete(stmt) => reads.delete(stmt),
-            Statement::CreateView(stmt) => reads.select(&stmt.query),
-            Statement::CreateTable(stmt) => match &stmt.as_select {
-                Some(select) => reads.select(select),
-                None => return Ok(()),
-            },
-            _ => return Ok(()),
-        }
-        let mut at = 0;
-        while let Some(name) = reads.tables.get(at).cloned() {
-            at += 1;
-            if ctx.has_cte_by_lower(&name) {
-                continue;
-            }
-            self.engine.check_reserved_table(&name)?;
-            if let Some(view) = self.engine.get_view_lowercase(&name)? {
-                if let Statement::Select(stmt) =
-                    self.parse_view_statement(&view.query)?.statement.as_ref()
-                {
-                    reads.select(stmt);
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn validity(&self, epoch: u64, walk: impl FnOnce(&mut Reads<'_>)) -> PlanValidity {
         let mut reads = Reads {
             executor: self,
             names: Vec::new(),
-            ctes: Vec::new(),
-            tables: Vec::new(),
         };
         walk(&mut reads);
         let unchanged = self.engine.schema_epoch() == epoch;
@@ -130,10 +75,6 @@ impl Executor {
 struct Reads<'a> {
     executor: &'a Executor,
     names: Vec<(SmartString, u64)>,
-    /// The CTE names in scope where the walk stands
-    ctes: Vec<SmartString>,
-    /// The names read as a table or view, no CTE in scope taking them
-    tables: Vec<SmartString>,
 }
 
 impl Reads<'_> {
@@ -146,16 +87,8 @@ impl Reads<'_> {
         self.names.push((name.clone(), at));
     }
 
-    /// A source `name`, lower case, which a CTE in scope may take
-    fn source(&mut self, name: &SmartString) {
-        self.name(name);
-        if !self.ctes.contains(name) && !self.tables.contains(name) {
-            self.tables.push(name.clone());
-        }
-    }
-
     fn insert(&mut self, insert: &InsertStatement) {
-        self.source(&insert.table_name.value_lower);
+        self.name(&insert.table_name.value_lower);
         insert.values.iter().flatten().for_each(|e| self.expr(e));
         if let Some(select) = &insert.select {
             self.select(select);
@@ -166,44 +99,28 @@ impl Reads<'_> {
     }
 
     fn update(&mut self, update: &UpdateStatement) {
-        let scope = self.with(update.with.as_ref());
-        self.source(&update.table_name.value_lower);
+        self.with(update.with.as_ref());
+        self.name(&update.table_name.value_lower);
         update.updates.values().for_each(|e| self.expr(e));
         self.exprs(update.where_clause.as_deref());
         update.returning.iter().for_each(|e| self.expr(e));
-        self.ctes.truncate(scope);
     }
 
     fn delete(&mut self, delete: &DeleteStatement) {
-        let scope = self.with(delete.with.as_ref());
-        self.source(&delete.table_name.value_lower);
+        self.with(delete.with.as_ref());
+        self.name(&delete.table_name.value_lower);
         self.exprs(delete.where_clause.as_deref());
         delete.returning.iter().for_each(|e| self.expr(e));
-        self.ctes.truncate(scope);
     }
 
-    /// Walks the CTEs of `with`, each in scope of the ones before it and of
-    /// itself when recursive, and leaves all in scope; the scope's length
-    /// before them, for the caller to cut back to
-    fn with(&mut self, with: Option<&WithClause>) -> usize {
-        let scope = self.ctes.len();
-        if let Some(with) = with {
-            for cte in &with.ctes {
-                let recursive = with.is_recursive || cte.is_recursive;
-                if recursive {
-                    self.ctes.push(cte.name.value_lower.clone());
-                }
-                self.select(&cte.query);
-                if !recursive {
-                    self.ctes.push(cte.name.value_lower.clone());
-                }
-            }
+    fn with(&mut self, with: Option<&WithClause>) {
+        for cte in with.iter().flat_map(|with| &with.ctes) {
+            self.select(&cte.query);
         }
-        scope
     }
 
     fn select(&mut self, select: &SelectStatement) {
-        let scope = self.with(select.with.as_ref());
+        self.with(select.with.as_ref());
         select.distinct_on.iter().for_each(|e| self.expr(e));
         select.columns.iter().for_each(|e| self.expr(e));
         self.exprs(select.table_expr.as_deref());
@@ -237,7 +154,6 @@ impl Reads<'_> {
         for set_op in &select.set_operations {
             self.select(&set_op.right);
         }
-        self.ctes.truncate(scope);
     }
 
     fn exprs(&mut self, expr: Option<&Expression>) {
@@ -311,7 +227,7 @@ impl Reads<'_> {
                     .for_each(|o| self.expr(&o.expression));
                 window.frame_offsets().for_each(|e| self.expr(e));
             }
-            Expression::TableSource(source) => self.source(&source.name.value_lower),
+            Expression::TableSource(source) => self.name(&source.name.value_lower),
             Expression::JoinSource(join) => {
                 self.expr(&join.left);
                 self.expr(&join.right);

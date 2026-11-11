@@ -1361,13 +1361,13 @@ struct ScopeTable {
 
 impl ScopeTable {
     /// The scope of the stored table `schema`, whose rowid it reads: its
-    /// primary key, else, when `slot`, a column past its own its rows carry
-    fn of_table(name: impl Into<Option<SmartString>>, schema: &Schema, slot: bool) -> Self {
+    /// primary key, else, when `slot`, a column past its own its rows carry;
+    /// refused for a table an older build let a column of that name
+    fn of_table(name: impl Into<Option<SmartString>>, schema: &Schema, slot: bool) -> Result<Self> {
         let mut scope = Self::of(name, schema);
-        debug_assert!(
-            scope.rowids.is_empty(),
-            "a stored table has no _rowid_ column"
-        );
+        if !scope.rowids.is_empty() {
+            schema.check_column_names()?;
+        }
         match schema.rowid_column() {
             Some(key) => scope.rowids.push((0, Some(key))),
             None if slot => {
@@ -1384,7 +1384,7 @@ impl ScopeTable {
             }
             None => scope.rowids.push((0, None)),
         }
-        scope
+        Ok(scope)
     }
 
     /// Whether column `at` is a row id slot, which no `*` shows
@@ -1496,14 +1496,21 @@ impl ScopeTable {
 
     /// The scope of the FROM entry `side`, its tables `leaves` in turn and
     /// each join among them merging columns as [`Self::joined`] does
-    fn of_side(side: &Expression, leaves: &mut impl Iterator<Item = Self>) -> Option<Self> {
+    fn of_side(
+        side: &Expression,
+        leaves: &mut impl Iterator<Item = Result<Self>>,
+    ) -> Result<Option<Self>> {
         match side {
             Expression::JoinSource(join) => {
-                let left = Self::of_side(&join.left, leaves)?;
-                let right = Self::of_side(&join.right, leaves)?;
-                Some(Self::joined(join, left, right))
+                let Some(left) = Self::of_side(&join.left, leaves)? else {
+                    return Ok(None);
+                };
+                let Some(right) = Self::of_side(&join.right, leaves)? else {
+                    return Ok(None);
+                };
+                Ok(Some(Self::joined(join, left, right)))
             }
-            _ => leaves.next(),
+            _ => leaves.next().transpose(),
         }
     }
 
@@ -1711,24 +1718,27 @@ impl ScopeTable {
 
 /// The scope of a join side's table: a stored table's with its rowid, any
 /// other source's with its columns
-fn leaf_scope((name, schema, stored): &SideLeaf) -> ScopeTable {
+fn leaf_scope((name, schema, stored): &SideLeaf) -> Result<ScopeTable> {
     let name = name.as_deref().map(|n| SmartString::from(n.to_lowercase()));
     match stored {
         true => ScopeTable::of_table(name, schema, false),
-        false => ScopeTable::of(name, schema),
+        false => Ok(ScopeTable::of(name, schema)),
     }
 }
 
 /// The scope of each side of `join` over `sides`, its tables side by side,
 /// read by position in the joined row
-fn side_scopes(join: &JoinTableSource, sides: &JoinSides) -> Option<[ScopeTable; 2]> {
+fn side_scopes(join: &JoinTableSource, sides: &JoinSides) -> Result<Option<[ScopeTable; 2]>> {
     let side_scope = |expr: &Expression, side: &JoinSide| {
         ScopeTable::of_side(expr, &mut side.leaves.iter().map(leaf_scope))
     };
-    Some([
-        side_scope(&join.left, &sides[0])?,
-        side_scope(&join.right, &sides[1])?,
-    ])
+    let Some(left) = side_scope(&join.left, &sides[0])? else {
+        return Ok(None);
+    };
+    let Some(right) = side_scope(&join.right, &sides[1])? else {
+        return Ok(None);
+    };
+    Ok(Some([left, right]))
 }
 
 /// An error when a column of `merges`, the pairs a NATURAL join or a USING
@@ -2106,7 +2116,7 @@ impl StatementWalk<'_> {
                         // A table read AS OF has no rowid
                         match ts.as_of {
                             Some(_) => ScopeTable::of(name, &schema),
-                            None => ScopeTable::of_table(name, &schema, !joined),
+                            None => ScopeTable::of_table(name, &schema, !joined)?,
                         }
                     }
                 }
@@ -6961,7 +6971,7 @@ impl Builder<'_> {
                 match self.entry_read(entry, sq.where_clause.as_deref(), counts, outer)? {
                     FromEntry::Statement => return self.statement_block(sq, outer, parent, form),
                     FromEntry::Table(table, name, schema) => {
-                        let scope = ScopeTable::of_table(name, &schema, names_rowid(sq));
+                        let scope = ScopeTable::of_table(name, &schema, names_rowid(sq))?;
                         (Some(table), None, schema, scope)
                     }
                     FromEntry::Source(name, source, columns) => over_source(name, source, columns),
@@ -8762,7 +8772,7 @@ impl PreparedSelect {
     ) -> Result<Self> {
         let registry = global_registry();
         let scope = match stored {
-            true => ScopeTable::of_table(scope_name.clone(), schema, names_rowid(stmt)),
+            true => ScopeTable::of_table(scope_name.clone(), schema, names_rowid(stmt))?,
             false => ScopeTable::of(scope_name.clone(), schema),
         };
         // A statement with window functions reads its rows as a SELECT * of
@@ -10119,7 +10129,7 @@ impl Executor {
         };
         let scope = match kind {
             GroupedSource::Table => {
-                ScopeTable::of_table(scope_name.clone(), &schema, names_rowid(stmt))
+                ScopeTable::of_table(scope_name.clone(), &schema, names_rowid(stmt))?
             }
             _ => ScopeTable::of(scope_name.clone(), &schema),
         };
@@ -10378,7 +10388,7 @@ impl PreparedDml {
                 .chain(sets.iter().map(|(_, value)| *value))
                 .chain(returning.into_iter().flat_map(|sites| sites.values))
                 .any(expr_names_rowid);
-        let scope = ScopeTable::of_table(scope_name.clone(), schema, slot);
+        let scope = ScopeTable::of_table(scope_name.clone(), schema, slot)?;
         let scopes = [&scope];
         let chain = Chain { scopes: &scopes };
         let mut builder = Builder {
@@ -10448,25 +10458,27 @@ impl PreparedDml {
             rewritten_values.push(programs);
         }
         // ON CONFLICT reads the row met and the excluded row, joined
-        let joined = conflict.map(|sites| {
-            let excluded = SmartString::from("excluded");
-            // `excluded` names the excluded row, also when the target bears
-            // that name; the target then has a name no qualifier can spell
-            let target = if *sites.table == excluded {
-                SmartString::from(format!("{RESOLVED}{excluded}"))
-            } else {
-                sites.table.clone()
-            };
-            // A bare name reads the row met; the excluded row only by its name
-            let widens = Executor::conflict_widens(sites.schema, sites.stmt);
-            let mut joined = ScopeTable::beside(
-                ScopeTable::of_table(target, sites.schema, widens),
-                ScopeTable::of(excluded, sites.schema),
-            )
-            .by_position();
-            joined.bare = sites.schema.columns.len() + usize::from(widens);
-            joined
-        });
+        let joined = conflict
+            .map(|sites| {
+                let excluded = SmartString::from("excluded");
+                // `excluded` names the excluded row, also when the target bears
+                // that name; the target then has a name no qualifier can spell
+                let target = if *sites.table == excluded {
+                    SmartString::from(format!("{RESOLVED}{excluded}"))
+                } else {
+                    sites.table.clone()
+                };
+                // A bare name reads the row met; the excluded row only by its name
+                let widens = Executor::conflict_widens(sites.schema, sites.stmt);
+                let mut joined = ScopeTable::beside(
+                    ScopeTable::of_table(target, sites.schema, widens)?,
+                    ScopeTable::of(excluded, sites.schema),
+                )
+                .by_position();
+                joined.bare = sites.schema.columns.len() + usize::from(widens);
+                Ok::<_, Error>(joined)
+            })
+            .transpose()?;
         let mut conflict_parts = None;
         if let (Some(sites), Some(joined)) = (conflict, &joined) {
             let scopes = [joined];
@@ -10500,11 +10512,13 @@ impl PreparedDml {
             conflict_parts = Some((sets, where_, reads_target));
         }
         // RETURNING reads the row returned, `*` each of its columns
-        let returning_scope = returning.map(|sites| {
-            // The row returned has its id, an inserted one's included
-            let slot = sites.values.iter().any(expr_names_rowid);
-            ScopeTable::of_table(scope_name.clone(), sites.schema, slot)
-        });
+        let returning_scope = returning
+            .map(|sites| {
+                // The row returned has its id, an inserted one's included
+                let slot = sites.values.iter().any(expr_names_rowid);
+                ScopeTable::of_table(scope_name.clone(), sites.schema, slot)
+            })
+            .transpose()?;
         let mut returning_parts = None;
         if let (Some(sites), Some(returning_scope)) = (returning, &returning_scope) {
             let scopes = [returning_scope];
@@ -10927,7 +10941,7 @@ impl JoinBlocks {
         param_count: usize,
     ) -> Result<Option<Self>> {
         let rows_sides = [sides[0].rows, sides[1].rows];
-        let Some([left_scope, right_scope]) = side_scopes(join, sides) else {
+        let Some([left_scope, right_scope]) = side_scopes(join, sides)? else {
             return Ok(None);
         };
         let left_width = left_scope.columns.len();
@@ -11009,7 +11023,7 @@ impl JoinBlocks {
                 kept[i] = Some(filter.clone());
                 continue;
             };
-            let side = leaf_scope(&sides[i].leaves[0]);
+            let side = leaf_scope(&sides[i].leaves[0])?;
             let side_scopes = [&side];
             let side_chain = Chain {
                 scopes: &side_scopes,
@@ -11106,7 +11120,7 @@ impl JoinBlocks {
                 None if !rows_sides[i] => (&none, true),
                 None => continue,
             };
-            let side = leaf_scope(&sides[i].leaves[0]);
+            let side = leaf_scope(&sides[i].leaves[0])?;
             let side_scopes = [&side];
             let side_chain = Chain {
                 scopes: &side_scopes,

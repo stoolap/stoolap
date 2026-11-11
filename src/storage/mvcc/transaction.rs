@@ -841,8 +841,7 @@ impl Transaction for MvccTransaction {
         // Scope the borrow to allow later mutable operations
         let schema = {
             let ops = self.get_engine_ops()?;
-            let table =
-                ops.get_table_for_transaction(self.id, name, None, None, TableUse::Write)?;
+            let table = ops.get_table_for_transaction(self.id, name, None, None, TableUse::Ddl)?;
             table.schema().clone()
         };
 

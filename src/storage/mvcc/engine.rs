@@ -881,9 +881,22 @@ struct DdlShared {
     /// The epoch at which every name last changed together, by an open or
     /// a restore
     name_floor: AtomicU64,
+    /// Whether the open or a restore found a table whose column takes the
+    /// row identity's name; a table's reads ask its schema only then
+    reserved_names: AtomicBool,
 }
 
 impl DdlShared {
+    /// An error when `store`'s table has a column of the row identity's
+    /// name, as only an older build let one: it serves DDL alone
+    #[inline]
+    fn check_reserved(&self, store: &VersionStore) -> Result<()> {
+        if self.reserved_names.load(Ordering::Acquire) {
+            store.schema().check_column_names()?;
+        }
+        Ok(())
+    }
+
     /// Moves the schema epoch for a change to the tables or views `names`,
     /// lower case, which take the new epoch as their own
     fn changed(&self, names: &[&str]) {
@@ -1020,9 +1033,6 @@ pub struct MVCCEngine {
     /// Cached reverse FK mapping: parent_table → Vec<(child_table, FK constraint)>
     /// Rebuilt lazily on schema_epoch change. Zero cost for non-FK databases.
     fk_reverse_cache: RwLock<FkReverseCache>,
-    /// Whether the open or a restore found a table whose column takes the
-    /// row identity's name; a statement's tables are asked only then
-    any_reserved_name: AtomicBool,
     /// Snapshot timestamps loaded per table — used to pair HNSW graph files with their
     /// matching data snapshots during WAL replay.
     snapshot_timestamps: RwLock<FxHashMap<String, String>>,
@@ -1261,12 +1271,12 @@ impl MVCCEngine {
                 schema_epoch: AtomicU64::new(0),
                 name_epochs: parking_lot::RwLock::new(FxHashMap::default()),
                 name_floor: AtomicU64::new(0),
+                reserved_names: AtomicBool::new(false),
             }),
             instance: NEXT_ENGINE_INSTANCE.fetch_add(1, Ordering::Relaxed),
             stats_epoch: AtomicU64::new(0),
             cleanup_handle: Mutex::new(None),
             fk_reverse_cache: RwLock::new((u64::MAX, StringMap::default())),
-            any_reserved_name: AtomicBool::new(false),
             snapshot_timestamps: RwLock::new(FxHashMap::default()),
             segment_managers: Arc::new(RwLock::new(FxHashMap::default())),
             force_seal_all: AtomicBool::new(false),
@@ -3854,22 +3864,6 @@ impl MVCCEngine {
             .ok_or_else(|| Error::TableNotFound(table_name.as_ref().to_string()))
     }
 
-    /// An error when a column of table `name` takes the row identity's name;
-    /// a name the engine holds no table of is no error here
-    pub(crate) fn check_reserved_table(&self, name: &str) -> Result<()> {
-        match self.get_table_schema(name) {
-            Ok(schema) => schema.check_column_names(),
-            Err(_) => Ok(()),
-        }
-    }
-
-    /// Whether the open or a restore found a table whose column takes the
-    /// row identity's name
-    #[inline]
-    pub(crate) fn has_reserved_names(&self) -> bool {
-        self.any_reserved_name.load(Ordering::Acquire)
-    }
-
     /// About how many committed rows table `name` holds, hot and sealed,
     /// read without a transaction or a table; None for a table it does not hold
     pub(crate) fn row_count_hint(&self, name: &str) -> Option<usize> {
@@ -4079,7 +4073,7 @@ impl MVCCEngine {
     fn note_reserved_names(&self) {
         for schema in self.schemas.read().unwrap().values() {
             if let Err(e) = schema.check_column_names() {
-                self.any_reserved_name.store(true, Ordering::Release);
+                self.ddl.reserved_names.store(true, Ordering::Release);
                 eprintln!("Warning: {e}");
             }
         }
@@ -6154,7 +6148,7 @@ impl MVCCEngine {
                 // A table of the row identity's name serves DDL alone from the
                 // moment it loads, should the restore stop after it
                 Ok(reader) if reader.schema().check_column_names().is_err() => {
-                    self.any_reserved_name.store(true, Ordering::Release);
+                    self.ddl.reserved_names.store(true, Ordering::Release);
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -9262,7 +9256,7 @@ impl MVCCEngine {
             self.get_or_create_segment_manager(table_name)
                 .check_available()?;
         }
-        Ok(())
+        self.ddl.check_reserved(store)
     }
 
     /// Row `row_id` in the latest committed state: its hot version as the
@@ -10019,6 +10013,9 @@ impl TransactionEngineOperations for EngineOperations {
             .cloned()
             .ok_or_else(|| Error::TableNotFound(table_name_lower.to_string()))?;
         drop(stores);
+        if table_use != TableUse::Ddl {
+            self.ddl.check_reserved(&version_store)?;
+        }
 
         // Check if we have a cached transaction version store for this
         // (txn_id, table_name); a new one comes admitted at the layout read
@@ -10039,7 +10036,7 @@ impl TransactionEngineOperations for EngineOperations {
             // A store published later would not reach a read handle, so one
             // is taken only where the statement cannot write
             let reads_only = || match table_use {
-                TableUse::Write => false,
+                TableUse::Write | TableUse::Ddl => false,
                 TableUse::Read | TableUse::KeyCheck => true,
                 TableUse::ReadBesideWrites => version_store.schema().foreign_keys.is_empty(),
             };

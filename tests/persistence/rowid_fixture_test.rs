@@ -59,7 +59,9 @@ fn refused(db: &Database, sql: &str) {
     let text = db.execute(sql, ()).map(drop);
     let prepared = db.prepare(sql).and_then(|stmt| stmt.execute(()).map(drop));
     for (how, result) in [("text", text), ("prepared", prepared)] {
-        let message = result.unwrap_err().to_string();
+        let Err(message) = result.map_err(|e| e.to_string()) else {
+            panic!("{how}: {sql} was served");
+        };
         assert!(
             message.contains("table t") && message.contains("RENAME COLUMN _rowid_"),
             "{how}: {sql}: {message}"
@@ -87,7 +89,11 @@ fn a_table_with_a_column_named_after_the_row_identity_serves_ddl_alone() {
             "SELECT v FROM u WHERE id IN (SELECT a FROM t)",
             "WITH s AS (SELECT a FROM t) SELECT a FROM s",
             "INSERT INTO u SELECT a + 10, a FROM t",
-            "EXPLAIN SELECT a FROM t",
+            "EXPLAIN ANALYZE SELECT a FROM t",
+            "WITH t AS (SELECT 1 AS a) UPDATE t SET a = 5",
+            "WITH t AS (SELECT 1 AS a) DELETE FROM t",
+            "WITH RECURSIVE t(a) AS (SELECT a FROM t UNION ALL SELECT a FROM t WHERE FALSE) \
+             SELECT SUM(a) FROM t",
             "CREATE TABLE t2 AS SELECT a FROM t",
             "WITH t AS (SELECT a FROM t) SELECT a FROM t",
             "SELECT a FROM t WHERE EXISTS (WITH t AS (SELECT 1 AS a) SELECT a FROM t)",
@@ -207,6 +213,7 @@ fn a_snapshot_with_a_column_named_after_the_row_identity_restores_to_ddl_alone()
 #[test]
 fn a_failed_rename_of_the_column_leaves_the_table_serving_ddl_alone() {
     use std::sync::atomic::Ordering;
+    let _guard = stoolap::test_failpoints::FailpointGuard::new();
     let (_dir, dsn) = copied("column_named_rowid");
     let db = Database::open(&dsn).unwrap();
     stoolap::test_failpoints::WAL_WRITE_FAIL.store(true, Ordering::Release);
@@ -214,12 +221,14 @@ fn a_failed_rename_of_the_column_leaves_the_table_serving_ddl_alone() {
     stoolap::test_failpoints::WAL_WRITE_FAIL.store(false, Ordering::Release);
     assert!(renamed.is_err(), "the rename went through");
     refused(&db, "SELECT a FROM t");
+    refused(&db, "INSERT INTO t VALUES (3, 30)");
 }
 
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn a_restore_stopped_after_a_table_of_the_reserved_name_leaves_it_serving_ddl_alone() {
     use std::sync::atomic::Ordering;
+    let _guard = stoolap::test_failpoints::FailpointGuard::new();
     let (_dir, dsn) = copied("snapshot_named_rowid_twice");
     let db = Database::open(&dsn).unwrap();
     assert_eq!(
@@ -232,5 +241,6 @@ fn a_restore_stopped_after_a_table_of_the_reserved_name_leaves_it_serving_ddl_al
     assert!(restored.is_err(), "the restore went through");
     for table in ["t", "t2"] {
         refused(&db, &format!("SELECT a FROM {table}"));
+        refused(&db, &format!("INSERT INTO {table} VALUES (3, 30)"));
     }
 }

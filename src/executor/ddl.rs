@@ -1161,7 +1161,7 @@ impl Executor {
 
         // Get the table for modifications
         let mut tx = self.begin_transaction()?;
-        let mut table = tx.get_statement_table(table_name)?;
+        let mut table = tx.get_ddl_table(table_name)?;
 
         // Process the single ALTER TABLE operation
         match stmt.operation {
