@@ -356,6 +356,68 @@ fn a_descending_float_top_k_reads_a_volume_holding_nan_past_its_zone_bound() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+#[test]
+fn a_descending_float_top_k_through_a_side_file_takes_the_nan_its_range_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?checkpoint_on_close=off",
+        dir.path().display()
+    ))
+    .unwrap();
+    for sql in [
+        "CREATE TABLE d (id INTEGER PRIMARY KEY, f FLOAT)",
+        "CREATE INDEX d_f ON d (f)",
+        "INSERT INTO d SELECT value, CASE WHEN value = 2000 THEN CAST('NaN' AS FLOAT) \
+         ELSE value END FROM generate_series(1, 2000)",
+        "PRAGMA CHECKPOINT",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    // The statement, its keys and ids, and whether side file rounds answer it
+    let cases: [(&str, &[&str], &[i64], bool); 4] = [
+        (
+            "SELECT id, f FROM d ORDER BY f DESC LIMIT 2",
+            &["NaN", "1999"],
+            &[1999, 2000],
+            false,
+        ),
+        (
+            "SELECT id, f FROM d WHERE f > 1000 ORDER BY f DESC LIMIT 2",
+            &["NaN", "1999"],
+            &[1999, 2000],
+            false,
+        ),
+        (
+            "SELECT id, f FROM d WHERE f < 1500 ORDER BY f DESC LIMIT 2",
+            &["1499", "1498"],
+            &[1498, 1499],
+            true,
+        ),
+        (
+            "SELECT id, f FROM d ORDER BY f LIMIT 2",
+            &["1", "2"],
+            &[1, 2],
+            true,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (sql, keys, ids, rounds) in cases {
+        #[cfg(feature = "test-failpoints")]
+        let before = stoolap::test_failpoints::top_k_side_rounds();
+        let got = read(&db, sql);
+        if got.0 != keys || got.1 != ids {
+            wrong.push(format!("{sql}\n  got  {got:?}\n  want ({keys:?}, {ids:?})"));
+        }
+        #[cfg(feature = "test-failpoints")]
+        if (stoolap::test_failpoints::top_k_side_rounds() > before) != rounds {
+            wrong.push(format!("{sql}: side file rounds taken is not {rounds}"));
+        }
+        #[cfg(not(feature = "test-failpoints"))]
+        let _ = rounds;
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// The ids a statement returns, in order
 fn ids(db: &Database, sql: &str) -> Vec<i64> {
     db.query(sql, ())

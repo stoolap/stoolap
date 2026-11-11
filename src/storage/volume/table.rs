@@ -2476,6 +2476,14 @@ impl SegmentedTable {
         else {
             return Ok(false);
         };
+        // Descending, a NaN the range takes in comes before every key
+        if !keep.ascending {
+            let (low, high) =
+                Self::i64_bounds(schema, comparisons, def).unwrap_or((i64::MIN, i64::MAX));
+            if Self::range_misses_nan(cs, def, &KeyRange::I64(low, high)) {
+                return Ok(false);
+            }
+        }
         let Some((mut low, mut high)) = self.side_positions(side, def, comparisons)? else {
             return Ok(false);
         };
@@ -2785,6 +2793,16 @@ impl SegmentedTable {
         physical.is_none_or(|p| cs.volume.meta.nan_count(p) != Some(0))
     }
 
+    /// Whether `keys` read from the side file would miss a NaN of the
+    /// volume that the range takes in: one open above
+    fn range_misses_nan(
+        cs: &super::manifest::ColdSegment,
+        def: &SideIndexDef,
+        keys: &KeyRange<'_>,
+    ) -> bool {
+        matches!(keys, KeyRange::I64(_, i64::MAX)) && Self::may_hold_unkeyed_nan(cs, def)
+    }
+
     /// Whether a volume's side file is asked for `keys` under `def`,
     /// decided before any page is read: the file must hold the index's
     /// entry over the volume's column, the directory must not rule the
@@ -2806,7 +2824,7 @@ impl SegmentedTable {
             READS.count(&READS.ineligible, 1);
             return Ok(SideAdmission::Scan);
         };
-        if matches!(keys, KeyRange::I64(_, i64::MAX)) && Self::may_hold_unkeyed_nan(cs, def) {
+        if Self::range_misses_nan(cs, def, &keys) {
             READS.count(&READS.ineligible, 1);
             return Ok(SideAdmission::Scan);
         }
