@@ -3901,7 +3901,7 @@ impl Executor {
                     fks,
                 )?;
             }
-            update_actions.push(idx, old, new);
+            update_actions.push(row_id, idx, old, new);
         }
 
         Ok((updated > 0, captured_row))

@@ -32,7 +32,7 @@ use std::cell::Cell;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::common::{I64Map, I64Set};
 use crate::core::{Error, ForeignKeyAction, ForeignKeyConstraint, Result, Schema, Value};
@@ -957,11 +957,14 @@ pub(crate) fn enforce_update_actions(
         .map(|(column, values)| {
             let mut root = Changed::new(table, column);
             root.done = true;
+            // Each value given changed, also one the statement changed back
             root.values = values
                 .into_iter()
-                .map(|(old, new)| Taken::new(old, new, 0))
+                .map(|(old, new)| Taken {
+                    changed: true,
+                    ..Taken::new(old, new, 0)
+                })
                 .collect();
-            root.mark_changed();
             root
         })
         .collect();
@@ -997,33 +1000,45 @@ pub(crate) fn enforce_update_actions(
 /// actions run once at its end, after its per-row blocks have read
 #[derive(Default)]
 pub(crate) struct UpdateActions {
-    columns: Vec<ColumnChanges>,
+    columns: Vec<RowChanges>,
 }
 
-/// A changed column, its (old, new) values, and where each new value is
-type ColumnChanges = (usize, Vec<(Value, Value)>, FxHashMap<Value, usize>);
+/// One referenced column's changes, each row's from the value it held
+/// first to the value it holds now
+#[derive(Default)]
+struct RowChanges {
+    column: usize,
+    values: Vec<(Value, Value)>,
+    /// Each row's place in `values`; None for a row whose first value
+    /// another row held at the statement's start, whose children are that row's
+    rows: I64Map<Option<usize>>,
+    starts: FxHashSet<Value>,
+}
 
 impl UpdateActions {
-    /// Takes `old` becoming `new`; a value the statement wrote before is
-    /// followed from the value the statement found
-    pub(crate) fn push(&mut self, column: usize, old: Value, new: Value) {
-        let at = match self.columns.iter().position(|(c, _, _)| *c == column) {
+    /// Takes the row `row` changing `column` from `old` to `new`
+    pub(crate) fn push(&mut self, row: i64, column: usize, old: Value, new: Value) {
+        let at = match self.columns.iter().position(|c| c.column == column) {
             Some(at) => at,
             None => {
-                self.columns
-                    .push((column, Vec::new(), FxHashMap::default()));
+                self.columns.push(RowChanges {
+                    column,
+                    ..RowChanges::default()
+                });
                 self.columns.len() - 1
             }
         };
-        let (_, values, by_new) = &mut self.columns[at];
-        match by_new.remove(&old) {
-            Some(earlier) => {
-                values[earlier].1 = new.clone();
-                by_new.insert(new, earlier);
+        let changes = &mut self.columns[at];
+        match changes.rows.get(row).copied() {
+            Some(Some(at)) => changes.values[at].1 = new,
+            Some(None) => {}
+            None if changes.starts.contains(&old) => {
+                changes.rows.insert(row, None);
             }
             None => {
-                by_new.insert(new.clone(), values.len());
-                values.push((old, new));
+                changes.starts.insert(old.clone());
+                changes.rows.insert(row, Some(changes.values.len()));
+                changes.values.push((old, new));
             }
         }
     }
@@ -1036,10 +1051,7 @@ impl UpdateActions {
         pending: Option<&mut PendingParents<'_>>,
     ) -> Result<()> {
         let changes: Vec<(usize, Vec<(Value, Value)>)> = (self.columns.into_iter())
-            .map(|(column, mut values, _)| {
-                values.retain(|(old, new)| !same_value(old, new));
-                (column, values)
-            })
+            .map(|changes| (changes.column, changes.values))
             .filter(|(_, values)| !values.is_empty())
             .collect();
         match changes.is_empty() {

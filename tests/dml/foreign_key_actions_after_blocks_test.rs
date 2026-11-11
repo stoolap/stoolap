@@ -19,14 +19,16 @@
 use stoolap::core::Value;
 use stoolap::Database;
 
-const TABLES: [&str; 7] = [
+const TABLES: [&str; 9] = [
     "CREATE TABLE p (id INTEGER PRIMARY KEY, code INTEGER UNIQUE, n INTEGER)",
     "CREATE TABLE cd (id INTEGER PRIMARY KEY, pd INTEGER REFERENCES p(id) ON DELETE CASCADE)",
     "CREATE TABLE cu (id INTEGER PRIMARY KEY, pc INTEGER REFERENCES p(code) ON UPDATE CASCADE ON DELETE SET NULL)",
+    "CREATE TABLE cn (id INTEGER PRIMARY KEY, pc INTEGER REFERENCES p(code) ON UPDATE SET NULL ON DELETE SET NULL)",
     "CREATE VIEW vcd AS SELECT * FROM cd",
     "INSERT INTO p VALUES (1, 5, 0), (2, 6, 0), (3, 7, 0)",
     "INSERT INTO cd VALUES (1, 1), (2, 1), (3, 2)",
     "INSERT INTO cu VALUES (1, 7), (2, 7), (3, 6)",
+    "INSERT INTO cn VALUES (1, 5)",
 ];
 
 /// A statement, its parameters, the rows it returns, and what holds after it
@@ -100,6 +102,23 @@ const CASES: &[Case] = &[
             ("SELECT COUNT(*) FROM cu WHERE pc = 700", 2),
             ("SELECT COUNT(*) FROM cu WHERE pc = 70", 0),
         ],
+    },
+    Case {
+        sql: "INSERT INTO p VALUES (3, 8, 0), (4, 7, 0), (4, 9, 0), (3, 7, 0) \
+              ON CONFLICT (id) DO UPDATE SET code = excluded.code",
+        params: &[],
+        returned: &[],
+        after: &[
+            ("SELECT COUNT(*) FROM cu WHERE pc = 7", 2),
+            ("SELECT COUNT(*) FROM cu WHERE pc = 9", 0),
+        ],
+    },
+    Case {
+        sql: "INSERT INTO p VALUES (1, 50, 0), (1, 5, 0) ON CONFLICT (id) DO UPDATE \
+              SET code = excluded.code",
+        params: &[],
+        returned: &[],
+        after: &[("SELECT COUNT(*) FROM cn WHERE pc IS NULL", 1)],
     },
 ];
 
@@ -199,4 +218,24 @@ fn a_block_sees_the_transaction_s_earlier_writes_but_not_the_cascade() {
         "the two children found and the one this transaction added"
     );
     assert_eq!(scalar(&db, "SELECT COUNT(*) FROM cd"), 1);
+}
+
+#[test]
+fn a_row_the_statement_inserts_takes_the_statement_s_cascade() {
+    let db = Database::open("memory://fk_actions_after_blocks_inserted_child").unwrap();
+    for sql in [
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, u INTEGER UNIQUE, up INTEGER REFERENCES s(u) ON UPDATE CASCADE)",
+        "INSERT INTO s VALUES (1, 1, NULL)",
+        "INSERT INTO s VALUES (1, 2, NULL), (2, 3, 1) ON CONFLICT (id) DO UPDATE SET u = excluded.u",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    assert_eq!(
+        ints(
+            db.query("SELECT id, u, up FROM s WHERE id = 2", ())
+                .unwrap()
+        ),
+        [[2, 3, 2]],
+        "the inserted row named u = 1, which the update moved to 2"
+    );
 }

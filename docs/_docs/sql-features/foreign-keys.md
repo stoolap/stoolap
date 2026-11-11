@@ -244,6 +244,8 @@ RETURNING id, (SELECT COUNT(*) FROM children WHERE children.parent_id = parents.
 -- Returns (1, 2), then the cascade removes the 2 children
 ```
 
+The actions reach the child rows that hold the parent's value at the end of the statement, a row the statement inserted too. An upsert that changes one parent row more than once acts on its children once: `CASCADE` gives them the row's last value, and `SET NULL` clears them even when the row ends with the value it started with.
+
 ### Concurrent Transactions
 
 A child row's FK check and a delete or key change of its parent row in two open transactions never both commit. The second of the two to reach the key fails with a write conflict, which can be retried once the first transaction has ended:
