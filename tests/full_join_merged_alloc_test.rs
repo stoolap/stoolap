@@ -65,11 +65,11 @@ fn run(db: &Database, sql: &str, rows: usize) -> usize {
 }
 
 /// The allocations of the full join USING over `n` rows a side, half of
-/// them matched, and of the ON join it stands for
-fn both(name: &str, n: usize) -> (usize, usize) {
+/// them matched, `t`'s key of type `key`, and of the ON join it stands for
+fn both(name: &str, n: usize, key: &str) -> (usize, usize) {
     let db = Database::open(&format!("memory://{name}")).unwrap();
     for sql in [
-        "CREATE TABLE t (k INTEGER, a INTEGER)".to_string(),
+        format!("CREATE TABLE t (k {key}, a INTEGER)"),
         "CREATE TABLE u (k INTEGER, b INTEGER)".to_string(),
         format!("INSERT INTO t SELECT g.value, g.value FROM generate_series(1, {n}) g"),
         format!(
@@ -92,7 +92,7 @@ fn both(name: &str, n: usize) -> (usize, usize) {
 #[test]
 fn a_full_join_holds_its_merged_column_without_an_allocation_per_row() {
     let _guard = serial();
-    let (merged, on) = both("full_join_merged_alloc_streaming", 600);
+    let (merged, on) = both("full_join_merged_alloc_streaming", 600, "INTEGER");
     assert!(
         merged <= on + 64,
         "{merged} allocations over USING, {on} over ON, for 900 rows"
@@ -102,9 +102,20 @@ fn a_full_join_holds_its_merged_column_without_an_allocation_per_row() {
 #[test]
 fn a_parallel_full_join_holds_its_merged_column_without_an_allocation_per_row() {
     let _guard = serial();
-    let (merged, on) = both("full_join_merged_alloc_parallel", 12_000);
+    let (merged, on) = both("full_join_merged_alloc_parallel", 12_000, "INTEGER");
     assert!(
         merged <= on + 1_000,
         "{merged} allocations over USING, {on} over ON, for 18000 rows"
+    );
+}
+
+#[test]
+fn a_nested_loop_full_join_holds_its_merged_column_without_an_allocation_per_row() {
+    let _guard = serial();
+    // A TEXT key meeting an INTEGER one is compared in the residual
+    let (merged, on) = both("full_join_merged_alloc_nested", 200, "TEXT");
+    assert!(
+        merged <= on + 64,
+        "{merged} allocations over USING, {on} over ON, for 300 rows"
     );
 }

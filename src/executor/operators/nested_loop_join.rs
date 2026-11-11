@@ -50,6 +50,8 @@ pub struct NestedLoopJoinOperator<'a> {
 
     left_col_count: usize,
     right_col_count: usize,
+    // The values past both sides' each output row is made with room for
+    room: usize,
 
     // Materialized right side (inner loop)
     right_rows: Vec<Row>,
@@ -102,6 +104,7 @@ impl<'a> NestedLoopJoinOperator<'a> {
             condition_failed: false,
             left_col_count,
             right_col_count,
+            room: 0,
             right_rows: Vec::new(),
             current_left_row: None,
             current_right_idx: 0,
@@ -119,6 +122,12 @@ impl<'a> NestedLoopJoinOperator<'a> {
     /// The statement's subquery blocks the filter calls
     pub fn with_blocks(mut self, blocks: Option<&'a dyn SubqueryExecutor>) -> Self {
         self.blocks = blocks;
+        self
+    }
+
+    /// Each output row made with room for `room` values more
+    pub(crate) fn with_room(mut self, room: usize) -> Self {
+        self.room = room;
         self
     }
 
@@ -146,7 +155,7 @@ impl<'a> NestedLoopJoinOperator<'a> {
     /// Combine left and right rows into output row.
     #[inline]
     fn combine(&self, left: &Row, right: &Row) -> Row {
-        Row::from_combined(left, right)
+        Row::from_combined_with_room(left, right, self.room)
     }
 
     /// Get the next left row from the outer input.
@@ -304,7 +313,7 @@ impl Operator for NestedLoopJoinOperator<'_> {
                 self.advance_left()?;
                 let null_right = self.null_right_row();
                 // Use owned variant - both rows are owned and won't be used again
-                let combined = Row::from_combined_owned(left_row, null_right);
+                let combined = Row::from_combined_owned_with_room(left_row, null_right, self.room);
                 return Ok(Some(RowRef::Owned(combined)));
             }
 

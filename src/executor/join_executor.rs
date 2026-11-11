@@ -959,8 +959,9 @@ impl JoinExecutor {
         }
 
         // Create nested loop join operator
-        let mut nl_op =
-            NestedLoopJoinOperator::new(left_op, right_op, join_type, filter).with_blocks(site);
+        let mut nl_op = NestedLoopJoinOperator::new(left_op, right_op, join_type, filter)
+            .with_blocks(site)
+            .with_room(self.room);
 
         // Execute with Volcano model
         self.execute_operator_with_filter(&mut nl_op, limit, &[], None)
