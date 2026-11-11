@@ -65,7 +65,7 @@ const MERGING: &[(&str, &str, &[&str])] = &[
 
 /// The join around the side, `{m}` the side, as written and as ON joins, and
 /// the columns its other tables add to a star. One that merges a column with
-/// the side's merged one merges it with the side's left column
+/// the side's merged one merges it with `{k}`, the column that one reads
 const AROUND: &[(&str, &str, &str)] = &[
     (
         "{m} JOIN u AS r ON r.id = t.a",
@@ -89,23 +89,24 @@ const AROUND: &[(&str, &str, &str)] = &[
     ),
     (
         "{m} JOIN s AS r USING (id)",
-        "{m} JOIN s AS r ON r.id = t.id",
+        "{m} JOIN s AS r ON r.id = {k}",
         ", r.x",
     ),
     (
         "{m} LEFT JOIN s AS r USING (id)",
-        "{m} LEFT JOIN s AS r ON r.id = t.id",
+        "{m} LEFT JOIN s AS r ON r.id = {k}",
         ", r.x",
     ),
     (
         "{m} NATURAL JOIN s AS r",
-        "{m} JOIN s AS r ON r.id = t.id AND r.x = u.x",
+        "{m} JOIN s AS r ON r.id = {k} AND r.x = u.x",
         "",
     ),
 ];
 
 /// Each statement over `{f}`, `{id}` the merged column; the bare name stands
-/// for the left table's column, as at the top
+/// for the column the merge reads, as at the top: the left table's, a right
+/// join's right one
 const SHAPES: &[&str] = &[
     "SELECT {id}, t.id, u.id, u.x, r.x FROM {f} WHERE COALESCE(u.x, 0) < (SELECT MAX(y) FROM w) + 100",
     "SELECT * FROM {f} WHERE COALESCE(t.b, 0) < (SELECT MAX(y) FROM w) * 100",
@@ -169,16 +170,20 @@ fn check_shapes(db: &Database, context: &str, shapes: &[&str], wrong: &mut Vec<S
     for (merging, as_on, kinds) in MERGING {
         for kind in kinds.iter() {
             let (merging, as_on) = (merging.replace("{j}", kind), as_on.replace("{j}", kind));
+            let merged = match kind.contains("RIGHT") {
+                true => "u.id",
+                false => "t.id",
+            };
             for (around, around_on, others) in AROUND {
                 let from = around.replace("{m}", &merging);
-                let from_on = around_on.replace("{m}", &as_on);
+                let from_on = around_on.replace("{m}", &as_on).replace("{k}", merged);
                 for shape in shapes {
                     let sql = shape.replace("{f}", &from).replace("{id}", "id");
-                    let star = format!("t.id, t.a, t.b, u.x{others}");
+                    let star = format!("{merged}, t.a, t.b, u.x{others}");
                     let want = shape
                         .replace("SELECT *", &format!("SELECT {star}"))
                         .replace("{f}", &from_on)
-                        .replace("{id}", "t.id");
+                        .replace("{id}", merged);
                     count += 1;
                     // A bare merged name that another table also has is
                     // ambiguous
