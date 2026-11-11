@@ -730,6 +730,7 @@ impl VolumeFileWriter {
             meta.row_count,
         );
         store.check_blocks(crcs);
+        store.build_from_row_ids(meta.row_id_column, &meta.row_ids);
         let mut unique_indices = rustc_hash::FxHashMap::default();
         for UniqueIndexing {
             columns,
@@ -1219,7 +1220,14 @@ mod tests {
 
     #[test]
     fn a_damaged_file_is_refused_where_it_is_read_and_an_aborted_writer_leaves_nothing() {
-        let schema = schema();
+        // Without a key, so the first column's blocks are decoded
+        let schema = schema()
+            .columns
+            .iter()
+            .fold(SchemaBuilder::new("t"), |b, c| {
+                b.column(&c.name, c.data_type, c.nullable, false)
+            })
+            .build();
         let (_, volume, path, dir) = written(&schema, 200, 50);
         drop(volume);
         let intact = std::fs::read(&path).unwrap();
@@ -1562,8 +1570,24 @@ mod tests {
             assert_eq!(volume.meta.row_id_column, want, "{odd:?}");
             let reread = read_volume_from_disk(&path).unwrap();
             assert_eq!(reread.meta.row_id_column, want, "{odd:?}");
+            let keys = |i: i64| if Some(i) == odd { -i } else { i };
+            for store in [&volume, &reread].map(|v| v.columns.compressed_store().unwrap()) {
+                for group in 0..2 {
+                    let start = group * ROW_GROUP_SIZE;
+                    let end = (start + ROW_GROUP_SIZE).min(rows as usize);
+                    let cells: Vec<i64> = (start as i64..end as i64).map(keys).collect();
+                    match &*store.group_column(0, group).unwrap() {
+                        ColumnData::Int64 { values, nulls } => {
+                            assert_eq!(values, &cells, "{odd:?} group {group}");
+                            assert!(!nulls.contains(&true), "{odd:?} group {group}");
+                        }
+                        _ => panic!("{odd:?}: the key is not INT64"),
+                    }
+                }
+                assert!(store.group_column(0, 2).is_err(), "{odd:?}");
+            }
             for i in [0, 3, ROW_GROUP_SIZE as i64, rows - 7, rows - 1] {
-                let key = if Some(i) == odd { -i } else { i };
+                let key = keys(i);
                 assert_eq!(
                     reread.cell(0, i as usize).unwrap(),
                     Value::Integer(key),

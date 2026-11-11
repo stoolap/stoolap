@@ -222,7 +222,8 @@ fn test_a_damaged_block_fails_the_statements_that_read_it() {
     let path = &volumes[0];
     let mut bytes = std::fs::read(path).unwrap();
     assert_eq!(&bytes[..4], b"STV5");
-    bytes[16] ^= 0xFF;
+    let at = last_block_byte(&bytes);
+    bytes[at] ^= 0xFF;
     std::fs::write(path, &bytes).unwrap();
     let db = Database::open(&dsn).unwrap();
     match run(&db, "SELECT * FROM t") {
@@ -242,6 +243,35 @@ fn bloom_words_at(bytes: &[u8], col: usize) -> usize {
 
 fn u64_at(bytes: &[u8], at: usize) -> usize {
     u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize
+}
+
+#[test]
+fn test_a_damaged_key_block_is_not_read_and_verify_reports_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (dsn, volumes) = sealed(dir.path(), "damaged_key_block");
+    let mut bytes = std::fs::read(&volumes[0]).unwrap();
+    bytes[16] ^= 0xFF;
+    std::fs::write(&volumes[0], &bytes).unwrap();
+    let db = Database::open(&dsn).unwrap();
+    assert_eq!(run(&db, "SELECT * FROM t"), Ok(ROWS as usize));
+    let ids: i64 = db.query_one("SELECT SUM(id) FROM t", ()).unwrap();
+    assert_eq!(ids, ROWS * (ROWS + 1) / 2);
+    let (status, detail) = verified(&db, "t");
+    assert_eq!(status, "damaged");
+    let detail = detail.unwrap();
+    assert!(
+        detail.contains("block CRC mismatch at column 0 (id), group 0"),
+        "{detail}"
+    );
+}
+
+/// The last byte of a V5 file's blocks, in the last column's block of a
+/// volume of one group: the sections begin after it
+fn last_block_byte(bytes: &[u8]) -> usize {
+    let table = u64_at(bytes, bytes.len() - 32);
+    let count = u32::from_le_bytes(bytes[table..table + 4].try_into().unwrap()) as usize;
+    let sections = (0..count).map(|i| u64_at(bytes, table + 8 + i * 40 + 8));
+    sections.min().unwrap() - 1
 }
 
 /// Where the bloom section (kind 9) of a V5 file's bytes begins
@@ -553,13 +583,14 @@ fn test_verify_reads_a_block_damaged_after_the_group_was_cached() {
     // Every group of t decoded into the group cache, then the file damaged
     assert_eq!(run(&db, "SELECT * FROM t"), Ok(ROWS as usize));
     let mut bytes = std::fs::read(&volumes[0]).unwrap();
-    bytes[16] ^= 0xFF;
+    let at = last_block_byte(&bytes);
+    bytes[at] ^= 0xFF;
     std::fs::write(&volumes[0], &bytes).unwrap();
     let (status, detail) = verified(&db, "t");
     assert_eq!(status, "damaged");
     let detail = detail.unwrap();
     assert!(
-        detail.contains("block CRC mismatch at column 0 (id), group 0"),
+        detail.contains("block CRC mismatch at column 2 (w), group 0"),
         "{detail}"
     );
     assert_eq!(verified(&db, "u"), ("ok".to_string(), None));
@@ -569,7 +600,7 @@ fn test_verify_reads_a_block_damaged_after_the_group_was_cached() {
     let db = Database::open(&dsn).unwrap();
     match run(&db, "SELECT * FROM t") {
         Err(msg) => assert!(
-            msg.contains("block CRC mismatch at column 0, group 0")
+            msg.contains("block CRC mismatch at column 2, group 0")
                 && msg.contains(volumes[0].file_name().unwrap().to_str().unwrap()),
             "got: {msg}"
         ),
