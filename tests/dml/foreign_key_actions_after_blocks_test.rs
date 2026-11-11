@@ -120,6 +120,16 @@ const CASES: &[Case] = &[
         returned: &[],
         after: &[("SELECT COUNT(*) FROM cn WHERE pc IS NULL", 1)],
     },
+    Case {
+        sql: "INSERT INTO p VALUES (3, 70, 0), (4, 700, 0) ON CONFLICT (id) DO UPDATE \
+              SET id = excluded.id + 1, code = excluded.code",
+        params: &[],
+        returned: &[],
+        after: &[
+            ("SELECT COUNT(*) FROM cu WHERE pc = 700", 2),
+            ("SELECT COUNT(*) FROM p WHERE id = 5 AND code = 700", 1),
+        ],
+    },
 ];
 
 fn ints(rows: stoolap::Rows) -> Vec<Vec<i64>> {
@@ -237,5 +247,24 @@ fn a_row_the_statement_inserts_takes_the_statement_s_cascade() {
         ),
         [[2, 3, 2]],
         "the inserted row named u = 1, which the update moved to 2"
+    );
+}
+
+#[test]
+fn a_value_an_upsert_changes_back_cascades_into_no_column() {
+    let db = Database::open("memory://fk_actions_after_blocks_changed_back").unwrap();
+    for sql in [
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, a INTEGER UNIQUE, \
+         b INTEGER UNIQUE REFERENCES s(a) ON UPDATE CASCADE, c INTEGER REFERENCES s(b) ON UPDATE CASCADE)",
+        "INSERT INTO s VALUES (1, 1, 1, NULL)",
+        "INSERT INTO s VALUES (1, 2, 2, NULL), (1, 1, 1, NULL) ON CONFLICT (id) DO UPDATE \
+         SET a = excluded.a, b = excluded.b",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    assert_eq!(
+        ints(db.query("SELECT a, b FROM s", ()).unwrap()),
+        [[1, 1]],
+        "the row ends as it started"
     );
 }

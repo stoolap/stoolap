@@ -3739,7 +3739,7 @@ impl Executor {
             }
         }
         let mut fk_rows: Vec<Row> = Vec::new();
-        let mut ref_changes: Vec<(usize, Value, Value)> = Vec::new();
+        let mut ref_changes: Vec<(i64, usize, Value, Value)> = Vec::new();
         // A row whose primary key the update changes moves to its new id (move_rows)
         let key_set = schema
             .pk_column_index()
@@ -3827,7 +3827,7 @@ impl Executor {
             for (idx, new_value) in updates_to_apply {
                 if let Some(old) = row.get(idx).filter(|old| **old != new_value) {
                     if !old.is_null() && fks_by_ref_col.contains_key(&idx) {
-                        ref_changes.push((idx, old.clone(), new_value.clone()));
+                        ref_changes.push((id, idx, old.clone(), new_value.clone()));
                     }
                     fk_moved |= schema.foreign_keys.iter().any(|fk| fk.column_index == idx);
                 }
@@ -3876,6 +3876,13 @@ impl Executor {
             let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
             table.update(access, where_expr.as_deref(), &mut setter)?
         };
+        // A moved row's id is its new primary key
+        let moved: smallvec::SmallVec<[(i64, i64); 1]> = (moves.iter())
+            .filter_map(|(id, row)| match key_set.and_then(|pk| row.get(pk)) {
+                Some(Value::Integer(to)) => Some((*id, *to)),
+                _ => None,
+            })
+            .collect();
         move_rows(&mut **table, moves)?;
 
         let txn_id = table.txn_id();
@@ -3888,7 +3895,7 @@ impl Executor {
                 pending_parents,
             )?;
         }
-        for (idx, old, new) in ref_changes {
+        for (id, idx, old, new) in ref_changes {
             let Some(fks) = fks_by_ref_col.get(&idx) else {
                 continue;
             };
@@ -3901,7 +3908,10 @@ impl Executor {
                     fks,
                 )?;
             }
-            update_actions.push(row_id, idx, old, new);
+            update_actions.push(id, idx, old, new);
+        }
+        for (from, to) in moved {
+            update_actions.moved(from, to);
         }
 
         Ok((updated > 0, captured_row))

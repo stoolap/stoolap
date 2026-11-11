@@ -1043,6 +1043,15 @@ impl UpdateActions {
         }
     }
 
+    /// Follows the row `from` to the id `to` its new primary key gives it
+    pub(crate) fn moved(&mut self, from: i64, to: i64) {
+        for changes in &mut self.columns {
+            if let Some(at) = changes.rows.remove(from) {
+                changes.rows.insert(to, at);
+            }
+        }
+    }
+
     pub(crate) fn run(
         self,
         engine: &MVCCEngine,
@@ -1289,10 +1298,12 @@ fn run_update_action(
     let fk = &action.fk;
     let child_table = action.child_table.as_str();
     let from = &columns[action.from];
+    let set_null = fk.on_update == ForeignKeyAction::SetNull;
+    // A value changed back leaves the children of any other action as they are
     let changes: Vec<(Value, Value)> = from
         .values
         .iter()
-        .filter(|t| t.changed)
+        .filter(|t| t.changed && (set_null || !same_value(&t.old, &t.new)))
         .map(|t| (t.old.clone(), t.new.clone()))
         .collect();
     if changes.is_empty() {
@@ -1342,7 +1353,6 @@ fn run_update_action(
     let col_name = &child_schema.columns[col_idx].name;
     // The child stores the parent's value in its own column type, checked as stored
     let col_type = child_schema.columns[col_idx].data_type;
-    let set_null = fk.on_update == ForeignKeyAction::SetNull;
     let mut reached = false;
     for (old_value, new_value) in &changes {
         if !child_rows_exist(engine, txn_id, child_table, fk, old_value)? {
