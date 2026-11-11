@@ -675,7 +675,7 @@ fn side_pairs(
             excluded.push(right);
         }
         // A merge over another reads the column at the end of their chain
-        let read = held.merged_at(left);
+        let read = held.side_merged_at(left);
         let name = bare_name(&columns[left]);
         let named = renames
             .iter()
@@ -5494,7 +5494,7 @@ impl Executor {
                     let mut named = left_columns.clone();
                     let left_width = left_columns.len();
                     for (left, ..) in held.side_merges().filter(|&(l, ..)| l < left_width) {
-                        let read = held.merged_at(left);
+                        let read = held.side_merged_at(left);
                         named[read] = bare_name(&named[read]).to_string();
                     }
                     std::borrow::Cow::Owned(named)

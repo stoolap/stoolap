@@ -173,6 +173,11 @@ fn a_merged_column_reads_the_side_its_join_kind_keeps() {
             ints(&[&[s(3), s(1)]]),
         ),
         (
+            "SELECT *, ROW_NUMBER() OVER () FROM p1 RIGHT JOIN p2 USING (k) \
+             RIGHT JOIN p3 USING (k) WHERE k > $1",
+            ints(&[&[s(3), s(1)]]),
+        ),
+        (
             "SELECT k, a, b FROM w RIGHT JOIN (SELECT * FROM t RIGHT JOIN u USING (k)) x \
              USING (k) WHERE b > $1 ORDER BY k",
             ints(&[&[s(2), s(20), s(200)], &[s(3), N, s(300)]]),
