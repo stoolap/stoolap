@@ -1455,12 +1455,34 @@ fn check_changed(
     Ok(())
 }
 
+/// An error when another table's foreign key names `parent_table`, which a
+/// DROP TABLE without CASCADE would leave naming nothing. The table's keys
+/// into itself go with it
+pub(crate) fn check_no_referencing_keys(engine: &MVCCEngine, parent_table: &str) -> Result<()> {
+    let referencing = find_referencing_fks(engine, parent_table);
+    // The keys store the child's name in lower case
+    let own = parent_table.to_lowercase();
+    let Some((child_table, fk)) = referencing.iter().find(|(child, _)| *child != own) else {
+        return Ok(());
+    };
+    Err(Error::foreign_key_violation(
+        child_table,
+        &fk.column_name,
+        parent_table,
+        &fk.referenced_column,
+        format!(
+            "cannot drop table '{parent_table}': table '{child_table}' references it, \
+             DROP TABLE ... CASCADE drops the reference"
+        ),
+    ))
+}
+
 /// Check if any child tables have rows that actually reference the given parent table.
-/// Used by DROP TABLE and TRUNCATE to ensure no referencing rows exist.
+/// Used by TRUNCATE to ensure no referencing rows exist.
 /// Only counts rows where the FK column is non-NULL (NULL means "no reference").
 ///
 /// Blocks for ALL FK action types (RESTRICT, CASCADE, SET NULL, NO ACTION) because
-/// DROP TABLE/TRUNCATE are DDL operations that don't cascade to child rows — they
+/// TRUNCATE is a DDL operation that doesn't cascade to child rows: it
 /// would leave orphaned references. The user must delete child rows first.
 ///
 /// When `txn_id` is provided, uses the caller's transaction for visibility (sees
@@ -1476,11 +1498,10 @@ pub(crate) fn check_no_referencing_rows(
         return Ok(());
     }
 
-    // A table's rows that reference the table itself go with it
-    for (child_table, fk) in referencing
-        .iter()
-        .filter(|(child, _)| !child.eq_ignore_ascii_case(parent_table))
-    {
+    // A table's rows that reference the table itself go with it; the keys
+    // store the child's name in lower case
+    let own = parent_table.to_lowercase();
+    for (child_table, fk) in referencing.iter().filter(|(child, _)| *child != own) {
         // Build IS NOT NULL filter on the FK column — pushed down to storage layer
         // so indexes can be used and we stop after the first match (limit=1)
         // The filter's positions come from the handle that reads the rows

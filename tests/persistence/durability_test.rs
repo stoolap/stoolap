@@ -9041,14 +9041,13 @@ fn test_drop_parent_strips_child_fk_on_recovery() {
         )
         .unwrap();
 
-        // Insert data into parent and child with NULL FK (so drop isn't blocked)
         db.execute("INSERT INTO parent_drop VALUES (1, 'Alice')", ())
             .unwrap();
         db.execute("INSERT INTO child_drop VALUES (1, NULL, 'x')", ())
             .unwrap();
 
-        // Drop parent — in-memory, child FK is stripped
-        db.execute("DROP TABLE parent_drop", ()).unwrap();
+        // Drop parent with CASCADE: in-memory, child FK is stripped
+        db.execute("DROP TABLE parent_drop CASCADE", ()).unwrap();
 
         // Verify child FK is gone in memory: insert with any pid should work
         db.execute("INSERT INTO child_drop VALUES (2, 999, 'y')", ())

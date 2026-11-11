@@ -258,29 +258,22 @@ FK checks read the newest committed rows, also in a transaction under `SNAPSHOT`
 
 ### DROP TABLE
 
-DROP TABLE is blocked if any child table has rows with non-NULL FK values referencing the table, regardless of the FK action (RESTRICT, CASCADE, or SET NULL). Rows of the table itself that reference it go with it and do not block. DDL operations do not cascade to child rows:
+DROP TABLE is blocked while another table's foreign key references the table, whatever rows the child holds and whatever the key's action. A key of the table into itself goes with it and does not block. `DROP TABLE ... CASCADE` drops the table together with the foreign keys that reference it: the child tables keep their rows and their columns, which are no longer foreign keys. DDL operations do not cascade to child rows:
 
 ```sql
--- Blocked: child rows reference this table
+-- Blocked: children's key references this table, with or without rows
 DROP TABLE parents;
--- Error: cannot drop/truncate table 'parents', rows in 'children' still reference it
+-- Error: cannot drop table 'parents': table 'children' references it, DROP TABLE ... CASCADE drops the reference
 
--- Solution: delete child rows first, then drop
-DELETE FROM children WHERE parent_id IS NOT NULL;
-DROP TABLE parents;
-```
-
-When a parent table is dropped (after child references are cleared), FK constraints referencing it are automatically stripped from child table schemas:
-
-```sql
-DROP TABLE parents;
+-- Either drop the child first, or drop the key with the parent
+DROP TABLE parents CASCADE;
 -- children.parent_id is no longer a FK, inserts with any value succeed
 INSERT INTO children VALUES (1, 999, 'No FK');
 ```
 
 ### TRUNCATE TABLE
 
-TRUNCATE is blocked when child tables have referencing rows, same as DROP TABLE:
+TRUNCATE is blocked when child tables have referencing rows:
 
 ```sql
 -- Blocked if children reference this table

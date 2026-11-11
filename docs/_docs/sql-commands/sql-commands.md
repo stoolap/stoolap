@@ -728,14 +728,17 @@ Removes a table and all its data.
 #### Basic Syntax
 
 ```sql
-DROP TABLE [IF EXISTS] table_name;
+DROP TABLE [IF EXISTS] table_name [CASCADE];
 ```
+
+A table another table's foreign key references is not dropped. `CASCADE` drops those foreign keys with it; the referencing tables keep their rows.
 
 #### Examples
 
 ```sql
 DROP TABLE temporary_data;
 DROP TABLE IF EXISTS old_logs;
+DROP TABLE customers CASCADE;
 ```
 
 ### CREATE VIEW
