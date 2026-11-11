@@ -881,9 +881,22 @@ struct DdlShared {
     /// The epoch at which every name last changed together, by an open or
     /// a restore
     name_floor: AtomicU64,
+    /// Whether the open or a restore found a table whose column takes the
+    /// row identity's name; a table's reads ask its schema only then
+    reserved_names: AtomicBool,
 }
 
 impl DdlShared {
+    /// An error when `store`'s table has a column of the row identity's
+    /// name, as only an older build let one: it serves DDL alone
+    #[inline]
+    fn check_reserved(&self, store: &VersionStore) -> Result<()> {
+        if self.reserved_names.load(Ordering::Acquire) {
+            store.schema().check_column_names()?;
+        }
+        Ok(())
+    }
+
     /// Moves the schema epoch for a change to the tables or views `names`,
     /// lower case, which take the new epoch as their own
     fn changed(&self, names: &[&str]) {
@@ -1258,6 +1271,7 @@ impl MVCCEngine {
                 schema_epoch: AtomicU64::new(0),
                 name_epochs: parking_lot::RwLock::new(FxHashMap::default()),
                 name_floor: AtomicU64::new(0),
+                reserved_names: AtomicBool::new(false),
             }),
             instance: NEXT_ENGINE_INSTANCE.fetch_add(1, Ordering::Relaxed),
             stats_epoch: AtomicU64::new(0),
@@ -1386,15 +1400,7 @@ impl MVCCEngine {
                 // read via normalize_row_to_schema would get NULL instead of the column default.
                 self.populate_schema_defaults();
 
-                // A column an older build let take the row identity's name
-                // opens no database
-                {
-                    let schemas = (self.schemas.read())
-                        .map_err(|_| Error::internal("schemas lock poisoned"))?;
-                    for schema in schemas.values() {
-                        schema.check_column_names()?;
-                    }
-                }
+                self.note_reserved_names();
 
                 // A volume an older build left holding a column in another
                 // type than the schema's is rewritten before any mapping
@@ -4062,6 +4068,17 @@ impl MVCCEngine {
         refresh_schema(&self.version_stores, &self.schemas, &self.ddl, table_name)
     }
 
+    /// Notes whether a table's column takes the row identity's name, as only
+    /// an older build let one, and warns of each: such a table serves DDL alone
+    fn note_reserved_names(&self) {
+        for schema in self.schemas.read().unwrap().values() {
+            if let Err(e) = schema.check_column_names() {
+                self.ddl.reserved_names.store(true, Ordering::Release);
+                eprintln!("Warning: {e}");
+            }
+        }
+    }
+
     /// Get or create a segment manager for a table.
     fn get_or_create_segment_manager(
         &self,
@@ -6127,16 +6144,20 @@ impl MVCCEngine {
         // before the destructive step. Without this, a corrupt .vol would fail after
         // WAL/volumes are already deleted, causing total data loss.
         for (table_name, path) in &snapshot_files {
-            // A schema an older build kept with the row identity's name is
-            // refused here, before anything is removed
-            let checked = super::snapshot::SnapshotReader::open(path)
-                .and_then(|reader| reader.schema().check_column_names());
-            if let Err(e) = checked {
-                self.registry.start_accepting_transactions();
-                return Err(Error::internal(format!(
-                    "Snapshot validation failed for table {}: {}",
-                    table_name, e
-                )));
+            match super::snapshot::SnapshotReader::open(path) {
+                // A table of the row identity's name serves DDL alone from the
+                // moment it loads, should the restore stop after it
+                Ok(reader) if reader.schema().check_column_names().is_err() => {
+                    self.ddl.reserved_names.store(true, Ordering::Release);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    self.registry.start_accepting_transactions();
+                    return Err(Error::internal(format!(
+                        "Snapshot validation failed for table {}: {}",
+                        table_name, e
+                    )));
+                }
             }
             // Also validate companion .vol if it exists (will be used by load_table_snapshot_as_volume)
             let vol_path = path.with_extension("vol");
@@ -6302,6 +6323,11 @@ impl MVCCEngine {
             } else {
                 self.load_table_snapshot(table_name, snapshot_path)
             };
+            #[cfg(feature = "test-failpoints")]
+            let load_result = match crate::test_failpoints::restore_load_fails() {
+                true => Err(Error::internal("injected restore load failure")),
+                false => load_result,
+            };
 
             match load_result {
                 Ok(_source_lsn) => {
@@ -6378,6 +6404,7 @@ impl MVCCEngine {
 
         // Populate default values from DEFAULT expressions
         self.populate_schema_defaults();
+        self.note_reserved_names();
 
         // Sync auto-increment counters from segment managers.
         // Without this, tables loaded as volumes would have stale counters
@@ -9229,7 +9256,7 @@ impl MVCCEngine {
             self.get_or_create_segment_manager(table_name)
                 .check_available()?;
         }
-        Ok(())
+        self.ddl.check_reserved(store)
     }
 
     /// Row `row_id` in the latest committed state: its hot version as the
@@ -9986,6 +10013,9 @@ impl TransactionEngineOperations for EngineOperations {
             .cloned()
             .ok_or_else(|| Error::TableNotFound(table_name_lower.to_string()))?;
         drop(stores);
+        if !matches!(table_use, TableUse::Ddl | TableUse::Metadata) {
+            self.ddl.check_reserved(&version_store)?;
+        }
 
         // Check if we have a cached transaction version store for this
         // (txn_id, table_name); a new one comes admitted at the layout read
@@ -10006,8 +10036,8 @@ impl TransactionEngineOperations for EngineOperations {
             // A store published later would not reach a read handle, so one
             // is taken only where the statement cannot write
             let reads_only = || match table_use {
-                TableUse::Write => false,
-                TableUse::Read | TableUse::KeyCheck => true,
+                TableUse::Write | TableUse::Ddl => false,
+                TableUse::Read | TableUse::KeyCheck | TableUse::Metadata => true,
                 TableUse::ReadBesideWrites => version_store.schema().foreign_keys.is_empty(),
             };
             if let Some(cached) = found {

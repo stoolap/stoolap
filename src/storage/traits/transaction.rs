@@ -275,6 +275,10 @@ pub enum TableUse {
     /// It checks a foreign key: it writes no table, and reads the newest
     /// commits under any isolation
     KeyCheck,
+    /// It changes or drops the table's definition, and may write the table
+    Ddl,
+    /// It reads the table's definition and none of its rows
+    Metadata,
 }
 
 /// The query executor's table for its own statements on the thread that
@@ -298,6 +302,9 @@ pub(crate) trait StatementTable {
         view: Option<&StatementView>,
         table_use: TableUse,
     ) -> Result<Box<dyn Table>>;
+
+    /// The table a DDL statement changes or drops
+    fn get_ddl_table(&self, name: &str) -> Result<Box<dyn Table>>;
 }
 
 impl<T: Transaction + ?Sized> StatementTable for T {
@@ -326,6 +333,11 @@ impl<T: Transaction + ?Sized> StatementTable for T {
         table_use: TableUse,
     ) -> Result<Box<dyn Table>> {
         self.get_table_ungated_for(name, StatementAccess(()), view.cloned(), table_use)
+    }
+
+    #[inline]
+    fn get_ddl_table(&self, name: &str) -> Result<Box<dyn Table>> {
+        self.get_table_ungated_for(name, StatementAccess(()), None, TableUse::Ddl)
     }
 }
 

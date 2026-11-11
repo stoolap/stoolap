@@ -609,12 +609,19 @@ impl Schema {
         self.pk_column_index()
     }
 
-    /// An error naming the table when a column takes the name of the row's
-    /// identity, as only a schema an older build kept can
+    /// An error naming the table and the way out when a column takes the
+    /// name of the row's identity, as only a schema an older build kept can
     pub fn check_column_names(&self) -> Result<()> {
         for col in &self.columns {
-            check_column_name(&col.name)
-                .map_err(|e| Error::invalid_argument(format!("table {}: {e}", self.table_name)))?;
+            check_column_name(&col.name).map_err(|e| {
+                Error::invalid_argument(format!(
+                    "table {table}: {e}; rename the column first: \
+                     ALTER TABLE {table} RENAME COLUMN {column} TO <name>, \
+                     or drop it",
+                    table = self.table_name,
+                    column = col.name.escape_debug(),
+                ))
+            })?;
         }
         Ok(())
     }

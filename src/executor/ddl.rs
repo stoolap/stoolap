@@ -1093,19 +1093,53 @@ impl Executor {
             return Err(Error::IndexNotFound(index_name.to_string()));
         };
 
+        // The table is opened before the drop is recorded: a refusal records nothing
+        let tx = self.begin_transaction()?;
+        let table = tx.get_ddl_table(&table_name)?;
+
         // Record index drop to WAL BEFORE applying in-memory change.
         // This prevents ghost state where the index is removed from memory
         // but still exists in WAL (would reappear after crash recovery).
         self.engine.record_drop_index(&table_name, &index_name)?;
 
         // Now apply the in-memory change
-        let tx = self.begin_transaction()?;
-        let table = tx.get_statement_table(&table_name)?;
         table.drop_index(&index_name)?;
         self.engine.discard_uncovered_side_files(&table_name);
         self.engine.index_changed(&table_name);
 
         Ok(Box::new(ExecResult::empty()))
+    }
+
+    /// An error when `column` takes the row identity's name and a view's
+    /// text names it: an older build read the column there, and once the
+    /// column is renamed or dropped the same text reads the row identity
+    fn check_views_keep_reserved_reads(&self, column: &str) -> Result<()> {
+        if crate::core::check_column_name(column).is_ok() {
+            return Ok(());
+        }
+        for name in self.engine.list_views()? {
+            let Some(view) = self.engine.get_view_lowercase(&name)? else {
+                continue;
+            };
+            let mut lexer = crate::parser::Lexer::new(&view.query);
+            loop {
+                let token = lexer.next_token();
+                match token.token_type {
+                    crate::parser::TokenType::Eof | crate::parser::TokenType::Error => break,
+                    crate::parser::TokenType::Identifier
+                        if crate::core::check_column_name(&token.literal).is_err() =>
+                    {
+                        return Err(Error::invalid_argument(format!(
+                            "view {} reads {}, which names the row identity once column \
+                             {column} is renamed or dropped; drop or replace the view first",
+                            view.original_name, token.literal
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Execute an ALTER TABLE statement
@@ -1129,7 +1163,7 @@ impl Executor {
 
         // Get the table for modifications
         let mut tx = self.begin_transaction()?;
-        let mut table = tx.get_statement_table(table_name)?;
+        let mut table = tx.get_ddl_table(table_name)?;
 
         // Process the single ALTER TABLE operation
         match stmt.operation {
@@ -1246,6 +1280,7 @@ impl Executor {
             }
             AlterTableOperation::DropColumn => {
                 if let Some(ref col_name) = stmt.column_name {
+                    self.check_views_keep_reserved_reads(&col_name.value)?;
                     // A column another CHECK reads stays; its own CHECK goes with it
                     let schema = self.engine.get_table_schema(table_name)?;
                     if let Some(idx) = schema.get_column_index(&col_name.value) {
@@ -1282,6 +1317,7 @@ impl Executor {
             }
             AlterTableOperation::RenameColumn => match (&stmt.column_name, &stmt.new_column_name) {
                 (Some(old_name), Some(new_name)) => {
+                    self.check_views_keep_reserved_reads(&old_name.value)?;
                     let mut change = self.engine.begin_column_change(table_name)?;
                     let previous_schema = self.engine.get_table_schema(table_name)?;
                     // Refused before anything changes when a volume would not map

@@ -1060,7 +1060,7 @@ impl Database {
     pub fn table_exists(&self, name: &str) -> Result<bool> {
         let engine = &self.inner.shared.engine;
         let tx = engine.begin_transaction()?;
-        Ok(tx.get_read_table_at(name, None, TableUse::Read).is_ok())
+        Ok(tx.get_read_table_at(name, None, TableUse::Metadata).is_ok())
     }
 
     /// Get the DSN this database was opened with

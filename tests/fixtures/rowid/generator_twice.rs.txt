@@ -1,0 +1,20 @@
+//! Writes a database whose snapshot holds two tables naming a column after
+//! the row identity, both renamed since
+use stoolap::Database;
+
+fn main() {
+    let out = std::env::args().nth(1).expect("an output directory");
+    let db = Database::open(&format!("file://{out}/snapshot_named_rowid_twice")).unwrap();
+    for table in ["t", "t2"] {
+        db.execute(&format!("CREATE TABLE {table} (a INTEGER, _rowid_ INTEGER)"), ())
+            .unwrap();
+        db.execute(&format!("INSERT INTO {table} VALUES (1, 10), (2, 20)"), ())
+            .unwrap();
+    }
+    db.execute("PRAGMA SNAPSHOT", ()).unwrap();
+    for table in ["t", "t2"] {
+        db.execute(&format!("ALTER TABLE {table} RENAME COLUMN _rowid_ TO b"), ())
+            .unwrap();
+    }
+    db.close().unwrap();
+}
