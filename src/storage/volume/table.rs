@@ -2476,6 +2476,14 @@ impl SegmentedTable {
         else {
             return Ok(false);
         };
+        // Descending, a NaN the range takes in comes before every key
+        if !keep.ascending {
+            let (low, high) =
+                Self::i64_bounds(schema, comparisons, def).unwrap_or((i64::MIN, i64::MAX));
+            if Self::range_misses_nan(cs, def, &KeyRange::I64(low, high)) {
+                return Ok(false);
+            }
+        }
         let Some((mut low, mut high)) = self.side_positions(side, def, comparisons)? else {
             return Ok(false);
         };
@@ -2785,6 +2793,16 @@ impl SegmentedTable {
         physical.is_none_or(|p| cs.volume.meta.nan_count(p) != Some(0))
     }
 
+    /// Whether `keys` read from the side file would miss a NaN of the
+    /// volume that the range takes in: one open above
+    fn range_misses_nan(
+        cs: &super::manifest::ColdSegment,
+        def: &SideIndexDef,
+        keys: &KeyRange<'_>,
+    ) -> bool {
+        matches!(keys, KeyRange::I64(_, i64::MAX)) && Self::may_hold_unkeyed_nan(cs, def)
+    }
+
     /// Whether a volume's side file is asked for `keys` under `def`,
     /// decided before any page is read: the file must hold the index's
     /// entry over the volume's column, the directory must not rule the
@@ -2806,7 +2824,7 @@ impl SegmentedTable {
             READS.count(&READS.ineligible, 1);
             return Ok(SideAdmission::Scan);
         };
-        if matches!(keys, KeyRange::I64(_, i64::MAX)) && Self::may_hold_unkeyed_nan(cs, def) {
+        if Self::range_misses_nan(cs, def, &keys) {
             READS.count(&READS.ineligible, 1);
             return Ok(SideAdmission::Scan);
         }
@@ -7161,10 +7179,6 @@ impl Table for SegmentedTable {
         else {
             return Ok(None);
         };
-        // NaN, which no zone map bounds, comes first descending
-        if !ascending && schema.columns[col_idx].data_type == DataType::Float {
-            return Ok(None);
-        }
         let null_free = !schema.columns[col_idx].nullable
             || where_expr.is_some_and(|w| index_plan::excludes_null(w, schema, column_name));
         let bounded = self.bounds_order(Some(col_idx));
@@ -7204,6 +7218,9 @@ impl Table for SegmentedTable {
                 .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
 
             let volumes = self.segment_mgr.get_volumes_newest_first_lazy();
+            // A NaN, which no zone map bounds, comes first descending
+            let nan_first =
+                |vol: &FrozenVolume, vcol: usize| !ascending && vol.meta.nan_count(vcol) != Some(0);
             // Every volume must carry the column: one sealed before it was
             // added reads its default, which no zone map bounds
             let mut ordered: Vec<(usize, usize, Option<&Value>)> =
@@ -7216,7 +7233,7 @@ impl Table for SegmentedTable {
                     return Ok(Some(None));
                 };
                 let bound = match vol.meta.zone_maps.get(vcol) {
-                    Some(zm) if bounded => keep.zone_bound(zm, null_free),
+                    Some(zm) if bounded && !nan_first(vol, vcol) => keep.zone_bound(zm, null_free),
                     _ => ZoneBound::Unbounded,
                 };
                 match bound {
@@ -7418,13 +7435,14 @@ impl Table for SegmentedTable {
                 }
                 // Row groups in bound order, clipped to the narrowed range; a
                 // volume without group metadata is one group
+                let group_bounds = bounded && !nan_first(vol, vcol);
                 let mut groups: Vec<(usize, usize, Option<&Value>)> = vol
                     .meta
                     .row_groups
                     .iter()
                     .filter_map(|rg| {
                         let bound = match rg.zone_maps.get(vcol) {
-                            Some(zm) if bounded => match keep.zone_bound(zm, null_free) {
+                            Some(zm) if group_bounds => match keep.zone_bound(zm, null_free) {
                                 ZoneBound::Empty => return None,
                                 ZoneBound::Unbounded => None,
                                 ZoneBound::Key(key) => Some(key),
