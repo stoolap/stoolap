@@ -240,9 +240,6 @@ impl PlannedUpdate {
     }
 }
 
-/// Asked of the version of the row a delete would delete, by its row id
-pub type RowJudge<'a> = dyn FnMut(i64, &Row) -> Result<bool> + 'a;
-
 pub trait Table: Send + Sync {
     /// Returns the name of the table
     fn name(&self) -> &str;
@@ -435,17 +432,17 @@ pub trait Table: Send + Sync {
     /// The number of rows deleted
     fn delete_by_row_ids(&mut self, row_ids: &[i64]) -> Result<i32>;
 
-    /// Deletes the rows of `row_ids` whose version `judge` passes, asked of
-    /// the version deleted, the one the commit checks. A version this
-    /// transaction wrote, or one a commit `found` sees made, is the version
-    /// the ids were found in and is not asked; a row another transaction
-    /// deleted since is neither deleted nor counted. On return `row_ids`
-    /// holds the ids deleted, in the order given.
-    fn delete_judged(
+    /// Deletes the rows of `row_ids` that hold the version they were found
+    /// in: one this transaction wrote, a hot one a commit `found` sees made,
+    /// or a sealed one in a volume of commits complete at `found`. Any other
+    /// row is left in place and handed to `changed` as it is now, for the
+    /// caller to judge outside this call; one deleted since is neither. On
+    /// return `row_ids` holds the ids deleted, in the order given.
+    fn delete_found(
         &mut self,
         row_ids: &mut Vec<i64>,
         found: &CommitCut,
-        judge: &mut RowJudge<'_>,
+        changed: &mut Vec<(i64, Row)>,
     ) -> Result<i32>;
 
     /// Returns all active row IDs visible to the current transaction.

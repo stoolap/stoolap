@@ -21,6 +21,7 @@
 
 use crate::common::names::eq_names;
 use crate::common::CompactArc;
+use crate::common::I64Set;
 use crate::common::SmartString;
 use crate::core::integer::integer_neg;
 use crate::core::{DataType, Error, Result, Row, RowVec, Schema, Value, ROWID_SLOT};
@@ -3295,17 +3296,19 @@ impl Executor {
                 None
             };
 
-            // A row changed since it was found is asked its WHERE as the version deleted holds it
+            // A row changed since it was found is asked its WHERE as it is now,
+            // the row id past its columns when the statement's programs read it
             let no_row = Row::new();
             let run_ctx = dml_run
                 .as_ref()
                 .filter(|_| where_prepared)
                 .map(|run| run.context(&no_row));
+            let judge_widens = dml_run.as_ref().is_some_and(|r| r.widens());
             let whole_storage = where_expr.as_deref().filter(|_| !needs_memory_filter);
             let mut returned: FxHashMap<i64, Row> = FxHashMap::default();
             let mut judge = |row_id: i64, row: &Row| -> Result<bool> {
                 let widened;
-                let row = match returns_widened {
+                let row = match judge_widens {
                     true => {
                         widened = super::prepared_select::widened(row.clone(), row_id);
                         &widened
@@ -3354,12 +3357,47 @@ impl Executor {
                 // The rows go in one call, read once from the volumes they sit in
                 #[cfg(any(test, feature = "test-failpoints"))]
                 crate::test_failpoints::delete_rows_scanned();
-                delete_count = table.delete_judged(&mut row_ids, &found, &mut judge)?;
+                // Taken before each call reads: the cut of the call after it
+                let mut next_cut = self.engine.registry_ref().commit_cut();
+                let mut changed: Vec<(i64, Row)> = Vec::new();
+                delete_count = table.delete_found(&mut row_ids, &found, &mut changed)?;
+                // The rows changed since they were found are judged outside
+                // the storage call, then named again under the cut taken
+                // before the versions judged were read
+                let mut rejudged: Vec<i64> = Vec::new();
+                // Rounds the changed rows may take before the delete gives up
+                const CHANGED_ROUNDS: usize = 3;
+                let mut rounds = 0;
+                while !changed.is_empty() {
+                    rounds += 1;
+                    if rounds > CHANGED_ROUNDS {
+                        return Err(Error::internal(format!(
+                            "write conflict: the rows of table '{table_name}' kept changing while the delete read them"
+                        )));
+                    }
+                    let mut passing: Vec<i64> = Vec::with_capacity(changed.len());
+                    for (row_id, row) in changed.drain(..) {
+                        if judge(row_id, &row)? {
+                            passing.push(row_id);
+                        }
+                    }
+                    if passing.is_empty() {
+                        break;
+                    }
+                    let cut =
+                        std::mem::replace(&mut next_cut, self.engine.registry_ref().commit_cut());
+                    delete_count += table.delete_found(&mut passing, &cut, &mut changed)?;
+                    rejudged.extend(passing);
+                }
                 // In the order the rows were found, as deleted; a row gone or
                 // no longer passing since then was not deleted and is not returned
+                let rejudged: Option<I64Set> =
+                    (!rejudged.is_empty()).then(|| rejudged.into_iter().collect());
                 let mut deleted = row_ids.iter().peekable();
                 for (row_id, row) in found_rows {
                     if deleted.next_if_eq(&&row_id).is_some() {
+                        returning_rows.push(row);
+                    } else if rejudged.as_ref().is_some_and(|ids| ids.contains(row_id)) {
                         returning_rows.push(returned.remove(&row_id).unwrap_or(row));
                     }
                 }

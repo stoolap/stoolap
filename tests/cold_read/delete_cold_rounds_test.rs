@@ -215,9 +215,7 @@ fn a_delete_of_scanned_rows_reads_no_file_under_the_fence() {
         let mut txn = db.engine().begin_transaction().unwrap();
         let mut table = txn.get_table("t").unwrap();
         let deleted = table
-            .delete_judged(&mut vec![1, 3], &CommitCut::through(0), &mut |_, _| {
-                Ok(true)
-            })
+            .delete_found(&mut vec![1, 3], &CommitCut::every(), &mut Vec::new())
             .unwrap();
         drop(table);
         txn.commit().unwrap();
@@ -458,7 +456,7 @@ fn a_scanned_id_named_twice_is_deleted_once() {
     let mut table = txn.get_table("t").unwrap();
     let mut ids = vec![1, 3, 1];
     let deleted = table
-        .delete_judged(&mut ids, &CommitCut::through(0), &mut |_, _| Ok(true))
+        .delete_found(&mut ids, &CommitCut::every(), &mut Vec::new())
         .unwrap();
     drop(table);
     txn.commit().unwrap();
@@ -467,7 +465,7 @@ fn a_scanned_id_named_twice_is_deleted_once() {
 }
 
 #[test]
-fn a_sealed_row_its_judge_refuses_is_not_deleted() {
+fn a_sealed_row_of_a_volume_sealed_past_the_cut_is_handed_back_in_place() {
     let _guard = FailpointGuard::new();
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path());
@@ -475,27 +473,28 @@ fn a_sealed_row_its_judge_refuses_is_not_deleted() {
     let mut txn = db.engine().begin_transaction().unwrap();
     let mut table = txn.get_table("t").unwrap();
     let mut ids = vec![1, 2, 3];
-    let mut judged = Vec::new();
+    let mut changed = Vec::new();
     let deleted = table
-        .delete_judged(&mut ids, &CommitCut::through(0), &mut |id, row| {
-            judged.push((id, row.get(2).cloned()));
-            Ok(id != 2)
-        })
+        .delete_found(&mut ids, &CommitCut::through(0), &mut changed)
         .unwrap();
     drop(table);
     txn.commit().unwrap();
-    assert_eq!(deleted, 2);
-    assert_eq!(ids, [1, 3]);
-    judged.sort_by_key(|(id, _)| *id);
+    assert_eq!(deleted, 0);
+    assert!(ids.is_empty(), "{ids:?}");
+    let mut changed: Vec<_> = changed
+        .into_iter()
+        .map(|(id, row)| (id, row.get(2).cloned()))
+        .collect();
+    changed.sort_by_key(|(id, _)| *id);
     assert_eq!(
-        judged,
+        changed,
         [
             (1, Some(stoolap::core::Value::Integer(10))),
             (2, Some(stoolap::core::Value::Integer(20))),
             (3, Some(stoolap::core::Value::Integer(30)))
         ]
     );
-    assert_eq!(count(&db, "SELECT COUNT(*) FROM t"), 1);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM t"), 3);
 }
 
 #[test]

@@ -19,9 +19,14 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use stoolap::test_failpoints::after_delete_rows_scanned;
-use stoolap::Database;
+use stoolap::functions::{
+    global_registry, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType,
+    ScalarFunction,
+};
+use stoolap::test_failpoints::{after_delete_rows_scanned, under_seal_fence};
+use stoolap::{Database, Value};
 
 /// `t` of three rows, two of them with `v = 10`, on the hot store and then sealed
 fn each_layout(name: &str, extra: &[&str], check: impl Fn(&Database)) {
@@ -201,4 +206,100 @@ fn without_a_key(db: &Database, sealed: bool) {
         })
         .collect();
     assert_eq!(left, [(1, 20), (3, 30)]);
+}
+
+/// Set once the rows are found: calls from then on are the judge's
+static JUDGING: AtomicBool = AtomicBool::new(false);
+static JUDGED: AtomicUsize = AtomicUsize::new(0);
+static JUDGED_UNDER_FENCE: AtomicUsize = AtomicUsize::new(0);
+
+/// Returns its argument and counts the calls the judge makes, and those
+/// made under a seal fence
+#[derive(Default)]
+struct DeleteJudgedFence;
+
+impl ScalarFunction for DeleteJudgedFence {
+    fn name(&self) -> &str {
+        "DELETE_JUDGED_FENCE"
+    }
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "DELETE_JUDGED_FENCE",
+            FunctionType::Scalar,
+            "test probe",
+            FunctionSignature::new(FunctionDataType::Integer, vec![FunctionDataType::Any], 1, 1),
+        )
+    }
+    fn evaluate(&self, args: &[Value]) -> stoolap::core::Result<Value> {
+        if JUDGING.load(Ordering::Relaxed) {
+            JUDGED.fetch_add(1, Ordering::Relaxed);
+            if under_seal_fence() {
+                JUDGED_UNDER_FENCE.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Ok(args[0].clone())
+    }
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(DeleteJudgedFence)
+    }
+}
+
+#[test]
+fn a_changed_row_is_judged_outside_the_seal_fence() {
+    let _ = global_registry().register_scalar::<DeleteJudgedFence>();
+    each_layout("outside_fence", &[], |db| {
+        JUDGED.store(0, Ordering::Relaxed);
+        JUDGED_UNDER_FENCE.store(0, Ordering::Relaxed);
+        let other = db.clone();
+        after_delete_rows_scanned(move || {
+            other
+                .execute("UPDATE t SET s = 'z' WHERE id = 1", ())
+                .unwrap();
+            JUDGING.store(true, Ordering::Relaxed);
+        });
+        let returned: Vec<i64> = db
+            .query(
+                "DELETE FROM t WHERE DELETE_JUDGED_FENCE(v) = 10 RETURNING id",
+                (),
+            )
+            .unwrap()
+            .map(|row| row.unwrap().get(0).unwrap())
+            .collect();
+        JUDGING.store(false, Ordering::Relaxed);
+        assert_eq!(returned, [1, 2]);
+        // (calls the judge made, those under the seal fence): the changed row only, outside it
+        let calls = (
+            JUDGED.load(Ordering::Relaxed),
+            JUDGED_UNDER_FENCE.load(Ordering::Relaxed),
+        );
+        assert_eq!(calls, (1, 0));
+    });
+}
+
+#[test]
+fn a_changed_row_is_judged_with_its_row_id_without_a_returning() {
+    let dir = tempfile::tempdir().unwrap();
+    for (dsn, sealed) in [
+        ("memory://delete_judged_row_id".to_string(), false),
+        (format!("file://{}", dir.path().display()), true),
+    ] {
+        let db = Database::open(&dsn).unwrap();
+        db.execute("CREATE TABLE n (k INTEGER, v INTEGER)", ())
+            .unwrap();
+        db.execute("INSERT INTO n VALUES (1, 10), (2, 10), (3, 30)", ())
+            .unwrap();
+        if sealed {
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        let fired = commit_between(&db, "UPDATE n SET v = 20 WHERE k = 1");
+        let deleted = db.execute("DELETE FROM n WHERE _rowid_ + 0 = 1", ());
+        assert!(fired.get(), "{dsn}: the commit did not come between");
+        assert_eq!(deleted.unwrap_or_else(|e| panic!("{dsn}: {e}")), 1);
+        let left: Vec<i64> = db
+            .query("SELECT k FROM n ORDER BY k", ())
+            .unwrap()
+            .map(|row| row.unwrap().get(0).unwrap())
+            .collect();
+        assert_eq!(left, [2, 3], "{dsn}");
+    }
 }

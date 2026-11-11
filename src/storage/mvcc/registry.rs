@@ -503,6 +503,12 @@ impl CommitCut {
         commit_seq <= self.floor || self.sees_past_floor(commit_seq)
     }
 
+    /// Whether every commit at or below `seq` was complete at the cut
+    #[inline]
+    pub fn sees_through(&self, seq: i64) -> bool {
+        seq <= self.floor
+    }
+
     #[cold]
     #[inline(never)]
     fn sees_past_floor(&self, commit_seq: i64) -> bool {
