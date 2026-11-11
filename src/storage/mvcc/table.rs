@@ -35,6 +35,7 @@ use crate::storage::mvcc::index_plan::{self, IndexPlan, Read};
 use crate::storage::mvcc::registry::{CommitCut, StatementView};
 use crate::storage::mvcc::scanner::{HotScanner, MVCCScanner};
 use crate::storage::mvcc::txn_gate::{GateRef, TxnGate};
+use crate::storage::mvcc::version_store::unique_beside_key;
 use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::mvcc::version_store::Reader;
 use crate::storage::mvcc::version_store::TxnStoreWrite;
@@ -4429,54 +4430,25 @@ impl Table for MVCCTable {
 
     fn for_each_unique_non_pk_index(
         &self,
-        f: &mut dyn FnMut(&str, &[String]) -> Result<()>,
+        f: &mut dyn FnMut(&dyn Index) -> Result<()>,
     ) -> Result<()> {
-        let pk_col = self
-            .cached_schema
-            .pk_column_index()
-            .map(|i| &self.cached_schema.columns[i].name);
-        let mut unique = smallvec::SmallVec::<[Arc<dyn Index>; 4]>::new();
-        let indexes = self.version_store.indexes_read();
-        for idx in indexes.values().map(|entry| &entry.index) {
-            if !idx.is_unique() {
-                continue;
-            }
-            let names = idx.column_names();
-            // Skip single-column indexes that match the PK column
-            if names.len() == 1 {
-                if let Some(pk) = pk_col {
-                    if eq_names(&names[0], pk) {
-                        continue;
-                    }
-                }
-            }
-            unique.push(Arc::clone(idx));
-        }
-        drop(indexes);
+        let key = self.cached_schema.pk_column_index();
+        let unique: smallvec::SmallVec<[Arc<dyn Index>; 4]> = (self.version_store.indexes_read())
+            .values()
+            .filter(|entry| unique_beside_key(&*entry.index, key))
+            .map(|entry| Arc::clone(&entry.index))
+            .collect();
         for idx in unique {
-            f(idx.name(), idx.column_names())?;
+            f(&*idx)?;
         }
         Ok(())
     }
 
     fn has_unique_non_pk_indexes(&self) -> bool {
-        let pk_col = self
-            .cached_schema
-            .pk_column_index()
-            .map(|i| &self.cached_schema.columns[i].name);
-        let indexes = self.version_store.indexes_read();
-        indexes.values().map(|entry| &entry.index).any(|idx| {
-            if !idx.is_unique() {
-                return false;
-            }
-            let names = idx.column_names();
-            if names.len() == 1 {
-                if let Some(pk) = pk_col {
-                    return !eq_names(&names[0], pk);
-                }
-            }
-            true
-        })
+        let key = self.cached_schema.pk_column_index();
+        (self.version_store.indexes_read())
+            .values()
+            .any(|entry| unique_beside_key(&*entry.index, key))
     }
 
     fn acquire_upsert_lock(&self) -> Option<Box<dyn std::any::Any>> {

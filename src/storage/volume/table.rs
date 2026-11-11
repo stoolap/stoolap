@@ -573,16 +573,12 @@ struct ColdDelete {
 type ColdDeleteRows = smallvec::SmallVec<[ColdDelete; 1]>;
 
 /// A UNIQUE index cold rows are checked against: its name, its columns as
-/// it spells them, and their positions, resolved once per statement
+/// it spells them, and their positions, taken once per statement
 type ColdUnique = (String, Vec<String>, smallvec::SmallVec<[usize; 4]>);
 
-/// The positions of the columns `names` spells, None when one is missing
-fn unique_positions(schema: &Schema, names: &[String]) -> Option<smallvec::SmallVec<[usize; 4]>> {
-    let at: smallvec::SmallVec<[usize; 4]> = names
-        .iter()
-        .filter_map(|name| schema.columns.iter().position(|c| eq_names(&c.name, name)))
-        .collect();
-    (at.len() == names.len()).then_some(at)
+/// The schema positions of `index`'s columns
+fn unique_positions(index: &dyn Index) -> smallvec::SmallVec<[usize; 4]> {
+    index.column_ids().iter().map(|&id| id as usize).collect()
 }
 
 /// What a DELETE has prepared so far, across the rounds a landing seal
@@ -2294,15 +2290,12 @@ impl SegmentedTable {
     }
 
     fn cold_unique_indexes(&self) -> Result<Vec<ColdUnique>> {
-        let schema = self.hot.schema();
         let mut indexes = Vec::new();
-        self.hot
-            .for_each_unique_non_pk_index(&mut |name, columns| {
-                if let Some(at) = unique_positions(schema, columns) {
-                    indexes.push((name.to_owned(), columns.to_vec(), at));
-                }
-                Ok(())
-            })?;
+        self.hot.for_each_unique_non_pk_index(&mut |index| {
+            let at = unique_positions(index);
+            indexes.push((index.name().to_owned(), index.column_names().to_vec(), at));
+            Ok(())
+        })?;
         Ok(indexes)
     }
 
@@ -2378,13 +2371,9 @@ impl SegmentedTable {
             }
             Ok(())
         } else {
-            self.hot
-                .for_each_unique_non_pk_index(&mut |name, columns| match unique_positions(
-                    schema, columns,
-                ) {
-                    Some(at) => check_unique(name, columns, &at),
-                    None => Ok(()),
-                })
+            self.hot.for_each_unique_non_pk_index(&mut |index| {
+                check_unique(index.name(), index.column_names(), &unique_positions(index))
+            })
         }
     }
 
@@ -2632,7 +2621,8 @@ impl SegmentedTable {
             .then_some((col, value))
         };
         let mut keys = Vec::new();
-        self.hot.for_each_unique_non_pk_index(&mut |_, columns| {
+        self.hot.for_each_unique_non_pk_index(&mut |index| {
+            let columns = index.column_names();
             if columns.iter().all(|name| set_value(name).is_some()) {
                 let (columns, values) = columns.iter().filter_map(|name| set_value(name)).unzip();
                 keys.push(UniqueKey { columns, values });
@@ -7844,7 +7834,7 @@ impl Table for SegmentedTable {
 
     fn for_each_unique_non_pk_index(
         &self,
-        f: &mut dyn FnMut(&str, &[String]) -> Result<()>,
+        f: &mut dyn FnMut(&dyn Index) -> Result<()>,
     ) -> Result<()> {
         self.hot.for_each_unique_non_pk_index(f)
     }

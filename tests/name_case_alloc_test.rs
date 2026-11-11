@@ -145,6 +145,44 @@ fn a_cold_unique_check_on_a_sigma_column_copies_no_name() {
 }
 
 #[test]
+fn a_cold_unique_check_beside_a_column_differing_only_in_sigma_copies_no_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?checkpoint_interval=3600",
+        dir.path().display()
+    ))
+    .unwrap();
+    for (table, first, unique) in [("va", "xa", "xb"), ("vb", "\"xΣ\"", "\"xσ\"")] {
+        db.execute(
+            &format!(
+                "CREATE TABLE {table} (id INTEGER PRIMARY KEY, {first} INTEGER, {unique} INTEGER UNIQUE)"
+            ),
+            (),
+        )
+        .unwrap();
+        db.execute(&format!("INSERT INTO {table} VALUES (1, 1, -1)"), ())
+            .unwrap();
+    }
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let unique = |table: &str| {
+        let values: Vec<String> = (10..10 + ROWS)
+            .map(|id| format!("({id}, {id}, {id})"))
+            .collect();
+        let sql = format!("INSERT INTO {table} VALUES {}", values.join(", "));
+        let before = allocations();
+        db.execute(&sql, ()).unwrap();
+        allocations() - before
+    };
+    let ascii = unique("va");
+    let other = unique("vb");
+    let per_row = extra_per_row(ascii, other);
+    assert!(
+        per_row <= LIMIT,
+        "{per_row} more allocations per row for the UNIQUE column \"xσ\" beside \"xΣ\" than for xb"
+    );
+}
+
+#[test]
 fn a_cold_insert_into_a_table_keyed_by_a_sigma_column_copies_no_name() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(&format!(
