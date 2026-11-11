@@ -192,6 +192,8 @@ ALTER TABLE users MODIFY COLUMN age FLOAT;
 ALTER TABLE users RENAME TO app_users;
 ```
 
+An added column takes its DEFAULT in every row the table already holds, or NULL without one. A `NOT NULL` column with no DEFAULT (or `DEFAULT NULL`) is therefore refused while the table holds rows, sealed ones included, and added to a table without rows. A transaction that wrote rows to the table before the column was added cannot commit them.
+
 ### Dropping Indexes
 
 ```sql
