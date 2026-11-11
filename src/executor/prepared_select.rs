@@ -15679,6 +15679,7 @@ impl<'a> PreparedRunner<'a> {
             crate::core::value::nulls_first(ascending, nulls_first),
             limit,
             offset,
+            where_.needed.as_deref(),
         )?;
         // A read that checks for no cancel is the statement's all the same
         ctx.check_cancelled()?;

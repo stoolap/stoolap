@@ -388,7 +388,7 @@ fn test_first_seal_during_the_hot_top_k_keeps_the_series() {
     expr.prepare_for_schema(table.schema());
     let walk = table.top_k_walk(&expr, "t");
     let answer = table
-        .scan_top_k(walk.as_ref(), Some(&expr), "t", false, true, 1, 0)
+        .scan_top_k(walk.as_ref(), Some(&expr), "t", false, true, 1, 0, None)
         .unwrap();
     assert!(fired.load(Ordering::SeqCst));
     let got: Option<Vec<i64>> = answer.map(|rows| rows.into_iter().map(|(id, _)| id).collect());

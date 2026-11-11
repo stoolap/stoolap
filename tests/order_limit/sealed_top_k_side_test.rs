@@ -557,3 +557,73 @@ fn a_sealed_top_k_through_a_side_file_loads_few_row_groups() {
         );
     }
 }
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_sealed_top_k_reads_only_the_columns_the_statement_reads() {
+    use stoolap::test_failpoints::take_group_column_decodes;
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!(
+        "file://{}?checkpoint_on_close=off&checkpoint_interval=0&compact_threshold=100",
+        dir.path().display()
+    );
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE x (id INTEGER PRIMARY KEY, k INTEGER, p TEXT, q TEXT)",
+            (),
+        )
+        .unwrap();
+        db.execute("CREATE INDEX x_k ON x(k) USING BTREE", ())
+            .unwrap();
+        db.execute(
+            "INSERT INTO x SELECT value, (value * 7919) % 200000, 'p' || value, 'q' || value \
+             FROM generate_series(1, 200000)",
+            (),
+        )
+        .unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        db.close().unwrap();
+    }
+    // The statement, the payload it returns and the columns it reads
+    let cases: [(&str, &str, &[usize]); 3] = [
+        (
+            "SELECT k, k FROM x WHERE k > 100 ORDER BY k LIMIT 3",
+            "10",
+            &[1],
+        ),
+        (
+            "SELECT k, p FROM x WHERE k > 100 ORDER BY k LIMIT 3",
+            "p",
+            &[1, 2],
+        ),
+        (
+            "SELECT k, q FROM x WHERE k > 100 ORDER BY k LIMIT 3",
+            "q",
+            &[1, 3],
+        ),
+    ];
+    for (sql, payload, reads) in cases {
+        // Reopened, no block of the volume is decoded yet
+        let db = Database::open(&dsn).unwrap();
+        take_group_column_decodes();
+        let rows: Vec<(i64, String)> = db
+            .query(sql, ())
+            .unwrap()
+            .map(|row| {
+                let row = row.unwrap();
+                (row.get(0).unwrap(), row.get_value(1).unwrap().to_string())
+            })
+            .collect();
+        let decodes = take_group_column_decodes();
+        db.close().unwrap();
+        let keys: Vec<i64> = rows.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, [101, 102, 103], "{sql}");
+        assert!(
+            rows.iter().all(|(_, v)| v.starts_with(payload)),
+            "{sql}: {rows:?}"
+        );
+        let other: Vec<_> = decodes.iter().filter(|(c, _)| !reads.contains(c)).collect();
+        assert!(other.is_empty(), "{sql}: decoded other columns {other:?}");
+    }
+}

@@ -1272,7 +1272,9 @@ pub trait Table: Send + Sync {
     /// The first `limit` rows after `offset` in the order of `column_name`,
     /// NULLs first when `nulls_first`, with `where_expr` applied, from a
     /// table that can find them without reading every row, its hot rows by
-    /// `walk`. None when the table cannot answer in that order and the
+    /// `walk`. `needed` marks the columns the statement reads as
+    /// `scan_needed` takes them; a column not marked may come back as a
+    /// typed NULL. None when the table cannot answer in that order and the
     /// caller must sort a full scan.
     #[allow(clippy::too_many_arguments)]
     fn scan_top_k(
@@ -1284,6 +1286,7 @@ pub trait Table: Send + Sync {
         nulls_first: bool,
         limit: usize,
         offset: usize,
+        needed: Option<&[bool]>,
     ) -> Result<Option<RowVec>> {
         let _ = (
             walk,
@@ -1293,6 +1296,7 @@ pub trait Table: Send + Sync {
             nulls_first,
             limit,
             offset,
+            needed,
         );
         Ok(None)
     }
