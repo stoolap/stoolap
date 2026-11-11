@@ -3622,6 +3622,7 @@ impl Table for MVCCTable {
         _nulls_first: bool,
         limit: usize,
         offset: usize,
+        _columns: Option<&[bool]>,
     ) -> Result<Option<RowVec>> {
         let needed = limit.saturating_add(offset);
         if needed == 0 {

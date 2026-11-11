@@ -1709,7 +1709,7 @@ pub fn nulls_first(ascending: bool, written: Option<bool>) -> bool {
 /// One sort key: values in the total order of `Value::cmp`, a missing or
 /// NULL value placed by `nulls_first`. Every ORDER BY, MIN and MAX orders
 /// values by this rule
-#[inline]
+#[inline(always)]
 pub fn compare_order_key(
     a: Option<&Value>,
     b: Option<&Value>,

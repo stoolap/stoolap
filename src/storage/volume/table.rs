@@ -7114,6 +7114,7 @@ impl Table for SegmentedTable {
         nulls_first: bool,
         limit: usize,
         offset: usize,
+        columns: Option<&[bool]>,
     ) -> Result<Option<RowVec>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.scan_top_k");
@@ -7137,6 +7138,7 @@ impl Table for SegmentedTable {
                     nulls_first,
                     limit,
                     offset,
+                    columns,
                 )?;
                 if self.segment_mgr.seal_generation() == generation
                     && !self.destruction_since(begun)
@@ -7182,6 +7184,7 @@ impl Table for SegmentedTable {
                 nulls_first,
                 needed,
                 0,
+                columns,
             )?;
             let sealed_copies_checked = hot_top.is_some();
             let hot_rows = match hot_top {
@@ -7459,9 +7462,17 @@ impl Table for SegmentedTable {
                 }
             }
             self.check_cold()?;
+            // A kept row reads the columns the statement reads that the scan
+            // did not; the others stay as the scan left them, typed NULLs
+            let as_scanned: Option<Vec<bool>> = needed.as_ref().map(|read| {
+                read.iter()
+                    .enumerate()
+                    .map(|(ci, &read)| read || columns.is_some_and(|c| !c.get(ci).unwrap_or(&true)))
+                    .collect()
+            });
             let mut kept = KeptRows {
                 volumes: &kept_from,
-                known: needed.as_deref().unwrap_or_default(),
+                known: as_scanned.as_deref().unwrap_or_default(),
                 reader: None,
             };
             let rows =

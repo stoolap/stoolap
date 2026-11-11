@@ -96,22 +96,24 @@ impl RowStorage {
     /// Get mutable access to owned storage, converting if necessary (copy-on-write)
     #[inline]
     fn make_mut(&mut self) -> &mut CompactVec<Value> {
+        if let RowStorage::Shared(arc) = self {
+            *self = RowStorage::Owned(Self::owned_copy(arc));
+        }
         match self {
             RowStorage::Owned(vec) => vec,
-            RowStorage::Shared(arc) => {
-                // Copy-on-write: convert shared to owned
-                // Use extend_clone directly instead of .cloned().collect() to avoid
-                // the Cloned iterator adapter overhead
-                let len = arc.len();
-                let mut vec = CompactVec::with_capacity(len);
-                vec.extend_clone(arc);
-                *self = RowStorage::Owned(vec);
-                match self {
-                    RowStorage::Owned(vec) => vec,
-                    _ => unreachable!(),
-                }
-            }
+            RowStorage::Shared(_) => unreachable!(),
         }
+    }
+
+    /// A shared row's values copied into storage of its own, the rare case
+    /// kept out of `make_mut` so that stays small enough to inline
+    #[cold]
+    #[inline(never)]
+    fn owned_copy(arc: &CompactArc<[Value]>) -> CompactVec<Value> {
+        // extend_clone directly, without the Cloned iterator adapter
+        let mut vec = CompactVec::with_capacity(arc.len());
+        vec.extend_clone(arc);
+        vec
     }
 
     /// Convert to owned Vec<Value>, consuming self
