@@ -69,9 +69,10 @@ fn a_hot_parent_reads_its_sealed_children_outside_the_seal_fence() {
     .unwrap();
     for sql in [
         "CREATE TABLE p (id INTEGER PRIMARY KEY, u INTEGER UNIQUE, x INTEGER)",
-        "CREATE TABLE c (id INTEGER PRIMARY KEY REFERENCES p(u) ON UPDATE CASCADE)",
+        // `w` is read from its blocks: the key comes from the row ids
+        "CREATE TABLE c (id INTEGER PRIMARY KEY REFERENCES p(u) ON UPDATE CASCADE, w INTEGER)",
         "INSERT INTO p SELECT value, value * 10, 0 FROM generate_series(1, 2000)",
-        "INSERT INTO c SELECT value * 10 FROM generate_series(1, 2000)",
+        "INSERT INTO c SELECT value * 10, value FROM generate_series(1, 2000)",
         "PRAGMA CHECKPOINT",
         // Parent 7 gets a hot copy; its child 70 stays sealed
         "UPDATE p SET x = 1 WHERE id = 7",
