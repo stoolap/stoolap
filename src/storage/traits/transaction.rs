@@ -270,8 +270,9 @@ pub enum TableUse {
     Write,
     /// It writes no table
     Read,
-    /// It writes other tables: by cascade only tables with a foreign key
-    ReadBesideWrites,
+    /// It reads beside the statement's writes, the transaction's rows as
+    /// they stood at this write order, before the statement wrote
+    ReadAsFound(i64),
     /// It checks a foreign key: it writes no table, and reads the newest
     /// commits under any isolation
     KeyCheck,

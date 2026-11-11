@@ -419,7 +419,7 @@ INSERT INTO orders VALUES (7, 'B', 0)
 ON CONFLICT (id) DO UPDATE SET price = (SELECT price FROM catalog WHERE catalog.code = excluded.code);
 ```
 
-Outside an explicit transaction the statement reads one snapshot. Inside one, a value read for each conflict would see the rows this statement has already written, so such a value may not read the target table there, directly or through a view; the statement fails with an error instead.
+Outside an explicit transaction the statement reads one snapshot. Inside one, a value read for each conflict would see the rows this statement has already written, so such a value may not read the target table there, directly or through a view; the statement fails with an error instead. Another table is read as the statement found it in both cases: a value does not see the rows the foreign key actions of an earlier conflict changed, only the writes of earlier statements in the transaction.
 
 ### Subqueries in RETURNING
 
@@ -435,7 +435,14 @@ DELETE FROM orders WHERE created < '2024-01-01'
 RETURNING id, (SELECT COUNT(*) FROM orders);
 ```
 
-A subquery that reads the target table reads it as the statement found it, so for an `UPDATE` it returns a row's old values. Inside an explicit transaction a value read for each row returned may not read the target table, as in `ON CONFLICT`; the statement fails with an error instead.
+A subquery that reads the target table reads it as the statement found it, so for an `UPDATE` it returns a row's old values. Inside an explicit transaction a value read for each row returned may not read the target table, as in `ON CONFLICT`; the statement fails with an error instead. A child table the statement's `CASCADE` or `SET NULL` actions write is read as the statement found it too, in a transaction as well:
+
+```sql
+-- children references parents(id) ON DELETE CASCADE; parent 1 has 2 children
+DELETE FROM parents WHERE id = 1
+RETURNING id, (SELECT COUNT(*) FROM children WHERE children.parent_id = parents.id);
+-- Returns (1, 2); the cascade removes the 2 children
+```
 
 ### Subqueries in LIMIT and OFFSET
 

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use stoolap::core::{DataType, Row, SchemaBuilder, Value};
 use stoolap::storage::mvcc::{last_write_order, MVCCTable, TransactionVersionStore, VersionStore};
 use stoolap::storage::traits::Table;
-use stoolap::storage::volume::manifest::SegmentManager;
+use stoolap::storage::volume::manifest::{Pending, SegmentManager};
 use stoolap::storage::volume::table::SegmentedTable;
 use stoolap::Database;
 
@@ -134,8 +134,8 @@ fn repeated_pending_tombstone_keeps_its_original_boundary() {
     manager.add_pending_tombstone(1, 1);
     manager.add_pending_tombstone(1, 2);
     manager.rollback_pending_tombstones_after(1, boundary);
-    assert!(manager.is_pending_tombstone(1, 1));
-    assert!(!manager.is_pending_tombstone(1, 2));
+    assert!(manager.is_pending_tombstone(Pending::of(1), 1));
+    assert!(!manager.is_pending_tombstone(Pending::of(1), 2));
 }
 
 #[test]
@@ -156,10 +156,10 @@ fn table_rollback_keeps_the_claim_for_an_earlier_cold_delete() {
     let hot = MVCCTable::new(1, Arc::clone(&store), local);
     let table = SegmentedTable::new(Box::new(hot), Arc::clone(&manager));
     table.rollback_to_timestamp(boundary);
-    assert!(manager.is_pending_tombstone(1, 1));
+    assert!(manager.is_pending_tombstone(Pending::of(1), 1));
     assert!(store.try_claim_row(1, 2).is_err());
     table.rollback_to_timestamp(0);
-    assert!(!manager.is_pending_tombstone(1, 1));
+    assert!(!manager.is_pending_tombstone(Pending::of(1), 1));
     store.try_claim_row(1, 2).unwrap();
 }
 

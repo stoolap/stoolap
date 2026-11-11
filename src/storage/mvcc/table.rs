@@ -39,6 +39,7 @@ use crate::storage::mvcc::version_store::unique_beside_key;
 use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::mvcc::version_store::Reader;
 use crate::storage::mvcc::version_store::TxnStoreWrite;
+use crate::storage::mvcc::version_store::EVERY_WRITE;
 use crate::storage::mvcc::RowVersion;
 use crate::storage::mvcc::{TransactionVersionStore, TxnTableStore, VersionStore};
 use crate::storage::traits::{Index, PlannedUpdate, QueryResult, ScanAccess, Scanner, Table};
@@ -69,34 +70,43 @@ pub struct MVCCTable {
     /// The statement view this handle's reads are held to; None reads the
     /// newest committed state, as writes do
     view: Option<StatementView>,
+    /// The write order the transaction's rows are read at: a block of a
+    /// statement reads them as they stood before the statement wrote
+    cut: i64,
     /// Scans that fell through to the full visible-row walk
     #[cfg(test)]
     full_scans: std::sync::atomic::AtomicU64,
 }
 
 /// The transaction's rows of a table as a read sees them: none through a
-/// read handle, which has no store
-struct LocalRows<'a>(Option<std::sync::RwLockReadGuard<'a, TransactionVersionStore>>);
+/// read handle, which has no store, and those written by the cut through a
+/// handle that reads at one
+struct LocalRows<'a>(
+    Option<std::sync::RwLockReadGuard<'a, TransactionVersionStore>>,
+    i64,
+);
 
 impl LocalRows<'_> {
+    /// Conservative under a cut: true while any row is held
     fn has_local_changes(&self) -> bool {
         self.0.as_ref().is_some_and(|rows| rows.has_local_changes())
     }
 
     fn get_local_version(&self, row_id: i64) -> Option<&RowVersion> {
-        self.0.as_ref()?.get_local_version(row_id)
+        self.0.as_ref()?.local_version_at(row_id, self.1)
     }
 
     fn get_latest_local(&self, row_id: i64) -> Option<&RowVersion> {
-        self.0.as_ref()?.get_latest_local(row_id)
+        self.0.as_ref()?.local_version_at(row_id, self.1)
     }
 
     fn get(&self, row_id: i64) -> Option<Row> {
-        self.0.as_ref()?.get(row_id)
+        self.0.as_ref()?.get_at(row_id, self.1)
     }
 
     fn iter_local(&self) -> impl Iterator<Item = (i64, &RowVersion)> {
-        self.0.iter().flat_map(|rows| rows.iter_local())
+        let cut = self.1;
+        self.0.iter().flat_map(move |rows| rows.iter_local_at(cut))
     }
 }
 
@@ -374,6 +384,7 @@ impl MVCCTable {
             layout,
             gate: None,
             view: None,
+            cut: EVERY_WRITE,
         }
     }
 
@@ -396,6 +407,7 @@ impl MVCCTable {
             layout,
             gate: None,
             view: None,
+            cut: EVERY_WRITE,
         }
     }
 
@@ -413,6 +425,7 @@ impl MVCCTable {
             layout,
             gate: None,
             view: None,
+            cut: EVERY_WRITE,
         }
     }
 
@@ -427,6 +440,13 @@ impl MVCCTable {
     /// taken, and this transaction's own writes
     pub(crate) fn with_view(mut self, view: Option<StatementView>) -> Self {
         self.view = view;
+        self
+    }
+
+    /// The handle reads the transaction's rows as they stood at the write
+    /// order `cut`; it writes nothing
+    pub(crate) fn with_cut(mut self, cut: i64) -> Self {
+        self.cut = cut;
         self
     }
 
@@ -455,11 +475,12 @@ impl MVCCTable {
 
     /// The transaction's rows of this table, held for reading
     fn local(&self) -> LocalRows<'_> {
-        LocalRows(self.txn_versions.as_ref().map(|store| {
+        let rows = self.txn_versions.as_ref().map(|store| {
             store
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-        }))
+        });
+        LocalRows(rows, self.cut)
     }
 
     /// The layout this handle reads with
@@ -484,6 +505,7 @@ impl MVCCTable {
     /// The transaction's local store for a write: the rows it writes now
     /// are laid out as this handle's schema says
     fn writes(&self) -> Result<TxnStoreWrite<'_>> {
+        debug_assert_eq!(self.cut, EVERY_WRITE, "a handle reading at a cut wrote");
         self.local_store().map(|store| store.write_for(self.layout))
     }
 

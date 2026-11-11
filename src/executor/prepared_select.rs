@@ -13147,11 +13147,13 @@ impl Executor {
                     _ => false,
                 }
         };
-        // The statement writes its target, open before its blocks, and what
-        // its foreign keys cascade to
+        // The blocks open before the statement's first write and read the
+        // transaction's rows as they stood then
         let inner_ctx = ctx
             .with_incremented_query_depth()
-            .with_table_use(TableUse::ReadBesideWrites);
+            .with_table_use(TableUse::ReadAsFound(
+                crate::storage::mvcc::last_write_order(),
+            ));
         // A column change between taking the plan and opening a block's
         // table prepares again, against the table as it now is
         let mut fresh = false;

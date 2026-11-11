@@ -43,6 +43,7 @@ use crate::storage::mvcc::{
 };
 use crate::storage::traits::transaction::TableUse;
 use crate::storage::traits::{Engine, Index, Table, Transaction};
+use crate::storage::volume::manifest::Pending;
 
 mod retype;
 pub use retype::ColumnTypeChange;
@@ -167,7 +168,7 @@ impl RecheckKeys {
                 .and_then(|ws| ws.get(row_id))
                 .and_then(|entry| entry.read_version.as_ref())
                 .map(|rv| &rv.data);
-            let update = old_row.is_some() || mgr.is_pending_tombstone(txn_id, row_id);
+            let update = old_row.is_some() || mgr.is_pending_tombstone(Pending::of(txn_id), row_id);
             if let Some(pk_val) = pk_idx.and_then(|pk| row.get(pk)) {
                 let old_pk = pk_idx.and_then(|pk| old_row.and_then(|old| old.get(pk)));
                 if !pk_val.is_null() && (!update || old_pk != Some(pk_val)) {
@@ -9942,7 +9943,7 @@ impl EngineOperations {
                 let pk_val = &keys.values[check.start];
                 if let Some(cold_rid) = mgr.check_value_exists_in(snapshot, pk_col, pk_val)? {
                     if (!check.update || cold_rid != check.row_id)
-                        && !mgr.is_pending_tombstone(txn_id, cold_rid)
+                        && !mgr.is_pending_tombstone(Pending::of(txn_id), cold_rid)
                     {
                         return Err(crate::core::Error::PrimaryKeyConstraint { row_id: cold_rid });
                     }
@@ -9964,7 +9965,7 @@ impl EngineOperations {
             drop(values);
             if let Some(cold_rid) = found {
                 if (!check.update || cold_rid != check.row_id)
-                    && !mgr.is_pending_tombstone(txn_id, cold_rid)
+                    && !mgr.is_pending_tombstone(Pending::of(txn_id), cold_rid)
                 {
                     return Err(crate::core::Error::UniqueConstraint {
                         index: col_names.join("_"),
@@ -10051,11 +10052,14 @@ impl TransactionEngineOperations for EngineOperations {
             drop(cache);
 
             // A store published later would not reach a read handle, so one
-            // is taken only where the statement cannot write
+            // is taken only where the statement cannot write, or reads as
+            // found, before any write it makes
             let reads_only = || match table_use {
                 TableUse::Write | TableUse::Ddl => false,
-                TableUse::Read | TableUse::KeyCheck | TableUse::Metadata => true,
-                TableUse::ReadBesideWrites => version_store.schema().foreign_keys.is_empty(),
+                TableUse::Read
+                | TableUse::KeyCheck
+                | TableUse::Metadata
+                | TableUse::ReadAsFound(_) => true,
             };
             if let Some(cached) = found {
                 (Some(cached), None)
@@ -10084,11 +10088,15 @@ impl TransactionEngineOperations for EngineOperations {
                 }
             }
         };
+        let cut = match table_use {
+            TableUse::ReadAsFound(cut) => cut,
+            _ => crate::storage::mvcc::version_store::EVERY_WRITE,
+        };
         let open = |version_store| match txn_versions {
             Some(txn_versions) => {
-                MVCCTable::new_with_shared_store(txn_id, version_store, txn_versions)
+                MVCCTable::new_with_shared_store(txn_id, version_store, txn_versions).with_cut(cut)
             }
-            None => MVCCTable::new_for_read(txn_id, version_store),
+            None => MVCCTable::new_for_read(txn_id, version_store).with_cut(cut),
         };
         #[cfg(feature = "test-failpoints")]
         if admitted.is_some() {
@@ -10144,7 +10152,8 @@ impl TransactionEngineOperations for EngineOperations {
                 schema_generation,
             )
             .with_txn_gate(gate.cloned())
-            .with_view(view),
+            .with_view(view)
+            .with_cut(cut),
         ))
     }
 
@@ -10525,7 +10534,7 @@ impl TransactionEngineOperations for EngineOperations {
         let mgrs = self.segment_managers.read().unwrap();
         for table_name in &touched_tables {
             if let Some(mgr) = mgrs.get(table_name.as_str()) {
-                if mgr.has_pending_tombstones(txn_id) {
+                if mgr.has_pending_tombstones(Pending::of(txn_id)) {
                     return true;
                 }
             }

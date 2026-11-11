@@ -32,6 +32,25 @@ use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::storage::mvcc::next_write_order;
+use crate::storage::mvcc::version_store::EVERY_WRITE;
+
+/// The pending tombstones a read sees: those of the transaction `txn_id`
+/// made by the write order `cut`
+#[derive(Clone, Copy, Debug)]
+pub struct Pending {
+    pub txn_id: i64,
+    pub cut: i64,
+}
+
+impl Pending {
+    /// Every pending tombstone of `txn_id`
+    pub fn of(txn_id: i64) -> Self {
+        Self {
+            txn_id,
+            cut: EVERY_WRITE,
+        }
+    }
+}
 
 use crate::common::SmartString;
 use crate::core::{Result, Value};
@@ -3580,39 +3599,46 @@ impl SegmentManager {
     /// Insert pending tombstones for a transaction directly into a set (no Vec clone).
     pub fn insert_pending_tombstones_into(
         &self,
-        txn_id: i64,
+        of: Pending,
         dest: &mut rustc_hash::FxHashSet<i64>,
     ) {
-        if let Some(ids) = self.pending_txn_tombstones.read().get(&txn_id) {
-            for &id in ids.keys() {
-                dest.insert(id);
+        if let Some(ids) = self.pending_txn_tombstones.read().get(&of.txn_id) {
+            for (&id, &at) in ids {
+                if at <= of.cut {
+                    dest.insert(id);
+                }
             }
         }
     }
 
     /// Get the count of pending tombstones for a transaction without cloning.
-    pub fn pending_tombstone_count(&self, txn_id: i64) -> usize {
-        self.pending_txn_tombstones
-            .read()
-            .get(&txn_id)
-            .map_or(0, |v| v.len())
+    pub fn pending_tombstone_count(&self, of: Pending) -> usize {
+        let pending = self.pending_txn_tombstones.read();
+        let Some(ids) = pending.get(&of.txn_id) else {
+            return 0;
+        };
+        match of.cut {
+            EVERY_WRITE => ids.len(),
+            cut => ids.values().filter(|&&at| at <= cut).count(),
+        }
     }
 
     /// Check if a specific row_id is a pending tombstone for a transaction.
     /// O(1) with FxHashSet (was O(n) with Vec).
-    pub fn is_pending_tombstone(&self, txn_id: i64, row_id: i64) -> bool {
+    pub fn is_pending_tombstone(&self, of: Pending, row_id: i64) -> bool {
         self.pending_txn_tombstones
             .read()
-            .get(&txn_id)
-            .is_some_and(|set| set.contains_key(&row_id))
+            .get(&of.txn_id)
+            .and_then(|set| set.get(&row_id))
+            .is_some_and(|&at| at <= of.cut)
     }
 
-    /// The ids among `ids` with a pending tombstone of `txn_id`; none looked
+    /// The ids among `ids` with a pending tombstone of `of`; none looked
     /// up when the transaction has no pending set. Room for more than fit
     /// inline is made with the lock released, then the ids are read again
     pub(crate) fn pending_among(
         &self,
-        txn_id: i64,
+        of: Pending,
         ids: impl Iterator<Item = i64> + Clone,
     ) -> smallvec::SmallVec<[i64; 4]> {
         let mut found = smallvec::SmallVec::new();
@@ -3621,11 +3647,12 @@ impl SegmentManager {
             #[cfg(feature = "test-failpoints")]
             let locked = crate::test_failpoints::PendingSetLock::enter();
             found.clear();
-            let Some(set) = pending.get(&txn_id) else {
+            let Some(set) = pending.get(&of.txn_id) else {
                 return found;
             };
+            let held = |id: &i64| set.get(id).is_some_and(|&at| at <= of.cut);
             let mut needed = 0;
-            for id in ids.clone().filter(|id| set.contains_key(id)) {
+            for id in ids.clone().filter(held) {
                 if found.len() < found.capacity() {
                     found.push(id);
                 }
@@ -3676,11 +3703,11 @@ impl SegmentManager {
     }
 
     /// Check if a txn has any pending tombstones (for has_local_changes).
-    pub fn has_pending_tombstones(&self, txn_id: i64) -> bool {
+    pub fn has_pending_tombstones(&self, of: Pending) -> bool {
         self.pending_txn_tombstones
             .read()
-            .get(&txn_id)
-            .is_some_and(|v| !v.is_empty())
+            .get(&of.txn_id)
+            .is_some_and(|v| v.values().any(|&at| at <= of.cut))
     }
 
     /// Check if a row_id is tombstoned (any commit_seq).
