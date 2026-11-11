@@ -489,12 +489,13 @@ impl Executor {
 
         let schema = schema_builder.build();
 
-        // Collect FK columns that need auto-created indexes (skip PK and UNIQUE columns)
+        // Collect FK columns that need auto-created indexes (skip PK and UNIQUE columns),
+        // one per column however many keys it carries
         let mut fk_index_columns: Vec<String> = Vec::new();
         for fk in &schema.foreign_keys {
             let col = &schema.columns[fk.column_index];
             // Skip if the column is already a PK (has PkIndex) or UNIQUE (gets a unique index above)
-            if col.primary_key {
+            if col.primary_key || fk_index_columns.contains(&col.name) {
                 continue;
             }
             let col_lower = col.name.to_lowercase();
