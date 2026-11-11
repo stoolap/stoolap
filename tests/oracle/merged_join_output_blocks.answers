@@ -9,7 +9,7 @@
 2	3df923c1a4acf5d8	SELECT *, (SELECT s.a FROM s WHERE s.id = r.id) AS m FROM l NATURAL JOIN r ORDER BY (SELECT MAX(s.a) FROM s WHERE s.b = l.k), l.id, r.id LIMIT 9
 2	3df923c1a4acf5d8	SELECT *, (SELECT s.a FROM s WHERE s.id = r.id) AS m FROM l NATURAL JOIN r ORDER BY l.id, r.id
 10	3f7ff944ccb90f9a	SELECT *, (SELECT s.a FROM s WHERE s.id = r.id) AS m FROM l RIGHT JOIN r USING (k) ORDER BY (SELECT MAX(s.a) FROM s WHERE s.b = l.k), l.id, r.id LIMIT 9
-103	d377d81770531d1c	SELECT *, (SELECT s.a FROM s WHERE s.id = r.id) AS m FROM l RIGHT JOIN r USING (k) ORDER BY l.id, r.id
+103	65ce5ccf553b1c78	SELECT *, (SELECT s.a FROM s WHERE s.id = r.id) AS m FROM l RIGHT JOIN r USING (k) ORDER BY l.id, r.id
 10	b10f4498dc0af425	SELECT l.id, r.id, (SELECT MAX(s.a) FROM s WHERE s.b = l.k) AS m FROM l FULL JOIN r USING (k) ORDER BY (SELECT MAX(s.a) FROM s WHERE s.b = l.k), l.id, r.id LIMIT 9
 103	169eed025ef41904	SELECT l.id, r.id, (SELECT MAX(s.a) FROM s WHERE s.b = l.k) AS m FROM l FULL JOIN r USING (k) ORDER BY l.id, r.id
 2	cadfebe52ecadfb6	SELECT l.id, r.id, (SELECT MAX(s.a) FROM s WHERE s.b = l.k) AS m FROM l JOIN r USING (id, k) ORDER BY (SELECT MAX(s.a) FROM s WHERE s.b = l.k), l.id, r.id LIMIT 9

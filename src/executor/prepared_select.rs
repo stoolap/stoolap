@@ -1351,9 +1351,10 @@ struct ScopeTable {
     /// The first columns, which a bare name may bind; past them a column is
     /// read only through its table's name
     bare: usize,
-    /// The columns a NATURAL or USING join merges, each a left side's column
-    /// and the right side's it is one column with under a bare name
-    merged: SmallVec<[(usize, usize); 1]>,
+    /// The columns a NATURAL or USING join merges, each a left side's column,
+    /// the right side's it is one column with under a bare name, and the one
+    /// of them the merged column reads, by [`merged_slot`]
+    merged: SmallVec<[(usize, usize, usize); 1]>,
     /// Each stored table's first column and the column its rowid reads,
     /// None for a table without a primary key whose rows carry no row id
     rowids: SmallVec<[(usize, Option<usize>); 2]>,
@@ -1448,7 +1449,7 @@ impl ScopeTable {
             right
                 .merged
                 .iter()
-                .map(|(left, right)| (left + offset, right + offset)),
+                .map(|(left, right, slot)| (left + offset, right + offset, slot + offset)),
         );
         let mut rowids = left.rowids;
         rowids.extend(
@@ -1469,8 +1470,8 @@ impl ScopeTable {
     }
 
     /// The scope of `join` of `left` and `right`, each name its USING list or
-    /// a NATURAL join merges one column: the left side's first column of
-    /// that name with the right side's first
+    /// a NATURAL join merges one column: the column the left side's bare name
+    /// reads with the right side's, a side that is a join reading its own merge
     fn joined(join: &JoinTableSource, left: Self, right: Self) -> Self {
         let (left_names, right_names) = (&left.lower[..left.bare], &right.lower[..right.bare]);
         let natural = join.join_type.to_uppercase().contains("NATURAL");
@@ -1479,13 +1480,16 @@ impl ScopeTable {
             .iter()
             .map(|c| c.value_lower.as_str())
             .chain(left_names.iter().map(String::as_str).filter(|_| natural));
-        let mut merged: SmallVec<[(usize, usize); 1]> = SmallVec::new();
+        let mut merged: SmallVec<[(usize, usize, usize); 1]> = SmallVec::new();
         for name in names {
             let at = |names: &[String]| names.iter().position(|c| c == name);
             if let (Some(l), Some(r)) = (at(left_names), at(right_names)) {
-                let pair = (l, left.lower.len() + r);
-                if !merged.contains(&pair) {
-                    merged.push(pair);
+                let (l, r) = (left.merged_at(l), left.lower.len() + right.merged_at(r));
+                if !merged
+                    .iter()
+                    .any(|&(left, right, _)| (left, right) == (l, r))
+                {
+                    merged.push((l, r, merged_slot(&join.join_type, l, r)));
                 }
             }
         }
@@ -1701,6 +1705,18 @@ impl ScopeTable {
         (self.tables[at].0.as_ref(), self.tables[at].1..end)
     }
 
+    /// The column the merged column read through column `at` is: `at`'s
+    /// pair's, then each pair over it in turn, a join's pairs following its
+    /// sides'; `at` itself outside every pair
+    fn merged_at(&self, mut at: usize) -> usize {
+        for &(left, right, slot) in &self.merged {
+            if at == left || at == right {
+                at = slot;
+            }
+        }
+        at
+    }
+
     /// An error when a column in `rest` is also named `name`: a reference to
     /// a name two columns have is ambiguous, in one table or in two
     fn unique(
@@ -1741,10 +1757,51 @@ fn side_scopes(join: &JoinTableSource, sides: &JoinSides) -> Result<Option<[Scop
     Ok(Some([left, right]))
 }
 
+/// The equalities of the columns `join` merges by a NATURAL join or a USING
+/// list over `sides`, each read by its place in the joined row, a side that
+/// is a join read by its merged column; None when it merges none
+pub(crate) fn merged_condition(
+    join: &JoinTableSource,
+    sides: &JoinSides,
+) -> Result<Option<Expression>> {
+    let Some([left, right]) = side_scopes(join, sides)? else {
+        return Ok(None);
+    };
+    let inner = left.merged.len() + right.merged.len();
+    let scope = ScopeTable::joined(join, left, right);
+    let column = |at: usize| {
+        let name = &scope.lower[at];
+        Box::new(Expression::Column(ColumnRef {
+            index: at as u32,
+            name: ident(name, name),
+        }))
+    };
+    let equalities = scope.merged[inner..].iter().map(|&(l, r, _)| {
+        Expression::Infix(InfixExpression::new(
+            Token::new(TokenType::Operator, "=", Position::default()),
+            column(l),
+            "=".to_string(),
+            column(r),
+        ))
+    });
+    Ok(crate::executor::utils::combine_predicates_with_and(
+        equalities.collect(),
+    ))
+}
+
+/// The column of a `join_type` join's pair `left`, `right` its merged
+/// column reads: a right join's right side's, else the left side's
+pub(crate) fn merged_slot(join_type: &str, left: usize, right: usize) -> usize {
+    match join_type.to_uppercase().contains("RIGHT") {
+        true => right,
+        false => left,
+    }
+}
+
 /// An error when a column of `merges`, the pairs a NATURAL join or a USING
 /// list merges in `scope`, shares its name with another of its table
-fn merged_once(scope: &ScopeTable, merges: &[(usize, usize)]) -> Result<()> {
-    for &(left, right) in merges {
+fn merged_once(scope: &ScopeTable, merges: &[(usize, usize, usize)]) -> Result<()> {
+    for &(left, right, _) in merges {
         for at in [left, right] {
             let (table, range) = scope.table(at);
             let name = scope.lower[at].as_str();
@@ -2694,7 +2751,7 @@ fn output_names(stmt: &SelectStatement, own: &ScopeTable, shown: bool) -> Result
 /// table without one
 fn run_name(own: &ScopeTable, at: usize) -> String {
     let (table, _) = own.table(at);
-    match table.filter(|_| own.tables.len() > 1 && !own.merged.iter().any(|m| m.0 == at)) {
+    match table.filter(|_| own.tables.len() > 1 && !own.merged.iter().any(|m| m.2 == at)) {
         None => own.columns[at].clone(),
         Some(table) => qualified(table, &own.columns[at]),
     }
@@ -2791,7 +2848,10 @@ impl Chain<'_> {
                     scope.rowids.iter().any(|(_, first)| match (first, at) {
                         (Some(first), Some(at)) => {
                             is_rowid_name(&scope.lower[*at])
-                                && scope.merged.contains(&(*first, *at))
+                                && scope
+                                    .merged
+                                    .iter()
+                                    .any(|&(l, r, _)| (l, r) == (*first, *at))
                         }
                         _ => false,
                     })
@@ -2799,7 +2859,14 @@ impl Chain<'_> {
                 let mut rowids = scope.rowids.iter().filter(|(_, at)| !merged(at));
                 match (rowids.next(), rowids.next()) {
                     (None, _) => continue,
-                    (Some((_, Some(index))), None) => return Ok(Some((depth, *index))),
+                    // A merged pair of `_rowid_` columns reads as its merge does
+                    (Some((_, Some(index))), None) => {
+                        let index = match is_rowid_name(&scope.lower[*index]) {
+                            true => scope.merged_at(*index),
+                            false => *index,
+                        };
+                        return Ok(Some((depth, index)));
+                    }
                     (Some((_, None)), None) => {
                         return Err(Error::ColumnNotFound(id.value.to_string()))
                     }
@@ -2808,10 +2875,11 @@ impl Chain<'_> {
             }
             let bare = &scope.lower[..scope.bare];
             if let Some(index) = bare.iter().position(|c| *c == id.value_lower) {
-                let rest =
-                    (index + 1..scope.bare).filter(|&at| !scope.merged.contains(&(index, at)));
+                // The columns of one merge are one column, the one it reads
+                let read = scope.merged_at(index);
+                let rest = (index + 1..scope.bare).filter(|&at| scope.merged_at(at) != read);
                 scope.unique(rest, &id.value_lower, &id.value)?;
-                return Ok(Some((depth, index)));
+                return Ok(Some((depth, read)));
             }
         }
         if let Some((qualifier, name)) = split_qualified(&id.value_lower) {
@@ -8015,9 +8083,13 @@ fn projected_aliases(
 
 /// The columns of a joined row of `width` columns over `scope` a `*` shows:
 /// all but each merged pair's right column, as the merge shows the pair
-/// once, and each row id slot
+/// once, in its left column's place and as its merged column reads, and
+/// each row id slot
 fn star_columns(scope: &ScopeTable, width: usize) -> Vec<usize> {
-    (0..width).filter(|&at| star_shows(scope, at)).collect()
+    (0..width)
+        .filter(|&at| star_shows(scope, at))
+        .map(|at| scope.merged_at(at))
+        .collect()
 }
 
 /// How many columns [`star_columns`] gives, counted without them
@@ -8027,7 +8099,7 @@ fn star_width(scope: &ScopeTable, width: usize) -> usize {
 
 /// Whether a `*` over `scope` shows its column `at`
 fn star_shows(scope: &ScopeTable, at: usize) -> bool {
-    !scope.merged.iter().any(|&(_, right)| right == at)
+    !scope.merged.iter().any(|&(_, right, _)| right == at)
         && (at >= scope.lower.len() || !scope.is_slot(at))
 }
 
@@ -10775,15 +10847,15 @@ impl JoinBlocks {
     }
 
     /// The pairs a joined side merges, each its left and right column in the
-    /// joined row, which its run keeps apart; the join's own pairs straddle
-    /// the sides
-    pub(crate) fn side_merges(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+    /// joined row and the one its merged column reads, which its run keeps
+    /// apart; the join's own pairs straddle the sides
+    pub(crate) fn side_merges(&self) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
         let left_width = self.left.len();
         self.scope
             .merged
             .iter()
             .copied()
-            .filter(move |&(left, right)| (left < left_width) == (right < left_width))
+            .filter(move |&(left, right, _)| (left < left_width) == (right < left_width))
     }
 
     /// An error when a SELECT item, grouping, HAVING, sort key or named
@@ -10844,8 +10916,9 @@ impl JoinBlocks {
     }
 
     /// Every pair the joined row merges, the join's own and its sides',
-    /// each its left and right column in the joined row
-    pub(crate) fn merges(&self) -> &[(usize, usize)] {
+    /// each its left and right column in the joined row and the one its
+    /// merged column reads
+    pub(crate) fn merges(&self) -> &[(usize, usize, usize)] {
         &self.scope.merged
     }
 

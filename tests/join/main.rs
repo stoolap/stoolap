@@ -61,6 +61,7 @@ mod join_where_false_test;
 mod joined_column_sources_test;
 mod joined_using_sides_test;
 mod merged_join_output_blocks_test;
+mod merged_using_kind_test;
 mod nested_join_outer_scope_test;
 mod plain_join_blocks_test;
 mod small_outer_join_test;
