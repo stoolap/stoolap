@@ -1020,6 +1020,9 @@ pub struct MVCCEngine {
     /// Cached reverse FK mapping: parent_table → Vec<(child_table, FK constraint)>
     /// Rebuilt lazily on schema_epoch change. Zero cost for non-FK databases.
     fk_reverse_cache: RwLock<FkReverseCache>,
+    /// Whether the open or a restore found a table whose column takes the
+    /// row identity's name; a statement's tables are asked only then
+    any_reserved_name: AtomicBool,
     /// Snapshot timestamps loaded per table — used to pair HNSW graph files with their
     /// matching data snapshots during WAL replay.
     snapshot_timestamps: RwLock<FxHashMap<String, String>>,
@@ -1263,6 +1266,7 @@ impl MVCCEngine {
             stats_epoch: AtomicU64::new(0),
             cleanup_handle: Mutex::new(None),
             fk_reverse_cache: RwLock::new((u64::MAX, StringMap::default())),
+            any_reserved_name: AtomicBool::new(false),
             snapshot_timestamps: RwLock::new(FxHashMap::default()),
             segment_managers: Arc::new(RwLock::new(FxHashMap::default())),
             force_seal_all: AtomicBool::new(false),
@@ -1386,15 +1390,7 @@ impl MVCCEngine {
                 // read via normalize_row_to_schema would get NULL instead of the column default.
                 self.populate_schema_defaults();
 
-                // A column an older build let take the row identity's name
-                // opens no database
-                {
-                    let schemas = (self.schemas.read())
-                        .map_err(|_| Error::internal("schemas lock poisoned"))?;
-                    for schema in schemas.values() {
-                        schema.check_column_names()?;
-                    }
-                }
+                self.note_reserved_names();
 
                 // A volume an older build left holding a column in another
                 // type than the schema's is rewritten before any mapping
@@ -3858,6 +3854,22 @@ impl MVCCEngine {
             .ok_or_else(|| Error::TableNotFound(table_name.as_ref().to_string()))
     }
 
+    /// An error when a column of table `name` takes the row identity's name;
+    /// a name the engine holds no table of is no error here
+    pub(crate) fn check_reserved_table(&self, name: &str) -> Result<()> {
+        match self.get_version_store(name) {
+            Ok(store) if store.has_reserved_name() => store.schema().check_column_names(),
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether the open or a restore found a table whose column takes the
+    /// row identity's name
+    #[inline]
+    pub(crate) fn has_reserved_names(&self) -> bool {
+        self.any_reserved_name.load(Ordering::Acquire)
+    }
+
     /// About how many committed rows table `name` holds, hot and sealed,
     /// read without a transaction or a table; None for a table it does not hold
     pub(crate) fn row_count_hint(&self, name: &str) -> Option<usize> {
@@ -4059,7 +4071,34 @@ impl MVCCEngine {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
-        refresh_schema(&self.version_stores, &self.schemas, &self.ddl, table_name)
+        refresh_schema(&self.version_stores, &self.schemas, &self.ddl, table_name)?;
+        // A table a DDL left without a column of the row identity's name
+        // serves every statement again
+        let store = self.get_version_store(table_name)?;
+        if store.has_reserved_name() {
+            store.note_reserved_name();
+        }
+        Ok(())
+    }
+
+    /// Notes each table whose column takes the row identity's name, as only
+    /// an older build let one, and warns of it: the table serves DDL alone
+    fn note_reserved_names(&self) {
+        let stores: Vec<Arc<VersionStore>> = self
+            .version_stores
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        for store in stores {
+            if store.note_reserved_name() {
+                self.any_reserved_name.store(true, Ordering::Release);
+                if let Err(e) = store.schema().check_column_names() {
+                    eprintln!("Warning: {e}");
+                }
+            }
+        }
     }
 
     /// Get or create a segment manager for a table.
@@ -6127,11 +6166,7 @@ impl MVCCEngine {
         // before the destructive step. Without this, a corrupt .vol would fail after
         // WAL/volumes are already deleted, causing total data loss.
         for (table_name, path) in &snapshot_files {
-            // A schema an older build kept with the row identity's name is
-            // refused here, before anything is removed
-            let checked = super::snapshot::SnapshotReader::open(path)
-                .and_then(|reader| reader.schema().check_column_names());
-            if let Err(e) = checked {
+            if let Err(e) = super::snapshot::SnapshotReader::open(path) {
                 self.registry.start_accepting_transactions();
                 return Err(Error::internal(format!(
                     "Snapshot validation failed for table {}: {}",
@@ -6378,6 +6413,7 @@ impl MVCCEngine {
 
         // Populate default values from DEFAULT expressions
         self.populate_schema_defaults();
+        self.note_reserved_names();
 
         // Sync auto-increment counters from segment managers.
         // Without this, tables loaded as volumes would have stale counters

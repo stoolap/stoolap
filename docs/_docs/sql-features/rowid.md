@@ -26,7 +26,15 @@ SELECT _rowid_, kind FROM events WHERE _rowid_ = 2;
 
 `_rowid_` names the row identity and nothing else. No column and no alias may take it: `CREATE TABLE`, `ALTER TABLE ... ADD COLUMN` or `RENAME COLUMN`, `CREATE TABLE ... AS SELECT`, a select-list or `RETURNING` alias, and the column list of a CTE, a `VALUES` list or a table function all refuse it. `rowid` is an ordinary name: a table may have a column named `rowid`, and a query may alias to it.
 
-A database written before the name was reserved, holding a table with a column named `_rowid_`, refuses to open; the error names the table.
+A database written before the name was reserved, holding a table with a column named `_rowid_`, opens, and every other table works as before. The open prints a warning naming that table, and every statement that reads it, directly or through a view, is refused with an error that names the way out:
+
+```sql
+ALTER TABLE t RENAME COLUMN _rowid_ TO legacy_id;
+-- or
+ALTER TABLE t DROP COLUMN _rowid_;
+```
+
+Once the column has another name or is gone, the table serves every statement again, also after the database is opened again. `DROP TABLE` works on such a table too. A view whose query names `_rowid_` keeps the rename and the drop from going through, because the same text would then read the row identity instead of the column: drop or replace the view first. Restoring a snapshot that holds such a column leaves the table in the same state.
 
 ## Where _rowid_ can be used
 

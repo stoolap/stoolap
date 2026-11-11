@@ -16,6 +16,7 @@
 //! while none of them changes; a view's query runs under its own plan
 
 use crate::common::SmartString;
+use crate::core::Result;
 use crate::parser::ast::*;
 use crate::storage::traits::Engine;
 
@@ -58,6 +59,48 @@ impl Executor {
             }
             exprs.into_iter().for_each(|e| reads.expr(e));
         })
+    }
+
+    /// An error when `statement` names a table whose column takes the row
+    /// identity's name, which serves DDL alone, itself or through a view;
+    /// walked only while such a table is
+    pub(crate) fn check_reserved_reads(&self, statement: &Statement) -> Result<()> {
+        if !self.engine.has_reserved_names() {
+            return Ok(());
+        }
+        let mut reads = Reads {
+            executor: self,
+            names: Vec::new(),
+        };
+        let mut statement = statement;
+        while let Statement::Explain(explain) = statement {
+            statement = &explain.statement;
+        }
+        match statement {
+            Statement::Select(stmt) => reads.select(stmt),
+            Statement::Insert(stmt) => reads.insert(stmt),
+            Statement::Update(stmt) => reads.update(stmt),
+            Statement::Delete(stmt) => reads.delete(stmt),
+            Statement::CreateView(stmt) => reads.select(&stmt.query),
+            Statement::CreateTable(stmt) => match &stmt.as_select {
+                Some(select) => reads.select(select),
+                None => return Ok(()),
+            },
+            _ => return Ok(()),
+        }
+        let mut at = 0;
+        while let Some((name, _)) = reads.names.get(at).cloned() {
+            at += 1;
+            self.engine.check_reserved_table(&name)?;
+            if let Some(view) = self.engine.get_view_lowercase(&name)? {
+                if let Statement::Select(stmt) =
+                    self.parse_view_statement(&view.query)?.statement.as_ref()
+                {
+                    reads.select(stmt);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn validity(&self, epoch: u64, walk: impl FnOnce(&mut Reads<'_>)) -> PlanValidity {

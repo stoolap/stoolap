@@ -1,0 +1,14 @@
+//! Writes a database holding a table that names a column after the row
+//! identity, a view reading that column, and a table that does not
+use stoolap::Database;
+
+fn main() {
+    let out = std::env::args().nth(1).expect("an output directory");
+    let db = Database::open(&format!("file://{out}/column_named_rowid_beside")).unwrap();
+    db.execute("CREATE TABLE t (a INTEGER, _rowid_ INTEGER)", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 20)", ()).unwrap();
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, v INTEGER)", ()).unwrap();
+    db.execute("INSERT INTO u VALUES (1, 100)", ()).unwrap();
+    db.execute("CREATE VIEW v AS SELECT _rowid_ AS x FROM t", ()).unwrap();
+    db.close().unwrap();
+}
