@@ -460,7 +460,15 @@ fn a_side_file_round_whose_walk_is_refused_reads_the_volume_once() {
     )
     .unwrap();
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    /// This thread's side walks refused while held, also on a panic
+    struct Refused;
+    impl Drop for Refused {
+        fn drop(&mut self) {
+            refuse_side_walks(0);
+        }
+    }
     let before = top_k_side_rounds();
+    let refused = Refused;
     refuse_side_walks(usize::MAX);
     let keys: Vec<i64> = db
         .query(
@@ -470,7 +478,7 @@ fn a_side_file_round_whose_walk_is_refused_reads_the_volume_once() {
         .unwrap()
         .map(|row| row.unwrap().get(0).unwrap())
         .collect();
-    refuse_side_walks(0);
+    drop(refused);
     assert_eq!(keys, [49_999, 149_999]);
     assert_eq!(
         top_k_side_rounds() - before,

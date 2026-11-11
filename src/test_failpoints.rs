@@ -3221,21 +3221,23 @@ pub(crate) fn row_materialized() {
     ROWS_MATERIALIZED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Process-wide: side walks still to refuse when they take their reader
-static REFUSE_SIDE_WALKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    /// Side walks this thread still refuses when they take their reader
+    static REFUSE_SIDE_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
-/// Has the next `count` side walks refused when they take their reader
+/// Has this thread's next `count` side walks refused when they take their
+/// reader
 pub fn refuse_side_walks(count: usize) {
-    REFUSE_SIDE_WALKS.store(count, std::sync::atomic::Ordering::Relaxed);
+    REFUSE_SIDE_WALKS.with(|n| n.set(count));
 }
 
 pub(crate) fn side_walk_refused() -> bool {
-    use std::sync::atomic::Ordering::Relaxed;
-    if REFUSE_SIDE_WALKS.load(Relaxed) == 0 {
-        return false;
-    }
-    REFUSE_SIDE_WALKS.fetch_sub(1, Relaxed);
-    true
+    REFUSE_SIDE_WALKS.with(|n| {
+        let left = n.get();
+        n.set(left.saturating_sub(1));
+        left > 0
+    })
 }
 
 pub(crate) fn unique_read_candidates(count: usize) {
