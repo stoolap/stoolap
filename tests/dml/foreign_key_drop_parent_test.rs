@@ -165,6 +165,38 @@ fn a_parent_named_in_another_case_keeps_its_keys() {
 }
 
 #[test]
+fn a_key_into_its_own_table_named_in_another_case_does_not_block() {
+    let db = Database::open("memory://fk_drop_parent_unicode_self").unwrap();
+    db.execute(
+        "CREATE TABLE \"üp\" (id INTEGER PRIMARY KEY, up INTEGER REFERENCES \"üp\"(id))",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO \"üp\" VALUES (1, NULL), (2, 1)", ())
+        .unwrap();
+    db.execute("TRUNCATE TABLE \"ÜP\"", ()).unwrap();
+    db.execute("INSERT INTO \"üp\" VALUES (1, NULL), (2, 1)", ())
+        .unwrap();
+    db.execute("DROP TABLE \"ÜP\"", ()).unwrap();
+
+    db.execute("CREATE TABLE \"äq\" (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, q INTEGER REFERENCES \"äq\"(id))",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO \"äq\" VALUES (1)", ()).unwrap();
+    db.execute("INSERT INTO r VALUES (1, 1)", ()).unwrap();
+    assert!(db.execute("TRUNCATE TABLE \"ÄQ\"", ()).is_err());
+    let error = db.execute("DROP TABLE \"ÄQ\"", ()).unwrap_err();
+    assert!(
+        error.to_string().contains("table 'r' references it"),
+        "{error}"
+    );
+}
+
+#[test]
 fn a_key_created_inside_a_transaction_blocks_the_drop() {
     let db = Database::open("memory://fk_drop_parent_created_in_tx").unwrap();
     db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY)", ())

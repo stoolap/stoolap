@@ -1460,10 +1460,9 @@ fn check_changed(
 /// into itself go with it
 pub(crate) fn check_no_referencing_keys(engine: &MVCCEngine, parent_table: &str) -> Result<()> {
     let referencing = find_referencing_fks(engine, parent_table);
-    let Some((child_table, fk)) = referencing
-        .iter()
-        .find(|(child, _)| !child.eq_ignore_ascii_case(parent_table))
-    else {
+    // The keys store the child's name in lower case
+    let own = parent_table.to_lowercase();
+    let Some((child_table, fk)) = referencing.iter().find(|(child, _)| *child != own) else {
         return Ok(());
     };
     Err(Error::foreign_key_violation(
@@ -1499,11 +1498,10 @@ pub(crate) fn check_no_referencing_rows(
         return Ok(());
     }
 
-    // A table's rows that reference the table itself go with it
-    for (child_table, fk) in referencing
-        .iter()
-        .filter(|(child, _)| !child.eq_ignore_ascii_case(parent_table))
-    {
+    // A table's rows that reference the table itself go with it; the keys
+    // store the child's name in lower case
+    let own = parent_table.to_lowercase();
+    for (child_table, fk) in referencing.iter().filter(|(child, _)| *child != own) {
         // Build IS NOT NULL filter on the FK column — pushed down to storage layer
         // so indexes can be used and we stop after the first match (limit=1)
         // The filter's positions come from the handle that reads the rows
