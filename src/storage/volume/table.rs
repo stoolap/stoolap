@@ -1067,14 +1067,6 @@ impl SegmentedTable {
         Ok(answer.filter(|_| self.hot.publish_epoch_if_quiet() == Some(epoch)))
     }
 
-    /// `clear_of_destruction` for a shortcut over the newest committed state
-    fn newest_clear_of_destruction<T>(
-        &self,
-        read: impl FnMut() -> Result<Option<T>>,
-    ) -> Result<Option<T>> {
-        self.read_newest(|| self.clear_of_destruction(read))
-    }
-
     /// `across_seals` for a shortcut over the newest committed state
     fn newest_across_seals<T>(
         &self,
@@ -5418,33 +5410,29 @@ impl Table for SegmentedTable {
             }
             return self.count_cold_and_hot();
         }
-        // During seal, rows temporarily exist in both hot and cold.
-        // Use the same O(1) formula with overlap correction. The count
-        // may be off by a few rows during the brief overlap window, but
-        // this avoids an O(total_rows) HashSet collection that made ALL
-        // queries slow during checkpoint. A commit moving a row between the
-        // two counts would tear the sum: they answer only when no commit
-        // published across them, else the rows are counted
-        let counted = self.clear_of_destruction(|| {
+        // O(1) counts held to one seal generation and one commit epoch, else the scan counts
+        let counted = self.across_seals(|generation| {
             for _ in 0..ROW_COUNT_TRIES {
                 let Some(epoch) = self.hot.publish_epoch_if_quiet() else {
                     std::thread::yield_now();
                     continue;
                 };
-                let count = {
-                    let _seal_guard = self.segment_mgr.acquire_seal_read();
-                    let seg = self.segment_mgr.deduped_row_count()?;
-                    #[cfg(feature = "test-failpoints")]
-                    crate::test_failpoints::hot_and_cold_reads_split();
-                    let pending = self.segment_mgr.pending_tombstone_count(self.txn_id());
-                    let overlap = self.segment_mgr.seal_overlap();
-                    seg.saturating_sub(pending) + self.hot.row_count()?.saturating_sub(overlap)
-                };
+                if self.segment_mgr.seal_overlap() > 0 {
+                    return Ok(Some(None));
+                }
+                let seg = self.segment_mgr.deduped_row_count()?;
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::hot_and_cold_reads_split();
+                let pending = self.segment_mgr.pending_tombstone_count(self.txn_id());
+                let count = seg.saturating_sub(pending) + self.hot.row_count()?;
+                if self.seal_moved(generation) {
+                    return Ok(None);
+                }
                 if self.hot.publish_epoch_if_quiet() == Some(epoch) {
-                    return Ok(Some(count));
+                    return Ok(Some(Some(count)));
                 }
             }
-            Ok(None)
+            Ok(Some(None))
         })?;
         match counted {
             Some(count) => Ok(count),
@@ -5462,22 +5450,20 @@ impl Table for SegmentedTable {
     fn fast_row_count(&self) -> Result<Option<usize>> {
         // deduped_row_count subtracts ALL tombstones, newer ones a snapshot
         // or a view may not see among them
-        self.newest_clear_of_destruction(|| {
-            let _seal_guard = self.segment_mgr.acquire_seal_read();
+        self.newest_across_seals(|generation| {
+            // A seal's overlap, rows in both stores, leaves the count to a scan
+            if self.segment_mgr.seal_overlap() > 0 {
+                return Ok(Some(None));
+            }
             let Some(hot_count) = self.hot.fast_row_count()? else {
-                return Ok(None);
+                return Ok(Some(None));
             };
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::hot_and_cold_reads_split();
             let seg = self.segment_mgr.deduped_row_count()?;
             let pending = self.segment_mgr.pending_tombstone_count(self.txn_id());
-            let overlap = self.segment_mgr.seal_overlap();
-            // During seal, rows temporarily exist in both hot and cold.
-            // Subtract overlap to avoid double-counting. May drift by a few rows
-            // during the brief window, but O(1) vs O(N) is worth it.
-            Ok(Some(
-                seg.saturating_sub(pending) + hot_count.saturating_sub(overlap),
-            ))
+            let count = seg.saturating_sub(pending) + hot_count;
+            Ok((!self.seal_moved(generation)).then_some(Some(count)))
         })
     }
 

@@ -219,3 +219,76 @@ fn an_aggregate_over_evicted_volumes_reads_no_file_under_the_seal_fence() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+#[test]
+fn a_row_count_a_seal_lands_between_counts_again_and_counts_each_row_once() {
+    use stoolap::storage::traits::Engine;
+    use stoolap::test_failpoints::between_hot_and_cold_reads;
+    let _guard = FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db = sealed(dir.path());
+    let mut first = 201;
+    let mut wrong = Vec::new();
+    for how in ["row_count", "fast_row_count"] {
+        // Hot rows the seal between the two counts moves into a volume
+        db.execute(
+            &format!(
+                "INSERT INTO t SELECT value, value FROM generate_series({first}, {first} + 49)"
+            ),
+            (),
+        )
+        .unwrap();
+        let want = (first + 50 - 11) as usize;
+        first += 50;
+        let other = db.clone();
+        between_hot_and_cold_reads(move || other.engine().seal_for_test().unwrap());
+        let retries = stoolap::test_failpoints::seal_retries();
+        let mut tx = db.engine().begin_transaction().unwrap();
+        let table = tx.get_table("t").unwrap();
+        let count = match how {
+            "row_count" => Some(table.row_count().unwrap()),
+            _ => table.fast_row_count().unwrap(),
+        };
+        drop(table);
+        tx.rollback().unwrap();
+        let retried = stoolap::test_failpoints::seal_retries() - retries;
+        if count != Some(want) || retried == 0 {
+            wrong.push(format!(
+                "{how}: counted {count:?}, want {want}, {retried} retries"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_row_count_holds_no_seal_fence_between_its_two_counts() {
+    use stoolap::storage::traits::Engine;
+    use stoolap::test_failpoints::{between_hot_and_cold_reads, under_seal_fence};
+    let _guard = FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db = sealed(dir.path());
+    db.execute("INSERT INTO t VALUES (201, 201), (202, 202)", ())
+        .unwrap();
+    let mut wrong = Vec::new();
+    for how in ["row_count", "fast_row_count"] {
+        let fenced = Rc::new(Cell::new(None));
+        let seen = Rc::clone(&fenced);
+        between_hot_and_cold_reads(move || seen.set(Some(under_seal_fence())));
+        let mut tx = db.engine().begin_transaction().unwrap();
+        let table = tx.get_table("t").unwrap();
+        let count = match how {
+            "row_count" => Some(table.row_count().unwrap()),
+            _ => table.fast_row_count().unwrap(),
+        };
+        drop(table);
+        tx.rollback().unwrap();
+        if count != Some(192) || fenced.get() != Some(false) {
+            wrong.push(format!(
+                "{how}: counted {count:?}, fence held {:?}",
+                fenced.get()
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

@@ -3077,6 +3077,11 @@ pub(crate) fn seal_fence_entered() {
     SEAL_FENCE_DEPTH.with(|d| d.set(d.get() + 1));
 }
 
+/// Whether this thread holds the read side of a table's seal fence now
+pub fn under_seal_fence() -> bool {
+    SEAL_FENCE_DEPTH.with(|d| d.get() > 0)
+}
+
 pub(crate) fn seal_fence_left() {
     SEAL_FENCE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
 }
