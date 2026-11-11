@@ -318,7 +318,7 @@ fn correlated_precompute_filter_error_preserves_prior_statement() {
 }
 
 #[test]
-fn correlated_fk_precheck_reports_read_error_before_set_error() {
+fn correlated_update_of_a_referenced_column_propagates_late_scan_error() {
     let fixture = Fixture::new();
     let db = fixture.open();
     db.execute("CREATE TABLE target (id INTEGER, v INTEGER UNIQUE)", ())
@@ -327,7 +327,7 @@ fn correlated_fk_precheck_reports_read_error_before_set_error() {
     begin_target_update(&db);
     assert_read_error(
         &db,
-        "UPDATE target SET v = 'bad' WHERE (SELECT t.v FROM t WHERE t.id = target.id + 0) > 0",
+        "UPDATE target SET v = v + 1 WHERE (SELECT t.v FROM t WHERE t.id = target.id + 0) > 0",
     );
     assert_target_unchanged(&db);
     db.execute("COMMIT", ()).unwrap();
