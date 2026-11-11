@@ -6826,17 +6826,22 @@ impl MVCCEngine {
             identities_of.push((identities, definition));
         }
         let mut deferred = self.backfill_deferred.lock().unwrap();
-        deferred.retain(|(table, segment)| {
-            work.iter()
-                .any(|&(index, id, _)| id == *segment && tables[index].0 == *table)
+        let candidates: FxHashSet<(&str, u64)> = work
+            .iter()
+            .map(|&(index, id, _)| (tables[index].0.as_str(), id))
+            .collect();
+        deferred.retain(|(table, segment)| candidates.contains(&(table.as_str(), *segment)));
+        // A volume's place in the queue, one past it; 0 for one not queued
+        let waiting: FxHashMap<(&str, u64), usize> = deferred
+            .iter()
+            .enumerate()
+            .map(|(at, (table, segment))| ((table.as_str(), *segment), at + 1))
+            .collect();
+        work.sort_by_cached_key(|&(index, id, has_side)| {
+            let at = waiting.get(&(tables[index].0.as_str(), id));
+            (at.copied().unwrap_or(0), has_side, index, id)
         });
-        let waiting = |index: usize, id: u64| {
-            let at = deferred
-                .iter()
-                .position(|(table, segment)| *segment == id && *table == tables[index].0);
-            at.map_or(0, |at| at + 1)
-        };
-        work.sort_by_cached_key(|&(index, id, has_side)| (waiting(index, id), has_side, index, id));
+        drop(waiting);
         drop(deferred);
         let pending = work.len();
         for (index, seg_id, _) in work {
