@@ -27,12 +27,16 @@ struct Row {
     f: Option<f64>,
     ts: Option<i64>,
     p: i64,
+    t: Option<String>,
+    h: Option<String>,
 }
 
 fn row(id: i64) -> Row {
     let i = (id * 7919) % 3000;
     Row {
         id,
+        t: (id % 71 != 0).then(|| format!("k{:04}", i % 500)),
+        h: (id % 73 != 0).then(|| format!("h{:04}", i % 300)),
         i: (id % 97 != 0).then_some(i),
         f: match id {
             _ if id % 89 == 0 => Some(f64::NAN),
@@ -53,6 +57,7 @@ fn sql_of(r: &Row) -> String {
         None => "NULL".to_string(),
     };
     let opt = |v: Option<i64>| v.map_or("NULL".to_string(), |v| v.to_string());
+    let text = |v: &Option<String>| v.as_ref().map_or("NULL".to_string(), |v| format!("'{v}'"));
     let ts = r.ts.map_or("NULL".to_string(), |s| {
         format!(
             "'2024-01-01 {:02}:{:02}:{:02}'",
@@ -61,7 +66,14 @@ fn sql_of(r: &Row) -> String {
             s % 60
         )
     });
-    format!("({}, {}, {f}, {ts}, {})", r.id, opt(r.i), r.p)
+    format!(
+        "({}, {}, {f}, {ts}, {}, {}, {})",
+        r.id,
+        opt(r.i),
+        r.p,
+        text(&r.t),
+        text(&r.h)
+    )
 }
 
 /// Three sealed volumes, then rows deleted, rows updated in place into the
@@ -69,10 +81,13 @@ fn sql_of(r: &Row) -> String {
 fn sealed(dir: &std::path::Path) -> (Database, Vec<Row>) {
     let db = Database::open(&format!("file://{}?checkpoint_on_close=off", dir.display())).unwrap();
     for sql in [
-        "CREATE TABLE w (id INTEGER PRIMARY KEY, i INTEGER, f FLOAT, ts TIMESTAMP, p INTEGER)",
+        "CREATE TABLE w (id INTEGER PRIMARY KEY, i INTEGER, f FLOAT, ts TIMESTAMP, p INTEGER, \
+         t TEXT, h TEXT)",
         "CREATE INDEX w_i ON w (i)",
         "CREATE INDEX w_f ON w (f)",
         "CREATE INDEX w_ts ON w (ts)",
+        "CREATE INDEX w_t ON w (t) USING BTREE",
+        "CREATE INDEX w_h ON w (h) USING HASH",
     ] {
         db.execute(sql, ()).unwrap();
     }
@@ -90,7 +105,8 @@ fn sealed(dir: &std::path::Path) -> (Database, Vec<Row>) {
     db.execute("UPDATE w SET p = p WHERE id % 60 = 1", ())
         .unwrap();
     db.execute(
-        "UPDATE w SET i = i + 1, f = f + 0.5, ts = ts + INTERVAL '1 second' WHERE id % 70 = 2",
+        "UPDATE w SET i = i + 1, f = f + 0.5, ts = ts + INTERVAL '1 second', t = t || 'x', \
+         h = h || 'x' WHERE id % 70 = 2",
         (),
     )
     .unwrap();
@@ -98,6 +114,8 @@ fn sealed(dir: &std::path::Path) -> (Database, Vec<Row>) {
         r.i = r.i.map(|i| i + 1);
         r.f = r.f.map(|f| f + 0.5);
         r.ts = r.ts.map(|s| s + 1);
+        r.t = r.t.as_ref().map(|t| format!("{t}x"));
+        r.h = r.h.as_ref().map(|h| format!("{h}x"));
     }
     (db, model)
 }
@@ -136,6 +154,21 @@ const CASES: &[Case] = &[
         "ts >= '2024-01-01 00:10:00' AND ts < '2024-01-01 00:12:00'",
         |r| r.ts.is_some_and(|s| (600..720).contains(&s)),
     ),
+    ("t = 'k0017'", |r| r.t.as_deref() == Some("k0017")),
+    ("t = 'k0017' AND p = 3", |r| {
+        r.t.as_deref() == Some("k0017") && r.p == 3
+    }),
+    ("t = 'k0002x'", |r| r.t.as_deref() == Some("k0002x")),
+    ("t = 'nowhere'", |r| r.t.as_deref() == Some("nowhere")),
+    // Keys of id 2, whose key an update moved, and of id 50, deleted
+    ("t = 'k0338'", |r| r.t.as_deref() == Some("k0338")),
+    ("t = 'k0450'", |r| r.t.as_deref() == Some("k0450")),
+    ("h = 'h0238'", |r| r.h.as_deref() == Some("h0238")),
+    ("h = 'h0250'", |r| r.h.as_deref() == Some("h0250")),
+    ("h = 'h0042'", |r| r.h.as_deref() == Some("h0042")),
+    ("h = 'h0042' AND i < 1500", |r| {
+        r.h.as_deref() == Some("h0042") && r.i.is_some_and(|i| i < 1500)
+    }),
 ];
 
 #[test]
@@ -154,6 +187,78 @@ fn a_sealed_count_through_side_files_counts_as_the_scan_does() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// The calls a statement makes over the rows its WHERE passes, as text
+type Calls = fn(&[&Row]) -> String;
+
+/// The calls, the WHERE, the model's WHERE and the model's answer
+type AggregateCase = (&'static str, &'static str, fn(&Row) -> bool, Calls);
+
+fn text_of(v: Option<i64>) -> String {
+    v.map_or("NULL".to_string(), |v| v.to_string())
+}
+
+#[test]
+fn a_sealed_aggregate_through_side_files_answers_as_the_scan_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, model) = sealed(dir.path());
+    let sum_p: Calls = |rows| text_of((!rows.is_empty()).then(|| rows.iter().map(|r| r.p).sum()));
+    let min_max_i: Calls = |rows| {
+        let keys = rows.iter().filter_map(|r| r.i);
+        format!("{}|{}", text_of(keys.clone().min()), text_of(keys.max()))
+    };
+    let counts: Calls = |rows| {
+        let f = rows.iter().filter(|r| r.f.is_some()).count();
+        format!("{}|{f}", rows.len())
+    };
+    let cases: [AggregateCase; 6] = [
+        ("SUM(p)", "i = 17", |r| r.i == Some(17), sum_p),
+        (
+            "SUM(p)",
+            "t = 'k0338'",
+            |r| r.t.as_deref() == Some("k0338"),
+            sum_p,
+        ),
+        (
+            "MIN(i), MAX(i)",
+            "h = 'h0238'",
+            |r| r.h.as_deref() == Some("h0238"),
+            min_max_i,
+        ),
+        (
+            "MIN(i), MAX(i)",
+            "i >= 100 AND i < 200 AND p < 5",
+            |r| r.i.is_some_and(|i| (100..200).contains(&i)) && r.p < 5,
+            min_max_i,
+        ),
+        (
+            "COUNT(*), COUNT(f)",
+            "ts >= '2024-01-01 00:10:00' AND ts < '2024-01-01 00:12:00'",
+            |r| r.ts.is_some_and(|s| (600..720).contains(&s)),
+            counts,
+        ),
+        (
+            "SUM(p)",
+            "t = 'nowhere'",
+            |r| r.t.as_deref() == Some("nowhere"),
+            sum_p,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (calls, predicate, holds, answer) in cases {
+        let sql = format!("SELECT {calls} FROM w WHERE {predicate}");
+        let row = db.query(&sql, ()).unwrap().next().unwrap().unwrap();
+        let got: Vec<String> = (0..row.len())
+            .map(|i| row.get_value(i).unwrap().to_string())
+            .collect();
+        let passing: Vec<&Row> = model.iter().filter(|r| holds(r)).collect();
+        let want = answer(&passing);
+        if got.join("|") != want {
+            wrong.push(format!("{sql}: got {}, want {want}", got.join("|")));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn a_sealed_count_of_one_key_reads_the_side_file_and_at_most_one_block() {
@@ -165,11 +270,20 @@ fn a_sealed_count_of_one_key_reads_the_side_file_and_at_most_one_block() {
     );
     {
         let db = Database::open(&dsn).unwrap();
-        db.execute("CREATE TABLE x (id INTEGER PRIMARY KEY, k INTEGER)", ())
-            .unwrap();
-        db.execute("CREATE INDEX x_k ON x(k)", ()).unwrap();
         db.execute(
-            "INSERT INTO x SELECT value, (value * 7919) % 200000 FROM generate_series(1, 200000)",
+            "CREATE TABLE x (id INTEGER PRIMARY KEY, k INTEGER, s TEXT, h TEXT)",
+            (),
+        )
+        .unwrap();
+        db.execute("CREATE INDEX x_k ON x(k)", ()).unwrap();
+        db.execute("CREATE INDEX x_s ON x(s) USING BTREE", ())
+            .unwrap();
+        db.execute("CREATE INDEX x_h ON x(h) USING HASH", ())
+            .unwrap();
+        db.execute(
+            "INSERT INTO x SELECT value, (value * 7919) % 200000, \
+             'k' || ((value * 7919) % 200000), 'h' || ((value * 7919) % 200000) \
+             FROM generate_series(1, 200000)",
             (),
         )
         .unwrap();
@@ -180,6 +294,8 @@ fn a_sealed_count_of_one_key_reads_the_side_file_and_at_most_one_block() {
     for (sql, want) in [
         ("SELECT COUNT(*) FROM x WHERE k = 1", 1),
         ("SELECT COUNT(*) FROM x WHERE k = 150000", 1),
+        ("SELECT COUNT(*) FROM x WHERE s = 'k1'", 1),
+        ("SELECT COUNT(*) FROM x WHERE h = 'h150000'", 1),
     ] {
         // Reopened and evicted, no block of the volume is held
         let db = Database::open(&dsn).unwrap();
