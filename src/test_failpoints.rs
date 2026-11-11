@@ -2532,6 +2532,7 @@ thread_local! {
     static SEGMENT_MAP_CLONES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ROW_ID_ORDER_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TOP_K_COLD_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TOP_K_SIDE_ROUNDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static HOT_TOP_K_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static KEPT_MEMBER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static INNER_FETCH_FILTERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -3228,21 +3229,23 @@ pub(crate) fn row_materialized() {
     ROWS_MATERIALIZED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Process-wide: side walks still to refuse when they take their reader
-static REFUSE_SIDE_WALKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    /// Side walks this thread still refuses when they take their reader
+    static REFUSE_SIDE_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
-/// Has the next `count` side walks refused when they take their reader
+/// Has this thread's next `count` side walks refused when they take their
+/// reader
 pub fn refuse_side_walks(count: usize) {
-    REFUSE_SIDE_WALKS.store(count, std::sync::atomic::Ordering::Relaxed);
+    REFUSE_SIDE_WALKS.with(|n| n.set(count));
 }
 
 pub(crate) fn side_walk_refused() -> bool {
-    use std::sync::atomic::Ordering::Relaxed;
-    if REFUSE_SIDE_WALKS.load(Relaxed) == 0 {
-        return false;
-    }
-    REFUSE_SIDE_WALKS.fetch_sub(1, Relaxed);
-    true
+    REFUSE_SIDE_WALKS.with(|n| {
+        let left = n.get();
+        n.set(left.saturating_sub(1));
+        left > 0
+    })
 }
 
 pub(crate) fn unique_read_candidates(count: usize) {
@@ -3286,6 +3289,15 @@ pub fn top_k_cold_rows() -> usize {
 
 pub(crate) fn top_k_cold_row_built() {
     TOP_K_COLD_ROWS.with(|n| n.set(n.get() + 1));
+}
+
+/// Position ranges this thread's top-k reads took from side files, so far
+pub fn top_k_side_rounds() -> usize {
+    TOP_K_SIDE_ROUNDS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn top_k_side_round() {
+    TOP_K_SIDE_ROUNDS.with(|n| n.set(n.get() + 1));
 }
 
 /// The most row ids one chunk of this thread's B-tree walks copied under the
