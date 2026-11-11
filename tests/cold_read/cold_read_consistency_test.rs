@@ -191,9 +191,13 @@ fn readers_share_a_retired_volume_without_keeping_its_payload_alive() {
     let dir = tempfile::tempdir().unwrap();
     let schema = SchemaBuilder::new("t")
         .column("id", DataType::Integer, false, true)
+        .column("v", DataType::Integer, true, false)
         .build();
     let mut builder = VolumeBuilder::new(&schema);
-    builder.add_row(1, &Row::from_values(vec![Value::Integer(1)]));
+    builder.add_row(
+        1,
+        &Row::from_values(vec![Value::Integer(1), Value::Integer(10)]),
+    );
     let volume = builder.finish().unwrap();
     let id = io::next_volume_id();
     let path = io::write_volume_to_disk(dir.path(), "t", id, &volume).unwrap();
@@ -240,7 +244,9 @@ fn readers_share_a_retired_volume_without_keeping_its_payload_alive() {
         .stats()
         .misses;
     for volume in &loaded {
-        assert_eq!(volume.get_row(0).unwrap()[0], Value::Integer(1));
+        let row = volume.get_row(0).unwrap();
+        assert_eq!(row[0], Value::Integer(1));
+        assert_eq!(row[1], Value::Integer(10));
     }
     let after = stoolap::storage::volume::group_cache::DECODED_GROUPS
         .stats()

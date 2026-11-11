@@ -59,6 +59,8 @@ pub(crate) const COL_BYTES: u8 = 6;
 
 // Column flags
 pub(crate) const FLAG_SORTED: u8 = 0x01;
+/// V5: an INT64 column whose cells equal the row ids, none NULL
+pub(crate) const FLAG_ROW_IDS: u8 = 0x02;
 
 // STVL format removed. All volumes use V4 format (see io.rs).
 
@@ -1159,6 +1161,7 @@ pub(crate) struct VolumeMetadata {
     pub column_types: Vec<DataType>,
     pub row_groups: Vec<super::column::RowGroupMeta>,
     pub column_name_map: ahash::AHashMap<SmartString, usize>,
+    pub row_id_column: Option<usize>,
 }
 
 /// Serialize volume metadata (everything except column data) for V4 format.
@@ -1594,6 +1597,7 @@ pub(crate) fn deserialize_volume_metadata(data: &[u8]) -> io::Result<VolumeMetad
         column_types,
         row_groups,
         column_name_map,
+        row_id_column: None,
     })
 }
 
@@ -1688,11 +1692,14 @@ pub(crate) fn v5_metadata_sections(
     columns.extend_from_slice(&(V5_COLUMN_ENTRY as u32).to_le_bytes());
     let mut dict_col = 0usize;
     for (i, &(type_tag, ext_tag)) in kinds.iter().enumerate() {
-        let flags = if meta.sorted_columns[i] {
+        let mut flags = if meta.sorted_columns[i] {
             FLAG_SORTED
         } else {
             0
         };
+        if meta.row_id_column == Some(i) {
+            flags |= FLAG_ROW_IDS;
+        }
         let dict_count = if type_tag == COL_DICTIONARY {
             let d = dictionaries.get(dict_col).ok_or_else(|| {
                 io::Error::new(
@@ -1892,6 +1899,7 @@ pub(crate) fn v5_metadata_from_sections(
     let mut col_type_tags = Vec::with_capacity(col_count);
     let mut col_ext_types = Vec::with_capacity(col_count);
     let mut col_sorted = Vec::with_capacity(col_count);
+    let mut row_id_column = None;
     let mut col_dict_counts = Vec::with_capacity(col_count);
     let mut column_types = Vec::with_capacity(col_count);
     let mut name_lens = Vec::with_capacity(col_count);
@@ -1905,6 +1913,12 @@ pub(crate) fn v5_metadata_from_sections(
         }
         col_type_tags.push(e[0]);
         col_sorted.push(e[1] & FLAG_SORTED != 0);
+        if e[1] & FLAG_ROW_IDS != 0 {
+            if e[0] != COL_INT64 || row_id_column.is_some() {
+                return Err(invalid("row id flag"));
+            }
+            row_id_column = Some(i);
+        }
         col_ext_types.push(if e[0] == COL_BYTES { e[2] } else { 0 });
         column_types.push(dtype);
         col_dict_counts.push(u32_at(e, 8));
@@ -2095,6 +2109,7 @@ pub(crate) fn v5_metadata_from_sections(
             column_types,
             row_groups,
             column_name_map,
+            row_id_column,
         },
         bounds,
     })
