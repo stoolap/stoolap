@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use crate::common::names::eq_names;
 use crate::common::{CompactArc, CompactVec, SmartString};
 use crate::core::{IndexType, Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::{Expression, GroupByModifier, SelectStatement};
@@ -344,7 +345,7 @@ impl Executor {
             .iter()
             .map(|agg| {
                 let column = bare_column(agg);
-                let named = || columns.iter().position(|c| c.eq_ignore_ascii_case(column));
+                let named = || columns.iter().position(|c| eq_names(c, column));
                 agg.expression.is_none().then(named).flatten()
             })
             .collect()

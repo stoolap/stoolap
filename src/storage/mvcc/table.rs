@@ -21,6 +21,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::sync::Arc;
 
+use crate::common::names::eq_names;
 use crate::common::{CompactArc, I64Set};
 use crate::core::{
     DataType, Error, IndexType, Result, Row, RowIdVec, RowVec, Schema, SchemaColumn, Value,
@@ -249,7 +250,7 @@ pub(crate) fn pk_equality_id(expr: &dyn Expression, schema: &Schema) -> Option<i
     }
     let pk_col = &schema.columns[pk_indices[0]];
     let (col_name, operator, value) = expr.get_comparison_info()?;
-    if !col_name.eq_ignore_ascii_case(&pk_col.name) || operator != Operator::Eq {
+    if !eq_names(col_name, &pk_col.name) || operator != Operator::Eq {
         return None;
     }
     match value {
@@ -313,9 +314,7 @@ fn key_range(expr: &dyn Expression, schema: &Schema) -> Option<(i64, i64)> {
     let pk = &schema.columns[schema.pk_column_index()?].name;
     let mut leaves = Vec::new();
     if !collect_conjuncts(expr, &mut leaves)
-        || !leaves
-            .iter()
-            .all(|(column, _, _)| column.eq_ignore_ascii_case(pk))
+        || !leaves.iter().all(|(column, _, _)| eq_names(column, pk))
     {
         return None;
     }
@@ -754,7 +753,7 @@ impl MVCCTable {
         let mut prefix = Vec::with_capacity(equal);
         for column in &columns[..equal] {
             let (_, _, value) = leaves.iter().find(|(name, op, value)| {
-                *op == Operator::Eq && !value.is_null() && name.eq_ignore_ascii_case(column)
+                *op == Operator::Eq && !value.is_null() && eq_names(name, column)
             })?;
             prefix.push((*value).clone());
         }
@@ -762,7 +761,7 @@ impl MVCCTable {
         let mut lower = None;
         let mut upper = None;
         for (name, op, value) in &leaves {
-            if !name.eq_ignore_ascii_case(walked) {
+            if !eq_names(name, walked) {
                 continue;
             }
             if value.is_null() {
@@ -833,9 +832,7 @@ impl MVCCTable {
             IndexPlan::Key => {
                 let pk = &schema.columns[schema.pk_column_index()?].name;
                 let id = scope.iter().find_map(|c| match c.get_comparison_info() {
-                    Some((column, Operator::Eq, Value::Integer(id)))
-                        if column.eq_ignore_ascii_case(pk) =>
-                    {
+                    Some((column, Operator::Eq, Value::Integer(id))) if eq_names(column, pk) => {
                         Some(*id)
                     }
                     _ => None,
@@ -852,9 +849,7 @@ impl MVCCTable {
                         .downcast_ref::<crate::storage::expression::InListExpr>()
                         .filter(|list| {
                             !list.is_not()
-                                && list
-                                    .get_column_name()
-                                    .is_some_and(|n| n.eq_ignore_ascii_case(pk))
+                                && list.get_column_name().is_some_and(|n| eq_names(n, pk))
                         })
                 })?;
                 let mut row_ids = RowIdVec::with_capacity(list.get_values().len());
@@ -933,7 +928,7 @@ impl MVCCTable {
     ) -> Option<RowIdVec> {
         use crate::core::Operator;
         let column = index.column_names()[0].as_str();
-        let named = |name: &str| name.eq_ignore_ascii_case(column);
+        let named = |name: &str| eq_names(name, column);
         match read {
             Read::Equal => {
                 let value = scope.iter().find_map(|c| match c.get_comparison_info() {
@@ -1053,9 +1048,7 @@ impl MVCCTable {
         let mut values: Vec<Value> = Vec::with_capacity(equal + 1);
         for column in &columns[..equal] {
             let value = scope.iter().find_map(|c| match c.get_comparison_info() {
-                Some((name, Operator::Eq, value)) if name.eq_ignore_ascii_case(column) => {
-                    Some(value)
-                }
+                Some((name, Operator::Eq, value)) if eq_names(name, column) => Some(value),
                 _ => None,
             })?;
             values.push(value.clone());
@@ -1115,16 +1108,13 @@ fn column_bounds<'a>(column: &str, scope: &[&'a dyn Expression]) -> (KeyBound<'a
     };
     for &conjunct in scope {
         if let Some((name, operator, value)) = conjunct.get_comparison_info() {
-            if name.eq_ignore_ascii_case(column) {
+            if eq_names(name, column) {
                 bound(operator, value);
             }
         } else if let Some(between) = conjunct
             .as_any()
             .downcast_ref::<crate::storage::expression::BetweenExpr>()
-            .filter(|b| {
-                b.get_column_name()
-                    .is_some_and(|n| n.eq_ignore_ascii_case(column))
-            })
+            .filter(|b| b.get_column_name().is_some_and(|n| eq_names(n, column)))
         {
             for (_, operator, value) in between.collect_comparisons() {
                 bound(operator, value);
@@ -2799,7 +2789,7 @@ impl MVCCTable {
                     .cached_schema
                     .columns
                     .iter()
-                    .find(|c| c.name_lower.eq_ignore_ascii_case(column))
+                    .find(|c| eq_names(&c.name_lower, column))
                     .map(|c| c.data_type)
                 else {
                     return Ok(None);
@@ -3638,7 +3628,7 @@ impl Table for MVCCTable {
         let Some(plan) = self.walk_keys(walk, expr) else {
             return Ok(None);
         };
-        if !plan.index.column_names()[plan.prefix.len()].eq_ignore_ascii_case(column_name) {
+        if !eq_names(&plan.index.column_names()[plan.prefix.len()], column_name) {
             return Ok(None);
         }
         let schema = &self.cached_schema;
@@ -4455,7 +4445,7 @@ impl Table for MVCCTable {
             // Skip single-column indexes that match the PK column
             if names.len() == 1 {
                 if let Some(pk) = pk_col {
-                    if names[0].eq_ignore_ascii_case(pk) {
+                    if eq_names(&names[0], pk) {
                         continue;
                     }
                 }
@@ -4482,7 +4472,7 @@ impl Table for MVCCTable {
             let names = idx.column_names();
             if names.len() == 1 {
                 if let Some(pk) = pk_col {
-                    return !names[0].eq_ignore_ascii_case(pk);
+                    return !eq_names(&names[0], pk);
                 }
             }
             true

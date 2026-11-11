@@ -23,6 +23,7 @@
 //! - CREATE VIEW
 //! - DROP VIEW
 
+use super::utils::eq_names;
 use crate::core::{DataType, Error, ForeignKeyAction, ForeignKeyConstraint, Result, SchemaBuilder};
 use crate::parser::ast::*;
 use crate::storage::mvcc::engine::ViewDefinition;
@@ -303,14 +304,12 @@ impl Executor {
                 .constraints
                 .iter()
                 .any(|c| matches!(c, ColumnConstraint::NotNull))
-                && !composite_pk_columns
-                    .iter()
-                    .any(|pk| pk.eq_ignore_ascii_case(col_name));
+                && !composite_pk_columns.iter().any(|pk| eq_names(pk, col_name));
             let is_primary_key = col_def
                 .constraints
                 .iter()
                 .any(|c| matches!(c, ColumnConstraint::PrimaryKey))
-                || table_level_pk.is_some_and(|pk| pk.eq_ignore_ascii_case(col_name));
+                || table_level_pk.is_some_and(|pk| eq_names(pk, col_name));
 
             // Validate PRIMARY KEY type - only INTEGER is supported
             if is_primary_key && data_type != DataType::Integer {
@@ -466,7 +465,7 @@ impl Executor {
                 let index = stmt
                     .columns
                     .iter()
-                    .position(|c| c.name.value.eq_ignore_ascii_case(&column.value))
+                    .position(|c| eq_names(&c.name.value, &column.value))
                     .ok_or_else(|| Error::ColumnNotFound(column.value.to_string()))?;
                 if key.contains(&index) {
                     return Err(Error::Parse(format!(

@@ -21,6 +21,7 @@
 //! - IN list/subquery/hashset using index probe
 //! - Window function pre-sorting detection
 
+use crate::common::names::eq_names;
 use crate::common::{CompactArc, I64Set};
 use crate::core::predicate::{kind, PredicateSet};
 use crate::core::{DataType, Result, Row, RowVec, Value, ValueSet};
@@ -133,10 +134,8 @@ impl Executor {
             && window_expr.order_by.len() == 1
             && window_expr.order_by[0].ascending == ascending
             && match &window_expr.order_by[0].expression {
-                Expression::Identifier(id) => id.value.eq_ignore_ascii_case(order_col),
-                Expression::QualifiedIdentifier(qid) => {
-                    qid.name.value.eq_ignore_ascii_case(order_col)
-                }
+                Expression::Identifier(id) => eq_names(&id.value, order_col),
+                Expression::QualifiedIdentifier(qid) => eq_names(&qid.name.value, order_col),
                 _ => false,
             };
         if !follows_fetch_order {
@@ -239,7 +238,7 @@ impl Executor {
             };
             match canonical {
                 None => *canonical = Some(col_name),
-                Some(c) if !c.eq_ignore_ascii_case(&col_name) => return Err(()),
+                Some(c) if !eq_names(c, &col_name) => return Err(()),
                 _ => {}
             }
             Ok(())

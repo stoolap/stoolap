@@ -33,6 +33,7 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
+use crate::common::names::eq_names;
 use crate::common::SmartString;
 
 use crate::common::{
@@ -5642,7 +5643,7 @@ impl VersionStore {
         let indexes = self.indexes.read();
         for entry in indexes.values() {
             let column_names = entry.index.column_names();
-            if column_names.len() == 1 && column_names[0].eq_ignore_ascii_case(column_name) {
+            if column_names.len() == 1 && eq_names(&column_names[0], column_name) {
                 return Some(Arc::clone(&entry.index));
             }
         }
@@ -5745,7 +5746,7 @@ impl VersionStore {
             let names = idx.column_names();
             if names.len() == 1 {
                 if let Some(pk) = pk_col {
-                    if names[0].eq_ignore_ascii_case(pk) {
+                    if eq_names(&names[0], pk) {
                         continue;
                     }
                 }
@@ -5813,7 +5814,7 @@ impl VersionStore {
                 let Some(column) = schema
                     .columns
                     .iter()
-                    .position(|c| c.name_lower.eq_ignore_ascii_case(name))
+                    .position(|c| eq_names(&c.name_lower, name))
                 else {
                     continue 'indexes;
                 };

@@ -19,6 +19,7 @@
 //! - UPDATE
 //! - DELETE
 
+use crate::common::names::eq_names;
 use crate::common::CompactArc;
 use crate::common::I64Set;
 use crate::common::SmartString;
@@ -2293,7 +2294,7 @@ impl Executor {
         let column = schema
             .columns
             .iter()
-            .find(|c| c.name.eq_ignore_ascii_case(name))
+            .find(|c| eq_names(&c.name, name))
             .ok_or_else(|| Error::ColumnNotFound(name.to_string()))?;
         // The expression comes first: a value kept beside it was computed
         // once, when the column was added, and a RANDOM() default must be

@@ -25,6 +25,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 use crate::api::params::ParamVec;
+use crate::common::names::eq_names;
 use crate::common::{CompactArc, SmartString};
 use crate::core::predicate::{kind, KeySide, PredicateSet};
 use crate::core::{
@@ -5621,7 +5622,7 @@ fn member_rows(
         return Ok(None);
     };
     let pk = schema.pk_column_index().map(|pk| &schema.columns[pk]);
-    match pk.filter(|pk| pk.name.eq_ignore_ascii_case(column)) {
+    match pk.filter(|pk| eq_names(&pk.name, column)) {
         Some(pk) => {
             let rows = Executor::rows_of_members(
                 table,
@@ -5660,7 +5661,7 @@ fn keyset_start(schema: &Schema, filter: Option<&dyn StorageExpr>) -> Option<Opt
         let (column, operator, Value::Integer(bound)) = conjunct.get_comparison_info()? else {
             return None;
         };
-        if !column.eq_ignore_ascii_case(&pk.name) {
+        if !eq_names(column, &pk.name) {
             return None;
         }
         let first = match operator {
@@ -8041,7 +8042,7 @@ fn source_fits(columns: &[String], schema: &Schema) -> bool {
         && columns
             .iter()
             .zip(&schema.columns)
-            .all(|(c, s)| c.eq_ignore_ascii_case(&s.name))
+            .all(|(c, s)| eq_names(c, &s.name))
 }
 
 /// The rows of a VALUES list, or the arguments of a table function as one
@@ -11056,7 +11057,7 @@ impl JoinBlocks {
         // A joined side's rows hold its tables' columns in turn, each named
         // by its table and its own name
         let fits = |c: &SchemaColumn, n: &String| match self.nested[side] {
-            true => bare_name(n).eq_ignore_ascii_case(&c.name),
+            true => eq_names(bare_name(n), &c.name),
             false => c.name == *n,
         };
         if prepared.len() == columns.len() && prepared.iter().zip(columns).all(|(c, n)| fits(c, n))

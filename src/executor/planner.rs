@@ -27,6 +27,7 @@
 
 use std::sync::Arc;
 
+use crate::common::names::eq_names;
 use crate::common::StringMap;
 use crate::storage::traits::transaction::{StatementTable, TableUse};
 
@@ -318,7 +319,7 @@ impl QueryPlanner {
             let row = result.row();
             // Check if this row is for our table (table_name is column 1)
             if let Some(Value::Text(name)) = row.get(1) {
-                if name.eq_ignore_ascii_case(table_name) {
+                if eq_names(name, table_name) {
                     return Ok(TableStats {
                         table_name: table_name.to_string(),
                         row_count: row.get(2).and_then(|v| v.as_int64()).unwrap_or(0) as u64,
@@ -356,7 +357,7 @@ impl QueryPlanner {
             let row = result.row();
             // Check if this row is for our table (table_name is column 1)
             if let Some(Value::Text(name)) = row.get(1) {
-                if name.eq_ignore_ascii_case(table_name) {
+                if eq_names(name, table_name) {
                     if let Some(Value::Text(col_name)) = row.get(2) {
                         // Parse histogram from JSON string if available
                         let histogram = row

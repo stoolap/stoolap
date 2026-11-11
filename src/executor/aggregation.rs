@@ -39,8 +39,8 @@ use super::expression::{run_params, ExprVM, SubqueryExecutor};
 use super::query::order_by_inputs;
 use super::result::ExecutorResult;
 use super::utils::{
-    bare_name, build_column_index_map, eq_folded, item_name, item_spelled_name, qualified,
-    qualified_index, qualified_key_index, shown_name, split_qualified, with_lowercase,
+    bare_name, build_column_index_map, eq_folded, eq_names, item_name, item_spelled_name,
+    qualified, qualified_index, qualified_key_index, shown_name, split_qualified,
 };
 use super::window::{HeldWindow, WindowOutput};
 use super::Executor;
@@ -312,7 +312,7 @@ pub(crate) fn aggregate_alias_key(
     !binds
         && select.iter().any(|item| {
             matches!(item, Expression::Aliased(aliased)
-                if aliased.alias.value.eq_ignore_ascii_case(&name.value)
+                if eq_names(&aliased.alias.value, &name.value)
                     && expression_contains_aggregate(&aliased.expression))
         })
 }
@@ -350,16 +350,12 @@ pub(crate) fn check_grouped_reads(
 /// The positions of `columns` whose name another column carries, folded as
 /// the compiler folds a name; empty, allocating nothing, when none is
 pub(crate) fn repeated_columns(columns: &[String]) -> Vec<usize> {
-    let same = |a: &str, b: &str| match a.is_ascii() && b.is_ascii() {
-        true => a.eq_ignore_ascii_case(b),
-        false => with_lowercase(a, |a| with_lowercase(b, |b| a.eq(b))),
-    };
     let mut repeated = Vec::new();
     for (at, name) in columns.iter().enumerate() {
         if columns
             .iter()
             .enumerate()
-            .any(|(other, column)| other != at && same(name, column))
+            .any(|(other, column)| other != at && eq_names(name, column))
         {
             repeated.push(at);
         }
@@ -391,13 +387,10 @@ fn ungrouped_read(
     // A reference spelled as a group column binds as that column does
     let spelled_grouped = |reference: &Expression| {
         items.iter().any(|item| match (item, reference) {
-            (GroupByItem::Column(c), Expression::Identifier(id)) => {
-                c.eq_ignore_ascii_case(&id.value)
-            }
+            (GroupByItem::Column(c), Expression::Identifier(id)) => eq_names(c, &id.value),
             (GroupByItem::Column(c), Expression::QualifiedIdentifier(q)) => split_qualified(c)
                 .is_some_and(|(table, name)| {
-                    table.eq_ignore_ascii_case(&q.qualifier.value)
-                        && name.eq_ignore_ascii_case(&q.name.value)
+                    eq_names(table, &q.qualifier.value) && eq_names(name, &q.name.value)
                 }),
             _ => false,
         })
@@ -548,14 +541,11 @@ fn column_parts(item: &GroupByItem) -> Option<(Option<&str>, &str)> {
 /// Whether two items group by the same column written alike, its names
 /// lowered as a column binds
 fn same_column(a: &GroupByItem, b: &GroupByItem) -> bool {
-    let same = |a: &str, b: &str| {
-        super::utils::with_lowercase(a, |a| super::utils::with_lowercase(b, |b| a.eq(b)))
-    };
     match (column_parts(a), column_parts(b)) {
         (Some((a_table, a_name)), Some((b_table, b_name))) => {
-            same(a_name, b_name)
+            eq_names(a_name, b_name)
                 && match (a_table, b_table) {
-                    (Some(a), Some(b)) => same(a, b),
+                    (Some(a), Some(b)) => eq_names(a, b),
                     (None, None) => true,
                     _ => false,
                 }
@@ -599,19 +589,20 @@ fn qualified_parts(name: &str) -> (Option<&str>, &str) {
 /// each one it spells and the first of each table it qualifies, over which
 /// it resolves as it does over all of `source`
 fn columns_named(source: &[String], names: &[(Option<&str>, &str)]) -> Vec<String> {
-    let same = |a: &str, b: &str| with_lowercase(a, |a| with_lowercase(b, |b| a.eq(b)));
     let mut tables: smallvec::SmallVec<[&str; 4]> = smallvec::SmallVec::new();
     let mut kept = Vec::new();
     for column in source {
         let (table, name) = qualified_parts(column);
         let first_of_table = table.filter(|table| {
-            !tables.iter().any(|seen| same(seen, table))
-                && names.iter().any(|(q, _)| q.is_some_and(|q| same(q, table)))
+            !tables.iter().any(|seen| eq_names(seen, table))
+                && names
+                    .iter()
+                    .any(|(q, _)| q.is_some_and(|q| eq_names(q, table)))
         });
         if let Some(table) = first_of_table {
             tables.push(table);
         }
-        if first_of_table.is_some() || names.iter().any(|(_, n)| same(n, name)) {
+        if first_of_table.is_some() || names.iter().any(|(_, n)| eq_names(n, name)) {
             kept.push(column.clone());
         }
     }

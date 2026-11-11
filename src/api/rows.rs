@@ -45,6 +45,7 @@
 //! let users: Vec<User> = db.query_as("SELECT id, name FROM users", ())?;
 //! ```
 
+use crate::common::names::eq_names;
 use crate::common::CompactArc;
 use crate::core::{Error, Result, Row, Value};
 use crate::storage::traits::QueryResult;
@@ -183,16 +184,7 @@ impl ResultRow {
 
     /// Get the index of a column by name (case-insensitive)
     fn column_index(&self, name: &str) -> Result<usize> {
-        let position = if name.is_ascii() && self.columns.iter().all(|c| c.is_ascii()) {
-            self.columns
-                .iter()
-                .position(|c| c.eq_ignore_ascii_case(name))
-        } else {
-            let name_lower = name.to_lowercase();
-            self.columns
-                .iter()
-                .position(|c| c.to_lowercase() == name_lower)
-        };
+        let position = self.columns.iter().position(|c| eq_names(c, name));
         position.ok_or_else(|| Error::ColumnNotFound(name.to_string()))
     }
 }

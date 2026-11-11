@@ -24,6 +24,7 @@
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 
+pub(crate) use crate::common::names::{eq_folded, eq_names};
 use crate::common::SmartString;
 
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
@@ -49,9 +50,11 @@ pub(crate) fn probes_by_equality(table: &dyn crate::storage::traits::Table, colu
         .get_index_on_column(column)
         .is_some_and(|index| match index.index_type() {
             IndexType::BTree => true,
-            IndexType::Hash => table.schema().columns.iter().any(|c| {
-                c.data_type == DataType::Text && c.name_lower.eq_ignore_ascii_case(column)
-            }),
+            IndexType::Hash => table
+                .schema()
+                .columns
+                .iter()
+                .any(|c| c.data_type == DataType::Text && eq_names(&c.name_lower, column)),
             _ => false,
         })
 }
@@ -2561,17 +2564,6 @@ pub fn compute_join_projection(
     })
 }
 
-/// `f` over the characters of `s` lowercased as `str::to_lowercase` gives
-/// them; a copy is made only for a name holding `Σ`, the one letter it
-/// lowercases by its context
-pub(crate) fn with_lowercase<R>(s: &str, f: impl FnOnce(&mut dyn Iterator<Item = char>) -> R) -> R {
-    if s.contains('Σ') {
-        f(&mut s.to_lowercase().chars())
-    } else {
-        f(&mut s.chars().flat_map(char::to_lowercase))
-    }
-}
-
 /// What separates a column's qualifier from its own name in the column
 /// text the executor binds by. No identifier holds it, so a dot inside a
 /// quoted qualifier or name never splits them otherwise. A caller handing
@@ -2608,18 +2600,6 @@ pub fn shown_name(column: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// Case-insensitive comparison of a column name against an already
-/// lowercased name, lowercasing the column as `str::to_lowercase` does,
-/// final sigma included
-#[inline]
-pub(crate) fn eq_folded(column: &str, lower: &str) -> bool {
-    if column.is_ascii() {
-        lower.is_ascii() && column.eq_ignore_ascii_case(lower)
-    } else {
-        with_lowercase(column, |column| column.eq(lower.chars()))
-    }
-}
-
 /// The same for a column `qualifier` qualifies, named `name`
 #[inline]
 pub(crate) fn eq_folded_qualified(column: &str, qualifier: &str, name: &str) -> bool {
@@ -2653,16 +2633,6 @@ pub(crate) fn for_each_qualified_star_column(
 fn qualified_name_start(column: &str, qualifier: &str) -> Option<usize> {
     let (q, _) = split_qualified(column)?;
     eq_names(q, qualifier).then_some(q.len() + QUALIFIER_SEP.len_utf8())
-}
-
-/// Whether two names are one ignoring case, each lowercased on its own as
-/// `str::to_lowercase` does
-fn eq_names(a: &str, b: &str) -> bool {
-    if a.is_ascii() && b.is_ascii() {
-        a.eq_ignore_ascii_case(b)
-    } else {
-        with_lowercase(a, |a| with_lowercase(b, |b| a.eq(b)))
-    }
 }
 
 #[cfg(test)]

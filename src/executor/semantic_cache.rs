@@ -85,17 +85,7 @@ use std::time::Duration;
 use crate::common::{CompactArc, StringMap};
 use crate::core::{Error, Result, Row};
 
-/// Convert to lowercase without allocation if already lowercase ASCII.
-/// Returns Cow::Borrowed for those (zero allocation); any other name is
-/// lowercased as `str::to_lowercase` does.
-#[inline]
-fn to_lowercase_cow(s: &str) -> Cow<'_, str> {
-    if s.bytes().all(|b| b.is_ascii() && !b.is_ascii_uppercase()) {
-        Cow::Borrowed(s)
-    } else {
-        Cow::Owned(s.to_lowercase())
-    }
-}
+use crate::common::names::{eq_names, to_lowercase_cow};
 use crate::functions::FunctionRegistry;
 use crate::parser::ast::{Expression, InfixOperator};
 
@@ -995,7 +985,7 @@ fn check_range_subsumption(cached: &Expression, new: &Expression) -> Option<Subs
     let new_col = column_name_of(&new_infix.left)?;
 
     // OPTIMIZATION: Use case-insensitive comparison instead of double to_lowercase()
-    if !cached_col.eq_ignore_ascii_case(new_col) {
+    if !eq_names(cached_col, new_col) {
         return None;
     }
 

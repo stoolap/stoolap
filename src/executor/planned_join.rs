@@ -28,7 +28,7 @@ use super::operators::index_nested_loop::IndexLookupStrategy;
 use super::prepared_join::PreparedJoin;
 use super::query::{CteNames, HOT_INNER_ROWS_PER_KEY, SMALL_OUTER_ROWS};
 use super::query_classification::QueryClassification;
-use super::utils::{bare_name, probes_by_equality, qualified, split_qualified};
+use super::utils::{bare_name, eq_names, probes_by_equality, qualified, split_qualified};
 use super::Executor;
 use crate::optimizer::feedback::global_feedback_cache;
 
@@ -170,10 +170,10 @@ impl Executor {
             && pk_columns.iter().all(|pk| {
                 keys.iter().any(|col| match col {
                     Expression::QualifiedIdentifier(qid) => {
-                        qid.qualifier.value.eq_ignore_ascii_case(left_alias)
-                            && qid.name.value.eq_ignore_ascii_case(&pk.name)
+                        eq_names(&qid.qualifier.value, left_alias)
+                            && eq_names(&qid.name.value, &pk.name)
                     }
-                    Expression::Identifier(id) => id.value.eq_ignore_ascii_case(&pk.name),
+                    Expression::Identifier(id) => eq_names(&id.value, &pk.name),
                     _ => false,
                 })
             });
@@ -183,9 +183,7 @@ impl Executor {
         // An unqualified GROUP BY column could be either side's; it is
         // taken as the left side's
         let of_left = |col: &Expression| match col {
-            Expression::QualifiedIdentifier(qid) => {
-                qid.qualifier.value.eq_ignore_ascii_case(left_alias)
-            }
+            Expression::QualifiedIdentifier(qid) => eq_names(&qid.qualifier.value, left_alias),
             Expression::Identifier(_) => true,
             _ => false,
         };
@@ -273,7 +271,7 @@ impl Executor {
         // The outer column is the outer side's: qualified by its name, or a
         // bare name the inner table has no column of
         let outer_named_by_inner =
-            || (schema.columns.iter()).any(|c| c.name_lower.eq_ignore_ascii_case(&outer_col));
+            || (schema.columns.iter()).any(|c| eq_names(&c.name_lower, &outer_col));
         let outer_side = match split_qualified(&outer_col) {
             Some(_) => {
                 outer_alias.is_none_or(|alias| qualified_by(&outer_col, &alias.to_lowercase()))

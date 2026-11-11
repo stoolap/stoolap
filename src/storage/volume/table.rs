@@ -28,6 +28,7 @@
 
 use std::sync::Arc;
 
+use crate::common::names::eq_names;
 use crate::common::{CompactArc, I64Set};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -2247,7 +2248,7 @@ impl SegmentedTable {
         for (idx_name, col_names) in unique_indexes.iter().flatten() {
             let col_indices: smallvec::SmallVec<[usize; 4]> = col_names
                 .iter()
-                .filter_map(|name| schema.columns.iter().position(|c| c.name_lower == *name))
+                .filter_map(|name| schema.columns.iter().position(|c| eq_names(&c.name, name)))
                 .collect();
             if col_indices.len() != col_names.len() {
                 continue;
@@ -2331,7 +2332,7 @@ impl SegmentedTable {
         let mut check_unique = |idx_name: &str, col_names: &[String]| {
             let col_indices: smallvec::SmallVec<[usize; 4]> = col_names
                 .iter()
-                .filter_map(|name| schema.columns.iter().position(|c| c.name_lower == *name))
+                .filter_map(|name| schema.columns.iter().position(|c| eq_names(&c.name, name)))
                 .collect();
             if col_indices.len() != col_names.len() {
                 return Ok(());
@@ -2611,7 +2612,7 @@ impl SegmentedTable {
             let col = schema.get_column_index(name)?;
             let column = &schema.columns[col];
             let &(_, _, value) = comparisons.iter().find(|(compared, op, _)| {
-                *op == crate::core::Operator::Eq && compared.eq_ignore_ascii_case(&column.name)
+                *op == crate::core::Operator::Eq && eq_names(compared, &column.name)
             })?;
             matches!(
                 (column.data_type, value),
@@ -2703,7 +2704,7 @@ impl SegmentedTable {
         let (mut low, mut high) = (i64::MIN, i64::MAX);
         let mut bounded = false;
         for &(col_name, op, value) in comparisons {
-            if !col_name.eq_ignore_ascii_case(name) {
+            if !eq_names(col_name, name) {
                 continue;
             }
             // The comparisons all hold, so their key ranges intersect
@@ -2731,8 +2732,7 @@ impl SegmentedTable {
         let compared = |column: u32, equal: bool| {
             schema.columns.get(column as usize).is_some_and(|c| {
                 comparisons.iter().any(|(name, op, _)| {
-                    (!equal || *op == crate::core::Operator::Eq)
-                        && name.eq_ignore_ascii_case(&c.name_lower)
+                    (!equal || *op == crate::core::Operator::Eq) && eq_names(name, &c.name_lower)
                 })
             })
         };
@@ -2771,8 +2771,7 @@ impl SegmentedTable {
             comparisons
                 .iter()
                 .filter(|(column, op, _)| {
-                    (!equal || *op == crate::core::Operator::Eq)
-                        && column.eq_ignore_ascii_case(name)
+                    (!equal || *op == crate::core::Operator::Eq) && eq_names(column, name)
                 })
                 .map(|&(_, _, value)| encoded_len(component.domain, value))
                 .max()
@@ -2795,7 +2794,7 @@ impl SegmentedTable {
             };
             let mut pushed = false;
             for &(column, op, value) in comparisons {
-                if op != crate::core::Operator::Eq || !column.eq_ignore_ascii_case(name) {
+                if op != crate::core::Operator::Eq || !eq_names(column, name) {
                     continue;
                 }
                 match push_equal(component.domain, value, &mut prefix) {
@@ -2819,7 +2818,7 @@ impl SegmentedTable {
         if let Some(name) = name_of(next.column) {
             let on_next = comparisons
                 .iter()
-                .filter(|(column, _, _)| column.eq_ignore_ascii_case(name))
+                .filter(|(column, _, _)| eq_names(column, name))
                 .map(|&(_, op, value)| (op, value));
             prefix = match component_range(next.domain, prefix, on_next) {
                 Ok(range) => return Some((range, Capability::Range)),
@@ -2974,7 +2973,7 @@ impl SegmentedTable {
             def.kind == KeyKind::OrderedBytes
                 && matches!(def.components.as_slice(), [only] if only.domain == Domain::Text
                     && schema.columns.get(only.column as usize)
-                        .is_some_and(|c| c.name_lower.eq_ignore_ascii_case(column)))
+                        .is_some_and(|c| eq_names(&c.name_lower, column)))
         })
     }
 

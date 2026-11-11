@@ -502,7 +502,7 @@ impl MvccTransaction {
     fn savepoint_position(&self, name: &str) -> Result<usize> {
         self.savepoints
             .iter()
-            .rposition(|(sp_name, _)| sp_name == name)
+            .rposition(|(sp_name, _)| crate::common::names::eq_names(sp_name, name))
             .ok_or_else(|| Error::invalid_argument(format!("savepoint '{}' does not exist", name)))
     }
 
