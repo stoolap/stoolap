@@ -44,6 +44,7 @@ mod foreign_key_drop_column_test;
 mod foreign_key_rename_parent_test;
 mod foreign_key_self_reference_test;
 mod foreign_key_test;
+mod foreign_key_update_same_value_test;
 mod insert_path_test;
 mod insert_select_dataloss_test;
 mod insert_select_test;

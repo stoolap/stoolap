@@ -2621,49 +2621,6 @@ impl Executor {
                 FxHashMap::default()
             };
 
-        // Pre-check RESTRICT constraints and CASCADE depth BEFORE writing parent rows.
-        // Only scan rows if the FK tree actually has RESTRICT or exceeds depth limits.
-        // Pure CASCADE/SET NULL trees within depth limits skip this scan entirely.
-        if !fks_by_ref_col.is_empty() {
-            let any_needs_precheck = fks_by_ref_col
-                .values()
-                .any(|fks| super::foreign_key::fk_tree_needs_precheck(&self.engine, fks));
-            if any_needs_precheck {
-                let parent_rows = match dml_run.as_ref().filter(|_| where_prepared) {
-                    Some(run) => {
-                        let mut rows = RowVec::new();
-                        run.passing_rows(&*table, ctx, &mut |id, row| rows.push((id, row)))?;
-                        rows
-                    }
-                    None => table.collect_all_rows(where_expr.as_deref())?,
-                };
-                let mut vm = super::expression::ExprVM::new();
-                for (_rid, row) in parent_rows.iter() {
-                    // The prepared WHERE chose these rows already
-                    if let Some(program) = &memory_where_program {
-                        let program = program.as_ref().map_err(Clone::clone)?;
-                        let exec = super::aggregation::slot_context(row, ctx);
-                        if !vm.execute_bool_checked(program, &exec)? {
-                            continue;
-                        }
-                    }
-                    for (&col_idx, fks_for_col) in &fks_by_ref_col {
-                        if let Some(old_val) = row.get(col_idx) {
-                            if !old_val.is_null() {
-                                super::foreign_key::pre_check_restrict_for_update(
-                                    &self.engine,
-                                    table.txn_id(),
-                                    table_name,
-                                    old_val,
-                                    fks_for_col,
-                                )?;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
         // Create a setter function that applies updates using pre-computed indices
         // If we need memory filtering, include the WHERE check in the setter
         let rows_affected = {
@@ -2947,15 +2904,28 @@ impl Executor {
             }
         }
 
-        // Post-update referenced-column change enforcement: apply CASCADE/SET NULL.
-        // RESTRICT constraints were already pre-checked above, so this should not
-        // fail for RESTRICT. CASCADE/SET NULL failures are propagated as errors.
+        // Post-update referenced-column change enforcement: each value the
+        // statement changed is checked against RESTRICT, then CASCADE/SET NULL apply
         if !fks_by_ref_col.is_empty() {
             // Each column's changes cascade together, so a child row is
             // matched by the value the statement found, once
             let mut by_column: FxHashMap<usize, Vec<(Value, Value)>> = FxHashMap::default();
+            let restricted: Vec<usize> = fks_by_ref_col
+                .iter()
+                .filter(|(_, fks)| super::foreign_key::fk_tree_needs_precheck(&self.engine, fks))
+                .map(|(&col_idx, _)| col_idx)
+                .collect();
             for (col_idx, old_val, new_val) in ref_col_changes.into_inner() {
-                if fks_by_ref_col.contains_key(&col_idx) {
+                if let Some(fks) = fks_by_ref_col.get(&col_idx) {
+                    if restricted.contains(&col_idx) {
+                        super::foreign_key::pre_check_restrict_for_update(
+                            &self.engine,
+                            table.txn_id(),
+                            table_name,
+                            &old_val,
+                            fks,
+                        )?;
+                    }
                     by_column
                         .entry(col_idx)
                         .or_default()
