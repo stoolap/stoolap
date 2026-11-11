@@ -419,7 +419,7 @@ INSERT INTO orders VALUES (7, 'B', 0)
 ON CONFLICT (id) DO UPDATE SET price = (SELECT price FROM catalog WHERE catalog.code = excluded.code);
 ```
 
-Outside an explicit transaction the statement reads one snapshot. Inside one, a value read for each conflict would see the rows this statement has already written, so such a value may not read the target table there, directly or through a view; the statement fails with an error instead.
+Outside an explicit transaction the statement reads one snapshot. Inside one, a value read for each conflict would see the rows this statement has already written, so such a value may not read the target table there, directly or through a view; the statement fails with an error instead. A table the statement's foreign key actions write is read as found too: the actions run at the end of the statement (see [When Actions Run]({% link _docs/sql-features/foreign-keys.md %}#when-actions-run)).
 
 ### Subqueries in RETURNING
 
@@ -435,7 +435,7 @@ DELETE FROM orders WHERE created < '2024-01-01'
 RETURNING id, (SELECT COUNT(*) FROM orders);
 ```
 
-A subquery that reads the target table reads it as the statement found it, so for an `UPDATE` it returns a row's old values. Inside an explicit transaction a value read for each row returned may not read the target table, as in `ON CONFLICT`; the statement fails with an error instead.
+A subquery that reads the target table reads it as the statement found it, so for an `UPDATE` it returns a row's old values. Inside an explicit transaction a value read for each row returned may not read the target table, as in `ON CONFLICT`; the statement fails with an error instead. A child table a `CASCADE` or `SET NULL` of the statement writes is read before those actions, in a transaction too.
 
 ### Subqueries in LIMIT and OFFSET
 

@@ -99,7 +99,7 @@ fn a_probe_through_a_given_snapshot_sees_a_write_made_through_it_later() {
 }
 
 #[test]
-fn a_returning_block_reading_a_cascaded_table_sees_the_cascade() {
+fn a_returning_block_reading_a_cascaded_table_reads_it_as_the_statement_found_it() {
     let db = Database::open("memory://read_table_handle_cascade").unwrap();
     for sql in [
         "CREATE TABLE p (id INTEGER PRIMARY KEY)",
@@ -120,7 +120,7 @@ fn a_returning_block_reading_a_cascaded_table_sees_the_cascade() {
     db.execute("COMMIT", ()).unwrap();
     assert_eq!(
         got,
-        (1, 0),
-        "the deleted parent and its children the block counts after the cascade"
+        (1, 1),
+        "the deleted parent and the children the block counts before the cascade"
     );
 }

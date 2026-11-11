@@ -34,6 +34,7 @@ mod dml_subquery_rule_test;
 mod dml_verification_test;
 mod dml_where_context_test;
 mod drop_primary_key_test;
+mod foreign_key_actions_after_blocks_test;
 mod foreign_key_cascade_into_key_test;
 mod foreign_key_cascade_key_fence_test;
 mod foreign_key_cascade_once_test;

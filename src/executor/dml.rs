@@ -1088,6 +1088,7 @@ impl Executor {
         };
         // Keys into this table whose parent is a later row of the statement
         let mut pending_parents = super::foreign_key::PendingParents::new(table_name);
+        let mut update_actions = super::foreign_key::UpdateActions::default();
 
         // Create VM for constant expression evaluation (reused for all INSERT values)
         use super::expression::{ExecuteContext, ExprVM};
@@ -1267,7 +1268,7 @@ impl Executor {
                                 ctx,
                                 (has_returning, widened),
                                 conflict,
-                                &mut pending_parents,
+                                (&mut pending_parents, &mut update_actions),
                             ) {
                                 Ok((updated, returned)) => {
                                     if let Some(updated_row) = returned {
@@ -1317,7 +1318,7 @@ impl Executor {
                                         ctx,
                                         (has_returning, widened),
                                         conflict,
-                                        &mut pending_parents,
+                                        (&mut pending_parents, &mut update_actions),
                                     ) {
                                         Ok((updated, returned)) => {
                                             if let Some(updated_row) = returned {
@@ -1356,7 +1357,6 @@ impl Executor {
             if let Some(err) = select_result.last_error() {
                 return Err(err);
             }
-            pending_parents.check(&self.engine, table.txn_id())?;
 
             // Invalidate semantic cache for this table BEFORE commit
             // CRITICAL: Must invalidate before commit to prevent stale data window
@@ -1377,6 +1377,9 @@ impl Executor {
             } else {
                 None
             };
+            let txn_id = table.txn_id();
+            update_actions.run(&self.engine, txn_id, table_name, Some(&mut pending_parents))?;
+            pending_parents.check(&self.engine, txn_id)?;
 
             // A statement whose reads a truncate or drop overtook commits nothing
             ctx.view_held()?;
@@ -1556,7 +1559,7 @@ impl Executor {
                                 ctx,
                                 (has_returning, widened),
                                 conflict,
-                                &mut pending_parents,
+                                (&mut pending_parents, &mut update_actions),
                             ) {
                                 Ok((updated, returned)) => {
                                     if let Some(updated_row) = returned {
@@ -1607,7 +1610,7 @@ impl Executor {
                                         ctx,
                                         (has_returning, widened),
                                         conflict,
-                                        &mut pending_parents,
+                                        (&mut pending_parents, &mut update_actions),
                                     ) {
                                         Ok((updated, returned)) => {
                                             if let Some(updated_row) = returned {
@@ -1723,7 +1726,6 @@ impl Executor {
                 rows_affected += 1;
             }
         }
-        pending_parents.check(&self.engine, table.txn_id())?;
 
         // Invalidate semantic cache for this table BEFORE commit
         // CRITICAL: Must invalidate before commit to prevent stale data window
@@ -1743,6 +1745,9 @@ impl Executor {
         } else {
             None
         };
+        let txn_id = table.txn_id();
+        update_actions.run(&self.engine, txn_id, table_name, Some(&mut pending_parents))?;
+        pending_parents.check(&self.engine, txn_id)?;
 
         // A statement whose reads a truncate or drop overtook commits nothing
         ctx.view_held()?;
@@ -2272,6 +2277,7 @@ impl Executor {
                 standalone_tx,
                 runner.as_ref(),
                 programs.returning(),
+                || Ok(()),
             ));
         }
 
@@ -2905,12 +2911,11 @@ impl Executor {
             }
         }
 
-        // Post-update referenced-column change enforcement: each value the
-        // statement changed is checked against RESTRICT, then CASCADE/SET NULL apply
+        // Each value the statement changed is checked against RESTRICT now;
+        // CASCADE/SET NULL apply once RETURNING has read, each column's changes
+        // together, so a child row is matched by the value the statement found
+        let mut by_column: FxHashMap<usize, Vec<(Value, Value)>> = FxHashMap::default();
         if !fks_by_ref_col.is_empty() {
-            // Each column's changes cascade together, so a child row is
-            // matched by the value the statement found, once
-            let mut by_column: FxHashMap<usize, Vec<(Value, Value)>> = FxHashMap::default();
             let restricted: Vec<usize> = fks_by_ref_col
                 .iter()
                 .filter(|(_, fks)| super::foreign_key::fk_tree_needs_precheck(&self.engine, fks))
@@ -2933,16 +2938,18 @@ impl Executor {
                         .push((old_val, new_val));
                 }
             }
-            if !by_column.is_empty() {
-                super::foreign_key::enforce_update_actions(
-                    &self.engine,
-                    table.txn_id(),
-                    table_name,
-                    by_column.into_iter().collect(),
-                    None,
-                )?;
-            }
         }
+        let txn_id = table.txn_id();
+        let actions = || match by_column.is_empty() {
+            true => Ok(()),
+            false => super::foreign_key::enforce_update_actions(
+                &self.engine,
+                txn_id,
+                table_name,
+                by_column.into_iter().collect(),
+                None,
+            ),
+        };
 
         // Invalidate semantic cache for this table BEFORE commit
         // CRITICAL: Must invalidate before commit to prevent stale data window
@@ -2959,8 +2966,10 @@ impl Executor {
                 standalone_tx,
                 dml_run.as_ref(),
                 None,
+                actions,
             ));
         }
+        actions()?;
 
         // A statement whose reads a truncate or drop overtook commits nothing
         ctx.view_held()?;
@@ -3150,6 +3159,8 @@ impl Executor {
 
         let has_referencing_fks = !referencing_fks.is_empty();
 
+        // The keys' actions, written once RETURNING has read
+        let mut delete_plan = None;
         // Delete rows
         let rows_affected = if needs_memory_filter || has_returning || has_referencing_fks {
             // Complex WHERE expression, RETURNING, or FK enforcement - need to scan rows first
@@ -3274,7 +3285,7 @@ impl Executor {
 
             // The keys' actions are worked out from the rows as found, and
             // a refusal comes before any row goes
-            let delete_plan = if has_referencing_fks {
+            delete_plan = if has_referencing_fks {
                 let ids: Vec<i64> = rows_to_delete
                     .iter()
                     .filter_map(|(pk, _)| match pk {
@@ -3342,9 +3353,6 @@ impl Executor {
                     );
                 }
             }
-            if let Some(plan) = delete_plan {
-                plan.write(&self.engine, table.txn_id())?;
-            }
             delete_count
         } else {
             // A WHERE the storage layer takes whole: it reads the rows the
@@ -3370,6 +3378,11 @@ impl Executor {
             self.semantic_cache.invalidate_table(table_name);
         }
 
+        let txn_id = table.txn_id();
+        let actions = || match delete_plan {
+            Some(plan) => plan.write(&self.engine, txn_id),
+            None => Ok(()),
+        };
         if has_returning {
             return statement_rollback.finish(self.finish_returning(
                 &stmt.returning,
@@ -3379,8 +3392,10 @@ impl Executor {
                 standalone_tx,
                 dml_run.as_ref(),
                 None,
+                actions,
             ));
         }
+        actions()?;
 
         // A statement whose reads a truncate or drop overtook commits nothing
         ctx.view_held()?;
@@ -3641,7 +3656,10 @@ impl Executor {
         ctx: &ExecutionContext,
         (capture_row, returns_id): (bool, bool),
         conflict: Option<&ConflictRun<'_, '_>>,
-        pending_parents: &mut super::foreign_key::PendingParents<'_>,
+        (pending_parents, update_actions): (
+            &mut super::foreign_key::PendingParents<'_>,
+            &mut super::foreign_key::UpdateActions,
+        ),
     ) -> Result<(bool, Option<Row>)> {
         // Build a WHERE clause to find the specific row
         // Use schema's cached pk_column_index for O(1) lookup
@@ -3870,7 +3888,6 @@ impl Executor {
                 pending_parents,
             )?;
         }
-        let mut by_column: Vec<(usize, Vec<(Value, Value)>)> = Vec::new();
         for (idx, old, new) in ref_changes {
             let Some(fks) = fks_by_ref_col.get(&idx) else {
                 continue;
@@ -3884,16 +3901,7 @@ impl Executor {
                     fks,
                 )?;
             }
-            by_column.push((idx, vec![(old, new)]));
-        }
-        if !by_column.is_empty() {
-            super::foreign_key::enforce_update_actions(
-                &self.engine,
-                txn_id,
-                &schema.table_name,
-                by_column,
-                Some(pending_parents),
-            )?;
+            update_actions.push(idx, old, new);
         }
 
         Ok((updated > 0, captured_row))
@@ -4028,9 +4036,12 @@ impl Executor {
         standalone_tx: Option<Box<dyn Transaction>>,
         prepared: Option<&super::prepared_select::DmlRunner<'_>>,
         held: Option<&[Result<super::expression::SharedProgram>]>,
+        foreign_key_actions: impl FnOnce() -> Result<()>,
     ) -> Result<Box<dyn QueryResult>> {
         let result =
             self.build_returning_result(returning, source_rows, column_names, ctx, prepared, held)?;
+        // The keys' actions write once RETURNING has read the tables as found
+        foreign_key_actions()?;
         // A statement whose reads a truncate or drop overtook commits nothing
         ctx.view_held()?;
         if let Some(mut tx) = standalone_tx {

@@ -993,6 +993,62 @@ pub(crate) fn enforce_update_actions(
     check_changed(engine, txn_id, &columns[roots..], pending)
 }
 
+/// The referenced values a statement changed row by row, whose ON UPDATE
+/// actions run once at its end, after its per-row blocks have read
+#[derive(Default)]
+pub(crate) struct UpdateActions {
+    columns: Vec<ColumnChanges>,
+}
+
+/// A changed column, its (old, new) values, and where each new value is
+type ColumnChanges = (usize, Vec<(Value, Value)>, FxHashMap<Value, usize>);
+
+impl UpdateActions {
+    /// Takes `old` becoming `new`; a value the statement wrote before is
+    /// followed from the value the statement found
+    pub(crate) fn push(&mut self, column: usize, old: Value, new: Value) {
+        let at = match self.columns.iter().position(|(c, _, _)| *c == column) {
+            Some(at) => at,
+            None => {
+                self.columns
+                    .push((column, Vec::new(), FxHashMap::default()));
+                self.columns.len() - 1
+            }
+        };
+        let (_, values, by_new) = &mut self.columns[at];
+        match by_new.remove(&old) {
+            Some(earlier) => {
+                values[earlier].1 = new.clone();
+                by_new.insert(new, earlier);
+            }
+            None => {
+                by_new.insert(new.clone(), values.len());
+                values.push((old, new));
+            }
+        }
+    }
+
+    pub(crate) fn run(
+        self,
+        engine: &MVCCEngine,
+        txn_id: i64,
+        table: &str,
+        pending: Option<&mut PendingParents<'_>>,
+    ) -> Result<()> {
+        let changes: Vec<(usize, Vec<(Value, Value)>)> = (self.columns.into_iter())
+            .map(|(column, mut values, _)| {
+                values.retain(|(old, new)| !same_value(old, new));
+                (column, values)
+            })
+            .filter(|(_, values)| !values.is_empty())
+            .collect();
+        match changes.is_empty() {
+            true => Ok(()),
+            false => enforce_update_actions(engine, txn_id, table, changes, pending),
+        }
+    }
+}
+
 /// A column that the ON UPDATE actions of one statement change
 struct Changed {
     table: String,

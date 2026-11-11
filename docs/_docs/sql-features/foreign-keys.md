@@ -233,6 +233,17 @@ ROLLBACK;
 -- All rows are back to their original state
 ```
 
+### When Actions Run
+
+A statement's `CASCADE` and `SET NULL` actions write the child rows at the end of the statement, once its own rows are written and its `RETURNING` and `ON CONFLICT` subqueries have read. Such a subquery sees a child table as the statement found it, inside a transaction too, and a conflict of an upsert does not see the actions of an earlier conflict:
+
+```sql
+-- children references parents(id) ON DELETE CASCADE; parent 1 has 2 children
+DELETE FROM parents WHERE id = 1
+RETURNING id, (SELECT COUNT(*) FROM children WHERE children.parent_id = parents.id);
+-- Returns (1, 2), then the cascade removes the 2 children
+```
+
 ### Concurrent Transactions
 
 A child row's FK check and a delete or key change of its parent row in two open transactions never both commit. The second of the two to reach the key fails with a write conflict, which can be retried once the first transaction has ended:
