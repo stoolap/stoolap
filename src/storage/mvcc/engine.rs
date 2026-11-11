@@ -1051,10 +1051,10 @@ pub struct MVCCEngine {
     /// Set when close begins: no pass starts, a running one stops at its
     /// next volume, and close waits for it before letting the files go
     closing: AtomicBool,
-    /// The table, the side state and the segment a pass last examined, so
-    /// a volume that cannot be built, in any table, does not keep the rest
-    /// from their turn
-    backfill_cursor: Mutex<Option<(String, bool, u64)>>,
+    /// The table and segment a pass last examined, of the volumes with no
+    /// side file and of those with an older one, so a volume that cannot be
+    /// built, in any table, does not keep the rest of its kind from their turn
+    backfill_cursor: Mutex<[Option<(String, u64)>; 2]>,
     /// Global epoch counter for volume eviction. Incremented each checkpoint
     /// cycle. Volumes whose last_access_epoch < eviction_epoch are idle.
     #[cfg(not(target_arch = "wasm32"))]
@@ -1275,7 +1275,7 @@ impl MVCCEngine {
             compaction_running: Arc::new(AtomicBool::new(false)),
             backfill_running: AtomicBool::new(false),
             closing: AtomicBool::new(false),
-            backfill_cursor: Mutex::new(None),
+            backfill_cursor: Mutex::new([None, None]),
             #[cfg(not(target_arch = "wasm32"))]
             eviction_epoch: AtomicU64::new(0),
         }
@@ -6785,11 +6785,11 @@ impl MVCCEngine {
                 })
                 .collect()
         };
-        // Every candidate of every table first, in table, side state, then
-        // segment order, so what is left is counted whole; the sequence
-        // starts after the candidate the last pass examined and wraps, so
-        // a volume that cannot be built in one table does not hold the
-        // rest, in any table, forever
+        // Every candidate of every table first, the volumes with no side
+        // file before those with an older one, each kind in table then
+        // segment order, so what is left is counted whole; each kind starts
+        // after the volume of its kind the last pass examined and wraps, so
+        // a volume that cannot be built does not hold the rest forever
         let mut work: Vec<(usize, u64, bool)> = Vec::new();
         let mut identities_of: Vec<(Vec<crate::storage::volume::side_index::SideIndexDef>, u64)> =
             Vec::with_capacity(tables.len());
@@ -6800,7 +6800,7 @@ impl MVCCEngine {
                 (store.side_index_defs(), mgr.definition_epoch())
             };
             let snapshot = mgr.cold_snapshot();
-            let mut candidates: Vec<(u64, bool)> = if identities.is_empty() {
+            let candidates: Vec<(u64, bool)> = if identities.is_empty() {
                 Vec::new()
             } else {
                 snapshot
@@ -6820,8 +6820,6 @@ impl MVCCEngine {
                     })
                     .collect()
             };
-            // The volume the query path cannot serve at all comes first
-            candidates.sort_unstable_by_key(|&(id, has_side)| (has_side, id));
             work.extend(
                 candidates
                     .into_iter()
@@ -6829,11 +6827,18 @@ impl MVCCEngine {
             );
             identities_of.push((identities, definition));
         }
-        if let Some((table, had_side, segment)) = self.backfill_cursor.lock().unwrap().clone() {
-            let at = work.partition_point(|&(index, id, has_side)| {
-                (tables[index].0.as_str(), has_side, id) <= (table.as_str(), had_side, segment)
-            });
-            work.rotate_left(at);
+        // The volumes the query path cannot serve at all come first, in every table
+        work.sort_unstable_by_key(|&(index, id, has_side)| (has_side, index, id));
+        let older = work.partition_point(|&(_, _, has_side)| !has_side);
+        let cursors = self.backfill_cursor.lock().unwrap().clone();
+        let (none, old) = work.split_at_mut(older);
+        for (kind, cursor) in [(none, &cursors[0]), (old, &cursors[1])] {
+            if let Some((table, segment)) = cursor {
+                let at = kind.partition_point(|&(index, id, _)| {
+                    (tables[index].0.as_str(), id) <= (table.as_str(), *segment)
+                });
+                kind.rotate_left(at);
+            }
         }
         let pending = work.len();
         for (index, seg_id, has_side) in work {
@@ -6850,7 +6855,7 @@ impl MVCCEngine {
                 break;
             }
             report.examined += 1;
-            *self.backfill_cursor.lock().unwrap() = Some((name.clone(), has_side, seg_id));
+            self.backfill_cursor.lock().unwrap()[has_side as usize] = Some((name.clone(), seg_id));
             let snapshot = mgr.cold_snapshot();
             let Some(cs) = snapshot.segs.get(&seg_id) else {
                 report.discarded += 1;
