@@ -109,6 +109,8 @@ The ON UPDATE actions of one statement are worked out from the rows as they were
 - A SET NULL is a change of the column like any other: the rows that reference the nulled column follow their own ON UPDATE action.
 - Each value a cascade writes is checked against every other foreign key of its column once all the rows are written.
 
+Only a value the statement changes is asked. A row that writes back the value its referenced column holds, as `SET id = id` or `SET code = 'a'` on a row whose code is `'a'`, is left alone by every key: no action runs, RESTRICT does not refuse it, and no other transaction waits on it. A RESTRICT or NO ACTION key refuses a changed value that a row still names once the statement's rows are written, so in a table that references itself, `UPDATE t SET id = id + 10, parent_id = parent_id + 10` moves every row with its parent.
+
 ### Examples
 
 ```sql
@@ -248,7 +250,7 @@ INSERT INTO children VALUES (3, 1, 'Child');
 COMMIT;
 ```
 
-The same holds the other way round: while a transaction that inserted or updated a child of parent 1 is open, a delete of parent 1, or an update of the column the key references, fails with a write conflict. Child rows of the same parent inserted by several transactions at once do not conflict with each other.
+The same holds the other way round: while a transaction that inserted or updated a child of parent 1 is open, a delete of parent 1, or an update that changes the column the key references, fails with a write conflict. Child rows of the same parent inserted by several transactions at once do not conflict with each other.
 
 FK checks read the newest committed rows, also in a transaction under `SNAPSHOT` isolation. A child insert in such a transaction fails if its parent was deleted after the transaction began. A parent delete or key change finds the children committed after the transaction began: `RESTRICT` refuses it as usual. A `CASCADE` or `SET NULL` that would change such a child, or a child another transaction changed after this one began, fails with a write conflict, as any write of that row by the transaction would.
 

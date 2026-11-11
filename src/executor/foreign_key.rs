@@ -693,10 +693,9 @@ impl Reached {
     }
 }
 
-/// Pre-check RESTRICT constraints and CASCADE depth before writing parent rows.
-/// Walks the full FK tree (including recursive grandchild RESTRICT behind CASCADE/SET NULL)
-/// to detect violations before any rows are modified, preserving statement atomicity.
-/// Returns true if the tree has constraints that need row-level pre-checking.
+/// Checks RESTRICT constraints and CASCADE depth for one value the statement
+/// changed, after its rows are written and before any child row is. Walks the
+/// full FK tree, grandchild RESTRICT behind CASCADE/SET NULL included
 pub(crate) fn pre_check_restrict_for_update(
     engine: &MVCCEngine,
     txn_id: i64,
@@ -1240,7 +1239,7 @@ fn run_update_action(
         changes.iter().map(|(old, _)| old),
     )?;
     let Some(to) = action.to else {
-        // The root's own keys were asked before its rows were written
+        // The root's own keys were asked before the actions ran
         if from_root {
             return Ok(());
         }
