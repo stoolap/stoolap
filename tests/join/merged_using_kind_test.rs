@@ -36,6 +36,11 @@ fn fill(db: &Database) {
         "INSERT INTO p3 VALUES (3)",
         "CREATE TABLE p4 (k INTEGER)",
         "INSERT INTO p4 VALUES (4)",
+        "CREATE TABLE m1 (x INTEGER, y INTEGER, a INTEGER)",
+        "INSERT INTO m1 VALUES (1, 1, 10), (2, 2, 20)",
+        "CREATE TABLE m2 (x INTEGER, y INTEGER, b INTEGER)",
+        "INSERT INTO m2 VALUES (2, 2, 200), (2, 3, 300)",
+        "CREATE VIEW vf AS SELECT k, a, b FROM t NATURAL FULL JOIN u",
         "CREATE TABLE ri (id INTEGER PRIMARY KEY)",
         "INSERT INTO ri VALUES (1), (2), (3)",
         "CREATE TABLE tx (k TEXT)",
@@ -368,6 +373,36 @@ fn a_merged_column_reads_the_side_its_join_kind_keeps() {
                 &[s(3), N, s(300)],
                 &[s(4), N, N],
             ]),
+        ),
+        // A NATURAL join of each kind merges as the USING list of its
+        // common columns does
+        (
+            "SELECT k FROM t NATURAL FULL JOIN u WHERE k > $1 ORDER BY k",
+            ints(&[&[s(1)], &[s(2)], &[s(3)]]),
+        ),
+        (
+            "SELECT * FROM t NATURAL FULL OUTER JOIN u WHERE k > $1 ORDER BY k",
+            ints(&[&[s(1), s(10), N], &[s(2), s(20), s(200)], &[s(3), N, s(300)]]),
+        ),
+        (
+            "SELECT k, a, b FROM t NATURAL INNER JOIN u WHERE k > $1",
+            ints(&[&[s(2), s(20), s(200)]]),
+        ),
+        (
+            "SELECT k, c FROM t NATURAL FULL JOIN u NATURAL FULL JOIN w WHERE k > $1 ORDER BY k",
+            ints(&[&[s(1), N], &[s(2), N], &[s(3), s(3000)], &[s(4), s(4000)]]),
+        ),
+        (
+            "SELECT x, y, a, b FROM m1 NATURAL FULL JOIN m2 WHERE $1 = 0 ORDER BY x, y",
+            ints(&[
+                &[s(1), s(1), s(10), N],
+                &[s(2), s(2), s(20), s(200)],
+                &[s(2), s(3), N, s(300)],
+            ]),
+        ),
+        (
+            "SELECT k, a, b FROM vf WHERE k > $1 ORDER BY k",
+            ints(&[&[s(1), s(10), N], &[s(2), s(20), s(200)], &[s(3), N, s(300)]]),
         ),
     ];
     let mut wrong = Vec::new();
