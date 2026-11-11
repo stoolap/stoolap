@@ -192,14 +192,34 @@ const CASES: &[Case] = &[
         &["3.5", "4.5"],
         &[3, 4],
     ),
-    // Descending, NaN comes first and no zone map bounds it: the sort answers
+    // Descending, NaN comes first: a volume that may hold one is read unbounded
     (
         "SELECT id, f FROM s ORDER BY f DESC LIMIT 9",
-        false,
+        true,
         &[
             "NULL", "NULL", "NULL", "NULL", "NaN", "NaN", "NaN", "NaN", "NaN",
         ],
         &[5, 6, 11, 12, 13, 14, 15, 17, 18],
+    ),
+    (
+        "SELECT id, f FROM s ORDER BY f DESC LIMIT 12",
+        true,
+        &[
+            "NULL", "NULL", "NULL", "NULL", "NaN", "NaN", "NaN", "NaN", "NaN", "10.5", "8.5", "7.5",
+        ],
+        &[5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 17, 18],
+    ),
+    (
+        "SELECT id, f FROM s ORDER BY f DESC NULLS LAST LIMIT 7",
+        true,
+        &["NaN", "NaN", "NaN", "NaN", "NaN", "10.5", "8.5"],
+        &[5, 8, 10, 13, 14, 15, 17],
+    ),
+    (
+        "SELECT id, f FROM s WHERE f < 9 ORDER BY f DESC LIMIT 3",
+        true,
+        &["8.5", "7.5", "4.5"],
+        &[4, 7, 8],
     ),
     (
         "SELECT id, t FROM s ORDER BY t LIMIT 2",
@@ -245,6 +265,92 @@ fn a_sealed_top_k_places_null_and_nan_as_the_sort_does() {
         }
         if taken(&db, sql).is_some_and(|taken| taken != top_k) {
             wrong.push(format!("{sql}: top-k read taken is not {top_k}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_descending_float_top_k_reads_a_volume_holding_nan_past_its_zone_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?checkpoint_on_close=off",
+        dir.path().display()
+    ))
+    .unwrap();
+    for (table, index) in [("m", false), ("n", true)] {
+        db.execute(
+            &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, f FLOAT)"),
+            (),
+        )
+        .unwrap();
+        if index {
+            db.execute(&format!("CREATE INDEX {table}_f ON {table} (f)"), ())
+                .unwrap();
+        }
+        db.execute(
+            &format!("INSERT INTO {table} SELECT value, value FROM generate_series(1, 1000)"),
+            (),
+        )
+        .unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        // The newer volume's numbers are all below the older one's
+        db.execute(
+            &format!(
+                "INSERT INTO {table} SELECT value, CASE WHEN value = 2000 \
+                 THEN CAST('NaN' AS FLOAT) ELSE 0.5 END FROM generate_series(1001, 3000)"
+            ),
+            (),
+        )
+        .unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    }
+    // One volume of two row groups, the second's numbers below the first's
+    db.execute("CREATE TABLE g (id INTEGER PRIMARY KEY, f FLOAT)", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO g SELECT value, CASE WHEN value = 68000 THEN CAST('NaN' AS FLOAT) \
+         WHEN value > 65536 THEN 0.5 ELSE value END FROM generate_series(1, 70000)",
+        (),
+    )
+    .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let mut wrong = Vec::new();
+    let grouped = (
+        "SELECT id, f FROM g ORDER BY f DESC LIMIT 2".to_string(),
+        vec!["NaN", "65536"],
+        vec![65536, 68000],
+    );
+    for table in ["m", "n", "g"] {
+        let cases = if table == "g" {
+            vec![grouped.clone()]
+        } else {
+            vec![
+                (
+                    format!("SELECT id, f FROM {table} ORDER BY f DESC LIMIT 2"),
+                    vec!["NaN", "1000"],
+                    vec![1000, 2000],
+                ),
+                (
+                    format!("SELECT id, f FROM {table} WHERE f > 999 ORDER BY f DESC LIMIT 2"),
+                    vec!["NaN", "1000"],
+                    vec![1000, 2000],
+                ),
+                (
+                    format!("SELECT id, f FROM {table} WHERE f < 999 ORDER BY f DESC LIMIT 2"),
+                    vec!["998", "997"],
+                    vec![997, 998],
+                ),
+            ]
+        };
+        for (sql, keys, ids) in cases {
+            let got = read(&db, &sql);
+            if got.0 != keys || got.1 != ids {
+                wrong.push(format!("{sql}\n  got  {got:?}\n  want ({keys:?}, {ids:?})"));
+            }
+            if taken(&db, &sql) == Some(false) {
+                wrong.push(format!("{sql}: the top-k read did not answer"));
+            }
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));

@@ -7161,10 +7161,6 @@ impl Table for SegmentedTable {
         else {
             return Ok(None);
         };
-        // NaN, which no zone map bounds, comes first descending
-        if !ascending && schema.columns[col_idx].data_type == DataType::Float {
-            return Ok(None);
-        }
         let null_free = !schema.columns[col_idx].nullable
             || where_expr.is_some_and(|w| index_plan::excludes_null(w, schema, column_name));
         let bounded = self.bounds_order(Some(col_idx));
@@ -7204,6 +7200,9 @@ impl Table for SegmentedTable {
                 .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
 
             let volumes = self.segment_mgr.get_volumes_newest_first_lazy();
+            // A NaN, which no zone map bounds, comes first descending
+            let nan_first =
+                |vol: &FrozenVolume, vcol: usize| !ascending && vol.meta.nan_count(vcol) != Some(0);
             // Every volume must carry the column: one sealed before it was
             // added reads its default, which no zone map bounds
             let mut ordered: Vec<(usize, usize, Option<&Value>)> =
@@ -7216,7 +7215,7 @@ impl Table for SegmentedTable {
                     return Ok(Some(None));
                 };
                 let bound = match vol.meta.zone_maps.get(vcol) {
-                    Some(zm) if bounded => keep.zone_bound(zm, null_free),
+                    Some(zm) if bounded && !nan_first(vol, vcol) => keep.zone_bound(zm, null_free),
                     _ => ZoneBound::Unbounded,
                 };
                 match bound {
@@ -7418,13 +7417,14 @@ impl Table for SegmentedTable {
                 }
                 // Row groups in bound order, clipped to the narrowed range; a
                 // volume without group metadata is one group
+                let group_bounds = bounded && !nan_first(vol, vcol);
                 let mut groups: Vec<(usize, usize, Option<&Value>)> = vol
                     .meta
                     .row_groups
                     .iter()
                     .filter_map(|rg| {
                         let bound = match rg.zone_maps.get(vcol) {
-                            Some(zm) if bounded => match keep.zone_bound(zm, null_free) {
+                            Some(zm) if group_bounds => match keep.zone_bound(zm, null_free) {
                                 ZoneBound::Empty => return None,
                                 ZoneBound::Unbounded => None,
                                 ZoneBound::Key(key) => Some(key),
