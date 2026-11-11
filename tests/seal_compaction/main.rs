@@ -14,6 +14,7 @@
 
 //! Sealing hot rows into volumes, compaction and truncation
 
+mod aggregate_cold_view_test;
 mod arena_slot_reuse_test;
 mod captured_version_payload_test;
 mod commit_seal_stamp_test;

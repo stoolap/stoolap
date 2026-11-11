@@ -3804,7 +3804,6 @@ impl SegmentManager {
     pub fn get_cold_row_normalized(
         &self,
         row_id: i64,
-        schema: &crate::core::Schema,
         needed: Option<&[bool]>,
     ) -> crate::core::Result<Option<crate::core::Row>> {
         let ts = Arc::clone(&*self.tombstones.read());
@@ -3833,15 +3832,14 @@ impl SegmentManager {
                             Some(v) => v,
                             None => {
                                 // Segment removed by compaction — retry with fresh state.
-                                return self.get_cold_row_normalized_retry(row_id, schema, needed);
+                                return self.get_cold_row_normalized_retry(row_id, needed);
                             }
                         }
                     } else {
                         cold.volume.mark_accessed();
                         Arc::clone(&cold.volume)
                     };
-                    let mapping = self.get_volume_mapping(*seg_id, schema);
-                    return Ok(Some(row_of(&vol, idx, &mapping, needed)?));
+                    return Ok(Some(row_of(&vol, idx, &cold.mapping, needed)?));
                 }
             }
         }
@@ -3852,7 +3850,6 @@ impl SegmentManager {
     fn get_cold_row_normalized_retry(
         &self,
         row_id: i64,
-        schema: &crate::core::Schema,
         needed: Option<&[bool]>,
     ) -> crate::core::Result<Option<crate::core::Row>> {
         self.ensure_columns();
@@ -3881,8 +3878,7 @@ impl SegmentManager {
                         });
                     }
                     cold.volume.mark_accessed();
-                    let mapping = self.get_volume_mapping(*seg_id, schema);
-                    return Ok(Some(row_of(&cold.volume, idx, &mapping, needed)?));
+                    return Ok(Some(row_of(&cold.volume, idx, &cold.mapping, needed)?));
                 }
             }
         }
