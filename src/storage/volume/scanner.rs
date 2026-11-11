@@ -665,7 +665,7 @@ impl VolumeScanner {
                     row_count: 0,
                     column_names: Vec::new(),
                     column_types: Vec::new(),
-                    row_ids: Vec::new(),
+                    row_ids: Arc::new(Vec::new()),
                     row_order: std::sync::OnceLock::new(),
                     locator: None,
                     sorted_columns: Vec::new(),

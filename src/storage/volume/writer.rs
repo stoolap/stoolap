@@ -641,6 +641,9 @@ pub struct CompressedBlockStore {
     group_size: usize,
     /// Total row count across all groups
     row_count: usize,
+    /// The column whose cells equal the volume's row ids, with the ids:
+    /// its groups are built from them, its blocks never decoded
+    row_id_column: Option<(usize, Arc<Vec<i64>>)>,
     /// Process-unique id, the key of this store's entries in the decoded
     /// group cache
     id: usize,
@@ -686,6 +689,35 @@ impl CompressedBlockStore {
         self.cached_group_column(col_idx, group_idx, Some(reads.column(col_idx)))
     }
 
+    /// Builds the groups of `column` from `row_ids` instead of decoding its
+    /// blocks: the volume's row id column, whose cells the writer found
+    /// equal to them, none NULL
+    pub(crate) fn build_from_row_ids(&mut self, column: Option<usize>, row_ids: &Arc<Vec<i64>>) {
+        self.row_id_column = column.map(|col_idx| (col_idx, Arc::clone(row_ids)));
+    }
+
+    /// Group `group_idx` of `col_idx` from the row ids, when it is the
+    /// column built from them
+    fn row_id_group(
+        &self,
+        col_idx: usize,
+        group_idx: usize,
+    ) -> Option<std::io::Result<ColumnData>> {
+        let (column, ids) = self.row_id_column.as_ref().filter(|(c, _)| *c == col_idx)?;
+        let start = group_idx.saturating_mul(self.group_size);
+        let end = start.saturating_add(self.group_size).min(ids.len());
+        Some(match ids.get(start..end) {
+            Some(values) if start < end => Ok(ColumnData::Int64 {
+                values: values.to_vec(),
+                nulls: vec![false; values.len()],
+            }),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("group {group_idx} of column {column} is out of range"),
+            )),
+        })
+    }
+
     fn cached_group_column(
         &self,
         col_idx: usize,
@@ -702,6 +734,9 @@ impl CompressedBlockStore {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "group index out of range")
         })?;
         super::group_cache::DECODED_GROUPS.get_or_decode((self.id, key_col, key_group), || {
+            if let Some(column) = self.row_id_group(col_idx, group_idx) {
+                return column;
+            }
             #[cfg(test)]
             self.decoded_groups
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -830,6 +865,7 @@ impl CompressedBlockStore {
             col_dicts,
             group_size,
             row_count,
+            row_id_column: None,
             id: next_store_id(),
             #[cfg(test)]
             decoded_groups: std::sync::atomic::AtomicU64::new(0),
@@ -858,6 +894,7 @@ impl CompressedBlockStore {
             col_dicts,
             group_size,
             row_count,
+            row_id_column: None,
             id: next_store_id(),
             #[cfg(test)]
             decoded_groups: std::sync::atomic::AtomicU64::new(0),
@@ -922,6 +959,7 @@ impl CompressedBlockStore {
             col_dicts,
             group_size,
             row_count,
+            row_id_column: None,
             id: next_store_id(),
             #[cfg(test)]
             decoded_groups: std::sync::atomic::AtomicU64::new(0),
@@ -2021,7 +2059,7 @@ pub struct VolumeMeta {
     /// Column types (from schema)
     pub column_types: Vec<DataType>,
     /// Row IDs for each row (preserves original IDs for index compatibility)
-    pub row_ids: Vec<i64>,
+    pub row_ids: Arc<Vec<i64>>,
     /// Positions sorted by row id when the ids are not ascending, built on
     /// first use; None when a binary search over `row_ids` works
     pub row_order: std::sync::OnceLock<Option<Box<[u32]>>>,
@@ -3174,7 +3212,7 @@ impl VolumeBuilder {
             row_count: self.row_count,
             column_names,
             column_types,
-            row_ids: std::mem::take(&mut self.row_ids),
+            row_ids: Arc::new(std::mem::take(&mut self.row_ids)),
             row_order: std::sync::OnceLock::from(row_order),
             locator: None,
             sorted_columns: std::mem::take(&mut self.sorted),
@@ -3839,7 +3877,7 @@ impl VolumeBuilder {
                 row_count: self.row_count,
                 column_names,
                 column_types,
-                row_ids: self.row_ids,
+                row_ids: Arc::new(self.row_ids),
                 row_order: std::sync::OnceLock::from(row_order),
                 locator: None,
                 sorted_columns,
@@ -5518,8 +5556,9 @@ mod tests {
 
     /// A volume file of `groups` groups of a narrow column, read back
     fn file_volume(groups: usize) -> (FrozenVolume, tempfile::TempDir) {
+        // Not the key, whose groups are built from the row ids
         let schema = crate::core::SchemaBuilder::new("t")
-            .column("id", DataType::Integer, false, true)
+            .column("n", DataType::Integer, false, false)
             .build();
         let mut builder = VolumeBuilder::new(&schema);
         for i in 0..(groups * ROW_GROUP_SIZE) as i64 {

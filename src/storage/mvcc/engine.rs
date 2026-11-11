@@ -8651,7 +8651,7 @@ impl MVCCEngine {
                         let mut sealed_ids: FxHashSet<i64> = FxHashSet::default();
                         if !ts.is_empty() {
                             for (vol, _, _) in &sealed_volumes {
-                                for &rid in &vol.meta.row_ids {
+                                for &rid in vol.meta.row_ids.iter() {
                                     if ts.contains_key(&rid) && !skip_set.contains(&rid) {
                                         sealed_ids.insert(rid);
                                     }

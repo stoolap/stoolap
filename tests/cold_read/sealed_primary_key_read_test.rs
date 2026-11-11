@@ -44,12 +44,17 @@ fn a_sealed_row_read_by_its_rows_decodes_no_block_of_its_primary_key() {
         db.execute("PRAGMA CHECKPOINT", ()).unwrap();
         db.close().unwrap();
     }
-    let cases: [(&str, &[(i64, i64)]); 2] = [
+    let cases: [(&str, &[(i64, i64)]); 4] = [
         (
             "SELECT id, k FROM x WHERE k > 100 ORDER BY k LIMIT 2",
             &[(185579, 101), (3258, 102)],
         ),
         ("SELECT id, k FROM x WHERE id = 17679", &[(17679, 1)]),
+        ("SELECT id, k FROM x WHERE k = 1", &[(17679, 1)]),
+        (
+            "SELECT id, k FROM x WHERE k >= 101 AND k <= 102 ORDER BY id",
+            &[(3258, 102), (185579, 101)],
+        ),
     ];
     let mut decoded_key = Vec::new();
     for (sql, want) in cases {

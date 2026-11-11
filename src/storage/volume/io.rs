@@ -518,6 +518,8 @@ fn file_volume(
     if let Some(crcs) = crcs {
         store.check_blocks(crcs);
     }
+    let row_ids = Arc::new(meta.row_ids);
+    store.build_from_row_ids(meta.row_id_column, &row_ids);
     let columns = LazyColumns::deferred(store, col_data_types);
 
     FrozenVolume {
@@ -529,7 +531,7 @@ fn file_volume(
             row_count: meta.row_count,
             column_names: meta.column_names,
             column_types: meta.column_types,
-            row_ids: meta.row_ids,
+            row_ids,
             row_order: std::sync::OnceLock::new(),
             locator,
             sorted_columns: meta.col_sorted,
@@ -1393,7 +1395,7 @@ mod tests {
         assert!(loaded.meta.sorted_columns[0]);
 
         // Row IDs survived
-        assert_eq!(loaded.meta.row_ids, vec![1, 2, 3]);
+        assert_eq!(&loaded.meta.row_ids[..], [1, 2, 3]);
     }
 
     #[test]
@@ -1730,7 +1732,7 @@ mod tests {
             let path =
                 write_volume_to_disk(dir.path(), "t", n as u64 + 1, &id_volume(ids)).unwrap();
             let loaded = read_volume_from_disk(&path).unwrap();
-            assert_eq!(&loaded.meta.row_ids, ids);
+            assert_eq!(&loaded.meta.row_ids[..], &ids[..]);
         }
     }
 

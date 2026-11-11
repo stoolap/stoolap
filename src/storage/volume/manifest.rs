@@ -1179,7 +1179,7 @@ fn mask_shared_ids(
             }
         }
     } else {
-        for &id in &new.meta.row_ids {
+        for &id in new.meta.row_ids.iter() {
             if (lo..=hi).contains(&id) {
                 if let Some(pos) = old.locate(id) {
                     clear(pos, id);
