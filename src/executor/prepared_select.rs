@@ -10915,6 +10915,12 @@ impl JoinBlocks {
         checked
     }
 
+    /// The column of the joined row the merged column read through column
+    /// `at` is, through every merge over it; `at` outside every merge
+    pub(crate) fn merged_at(&self, at: usize) -> usize {
+        self.scope.merged_at(at)
+    }
+
     /// Every pair the joined row merges, the join's own and its sides',
     /// each its left and right column in the joined row and the one its
     /// merged column reads

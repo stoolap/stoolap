@@ -137,6 +137,23 @@ fn a_merged_column_reads_the_side_its_join_kind_keeps() {
              WHERE c > $1 ORDER BY k",
             ints(&[&[s(3), s(300), s(3000)], &[s(4), N, s(4000)]]),
         ),
+        // A star over a chain of right joins beside another source
+        (
+            "SELECT * FROM t RIGHT JOIN u USING (k) RIGHT JOIN w USING (k) \
+             CROSS JOIN (SELECT 9 AS z) x WHERE c > $1 ORDER BY c",
+            ints(&[
+                &[s(3), N, s(300), s(3000), s(9)],
+                &[s(4), N, N, s(4000), s(9)],
+            ]),
+        ),
+        (
+            "SELECT *, ROW_NUMBER() OVER (ORDER BY c) FROM t RIGHT JOIN u USING (k) \
+             RIGHT JOIN w USING (k) CROSS JOIN (SELECT 9 AS z) x WHERE c > $1 ORDER BY c",
+            ints(&[
+                &[s(3), N, s(300), s(3000), s(9), s(1)],
+                &[s(4), N, N, s(4000), s(9), s(2)],
+            ]),
+        ),
         (
             "SELECT k, a, b FROM w RIGHT JOIN (SELECT * FROM t RIGHT JOIN u USING (k)) x \
              USING (k) WHERE b > $1 ORDER BY k",

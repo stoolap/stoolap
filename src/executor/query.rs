@@ -669,13 +669,19 @@ fn side_pairs(
         .columns
         .iter()
         .any(|c| matches!(c, Expression::QualifiedStar(_)));
-    let mut in_place = Vec::new();
-    for (left, right, read) in held.side_merges() {
+    let mut in_place: Vec<(usize, String)> = Vec::new();
+    for (left, right, _) in held.side_merges() {
         if star {
             excluded.push(right);
         }
+        // A merge over another reads the column at the end of their chain
+        let read = held.merged_at(left);
         let name = bare_name(&columns[left]);
-        if renames.iter().any(|(named, ..)| *named == left) || !(star || names_bare(stmt, name)) {
+        let named = renames
+            .iter()
+            .any(|(place, at, _)| *place == left || *at == read)
+            || in_place.iter().any(|(at, _)| *at == read);
+        if named || !(star || names_bare(stmt, name)) {
             continue;
         }
         match star || qualified_star {
