@@ -2501,10 +2501,16 @@ impl Parser<'_> {
         }
         let table_name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
 
+        let cascade = self.peek_token_is_keyword(Keyword::Cascade);
+        if cascade {
+            self.next_token();
+        }
+
         Some(DropTableStatement {
             token,
             table_name,
             if_exists,
+            cascade,
         })
     }
 

@@ -789,17 +789,14 @@ impl Executor {
             return Err(Error::TableNotFound(table_name.to_string()));
         }
 
+        if !stmt.cascade {
+            super::foreign_key::check_no_referencing_keys(&self.engine, table_name)?;
+        }
+
         // Check if there's an active transaction
         let mut active_tx = self.active_transaction.lock().unwrap();
         match active_tx.as_mut() {
             Some(tx_state) => {
-                // Check FK constraints: block DROP if child tables reference this table
-                // Uses the caller's transaction so uncommitted child deletes are visible
-                super::foreign_key::check_no_referencing_rows(
-                    &self.engine,
-                    table_name,
-                    Some(tx_state.transaction.id()),
-                )?;
                 // WARNING: DROP TABLE within a transaction has limited rollback support.
                 // On rollback, the table schema will be recreated but DATA WILL BE LOST.
                 // This is because table data is immediately deleted and cannot be recovered.
@@ -812,7 +809,6 @@ impl Executor {
             }
             None => {
                 drop(active_tx);
-                super::foreign_key::check_no_referencing_rows(&self.engine, table_name, None)?;
                 // No active transaction - use engine method directly (auto-committed with WAL)
                 self.engine.drop_table_internal(table_name)?;
             }

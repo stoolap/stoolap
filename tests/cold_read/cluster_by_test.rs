@@ -376,7 +376,7 @@ fn dropping_a_referenced_parent_keeps_the_child_key() {
         (),
     )
     .unwrap();
-    db.execute("DROP TABLE p", ()).unwrap();
+    db.execute("DROP TABLE p CASCADE", ()).unwrap();
     assert_eq!(
         db.engine().get_table_schema("c").unwrap().cluster_key,
         vec![2]

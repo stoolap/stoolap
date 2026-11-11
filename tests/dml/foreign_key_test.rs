@@ -732,11 +732,9 @@ fn test_fk_drop_parent_cleans_child_fk() {
         (),
     ).unwrap();
 
-    // Delete all child rows so we can drop the parent
-    // (no child rows reference the parent — DROP is allowed)
-    // Don't insert any children, so the parent has no references
-
-    db.execute("DROP TABLE parents", ()).unwrap();
+    // A child without rows still names the parent: only CASCADE drops it
+    assert!(db.execute("DROP TABLE parents", ()).is_err());
+    db.execute("DROP TABLE parents CASCADE", ()).unwrap();
 
     // Now insert into child table with any parent_id — FK constraint should be gone
     db.execute("INSERT INTO children VALUES (1, 999, 'Orphan')", ())
@@ -811,7 +809,7 @@ fn test_fk_multi_level_cascade_restrict_blocks() {
 }
 
 // =====================================================================
-// DROP TABLE with NULL FK values should not be blocked
+// DROP TABLE with NULL FK values is blocked by the key, CASCADE drops it
 // =====================================================================
 
 #[test]
@@ -829,8 +827,8 @@ fn test_fk_drop_table_with_null_fk_children() {
     db.execute("INSERT INTO children VALUES (2, NULL, 'Orphan2')", ())
         .unwrap();
 
-    // DROP TABLE should succeed — no child rows actually reference the parent
-    db.execute("DROP TABLE parents", ()).unwrap();
+    assert!(db.execute("DROP TABLE parents", ()).is_err());
+    db.execute("DROP TABLE parents CASCADE", ()).unwrap();
 
     // Children should still exist
     assert_eq!(count(&db, "SELECT COUNT(*) FROM children"), 2);
@@ -868,15 +866,16 @@ fn test_fk_drop_table_blocked_for_cascade_fk() {
     );
     let err = result.unwrap_err().to_string();
     assert!(
-        err.contains("still reference it"),
-        "Error should mention referencing rows: {}",
+        err.contains("table 'children' references it"),
+        "Error should name the referencing table: {}",
         err
     );
 
-    // After deleting the child rows, DROP should succeed
+    // Deleting the child rows leaves the key: only CASCADE drops the parent
     db.execute("DELETE FROM children WHERE parent_id = 1", ())
         .unwrap();
-    db.execute("DROP TABLE parents", ()).unwrap();
+    assert!(db.execute("DROP TABLE parents", ()).is_err());
+    db.execute("DROP TABLE parents CASCADE", ()).unwrap();
 }
 
 #[test]
@@ -905,18 +904,19 @@ fn test_fk_drop_table_blocked_for_set_null_fk() {
         "DROP TABLE should be blocked when child rows with SET NULL FK exist"
     );
 
-    // Setting FK to NULL manually, then DROP should succeed
+    // Setting FK to NULL manually leaves the key: only CASCADE drops the parent
     db.execute("UPDATE children SET parent_id = NULL WHERE id = 10", ())
         .unwrap();
-    db.execute("DROP TABLE parents", ()).unwrap();
+    assert!(db.execute("DROP TABLE parents", ()).is_err());
+    db.execute("DROP TABLE parents CASCADE", ()).unwrap();
 }
 
 // =====================================================================
-// DROP TABLE in explicit transaction sees uncommitted child deletes
+// DROP TABLE in explicit transaction is blocked by the key, not the rows
 // =====================================================================
 
 #[test]
-fn test_fk_drop_table_sees_uncommitted_child_deletes() {
+fn test_fk_drop_table_in_transaction_is_blocked_after_child_deletes() {
     let db = setup();
     db.execute(
         "CREATE TABLE parents (id INTEGER PRIMARY KEY, name TEXT)",
@@ -939,14 +939,8 @@ fn test_fk_drop_table_sees_uncommitted_child_deletes() {
     db.execute("DELETE FROM children WHERE parent_id = 1", ())
         .unwrap();
 
-    // DROP TABLE should succeed because the child delete (uncommitted) is visible
-    // within the same transaction
-    let result = db.execute("DROP TABLE parents", ());
-    assert!(
-        result.is_ok(),
-        "DROP TABLE should succeed after uncommitted child delete in same txn: {:?}",
-        result
-    );
+    assert!(db.execute("DROP TABLE parents", ()).is_err());
+    db.execute("DROP TABLE parents CASCADE", ()).unwrap();
 
     db.execute("COMMIT", ()).unwrap();
 

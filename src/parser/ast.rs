@@ -2934,6 +2934,8 @@ pub struct DropTableStatement {
     pub token: Token,
     pub table_name: Identifier,
     pub if_exists: bool,
+    /// CASCADE: the other tables' foreign keys into the table go with it
+    pub cascade: bool,
 }
 
 impl fmt::Display for DropTableStatement {
@@ -2943,6 +2945,9 @@ impl fmt::Display for DropTableStatement {
             result.push_str("IF EXISTS ");
         }
         result.push_str(&self.table_name.to_string());
+        if self.cascade {
+            result.push_str(" CASCADE");
+        }
         write!(f, "{}", result)
     }
 }

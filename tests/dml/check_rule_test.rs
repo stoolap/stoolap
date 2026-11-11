@@ -343,7 +343,7 @@ fn dropping_a_parent_table_keeps_the_child_checks() {
         (),
     )
     .unwrap();
-    db.execute("DROP TABLE p", ()).unwrap();
+    db.execute("DROP TABLE p CASCADE", ()).unwrap();
     db.execute("INSERT INTO c VALUES (1, 5, 1)", ()).unwrap();
     refused(&db, &["INSERT INTO c VALUES (2, 60, 50)"]);
 }
