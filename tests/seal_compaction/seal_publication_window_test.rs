@@ -330,25 +330,3 @@ fn partition_values_inside_a_seal_keep_a_cold_row_updated_before_it() {
     assert_eq!(values, expected, "value 105 inside the seal");
     tx.rollback().unwrap();
 }
-
-#[test]
-fn distinct_values_inside_a_seal_keep_a_cold_row_updated_before_it() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = cold_row_updated(&dir, true);
-    let mut tx = db.engine().begin_transaction().unwrap();
-    let table = tx.get_table("t").unwrap();
-    let mut values: Vec<i64> = inside_seal(&db, Hold::IndexesCleaned, None, || {
-        table
-            .compute_distinct_values(1)
-            .unwrap()
-            .expect("the indexed column's values answer")
-            .into_iter()
-            .map(|v| v.as_int64().unwrap())
-            .collect()
-    });
-    values.sort_unstable();
-    let mut expected: Vec<i64> = after_update().into_iter().map(|(_, v)| v).collect();
-    expected.sort_unstable();
-    assert_eq!(values, expected, "value 105 inside the seal");
-    tx.rollback().unwrap();
-}

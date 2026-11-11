@@ -1176,12 +1176,6 @@ fn warm_partitions_propagate_column_failure() {
 }
 
 #[test]
-fn warm_distinct_propagates_column_failure() {
-    use stoolap::storage::traits::Table;
-    assert_warm_read_failure(|table| table.compute_distinct_values(1).map(drop));
-}
-
-#[test]
 fn warm_filtered_aggregation_propagates_column_failure() {
     use stoolap::core::Value;
     use stoolap::storage::expression::ComparisonExpr;
@@ -1218,11 +1212,6 @@ fn fully_hidden_warm_columns_are_not_decoded() {
     assert_eq!(table.sum_column(1).unwrap().map(|sum| sum.count()), Some(0));
     assert_eq!(table.get_partition_count("b").unwrap(), Some(0));
     assert!(table.get_partition_values("b").unwrap().unwrap().is_empty());
-    assert!(table
-        .compute_distinct_values(1)
-        .unwrap()
-        .unwrap()
-        .is_empty());
     assert!(table
         .collect_rows_grouped_by_partition("b")
         .unwrap()

@@ -2973,13 +2973,7 @@ impl Executor {
         table: &dyn crate::storage::traits::Table,
         column: &str,
     ) -> Result<Option<Vec<Value>>> {
-        let values = match table.get_partition_values(column)? {
-            Some(values) => Some(values),
-            None => match table.schema().column_index_map().get(column) {
-                Some(&col_idx) => table.compute_distinct_values(col_idx)?,
-                None => None,
-            },
-        };
+        let values = table.get_partition_values(column)?;
         if values.is_some() {
             super::result::DistinctPath::Values.taken();
         }

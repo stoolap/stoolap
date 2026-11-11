@@ -89,6 +89,40 @@ type ColdView = (
     Arc<Vec<(u64, super::manifest::ColdSegment)>>,
 );
 
+/// The positions below `rows` whose bit is set, a word at a time; every
+/// position when there are no bits
+#[derive(Clone)]
+struct ShownPositions<'a> {
+    bits: Option<&'a [u64]>,
+    rows: usize,
+    /// The next word to read, the first position of the word in hand, and
+    /// its bits not yet handed out
+    at: usize,
+    base: usize,
+    word: u64,
+}
+
+impl Iterator for ShownPositions<'_> {
+    type Item = usize;
+
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        let Some(bits) = self.bits else {
+            let i = self.at;
+            self.at += 1;
+            return (i < self.rows).then_some(i);
+        };
+        while self.word == 0 {
+            self.word = *bits.get(self.at)?;
+            self.base = self.at * 64;
+            self.at += 1;
+        }
+        let i = self.base + self.word.trailing_zeros() as usize;
+        self.word &= self.word - 1;
+        (i < self.rows).then_some(i)
+    }
+}
+
 /// What a volume's built unique index decided for a read: nothing, and the
 /// side file decides; no candidate; or the candidates' positions, ascending
 enum UniqueDecision {
@@ -1252,6 +1286,168 @@ impl SegmentedTable {
     fn check_cold(&self) -> Result<()> {
         self.segment_mgr
             .check_schema_generation(self.schema_generation)
+    }
+
+    /// The distinct values of column `col_idx` the statement sees, NULL
+    /// among them when `with_null`; None when the hot rows of a column with
+    /// no hot index cannot be enumerated, under a snapshot, or in a seal's overlap
+    fn distinct_column(&self, col_idx: usize, with_null: bool) -> Result<Option<ValueSet>> {
+        if self.snapshot_seq.is_some() || self.segment_mgr.seal_overlap() > 0 {
+            return Ok(None);
+        }
+        self.newest_across_seals(|generation| {
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::merged_read_began();
+            let schema = self.hot.schema();
+            let Some(column) = schema.columns.get(col_idx) else {
+                return Ok(Some(None));
+            };
+            let data_type = column.data_type;
+            let mut distinct = ValueSet::default();
+            match self.hot.get_partition_values(&column.name)? {
+                Some(values) => {
+                    distinct.extend(values.into_iter().filter(|v| with_null || !v.is_null()))
+                }
+                // Local writes leave the count blind to a row over a deleted id
+                None if self.hot.has_local_changes() || self.hot.row_count()? > 0 => {
+                    return Ok(Some(None))
+                }
+                None => {}
+            }
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::hot_and_cold_reads_split();
+            let mut hot_skip: FxHashSet<i64> = FxHashSet::default();
+            let (tombstones, volumes) = self.cold_view(&mut hot_skip, false)?;
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::merged_read_collected();
+            if self.seal_moved(generation) {
+                return Ok(None);
+            }
+            let cut = self.read_cut();
+            let default = self.column_default(col_idx);
+            for (_, cs) in volumes.iter() {
+                self.volume_distinct(
+                    cs,
+                    (col_idx, data_type, &default, with_null),
+                    (&tombstones, &hot_skip, &cut),
+                    &mut distinct,
+                )?;
+            }
+            self.check_cold()?;
+            Ok(Some(Some(distinct)))
+        })
+    }
+
+    /// Adds the values of `cs` the statement sees to `distinct`: the volume's
+    /// dictionary when it hides no row, else the dictionary ids or values of
+    /// the rows shown. A volume hidden whole is not decoded
+    fn volume_distinct(
+        &self,
+        cs: &super::manifest::ColdSegment,
+        (col_idx, data_type, default, with_null): (usize, DataType, &Value, bool),
+        (tombstones, hot_skip, cut): (&FxHashMap<i64, u64>, &FxHashSet<i64>, &CommitCut),
+        distinct: &mut ValueSet,
+    ) -> Result<()> {
+        let vol = &cs.volume;
+        let rows = vol.meta.row_count;
+        let shown = self.shown_rows(cs, tombstones, hot_skip, cut)?;
+        let positions = ShownPositions {
+            bits: shown.as_deref(),
+            rows,
+            at: 0,
+            base: 0,
+            word: 0,
+        };
+        if positions.clone().next().is_none() {
+            return Ok(());
+        }
+        let phys = match cs.mapping.sources.get(col_idx) {
+            Some(super::writer::ColSource::Volume(phys)) => *phys,
+            _ => {
+                if with_null || !default.is_null() {
+                    distinct.insert(default.clone());
+                }
+                return Ok(());
+            }
+        };
+        if shown.is_none() {
+            if let Some(dictionary) = vol.get_column_dictionary(phys)? {
+                distinct.extend(dictionary.iter().map(|text| Value::Text(text.clone())));
+                let zone = vol.meta.zone_maps.get(phys);
+                if with_null && zone.is_some_and(|zone| zone.null_count > 0) {
+                    distinct.insert(Value::null(data_type));
+                }
+                return Ok(());
+            }
+        }
+        let column = vol.columns.get(phys)?;
+        // Values mostly distinct in a sample go to the set whole, hashed once
+        const SAMPLE: usize = 4096;
+        let sample = positions.clone().take(SAMPLE);
+        let (sampled, rows_sampled) =
+            (column.first_of_each(sample.clone()).0.len(), sample.count());
+        let dictionary = matches!(column, super::column::ColumnData::Dictionary { .. });
+        if !dictionary && sampled * 2 > rows_sampled {
+            for i in positions.filter(|&i| with_null || !column.is_null(i)) {
+                distinct.insert(column.get_value(i));
+            }
+            return Ok(());
+        }
+        let (firsts, null) = column.first_of_each(positions);
+        distinct.extend(firsts.into_iter().map(|i| column.get_value(i)));
+        if let Some(i) = null.filter(|_| with_null) {
+            distinct.insert(column.get_value(i));
+        }
+        Ok(())
+    }
+
+    /// The positions of `cs` the statement sees, as bits; None when it sees
+    /// every row. Each tombstoned or hot id is located in the volume, or,
+    /// with more such ids than rows, each row's id is looked up
+    fn shown_rows(
+        &self,
+        cs: &super::manifest::ColdSegment,
+        tombstones: &FxHashMap<i64, u64>,
+        hot_skip: &FxHashSet<i64>,
+        cut: &CommitCut,
+    ) -> Result<Option<Vec<u64>>> {
+        let vol = &cs.volume;
+        let rows = vol.meta.row_count;
+        let hidden = tombstones.len() + hot_skip.len();
+        if cs.visible.is_none() && hidden == 0 {
+            return Ok(None);
+        }
+        let mut bits = match &cs.visible {
+            Some(bits) => bits.to_vec(),
+            None => vec![u64::MAX; rows.div_ceil(64)],
+        };
+        let mut cleared = false;
+        let mut hide = |i: usize| {
+            bits[i >> 6] &= !(1u64 << (i & 63));
+            cleared = true;
+        };
+        if hidden <= rows {
+            for (&id, &seq) in tombstones.iter() {
+                if let Some(i) = vol
+                    .locate(id)
+                    .filter(|_| self.is_tombstone_visible(seq, cut))
+                {
+                    hide(i);
+                }
+            }
+            hot_skip
+                .iter()
+                .filter_map(|&id| vol.locate(id))
+                .for_each(&mut hide);
+        } else {
+            let row_ids = vol.row_ids()?;
+            for (i, id) in row_ids.iter().enumerate() {
+                if hot_skip.contains(id) || self.is_row_tombstoned(tombstones, *id, cut) {
+                    hide(i);
+                }
+            }
+        }
+        Ok((cs.visible.is_some() || cleared).then_some(bits))
     }
 
     /// Reload through the captured file owner even after segment retirement.
@@ -6278,90 +6474,24 @@ impl Table for SegmentedTable {
     // =========================================================================
 
     fn get_partition_count(&self, column_name: &str) -> Result<Option<usize>> {
-        self.newest_across_seals(|generation| {
-            let cut = self.read_cut();
-            if !self.segment_mgr.has_segments() {
-                let hot = self.hot.get_partition_count(column_name)?;
-                return Ok((!self.seal_moved(generation)).then_some(hot));
-            }
-
-            // During seal, hot+cold overlap — can't reliably count
-            if self.segment_mgr.seal_overlap() > 0 {
+        // A table with no volumes counts its hot index alone
+        let hot = self.newest_across_seals(|generation| {
+            if self.segment_mgr.has_segments() {
                 return Ok(Some(None));
             }
-
-            let schema = self.hot.schema();
-            let Some(&col_idx) = schema.column_index_map().get(&column_name.to_lowercase()) else {
-                return Ok(Some(None));
-            };
-
-            // Collect hot distinct values from index. If no index exists on this
-            // column, bail — we can't enumerate hot values without a full scan.
-            let mut distinct: ValueSet = ValueSet::default();
-            let Some(hot_values) = self.hot.get_partition_values(column_name)? else {
-                return Ok(Some(None));
-            };
-            for v in hot_values {
-                if !v.is_null() {
-                    distinct.insert(v);
-                }
-            }
-            #[cfg(feature = "test-failpoints")]
-            crate::test_failpoints::hot_and_cold_reads_split();
-
-            // Build skip set: hot row_ids + tombstones + pending tombstones
-            let mut hot_skip: FxHashSet<i64> =
-                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-            let (tombstones_arc, volumes) = self.cold_view(&mut hot_skip, false)?;
-            if self.seal_moved(generation) {
-                return Ok(None);
-            }
-
-            // Scan cold volumes columnar-only (no Row materialization)
-            // Column resolution uses mapping (handles renames/drops) not col_name.
-            let default_val = self.column_default(col_idx);
-            let has_non_null_default = !default_val.is_null();
-            for (_, cs) in volumes.iter() {
-                let vol = &cs.volume;
-                let row_ids = vol.row_ids()?;
-                let Some(start) = (0..vol.meta.row_count).find(|&i| {
-                    cs.is_visible(i)
-                        && !self.is_row_tombstoned(&tombstones_arc, row_ids[i], &cut)
-                        && !hot_skip.contains(&row_ids[i])
-                }) else {
-                    continue;
-                };
-                let mapping = &cs.mapping;
-                let phys = if col_idx < mapping.sources.len() {
-                    match &mapping.sources[col_idx] {
-                        super::writer::ColSource::Volume(vi) => Some(*vi),
-                        super::writer::ColSource::Default(_) => None,
-                    }
-                } else {
-                    None
-                };
-                let column = phys.map(|pi| vol.columns.get(pi)).transpose()?;
-                for (i, &rid) in row_ids.iter().enumerate().skip(start) {
-                    if !cs.is_visible(i) {
-                        continue;
-                    }
-                    if self.is_row_tombstoned(&tombstones_arc, rid, &cut) || hot_skip.contains(&rid)
-                    {
-                        continue;
-                    }
-                    if let Some(col) = column {
-                        if !col.is_null(i) {
-                            distinct.insert(col.get_value(i));
-                        }
-                    } else if has_non_null_default {
-                        distinct.insert(default_val.clone());
-                    }
-                }
-            }
-
-            self.check_cold()?;
-            Ok(Some(Some(distinct.len())))
-        })
+            let hot = self.hot.get_partition_count(column_name)?;
+            Ok((!self.seal_moved(generation)).then_some(Some(hot)))
+        })?;
+        if let Some(hot) = hot {
+            return Ok(hot);
+        }
+        let schema = self.hot.schema();
+        let Some(&col_idx) = schema.column_index_map().get(&column_name.to_lowercase()) else {
+            return Ok(None);
+        };
+        Ok(self
+            .distinct_column(col_idx, false)?
+            .map(|distinct| distinct.len()))
     }
 
     fn get_partition_values(&self, column_name: &str) -> Result<Option<Vec<Value>>> {
@@ -6371,222 +6501,12 @@ impl Table for SegmentedTable {
         if let Some(result) = self.unsealed(|hot| hot.get_partition_values(column_name)) {
             return result;
         }
-
-        if self.segment_mgr.seal_overlap() > 0 {
+        let schema = self.hot.schema();
+        let Some(&col_idx) = schema.column_index_map().get(&column_name.to_lowercase()) else {
             return Ok(None);
-        }
-        self.newest_across_seals(|generation| {
-            #[cfg(any(test, feature = "test-failpoints"))]
-            crate::test_failpoints::merged_read_began();
-            let cut = self.read_cut();
-
-            let schema = self.hot.schema();
-            let Some(&col_idx) = schema.column_index_map().get(&column_name.to_lowercase()) else {
-                return Ok(Some(None));
-            };
-
-            // Bail if hot has no index on this column — can't enumerate hot values
-            // without a full scan. Returning Some with only cold values would be wrong.
-            let mut distinct: ValueSet = ValueSet::default();
-            let Some(hot_values) = self.hot.get_partition_values(column_name)? else {
-                return Ok(Some(None));
-            };
-            for v in hot_values {
-                distinct.insert(v);
-            }
-
-            let volumes = self.segment_mgr.get_volumes_newest_first()?;
-            let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-            let mut hot_skip: FxHashSet<i64> =
-                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-            self.hot.collect_hot_row_ids_into(&mut hot_skip);
-            self.segment_mgr
-                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
-            #[cfg(any(test, feature = "test-failpoints"))]
-            crate::test_failpoints::merged_read_collected();
-            if self.seal_moved(generation) {
-                return Ok(None);
-            }
-
-            // Column resolution uses mapping (handles renames/drops) not col_name.
-            let default_val = self.column_default(col_idx);
-            for (_, cs) in volumes.iter() {
-                let vol = &cs.volume;
-                let row_ids = vol.row_ids()?;
-                let Some(start) = (0..vol.meta.row_count).find(|&i| {
-                    cs.is_visible(i)
-                        && !self.is_row_tombstoned(&tombstones_arc, row_ids[i], &cut)
-                        && !hot_skip.contains(&row_ids[i])
-                }) else {
-                    continue;
-                };
-                let mapping = &cs.mapping;
-                let phys = if col_idx < mapping.sources.len() {
-                    match &mapping.sources[col_idx] {
-                        super::writer::ColSource::Volume(vi) => Some(*vi),
-                        super::writer::ColSource::Default(_) => None,
-                    }
-                } else {
-                    None
-                };
-                let column = phys.map(|pi| vol.columns.get(pi)).transpose()?;
-                for (i, &rid) in row_ids.iter().enumerate().skip(start) {
-                    if !cs.is_visible(i) {
-                        continue;
-                    }
-                    if self.is_row_tombstoned(&tombstones_arc, rid, &cut) || hot_skip.contains(&rid)
-                    {
-                        continue;
-                    }
-                    if let Some(col) = column {
-                        distinct.insert(col.get_value(i));
-                    } else {
-                        distinct.insert(default_val.clone());
-                    }
-                }
-            }
-
-            self.check_cold()?;
-            Ok(Some(Some(distinct.into_iter().collect())))
-        })
-    }
-
-    fn compute_distinct_values(&self, col_idx: usize) -> Result<Option<Vec<Value>>> {
-        // Bail during seal overlap — hot and cold may have duplicates
-        if self.segment_mgr.seal_overlap() > 0 {
-            return Ok(None);
-        }
-        // Tombstone visibility depends on a snapshot's or a view's point
-        self.newest_across_seals(|generation| {
-            #[cfg(any(test, feature = "test-failpoints"))]
-            crate::test_failpoints::merged_read_began();
-            let cut = self.read_cut();
-
-            let schema = self.hot.schema();
-            if col_idx >= schema.columns.len() {
-                return Ok(Some(None));
-            }
-            let col_name = &schema.columns[col_idx].name;
-
-            // Collect hot distinct values via index (same requirement as get_partition_values)
-            let mut distinct: ValueSet = ValueSet::default();
-            if let Some(hot_values) = self.hot.get_partition_values(col_name)? {
-                for v in hot_values {
-                    distinct.insert(v);
-                }
-            } else if self.hot.row_count()? > 0 {
-                // Hot has rows but no index on this column — cannot enumerate without full scan
-                return Ok(Some(None));
-            }
-
-            if !self.segment_mgr.has_segments() {
-                return Ok(Some(Some(distinct.into_iter().collect())));
-            }
-
-            let no_tombstones = self.segment_mgr.is_tombstone_set_empty()
-                && !self.segment_mgr.has_pending_tombstones(self.txn_id());
-
-            let volumes = self.segment_mgr.get_volumes_newest_first()?;
-            let tombstones_arc = if no_tombstones {
-                // Avoid cloning the Arc when we know the set is empty
-                Arc::new(FxHashMap::default())
-            } else {
-                self.segment_mgr.tombstone_set_arc()
-            };
-            let mut hot_skip: FxHashSet<i64> =
-                FxHashSet::with_capacity_and_hasher(1024, Default::default());
-            self.hot.collect_hot_row_ids_into(&mut hot_skip);
-            if !no_tombstones {
-                self.segment_mgr
-                    .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
-            }
-            #[cfg(any(test, feature = "test-failpoints"))]
-            crate::test_failpoints::merged_read_collected();
-            if self.seal_moved(generation) {
-                return Ok(None);
-            }
-
-            let schema = self.hot.schema();
-            let default_val = self.column_default(col_idx);
-
-            for (_, cs) in volumes.iter() {
-                let vol = &cs.volume;
-                let mapping = &cs.mapping;
-                let phys = if col_idx < mapping.sources.len() {
-                    match &mapping.sources[col_idx] {
-                        super::writer::ColSource::Volume(vi) => Some(*vi),
-                        super::writer::ColSource::Default(_) => None,
-                    }
-                } else {
-                    None
-                };
-
-                if let Some(pi) = phys {
-                    // Dictionary fast path: no tombstones and all rows visible means
-                    // the dictionary itself IS the distinct value set for this volume
-                    let can_use_dict = no_tombstones && cs.visible.is_none() && hot_skip.is_empty();
-
-                    if let Some(zone) = vol.meta.zone_maps.get(pi).filter(|_| can_use_dict) {
-                        if let Some(dict_arc) = vol.get_column_dictionary(pi)? {
-                            for entry in dict_arc.iter() {
-                                distinct.insert(Value::Text(entry.clone()));
-                            }
-                            // The dictionary holds no NULL; every row is visible here
-                            if zone.null_count > 0 {
-                                distinct.insert(Value::null(schema.columns[col_idx].data_type));
-                            }
-                            continue;
-                        }
-                    }
-
-                    // Fallback: row-by-row scan on this volume's column
-                    let row_ids = vol.row_ids()?;
-                    let Some(start) = (0..vol.meta.row_count).find(|&i| {
-                        cs.is_visible(i)
-                            && !hot_skip.contains(&row_ids[i])
-                            && (no_tombstones
-                                || !self.is_row_tombstoned(&tombstones_arc, row_ids[i], &cut))
-                    }) else {
-                        continue;
-                    };
-                    let col = vol.columns.get(pi)?;
-                    for (i, &rid) in row_ids.iter().enumerate().skip(start) {
-                        if !cs.is_visible(i) {
-                            continue;
-                        }
-                        if hot_skip.contains(&rid) {
-                            continue;
-                        }
-                        if !no_tombstones && self.is_row_tombstoned(&tombstones_arc, rid, &cut) {
-                            continue;
-                        }
-                        distinct.insert(col.get_value(i));
-                    }
-                } else {
-                    // Column was added after this volume was sealed — use default
-                    let row_ids = vol.row_ids()?;
-                    let has_visible = (0..vol.meta.row_count).any(|i| {
-                        if !cs.is_visible(i) {
-                            return false;
-                        }
-                        let rid = row_ids[i];
-                        if hot_skip.contains(&rid) {
-                            return false;
-                        }
-                        if !no_tombstones && self.is_row_tombstoned(&tombstones_arc, rid, &cut) {
-                            return false;
-                        }
-                        true
-                    });
-                    if has_visible {
-                        distinct.insert(default_val.clone());
-                    }
-                }
-            }
-
-            self.check_cold()?;
-            Ok(Some(Some(distinct.into_iter().collect())))
-        })
+        };
+        let distinct = self.distinct_column(col_idx, true)?;
+        Ok(distinct.map(|distinct| distinct.into_iter().collect()))
     }
 
     fn collect_rows_grouped_by_partition(
