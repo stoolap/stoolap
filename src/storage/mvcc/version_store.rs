@@ -33,6 +33,7 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
+use crate::common::names::eq_names;
 use crate::common::SmartString;
 
 use crate::common::{
@@ -326,6 +327,11 @@ fn count_chain_depth(entry: &VersionChainEntry) -> usize {
 /// Whether `index` is a unique index of `column` alone
 fn unique_on(index: &Arc<dyn Index>, column: usize) -> bool {
     index.is_unique() && index.column_ids() == [column as i32]
+}
+
+/// Whether `index` is a unique index other than one on the key column `key` alone
+pub(crate) fn unique_beside_key(index: &dyn Index, key: Option<usize>) -> bool {
+    index.is_unique() && !key.is_some_and(|key| index.column_ids() == [key as i32])
 }
 
 /// Convert arena index (usize) to compact representation (Option<NonZeroU64>)
@@ -5642,7 +5648,7 @@ impl VersionStore {
         let indexes = self.indexes.read();
         for entry in indexes.values() {
             let column_names = entry.index.column_names();
-            if column_names.len() == 1 && column_names[0].eq_ignore_ascii_case(column_name) {
+            if column_names.len() == 1 && eq_names(&column_names[0], column_name) {
                 return Some(Arc::clone(&entry.index));
             }
         }
@@ -5732,33 +5738,16 @@ impl VersionStore {
     /// Get column indices and names for all non-PK unique indexes.
     /// Used by commit-time cold revalidation.
     pub fn get_unique_non_pk_index_columns(&self) -> Vec<(Vec<usize>, Vec<String>)> {
-        let schema = self.schema();
-        let pk_col = schema
-            .pk_column_index()
-            .map(|i| &schema.columns[i].name_lower);
+        let key = self.schema().pk_column_index();
         let indexes = self.indexes.read();
-        let mut result = Vec::new();
-        for idx in indexes.values().map(|entry| &entry.index) {
-            if !idx.is_unique() {
-                continue;
-            }
-            let names = idx.column_names();
-            if names.len() == 1 {
-                if let Some(pk) = pk_col {
-                    if names[0].eq_ignore_ascii_case(pk) {
-                        continue;
-                    }
-                }
-            }
-            let col_indices: Vec<usize> = names
-                .iter()
-                .filter_map(|name| schema.columns.iter().position(|c| c.name_lower == *name))
-                .collect();
-            if col_indices.len() == names.len() {
-                result.push((col_indices, names.to_vec()));
-            }
-        }
-        result
+        (indexes.values())
+            .filter(|entry| unique_beside_key(&*entry.index, key))
+            .map(|entry| {
+                let idx = &entry.index;
+                let at = idx.column_ids().iter().map(|&id| id as usize).collect();
+                (at, idx.column_names().to_vec())
+            })
+            .collect()
     }
 
     /// The indexes a volume's side file holds entries for, as `kind_for`
@@ -5810,10 +5799,7 @@ impl VersionStore {
             };
             let mut components: smallvec::SmallVec<[Component; 4]> = smallvec::SmallVec::new();
             for name in idx.column_names() {
-                let Some(column) = schema
-                    .columns
-                    .iter()
-                    .position(|c| c.name_lower.eq_ignore_ascii_case(name))
+                let Some(column) = schema.columns.iter().position(|c| eq_names(&c.name, name))
                 else {
                     continue 'indexes;
                 };

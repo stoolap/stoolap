@@ -32,6 +32,7 @@ use crate::common::SmartString;
 use ahash::AHashSet;
 use std::sync::Arc;
 
+use crate::common::names::eq_names;
 use crate::common::{CompactArc, StringMap};
 use crate::core::{Error, Result, Row, RowVec, Value};
 use crate::parser::ast::*;
@@ -812,9 +813,9 @@ impl Executor {
     /// Check if an expression references a CTE
     fn expr_references_cte(&self, expr: &Expression, cte_name: &str) -> bool {
         match expr {
-            Expression::CteReference(cte_ref) => cte_ref.name.value.eq_ignore_ascii_case(cte_name),
-            Expression::TableSource(ts) => ts.name.value.eq_ignore_ascii_case(cte_name),
-            Expression::Identifier(id) => id.value.eq_ignore_ascii_case(cte_name),
+            Expression::CteReference(cte_ref) => eq_names(&cte_ref.name.value, cte_name),
+            Expression::TableSource(ts) => eq_names(&ts.name.value, cte_name),
+            Expression::Identifier(id) => eq_names(&id.value, cte_name),
             Expression::JoinSource(js) => {
                 self.expr_references_cte(&js.left, cte_name)
                     || self.expr_references_cte(&js.right, cte_name)

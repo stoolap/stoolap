@@ -26,6 +26,7 @@ pub mod compact_vec;
 pub mod cow_btree;
 pub mod i64_map;
 pub mod maps;
+pub(crate) mod names;
 pub mod smart_string;
 pub mod time_compat;
 pub mod version;

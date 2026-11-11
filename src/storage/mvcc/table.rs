@@ -21,6 +21,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::sync::Arc;
 
+use crate::common::names::eq_names;
 use crate::common::{CompactArc, I64Set};
 use crate::core::{
     DataType, Error, IndexType, Result, Row, RowIdVec, RowVec, Schema, SchemaColumn, Value,
@@ -34,6 +35,7 @@ use crate::storage::mvcc::index_plan::{self, IndexPlan, Read};
 use crate::storage::mvcc::registry::{CommitCut, StatementView};
 use crate::storage::mvcc::scanner::{HotScanner, MVCCScanner};
 use crate::storage::mvcc::txn_gate::{GateRef, TxnGate};
+use crate::storage::mvcc::version_store::unique_beside_key;
 use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::mvcc::version_store::Reader;
 use crate::storage::mvcc::version_store::TxnStoreWrite;
@@ -249,7 +251,7 @@ pub(crate) fn pk_equality_id(expr: &dyn Expression, schema: &Schema) -> Option<i
     }
     let pk_col = &schema.columns[pk_indices[0]];
     let (col_name, operator, value) = expr.get_comparison_info()?;
-    if !col_name.eq_ignore_ascii_case(&pk_col.name) || operator != Operator::Eq {
+    if !eq_names(col_name, &pk_col.name) || operator != Operator::Eq {
         return None;
     }
     match value {
@@ -313,9 +315,7 @@ fn key_range(expr: &dyn Expression, schema: &Schema) -> Option<(i64, i64)> {
     let pk = &schema.columns[schema.pk_column_index()?].name;
     let mut leaves = Vec::new();
     if !collect_conjuncts(expr, &mut leaves)
-        || !leaves
-            .iter()
-            .all(|(column, _, _)| column.eq_ignore_ascii_case(pk))
+        || !leaves.iter().all(|(column, _, _)| eq_names(column, pk))
     {
         return None;
     }
@@ -754,7 +754,7 @@ impl MVCCTable {
         let mut prefix = Vec::with_capacity(equal);
         for column in &columns[..equal] {
             let (_, _, value) = leaves.iter().find(|(name, op, value)| {
-                *op == Operator::Eq && !value.is_null() && name.eq_ignore_ascii_case(column)
+                *op == Operator::Eq && !value.is_null() && eq_names(name, column)
             })?;
             prefix.push((*value).clone());
         }
@@ -762,7 +762,7 @@ impl MVCCTable {
         let mut lower = None;
         let mut upper = None;
         for (name, op, value) in &leaves {
-            if !name.eq_ignore_ascii_case(walked) {
+            if !eq_names(name, walked) {
                 continue;
             }
             if value.is_null() {
@@ -833,9 +833,7 @@ impl MVCCTable {
             IndexPlan::Key => {
                 let pk = &schema.columns[schema.pk_column_index()?].name;
                 let id = scope.iter().find_map(|c| match c.get_comparison_info() {
-                    Some((column, Operator::Eq, Value::Integer(id)))
-                        if column.eq_ignore_ascii_case(pk) =>
-                    {
+                    Some((column, Operator::Eq, Value::Integer(id))) if eq_names(column, pk) => {
                         Some(*id)
                     }
                     _ => None,
@@ -852,9 +850,7 @@ impl MVCCTable {
                         .downcast_ref::<crate::storage::expression::InListExpr>()
                         .filter(|list| {
                             !list.is_not()
-                                && list
-                                    .get_column_name()
-                                    .is_some_and(|n| n.eq_ignore_ascii_case(pk))
+                                && list.get_column_name().is_some_and(|n| eq_names(n, pk))
                         })
                 })?;
                 let mut row_ids = RowIdVec::with_capacity(list.get_values().len());
@@ -933,7 +929,7 @@ impl MVCCTable {
     ) -> Option<RowIdVec> {
         use crate::core::Operator;
         let column = index.column_names()[0].as_str();
-        let named = |name: &str| name.eq_ignore_ascii_case(column);
+        let named = |name: &str| eq_names(name, column);
         match read {
             Read::Equal => {
                 let value = scope.iter().find_map(|c| match c.get_comparison_info() {
@@ -1053,9 +1049,7 @@ impl MVCCTable {
         let mut values: Vec<Value> = Vec::with_capacity(equal + 1);
         for column in &columns[..equal] {
             let value = scope.iter().find_map(|c| match c.get_comparison_info() {
-                Some((name, Operator::Eq, value)) if name.eq_ignore_ascii_case(column) => {
-                    Some(value)
-                }
+                Some((name, Operator::Eq, value)) if eq_names(name, column) => Some(value),
                 _ => None,
             })?;
             values.push(value.clone());
@@ -1115,16 +1109,13 @@ fn column_bounds<'a>(column: &str, scope: &[&'a dyn Expression]) -> (KeyBound<'a
     };
     for &conjunct in scope {
         if let Some((name, operator, value)) = conjunct.get_comparison_info() {
-            if name.eq_ignore_ascii_case(column) {
+            if eq_names(name, column) {
                 bound(operator, value);
             }
         } else if let Some(between) = conjunct
             .as_any()
             .downcast_ref::<crate::storage::expression::BetweenExpr>()
-            .filter(|b| {
-                b.get_column_name()
-                    .is_some_and(|n| n.eq_ignore_ascii_case(column))
-            })
+            .filter(|b| b.get_column_name().is_some_and(|n| eq_names(n, column)))
         {
             for (_, operator, value) in between.collect_comparisons() {
                 bound(operator, value);
@@ -2799,7 +2790,7 @@ impl MVCCTable {
                     .cached_schema
                     .columns
                     .iter()
-                    .find(|c| c.name_lower.eq_ignore_ascii_case(column))
+                    .find(|c| eq_names(&c.name_lower, column))
                     .map(|c| c.data_type)
                 else {
                     return Ok(None);
@@ -3638,7 +3629,7 @@ impl Table for MVCCTable {
         let Some(plan) = self.walk_keys(walk, expr) else {
             return Ok(None);
         };
-        if !plan.index.column_names()[plan.prefix.len()].eq_ignore_ascii_case(column_name) {
+        if !eq_names(&plan.index.column_names()[plan.prefix.len()], column_name) {
             return Ok(None);
         }
         let schema = &self.cached_schema;
@@ -4439,54 +4430,25 @@ impl Table for MVCCTable {
 
     fn for_each_unique_non_pk_index(
         &self,
-        f: &mut dyn FnMut(&str, &[String]) -> Result<()>,
+        f: &mut dyn FnMut(&dyn Index) -> Result<()>,
     ) -> Result<()> {
-        let pk_col = self
-            .cached_schema
-            .pk_column_index()
-            .map(|i| &self.cached_schema.columns[i].name_lower);
-        let mut unique = smallvec::SmallVec::<[Arc<dyn Index>; 4]>::new();
-        let indexes = self.version_store.indexes_read();
-        for idx in indexes.values().map(|entry| &entry.index) {
-            if !idx.is_unique() {
-                continue;
-            }
-            let names = idx.column_names();
-            // Skip single-column indexes that match the PK column
-            if names.len() == 1 {
-                if let Some(pk) = pk_col {
-                    if names[0].eq_ignore_ascii_case(pk) {
-                        continue;
-                    }
-                }
-            }
-            unique.push(Arc::clone(idx));
-        }
-        drop(indexes);
+        let key = self.cached_schema.pk_column_index();
+        let unique: smallvec::SmallVec<[Arc<dyn Index>; 4]> = (self.version_store.indexes_read())
+            .values()
+            .filter(|entry| unique_beside_key(&*entry.index, key))
+            .map(|entry| Arc::clone(&entry.index))
+            .collect();
         for idx in unique {
-            f(idx.name(), idx.column_names())?;
+            f(&*idx)?;
         }
         Ok(())
     }
 
     fn has_unique_non_pk_indexes(&self) -> bool {
-        let pk_col = self
-            .cached_schema
-            .pk_column_index()
-            .map(|i| &self.cached_schema.columns[i].name_lower);
-        let indexes = self.version_store.indexes_read();
-        indexes.values().map(|entry| &entry.index).any(|idx| {
-            if !idx.is_unique() {
-                return false;
-            }
-            let names = idx.column_names();
-            if names.len() == 1 {
-                if let Some(pk) = pk_col {
-                    return !names[0].eq_ignore_ascii_case(pk);
-                }
-            }
-            true
-        })
+        let key = self.cached_schema.pk_column_index();
+        (self.version_store.indexes_read())
+            .values()
+            .any(|entry| unique_beside_key(&*entry.index, key))
     }
 
     fn acquire_upsert_lock(&self) -> Option<Box<dyn std::any::Any>> {

@@ -17,6 +17,7 @@
 
 use std::sync::{Arc, RwLock};
 
+use crate::common::names::eq_names;
 use crate::common::{CompactArc, SmartString};
 use crate::core::{DataType, Result, Row, Schema, Value};
 use crate::parser::ast::{DeleteStatement, Expression, UpdateStatement};
@@ -331,8 +332,8 @@ impl Executor {
             return None;
         }
         let names_key = |expr: &Expression| match expr {
-            Expression::Identifier(id) => id.value.eq_ignore_ascii_case(pk_column),
-            Expression::QualifiedIdentifier(q) => q.name.value.eq_ignore_ascii_case(pk_column),
+            Expression::Identifier(id) => eq_names(&id.value, pk_column),
+            Expression::QualifiedIdentifier(q) => eq_names(&q.name.value, pk_column),
             _ => false,
         };
         let value = match (&*infix.left, &*infix.right) {

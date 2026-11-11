@@ -19,6 +19,7 @@
 //! - UPDATE
 //! - DELETE
 
+use crate::common::names::eq_names;
 use crate::common::CompactArc;
 use crate::common::I64Set;
 use crate::common::SmartString;
@@ -128,12 +129,12 @@ fn conflict_matches_target(conflict_target: &[Identifier], schema: &Schema, erro
             target_set == pk_cols
         }
         Error::UniqueConstraint { column, .. } => {
-            // `column` is comma-separated (e.g. "a" or "a, b")
-            let violated_cols: rustc_hash::FxHashSet<&str> =
-                column.split(", ").map(|s| s.trim()).collect();
-            // Compare lowercase: conflict_target is already lowered by Identifier::new;
-            // UniqueConstraint.column comes from index column_names which are lowercase
-            target_set == violated_cols
+            // `column` is comma-separated (e.g. "a" or "a, b"), each as the index spells it
+            let violated = || column.split(", ").map(str::trim);
+            violated().all(|v| target_set.iter().any(|t| eq_names(v, t)))
+                && target_set
+                    .iter()
+                    .all(|t| violated().any(|v| eq_names(v, t)))
         }
         _ => false,
     }
@@ -2293,7 +2294,7 @@ impl Executor {
         let column = schema
             .columns
             .iter()
-            .find(|c| c.name.eq_ignore_ascii_case(name))
+            .find(|c| eq_names(&c.name, name))
             .ok_or_else(|| Error::ColumnNotFound(name.to_string()))?;
         // The expression comes first: a value kept beside it was computed
         // once, when the column was added, and a RANDOM() default must be

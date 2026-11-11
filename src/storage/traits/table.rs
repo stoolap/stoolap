@@ -1123,20 +1123,12 @@ pub trait Table: Send + Sync {
 
     /// Iterate unique non-PK indexes by reference, avoiding per-call String allocations.
     ///
-    /// The callback receives `(&str, &[String])` — the index name and its column names —
-    /// without cloning.  Implementations that hold an `RwLock<FxHashMap<String, Arc<dyn Index>>>`
-    /// can iterate the lock guard directly.
-    ///
-    /// The default implementation falls back to `get_unique_indexes()`.
+    /// The callback receives each index, whose `column_ids` are its columns'
+    /// schema positions.
     fn for_each_unique_non_pk_index(
         &self,
-        f: &mut dyn FnMut(&str, &[String]) -> Result<()>,
-    ) -> Result<()> {
-        for (name, cols) in self.get_unique_indexes() {
-            f(&name, &cols)?;
-        }
-        Ok(())
-    }
+        f: &mut dyn FnMut(&dyn Index) -> Result<()>,
+    ) -> Result<()>;
 
     /// Check if the table has any unique indexes that are NOT the PK column.
     /// Used as a fast bail-out to avoid allocating get_unique_indexes().

@@ -28,6 +28,7 @@
 
 use std::sync::Arc;
 
+use crate::common::names::eq_names;
 use crate::common::{CompactArc, I64Set};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -534,7 +535,7 @@ struct ColdPrepare {
     shadowed: FxHashSet<i64>,
     /// The volumes walked whole at a settled generation
     seen_segments: FxHashSet<u64>,
-    unique_indexes: Option<Vec<(String, Vec<String>)>>,
+    unique_indexes: Option<Vec<ColdUnique>>,
     changes: Vec<ColdChange>,
     /// The ids named by the statement that no cold volume holds
     hot_ids: Vec<i64>,
@@ -570,6 +571,15 @@ struct ColdDelete {
 
 /// The sealed rows of one DELETE: one row, the `pk = k` case, stays inline
 type ColdDeleteRows = smallvec::SmallVec<[ColdDelete; 1]>;
+
+/// A UNIQUE index cold rows are checked against: its name, its columns as
+/// it spells them, and their positions, taken once per statement
+type ColdUnique = (String, Vec<String>, smallvec::SmallVec<[usize; 4]>);
+
+/// The schema positions of `index`'s columns
+fn unique_positions(index: &dyn Index) -> smallvec::SmallVec<[usize; 4]> {
+    index.column_ids().iter().map(|&id| id as usize).collect()
+}
 
 /// What a DELETE has prepared so far, across the rounds a landing seal
 /// makes it take
@@ -2238,20 +2248,13 @@ impl SegmentedTable {
         exclude_row_id: i64,
         snap: Option<&super::manifest::StatementSnapshot>,
         shadowed: &FxHashSet<i64>,
-        unique_indexes: &mut Option<Vec<(String, Vec<String>)>>,
+        unique_indexes: &mut Option<Vec<ColdUnique>>,
     ) -> Result<()> {
         if unique_indexes.is_none() {
             *unique_indexes = Some(self.cold_unique_indexes()?);
         }
         let schema = self.hot.schema();
-        for (idx_name, col_names) in unique_indexes.iter().flatten() {
-            let col_indices: smallvec::SmallVec<[usize; 4]> = col_names
-                .iter()
-                .filter_map(|name| schema.columns.iter().position(|c| c.name_lower == *name))
-                .collect();
-            if col_indices.len() != col_names.len() {
-                continue;
-            }
+        for (idx_name, col_names, col_indices) in unique_indexes.iter().flatten() {
             let coerced: smallvec::SmallVec<[Value; 4]> = col_indices
                 .iter()
                 .filter_map(|&idx| {
@@ -2267,9 +2270,9 @@ impl SegmentedTable {
 
             let found = match snap {
                 Some(snap) => {
-                    self.find_segment_row_id_by_values_in_stmt(snap, &col_indices, &values)?
+                    self.find_segment_row_id_by_values_in_stmt(snap, col_indices, &values)?
                 }
-                None => self.find_segment_row_id_by_values(&col_indices, &values)?,
+                None => self.find_segment_row_id_by_values(col_indices, &values)?,
             };
             if let Some(found_id) = found {
                 if found_id != exclude_row_id && !shadowed.contains(&found_id) {
@@ -2286,13 +2289,13 @@ impl SegmentedTable {
         Ok(())
     }
 
-    fn cold_unique_indexes(&self) -> Result<Vec<(String, Vec<String>)>> {
+    fn cold_unique_indexes(&self) -> Result<Vec<ColdUnique>> {
         let mut indexes = Vec::new();
-        self.hot
-            .for_each_unique_non_pk_index(&mut |name, columns| {
-                indexes.push((name.to_owned(), columns.to_vec()));
-                Ok(())
-            })?;
+        self.hot.for_each_unique_non_pk_index(&mut |index| {
+            let at = unique_positions(index);
+            indexes.push((index.name().to_owned(), index.column_names().to_vec(), at));
+            Ok(())
+        })?;
         Ok(indexes)
     }
 
@@ -2301,7 +2304,7 @@ impl SegmentedTable {
         snapshot: &super::manifest::ColdSnapshot,
         loads: &super::manifest::ColdLoads,
         row: &Row,
-        unique_indexes: Option<&[(String, Vec<String>)]>,
+        unique_indexes: Option<&[ColdUnique]>,
     ) -> Result<()> {
         let schema = self.hot.schema();
 
@@ -2328,14 +2331,7 @@ impl SegmentedTable {
         if unique_indexes.map_or_else(|| !self.hot.has_unique_non_pk_indexes(), |v| v.is_empty()) {
             return Ok(());
         }
-        let mut check_unique = |idx_name: &str, col_names: &[String]| {
-            let col_indices: smallvec::SmallVec<[usize; 4]> = col_names
-                .iter()
-                .filter_map(|name| schema.columns.iter().position(|c| c.name_lower == *name))
-                .collect();
-            if col_indices.len() != col_names.len() {
-                return Ok(());
-            }
+        let check_unique = |idx_name: &str, col_names: &[String], col_indices: &[usize]| {
             // Coerce values to schema column types before comparing with cold segments.
             // Prepared statements may pass TEXT for TIMESTAMP columns — the row is
             // coerced later in prepare_insert, but we need the correct types NOW for
@@ -2356,7 +2352,7 @@ impl SegmentedTable {
             if let Some(conflict_row_id) = self.find_segment_row_id_by_values_with_snapshot(
                 snapshot,
                 Some(loads),
-                &col_indices,
+                col_indices,
                 &values,
             )? {
                 drop(values);
@@ -2370,12 +2366,14 @@ impl SegmentedTable {
             Ok(())
         };
         if let Some(indexes) = unique_indexes {
-            for (name, columns) in indexes {
-                check_unique(name, columns)?;
+            for (name, columns, at) in indexes {
+                check_unique(name, columns, at)?;
             }
             Ok(())
         } else {
-            self.hot.for_each_unique_non_pk_index(&mut check_unique)
+            self.hot.for_each_unique_non_pk_index(&mut |index| {
+                check_unique(index.name(), index.column_names(), &unique_positions(index))
+            })
         }
     }
 
@@ -2611,7 +2609,7 @@ impl SegmentedTable {
             let col = schema.get_column_index(name)?;
             let column = &schema.columns[col];
             let &(_, _, value) = comparisons.iter().find(|(compared, op, _)| {
-                *op == crate::core::Operator::Eq && compared.eq_ignore_ascii_case(&column.name)
+                *op == crate::core::Operator::Eq && eq_names(compared, &column.name)
             })?;
             matches!(
                 (column.data_type, value),
@@ -2623,7 +2621,8 @@ impl SegmentedTable {
             .then_some((col, value))
         };
         let mut keys = Vec::new();
-        self.hot.for_each_unique_non_pk_index(&mut |_, columns| {
+        self.hot.for_each_unique_non_pk_index(&mut |index| {
+            let columns = index.column_names();
             if columns.iter().all(|name| set_value(name).is_some()) {
                 let (columns, values) = columns.iter().filter_map(|name| set_value(name)).unzip();
                 keys.push(UniqueKey { columns, values });
@@ -2703,7 +2702,7 @@ impl SegmentedTable {
         let (mut low, mut high) = (i64::MIN, i64::MAX);
         let mut bounded = false;
         for &(col_name, op, value) in comparisons {
-            if !col_name.eq_ignore_ascii_case(name) {
+            if !eq_names(col_name, name) {
                 continue;
             }
             // The comparisons all hold, so their key ranges intersect
@@ -2731,8 +2730,7 @@ impl SegmentedTable {
         let compared = |column: u32, equal: bool| {
             schema.columns.get(column as usize).is_some_and(|c| {
                 comparisons.iter().any(|(name, op, _)| {
-                    (!equal || *op == crate::core::Operator::Eq)
-                        && name.eq_ignore_ascii_case(&c.name_lower)
+                    (!equal || *op == crate::core::Operator::Eq) && eq_names(name, &c.name_lower)
                 })
             })
         };
@@ -2771,8 +2769,7 @@ impl SegmentedTable {
             comparisons
                 .iter()
                 .filter(|(column, op, _)| {
-                    (!equal || *op == crate::core::Operator::Eq)
-                        && column.eq_ignore_ascii_case(name)
+                    (!equal || *op == crate::core::Operator::Eq) && eq_names(column, name)
                 })
                 .map(|&(_, _, value)| encoded_len(component.domain, value))
                 .max()
@@ -2795,7 +2792,7 @@ impl SegmentedTable {
             };
             let mut pushed = false;
             for &(column, op, value) in comparisons {
-                if op != crate::core::Operator::Eq || !column.eq_ignore_ascii_case(name) {
+                if op != crate::core::Operator::Eq || !eq_names(column, name) {
                     continue;
                 }
                 match push_equal(component.domain, value, &mut prefix) {
@@ -2819,7 +2816,7 @@ impl SegmentedTable {
         if let Some(name) = name_of(next.column) {
             let on_next = comparisons
                 .iter()
-                .filter(|(column, _, _)| column.eq_ignore_ascii_case(name))
+                .filter(|(column, _, _)| eq_names(column, name))
                 .map(|&(_, op, value)| (op, value));
             prefix = match component_range(next.domain, prefix, on_next) {
                 Ok(range) => return Some((range, Capability::Range)),
@@ -2974,7 +2971,7 @@ impl SegmentedTable {
             def.kind == KeyKind::OrderedBytes
                 && matches!(def.components.as_slice(), [only] if only.domain == Domain::Text
                     && schema.columns.get(only.column as usize)
-                        .is_some_and(|c| c.name_lower.eq_ignore_ascii_case(column)))
+                        .is_some_and(|c| eq_names(&c.name_lower, column)))
         })
     }
 
@@ -7837,7 +7834,7 @@ impl Table for SegmentedTable {
 
     fn for_each_unique_non_pk_index(
         &self,
-        f: &mut dyn FnMut(&str, &[String]) -> Result<()>,
+        f: &mut dyn FnMut(&dyn Index) -> Result<()>,
     ) -> Result<()> {
         self.hot.for_each_unique_non_pk_index(f)
     }
@@ -9311,6 +9308,12 @@ mod tests {
         }
         fn schema(&self) -> &Schema {
             &self.schema
+        }
+        fn for_each_unique_non_pk_index(
+            &self,
+            _: &mut dyn FnMut(&dyn Index) -> Result<()>,
+        ) -> Result<()> {
+            Ok(())
         }
         fn txn_id(&self) -> i64 {
             1

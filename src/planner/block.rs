@@ -15,6 +15,7 @@
 //! How a subquery block answers, decided once when its statement is
 //! prepared; what only a run knows picks between the arms a node names
 
+use crate::common::names::eq_names;
 use crate::storage::traits::Table;
 
 /// How often a block computes its answer
@@ -89,7 +90,7 @@ fn exists_probes(table: &dyn Table, column: &str) -> bool {
         .schema()
         .columns
         .iter()
-        .position(|c| c.name_lower.eq_ignore_ascii_case(column))
+        .position(|c| eq_names(&c.name_lower, column))
     else {
         return false;
     };

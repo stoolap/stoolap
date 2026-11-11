@@ -27,6 +27,7 @@ mod expression_identity_test;
 mod grouped_ambiguous_name_test;
 mod keyword_column_test;
 mod missing_name_rule_test;
+mod non_ascii_uppercase_name_test;
 mod output_column_names_test;
 mod qualifier_scope_test;
 mod quoted_boolean_name_test;

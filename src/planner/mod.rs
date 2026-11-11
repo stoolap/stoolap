@@ -17,6 +17,7 @@
 
 use std::sync::Weak;
 
+use crate::common::names::eq_names;
 use crate::common::{CompactArc, SmartString};
 use crate::core::pattern::Pattern;
 use crate::core::{Operator, Schema};
@@ -692,7 +693,7 @@ pub fn ordered_read(
     }
     let keyed = schema
         .pk_column_index()
-        .is_some_and(|pk| schema.columns[pk].name.eq_ignore_ascii_case(column));
+        .is_some_and(|pk| eq_names(&schema.columns[pk].name, column));
     let Some(pushed) = pushed else {
         return Some(match keyed || store.get_index_by_column(column).is_some() {
             true => OrderedRead::Index,
@@ -705,7 +706,7 @@ pub fn ordered_read(
         matches!(
             conjunct.term(schema),
             Term::Compare { column: c, operator: Operator::Gt | Operator::Gte }
-                if c.eq_ignore_ascii_case(column)
+                if eq_names(c, column)
         )
     });
     Some(match keyed && ascending && !offset && bounds {

@@ -20,7 +20,6 @@
 use crate::common::{CompactArc, I64Map, SmartString, StringMap};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
-use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 
@@ -28,18 +27,7 @@ use std::path::Path;
 
 use crate::common::time_compat::Instant;
 
-/// Returns lowercase version of string, avoiding allocation if already lowercase.
-/// This is a hot-path optimization - most table names are already lowercase.
-#[inline]
-fn to_lowercase_cow(s: &str) -> Cow<'_, str> {
-    // Fast path: check if all bytes are already lowercase ASCII
-    // This avoids allocation for the common case
-    if s.bytes().all(|b| !b.is_ascii_uppercase()) {
-        Cow::Borrowed(s)
-    } else {
-        Cow::Owned(s.to_lowercase())
-    }
-}
+use crate::common::names::to_lowercase_cow;
 
 use super::file_lock::FileLock;
 

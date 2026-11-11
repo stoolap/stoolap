@@ -31,6 +31,7 @@ use ahash::AHashMap;
 pub static GLOBAL_EVICTION_EPOCH: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+use crate::common::names::eq_names;
 use crate::common::SmartString;
 use crate::core::{DataType, Error, Result, Row, Schema, Value};
 
@@ -4022,10 +4023,7 @@ impl ColumnMapping {
         if self.names.is_empty() {
             return volume.column_index(name);
         }
-        let position = self
-            .names
-            .iter()
-            .position(|n| n.as_str().eq_ignore_ascii_case(name))?;
+        let position = self.names.iter().position(|n| eq_names(n.as_str(), name))?;
         match self.sources.get(position)? {
             ColSource::Volume(v) => Some(*v),
             ColSource::Default(_) => None,
@@ -4098,8 +4096,8 @@ fn source_before_changes<'a>(
     let mut name = name_now;
     for (_, _, event) in events {
         match event {
-            SchemaEvent::Renamed { old, new } if new.eq_ignore_ascii_case(name) => name = old,
-            SchemaEvent::Dropped(dropped) if dropped.eq_ignore_ascii_case(name) => return None,
+            SchemaEvent::Renamed { old, new } if eq_names(new, name) => name = old,
+            SchemaEvent::Dropped(dropped) if eq_names(dropped, name) => return None,
             _ => {}
         }
     }
@@ -4221,7 +4219,7 @@ pub fn reading_turns_on_a_drop<'a>(
     let dropped = |name: &str| {
         dropped_columns
             .iter()
-            .any(|(d, _)| d.as_str().eq_ignore_ascii_case(name))
+            .any(|(d, _)| eq_names(d.as_str(), name))
     };
     let events = schema_events_since(volume_schema_version, dropped_columns, column_renames)?;
     schema.columns.iter().find_map(|col| {
@@ -4230,7 +4228,7 @@ pub fn reading_turns_on_a_drop<'a>(
         let mut held = volume.column_index(name).is_some();
         for (_, _, event) in &events {
             if let SchemaEvent::Renamed { old, new } = event {
-                if new.eq_ignore_ascii_case(name) {
+                if eq_names(new, name) {
                     name = old;
                     turns |= dropped(name);
                     held |= volume.column_index(name).is_some();
@@ -4302,7 +4300,7 @@ fn column_mapping(
             .columns
             .iter()
             .zip(volume.meta.column_names.iter())
-            .all(|(col, name)| col.name.eq_ignore_ascii_case(name));
+            .all(|(col, name)| eq_names(&col.name, name));
     let names = if names_match {
         Vec::new()
     } else {

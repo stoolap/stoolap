@@ -15,6 +15,7 @@
 //! A statement that groups one table by one column without WHERE: the one
 //! rule that says where its groups come from, and the run of that source
 
+use crate::common::names::eq_names;
 use crate::core::{Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::{Expression, GroupByModifier, SelectStatement};
 use crate::storage::index::id_list::GroupIds;
@@ -129,7 +130,7 @@ impl Executor {
         let Some(group_index) = schema
             .columns
             .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(&group))
+            .position(|c| eq_names(&c.name, &group))
         else {
             return Ok(None);
         };
@@ -144,7 +145,7 @@ impl Executor {
                 other => other,
             };
             match inner {
-                Expression::Identifier(id) => id.value.eq_ignore_ascii_case(&group),
+                Expression::Identifier(id) => eq_names(&id.value, &group),
                 Expression::FunctionCall(call) => {
                     super::utils::is_aggregate_function(&call.function)
                 }
@@ -154,9 +155,7 @@ impl Executor {
         let plain = stmt.columns.iter().all(group_item);
         // A name outside a call, from HAVING or an ORDER BY alias, which only
         // the walk reads, and only as the group column
-        let grouped_names = non_aggregated
-            .iter()
-            .all(|column| column.eq_ignore_ascii_case(&group));
+        let grouped_names = non_aggregated.iter().all(|column| eq_names(column, &group));
         let source =
             Self::grouped_source(stmt, classification, &aggregations, plain, grouped_names);
         if source == GroupedSource::Hash {

@@ -22,6 +22,8 @@ ROLLBACK TO SAVEPOINT savepoint_name;
 RELEASE SAVEPOINT savepoint_name;
 ```
 
+A savepoint name ignores case like any other name: `ROLLBACK TO SAVEPOINT SP1` finds the savepoint created as `sp1`. See [Names and Case]({% link _docs/sql-features/names.md %}).
+
 ## Basic Example
 
 ```sql

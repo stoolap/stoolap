@@ -311,11 +311,7 @@ fn input_column_index(columns: &[String], qualifier: Option<&str>, name: &str) -
 /// `name` as `eq_folded` takes it: borrowed when ASCII, which it compares
 /// ignoring case, or when lowercasing changes none of its characters
 fn folded(name: &str) -> std::borrow::Cow<'_, str> {
-    let changes = |c: char| {
-        let mut lower = c.to_lowercase();
-        lower.next() != Some(c) || lower.next().is_some()
-    };
-    if !name.is_ascii() && name.chars().any(changes) {
+    if !name.is_ascii() && name.chars().any(crate::common::names::changes_lowercased) {
         std::borrow::Cow::Owned(name.to_lowercase())
     } else {
         std::borrow::Cow::Borrowed(name)
@@ -500,7 +496,7 @@ use super::utils::compute_join_projection;
 use super::utils::{
     add_table_qualifier, bare_name, build_column_index_map, by_qualifier, collect_table_qualifiers,
     collect_unqualified_columns, column_kinds, combine_predicates_with_and, dummy_token, eq_folded,
-    eq_folded_qualified, expression_contains_aggregate, extract_and_conditions,
+    eq_folded_qualified, eq_names, expression_contains_aggregate, extract_and_conditions,
     extract_base_column_name, extract_join_keys_and_residual, flatten_and_predicates,
     flip_operator, for_each_qualified_star_column, get_table_alias_from_expr, index_join_residual,
     infix_to_operator, item_name, needed_columns, order_by_names_an_alias, qualified,
@@ -4574,7 +4570,7 @@ impl Executor {
                     // place of the equality the residual filter leaves out
                     let inner_key_idx = inner_cols
                         .iter()
-                        .position(|c| bare_name(c).eq_ignore_ascii_case(&inner_col));
+                        .position(|c| eq_names(bare_name(c), &inner_col));
                     #[cfg(feature = "test-failpoints")]
                     crate::test_failpoints::join_inner_opened();
                     // The program is held with the plan, by the key equality
@@ -6454,11 +6450,9 @@ impl Executor {
             });
         }
         let schema = table.schema();
-        let is_pk = schema.pk_column_index().is_some_and(|pk| {
-            schema.columns[pk]
-                .name_lower
-                .eq_ignore_ascii_case(inner_key_col)
-        });
+        let is_pk = schema
+            .pk_column_index()
+            .is_some_and(|pk| eq_names(&schema.columns[pk].name_lower, inner_key_col));
         let holds = match strategy {
             IndexLookupStrategy::PrimaryKey => is_pk,
             // The same object: a recreated index shares no pointer with it
@@ -6995,7 +6989,7 @@ impl Executor {
         // rows the index held for the key, not the rows' keys now
         let inner_key_idx = inner_cols
             .iter()
-            .position(|c| bare_name(c).eq_ignore_ascii_case(&inner_key_col));
+            .position(|c| eq_names(bare_name(c), &inner_key_col));
         let outer_len = outer_cols.len();
         let mut all_columns = outer_cols;
         all_columns.extend(inner_cols.iter().cloned());
@@ -7489,22 +7483,19 @@ impl Executor {
         }
 
         // OPTIMIZATION: For fast path check, use linear search to avoid HashMap allocation.
-        // Linear search with eq_ignore_ascii_case is faster than HashMap for small N
+        // Linear search with eq_names is faster than HashMap for small N
         // due to cache locality and zero allocation overhead.
         // HashMap will be built lazily only if we need project_rows_optimized.
 
         // Helper function for column lookup using linear search
         let find_column_index = |name: &str, columns: &[String]| -> Option<usize> {
             // Linear search with case-insensitive comparison
-            columns
-                .iter()
-                .position(|c| c.eq_ignore_ascii_case(name))
-                .or_else(|| {
-                    // Try unqualified match for qualified column names
-                    columns.iter().position(|c| {
-                        split_qualified(c).is_some_and(|(_, bare)| bare.eq_ignore_ascii_case(name))
-                    })
-                })
+            columns.iter().position(|c| eq_names(c, name)).or_else(|| {
+                // Try unqualified match for qualified column names
+                columns
+                    .iter()
+                    .position(|c| split_qualified(c).is_some_and(|(_, bare)| eq_names(bare, name)))
+            })
         };
         let find_qualified = |qid: &QualifiedIdentifier| {
             input_column_index(
@@ -8582,7 +8573,7 @@ impl Executor {
                         Expression::Identifier(id) => &id.value_lower,
                         _ => return None,
                     };
-                    columns.iter().position(|c| c.eq_ignore_ascii_case(name))
+                    columns.iter().position(|c| eq_names(c, name))
                 }
             }
         };
@@ -9670,10 +9661,10 @@ impl Executor {
                     // Join columns are qualified (e.g., "t1.time"), but aliases are
                     // unqualified (e.g., "time"), so we must also compare against
                     // the part after the dot.
-                    if base_cols.iter().any(|c| {
-                        c.eq_ignore_ascii_case(&alias_name)
-                            || bare_name(c).eq_ignore_ascii_case(&alias_name)
-                    }) {
+                    if base_cols
+                        .iter()
+                        .any(|c| eq_names(c, &alias_name) || eq_names(bare_name(c), &alias_name))
+                    {
                         continue;
                     }
                 }

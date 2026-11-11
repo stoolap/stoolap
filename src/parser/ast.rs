@@ -1850,7 +1850,7 @@ impl WindowExpression {
         let name = self.window_ref.as_deref()?;
         defs.iter()
             .enumerate()
-            .find(|(_, def)| def.name.eq_ignore_ascii_case(name))
+            .find(|(_, def)| crate::common::names::eq_names(&def.name, name))
     }
 
     /// The offsets of the frame's bounds

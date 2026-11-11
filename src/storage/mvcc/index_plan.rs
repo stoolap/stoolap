@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use smallvec::SmallVec;
 
+use crate::common::names::eq_names;
 use crate::core::{DataType, IndexType, Operator, Schema};
 use crate::storage::expression::{BetweenExpr, Expression, InListExpr};
 use crate::storage::traits::Index;
@@ -267,7 +268,7 @@ pub fn decide<T: IndexTerm + ?Sized>(
     } = where_.term(schema)
     {
         let pk = schema.pk_column_index().map(|at| &schema.columns[at].name);
-        if pk.is_some_and(|pk| pk.eq_ignore_ascii_case(column)) {
+        if pk.is_some_and(|pk| eq_names(pk, column)) {
             return Some(IndexPlan::Key);
         }
     }
@@ -300,13 +301,10 @@ fn decide_scope<T: IndexTerm + ?Sized>(
             }
             Term::And | Term::Other => continue,
         };
-        if operator == Some(Operator::Eq) && pk.is_some_and(|pk| pk.eq_ignore_ascii_case(column)) {
+        if operator == Some(Operator::Eq) && pk.is_some_and(|pk| eq_names(pk, column)) {
             return Some(IndexPlan::Key);
         }
-        let at = match asked
-            .iter()
-            .position(|a| a.column.eq_ignore_ascii_case(column))
-        {
+        let at = match asked.iter().position(|a| eq_names(a.column, column)) {
             Some(at) => at,
             None => {
                 asked.push(Asked {
@@ -333,7 +331,7 @@ fn decide_scope<T: IndexTerm + ?Sized>(
     }
     if asked
         .iter()
-        .any(|a| a.listed && pk.is_some_and(|pk| pk.eq_ignore_ascii_case(a.column)))
+        .any(|a| a.listed && pk.is_some_and(|pk| eq_names(pk, a.column)))
     {
         return Some(IndexPlan::Keys);
     }
@@ -346,7 +344,7 @@ fn decide_scope<T: IndexTerm + ?Sized>(
         &index.column_names()[..equal + *ranged as usize]
     });
     for a in &asked {
-        if covered.iter().any(|c| c.eq_ignore_ascii_case(a.column)) {
+        if covered.iter().any(|c| eq_names(c, a.column)) {
             continue;
         }
         let Some(index) = store.get_index_by_column(a.column) else {
@@ -423,9 +421,9 @@ pub fn excludes_null<T: IndexTerm + ?Sized>(where_: &T, schema: &Schema, column:
         Term::Compare {
             column: c,
             operator,
-        } => operator != Operator::IsNull && c.eq_ignore_ascii_case(column),
+        } => operator != Operator::IsNull && eq_names(c, column),
         Term::Between { column: c } | Term::In { column: c } | Term::LikePrefix { column: c } => {
-            c.eq_ignore_ascii_case(column)
+            eq_names(c, column)
         }
         Term::And | Term::Or | Term::Other => false,
     })
@@ -460,12 +458,12 @@ pub fn top_k_walk<T: IndexTerm + ?Sized>(
         .flatten()
         .filter(|(index, matched)| index.column_names().len() > *matched);
     if let Some((index, equal)) = prefix {
-        if !index.column_names()[equal].eq_ignore_ascii_case(column) {
+        if !eq_names(&index.column_names()[equal], column) {
             return None;
         }
         let ranged = compares
             .iter()
-            .any(|(name, operator)| name.eq_ignore_ascii_case(column) && *operator != Operator::Eq);
+            .any(|(name, operator)| eq_names(name, column) && *operator != Operator::Eq);
         return Some(IndexPlan::Prefix {
             index,
             equal,
@@ -473,7 +471,7 @@ pub fn top_k_walk<T: IndexTerm + ?Sized>(
         });
     }
     let bounded = compares.iter().all(|(name, operator)| {
-        name.eq_ignore_ascii_case(column)
+        eq_names(name, column)
             && matches!(
                 operator,
                 Operator::Gt | Operator::Gte | Operator::Lt | Operator::Lte
@@ -504,6 +502,6 @@ fn composite(
     let ranged = matched + 1 == columns.len()
         && asked
             .iter()
-            .any(|a| a.upper && a.column.eq_ignore_ascii_case(&columns[matched]));
+            .any(|a| a.upper && eq_names(a.column, &columns[matched]));
     (matched + ranged as usize >= least).then_some((index, (matched, ranged)))
 }
