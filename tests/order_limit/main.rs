@@ -23,6 +23,7 @@ mod order_by_alias_binding_test;
 mod order_by_hidden_column_test;
 mod order_by_hidden_derived_column_test;
 mod order_by_keys_bridge_test;
+mod order_by_merged_key_test;
 mod order_by_position_test;
 mod order_by_subquery_test;
 mod order_limit_path_equivalence_test;
