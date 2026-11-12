@@ -2362,6 +2362,67 @@ impl Reader {
         Ok(())
     }
 
+    /// Hands `each` every key with a position `shown` holds, in key order,
+    /// and returns how many positions `shown` holds
+    pub fn each_shown_key(
+        &self,
+        shown: impl Fn(u32) -> bool,
+        mut each: impl FnMut(i64),
+    ) -> std::io::Result<u64> {
+        let col = column_of(self)?;
+        let (mut keys, mut ends) = (Vec::new(), Vec::new());
+        let mut count = 0u64;
+        for (number, meta) in col.key_pages.iter().enumerate() {
+            self.with_page(PageKind::Keys, number, |content| match content {
+                PageContent::Keys { keys: k, ends: e } => {
+                    keys.clear();
+                    keys.extend_from_slice(k);
+                    ends.clear();
+                    ends.extend_from_slice(e);
+                    Ok(())
+                }
+                _ => Err(invalid("expected a key page")),
+            })??;
+            let (mut i, mut at, mut held) = (0, meta.pos_start, false);
+            let end = ends.last().copied().unwrap_or(at);
+            while at < end {
+                let page = col
+                    .pos_pages
+                    .partition_point(|p| p.pos_start <= at)
+                    .checked_sub(1)
+                    .ok_or_else(|| invalid("a key starts before its positions"))?;
+                let first = col.pos_pages[page].pos_start;
+                let stop = col
+                    .pos_pages
+                    .get(page + 1)
+                    .map_or(col.n_positions, |p| p.pos_start)
+                    .min(end);
+                self.with_page(PageKind::Positions, page, |content| {
+                    let PageContent::Positions(positions) = content else {
+                        return Err(invalid("expected a position page"));
+                    };
+                    while at < stop {
+                        let until = ends[i].min(stop);
+                        let span = (at - first) as usize..(until - first) as usize;
+                        let Some(span) = positions.get(span) else {
+                            return Err(invalid("position page shorter than its keys"));
+                        };
+                        let n = span.iter().filter(|&&p| shown(p)).count() as u64;
+                        (count, held, at) = (count + n, held || n > 0, until);
+                        if at == ends[i] {
+                            if std::mem::take(&mut held) {
+                                each(keys[i]);
+                            }
+                            i += 1;
+                        }
+                    }
+                    Ok(())
+                })??;
+            }
+        }
+        Ok(count)
+    }
+
     /// The upper bound the directory alone gives on the positions of keys
     /// in `[low, high]`, without reading a page
     pub fn candidate_bound(&self, low: i64, high: i64) -> std::io::Result<u64> {

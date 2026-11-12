@@ -351,3 +351,41 @@ fn a_sealed_numeric_distinct_that_hides_no_row_reads_no_block() {
         assert_eq!(read, 0, "the side files' keys answer DISTINCT {c}");
     }
 }
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_sealed_numeric_distinct_that_hides_rows_reads_no_block() {
+    use stoolap::test_failpoints::block_file_reads;
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!(
+        "file://{}?checkpoint_on_close=off&checkpoint_interval=0&compact_threshold=100",
+        dir.path().display()
+    );
+    let mut model = {
+        let (db, model) = sealed(dir.path());
+        db.close().unwrap();
+        model
+    };
+    let db = Database::open(&dsn).unwrap();
+    // Every NULL of i and every row of key 17 goes; one row in 50 moves to the hot store
+    db.execute(
+        "DELETE FROM w WHERE i IS NULL OR (id * 7919) % 300 = 17",
+        (),
+    )
+    .unwrap();
+    db.execute("UPDATE w SET u = u + 1 WHERE id % 50 = 1", ())
+        .unwrap();
+    model.retain(|r| r.i.is_some() && (r.id * 7919) % 300 != 17);
+    db.engine().cold_volumes_for_test("w");
+    for c in ["i", "ts", "h"] {
+        let before = block_file_reads();
+        let got: BTreeSet<String> = db
+            .query(&format!("SELECT DISTINCT {c} FROM w"), ())
+            .unwrap()
+            .map(|row| render(row.unwrap().get_value(0).unwrap()))
+            .collect();
+        let read = block_file_reads().0 - before.0;
+        assert_eq!(got, model_values(&model, c), "DISTINCT {c}");
+        assert_eq!(read, 0, "the side files' shown keys answer DISTINCT {c}");
+    }
+}
