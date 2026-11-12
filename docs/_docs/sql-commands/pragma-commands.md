@@ -281,6 +281,8 @@ The checkpoint cycle performs these steps in order:
 3. **WAL truncate**: Remove WAL entries before checkpoint LSN (only when all hot data is sealed)
 4. **Compact**: Merge sub-target, oversized, and tombstoned volumes into target-sized outputs
 
+If a manifest cannot be written, the other tables' manifests are still written, the WAL is kept whole, no compaction runs, and the command returns the error. Nothing is lost; the next checkpoint writes the manifest again.
+
 The background thread runs this cycle automatically every `checkpoint_interval` seconds. On clean shutdown, a force checkpoint seals ALL remaining hot rows regardless of threshold.
 
 This command is useful for:

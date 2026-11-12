@@ -1780,3 +1780,33 @@ fn a_rollback_restores_a_table_whose_drop_failed_after_it_went() {
     );
     let _ = db.close();
 }
+
+#[test]
+fn a_checkpoint_whose_manifest_write_fails_returns_the_error() {
+    let _guard = failpoint_guard();
+    let dir = tempdir().unwrap();
+    let dsn = format!("file://{}", dir.path().display());
+    let db = Database::open(&dsn).unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)",
+        "INSERT INTO t SELECT value, value FROM generate_series(1, 100)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    test_failpoints::MANIFEST_WRITE_FAIL.store(true, Ordering::Release);
+    let checkpoint = db.execute("PRAGMA CHECKPOINT", ());
+    test_failpoints::MANIFEST_WRITE_FAIL.store(false, Ordering::Release);
+    assert!(
+        checkpoint.is_err(),
+        "a checkpoint that left a manifest unwritten reported success"
+    );
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.close().unwrap();
+    let db = Database::open(&dsn).unwrap();
+    assert_eq!(
+        db.query_one::<i64, _>("SELECT SUM(n) FROM t", ()).unwrap(),
+        5050,
+        "rows after the reopen"
+    );
+    db.close().unwrap();
+}
