@@ -280,6 +280,15 @@ const CASES: &[(&[&str], &str)] = &[
         &["INSERT INTO t VALUES (1, 30, 0), (5, 30, 0) ON DUPLICATE KEY UPDATE u = excluded.u"],
         "ok => 1:30,2:20",
     ),
+    (
+        &[
+            "BEGIN",
+            "INSERT INTO t VALUES (1, -1, -1), (101, -1, 10), (2, -1, -1), (102, -1, 20) \
+             ON DUPLICATE KEY UPDATE u = excluded.w",
+            "COMMIT",
+        ],
+        "ok ok ok => 1:10,2:20",
+    ),
 ];
 
 #[test]

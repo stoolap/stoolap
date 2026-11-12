@@ -7681,20 +7681,18 @@ impl TransactionVersionStore {
             .is_some_and(|t| !t.key_changes.is_empty())
     }
 
-    /// The row other than `except` the transaction sees holding the key
-    /// `values` of `index`, hashed `hash`: a committed row the index finds
-    /// that the transaction left holding it, or one of its own rows
-    pub(crate) fn key_holder(
+    /// A committed row other than `except` the index finds holding the key
+    /// `values` of `index` that the transaction left holding it
+    fn committed_holder(
         &self,
         index: &dyn Index,
         values: &[Value],
-        hash: u64,
         except: i64,
     ) -> Result<Option<i64>, Error> {
         let columns = index.column_ids();
-        let holds = |row_id: i64, committed: bool| match self.get_latest_local(row_id) {
+        let holds = |row_id: i64| match self.get_latest_local(row_id) {
             Some(version) => !version.is_deleted() && key_held(&version.data, columns, values),
-            None => committed,
+            None => true,
         };
         let hnsw = index
             .as_any()
@@ -7703,7 +7701,7 @@ impl TransactionVersionStore {
             (Some(hnsw), [value]) => {
                 let mut passed = crate::common::I64Set::default();
                 while let Some(row_id) = hnsw.find_exact_duplicate(value, except, Some(&passed)) {
-                    if holds(row_id, true) {
+                    if holds(row_id) {
                         return Ok(Some(row_id));
                     }
                     passed.insert(row_id);
@@ -7711,28 +7709,18 @@ impl TransactionVersionStore {
             }
             _ => {
                 for entry in index.find(values)? {
-                    if entry.row_id != except && holds(entry.row_id, true) {
+                    if entry.row_id != except && holds(entry.row_id) {
                         return Ok(Some(entry.row_id));
                     }
                 }
             }
         }
-        let local = (self.tracking.as_deref())
-            .and_then(|t| {
-                t.local_keys
-                    .iter()
-                    .find(|(held, _)| held.as_slice() == columns)
-            })
-            .and_then(|(_, by_hash)| by_hash.get(&hash));
-        Ok(local
-            .into_iter()
-            .flatten()
-            .copied()
-            .find(|&row_id| row_id != except && holds(row_id, false)))
+        Ok(None)
     }
 
-    /// The holder [`Self::key_holder`] finds, or none, `row_id` then entered
-    /// as one of the transaction's own rows holding the key
+    /// The row other than `row_id` the transaction sees holding the key
+    /// `values` of `index`: a committed row it left holding it, or one of
+    /// its own rows; none and `row_id` entered as one of its own rows
     pub(crate) fn claim_key(
         &mut self,
         index: &dyn Index,
@@ -7743,33 +7731,50 @@ impl TransactionVersionStore {
         // all, of an index that came since too
         self.track_keys();
         self.unique_indexes();
-        let hash = key_hash(values);
-        if let Some(holder) = self.key_holder(index, values, hash, row_id)? {
+        if let Some(holder) = self.committed_holder(index, values, row_id)? {
             return Ok(Some(holder));
         }
-        self.enter_key(index.column_ids(), hash, row_id);
-        Ok(None)
+        let hash = key_hash(values);
+        Ok(self.meet_or_enter(index.column_ids(), Some(values), hash, row_id))
     }
 
     /// Enters `row_id` among the rows holding a key of `columns` hashed
-    /// `hash`, dropping those whose latest version holds no key so hashed:
-    /// a rollback to a savepoint enters the rows it gives back again
+    /// `hash`, as a rollback to a savepoint does for the rows it gives back
     fn enter_key(&mut self, columns: &[i32], hash: u64, row_id: i64) {
+        self.meet_or_enter(columns, None, hash, row_id);
+    }
+
+    /// One of the transaction's own rows other than `row_id` holding the
+    /// key `values` of `columns`, hashed `hash`, or none and `row_id`
+    /// entered there; rows whose latest version holds no key so hashed are
+    /// dropped either way, so each stale row is passed once
+    fn meet_or_enter(
+        &mut self,
+        columns: &[i32],
+        values: Option<&[Value]>,
+        hash: u64,
+        row_id: i64,
+    ) -> Option<i64> {
         let local_versions = self.local_versions.as_ref();
-        let Some(tracking) = self.tracking.as_deref_mut() else {
-            return;
+        let tracking = self.tracking.as_deref_mut()?;
+        let latest = |held: i64| {
+            (local_versions.and_then(|all| all.get(held)))
+                .and_then(|versions| versions.last())
+                .filter(|version| !version.is_deleted())
         };
         let rows = key_bucket(&mut tracking.local_keys, columns, hash);
         rows.retain(|held| {
-            let held = *held;
-            held != row_id
-                && (local_versions.and_then(|all| all.get(held)))
-                    .and_then(|versions| versions.last())
-                    .filter(|version| !version.is_deleted())
-                    .and_then(|version| row_key_hash(&version.data, columns))
-                    == Some(hash)
+            latest(*held).and_then(|version| row_key_hash(&version.data, columns)) == Some(hash)
         });
-        rows.push(row_id);
+        let holder = values.and_then(|values| {
+            rows.iter().copied().find(|&held| {
+                held != row_id && latest(held).is_some_and(|v| key_held(&v.data, columns, values))
+            })
+        });
+        if holder.is_none() && !rows.contains(&row_id) {
+            rows.push(row_id);
+        }
+        holder
     }
 
     /// Takes back everything this transaction's commit applied before its
