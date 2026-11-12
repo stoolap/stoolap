@@ -6671,7 +6671,7 @@ impl MVCCEngine {
         // Step 4: Persist manifests (includes tombstones + checkpoint_lsn).
         // checkpoint_lsn is > 0 only when all hot buffers are empty (fully sealed).
         // Track success: WAL truncation is only safe if ALL manifests are durable.
-        let mut all_manifests_persisted = true;
+        let mut manifest_error = None;
         {
             // Collect Arc clones under the read lock, then drop the lock
             // before doing file I/O to avoid blocking writers.
@@ -6695,7 +6695,7 @@ impl MVCCEngine {
                         mgr.table_name(),
                         e
                     );
-                    all_manifests_persisted = false;
+                    manifest_error.get_or_insert(e);
                 }
             }
         }
@@ -6709,7 +6709,7 @@ impl MVCCEngine {
         // checkpoint_lsn > 0 already guarantees all_hot_empty was true inside
         // the fence. Don't re-check the outer all_hot_empty (stale, checked
         // before fence when continuous inserts make it always false).
-        if checkpoint_lsn > 0 && all_manifests_persisted {
+        if checkpoint_lsn > 0 && manifest_error.is_none() {
             if let Some(ref pm) = *self.persistence {
                 if let Err(e) = pm.truncate_wal(checkpoint_lsn) {
                     eprintln!("Warning: Failed to truncate WAL: {}", e);
@@ -6721,7 +6721,8 @@ impl MVCCEngine {
         if let Some(ref pm) = *self.persistence {
             pm.check_wal_writable()?;
         }
-        Ok(())
+        // A manifest left behind keeps the boundary, and the caller learns why
+        manifest_error.map_or(Ok(()), Err)
     }
 
     /// Rewrites every table's volumes that hold a column in another type
