@@ -9824,11 +9824,77 @@ struct EngineOperations {
     holding_keys: AtomicBool,
     /// Whether `creating_txns` has an entry, so an end without one skips its lock
     creating: AtomicBool,
+    /// The next creation `new_creation` hands out; 0 stands for none
+    next_creation: AtomicU64,
 }
 
 // EngineOperations is Send + Sync because all fields are Arc-wrapped thread-safe types
 
 impl EngineOperations {
+    /// Drops the table named `name`; with `creation`, only the table made
+    /// with it, false when the name holds another table now
+    fn drop_table_of(&self, name: &str, creation: Option<u64>) -> Result<bool> {
+        let table_name_lower = name.to_lowercase();
+        // A view taken before the rows go, or while they go, is overtaken
+        let _destruction = self.registry.begin_destruction();
+
+        // Remove schema and clean up FK references in child tables
+        let mut neighbors = {
+            let mut schemas = self.schemas().write().unwrap();
+            if let Some(creation) = creation {
+                let made = self.version_stores().read().unwrap();
+                if made.get(&table_name_lower).map(|s| s.creation()) != Some(creation) {
+                    return Ok(false);
+                }
+            }
+            let Some(removed) = schemas.remove(&table_name_lower) else {
+                return Err(Error::TableNotFound(table_name_lower.to_string()));
+            };
+            let neighbors = fk_neighbors(&schemas, Some(&removed), &table_name_lower);
+            let version_stores = self.version_stores().read().unwrap();
+            strip_fk_references(&mut schemas, &version_stores, &table_name_lower);
+            neighbors
+        };
+        // Close and remove version store
+        {
+            let mut stores = self.version_stores().write().unwrap();
+            if let Some(store) = stores.remove(&table_name_lower) {
+                store.close();
+            }
+        }
+
+        // Record DDL to WAL so the drop survives crash recovery
+        if !self.should_skip_wal() {
+            if let Some(ref pm) = *self.persistence() {
+                if pm.is_enabled() {
+                    pm.record_ddl_operation(name, WALOperationType::DropTable, &[])?;
+                }
+            }
+        }
+
+        // Clear in-memory segment state (prevents phantom rows on re-create)
+        let mgr = self
+            .segment_managers
+            .read()
+            .unwrap()
+            .get(&table_name_lower)
+            .cloned();
+        if let Some(mgr) = &mgr {
+            mgr.clear();
+            mgr.persist()?;
+        }
+        self.segment_managers
+            .write()
+            .unwrap()
+            .remove(&table_name_lower);
+        remove_dropped_table_files(self.persistence(), &table_name_lower, mgr.as_deref())?;
+
+        neighbors.push(table_name_lower);
+        self.ddl
+            .changed(&neighbors.iter().map(String::as_str).collect::<Vec<_>>());
+        Ok(true)
+    }
+
     /// Lets the rows and claims of stores a handle handed out may hold past
     /// the transaction's end go now, once its statements are done
     fn discard_stores(tables: &[TxnTableEntry]) {
@@ -9869,6 +9935,7 @@ impl EngineOperations {
             key_holders: parking_lot::Mutex::new(crate::common::new_i64_map()),
             holding_keys: AtomicBool::new(false),
             creating: AtomicBool::new(false),
+            next_creation: AtomicU64::new(1),
         }
     }
 
@@ -10315,10 +10382,12 @@ impl TransactionEngineOperations for EngineOperations {
         schema: Schema,
         indexes: &[NewIndex],
         txn_id: i64,
+        creation: u64,
     ) -> Result<Box<dyn Table>> {
         let table_name = name.to_lowercase();
 
         let version_store = new_table_store(&schema, &self.registry, indexes)?;
+        version_store.set_creation(creation);
         let schema_data = MVCCEngine::serialize_schema(&schema);
 
         // Atomically check-and-insert under write lock to prevent TOCTOU race
@@ -10355,59 +10424,38 @@ impl TransactionEngineOperations for EngineOperations {
     }
 
     fn drop_table(&self, name: &str) -> Result<()> {
-        let table_name_lower = name.to_lowercase();
-        // A view taken before the rows go, or while they go, is overtaken
-        let _destruction = self.registry.begin_destruction();
+        self.drop_table_of(name, None).map(|_| ())
+    }
 
-        // Remove schema and clean up FK references in child tables
-        let mut neighbors = {
-            let mut schemas = self.schemas().write().unwrap();
-            let Some(removed) = schemas.remove(&table_name_lower) else {
-                return Err(Error::TableNotFound(table_name_lower.to_string()));
-            };
-            let neighbors = fk_neighbors(&schemas, Some(&removed), &table_name_lower);
-            let version_stores = self.version_stores().read().unwrap();
-            strip_fk_references(&mut schemas, &version_stores, &table_name_lower);
-            neighbors
-        };
-        // Close and remove version store
-        {
-            let mut stores = self.version_stores().write().unwrap();
-            if let Some(store) = stores.remove(&table_name_lower) {
-                store.close();
-            }
-        }
+    fn new_creation(&self) -> u64 {
+        self.next_creation.fetch_add(1, Ordering::Relaxed)
+    }
 
-        // Record DDL to WAL so the drop survives crash recovery
-        if !self.should_skip_wal() {
-            if let Some(ref pm) = *self.persistence() {
-                if pm.is_enabled() {
-                    pm.record_ddl_operation(name, WALOperationType::DropTable, &[])?;
-                }
-            }
-        }
-
-        // Clear in-memory segment state (prevents phantom rows on re-create)
-        let mgr = self
-            .segment_managers
+    fn table_creation(&self, name: &str) -> u64 {
+        self.version_stores()
             .read()
             .unwrap()
-            .get(&table_name_lower)
-            .cloned();
-        if let Some(mgr) = &mgr {
-            mgr.clear();
-            mgr.persist()?;
-        }
-        self.segment_managers
-            .write()
-            .unwrap()
-            .remove(&table_name_lower);
-        remove_dropped_table_files(self.persistence(), &table_name_lower, mgr.as_deref())?;
+            .get(&*to_lowercase_cow(name))
+            .map_or(0, |store| store.creation())
+    }
 
-        neighbors.push(table_name_lower);
-        self.ddl
-            .changed(&neighbors.iter().map(String::as_str).collect::<Vec<_>>());
-        Ok(())
+    fn drop_created(&self, creation: u64) -> Result<()> {
+        loop {
+            let name = self
+                .version_stores()
+                .read()
+                .unwrap()
+                .iter()
+                .find(|(_, store)| store.creation() == creation)
+                .map(|(name, _)| name.clone());
+            let Some(name) = name else {
+                return Ok(());
+            };
+            // A rename between the search and the drop searches again
+            if self.drop_table_of(&name, Some(creation))? {
+                return Ok(());
+            }
+        }
     }
 
     fn list_tables(&self) -> Result<Vec<String>> {

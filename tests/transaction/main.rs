@@ -48,6 +48,7 @@ mod statement_view_reads_test;
 mod statement_view_shortcuts_test;
 mod statement_view_test;
 mod streamed_view_read_test;
+mod table_undo_identity_test;
 mod transaction_id_everywhere_test;
 mod transaction_index_residual_test;
 mod transaction_lifetime_test;

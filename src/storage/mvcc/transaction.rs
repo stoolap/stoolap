@@ -34,13 +34,14 @@ use crate::storage::Expression;
 /// A table change of the transaction; the changes are undone in reverse order
 #[derive(Debug, Clone)]
 enum TableChange {
-    Created(String),
-    /// A dropped table's name and schema, and whether this transaction
-    /// created it, so a restore is logged with the creating record
+    /// The creation of a table, found by it whatever its name
+    Created(u64),
+    /// A dropped table's name and schema, and its creation when this
+    /// transaction created it, so a restore is logged with the creating record
     Dropped {
         name: String,
         schema: Box<Schema>,
-        created_here: bool,
+        created_here: Option<u64>,
     },
 }
 
@@ -128,17 +129,28 @@ pub trait TransactionEngineOperations: Send + Sync {
 
     /// Create a new table with `indexes`, reachable only once they are built,
     /// its WAL record committed with transaction `txn_id` or, under
-    /// DDL_TXN_ID, on its own
+    /// DDL_TXN_ID, on its own; `creation` is the table's creation, 0 for none
     fn create_table(
         &self,
         name: &str,
         schema: Schema,
         indexes: &[NewIndex],
         txn_id: i64,
+        creation: u64,
     ) -> Result<Box<dyn Table>>;
 
     /// Drop a table
     fn drop_table(&self, name: &str) -> Result<()>;
+
+    /// A creation no table has yet, for a table a transaction creates
+    fn new_creation(&self) -> u64;
+
+    /// The creation of the table named `name`, 0 for none or no table
+    fn table_creation(&self, name: &str) -> u64;
+
+    /// Drops the table made with `creation`, under whatever name it has
+    /// now; none left is not an error
+    fn drop_created(&self, creation: u64) -> Result<()>;
 
     /// List all tables
     fn list_tables(&self) -> Result<Vec<String>>;
@@ -458,14 +470,17 @@ impl MvccTransaction {
         let mut first_error = None;
         for change in changes.iter().rev() {
             let undone = match change {
-                TableChange::Created(name) => ops.drop_table(name),
+                TableChange::Created(creation) => ops.drop_created(*creation),
                 TableChange::Dropped {
                     name,
                     schema,
                     created_here,
                 } => {
-                    let logged_as = if *created_here { txn_id } else { DDL_TXN_ID };
-                    ops.create_table(name, Schema::clone(schema), &[], logged_as)
+                    let (logged_as, creation) = match created_here {
+                        Some(creation) => (txn_id, *creation),
+                        None => (DDL_TXN_ID, 0),
+                    };
+                    ops.create_table(name, Schema::clone(schema), &[], logged_as, creation)
                         .map(|_| ())
                 }
             };
@@ -838,11 +853,9 @@ impl Transaction for MvccTransaction {
         super::engine::check_new_table(&schema)?;
 
         let ops = self.get_engine_ops()?;
-        let table = ops.create_table(name, schema, indexes, self.id)?;
-
-        // Track for rollback - store the table name
-        self.table_changes
-            .push(TableChange::Created(name.to_lowercase()));
+        let creation = ops.new_creation();
+        let table = ops.create_table(name, schema, indexes, self.id, creation)?;
+        self.table_changes.push(TableChange::Created(creation));
 
         Ok(table)
     }
@@ -869,6 +882,7 @@ impl Transaction for MvccTransaction {
         };
 
         let ops = self.get_engine_ops()?;
+        let creation = ops.table_creation(name);
         let dropped = ops.drop_table(name);
         let name_lower = name.to_lowercase();
         // A drop that fails after the catalog lets go of the table still dropped it
@@ -884,12 +898,8 @@ impl Transaction for MvccTransaction {
         let created_here = self
             .table_changes
             .iter()
-            .rev()
-            .find_map(|change| match change {
-                TableChange::Created(created) => (*created == name_lower).then_some(true),
-                TableChange::Dropped { name, .. } => (*name == name_lower).then_some(false),
-            })
-            == Some(true);
+            .any(|change| matches!(change, TableChange::Created(c) if *c == creation && creation != 0))
+            .then_some(creation);
         self.table_changes.push(TableChange::Dropped {
             name: name_lower,
             schema: Box::new(schema),

@@ -143,3 +143,42 @@ fn a_failed_commit_brings_back_the_table_it_dropped() {
     assert!(exists(&db, "x"), "x was gone after a crash");
     db.close().unwrap();
 }
+
+#[test]
+fn a_failed_commit_leaves_a_table_that_took_its_tables_old_name() {
+    let _guard = FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let image = tempfile::tempdir().unwrap();
+    let db = Database::open(&dsn(dir.path())).unwrap();
+    let other = db.clone();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 7)", ()).unwrap();
+    db.execute("BEGIN", ()).unwrap();
+    db.execute("CREATE TABLE n (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("ALTER TABLE n RENAME TO m", ()).unwrap();
+    other
+        .execute("CREATE TABLE n (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    other.execute("INSERT INTO n VALUES (1)", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (2, 8)", ()).unwrap();
+    assert!(commit_refused_by_a_change(&db).is_err());
+    let rows = |db: &Database, table: &str| {
+        db.query_one::<i64, _>(&format!("SELECT COUNT(*) FROM {table}"), ())
+            .ok()
+    };
+    assert_eq!(rows(&other, "n"), Some(1), "the other session's n went");
+    assert!(!exists(&other, "m"), "m stayed");
+    crash_image(dir.path(), image.path());
+    drop(other);
+    drop(db);
+    let db = Database::open(&dsn(image.path())).unwrap();
+    assert_eq!(
+        rows(&db, "n"),
+        Some(1),
+        "the other session's n went after a crash"
+    );
+    assert!(!exists(&db, "m"), "m came back");
+    db.close().unwrap();
+}
