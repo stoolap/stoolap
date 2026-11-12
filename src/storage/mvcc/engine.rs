@@ -9543,6 +9543,25 @@ impl MVCCEngine {
         store.check_token(token)?;
         Ok(Some(result))
     }
+
+    /// The table `name` read as `view` sees it, by a reader that writes
+    /// nothing and so needs no transaction of its own
+    pub(crate) fn read_table_in_view(
+        &self,
+        name: &str,
+        view: &crate::storage::mvcc::registry::StatementView,
+    ) -> Result<Box<dyn Table>> {
+        if !self.is_open() {
+            return Err(Error::EngineNotOpen);
+        }
+        self.operations().get_table_for_transaction(
+            INVALID_TRANSACTION_ID + 1,
+            name,
+            None,
+            Some(view.clone()),
+            TableUse::Read,
+        )
+    }
 }
 
 // =============================================================================

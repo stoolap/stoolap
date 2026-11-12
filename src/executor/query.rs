@@ -6478,12 +6478,7 @@ impl Executor {
         } else {
             isolation
         };
-        let transaction = self.engine.begin_transaction_with_level(isolation)?;
-        Ok(StatementSnapshot::for_reads(
-            transaction,
-            isolation,
-            view.cloned(),
-        ))
+        StatementSnapshot::for_reads(&self.engine, isolation, view.cloned())
     }
 
     /// The aggregation and window functions of `stmt` over a source's rows,
