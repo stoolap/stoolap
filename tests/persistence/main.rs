@@ -14,6 +14,7 @@
 
 //! Durability: the WAL, snapshots, recovery and reopening a database
 
+mod auto_increment_reopen_test;
 mod bug_manifest_version_fail_closed_test;
 mod bug_unique_lost_after_reopen_test;
 mod checkpoint_catalog_copy_test;
