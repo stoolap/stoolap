@@ -102,6 +102,33 @@ fn an_upsert_changing_a_and_b_on_two_rows_carries_a_s_change() {
 }
 
 #[test]
+fn a_value_the_statement_wrote_into_a_key_column_is_not_moved_by_a_cascade() {
+    let db = Database::open("memory://fk_into_changed_column_written").unwrap();
+    for sql in [
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, a INTEGER UNIQUE, \
+         b INTEGER UNIQUE REFERENCES s(a) ON UPDATE CASCADE, c INTEGER REFERENCES s(b) ON UPDATE CASCADE)",
+        "INSERT INTO s VALUES (1, 3, 1, NULL), (2, 1, NULL, 1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    for sql in [
+        "INSERT INTO s VALUES (1, 5, 3, NULL) ON CONFLICT (id) DO UPDATE SET a = excluded.a, b = excluded.b",
+        "UPDATE s SET a = 5, b = 3 WHERE id = 1",
+    ] {
+        let error = db.execute(sql, ()).unwrap_err().to_string();
+        assert!(
+            error.contains("a = 3 does not exist"),
+            "{sql}: row 1's new b = 3 names an a the statement changed: {error}"
+        );
+        assert_eq!(
+            rows(&db, "s"),
+            [[Some(1), Some(3), Some(1), None], [Some(2), Some(1), None, Some(1)]],
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn a_cascade_round_a_cycle_of_keys_ends_where_it_reaches_no_row() {
     let db = Database::open("memory://fk_into_changed_column_cycles").unwrap();
     for sql in [

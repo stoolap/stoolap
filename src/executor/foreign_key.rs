@@ -33,6 +33,7 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 
 use crate::common::{I64Map, I64Set};
 use crate::core::{Error, ForeignKeyAction, ForeignKeyConstraint, Result, Schema, Value};
@@ -1010,6 +1011,9 @@ struct Changed {
     done: bool,
     /// The child table's store and layout `column` was read from
     token: Option<LayoutToken>,
+    /// The root the statement changed this same column in, whose new values
+    /// are rows the statement wrote and no key reaches
+    shadows: Option<usize>,
 }
 
 /// What one start value of a column becomes
@@ -1071,6 +1075,7 @@ impl Changed {
             waiting: 0,
             done: false,
             token: None,
+            shadows: None,
         }
     }
 
@@ -1191,7 +1196,11 @@ fn find_update_actions(
                     {
                         Some(at) => roots + at,
                         None => {
-                            columns.push(Changed::new(child_table, child_column));
+                            let mut into = Changed::new(child_table, child_column);
+                            into.shadows = columns[..roots]
+                                .iter()
+                                .position(|c| c.column == child_column && c.table == *child_table);
+                            columns.push(into);
                             columns.len() - 1
                         }
                     };
@@ -1219,8 +1228,9 @@ fn find_update_actions(
 /// before the column, every key but one leading back round a cycle; such a
 /// key is not waited for, and reaching a row through it is refused
 fn count_waits(actions: &mut [UpdateAction], columns: &mut [Changed], roots: usize) {
-    // Columns are found in order, so each one's keys are one run of `actions`
-    let mut first = vec![actions.len(); columns.len() + 1];
+    // Columns are found in order, so each one's keys are one run of
+    // `actions`; a graph of a few columns walks without the heap
+    let mut first: SmallVec<[usize; 8]> = smallvec::smallvec![actions.len(); columns.len() + 1];
     for (at, action) in actions.iter().enumerate().rev() {
         first[action.from] = at;
     }
@@ -1230,8 +1240,8 @@ fn count_waits(actions: &mut [UpdateAction], columns: &mut [Changed], roots: usi
     const NEW: u8 = 0;
     const OPEN: u8 = 1;
     const DONE: u8 = 2;
-    let mut state = vec![NEW; columns.len()];
-    let mut walk: Vec<(usize, usize)> = Vec::new();
+    let mut state: SmallVec<[u8; 8]> = smallvec::smallvec![NEW; columns.len()];
+    let mut walk: SmallVec<[(usize, usize); 8]> = SmallVec::new();
     for root in 0..roots {
         state[root] = OPEN;
         walk.push((root, first[root]));
@@ -1328,7 +1338,11 @@ fn run_update_action(
     let set_null = fk.on_update == ForeignKeyAction::SetNull;
     let mut reached = false;
     for (old_value, new_value) in &changes {
-        if !child_rows_exist(engine, txn_id, child_table, fk, old_value)? {
+        // A row holding a value the statement wrote into the column is that write
+        let written = columns[to].shadows.is_some_and(|root| {
+            (columns[root].values.iter()).any(|written| same_value(&written.new, old_value))
+        });
+        if written || !child_rows_exist(engine, txn_id, child_table, fk, old_value)? {
             continue;
         }
         check_children_seen(engine, txn_id, child_table, fk, old_value)?;
