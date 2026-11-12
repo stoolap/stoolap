@@ -78,6 +78,8 @@ fn after_the_view(db: &Database, sqls: &'static [&'static str]) -> Rc<Cell<bool>
 }
 
 fn ids(db: &Database, sql: &str) -> Vec<i64> {
+    // The reads here are the scan path's under a view; a key read takes none
+    fp::plan_without_key_reads();
     let mut out: Vec<i64> = db
         .query(sql, ())
         .unwrap()

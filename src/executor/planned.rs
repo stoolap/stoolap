@@ -30,13 +30,19 @@ use crate::storage::traits::{Engine, QueryResult};
 
 use super::context::ExecutionContext;
 use super::expression::{ExecuteContext, ExprVM};
-use super::prepared_select::{first_branch_of, prepared_branch, KeyReadPath, PreparedSelect};
+use super::prepared_select::{
+    first_branch_of, prepared_branch, KeyReadBy, KeyReadPath, PreparedSelect,
+};
 use super::query_cache::{check_compiled_token, or_normal_path, CompiledExecution};
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::ExecutorResult;
 use super::row_count::static_row_counts;
 use super::utils::where_without_aggregates;
 use super::Executor;
+
+/// The most rows a non-unique index key read takes; past them the work per
+/// row outweighs the statement setup the read saves
+const INDEX_GET_ROWS: usize = 256;
 
 impl Executor {
     /// `run` over the plan `compiled` holds for `stmt` when it reads a key,
@@ -209,6 +215,7 @@ impl Executor {
                 (table.clone(), &store),
                 (schema, token),
                 (counts.offset, counts.limit),
+                !stmt.order_by.is_empty() || !stmt.distinct_on.is_empty(),
             );
         }
         prepared.quiet = quiet;
@@ -421,9 +428,9 @@ impl Executor {
     ) -> Option<Result<Box<dyn QueryResult>>> {
         // Read through the statement, and `read_planned` inlined: a key read
         // borrowed as an argument has its fields loaded ahead of every row
-        let (plan, unique) = planned.key_read()?;
-        let rows = match unique {
-            false => {
+        let (plan, by) = planned.key_read()?;
+        let rows = match by {
+            KeyReadBy::Pk => {
                 let key = plan.key.integer(params)?;
                 let needed = plan.needed.as_deref();
                 self.fetch_pk_row(
@@ -436,13 +443,17 @@ impl Executor {
                     needed,
                 )
             }
-            true => self
+            KeyReadBy::Unique => self
                 .fetch_unique_row(plan, params, in_txn, view)
                 .transpose()?,
+            KeyReadBy::Index => self
+                .fetch_index_rows(plan, params, in_txn, view)
+                .transpose()?,
         };
-        match unique {
-            false => KeyReadPath::PkGet.taken(),
-            true => KeyReadPath::UniqueGet.taken(),
+        match by {
+            KeyReadBy::Pk => KeyReadPath::PkGet.taken(),
+            KeyReadBy::Unique => KeyReadPath::UniqueGet.taken(),
+            KeyReadBy::Index => KeyReadPath::IndexGet.taken(),
         }
         or_normal_path(rows.and_then(|rows| self.read_planned(plan, rows, params, transaction)))
     }
@@ -484,6 +495,43 @@ impl Executor {
         Ok(rows)
     }
 
+    /// The rows `plan`'s non-unique index holds for its key's value, read as
+    /// the latest committed state; None outside an autocommit read committed
+    /// statement without a view, or when the index or the read declines
+    #[inline(never)]
+    fn fetch_index_rows(
+        &self,
+        plan: &KeyRead,
+        params: &[Value],
+        in_txn: bool,
+        view: Option<&StatementView>,
+    ) -> Result<Option<KeyRows>> {
+        if in_txn
+            || view.is_some()
+            || self.isolation_level() != crate::core::IsolationLevel::ReadCommitted
+        {
+            return Ok(None);
+        }
+        let Some(value) = plan.key.value(params).filter(|value| !value.is_null()) else {
+            return Ok(None);
+        };
+        let Some(store) = plan.store.upgrade().filter(|store| !store.is_closed()) else {
+            return Ok(None);
+        };
+        let rows = self.engine.fetch_latest_equal_in(
+            &plan.table,
+            &store,
+            (plan.key.column(), &value),
+            INDEX_GET_ROWS,
+            plan.token,
+        )?;
+        #[cfg(feature = "test-failpoints")]
+        if rows.is_some() {
+            crate::test_failpoints::note_read("exec.index_get");
+        }
+        Ok(rows.map(KeyRows::Many))
+    }
+
     #[inline(always)]
     fn read_planned(
         &self,
@@ -493,7 +541,10 @@ impl Executor {
         transaction: Option<u64>,
     ) -> Result<Box<dyn QueryResult>> {
         let mut vm: Option<ExprVM> = None;
-        let mut out = RowVec::with_capacity(1);
+        let mut out = RowVec::with_capacity(match &rows {
+            KeyRows::One(..) => 1,
+            KeyRows::Many(rows) => rows.len(),
+        });
         let mut passed = 0;
         for (id, row) in rows {
             let row = normalize_row_to_schema(row, &plan.schema);

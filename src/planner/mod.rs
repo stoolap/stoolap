@@ -80,6 +80,9 @@ pub enum Read {
     /// The row a unique index of one column holds for its equality, asked
     /// the whole WHERE
     UniqueGet(KeyRead),
+    /// The rows a non-unique index of one column holds for its equality,
+    /// asked the whole WHERE, for a statement that keeps no order
+    IndexGet(KeyRead),
     /// A scan, through the indexes the choice reads
     Scan(Option<ScanChoice>),
     /// The rows in ORDER BY order. When the table declines the read, its
@@ -166,7 +169,7 @@ impl Read {
     /// read; None for a scan the table chooses
     pub fn scan(&self) -> Option<&ScanChoice> {
         match self {
-            Self::PkGet(key) | Self::UniqueGet(key) => key.otherwise.scan(),
+            Self::PkGet(key) | Self::UniqueGet(key) | Self::IndexGet(key) => key.otherwise.scan(),
             Self::DistinctValues { otherwise, .. }
             | Self::Window { otherwise, .. }
             | Self::Aggregated { otherwise, .. }
@@ -194,7 +197,9 @@ impl Read {
     pub fn ordered(&self) -> Option<OrderedRead> {
         match self {
             Self::Ordered { read, .. } => Some(*read),
-            Self::PkGet(key) | Self::UniqueGet(key) => key.otherwise.ordered(),
+            Self::PkGet(key) | Self::UniqueGet(key) | Self::IndexGet(key) => {
+                key.otherwise.ordered()
+            }
             Self::DistinctValues { otherwise, .. } => otherwise.ordered(),
             _ => None,
         }
@@ -377,6 +382,15 @@ fn read_lines(read: &Read, text: &PlanText<'_>, lines: &mut Vec<String>) {
                 alternative(
                     lines,
                     format!("UniqueGet {} {}", text.table, key.key.describe()),
+                );
+            }
+            read_lines(&key.otherwise, text, lines);
+        }
+        (Read::IndexGet(key), _) => {
+            if text.keyed {
+                alternative(
+                    lines,
+                    format!("IndexGet {} {}", text.table, key.key.describe()),
                 );
             }
             read_lines(&key.otherwise, text, lines);

@@ -4348,7 +4348,7 @@ impl PreparedSelect {
             plan.read.scan().is_some()
                 || matches!(
                     plan.read,
-                    Read::Source(_) | Read::PkGet(_) | Read::UniqueGet(_)
+                    Read::Source(_) | Read::PkGet(_) | Read::UniqueGet(_) | Read::IndexGet(_)
                 )
         })?;
         // A source's rows are each judged by the whole WHERE
@@ -4433,36 +4433,51 @@ impl PreparedSelect {
     }
 
     /// Reads the statement's row by its primary key equality, else by an
-    /// equality a unique index of its column alone answers, skipping
-    /// `offset` rows and keeping `limit`, for a statement that asks no block,
-    /// takes no set and computes no sort or DISTINCT ON key; a run whose key
-    /// names no row reads as the plan did
+    /// equality a unique index of its column alone answers, else, for a
+    /// statement that is not `ordered`, the rows a non-unique index of its
+    /// column alone holds; skipping `offset` rows and keeping `limit`, for a
+    /// statement that asks no block, takes no set and computes no sort or
+    /// DISTINCT ON key; a run whose key names no row reads as the plan did
     pub(crate) fn read_by_key(
         &mut self,
         (table, store): (SmartString, &Arc<VersionStore>),
         (schema, token): (CompactArc<Schema>, LayoutToken),
         (offset, limit): (usize, Option<usize>),
+        ordered: bool,
     ) {
         // A key read hands its row back without its row id
         if self.where_.narrowing.is_some() || !self.where_.sets.is_empty() || self.where_.widen {
             return;
         }
+        #[cfg(feature = "test-failpoints")]
+        if crate::test_failpoints::key_reads_off() {
+            return;
+        }
         let Some(items) = self.output_items() else {
             return;
         };
-        // A unique read is asked the whole WHERE, its own equality too
-        let (key, filter, unique) = match self.where_.point.clone() {
-            Some((key, filter)) => (key, filter, false),
-            None => match self
-                .where_
-                .equalities
-                .iter()
-                .find(|key| store.has_unique_index_on(key.index))
-                .filter(|_| !self.asks_blocks())
-            {
-                Some(key) => (key.clone(), Some(self.where_.whole.program.clone()), true),
-                None => return,
-            },
+        // An index read is asked the whole WHERE, its own equality too
+        let (key, filter, by) = match self.where_.point.clone() {
+            Some((key, filter)) => (key, filter, KeyReadBy::Pk),
+            None if self.asks_blocks() => return,
+            None => {
+                let equalities = &self.where_.equalities;
+                let unique = equalities
+                    .iter()
+                    .find(|key| store.has_unique_index_on(key.index))
+                    .map(|key| (key, KeyReadBy::Unique));
+                let indexed = || {
+                    equalities
+                        .iter()
+                        .find(|key| store.index_on(key.index).is_some())
+                        .filter(|_| !ordered)
+                        .map(|key| (key, KeyReadBy::Index))
+                };
+                match unique.or_else(indexed) {
+                    Some((key, by)) => (key.clone(), Some(self.where_.whole.program.clone()), by),
+                    None => return,
+                }
+            }
         };
         let projection = Projection::of(items);
         let mut steps = SmallVec::new();
@@ -4491,9 +4506,10 @@ impl PreparedSelect {
         };
         self.plan = Some(Plan {
             steps,
-            read: match unique {
-                true => Read::UniqueGet(read),
-                false => Read::PkGet(read),
+            read: match by {
+                KeyReadBy::Pk => Read::PkGet(read),
+                KeyReadBy::Unique => Read::UniqueGet(read),
+                KeyReadBy::Index => Read::IndexGet(read),
             },
         });
     }
@@ -4627,11 +4643,12 @@ impl PreparedSelect {
         })
     }
 
-    /// The key read the plan chose, and whether a unique index reads it
-    pub(crate) fn key_read(&self) -> Option<(&KeyRead, bool)> {
+    /// The key read the plan chose, and what reads it
+    pub(crate) fn key_read(&self) -> Option<(&KeyRead, KeyReadBy)> {
         match self.plan.as_ref().map(|plan| &plan.read) {
-            Some(Read::PkGet(read)) => Some((read, false)),
-            Some(Read::UniqueGet(read)) => Some((read, true)),
+            Some(Read::PkGet(read)) => Some((read, KeyReadBy::Pk)),
+            Some(Read::UniqueGet(read)) => Some((read, KeyReadBy::Unique)),
+            Some(Read::IndexGet(read)) => Some((read, KeyReadBy::Index)),
             _ => None,
         }
     }
@@ -5520,6 +5537,15 @@ impl PreparedComparison {
     }
 }
 
+/// What a planned key read reads its rows by
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeyReadBy {
+    Pk,
+    Unique,
+    /// A non-unique index of the key's column alone
+    Index,
+}
+
 /// Every path that reads a statement's rows by the keys or row ids it
 /// names instead of a scan. Each notes, under test-failpoints, that it read
 /// them, for the equivalence test against recorded answers
@@ -5537,6 +5563,8 @@ pub(crate) enum KeyReadPath {
     BlockPointRows,
     /// A subquery block's row read by its primary key equality, as a value
     BlockPointValue,
+    /// A planned statement's rows read by a non-unique index
+    IndexGet,
 }
 
 impl KeyReadPath {
@@ -5549,13 +5577,14 @@ impl KeyReadPath {
 
 #[cfg(any(test, feature = "test-failpoints"))]
 impl KeyReadPath {
-    pub(crate) const ALL: [KeyReadPath; 6] = [
+    pub(crate) const ALL: [KeyReadPath; 7] = [
         KeyReadPath::PkGet,
         KeyReadPath::UniqueGet,
         KeyReadPath::KeyMembers,
         KeyReadPath::RowIds,
         KeyReadPath::BlockPointRows,
         KeyReadPath::BlockPointValue,
+        KeyReadPath::IndexGet,
     ];
 
     pub(crate) const fn name(self) -> &'static str {
@@ -5566,6 +5595,7 @@ impl KeyReadPath {
             KeyReadPath::RowIds => "row_ids",
             KeyReadPath::BlockPointRows => "block_point_rows",
             KeyReadPath::BlockPointValue => "block_point_value",
+            KeyReadPath::IndexGet => "index_get",
         }
     }
 }

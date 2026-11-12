@@ -438,6 +438,8 @@ thread_local! {
     static COLUMN_CHANGE_WAITING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static CHECKPOINT_CUT_TAKEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static CHECKPOINT_MANAGERS_TAKEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static INDEX_GET_IDS_TAKEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static KEY_READS_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static CATALOG_COPIES_TAKEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static RETYPE_OUTPUTS_WRITTEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static RETYPE_MANIFEST_WRITTEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
@@ -703,6 +705,26 @@ pub fn after_checkpoint_managers_taken(hook: impl FnOnce() + 'static) {
 
 pub(crate) fn checkpoint_managers_taken() {
     run_hook(&CHECKPOINT_MANAGERS_TAKEN_HOOK);
+}
+
+/// Run once on this thread when its next index key read took the ids the
+/// index holds for its key, before it reads their rows
+pub fn after_index_get_ids_taken(hook: impl FnOnce() + 'static) {
+    INDEX_GET_IDS_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn index_get_ids_taken() {
+    run_hook(&INDEX_GET_IDS_TAKEN_HOOK);
+}
+
+/// Plan the statements this thread plans from now on without a key read,
+/// for a test of what the scan path does under a statement's view
+pub fn plan_without_key_reads() {
+    KEY_READS_OFF.with(|off| off.set(true));
+}
+
+pub(crate) fn key_reads_off() -> bool {
+    KEY_READS_OFF.with(std::cell::Cell::get)
 }
 
 /// Run once on this thread when its next checkpoint took the catalog it
@@ -3744,6 +3766,8 @@ pub fn reset_all() {
     COLUMN_CHANGE_WAITING_HOOK.with(|slot| *slot.borrow_mut() = None);
     CHECKPOINT_CUT_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     CHECKPOINT_MANAGERS_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
+    INDEX_GET_IDS_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
+    KEY_READS_OFF.with(|off| off.set(false));
     CATALOG_COPIES_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     RETYPE_OUTPUTS_WRITTEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     RETYPE_MANIFEST_WRITTEN_HOOK.with(|slot| *slot.borrow_mut() = None);
