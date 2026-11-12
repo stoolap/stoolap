@@ -5663,8 +5663,7 @@ impl MVCCEngine {
                         };
 
                         if row.len() < schema_cols {
-                            for ci in row.len()..schema_cols {
-                                let col = &schema.columns[ci];
+                            for col in &schema.columns[row.len()..schema_cols] {
                                 if let Some(ref default_val) = col.default_value {
                                     row.push(default_val.clone());
                                 } else {
@@ -8472,8 +8471,7 @@ impl MVCCEngine {
             let schema_cols = schema.columns.len();
             for (_row_id, row) in &mut all_rows {
                 if row.len() < schema_cols {
-                    for i in row.len()..schema_cols {
-                        let col = &schema.columns[i];
+                    for col in &schema.columns[row.len()..schema_cols] {
                         if let Some(ref default_val) = col.default_value {
                             row.push(default_val.clone());
                         } else {
