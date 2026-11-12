@@ -965,7 +965,7 @@ pub(crate) fn enforce_update_actions(
             root
         })
         .collect();
-    let actions = find_update_actions(engine, &mut columns)?;
+    let actions = find_update_actions(engine, &mut columns, roots)?;
     // Each column's actions run once every action into it has
     let mut ready: Vec<usize> = (0..roots).collect();
     while let Some(at) = ready.pop() {
@@ -974,7 +974,7 @@ pub(crate) fn enforce_update_actions(
         }
         for action in actions.iter().filter(|a| a.from == at) {
             run_update_action(engine, txn_id, &mut columns, action, at < roots)?;
-            if let Some(to) = action.to {
+            if let Some(to) = action.to.filter(|_| action.counted) {
                 let into = &mut columns[to];
                 into.waiting -= 1;
                 if into.waiting == 0 && !into.done {
@@ -1037,6 +1037,8 @@ struct UpdateAction {
     to: Option<usize>,
     /// The key's bit in the `into` of its `to`
     bit: usize,
+    /// Whether `to` waits for it: every key but one round a cycle
+    counted: bool,
     child_table: String,
     fk: ForeignKeyConstraint,
 }
@@ -1164,6 +1166,7 @@ fn cascade_depth_exceeded() -> Error {
 fn find_update_actions(
     engine: &MVCCEngine,
     columns: &mut Vec<Changed>,
+    roots: usize,
 ) -> Result<Vec<UpdateAction>> {
     let mut actions = Vec::new();
     let mut next = 0;
@@ -1180,11 +1183,13 @@ fn find_update_actions(
                 ForeignKeyAction::Cascade | ForeignKeyAction::SetNull => {
                     let child_schema = engine.get_table_schema(child_table)?;
                     let child_column = key_position(&child_schema, fk)?;
-                    let at = match columns
+                    // A column the statement changed has its own values: a key
+                    // into it writes a column of its own
+                    let at = match columns[roots..]
                         .iter()
                         .position(|c| c.column == child_column && c.table == *child_table)
                     {
-                        Some(at) => at,
+                        Some(at) => roots + at,
                         None => {
                             columns.push(Changed::new(child_table, child_column));
                             columns.len() - 1
@@ -1192,7 +1197,6 @@ fn find_update_actions(
                     };
                     let into = &mut columns[at];
                     into.into.push(fk.clone());
-                    into.waiting += 1;
                     (Some(at), into.into.len() - 1)
                 }
             };
@@ -1200,13 +1204,60 @@ fn find_update_actions(
                 from: next,
                 to,
                 bit,
+                counted: false,
                 child_table: child_table.clone(),
                 fk: fk.clone(),
             });
         }
         next += 1;
     }
+    count_waits(&mut actions, columns, roots);
     Ok(actions)
+}
+
+/// Makes each column wait for the keys into it a walk from the roots meets
+/// before the column, every key but one leading back round a cycle; such a
+/// key is not waited for, and reaching a row through it is refused
+fn count_waits(actions: &mut [UpdateAction], columns: &mut [Changed], roots: usize) {
+    // Columns are found in order, so each one's keys are one run of `actions`
+    let mut first = vec![actions.len(); columns.len() + 1];
+    for (at, action) in actions.iter().enumerate().rev() {
+        first[action.from] = at;
+    }
+    for column in (0..columns.len()).rev() {
+        first[column] = first[column].min(first[column + 1]);
+    }
+    const NEW: u8 = 0;
+    const OPEN: u8 = 1;
+    const DONE: u8 = 2;
+    let mut state = vec![NEW; columns.len()];
+    let mut walk: Vec<(usize, usize)> = Vec::new();
+    for root in 0..roots {
+        state[root] = OPEN;
+        walk.push((root, first[root]));
+        while let Some((column, at)) = walk.last_mut() {
+            let column = *column;
+            if *at == first[column + 1] {
+                state[column] = DONE;
+                walk.pop();
+                continue;
+            }
+            let action = *at;
+            *at += 1;
+            let Some(to) = actions[action].to else {
+                continue;
+            };
+            if state[to] == OPEN {
+                continue;
+            }
+            actions[action].counted = true;
+            columns[to].waiting += 1;
+            if state[to] == NEW {
+                state[to] = OPEN;
+                walk.push((to, first[to]));
+            }
+        }
+    }
 }
 
 /// Runs `action` over the changed values of its column, recording what each
