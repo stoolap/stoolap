@@ -7746,8 +7746,8 @@ impl TransactionVersionStore {
 
     /// One of the transaction's own rows other than `row_id` holding the
     /// key `values` of `columns`, hashed `hash`, or none and `row_id`
-    /// entered there; rows whose latest version holds no key so hashed are
-    /// dropped either way, so each stale row is passed once
+    /// entered there once; rows whose latest version holds no key so hashed
+    /// are dropped either way, so each stale row is passed once
     fn meet_or_enter(
         &mut self,
         columns: &[i32],
@@ -7763,15 +7763,22 @@ impl TransactionVersionStore {
                 .filter(|version| !version.is_deleted())
         };
         let rows = key_bucket(&mut tracking.local_keys, columns, hash);
+        // Every copy of `row_id` goes, to come back once
+        let mut entered = false;
         rows.retain(|held| {
-            latest(*held).and_then(|version| row_key_hash(&version.data, columns)) == Some(hash)
+            let live = latest(*held).and_then(|version| row_key_hash(&version.data, columns))
+                == Some(hash);
+            if *held == row_id {
+                entered |= live;
+                return false;
+            }
+            live
         });
         let holder = values.and_then(|values| {
-            rows.iter().copied().find(|&held| {
-                held != row_id && latest(held).is_some_and(|v| key_held(&v.data, columns, values))
-            })
+            (rows.iter().copied())
+                .find(|&held| latest(held).is_some_and(|v| key_held(&v.data, columns, values)))
         });
-        if holder.is_none() && !rows.contains(&row_id) {
+        if holder.is_none() || entered {
             rows.push(row_id);
         }
         holder
@@ -10062,6 +10069,39 @@ mod tests {
             .map(|rows| rows.len())
             .sum();
         assert_eq!(entered, 1, "rows entered for the key");
+    }
+
+    #[test]
+    fn a_row_moved_off_a_key_and_back_stays_entered_once() {
+        use crate::core::types::DataType;
+        use crate::storage::index::HashIndex;
+        let store = Arc::new(VersionStore::new("t".to_string(), test_schema()));
+        let index = Arc::new(HashIndex::new(
+            "t_u".to_string(),
+            "t".to_string(),
+            vec!["u".to_string()],
+            vec![1],
+            vec![DataType::Integer],
+            true,
+            0,
+        ));
+        store.add_index("t_u".to_string(), index.clone());
+        let mut txn = TransactionVersionStore::new(Arc::clone(&store), 1);
+        txn.track_keys();
+        let row = |id: i64, u: i64| Row::from(vec![Value::from(id), Value::from(u)]);
+        txn.put(1, row(1, -1), false).unwrap();
+        txn.put(2, row(2, 2), false).unwrap();
+        for _ in 0..50 {
+            for (id, u) in [(1, 1), (2, -1), (2, 2), (1, -1)] {
+                txn.put(id, row(id, u), false).unwrap();
+            }
+            for (id, u) in [(1, -1), (2, 2)] {
+                assert_eq!(txn.claim_key(&*index, &[Value::from(u)], id).unwrap(), None);
+            }
+        }
+        let tracking = txn.tracking.as_deref().unwrap();
+        let held = tracking.local_keys[0].1[&key_hash(&[Value::from(-1i64)])].len();
+        assert_eq!(held, 1, "rows entered for key -1");
     }
 
     /// The layout admission sees is the one the transaction's rows are held
