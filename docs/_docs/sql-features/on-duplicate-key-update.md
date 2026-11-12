@@ -219,3 +219,5 @@ ON DUPLICATE KEY UPDATE val = EXCLUDED.val;
 4. **EXCLUDED pseudo-table**: Use `EXCLUDED.column` to reference incoming insert values. Without EXCLUDED, column names in the SET clause refer to the existing row in the target table.
 
 5. **Conflict target**: The column list in ON CONFLICT (...) is optional for DO NOTHING. For DO UPDATE SET, it documents which constraint you expect to conflict on.
+
+6. **One row met more than once**: The rows of one statement are applied in order, each against the table as the earlier rows left it, so a later row may conflict with a row an earlier one inserted or updated. `INSERT INTO t VALUES (1, 'a'), (1, 'b') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v` leaves `v = 'b'`, under either syntax. Subqueries in the statement still read the tables as the statement found them (see [Subqueries in ON CONFLICT]({% link _docs/sql-features/subqueries.md %}#subqueries-in-on-conflict)).
