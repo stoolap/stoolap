@@ -306,6 +306,31 @@ fn an_installed_transaction_is_judged_at_the_statement_end() {
 }
 
 #[test]
+fn an_installed_transaction_judges_by_the_rows_it_wrote_before() {
+    use stoolap::core::{Row, Value};
+    let mut wrong = Vec::new();
+    for rows in [Rows::Hot, Rows::Sealed, Rows::Mixed] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = database(rows, &dir);
+        let executor = stoolap::Executor::new(std::sync::Arc::clone(db.engine()));
+        let tx = executor.begin_transaction().unwrap();
+        let mut table = tx.get_table("t").unwrap();
+        let row = [3, 30, 0].map(Value::Integer).to_vec();
+        table.insert(Row::from(row)).unwrap();
+        drop(table);
+        executor.install_transaction(tx);
+        let inserted = executor.execute("INSERT INTO t VALUES (4, 30, 0)");
+        if !matches!(inserted, Err(stoolap::Error::UniqueConstraint { .. })) {
+            wrong.push(format!("{rows:?}: {:?}", inserted.map(|_| ())));
+        }
+        if let Some(mut tx) = executor.take_transaction() {
+            tx.rollback().unwrap();
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
 fn a_composite_key_is_judged_at_the_statement_end() {
     let mut wrong = Vec::new();
     for rows in [Rows::Hot, Rows::Sealed, Rows::Mixed] {

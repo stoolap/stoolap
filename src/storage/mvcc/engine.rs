@@ -230,6 +230,8 @@ fn check_statement_keys(
     txn_store: &TxnTableStore,
     mgr: Option<&crate::storage::volume::manifest::SegmentManager>,
 ) -> Result<()> {
+    // Read before the layout: a column change after it fails the volume read
+    let generation = mgr.map(|mgr| mgr.schema_generation());
     let mut store = txn_store.write_store();
     let mut rows = store.take_key_changes();
     rows.sort_unstable();
@@ -271,6 +273,8 @@ fn check_statement_keys(
     // A committed row only moves from the hot index to a volume, so the
     // volumes are read after it
     drop(store);
+    #[cfg(feature = "test-failpoints")]
+    crate::test_failpoints::statement_volumes_reading();
     let snapshot = mgr.statement_snapshot();
     let mut sealed: SmallVec<[(usize, i64); 1]> = SmallVec::new();
     for (position, (at, row_id, values)) in keys.iter().enumerate() {
@@ -294,6 +298,9 @@ fn check_statement_keys(
         }
     }
     mgr.publish_loaded(snapshot.take_loaded());
+    if let Some(generation) = generation {
+        mgr.check_schema_generation(generation)?;
+    }
     if sealed.is_empty() {
         return Ok(());
     }

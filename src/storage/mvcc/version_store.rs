@@ -7527,7 +7527,31 @@ impl TransactionVersionStore {
     /// Judges the unique keys this transaction writes from now on as it
     /// writes them, as an explicit transaction and an upsert do
     pub(crate) fn track_keys(&mut self) {
-        self.tracking.get_or_insert_with(Box::default);
+        if self.tracking.is_some() {
+            return;
+        }
+        self.tracking = Some(Box::default());
+        let written: Vec<i64> = self.iter_local().map(|(row_id, _)| row_id).collect();
+        self.enter_row_keys(written);
+    }
+
+    /// Enters the unique keys the latest versions of `rows` hold
+    fn enter_row_keys(&mut self, rows: Vec<i64>) {
+        if rows.is_empty() || !self.parent_store.may_hold_unique_beside_key() {
+            return;
+        }
+        let indexes: UniqueIndexes = self.unique_indexes().iter().cloned().collect();
+        for row_id in rows {
+            for index in &indexes {
+                let columns = index.column_ids();
+                let hash = (self.get_latest_local(row_id))
+                    .filter(|version| !version.is_deleted())
+                    .and_then(|version| row_key_hash(&version.data, columns));
+                if let Some(hash) = hash {
+                    self.enter_key(columns, hash, row_id);
+                }
+            }
+        }
     }
 
     /// Whether the transaction judges its unique keys as it writes them
@@ -9284,20 +9308,7 @@ impl TransactionVersionStore {
                 !versions.is_empty()
             });
         }
-        if !restored.is_empty() {
-            let indexes: UniqueIndexes = self.unique_indexes().iter().cloned().collect();
-            for row_id in restored {
-                for index in &indexes {
-                    let columns = index.column_ids();
-                    let hash = (self.get_latest_local(row_id))
-                        .filter(|version| !version.is_deleted())
-                        .and_then(|version| row_key_hash(&version.data, columns));
-                    if let Some(hash) = hash {
-                        self.enter_key(columns, hash, row_id);
-                    }
-                }
-            }
-        }
+        self.enter_row_keys(restored);
         // A layout no surviving row was written under is not the
         // transaction's any more
         self.bound.retain(|(_, first)| *first <= timestamp);

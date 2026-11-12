@@ -296,6 +296,23 @@ pub(crate) fn statement_indexes_read() {
 }
 
 thread_local! {
+    static STATEMENT_VOLUMES_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when a statement's end next reads a table's
+/// volumes for its unique keys, before it takes their snapshot.
+pub fn before_statement_volumes(hook: impl FnOnce() + 'static) {
+    STATEMENT_VOLUMES_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn statement_volumes_reading() {
+    let hook = STATEMENT_VOLUMES_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static COMMIT_VISIBLE_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
