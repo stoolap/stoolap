@@ -305,3 +305,49 @@ fn a_sealed_text_distinct_that_hides_no_row_reads_no_block() {
     assert_eq!(got, 300);
     assert_eq!(read, 0, "the volumes' dictionaries answer");
 }
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_sealed_numeric_distinct_that_hides_no_row_reads_no_block() {
+    use stoolap::test_failpoints::block_file_reads;
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!(
+        "file://{}?checkpoint_on_close=off&checkpoint_interval=0&compact_threshold=100",
+        dir.path().display()
+    );
+    let mut model = {
+        let (db, model) = sealed(dir.path());
+        db.execute("CREATE TABLE z (id INTEGER PRIMARY KEY, f FLOAT)", ())
+            .unwrap();
+        db.execute("CREATE INDEX z_f ON z (f)", ()).unwrap();
+        let values: Vec<String> = model
+            .iter()
+            .map(|r| match r.f {
+                Some(f) if !f.is_nan() => format!("({}, {f:?})", r.id),
+                _ => format!("({}, NULL)", r.id),
+            })
+            .collect();
+        db.execute(&format!("INSERT INTO z VALUES {}", values.join(", ")), ())
+            .unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        db.close().unwrap();
+        model
+    };
+    let db = Database::open(&dsn).unwrap();
+    db.engine().cold_volumes_for_test("w");
+    db.engine().cold_volumes_for_test("z");
+    for r in model.iter_mut() {
+        r.f = r.f.filter(|f| !f.is_nan());
+    }
+    for (table, c) in [("w", "i"), ("w", "ts"), ("w", "h"), ("z", "f")] {
+        let before = block_file_reads();
+        let got: BTreeSet<String> = db
+            .query(&format!("SELECT DISTINCT {c} FROM {table}"), ())
+            .unwrap()
+            .map(|row| render(row.unwrap().get_value(0).unwrap()))
+            .collect();
+        let read = block_file_reads().0 - before.0;
+        assert_eq!(got, model_values(&model, c), "DISTINCT {c}");
+        assert_eq!(read, 0, "the side files' keys answer DISTINCT {c}");
+    }
+}

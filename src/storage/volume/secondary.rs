@@ -2348,6 +2348,20 @@ impl Reader {
         range_bytes_with(self, lower, upper)
     }
 
+    /// Hands each key page's keys to `each`, in key order
+    pub fn each_key_page(&self, mut each: impl FnMut(&[i64])) -> std::io::Result<()> {
+        for page in 0..column_of(self)?.key_pages.len() {
+            self.with_page(PageKind::Keys, page, |content| match content {
+                PageContent::Keys { keys, .. } => {
+                    each(keys);
+                    Ok(())
+                }
+                _ => Err(invalid("expected a key page")),
+            })??;
+        }
+        Ok(())
+    }
+
     /// The upper bound the directory alone gives on the positions of keys
     /// in `[low, high]`, without reading a page
     pub fn candidate_bound(&self, low: i64, high: i64) -> std::io::Result<u64> {
