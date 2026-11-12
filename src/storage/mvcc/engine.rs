@@ -10305,16 +10305,16 @@ impl TransactionEngineOperations for EngineOperations {
 
         let version_store = new_table_store(&schema, &self.registry, indexes)?;
         let schema_data = MVCCEngine::serialize_schema(&schema);
-        if txn_id != super::persistence::DDL_TXN_ID {
-            self.creating_txns.lock().insert(txn_id);
-            self.creating.store(true, Ordering::Release);
-        }
 
         // Atomically check-and-insert under write lock to prevent TOCTOU race
         {
             let mut schemas = self.schemas().write().unwrap();
             if schemas.contains_key(&table_name) {
                 return Err(Error::TableAlreadyExists(table_name.to_string()));
+            }
+            if txn_id != super::persistence::DDL_TXN_ID {
+                self.creating_txns.lock().insert(txn_id);
+                self.creating.store(true, Ordering::Release);
             }
             schemas.insert(table_name.clone(), CompactArc::new(schema));
         }

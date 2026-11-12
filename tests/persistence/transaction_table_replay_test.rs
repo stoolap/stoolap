@@ -269,3 +269,23 @@ fn a_checkpoint_moves_the_boundary_once_a_creating_transaction_ends() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+#[test]
+fn a_create_that_finds_its_table_leaves_the_boundary_free() {
+    use stoolap::core::{DataType, SchemaBuilder};
+    use stoolap::storage::traits::Engine;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dsn(dir.path())).unwrap();
+    db.execute(CREATE, ()).unwrap();
+    let schema = SchemaBuilder::new("t")
+        .column("id", DataType::Integer, false, true)
+        .build();
+    let mut txn = db.engine().begin_transaction().unwrap();
+    assert!(txn.create_table("t", schema).is_err());
+    assert!(
+        publishes_boundary(dir.path(), &db),
+        "a failed create held the boundary"
+    );
+    txn.rollback().unwrap();
+}
