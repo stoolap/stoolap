@@ -943,6 +943,20 @@ pub trait Table: Send + Sync {
         self.create_index(name, columns, is_unique)
     }
 
+    /// Creates an index as [`Self::create_index_with_type`] does, where the
+    /// index `beside` may already cover the same column; the caller drops it
+    fn create_index_beside(
+        &self,
+        name: &str,
+        columns: &[&str],
+        is_unique: bool,
+        index_type: Option<IndexType>,
+        beside: Option<&str>,
+    ) -> Result<()> {
+        let _ = (name, columns, is_unique, index_type, beside);
+        Err(Error::NotSupported("create_index_beside".to_string()))
+    }
+
     /// Creates an HNSW index with custom parameters
     ///
     /// # Arguments

@@ -373,6 +373,20 @@ CREATE TABLE employees (
 SHOW INDEXES FROM employees;
 ```
 
+A unique index on the column serves the same lookups, so the FK column gets no index of its own when it is kept UNIQUE, whether the constraint is written on the column or as a table constraint:
+
+```sql
+CREATE TABLE badges (
+    id INTEGER PRIMARY KEY,
+    employee_id INTEGER,
+    UNIQUE (employee_id),
+    FOREIGN KEY (employee_id) REFERENCES employees(id)
+);
+-- Only the unique index 'unique_badges_0' is created
+```
+
+A unique index created later on a FK column takes the place of the automatic index: `CREATE UNIQUE INDEX` on `employees (dept_id)` above drops `fk_employees_dept_id` once the unique index is built. If the column holds duplicate values, the unique index is refused and the automatic index stays.
+
 ## Performance
 
 | Operation | Complexity | Notes |
