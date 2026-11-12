@@ -19,7 +19,9 @@
 use stoolap::core::Value;
 use stoolap::Database;
 
-const TABLES: [&str; 11] = [
+const TABLES: [&str; 13] = [
+    "CREATE TABLE l (k INTEGER PRIMARY KEY)",
+    "INSERT INTO l VALUES (1), (2)",
     "CREATE TABLE p (id INTEGER PRIMARY KEY, code INTEGER UNIQUE, n INTEGER)",
     "CREATE TABLE cd (id INTEGER PRIMARY KEY, pd INTEGER REFERENCES p(id) ON DELETE CASCADE)",
     "CREATE TABLE cdd (id INTEGER PRIMARY KEY, pdd INTEGER REFERENCES cd(id) ON DELETE CASCADE)",
@@ -162,6 +164,13 @@ const CASES: &[Case] = &[
         returned: &[&[2, 2]],
         after: &[("SELECT COUNT(*) FROM cd", 1)],
     },
+    Case {
+        sql: "DELETE FROM p WHERE id = 1 RETURNING \
+              (SELECT COUNT(*) FROM cd WHERE cd.pd = p.id LIMIT (SELECT COUNT(*) FROM cd))",
+        params: &[],
+        returned: &[&[2]],
+        after: &[("SELECT COUNT(*) FROM cd", 1)],
+    },
 ];
 
 /// How the statement runs: in autocommit, or in a transaction of an isolation
@@ -276,11 +285,12 @@ cases! {
     delete_two_level_cascade = 12,
     delete_exists_and_in = 13,
     delete_join_and_derived_table = 14,
+    delete_limited_by_a_subquery = 15,
 }
 
 #[test]
 fn every_case_has_a_test() {
-    assert_eq!(CASES.len(), 15);
+    assert_eq!(CASES.len(), 16);
 }
 
 /// Runs `earlier` in a transaction, then `sql`, returning its rows; the
@@ -301,7 +311,7 @@ const DELETE_ONE: &str =
 
 #[test]
 fn a_block_sees_the_transaction_s_earlier_writes_but_not_the_statement_s() {
-    let cases: [(&str, &[&str], &str, i64); 5] = [
+    let cases: [(&str, &[&str], &str, i64); 6] = [
         ("insert", &["INSERT INTO cd VALUES (9, 1)"], DELETE_ONE, 3),
         ("delete", &["DELETE FROM cd WHERE id = 2"], DELETE_ONE, 1),
         (
@@ -320,6 +330,13 @@ fn a_block_sees_the_transaction_s_earlier_writes_but_not_the_statement_s() {
             ],
             DELETE_ONE,
             3,
+        ),
+        (
+            "index_join",
+            &["INSERT INTO cd VALUES (9, 2)"],
+            "DELETE FROM p WHERE id = 1 RETURNING \
+             (SELECT cd.id FROM l JOIN cd ON cd.pd = l.k WHERE l.k = p.id ORDER BY cd.id LIMIT 1)",
+            1,
         ),
         (
             "cascaded_again",

@@ -10534,7 +10534,7 @@ impl TransactionEngineOperations for EngineOperations {
         let mgrs = self.segment_managers.read().unwrap();
         for table_name in &touched_tables {
             if let Some(mgr) = mgrs.get(table_name.as_str()) {
-                if mgr.has_pending_tombstones(Pending::of(txn_id)) {
+                if mgr.has_pending_tombstones(txn_id) {
                     return true;
                 }
             }

@@ -5755,7 +5755,7 @@ impl Table for SegmentedTable {
             let can_use_stats = !is_boolean_column
                 && self.segment_mgr.is_tombstone_set_empty()
                 && !self.segment_mgr.has_dead_copies()
-                && !self.segment_mgr.has_pending_tombstones(self.pending())
+                && !self.segment_mgr.has_pending_tombstones(self.txn_id())
                 && self.segment_mgr.total_row_count() == self.segment_mgr.deduped_row_count()?;
 
             if can_use_stats {
@@ -5892,7 +5892,7 @@ impl Table for SegmentedTable {
 
             let can_use_stats = self.segment_mgr.is_tombstone_set_empty()
                 && !self.segment_mgr.has_dead_copies()
-                && !self.segment_mgr.has_pending_tombstones(self.pending())
+                && !self.segment_mgr.has_pending_tombstones(self.txn_id())
                 && self.segment_mgr.total_row_count() == self.segment_mgr.deduped_row_count()?;
 
             // A stats pass cut short leaves the minimum of the volumes it read
@@ -6210,7 +6210,7 @@ impl Table for SegmentedTable {
 
             let can_use_stats = self.segment_mgr.is_tombstone_set_empty()
                 && !self.segment_mgr.has_dead_copies()
-                && !self.segment_mgr.has_pending_tombstones(self.pending())
+                && !self.segment_mgr.has_pending_tombstones(self.txn_id())
                 && self.segment_mgr.total_row_count() == self.segment_mgr.deduped_row_count()?;
 
             // A stats pass cut short leaves the maximum of the volumes it read
@@ -7046,7 +7046,7 @@ impl Table for SegmentedTable {
     }
 
     fn has_local_changes(&self) -> bool {
-        self.hot.has_local_changes() || self.segment_mgr.has_pending_tombstones(self.pending())
+        self.hot.has_local_changes() || self.segment_mgr.has_pending_tombstones(self.txn_id())
     }
 
     fn local_column_values(
@@ -7059,7 +7059,7 @@ impl Table for SegmentedTable {
     }
 
     fn index_view_epoch(&self) -> Option<u64> {
-        if self.segment_mgr.has_pending_tombstones(self.pending()) {
+        if self.segment_mgr.has_pending_tombstones(self.txn_id()) {
             return None;
         }
         self.hot.index_view_epoch()

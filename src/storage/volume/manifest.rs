@@ -3702,12 +3702,13 @@ impl SegmentManager {
         discarded
     }
 
-    /// Check if a txn has any pending tombstones (for has_local_changes).
-    pub fn has_pending_tombstones(&self, of: Pending) -> bool {
+    /// Check if a txn has any pending tombstones (for has_local_changes):
+    /// whatever their order, so a read at a cut declines a shortcut too
+    pub fn has_pending_tombstones(&self, txn_id: i64) -> bool {
         self.pending_txn_tombstones
             .read()
-            .get(&of.txn_id)
-            .is_some_and(|v| v.values().any(|&at| at <= of.cut))
+            .get(&txn_id)
+            .is_some_and(|v| !v.is_empty())
     }
 
     /// Check if a row_id is tombstoned (any commit_seq).

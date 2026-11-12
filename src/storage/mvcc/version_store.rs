@@ -8103,14 +8103,16 @@ impl TransactionVersionStore {
     /// The `column` value and id of every uncommitted row of this
     /// transaction that holds a value there, and the id of every row it
     /// wrote, deleted ones included: the transaction's version of a row is
-    /// the truth about it, whatever key the shared index holds it under
+    /// the truth about it, whatever key the shared index holds it under.
+    /// Only the rows written by the write order `cut` count
     pub fn local_values(
         &self,
         column: usize,
+        cut: i64,
         out: &mut Vec<(Value, i64)>,
         written: &mut crate::common::I64Set,
     ) {
-        for (row_id, version) in self.iter_local() {
+        for (row_id, version) in self.iter_local_at(cut) {
             written.insert(row_id);
             if version.is_deleted() {
                 continue;

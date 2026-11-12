@@ -108,6 +108,12 @@ impl LocalRows<'_> {
         let cut = self.1;
         self.0.iter().flat_map(move |rows| rows.iter_local_at(cut))
     }
+
+    fn values(&self, column: usize, out: &mut Vec<(Value, i64)>, written: &mut I64Set) {
+        if let Some(rows) = &self.0 {
+            rows.local_values(column, self.1, out, written);
+        }
+    }
 }
 
 /// Where a WHERE conjunction sits on a multi-column index: equalities on the
@@ -3950,9 +3956,7 @@ impl Table for MVCCTable {
         out: &mut Vec<(Value, i64)>,
         written: &mut crate::common::I64Set,
     ) {
-        if let Some(rows) = &self.local().0 {
-            rows.local_values(column, out, written);
-        }
+        self.local().values(column, out, written);
     }
 
     fn get_pending_versions(&self) -> Vec<(i64, Row, bool, i64)> {
