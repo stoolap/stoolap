@@ -208,6 +208,12 @@ pub trait TransactionEngineOperations: Send + Sync {
         let _ = txn_id;
     }
 
+    /// Ends the transaction's table creations, once its marker is written
+    /// or its created tables are dropped
+    fn end_table_creates(&self, txn_id: i64) {
+        let _ = txn_id;
+    }
+
     /// Marks every table the transaction writes as publishing, from before
     /// its index updates until the transaction is visible or undone
     fn begin_publish(&self, txn_id: i64, commit_seq: i64) -> super::version_store::PublishHold {
@@ -383,6 +389,10 @@ impl MvccTransaction {
         // Its outcome is visible or undone by now
         if let Some(ops) = &self.engine_operations {
             ops.release_keys(self.id);
+            // A dropped transaction ends them after its undo
+            if self.state != TransactionState::Active {
+                ops.end_table_creates(self.id);
+            }
         }
     }
 
@@ -476,6 +486,7 @@ impl MvccTransaction {
         if let Err(e) = Self::undo_table_changes(ops, txn_id, changes) {
             eprintln!("Warning: a dropped transaction's table changes were not all undone: {e}");
         }
+        ops.end_table_creates(txn_id);
     }
 
     /// Check if this is a read-only transaction

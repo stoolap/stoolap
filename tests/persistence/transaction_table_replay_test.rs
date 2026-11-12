@@ -168,3 +168,104 @@ fn a_transactions_table_is_replayed_as_the_transaction_ended() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+#[test]
+fn a_checkpoint_leaves_an_open_transactions_table_to_its_end() {
+    let insert = "INSERT INTO t VALUES (1, 1, 1)";
+    // Statements before the checkpoint, after it, and the rows of t after a crash
+    let cases: &[(&[&str], &[&str], Option<i64>)] = &[
+        (&["BEGIN", CREATE, insert], &[], None),
+        (&["BEGIN", CREATE, insert], &["COMMIT"], Some(1)),
+        (&["BEGIN", CREATE, insert], &["ROLLBACK"], None),
+        (
+            &["BEGIN", CREATE],
+            &["COMMIT", "PRAGMA CHECKPOINT"],
+            Some(0),
+        ),
+        (
+            &["BEGIN", "SAVEPOINT s", CREATE, "ROLLBACK TO SAVEPOINT s"],
+            &[],
+            None,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (before, after, rows) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let image = tempfile::tempdir().unwrap();
+        let db = Database::open(&dsn(dir.path())).unwrap();
+        let other = db.clone();
+        for sql in *before {
+            db.execute(sql, ()).unwrap();
+        }
+        other.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        for sql in *after {
+            db.execute(sql, ()).unwrap();
+        }
+        crash_image(dir.path(), image.path());
+        drop(other);
+        drop(db);
+
+        let db = Database::open(&dsn(image.path())).unwrap();
+        let replayed = db.query_one::<i64, _>("SELECT COUNT(*) FROM t", ()).ok();
+        if replayed != *rows {
+            wrong.push(format!(
+                "{before:?} checkpoint {after:?}: rows {replayed:?}, want {rows:?}"
+            ));
+        }
+        db.close().unwrap();
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Whether a checkpoint on `other` publishes a new recovery boundary
+fn publishes_boundary(dir: &Path, other: &Database) -> bool {
+    let meta = dir.join("wal").join("checkpoint.meta");
+    let before = std::fs::read(&meta).ok();
+    other.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    std::fs::read(&meta).ok() != before
+}
+
+#[test]
+fn a_checkpoint_moves_the_boundary_once_a_creating_transaction_ends() {
+    let ends: &[&[&str]] = &[
+        &["COMMIT"],
+        &["ROLLBACK"],
+        &[
+            "SAVEPOINT s",
+            "CREATE TABLE u (id INTEGER PRIMARY KEY)",
+            "ROLLBACK TO SAVEPOINT s",
+            "COMMIT",
+        ],
+    ];
+    let mut wrong = Vec::new();
+    for end in ends {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dsn(dir.path())).unwrap();
+        let other = db.clone();
+        db.execute("BEGIN", ()).unwrap();
+        db.execute(CREATE, ()).unwrap();
+        if publishes_boundary(dir.path(), &other) {
+            wrong.push(format!(
+                "{end:?}: boundary moved while the transaction was open"
+            ));
+        }
+        for sql in *end {
+            db.execute(sql, ()).unwrap();
+        }
+        if !publishes_boundary(dir.path(), &other) {
+            wrong.push(format!(
+                "{end:?}: boundary held after the transaction ended"
+            ));
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dsn(dir.path())).unwrap();
+    let other = db.clone();
+    db.execute("BEGIN", ()).unwrap();
+    db.execute(CREATE, ()).unwrap();
+    drop(db);
+    if !publishes_boundary(dir.path(), &other) {
+        wrong.push("dropped transaction: boundary held".to_string());
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
