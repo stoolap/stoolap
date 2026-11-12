@@ -23,8 +23,15 @@ fn rows(db: &Database, table: &str) -> Option<i64> {
 }
 
 /// Statements of the transaction (A) and of another session (B), each
-/// prefixed with its session, then the end of A
-const CASES: &[(&[&str], &str)] = &[
+/// prefixed with its session, the end of A, then the rows of n and of m
+type Case = (
+    &'static [&'static str],
+    &'static str,
+    Option<i64>,
+    Option<i64>,
+);
+
+const CASES: &[Case] = &[
     (
         &[
             "A:CREATE TABLE n (id INTEGER PRIMARY KEY)",
@@ -33,6 +40,8 @@ const CASES: &[(&[&str], &str)] = &[
             "B:INSERT INTO n VALUES (1)",
         ],
         "ROLLBACK",
+        Some(1),
+        None,
     ),
     (
         &[
@@ -42,6 +51,8 @@ const CASES: &[(&[&str], &str)] = &[
             "B:INSERT INTO n VALUES (1)",
         ],
         "ROLLBACK",
+        Some(1),
+        None,
     ),
     (
         &[
@@ -53,6 +64,8 @@ const CASES: &[(&[&str], &str)] = &[
             "A:ROLLBACK TO SAVEPOINT s",
         ],
         "COMMIT",
+        Some(1),
+        None,
     ),
     (
         &[
@@ -65,13 +78,29 @@ const CASES: &[(&[&str], &str)] = &[
             "B:INSERT INTO n VALUES (1)",
         ],
         "ROLLBACK",
+        Some(1),
+        None,
+    ),
+    (
+        &[
+            "A:CREATE TABLE n (id INTEGER PRIMARY KEY)",
+            "B:BEGIN",
+            "B:DROP TABLE n",
+            "B:ROLLBACK",
+        ],
+        "ROLLBACK",
+        None,
+        None,
     ),
 ];
 
 #[test]
 fn a_rollback_drops_its_own_table_under_any_name() {
+    // The failpoint tests here fail WAL syncs process-wide
+    #[cfg(feature = "test-failpoints")]
+    let _guard = stoolap::test_failpoints::FailpointGuard::new();
     let mut wrong = Vec::new();
-    for (statements, end) in CASES {
+    for (statements, end, want_n, want_m) in CASES {
         let dir = tempfile::tempdir().unwrap();
         let dsn = format!("file://{}", dir.path().display());
         let a = Database::open(&dsn).unwrap();
@@ -91,11 +120,52 @@ fn a_rollback_drops_its_own_table_under_any_name() {
         let db = Database::open(&dsn).unwrap();
         let reopened = (rows(&db, "n"), rows(&db, "m"));
         for (when, (n, m)) in [("live", live), ("reopened", reopened)] {
-            if n != Some(1) || m.is_some() {
+            if (n, m) != (*want_n, *want_m) {
                 wrong.push(format!("{statements:?} {end}: {when} n {n:?} m {m:?}"));
             }
         }
         db.close().unwrap();
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_create_of_the_old_name_waits_for_the_rollback_that_drops_it() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let _guard = stoolap::test_failpoints::FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}", dir.path().display());
+    let a = Database::open(&dsn).unwrap();
+    let b = a.clone();
+    a.execute("BEGIN", ()).unwrap();
+    a.execute("CREATE TABLE n (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    let creator = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let slot = std::rc::Rc::clone(&creator);
+    stoolap::test_failpoints::after_table_unlisted(move || {
+        let (created, waiting) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            b.execute("CREATE TABLE n (id INTEGER PRIMARY KEY)", ())?;
+            let _ = created.send(());
+            b.execute("INSERT INTO n VALUES (1)", ())
+        });
+        // Long enough for a create that does not wait to land
+        let _ = waiting.recv_timeout(Duration::from_millis(500));
+        *slot.borrow_mut() = Some(handle);
+    });
+    a.execute("ROLLBACK", ()).unwrap();
+    let written = creator.borrow_mut().take().unwrap().join().unwrap();
+    assert!(written.is_ok(), "{written:?}");
+    assert_eq!(rows(&a, "n"), Some(1), "the other session's n went");
+    a.close().unwrap();
+    let db = Database::open(&dsn).unwrap();
+    assert_eq!(
+        rows(&db, "n"),
+        Some(1),
+        "the other session's n went after a reopen"
+    );
+    db.close().unwrap();
 }

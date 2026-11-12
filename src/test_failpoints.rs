@@ -2388,6 +2388,23 @@ pub(crate) fn commit_marker_next() {
 }
 
 thread_local! {
+    static TABLE_UNLISTED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next table drop has taken the table out
+/// of the catalog and has not yet removed its store or logged the drop
+pub fn after_table_unlisted(hook: impl FnOnce() + 'static) {
+    TABLE_UNLISTED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn table_unlisted() {
+    let hook = TABLE_UNLISTED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static DROP_HOT_PUBLISHED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 

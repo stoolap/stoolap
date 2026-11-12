@@ -9855,6 +9855,8 @@ impl EngineOperations {
             strip_fk_references(&mut schemas, &version_stores, &table_name_lower);
             neighbors
         };
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::table_unlisted();
         // Close and remove version store
         {
             let mut stores = self.version_stores().write().unwrap();
@@ -10456,6 +10458,10 @@ impl TransactionEngineOperations for EngineOperations {
                 return Ok(());
             }
         }
+    }
+
+    fn ddl_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.ddl.serial.lock()
     }
 
     fn list_tables(&self) -> Result<Vec<String>> {

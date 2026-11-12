@@ -36,12 +36,14 @@ use crate::storage::Expression;
 enum TableChange {
     /// The creation of a table, found by it whatever its name
     Created(u64),
-    /// A dropped table's name and schema, and its creation when this
-    /// transaction created it, so a restore is logged with the creating record
+    /// A dropped table's name, schema and creation, which a restore gives
+    /// back, and whether this transaction created it, so a restore is logged
+    /// with the creating record
     Dropped {
         name: String,
         schema: Box<Schema>,
-        created_here: Option<u64>,
+        creation: u64,
+        created_here: bool,
     },
 }
 
@@ -151,6 +153,10 @@ pub trait TransactionEngineOperations: Send + Sync {
     /// Drops the table made with `creation`, under whatever name it has
     /// now; none left is not an error
     fn drop_created(&self, creation: u64) -> Result<()>;
+
+    /// The guard a DDL statement holds, so an undo of table changes runs
+    /// as one: no other DDL lands between its catalog, store and log steps
+    fn ddl_guard(&self) -> parking_lot::MutexGuard<'_, ()>;
 
     /// List all tables
     fn list_tables(&self) -> Result<Vec<String>>;
@@ -468,19 +474,19 @@ impl MvccTransaction {
         changes: &[TableChange],
     ) -> Result<()> {
         let mut first_error = None;
+        // Only with changes: a DDL statement ends its own, changeless transactions under it
+        let _ddl = (!changes.is_empty()).then(|| ops.ddl_guard());
         for change in changes.iter().rev() {
             let undone = match change {
                 TableChange::Created(creation) => ops.drop_created(*creation),
                 TableChange::Dropped {
                     name,
                     schema,
+                    creation,
                     created_here,
                 } => {
-                    let (logged_as, creation) = match created_here {
-                        Some(creation) => (txn_id, *creation),
-                        None => (DDL_TXN_ID, 0),
-                    };
-                    ops.create_table(name, Schema::clone(schema), &[], logged_as, creation)
+                    let logged_as = if *created_here { txn_id } else { DDL_TXN_ID };
+                    ops.create_table(name, Schema::clone(schema), &[], logged_as, *creation)
                         .map(|_| ())
                 }
             };
@@ -895,14 +901,15 @@ impl Transaction for MvccTransaction {
         }
 
         // Save schema for potential rollback (note: data cannot be recovered)
-        let created_here = self
-            .table_changes
-            .iter()
-            .any(|change| matches!(change, TableChange::Created(c) if *c == creation && creation != 0))
-            .then_some(creation);
+        let created_here = creation != 0
+            && self
+                .table_changes
+                .iter()
+                .any(|change| matches!(change, TableChange::Created(c) if *c == creation));
         self.table_changes.push(TableChange::Dropped {
             name: name_lower,
             schema: Box::new(schema),
+            creation,
             created_here,
         });
 
