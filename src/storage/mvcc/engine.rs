@@ -896,8 +896,9 @@ type FkReverseCache = (u64, StringMap<Arc<Vec<(String, ForeignKeyConstraint)>>>)
 /// What a DDL change shares with the transactions that can make one
 struct DdlShared {
     /// Held across a DDL statement's schema change and its WAL record, so
-    /// the log replays in the order the changes were applied
-    serial: parking_lot::Mutex<()>,
+    /// the log replays in the order the changes were applied; a thread that
+    /// holds it, a callback of its statement among them, takes it again
+    serial: parking_lot::ReentrantMutex<()>,
     /// Schema epoch counter - increments on any CREATE/ALTER/DROP TABLE
     /// Used for fast cache invalidation without HashMap lookup
     schema_epoch: AtomicU64,
@@ -913,6 +914,18 @@ struct DdlShared {
 }
 
 impl DdlShared {
+    /// The DDL guard, waited for while another thread holds it
+    fn guard(&self) -> parking_lot::ReentrantMutexGuard<'_, ()> {
+        #[cfg(feature = "test-failpoints")]
+        {
+            if let Some(guard) = self.serial.try_lock() {
+                return guard;
+            }
+            crate::test_failpoints::ddl_guard_waiting();
+        }
+        self.serial.lock()
+    }
+
     /// An error when `store`'s table has a column of the row identity's
     /// name, as only an older build let one: it serves DDL alone
     #[inline]
@@ -1296,7 +1309,7 @@ impl MVCCEngine {
             loading_from_disk: Arc::new(AtomicBool::new(false)),
             file_lock: Mutex::new(None),
             ddl: Arc::new(DdlShared {
-                serial: parking_lot::Mutex::new(()),
+                serial: parking_lot::ReentrantMutex::new(()),
                 schema_epoch: AtomicU64::new(0),
                 name_epochs: parking_lot::RwLock::new(FxHashMap::default()),
                 name_floor: AtomicU64::new(0),
@@ -4824,8 +4837,8 @@ impl MVCCEngine {
     /// Serializes a DDL statement's schema change with its WAL record
     /// against other DDL and against a checkpoint's re-recording of the
     /// catalog, so replay applies the changes in the order they were made
-    pub fn ddl_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
-        self.ddl.serial.lock()
+    pub fn ddl_guard(&self) -> parking_lot::ReentrantMutexGuard<'_, ()> {
+        self.ddl.guard()
     }
 
     /// After an index of `table_name` is dropped: the side file of every
@@ -10460,8 +10473,8 @@ impl TransactionEngineOperations for EngineOperations {
         }
     }
 
-    fn ddl_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
-        self.ddl.serial.lock()
+    fn ddl_guard(&self) -> parking_lot::ReentrantMutexGuard<'_, ()> {
+        self.ddl.guard()
     }
 
     fn list_tables(&self) -> Result<Vec<String>> {
@@ -11115,7 +11128,7 @@ impl TransactionEngineOperations for EngineOperations {
     }
 
     fn change_column_type(&self, change: &ColumnTypeChange<'_>) -> Result<()> {
-        let _ddl = self.ddl.serial.lock();
+        let _ddl = self.ddl.guard();
         retype::change_column_type(
             &retype::Shared {
                 version_stores: &self.version_stores,

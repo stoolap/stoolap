@@ -133,7 +133,6 @@ fn a_rollback_drops_its_own_table_under_any_name() {
 #[test]
 fn a_create_of_the_old_name_waits_for_the_rollback_that_drops_it() {
     use std::sync::mpsc;
-    use std::time::Duration;
 
     let _guard = stoolap::test_failpoints::FailpointGuard::new();
     let dir = tempfile::tempdir().unwrap();
@@ -146,14 +145,18 @@ fn a_create_of_the_old_name_waits_for_the_rollback_that_drops_it() {
     let creator = std::rc::Rc::new(std::cell::RefCell::new(None));
     let slot = std::rc::Rc::clone(&creator);
     stoolap::test_failpoints::after_table_unlisted(move || {
-        let (created, waiting) = mpsc::channel();
+        // The create either waits for the rollback's guard or lands now
+        let (reached, settled) = mpsc::channel();
         let handle = std::thread::spawn(move || {
+            let waits = reached.clone();
+            stoolap::test_failpoints::on_ddl_guard_waiting(move || {
+                let _ = waits.send("waits");
+            });
             b.execute("CREATE TABLE n (id INTEGER PRIMARY KEY)", ())?;
-            let _ = created.send(());
+            let _ = reached.send("landed");
             b.execute("INSERT INTO n VALUES (1)", ())
         });
-        // Long enough for a create that does not wait to land
-        let _ = waiting.recv_timeout(Duration::from_millis(500));
+        settled.recv().unwrap();
         *slot.borrow_mut() = Some(handle);
     });
     a.execute("ROLLBACK", ()).unwrap();
@@ -168,4 +171,84 @@ fn a_create_of_the_old_name_waits_for_the_rollback_that_drops_it() {
         "the other session's n went after a reopen"
     );
     db.close().unwrap();
+}
+
+thread_local! {
+    static IN_SELECT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs the armed callback once, then answers its argument
+#[derive(Default)]
+struct InSelect;
+
+impl stoolap::functions::ScalarFunction for InSelect {
+    fn name(&self) -> &str {
+        "TABLE_UNDO_IN_SELECT"
+    }
+    fn info(&self) -> stoolap::functions::FunctionInfo {
+        use stoolap::functions::{FunctionDataType, FunctionInfo, FunctionSignature, FunctionType};
+        FunctionInfo::new(
+            "TABLE_UNDO_IN_SELECT",
+            FunctionType::Scalar,
+            "runs the armed callback once",
+            FunctionSignature::new(FunctionDataType::Any, vec![FunctionDataType::Any], 1, 1),
+        )
+        .non_deterministic()
+    }
+    fn evaluate(
+        &self,
+        args: &[stoolap::core::Value],
+    ) -> stoolap::core::Result<stoolap::core::Value> {
+        if let Some(run) = IN_SELECT.with(|slot| slot.borrow_mut().take()) {
+            run();
+        }
+        Ok(args[0].clone())
+    }
+    fn clone_box(&self) -> Box<dyn stoolap::functions::ScalarFunction> {
+        Box::new(InSelect)
+    }
+}
+
+#[test]
+fn a_rollback_called_from_a_create_as_select_runs_under_its_guard() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    // The failpoint tests here fail WAL syncs process-wide
+    #[cfg(feature = "test-failpoints")]
+    let _guard = stoolap::test_failpoints::FailpointGuard::new();
+    stoolap::functions::registry::global_registry()
+        .register_scalar::<InSelect>()
+        .unwrap();
+    let (done, finished) = mpsc::channel();
+    std::thread::spawn(move || {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+        let b = a.clone();
+        a.execute("CREATE TABLE seed (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        a.execute("INSERT INTO seed VALUES (1)", ()).unwrap();
+        b.execute("BEGIN", ()).unwrap();
+        b.execute("CREATE TABLE n (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        IN_SELECT.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                b.execute("ROLLBACK", ()).unwrap();
+            }))
+        });
+        let created = a
+            .execute(
+                "CREATE TABLE c AS SELECT TABLE_UNDO_IN_SELECT(id) AS id FROM seed",
+                (),
+            )
+            .map(|_| ());
+        let _ = done.send((created, rows(&a, "c"), rows(&a, "n")));
+    });
+    let (created, c, n) = finished
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the rollback waited for the guard its own thread holds");
+    assert!(created.is_ok(), "{created:?}");
+    assert_eq!(c, Some(1), "c holds the selected row");
+    assert_eq!(n, None, "the rolled-back table stayed");
 }

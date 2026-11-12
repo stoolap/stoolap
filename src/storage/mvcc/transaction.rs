@@ -156,7 +156,7 @@ pub trait TransactionEngineOperations: Send + Sync {
 
     /// The guard a DDL statement holds, so an undo of table changes runs
     /// as one: no other DDL lands between its catalog, store and log steps
-    fn ddl_guard(&self) -> parking_lot::MutexGuard<'_, ()>;
+    fn ddl_guard(&self) -> parking_lot::ReentrantMutexGuard<'_, ()>;
 
     /// List all tables
     fn list_tables(&self) -> Result<Vec<String>>;
@@ -474,7 +474,7 @@ impl MvccTransaction {
         changes: &[TableChange],
     ) -> Result<()> {
         let mut first_error = None;
-        // Only with changes: a DDL statement ends its own, changeless transactions under it
+        // Only with changes, so a rollback of rows alone takes no lock
         let _ddl = (!changes.is_empty()).then(|| ops.ddl_guard());
         for change in changes.iter().rev() {
             let undone = match change {

@@ -2388,6 +2388,23 @@ pub(crate) fn commit_marker_next() {
 }
 
 thread_local! {
+    static DDL_GUARD_WAITING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when it next finds the DDL guard held by another
+/// thread, before it waits for it
+pub fn on_ddl_guard_waiting(hook: impl FnOnce() + 'static) {
+    DDL_GUARD_WAITING_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn ddl_guard_waiting() {
+    let hook = DDL_GUARD_WAITING_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static TABLE_UNLISTED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
