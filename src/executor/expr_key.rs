@@ -73,11 +73,15 @@ impl ExprKey {
         hasher.finish()
     }
 
-    /// The key of a column reference by `name`, dotted when qualified
+    /// The key of a column reference by the column text `name`, its
+    /// qualifier and own name each lowered as an identifier is
     pub(crate) fn column(name: &str) -> Self {
         let mut hasher = KeyHasher::new();
         hasher.tag(b'I');
-        hasher.name(name);
+        match super::utils::split_qualified(name) {
+            Some((qualifier, own)) => hasher.qualified_name(qualifier, own),
+            None => hasher.name(name),
+        }
         hasher.finish()
     }
 
@@ -147,12 +151,24 @@ impl KeyHasher {
         self.write(text.as_bytes());
     }
 
-    /// A name, whatever its case
+    /// A name, whatever its case: lowered by the name rule, a final sigma
+    /// to its own letter
     fn name(&mut self, name: &str) {
-        for c in name.chars().flat_map(char::to_lowercase) {
-            self.write_u32(c as u32);
-        }
+        self.lowered(name);
         self.write_u32(u32::MAX);
+    }
+
+    /// A qualified column's name, each part lowered on its own
+    fn qualified_name(&mut self, qualifier: &str, name: &str) {
+        self.lowered(qualifier);
+        self.write_u32(super::utils::QUALIFIER_SEP as u32);
+        self.name(name);
+    }
+
+    fn lowered(&mut self, name: &str) {
+        crate::common::names::with_lowercase(name, |chars| {
+            chars.for_each(|c| self.write_u32(c as u32))
+        });
     }
 
     fn flag(&mut self, flag: bool) {
@@ -284,17 +300,7 @@ fn write_expr(expr: &Expression, hasher: &mut KeyHasher) {
         // A GROUP BY keeps a qualified column as its qualified column text
         Expression::QualifiedIdentifier(qid) => {
             hasher.tag(b'I');
-            for c in qid
-                .qualifier
-                .value_lower
-                .chars()
-                .chain(std::iter::once(super::utils::QUALIFIER_SEP))
-                .chain(qid.name.value_lower.chars())
-                .flat_map(char::to_lowercase)
-            {
-                hasher.write_u32(c as u32);
-            }
-            hasher.write_u32(u32::MAX);
+            hasher.qualified_name(&qid.qualifier.value_lower, &qid.name.value_lower);
         }
         Expression::IntegerLiteral(lit) => {
             hasher.tag(b'N');
@@ -700,6 +706,16 @@ mod tests {
         assert_eq!(ExprKey::column("A'B"), select_key("\"a'b\""));
         assert_eq!(ExprKey::column(&qualified("T", "v")), select_key("t.V"));
         assert_eq!(ExprKey::column(&qualified("a", "Σ")), select_key("a.\"Σ\""));
+        // A word-final capital sigma lowers to a final sigma in either form
+        assert_eq!(ExprKey::column("ΑΣ"), select_key("\"ΑΣ\""));
+        assert_eq!(
+            ExprKey::column(&qualified("a", "ΑΣ")),
+            select_key("a.\"ΑΣ\"")
+        );
+        assert_ne!(
+            ExprKey::column(&qualified("a", "Σ")),
+            ExprKey::column(&qualified("a", "ς"))
+        );
         // A dotted name is one name, never a qualified column
         assert_ne!(ExprKey::column("t.v"), select_key("t.v"));
         // A name as the resolver lowers it, a final sigma to its own letter
