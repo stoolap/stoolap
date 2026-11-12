@@ -2426,6 +2426,13 @@ impl MVCCEngine {
             WALOperationType::CreateTable => {
                 // Deserialize schema from entry data
                 if let Ok(schema) = self.deserialize_schema(&entry.data) {
+                    let table_name = schema.table_name_lower.clone();
+                    log.settle_renames_to(&table_name);
+                    // A table that has a store is a checkpoint's catalog copy: its rows stay
+                    if self.get_version_store(&table_name).is_ok() {
+                        return Ok(());
+                    }
+
                     // Create the table (version store)
                     let version_store = Arc::new(VersionStore::with_visibility_checker(
                         schema.table_name.clone(),
@@ -2435,9 +2442,6 @@ impl MVCCEngine {
 
                     // Register virtual PkIndex for INTEGER PRIMARY KEY
                     register_pk_index(&schema, &version_store);
-
-                    let table_name = schema.table_name_lower.clone();
-                    log.settle_renames_to(&table_name);
 
                     {
                         let mut schemas = self.schemas.write().unwrap();
