@@ -105,7 +105,7 @@ FROM employees;
 
 The `expression` of LAG, LEAD, FIRST_VALUE, LAST_VALUE and NTH_VALUE may be any expression over the row, such as `salary * 12` or a subquery; it is computed for each row of the partition, and the function returns the value it has at the row it picks. The `default` of LAG and LEAD is computed for each row as well.
 
-The `n` of NTILE, the `offset` of LAG and LEAD, the `n` of NTH_VALUE and a frame offset are read once for the call. They may hold a parameter or a subquery that reads no row, such as `NTILE((SELECT COUNT(*) FROM teams))`; one that reads the row, such as `NTILE(salary)`, is an error: `the bucket count of NTILE must not read the row`.
+The `offset` of LAG and LEAD and the `n` of NTH_VALUE are read at each row, like the `default`: they may read the row, so `LAG(name, gap)` looks back as far as each row's `gap` says, and a function that draws a new value per call, such as `RANDOM()`, draws one for each row. NTH_VALUE reads its `n` only at a row whose frame holds a row. The `n` of NTILE is read once for each partition, at its first row in the window's order, so `NTILE(team_size) OVER (PARTITION BY team ORDER BY joined)` splits each team into as many buckets as its earliest member's `team_size`, and a function there that draws a new value per call draws once per partition. A frame offset is read once for the call: it may hold a parameter or a subquery that reads no row, such as `ROWS BETWEEN (SELECT MAX(lag) FROM settings) PRECEDING AND CURRENT ROW`; one that reads the row is an error: `a frame offset must not read the row`.
 
 #### LAG(expression [, offset [, default]])
 Accesses a value from a previous row within the partition.

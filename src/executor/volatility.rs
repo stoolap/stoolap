@@ -77,53 +77,19 @@ pub(crate) fn statement_constant(expr: &Expression, registry: &FunctionRegistry)
 /// The name of a window frame offset, which its window reads once
 pub(crate) const FRAME_OFFSET: &str = "a frame offset";
 
-/// The name of an aggregate's argument after its first, which it reads once
-pub(crate) const AGGREGATE_ARGUMENT: &str = "an aggregate argument after the first";
-
-/// The argument a window function that is no aggregate reads once rather
-/// than for each row, by its position and name
-pub(crate) fn window_count_argument(function: &str) -> Option<(usize, &'static str)> {
-    let named = |name: &str| function.eq_ignore_ascii_case(name);
-    if named("NTILE") {
-        Some((0, "the bucket count of NTILE"))
-    } else if named("LEAD") {
-        Some((1, "the offset of LEAD"))
-    } else if named("LAG") {
-        Some((1, "the offset of LAG"))
-    } else if named("NTH_VALUE") {
-        Some((1, "the n of NTH_VALUE"))
-    } else {
-        None
-    }
-}
-
-/// The name of argument `at` of a call to `function`, a window function's
-/// when `over`, when the call reads it once rather than for each row: an
-/// aggregate's after its first, or the one [`window_count_argument`] gives
-pub(crate) fn read_once_argument(function: &str, at: usize, over: bool) -> Option<&'static str> {
-    match window_count_argument(function).filter(|_| over) {
-        Some((count_at, what)) => (count_at == at).then_some(what),
-        None => {
-            (at > 0 && super::utils::is_aggregate_function(function)).then_some(AGGREGATE_ARGUMENT)
-        }
-    }
-}
-
 /// The error of an argument `what`, read once, that reads the row
 pub(crate) fn reads_row(what: &str) -> crate::core::Error {
     crate::core::Error::invalid_argument(format!("{what} must not read the row"))
 }
 
-/// An error unless `arg`, which its call reads once rather than for each
-/// row, is one value for the call as [`statement_constant`] asks, except
-/// that a prepared block counts as one unless `reads_parent` holds for it,
-/// and a function drawing a value per call counts only when `draws`
-pub(crate) fn read_once(
+/// Whether `arg` is one value for its call as [`statement_constant`] asks,
+/// except that a prepared block counts as one unless `reads_parent` holds
+/// for it, and a function drawing a value per call counts only when `draws`
+pub(crate) fn statement_constant_in(
     arg: &Expression,
     registry: &FunctionRegistry,
-    what: &str,
     (draws, reads_parent): (bool, &dyn Fn(u16) -> bool),
-) -> crate::core::Result<()> {
+) -> bool {
     let walk = Walk {
         registry,
         statement_rows: &|_| false,
@@ -132,9 +98,20 @@ pub(crate) fn read_once(
         draws,
         reads_parent,
     };
-    match walk.expression(arg) {
-        Volatility::PerCall => Err(reads_row(what)),
-        Volatility::Fixed | Volatility::PerStatement => Ok(()),
+    walk.expression(arg) != Volatility::PerCall
+}
+
+/// An error unless `arg`, which its call reads once rather than for each
+/// row, is one value for the call as [`statement_constant_in`] asks
+pub(crate) fn read_once(
+    arg: &Expression,
+    registry: &FunctionRegistry,
+    what: &str,
+    read: (bool, &dyn Fn(u16) -> bool),
+) -> crate::core::Result<()> {
+    match statement_constant_in(arg, registry, read) {
+        true => Ok(()),
+        false => Err(reads_row(what)),
     }
 }
 

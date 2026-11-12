@@ -249,10 +249,10 @@ fn reads(db: &Database, t: &str, [i1, i2, i3]: [i64; 3]) {
         if t == "k" { 4 } else { 3 },
         "a star beside a window leaves rowid out in {t}"
     );
-    assert!(
-        error(db, &format!("SELECT STRING_AGG(b, _rowid_) FROM {t}"))
-            .contains("must not read the row"),
-        "rowid as an aggregate's later argument reads the row in {t}"
+    assert_eq!(
+        q("SELECT STRING_AGG(b, _rowid_ ORDER BY a) FROM $t"),
+        [[Value::text(format!("x{i2}y{i3}z"))]],
+        "rowid as an aggregate's later argument reads each row in {t}"
     );
     let lagged = db
         .query(

@@ -101,6 +101,9 @@ pub(crate) fn compare_sort_keys(
 #[derive(Default, Debug)]
 pub struct DistinctTracker {
     seen: hashbrown::HashSet<Value, ahash::RandomState>,
+    /// The value and later arguments of each row seen, for a call that
+    /// reads its later arguments for each row
+    rows: Option<Box<hashbrown::HashSet<Box<[Value]>, ahash::RandomState>>>,
 }
 
 impl DistinctTracker {
@@ -124,6 +127,17 @@ impl DistinctTracker {
         self.check_and_add(value)
     }
 
+    /// Whether `value` with the later arguments `args` of its row is the
+    /// first such row; NULLs are equal here, as DISTINCT reads them
+    pub fn check_and_add_row(&mut self, value: &Value, args: &[Value]) -> bool {
+        let row: smallvec::SmallVec<[Value; 4]> =
+            std::iter::once(value).chain(args).cloned().collect();
+        let rows = self.rows.get_or_insert_with(Box::default);
+        let before = rows.len();
+        rows.get_or_insert_with(&row[..], |row| row.into());
+        rows.len() > before
+    }
+
     /// Get the count of distinct values
     #[inline]
     pub fn count(&self) -> usize {
@@ -133,6 +147,9 @@ impl DistinctTracker {
     /// Reset the tracker
     pub fn reset(&mut self) {
         self.seen.clear();
+        if let Some(rows) = &mut self.rows {
+            rows.clear();
+        }
     }
 }
 
@@ -192,6 +209,25 @@ impl AggregateState {
     pub fn accumulate_with_sort_key(&mut self, value: &Value, sort_keys: Vec<Value>) {
         if self.admits(value) {
             self.function.accumulate_with_sort_key(value, sort_keys);
+        }
+    }
+
+    /// Accumulates one input value with the later arguments its row reads,
+    /// and the call's ORDER BY keys for it when it orders its input. Under
+    /// DISTINCT a row counts once for the value and arguments together
+    #[inline]
+    pub fn accumulate_with_args(
+        &mut self,
+        value: &Value,
+        args: &[Value],
+        sort_keys: Option<Vec<Value>>,
+    ) {
+        let first = match &mut self.distinct {
+            Some(seen) if !value.is_null() => seen.check_and_add_row(value, args),
+            _ => true,
+        };
+        if first {
+            self.function.accumulate_with_args(value, args, sort_keys);
         }
     }
 

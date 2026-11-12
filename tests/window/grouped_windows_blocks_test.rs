@@ -604,7 +604,7 @@ fn a_where_set_raises_its_error_only_for_a_row_that_reaches_it() {
 }
 
 #[test]
-fn an_argument_read_once_that_reads_the_row_is_an_error() {
+fn an_argument_read_at_a_row_reads_it_and_a_frame_offset_reading_it_is_an_error() {
     let _guard = serial();
     let dir = tempfile::tempdir().unwrap();
     let hot = Database::open("memory://grouped_windows_blocks_row_argument").unwrap();
@@ -615,76 +615,57 @@ fn an_argument_read_once_that_reads_the_row_is_an_error() {
     let reads = "(SELECT COUNT(*) FROM u WHERE u.k = t.a)";
     let mut wrong = Vec::new();
     for db in [&hot, &sealed] {
-        for (call, what) in [
-            (
-                "NTILE({r}) OVER (ORDER BY t.id)",
-                "the bucket count of NTILE",
-            ),
-            (
-                "NTILE(t.a) OVER (ORDER BY t.id)",
-                "the bucket count of NTILE",
-            ),
-            (
-                "NTILE(t.a + (SELECT 1)) OVER (ORDER BY t.id)",
-                "the bucket count of NTILE",
-            ),
-            ("LAG(t.b, {r}) OVER (ORDER BY t.id)", "the offset of LAG"),
-            ("LAG(t.b, t.a) OVER (ORDER BY t.id)", "the offset of LAG"),
-            (
-                "LEAD(t.b, {r}, 0) OVER (ORDER BY t.id)",
-                "the offset of LEAD",
-            ),
-            (
-                "NTH_VALUE(t.b, {r}) OVER (ORDER BY t.id)",
-                "the n of NTH_VALUE",
-            ),
-            (
-                "SUM(t.b) OVER (ORDER BY t.id ROWS BETWEEN {r} PRECEDING AND CURRENT ROW)",
-                "a frame offset",
-            ),
-            (
-                "STRING_AGG(CAST(t.b AS TEXT), CAST({r} AS TEXT)) OVER (ORDER BY t.id)",
-                "an aggregate argument after the first",
-            ),
+        for call in [
+            "NTILE({r}) OVER (ORDER BY t.id)",
+            "NTILE(t.a) OVER (ORDER BY t.id)",
+            "NTILE(t.a + (SELECT 1)) OVER (ORDER BY t.id)",
+            "LAG(t.b, {r}) OVER (ORDER BY t.id)",
+            "LAG(t.b, t.a) OVER (ORDER BY t.id)",
+            "LEAD(t.b, {r}, 0) OVER (ORDER BY t.id)",
+            "NTH_VALUE(t.b, {r}) OVER (ORDER BY t.id)",
+            "STRING_AGG(CAST(t.b AS TEXT), CAST({r} AS TEXT)) OVER (ORDER BY t.id)",
         ] {
             let call = call.replace("{r}", reads);
             for sql in [
                 format!("SELECT t.id, {call} FROM t"),
                 format!("SELECT t.id, {call}, {reads} FROM t"),
             ] {
-                check_reads_row(db, &sql, what, &mut wrong);
+                check_reads_row(db, &sql, None, &mut wrong);
             }
         }
         for sql in [
             format!("SELECT t.a, STRING_AGG(CAST(t.b AS TEXT), CAST({reads} AS TEXT)) FROM t GROUP BY t.a"),
             format!("SELECT t.a, NTILE({reads}) OVER (ORDER BY t.a) FROM t GROUP BY t.a"),
+        ] {
+            check_reads_row(db, &sql, None, &mut wrong);
+        }
+        for sql in [
+            format!(
+                "SELECT t.id, SUM(t.b) OVER (ORDER BY t.id \
+                 ROWS BETWEEN {reads} PRECEDING AND CURRENT ROW) FROM t"
+            ),
             format!(
                 "SELECT t.id, SUM(t.b) OVER w FROM t \
                  WINDOW w AS (ORDER BY t.id ROWS BETWEEN {reads} PRECEDING AND CURRENT ROW)"
             ),
         ] {
-            let what = match sql.contains("STRING_AGG") {
-                true => "an aggregate argument after the first",
-                false if sql.contains("NTILE") => "the bucket count of NTILE",
-                false => "a frame offset",
-            };
-            check_reads_row(db, &sql, what, &mut wrong);
+            check_reads_row(db, &sql, Some("a frame offset"), &mut wrong);
         }
     }
-    let sql = format!("SELECT t.id, NTILE($1 + {reads}) OVER (ORDER BY t.id) FROM t");
-    match hot.query(&sql, (1,)).map(|rows| rows.count()) {
-        Err(e)
-            if e.to_string()
-                .contains("the bucket count of NTILE must not read the row") => {}
-        other => wrong.push(format!("{sql}: {other:?}")),
-    }
-    let sql = "SELECT NTILE($1 + (SELECT MIN(u.x) FROM u)) OVER (ORDER BY t.id) FROM t \
-               ORDER BY t.id";
     let ntile = |result: stoolap::Rows| -> Vec<i64> {
         result
             .map(|row| row.unwrap().get::<i64>(0).unwrap())
             .collect()
     };
+    // Read at t.id 1, whose t.a 1 four rows of u match: 1 + 4 buckets of 40
+    let sql = format!("SELECT NTILE($1 + {reads}) OVER (ORDER BY t.id) FROM t ORDER BY t.id");
+    let got = ntile(hot.query(&sql, (1,)).unwrap());
+    let want: Vec<i64> = (0..200).map(|i| i / 40 + 1).collect();
+    if got != want {
+        wrong.push(format!("{sql}: {got:?}"));
+    }
+    let sql = "SELECT NTILE($1 + (SELECT MIN(u.x) FROM u)) OVER (ORDER BY t.id) FROM t \
+               ORDER BY t.id";
     let got = ntile(hot.query(sql, (3,)).unwrap());
     let want = ntile(
         hot.query(
@@ -699,13 +680,18 @@ fn an_argument_read_once_that_reads_the_row_is_an_error() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// `sql` refused with the error of the argument `what`, read once, that
-/// reads the row, and no general mechanism run for it
-fn check_reads_row(db: &Database, sql: &str, what: &str, wrong: &mut Vec<String>) {
+/// `sql` answered, or refused with the error of the argument `refused`,
+/// read once, that reads the row, and no general mechanism run for it
+fn check_reads_row(db: &Database, sql: &str, refused: Option<&str>, wrong: &mut Vec<String>) {
     let before = general_hits();
     let got = rows(db, sql);
-    let refused = matches!(&got, Err(e) if e.contains(&format!("{what} must not read the row")));
-    if !refused || general_hits() != before {
+    let as_asked = match refused {
+        Some(what) => {
+            matches!(&got, Err(e) if e.contains(&format!("{what} must not read the row")))
+        }
+        None => got.is_ok(),
+    };
+    if !as_asked || general_hits() != before {
         wrong.push(format!("{sql}\n  got {got:?}"));
     }
 }

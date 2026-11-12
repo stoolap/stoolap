@@ -79,7 +79,7 @@ fn a_separator_reading_the_enclosing_row_is_read_for_each_call() {
             &[
                 (1, Some("a-b")),
                 (2, Some("a+b")),
-                (3, None),
+                (3, Some("ce")),
                 (4, Some("cxe")),
                 (5, Some("d")),
             ],
@@ -90,7 +90,7 @@ fn a_separator_reading_the_enclosing_row_is_read_for_each_call() {
             &[
                 (1, Some("a--b")),
                 (2, Some("a++b")),
-                (3, None),
+                (3, Some("ce")),
                 (4, Some("cxxe")),
                 (5, Some("d")),
             ],
@@ -101,7 +101,7 @@ fn a_separator_reading_the_enclosing_row_is_read_for_each_call() {
             &[
                 (1, Some("a-b")),
                 (2, Some("a+b")),
-                (3, None),
+                (3, Some("ce")),
                 (4, Some("cxe")),
                 (5, None),
             ],
@@ -159,18 +159,21 @@ fn a_parameter_separator_is_read_for_each_execution() {
 }
 
 #[test]
-fn a_separator_reading_the_block_row_is_an_error() {
+fn a_separator_reading_the_block_row_is_read_for_each_row() {
     let dir = tempfile::tempdir().unwrap();
     let db = setup("block_later_arguments_own_row", &dir, false);
-    let sql = "SELECT id, (SELECT STRING_AGG(t2.s, t2.sep) FROM t t2 WHERE t2.k = t.k) FROM t";
-    let error = db
-        .query(sql, ())
-        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-        .unwrap_err()
-        .to_string();
-    assert!(
-        error.contains("an aggregate argument after the first must not read the row"),
-        "{error}"
+    let sql = "SELECT id, (SELECT STRING_AGG(t2.s, t2.sep ORDER BY t2.id) FROM t t2 \
+               WHERE t2.k = t.k) FROM t ORDER BY id";
+    assert_eq!(
+        answers(&db, sql, ()),
+        texts(&[
+            (1, Some("a+b")),
+            (2, Some("a+b")),
+            (3, Some("cxe")),
+            (4, Some("cxe")),
+            (5, Some("d")),
+        ]),
+        "{sql}"
     );
 }
 

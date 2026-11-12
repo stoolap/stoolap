@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A STRING_AGG or GROUP_CONCAT separator is one value for the statement,
-//! read as CONCAT_WS reads its separator: a NULL one gives NULL, and one
-//! that reads the row is an error.
+//! A STRING_AGG or GROUP_CONCAT separator is read as CONCAT_WS reads its
+//! separator, except that a NULL one joins nothing, and one that reads the
+//! row is read at each row.
 
 use stoolap::{Database, Value};
 
@@ -63,8 +63,10 @@ fn create(db: &Database) {
 
 fn check(db: &Database, storage: &str, wrong: &mut Vec<String>) {
     for sep in SEPARATORS {
-        let want =
-            last_of_first_row(db.query(&format!("SELECT CONCAT_WS({sep}, 'x', 'y')"), ("+",)));
+        let want = match sep {
+            "NULL" => Ok(Value::text("xy")),
+            _ => last_of_first_row(db.query(&format!("SELECT CONCAT_WS({sep}, 'x', 'y')"), ("+",))),
+        };
         for shape in SHAPES {
             let sql = shape.replace("{sep}", sep);
             let got = last_of_first_row(db.query(&sql, ("+",)));
@@ -75,8 +77,9 @@ fn check(db: &Database, storage: &str, wrong: &mut Vec<String>) {
     }
     for shape in SHAPES {
         let sql = shape.replace("{sep}", "sep");
-        if let Ok(got) = last_of_first_row(db.query(&sql, ())) {
-            wrong.push(format!("{storage}: {sql} gave {got:?}, want an error"));
+        let got = last_of_first_row(db.query(&sql, ()));
+        if got != Ok(Value::text("x-y")) {
+            wrong.push(format!("{storage}: {sql} gave {got:?}, want x-y"));
         }
     }
     for shape in SHAPES {

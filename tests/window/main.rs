@@ -25,6 +25,7 @@ mod grouping_sets_window_test;
 mod named_window_extension_test;
 mod order_by_window_test;
 mod planned_window_test;
+mod row_arguments_test;
 mod unused_window_test;
 mod window_advanced_test;
 mod window_argument_once_test;
