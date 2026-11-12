@@ -1329,15 +1329,17 @@ pub trait Table: Send + Sync {
     /// Up to `limit` rows past `offset` in the order of `keys`, each a column
     /// and whether its NULLs come before its values, all ascending or all
     /// descending, read by walking the index whose leading columns they are.
-    /// None when the table cannot read them so, which leaves them to a sort
+    /// None when the table cannot read them so, which leaves them to a sort.
+    /// The walk asks `cancelled` as it goes and, once it is true, stops and
+    /// fails with `QueryCancelled` after letting the index go
     fn collect_rows_ordered_by_index_keys(
         &self,
         keys: &[(&str, bool)],
         ascending: bool,
-        limit: usize,
-        offset: usize,
+        (limit, offset): (usize, usize),
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<Option<RowVec>> {
-        let _ = (keys, ascending, limit, offset);
+        let _ = (keys, ascending, limit, offset, cancelled);
         Ok(None)
     }
 

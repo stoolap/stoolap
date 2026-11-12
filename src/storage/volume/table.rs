@@ -7051,11 +7051,11 @@ impl Table for SegmentedTable {
         &self,
         keys: &[(&str, bool)],
         ascending: bool,
-        limit: usize,
-        offset: usize,
+        cut: (usize, usize),
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<Option<RowVec>> {
         if let Some(result) = self
-            .unsealed(|hot| hot.collect_rows_ordered_by_index_keys(keys, ascending, limit, offset))
+            .unsealed(|hot| hot.collect_rows_ordered_by_index_keys(keys, ascending, cut, cancelled))
         {
             return result;
         }

@@ -5047,8 +5047,8 @@ impl Table for MVCCTable {
         &self,
         keys: &[(&str, bool)],
         ascending: bool,
-        limit: usize,
-        offset: usize,
+        (limit, offset): (usize, usize),
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<Option<RowVec>> {
         let needed = limit.saturating_add(offset);
         if needed == 0 {
@@ -5086,9 +5086,17 @@ impl Table for MVCCTable {
         // A row whose visible values differ from its key was changed between
         // the index and the version this statement sees: the full sort answers
         let mut stale = false;
+        // A cancel is seen every hundred rows, and raised once the walk has
+        // let the index go
+        let (mut visits, mut cancel) = (0usize, false);
         let walked = index.walk_keys_ordered(ascending, &nulls_first, &mut |row_id, key| {
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::hot_top_k_visited();
+            visits += 1;
+            if visits % 100 == 0 && cancelled() {
+                cancel = true;
+                return false;
+            }
             if let Some(version) = self
                 .version_store
                 .get_visible_version(row_id, self.reader())
@@ -5107,6 +5115,9 @@ impl Table for MVCCTable {
             }
             rows.len() < needed
         });
+        if cancel {
+            return Err(Error::QueryCancelled);
+        }
         if !walked || stale || self.index_view_epoch() != Some(epoch) {
             return Ok(None);
         }

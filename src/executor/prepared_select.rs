@@ -15839,7 +15839,13 @@ impl<'a> PreparedRunner<'a> {
             .iter()
             .map(|&(column, nulls)| (column, crate::core::value::nulls_first(ascending, nulls)))
             .collect();
-        let rows = table.collect_rows_ordered_by_index_keys(&keys, ascending, limit, offset)?;
+        let cancelled = || ctx.is_cancelled();
+        let rows = table.collect_rows_ordered_by_index_keys(
+            &keys,
+            ascending,
+            (limit, offset),
+            &cancelled,
+        )?;
         ctx.check_cancelled()?;
         if rows.is_some() {
             super::result::OrderLimitPath::PreparedIndexKeys.taken();

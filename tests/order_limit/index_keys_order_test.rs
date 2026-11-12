@@ -245,3 +245,40 @@ fn an_order_of_two_keys_walks_only_the_rows_it_keeps() {
         );
     }
 }
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_cancel_stops_the_walk_while_it_reads() {
+    use stoolap::test_failpoints::{hot_top_k_visits, on_hot_top_k_visit};
+    let db = Database::open("memory://index_keys_order_cancel").unwrap();
+    for sql in [
+        "CREATE TABLE big (a INTEGER, b INTEGER)",
+        "INSERT INTO big SELECT value % 10, value FROM generate_series(1, 5000)",
+        "CREATE INDEX big_ab ON big (a, b)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let executor = stoolap::Executor::new(std::sync::Arc::clone(db.engine()));
+    let ctx = stoolap::ExecutionContext::new();
+    let handle = ctx.clone();
+    on_hot_top_k_visit(move || handle.cancel());
+    let before = hot_top_k_visits();
+    let read = executor
+        .execute_with_context(
+            "SELECT a, b FROM big ORDER BY a, b LIMIT 10 OFFSET 1000",
+            &ctx,
+        )
+        .and_then(|mut rows| {
+            while rows.next() {}
+            rows.last_error().map_or(Ok(()), Err)
+        });
+    let visits = hot_top_k_visits() - before;
+    assert!(
+        matches!(read, Err(stoolap::Error::QueryCancelled)),
+        "{read:?}"
+    );
+    assert!(
+        visits <= 100,
+        "the walk read {visits} rows after its cancel"
+    );
+}
