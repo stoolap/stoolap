@@ -94,6 +94,43 @@ fn a_crash_after_the_catalog_copies_before_the_manifests_keeps_the_rows() {
 }
 
 #[test]
+fn a_crash_after_the_catalog_copies_of_a_reopened_table_with_a_default_keeps_the_rows() {
+    let _guard = test_failpoints::FailpointGuard::new();
+    let root = tempfile::tempdir().unwrap();
+    let (first, crashed) = (root.path().join("0"), root.path().join("1"));
+    let db = Database::open(&dsn(&first)).unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER DEFAULT 7)",
+        "INSERT INTO t (id) SELECT value FROM generate_series(1, 100)",
+        "PRAGMA CHECKPOINT",
+    ] {
+        db.execute(sql, ()).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    db.close().unwrap();
+    let db = Database::open(&dsn(&first)).unwrap();
+    db.execute("UPDATE t SET n = 8 WHERE id <= 10", ()).unwrap();
+    let (from, to) = (first.clone(), crashed.clone());
+    test_failpoints::after_checkpoint_managers_taken(move || crash_image(&from, &to));
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.close().unwrap();
+    let db = Database::open(&dsn(&crashed)).unwrap();
+    db.execute("INSERT INTO t (id) VALUES (101)", ()).unwrap();
+    let row = db
+        .query("SELECT COUNT(*), SUM(n) FROM t", ())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    let rows: (i64, i64) = (row.get(0).unwrap(), row.get(1).unwrap());
+    assert_eq!(
+        rows,
+        (101, 717),
+        "rows after the crash, and a default after it"
+    );
+    db.close().unwrap();
+}
+
+#[test]
 fn a_crash_after_a_checkpoint_whose_manifests_failed_keeps_the_rows() {
     let _guard = test_failpoints::FailpointGuard::new();
     let root = tempfile::tempdir().unwrap();

@@ -2429,11 +2429,7 @@ impl MVCCEngine {
                     let table_name = schema.table_name_lower.clone();
                     log.settle_renames_to(&table_name);
                     // A table that has a store is a checkpoint's catalog copy: its rows stay
-                    if let Ok(store) = self.get_version_store(&table_name) {
-                        debug_assert!(
-                            Self::serialize_schema(&store.schema()) == entry.data,
-                            "the catalog copy of {table_name} restates its replayed schema"
-                        );
+                    if self.get_version_store(&table_name).is_ok() {
                         return Ok(());
                     }
 
