@@ -285,6 +285,179 @@ fn a_side_file_that_does_not_open_is_replaced_by_a_pass() {
     assert_eq!(served(&db, 100, 103), (2, 0), "the rebuilt file reopens");
 }
 
+/// A side file of an older format is served as it was written, and a pass
+/// rebuilds it in the current one, after the volumes with no side file at
+/// all, although those are the later volumes.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_side_file_of_an_older_format_is_rebuilt_after_the_volumes_with_none() {
+    use stoolap::storage::volume::secondary::{rewrite_as_legacy, IndexFile};
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = open(dir.path(), "");
+        create(&db);
+        db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+        seal_volumes(&db, 3);
+        db.close().unwrap();
+    }
+    let table_dir = dir.path().join("volumes").join("t");
+    let version_of = |path: &Path| IndexFile::open(path, 1).unwrap().version();
+    let mut sides: Vec<_> = std::fs::read_dir(&table_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("sidx"))
+        .collect();
+    sides.sort_by_key(|p| {
+        stoolap::storage::volume::secondary::side_stem(p)
+            .and_then(|stem| stem.rsplit('_').next().map(str::to_string))
+            .and_then(|id| u64::from_str_radix(&id, 16).ok())
+            .unwrap_or_default()
+    });
+    assert_eq!(sides.len(), 3, "one side file per volume");
+    let current = version_of(&sides[2]);
+    assert!(sides.iter().all(|p| version_of(p) == current));
+    // The first volume's file is rewritten in the older format, as a
+    // database upgraded from the release before this one holds it; the
+    // second volume's goes away
+    rewrite_as_legacy(&sides[0]);
+    std::fs::remove_file(&sides[1]).unwrap();
+    assert!(version_of(&sides[0]) < current, "an older format");
+    assert!(version_of(&sides[2]) == current, "the third is untouched");
+
+    let db = open(dir.path(), "");
+    assert_eq!(
+        served(&db, 100, 103),
+        (2, 1),
+        "the older format serves, the volume with no file is ineligible"
+    );
+    // The volume with no side file is built first, although it is the
+    // later volume
+    let first = backfill(&db, Some(1));
+    assert_eq!((first["examined"], first["built"]), (1, 1));
+    assert_eq!(served(&db, 100, 103), (3, 0), "it is served from then on");
+    let second = backfill(&db, Some(1));
+    assert_eq!((second["examined"], second["built"]), (1, 1));
+    assert_eq!(served(&db, 100, 103), (3, 0));
+    let third = backfill(&db, None);
+    assert_eq!(third["examined"], 0, "nothing left to cover");
+    assert!(leftovers(dir.path(), "t").is_empty());
+    db.close().unwrap();
+
+    let mut sides: Vec<_> = std::fs::read_dir(&table_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("sidx"))
+        .collect();
+    sides.sort_by_key(|p| {
+        stoolap::storage::volume::secondary::side_stem(p)
+            .and_then(|stem| stem.rsplit('_').next().map(str::to_string))
+            .and_then(|id| u64::from_str_radix(&id, 16).ok())
+            .unwrap_or_default()
+    });
+    assert_eq!(sides.len(), 3, "one side file per volume again");
+    assert!(
+        sides.iter().all(|p| version_of(p) == current),
+        "every file is of the current format"
+    );
+}
+
+/// Rewrites every side file of `table` in the version 5 layout
+#[cfg(feature = "test-failpoints")]
+fn all_legacy(dir: &Path, table: &str) {
+    for name in side_names(dir, table) {
+        stoolap::storage::volume::secondary::rewrite_as_legacy(
+            &dir.join("volumes").join(table).join(name),
+        );
+    }
+}
+
+/// A volume with no side file is built before the older files of a table
+/// that sorts first.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_volume_with_no_side_file_is_built_before_another_table_s_older_files() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = open(dir.path(), "");
+        db.execute(
+            "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER NOT NULL)",
+            (),
+        )
+        .unwrap();
+        db.execute("CREATE INDEX idx_a_k ON a(k)", ()).unwrap();
+        for batch in 0..2 {
+            db.execute(
+                &format!(
+                    "INSERT INTO a VALUES ({}, 1), ({}, 2)",
+                    batch * 2 + 1,
+                    batch * 2 + 2
+                ),
+                (),
+            )
+            .unwrap();
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        create(&db);
+        seal_volumes(&db, 1);
+        db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+        db.close().unwrap();
+    }
+    all_legacy(dir.path(), "a");
+    assert_eq!(files(dir.path(), "a", "sidx").len(), 2);
+    assert!(files(dir.path(), "t", "sidx").is_empty());
+    let db = open(dir.path(), "");
+    let first = backfill(&db, Some(1));
+    assert_eq!((first["examined"], first["built"]), (1, 1), "{first:?}");
+    assert_eq!(
+        files(dir.path(), "t", "sidx").len(),
+        1,
+        "t's volume, with no side file, is built first"
+    );
+}
+
+/// A volume that comes to need a side file after a pass moved on to the
+/// older files is built at the next pass, ahead of the older files left,
+/// although its table sorts before the one the pass stopped in.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_volume_needing_a_side_file_after_a_pass_moved_on_is_built_next() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = open(dir.path(), "");
+        create(&db);
+        db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+        seal_volumes(&db, 3);
+        db.execute(
+            "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER NOT NULL)",
+            (),
+        )
+        .unwrap();
+        db.execute("INSERT INTO a VALUES (1, 1), (2, 2)", ())
+            .unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        db.close().unwrap();
+    }
+    all_legacy(dir.path(), "t");
+    let db = open(dir.path(), "");
+    let first = backfill(&db, Some(1));
+    assert_eq!((first["examined"], first["built"]), (1, 1), "{first:?}");
+    // Sealed with no index, a's volume has no side file and needs one now
+    db.execute("CREATE INDEX idx_a_k ON a(k)", ()).unwrap();
+    assert!(files(dir.path(), "a", "sidx").is_empty());
+    let second = backfill(&db, Some(1));
+    assert_eq!((second["examined"], second["built"]), (1, 1), "{second:?}");
+    assert_eq!(
+        files(dir.path(), "a", "sidx").len(),
+        1,
+        "a's volume is built before t's two older files left"
+    );
+}
+
 /// A backfill takes at most half the builds budget, and sizes its
 /// workspace to that share: a volume whose least workspace does not fit
 /// is refused and left, and one that fits is built in runs merged under
@@ -788,7 +961,7 @@ fn readable(path: &Path, yes: bool) {
 }
 
 /// A volume whose build keeps failing does not keep the newer ones from
-/// their turn: the next pass starts after it.
+/// their turn: the next pass takes them before it.
 #[cfg(unix)]
 #[test]
 fn a_failing_volume_does_not_starve_the_newer_ones() {
@@ -824,8 +997,51 @@ fn a_failing_volume_does_not_starve_the_newer_ones() {
     assert_eq!(served(&db, 100, 103), (2, 0));
 }
 
+/// A volume with no side file that cannot be built waits behind the
+/// volumes whose file lacks an index created since, so those are built.
+#[cfg(unix)]
+#[test]
+fn a_failing_volume_with_no_side_file_does_not_starve_a_file_missing_an_index() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "");
+    // Table a sorts first; its only volume has no side file and cannot be read
+    db.execute(
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER NOT NULL)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO a VALUES (1, 1), (2, 2)", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("CREATE INDEX idx_a_k ON a(k)", ()).unwrap();
+    create(&db);
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    seal_volumes(&db, 1);
+    db.close().unwrap();
+    let db = open(dir.path(), "");
+    // t's current file covers k, not the index on v created now
+    db.execute("CREATE INDEX idx_t_v ON t(v)", ()).unwrap();
+    let a_volume = std::fs::read_dir(dir.path().join("volumes").join("a"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("vol"))
+        .unwrap();
+    readable(&a_volume, false);
+    let first = backfill(&db, Some(1));
+    assert_eq!((first["failed"], first["left"]), (1, 1), "{first:?}");
+    let second = backfill(&db, Some(1));
+    readable(&a_volume, true);
+    assert_eq!(
+        (second["examined"], second["built"]),
+        (1, 1),
+        "t's file takes its turn: {second:?}"
+    );
+}
+
 /// A volume that cannot be built in one table does not keep another
-/// table's volumes from their turn either: the cursor spans the tables.
+/// table's volumes from their turn either: it waits behind every table's.
 #[cfg(unix)]
 #[test]
 fn a_failing_volume_does_not_starve_another_table() {
