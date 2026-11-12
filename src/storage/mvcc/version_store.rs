@@ -7763,20 +7763,29 @@ impl TransactionVersionStore {
                 .filter(|version| !version.is_deleted())
         };
         let rows = key_bucket(&mut tracking.local_keys, columns, hash);
-        // Every copy of `row_id` goes, to come back once
+        // Every copy of `row_id` goes, to come back once, and every copy of
+        // the holder but the first
         let mut entered = false;
+        let mut holder = None;
         rows.retain(|held| {
-            let live = latest(*held).and_then(|version| row_key_hash(&version.data, columns))
-                == Some(hash);
-            if *held == row_id {
-                entered |= live;
+            let held = *held;
+            let Some(version) = latest(held) else {
+                return false;
+            };
+            if row_key_hash(&version.data, columns) != Some(hash) {
                 return false;
             }
-            live
-        });
-        let holder = values.and_then(|values| {
-            (rows.iter().copied())
-                .find(|&held| latest(held).is_some_and(|v| key_held(&v.data, columns, values)))
+            if held == row_id {
+                entered = true;
+                return false;
+            }
+            if holder == Some(held) {
+                return false;
+            }
+            if holder.is_none() && values.is_some_and(|v| key_held(&version.data, columns, v)) {
+                holder = Some(held);
+            }
+            true
         });
         if holder.is_none() || entered {
             rows.push(row_id);
@@ -10098,6 +10107,38 @@ mod tests {
             for (id, u) in [(1, -1), (2, 2)] {
                 assert_eq!(txn.claim_key(&*index, &[Value::from(u)], id).unwrap(), None);
             }
+        }
+        let tracking = txn.tracking.as_deref().unwrap();
+        let held = tracking.local_keys[0].1[&key_hash(&[Value::from(-1i64)])].len();
+        assert_eq!(held, 1, "rows entered for key -1");
+    }
+
+    #[test]
+    fn a_holder_met_again_after_moving_back_stays_entered_once() {
+        use crate::core::types::DataType;
+        use crate::storage::index::HashIndex;
+        let store = Arc::new(VersionStore::new("t".to_string(), test_schema()));
+        let index = Arc::new(HashIndex::new(
+            "t_u".to_string(),
+            "t".to_string(),
+            vec!["u".to_string()],
+            vec![1],
+            vec![DataType::Integer],
+            true,
+            0,
+        ));
+        store.add_index("t_u".to_string(), index.clone());
+        let mut txn = TransactionVersionStore::new(Arc::clone(&store), 1);
+        txn.track_keys();
+        let row = |id: i64, u: i64| Row::from(vec![Value::from(id), Value::from(u)]);
+        txn.put(1, row(1, 1), false).unwrap();
+        txn.put(2, row(2, 2), false).unwrap();
+        for new_row in 101..151 {
+            for (id, u) in [(1, 1), (2, -1), (2, 2), (1, -1)] {
+                txn.put(id, row(id, u), false).unwrap();
+            }
+            let met = txn.claim_key(&*index, &[Value::from(-1i64)], new_row);
+            assert_eq!(met.unwrap(), Some(1), "holder of -1");
         }
         let tracking = txn.tracking.as_deref().unwrap();
         let held = tracking.local_keys[0].1[&key_hash(&[Value::from(-1i64)])].len();
