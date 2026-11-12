@@ -28,7 +28,7 @@ use crate::core::{DataType, Error, ForeignKeyAction, ForeignKeyConstraint, Resul
 use crate::parser::ast::*;
 use crate::storage::mvcc::engine::ViewDefinition;
 use crate::storage::traits::transaction::StatementTable;
-use crate::storage::traits::{Engine, QueryResult};
+use crate::storage::traits::{Engine, NewIndex, QueryResult};
 
 /// Validate a foreign key reference and build a `ForeignKeyConstraint`.
 ///
@@ -503,188 +503,42 @@ impl Executor {
             }
             fk_index_columns.push(col.name.clone());
         }
-        // Refused before the table is made when an index it gets would not be
-        // stored, of the type the index takes on its columns
-        let indexes = (unique_columns
+        // The indexes the table is made with, built before it is reachable
+        let mut indexes: Vec<NewIndex> = unique_columns
             .iter()
-            .map(|c| (unique_index_name(table_name, c), vec![c.as_str()])))
-        .chain(
+            .map(|c| NewIndex {
+                name: unique_index_name(table_name, c),
+                columns: vec![c.clone()],
+                unique: true,
+            })
+            .collect();
+        indexes.extend(
             table_unique_constraints
                 .iter()
                 .enumerate()
-                .map(|(i, columns)| {
-                    let columns: Vec<&str> = columns.iter().map(String::as_str).collect();
-                    (table_unique_index_name(table_name, i), columns)
+                .map(|(i, columns)| NewIndex {
+                    name: table_unique_index_name(table_name, i),
+                    columns: columns.clone(),
+                    unique: true,
                 }),
-        )
-        .chain(
-            fk_index_columns
-                .iter()
-                .map(|c| (fk_index_name(table_name, c), vec![c.as_str()])),
         );
-        for (name, columns) in indexes {
-            let data_types: Vec<DataType> = columns
-                .iter()
-                .map(|c| {
-                    schema
-                        .find_column(c)
-                        .map_or(DataType::Null, |(_, col)| col.data_type)
-                })
-                .collect();
-            let index_type =
-                crate::storage::mvcc::table::MVCCTable::index_type_for(&data_types, None);
-            crate::storage::mvcc::engine::check_index_name(&name, index_type)?;
-        }
-
-        // Check if there's an active transaction
+        indexes.extend(fk_index_columns.iter().map(|c| NewIndex {
+            name: fk_index_name(table_name, c),
+            columns: vec![c.clone()],
+            unique: false,
+        }));
         let mut active_tx = self.active_transaction.lock().unwrap();
-
-        if let Some(ref mut tx_state) = *active_tx {
-            // Use the active transaction for DDL (allows rollback)
-            let table = tx_state.transaction.create_table(table_name, schema)?;
-
-            // Create unique indexes for columns with UNIQUE constraint
-            for col_name in &unique_columns {
-                let index_name = unique_index_name(table_name, col_name);
-                table.create_index(&index_name, &[col_name.as_str()], true)?;
-                // Get index type for WAL persistence
-                let idx_type = table
-                    .get_index(&index_name)
-                    .map(|idx| idx.index_type())
-                    .unwrap_or(crate::core::IndexType::BTree);
-                // Record index creation to WAL for persistence
-                self.engine.record_create_index(
-                    table_name,
-                    &index_name,
-                    std::slice::from_ref(col_name),
-                    true,
-                    idx_type,
-                    None,
-                    None,
-                    None,
-                    None,
-                )?;
+        match active_tx.as_mut() {
+            // The active transaction's rollback drops the table
+            Some(tx_state) => {
+                tx_state
+                    .transaction
+                    .create_table_with_indexes(table_name, schema, &indexes)?;
+                self.engine.record_table_indexes(table_name, &indexes)?;
             }
-
-            // Create multi-column unique indexes from table-level constraints
-            for (i, col_names) in table_unique_constraints.iter().enumerate() {
-                let index_name = table_unique_index_name(table_name, i);
-                let col_refs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
-                table.create_index(&index_name, &col_refs, true)?;
-                // Get index type for WAL persistence
-                let idx_type = table
-                    .get_index(&index_name)
-                    .map(|idx| idx.index_type())
-                    .unwrap_or(crate::core::IndexType::BTree);
-                // Record index creation to WAL for persistence
-                self.engine.record_create_index(
-                    table_name,
-                    &index_name,
-                    col_names,
-                    true,
-                    idx_type,
-                    None,
-                    None,
-                    None,
-                    None,
-                )?;
-            }
-
-            // Auto-create indexes on FK columns for efficient referential integrity checks
-            for col_name in &fk_index_columns {
-                let index_name = fk_index_name(table_name, col_name);
-                table.create_index(&index_name, &[col_name.as_str()], false)?;
-                let idx_type = table
-                    .get_index(&index_name)
-                    .map(|idx| idx.index_type())
-                    .unwrap_or(crate::core::IndexType::BTree);
-                self.engine.record_create_index(
-                    table_name,
-                    &index_name,
-                    std::slice::from_ref(col_name),
-                    false,
-                    idx_type,
-                    None,
-                    None,
-                    None,
-                    None,
-                )?;
-            }
-        } else {
-            drop(active_tx);
-            // No active transaction - use direct engine call (auto-committed)
-            self.engine.create_table(schema)?;
-
-            // Create unique indexes and FK indexes
-            let needs_indexes = !unique_columns.is_empty()
-                || !table_unique_constraints.is_empty()
-                || !fk_index_columns.is_empty();
-            if needs_indexes {
-                let tx = self.begin_transaction()?;
-                let table = tx.get_statement_table(table_name)?;
-
-                for col_name in &unique_columns {
-                    let index_name = unique_index_name(table_name, col_name);
-                    table.create_index(&index_name, &[col_name.as_str()], true)?;
-                    let idx_type = table
-                        .get_index(&index_name)
-                        .map(|idx| idx.index_type())
-                        .unwrap_or(crate::core::IndexType::BTree);
-                    self.engine.record_create_index(
-                        table_name,
-                        &index_name,
-                        std::slice::from_ref(col_name),
-                        true,
-                        idx_type,
-                        None,
-                        None,
-                        None,
-                        None,
-                    )?;
-                }
-
-                // Create multi-column unique indexes from table-level constraints
-                for (i, col_names) in table_unique_constraints.iter().enumerate() {
-                    let index_name = table_unique_index_name(table_name, i);
-                    let col_refs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
-                    table.create_index(&index_name, &col_refs, true)?;
-                    let idx_type = table
-                        .get_index(&index_name)
-                        .map(|idx| idx.index_type())
-                        .unwrap_or(crate::core::IndexType::BTree);
-                    self.engine.record_create_index(
-                        table_name,
-                        &index_name,
-                        col_names,
-                        true,
-                        idx_type,
-                        None,
-                        None,
-                        None,
-                        None,
-                    )?;
-                }
-
-                // Auto-create indexes on FK columns for efficient referential integrity checks
-                for col_name in &fk_index_columns {
-                    let index_name = fk_index_name(table_name, col_name);
-                    table.create_index(&index_name, &[col_name.as_str()], false)?;
-                    let idx_type = table
-                        .get_index(&index_name)
-                        .map(|idx| idx.index_type())
-                        .unwrap_or(crate::core::IndexType::BTree);
-                    self.engine.record_create_index(
-                        table_name,
-                        &index_name,
-                        std::slice::from_ref(col_name),
-                        false,
-                        idx_type,
-                        None,
-                        None,
-                        None,
-                        None,
-                    )?;
-                }
+            None => {
+                drop(active_tx);
+                self.engine.create_table_with_indexes(schema, &indexes)?;
             }
         }
 

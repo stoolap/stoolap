@@ -40,4 +40,4 @@ pub use table::{
     CapturedGroups, ColdChange, FoundVersions, PlannedUpdate, ProbeScratch, ScanAccess, ScanPlan,
     Table, VersionMark,
 };
-pub use transaction::{TemporalType, Transaction};
+pub use transaction::{NewIndex, TemporalType, Transaction};
