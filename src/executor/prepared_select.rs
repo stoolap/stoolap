@@ -13105,6 +13105,48 @@ impl Executor {
         family.catalog()
     }
 
+    /// The prepared UPDATE, DELETE or INSERT `slot` holds when it fits this
+    /// run: the schema and columns it was prepared for, its CTEs and its
+    /// parameter count. Holding one is what makes the statement one of the
+    /// prepared family
+    pub(crate) fn held_prepared_dml(
+        &self,
+        slot: &RwLock<CompiledExecution>,
+        schema: &Schema,
+        conflict: Option<&ConflictSites<'_>>,
+        returning: Option<&ReturningSites<'_>>,
+        ctx: &ExecutionContext,
+    ) -> Option<Arc<PreparedDml>> {
+        let same = |held: &CompactArc<Vec<String>>, now: &Schema| {
+            let now = now.column_names_arc();
+            CompactArc::ptr_eq(held, &now) || *held == now
+        };
+        let fits = |p: &PreparedDml| {
+            p.validity.holds(&*self.engine, self.engine.schema_epoch())
+                && p.cte_scope.holds(ctx)
+                && p.blocks.param_count == ctx.params().len()
+                && same(&p.columns, schema)
+                && match (&p.conflict, conflict) {
+                    (Some(held), Some(now)) => same(&held.columns, now.schema),
+                    (None, None) => true,
+                    _ => false,
+                }
+                && match (&p.returning, returning) {
+                    (Some(held), Some(now)) => same(&held.columns, now.schema),
+                    (None, None) => true,
+                    _ => false,
+                }
+        };
+        let guard = slot.read().ok()?;
+        match &*guard {
+            CompiledExecution::PreparedDml(p) if fits(p) => Some(Arc::clone(p)),
+            CompiledExecution::Insert(insert) => {
+                insert.prepared.as_ref().filter(|p| fits(p)).cloned()
+            }
+            _ => None,
+        }
+    }
+
     /// The plan's prepared UPDATE, DELETE or INSERT over a target of
     /// `schema`, named `scope_name`, with its blocks' tables open, through
     /// the statement's own transaction `through` when given; prepared now
@@ -13125,28 +13167,6 @@ impl Executor {
         ctx: &ExecutionContext,
     ) -> Result<(Arc<PreparedDml>, DmlTables)> {
         let epoch = self.engine.schema_epoch();
-        let columns = schema.column_names_arc();
-        let same = |held: &CompactArc<Vec<String>>, now: &CompactArc<Vec<String>>| {
-            CompactArc::ptr_eq(held, now) || held == now
-        };
-        let conflict_columns = conflict.map(|sites| sites.schema.column_names_arc());
-        let returning_columns = returning.map(|sites| sites.schema.column_names_arc());
-        let fits = |p: &PreparedDml| {
-            p.validity.holds(&*self.engine, epoch)
-                && p.cte_scope.holds(ctx)
-                && p.blocks.param_count == ctx.params().len()
-                && same(&p.columns, &columns)
-                && match (&p.conflict, &conflict_columns) {
-                    (Some(held), Some(now)) => same(&held.columns, now),
-                    (None, None) => true,
-                    _ => false,
-                }
-                && match (&p.returning, &returning_columns) {
-                    (Some(held), Some(now)) => same(&held.columns, now),
-                    (None, None) => true,
-                    _ => false,
-                }
-        };
         // The blocks open before the statement's first write and read the
         // transaction's rows as they stood then; a read inside a block keeps its cut
         let cut = match ctx.table_use() {
@@ -13162,14 +13182,7 @@ impl Executor {
         loop {
             let held = compiled
                 .filter(|_| !fresh)
-                .and_then(|slot| slot.read().ok())
-                .and_then(|guard| match &*guard {
-                    CompiledExecution::PreparedDml(p) if fits(p) => Some(Arc::clone(p)),
-                    CompiledExecution::Insert(insert) => {
-                        insert.prepared.as_ref().filter(|p| fits(p)).cloned()
-                    }
-                    _ => None,
-                });
+                .and_then(|slot| self.held_prepared_dml(slot, schema, conflict, returning, ctx));
             let prepared = match held {
                 Some(prepared) => prepared,
                 None => {

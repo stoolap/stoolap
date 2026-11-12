@@ -2424,34 +2424,27 @@ impl Executor {
         // OPTIMIZATION: Use CompactArc<Vec<String>> to share column names without cloning
         let column_names = schema.column_names_arc();
 
-        // Pre-compute FK info for UPDATE validation
-        // Determine which FK columns are being updated (for parent validation)
-        let fk_cols_in_update: Vec<(usize, crate::core::ForeignKeyConstraint)> = {
-            let col_map = schema.column_index_map();
-            let updated_col_indices: Vec<usize> = stmt
-                .updates
-                .keys()
-                .filter_map(|col_name| {
-                    let col_lower = col_name.to_lowercase();
-                    col_map.get(col_lower.as_str()).copied()
-                })
-                .collect();
-            schema
-                .foreign_keys
-                .iter()
-                .filter(|fk| updated_col_indices.contains(&fk.column_index))
-                .map(|fk| (fk.column_index, fk.clone()))
-                .collect()
-        };
-        let has_fk_updates = !fk_cols_in_update.is_empty();
-
-        // A row's id is its primary key's value: a row whose key the statement
-        // changes is moved to its new id once every row is set (move_rows)
+        // Each SET column with its value, found once; a row's id is its
+        // primary key's value, so a row whose key the statement changes is
+        // moved to its new id once every row is set (move_rows)
+        let mut sets: Vec<(usize, &Expression)> = Vec::with_capacity(stmt.updates.len());
         let mut key_set = None;
-        for col_name in stmt.updates.keys() {
-            let column = written_column(schema, &col_name.to_lowercase())?;
-            key_set = key_set.or(column.filter(|&at| schema.pk_column_index() == Some(at)));
+        for (col_name, expr) in stmt.updates.iter() {
+            if let Some(at) = written_column(schema, &col_name.to_lowercase())? {
+                key_set = key_set.or((schema.pk_column_index() == Some(at)).then_some(at));
+                sets.push((at, expr));
+            }
         }
+        let sets_column = |at: usize| sets.iter().any(|(set, _)| *set == at);
+
+        // The foreign keys of the columns set, for parent validation
+        let fk_cols_in_update: Vec<(usize, crate::core::ForeignKeyConstraint)> = schema
+            .foreign_keys
+            .iter()
+            .filter(|fk| sets_column(fk.column_index))
+            .map(|fk| (fk.column_index, fk.clone()))
+            .collect();
+        let has_fk_updates = !fk_cols_in_update.is_empty();
 
         // Check if this table is referenced by child tables via columns being updated.
         // This handles CASCADE/RESTRICT/SET NULL for UNIQUE columns referenced by child FKs.
@@ -2459,20 +2452,15 @@ impl Executor {
             super::foreign_key::find_referencing_fks(&self.engine, table_name);
         let referencing_fks_for_update: Arc<Vec<(String, crate::core::ForeignKeyConstraint)>> =
             if all_referencing_fks.is_empty() {
-                Arc::new(Vec::new())
+                all_referencing_fks
             } else {
                 let col_map = schema.column_index_map();
-                let updated_cols: Vec<usize> = stmt
-                    .updates
-                    .keys()
-                    .filter_map(|c| col_map.get(c.to_lowercase().as_str()).copied())
-                    .collect();
                 let relevant: Vec<_> = all_referencing_fks
                     .iter()
                     .filter(|(_, fk)| {
                         col_map
                             .get(fk.referenced_column.to_lowercase().as_str())
-                            .is_some_and(|&idx| updated_cols.contains(&idx))
+                            .is_some_and(|&idx| sets_column(idx))
                     })
                     .cloned()
                     .collect();
@@ -2488,26 +2476,27 @@ impl Executor {
 
         // A statement of the prepared family runs through one runner, whose
         // subqueries read the tables as the statement found them
-        let returning_values = super::prepared_select::returning_values(&stmt.returning);
-        let in_family = self
+        let returning_sites =
+            (!stmt.returning.is_empty()).then_some(super::prepared_select::ReturningSites {
+                table: table_name,
+                schema,
+                values: &stmt.returning,
+            });
+        // A plan holding a prepared statement fit for this run answers it
+        let in_family = compiled.is_some_and(|slot| {
+            self.held_prepared_dml(slot, schema, None, returning_sites.as_ref(), ctx)
+                .is_some()
+        }) || self
             .dml_family(
                 stmt.where_clause.as_deref(),
-                stmt.updates.values().chain(returning_values),
+                stmt.updates
+                    .values()
+                    .chain(super::prepared_select::returning_values(&stmt.returning)),
             )
             .is_ok();
         let where_prepared = in_family && stmt.where_clause.is_some();
         let held_dml;
         let dml_run = if in_family {
-            let col_map = schema.column_index_map();
-            let sets: Vec<(usize, &Expression)> = stmt
-                .updates
-                .iter()
-                .filter_map(|(name, expr)| {
-                    col_map
-                        .get(name.to_lowercase().as_str())
-                        .map(|&i| (i, expr))
-                })
-                .collect();
             let (prepared, tables) = self.open_prepared_dml(
                 compiled,
                 schema,
@@ -2516,13 +2505,7 @@ impl Executor {
                 &sets,
                 &[] as &[Vec<Expression>],
                 None,
-                (!stmt.returning.is_empty())
-                    .then_some(super::prepared_select::ReturningSites {
-                        table: table_name,
-                        schema,
-                        values: &stmt.returning,
-                    })
-                    .as_ref(),
+                returning_sites.as_ref(),
                 standalone_tx
                     .as_deref()
                     .filter(|_| ctx.statement_snapshot().is_none()),
@@ -2630,7 +2613,6 @@ impl Executor {
             use super::expression::{ExecuteContext, ExprVM, SharedProgram};
             use super::prepared_select::Candidates;
 
-            let col_map = schema.column_index_map();
             let compiled_updates: Vec<(usize, crate::core::DataType, u16, SharedProgram)> =
                 if let Some(run) = &dml_run {
                     run.sets()
@@ -2647,38 +2629,31 @@ impl Executor {
                 } else {
                     // Compile directly from statement expressions
                     let registry = crate::functions::global_registry();
-                    stmt.updates
-                        .iter()
-                        .filter_map(|(col_name, expr)| {
-                            let col_lower: String = col_name.to_lowercase().into();
-                            col_map.get(&col_lower).map(|&idx| {
-                                let program = super::aggregation::compile_over_slots(
-                                    expr,
-                                    &column_names,
-                                    registry,
-                                    None,
-                                    false,
-                                    None,
-                                );
-                                program.map(|program| {
-                                    (
-                                        idx,
-                                        schema.columns[idx].data_type,
-                                        schema.columns[idx].vector_dimensions,
-                                        program,
-                                    )
-                                })
+                    sets.iter()
+                        .map(|&(idx, expr)| {
+                            let program = super::aggregation::compile_over_slots(
+                                expr,
+                                &column_names,
+                                registry,
+                                None,
+                                false,
+                                None,
+                            );
+                            program.map(|program| {
+                                (
+                                    idx,
+                                    schema.columns[idx].data_type,
+                                    schema.columns[idx].vector_dimensions,
+                                    program,
+                                )
                             })
                         })
                         .collect::<Result<_>>()?
                 };
 
-            // Column names for coercion errors, captured before the setter
-            // borrows the table mutably
-            let update_col_names: Vec<String> = compiled_updates
-                .iter()
-                .map(|(idx, _, _, _)| schema.columns[*idx].name.to_string())
-                .collect();
+            // The schema the coercion errors name columns from, held past the
+            // setter's mutable borrow of the table
+            let set_schema = table.schema_arc();
 
             // The CHECK constraints reading an updated column, held by the plan
             let compiled_check_exprs = match &dml_run {
@@ -2755,9 +2730,7 @@ impl Executor {
                     }
 
                     let mut updates = Vec::with_capacity(compiled_updates.len());
-                    for (k, (idx, col_type, vec_dims, program)) in
-                        compiled_updates.iter().enumerate()
-                    {
+                    for (idx, col_type, vec_dims, program) in compiled_updates.iter() {
                         // Propagate VM errors (overflow etc.): silently
                         // skipping a SET column would half-apply the row.
                         // Coercion validates like INSERT and the fast path
@@ -2773,7 +2746,7 @@ impl Executor {
                         validate_coercion(
                             &v,
                             &coerced,
-                            &update_col_names[k],
+                            &set_schema.columns[*idx].name,
                             *col_type,
                             *vec_dims,
                         )?;
@@ -3016,15 +2989,17 @@ impl Executor {
             .as_deref()
             .is_some_and(Self::has_subqueries);
         let returning_has_subqueries = stmt.returning.iter().any(Self::has_subqueries);
-        let returning_values = super::prepared_select::returning_values(&stmt.returning);
-        let in_family = self
-            .dml_family(stmt.where_clause.as_deref(), returning_values)
-            .is_ok();
-        let where_prepared = in_family && stmt.where_clause.is_some();
+        let family = || {
+            let returning_values = super::prepared_select::returning_values(&stmt.returning);
+            self.dml_family(stmt.where_clause.as_deref(), returning_values)
+                .is_ok()
+        };
+        // A statement with subqueries is asked its family before its table
+        // opens, for the snapshot they read; any other once it is open
+        let family_now = (where_has_subqueries || returning_has_subqueries).then(family);
         // Without a view the prepared subqueries read a snapshot taken before the write
         let snapshot_ctx;
-        let ctx = if in_family
-            && (where_has_subqueries || returning_has_subqueries)
+        let ctx = if family_now == Some(true)
             && active_tx.is_none()
             && ctx.statement_view().is_none()
             && ctx.statement_snapshot().is_none()
@@ -3071,6 +3046,20 @@ impl Executor {
         // If that fails (complex expression like a + b > 100), fall back to in-memory filtering
         let schema = table.schema();
 
+        let returning_sites =
+            (!stmt.returning.is_empty()).then_some(super::prepared_select::ReturningSites {
+                table: table_name,
+                schema,
+                values: &stmt.returning,
+            });
+        // A plan holding a prepared statement fit for this run answers it
+        let in_family = family_now.unwrap_or_else(|| {
+            compiled.is_some_and(|slot| {
+                self.held_prepared_dml(slot, schema, None, returning_sites.as_ref(), ctx)
+                    .is_some()
+            }) || family()
+        });
+        let where_prepared = in_family && stmt.where_clause.is_some();
         let held_dml;
         let dml_run = if in_family {
             let (prepared, tables) = self.open_prepared_dml(
@@ -3081,13 +3070,7 @@ impl Executor {
                 &[],
                 &[] as &[Vec<Expression>],
                 None,
-                (!stmt.returning.is_empty())
-                    .then_some(super::prepared_select::ReturningSites {
-                        table: table_name,
-                        schema,
-                        values: &stmt.returning,
-                    })
-                    .as_ref(),
+                returning_sites.as_ref(),
                 standalone_tx
                     .as_deref()
                     .filter(|_| ctx.statement_snapshot().is_none()),
