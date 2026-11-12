@@ -181,6 +181,7 @@ pub(crate) struct WindowPrograms {
     call_order: Box<[HeldProgram]>,
     default: HeldProgram,
     count: HeldProgram,
+    count_once: HeldOnce,
     /// An aggregate's arguments after the first, when read for each row
     args: Box<[HeldProgram]>,
     /// The arguments read once for the call: an aggregate's after its first,
@@ -386,11 +387,6 @@ impl<'w> RowArg<'w> {
         }
     }
 
-    /// Whether it is a literal or a parameter, one value at every row
-    fn fixed(&self) -> bool {
-        !matches!(self.source, ArgSource::Program(_))
-    }
-
     /// Its program over the input `columns`, a group item or aggregate read
     /// from its slot in `slots`, compiled on first read; None for a literal
     /// or a parameter, read without one
@@ -399,7 +395,7 @@ impl<'w> RowArg<'w> {
         (columns, slots): (&[String], &FxHashMap<ExprKey, usize>),
         (ctx, blocks): (&ExecutionContext, Option<&dyn SubqueryExecutor>),
     ) -> Result<Option<&Program>> {
-        if self.fixed() {
+        if !matches!(self.source, ArgSource::Program(_)) {
             return Ok(None);
         }
         let slots = Some(slots);
@@ -454,6 +450,8 @@ struct CallArgs<'w> {
     /// NTILE's n, read at the first row of each partition; LAG and LEAD's
     /// offset and NTH_VALUE's n, read at each row
     count: Option<RowArg<'w>>,
+    /// The count instead when it is one value for the statement, read once
+    count_once: Option<ConstArg<'w>>,
     /// LAG and LEAD's default, read at each row
     default: Option<RowArg<'w>>,
     /// A value function's first argument for each row, when it is not a column
@@ -500,16 +498,22 @@ impl<'w> CallArgs<'w> {
         };
         let frame = wf_info.frame.as_ref();
         let lead_lag = matches!(wf_info.name.as_str(), "LEAD" | "LAG");
+        let count = count_argument(&wf_info.name).and_then(|(at, _)| wf_info.arguments.get(at));
+        // A count that is one value for the statement reads alike at every row
+        let reads_parent = |id| blocks.is_none_or(|blocks| blocks.reads_parent(id));
+        let once = count.is_some_and(|expr| {
+            super::volatility::statement_constant_in(expr, registry, (true, &reads_parent))
+        });
         Self {
             frame_start: frame.and_then(|f| offset_of(&f.start, held.map(|h| &h.frame_start))),
             frame_end: (frame.and_then(|f| f.end.as_ref()))
                 .and_then(|end| offset_of(end, held.map(|h| &h.frame_end))),
-            count: count_argument(&wf_info.name).and_then(|(at, _)| {
-                let held = held.map(|h| &h.count);
-                wf_info
-                    .arguments
-                    .get(at)
-                    .map(|expr| RowArg::new(expr, held))
+            count: count
+                .filter(|_| !once)
+                .map(|expr| RowArg::new(expr, held.map(|h| &h.count))),
+            count_once: count.filter(|_| once).map(|expr| {
+                let what = count_argument(&wf_info.name).map_or("", |(_, what)| what);
+                ConstArg::new(expr, registry, what, (blocks, held.map(|h| &h.count_once)))
             }),
             default: wf_info
                 .arguments
@@ -538,10 +542,13 @@ impl<'w> CallArgs<'w> {
     /// Whether the default or the count read a subquery, which only the
     /// statement's blocks answer, so the partitions read them on this thread
     fn reads_blocks(&self) -> bool {
+        let once = self.count_once.as_ref().map(|arg| arg.expr);
         [&self.count, &self.default]
             .into_iter()
             .flatten()
-            .any(|arg| Executor::has_subqueries(arg.expr))
+            .map(|arg| arg.expr)
+            .chain(once)
+            .any(Executor::has_subqueries)
     }
 
     /// LAG and LEAD's default for the current `row`, NULL without one
@@ -570,10 +577,12 @@ impl<'w> CallArgs<'w> {
             i64,
         ),
     ) -> Result<Option<usize>> {
-        let Some(arg) = &self.count else {
-            return Ok(None);
+        let value = match (&self.count, &self.count_once) {
+            (Some(arg), _) => arg.value(programs.count, vm, row, read)?,
+            (None, Some(arg)) => arg.evaluate(read)?,
+            (None, None) => return Ok(None),
         };
-        window_count(&arg.value(programs.count, vm, row, read)?, what, min).map(Some)
+        window_count(&value, what, min).map(Some)
     }
 }
 
@@ -3476,10 +3485,10 @@ impl Executor {
             )
         };
         // NTILE reads its bucket count at the partition's first row; LAG and
-        // LEAD's offset is one value there when written as one
+        // LEAD's offset is one value there when it is one for the statement
         let once = match wf_info.name.as_str() {
             "NTILE" => Some(count_at(&mut vm, row_indices[0], 1)?.unwrap_or(1)),
-            "LEAD" | "LAG" if args.count.as_ref().is_none_or(RowArg::fixed) => {
+            "LEAD" | "LAG" if args.count.is_none() => {
                 Some(count_at(&mut vm, row_indices[0], 0)?.unwrap_or(1))
             }
             _ => None,

@@ -917,26 +917,24 @@ pub(crate) fn aggregate_extra_args(
     Ok((values, failed))
 }
 
-/// Whether an aggregate's extra argument is written as its value: a
-/// literal, or a quoted name, which reads as text
+/// Whether an aggregate's extra argument is written as its value, a literal;
+/// a quoted name is not, as it reads the column it names when there is one
 fn is_literal_extra_arg(arg: &Expression) -> bool {
-    match arg {
-        Expression::Identifier(id) => id.quoted,
+    matches!(
+        arg,
         Expression::IntegerLiteral(_)
-        | Expression::FloatLiteral(_)
-        | Expression::StringLiteral(_)
-        | Expression::BooleanLiteral(_)
-        | Expression::NullLiteral(_) => true,
-        _ => false,
-    }
+            | Expression::FloatLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+    )
 }
 
 /// The value of an extra argument written as its value
 fn literal_extra_arg(arg: &Expression) -> Option<Value> {
-    match arg {
-        _ if !is_literal_extra_arg(arg) => None,
-        Expression::Identifier(id) => Some(Value::text(id.value.as_str())),
-        arg => super::utils::extract_literal_value(arg),
+    match is_literal_extra_arg(arg) {
+        true => super::utils::extract_literal_value(arg),
+        false => None,
     }
 }
 
@@ -1446,6 +1444,7 @@ impl CompiledFeed {
         let inputs = self.inputs.iter().flat_map(|inputs| {
             (inputs.filter.iter())
                 .chain(&inputs.argument)
+                .chain(&inputs.args)
                 .chain(&inputs.order)
         });
         inputs.chain(self.items.iter().filter_map(|item| match item {
@@ -1459,6 +1458,7 @@ impl CompiledFeed {
         let inputs = self.inputs.iter_mut().flat_map(|inputs| {
             (inputs.filter.iter_mut())
                 .chain(&mut inputs.argument)
+                .chain(&mut inputs.args)
                 .chain(&mut inputs.order)
         });
         inputs.chain(self.items.iter_mut().filter_map(|item| match item {

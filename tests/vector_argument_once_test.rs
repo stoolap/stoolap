@@ -57,6 +57,8 @@ const SHAPES: &[&str] = &[
     "SELECT COUNT(*) FROM t WHERE e <=> '[0.5, 0.5, 0.5]' < 1e9",
     "SELECT COUNT(*) FROM t HAVING SUM(VEC_DISTANCE_L2(e, $1)) > 0",
     "SELECT COUNT(*) FROM t HAVING SUM(VEC_DISTANCE_IP('[0.5, 0.5, 0.5]', e)) < 0",
+    "SELECT COUNT(*) FROM t HAVING STRING_AGG('x', \
+     CASE WHEN VEC_DISTANCE_L2(e, $1) >= 0 THEN ',' END) IS NOT NULL",
 ];
 
 /// Arguments that read no row yet are evaluated per row: the function

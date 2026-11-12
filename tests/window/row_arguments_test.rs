@@ -153,6 +153,14 @@ const STATEMENTS: &[(&str, &str)] = &[
         "1|a1b1c 2|d2e2f",
     ),
     ("SELECT STRING_AGG(x, s ORDER BY id) FROM t", "a+bc-d+e+f"),
+    (
+        "SELECT g, STRING_AGG(x, \"s\" ORDER BY id) FROM t GROUP BY g ORDER BY g",
+        "1|a+bc 2|d+e+f",
+    ),
+    (
+        "SELECT STRING_AGG(x, \"zz\" ORDER BY id) FROM t",
+        "azzbzzczzdzzezzf",
+    ),
     ("SELECT STRING_AGG(x, NULL ORDER BY id) FROM t", "abcdef"),
     (
         "SELECT STRING_AGG(x, s ORDER BY id) FILTER (WHERE id <> 2) FROM t",
@@ -174,6 +182,14 @@ const STATEMENTS: &[(&str, &str)] = &[
     (
         "SELECT id, STRING_AGG(x, s) OVER (PARTITION BY g ORDER BY id) FROM t ORDER BY id",
         "1|a 2|a+b 3|a+bc 4|d 5|d+e 6|d+e+f",
+    ),
+    (
+        "SELECT id, STRING_AGG(x, \"s\") OVER (PARTITION BY g ORDER BY id) FROM t ORDER BY id",
+        "1|a 2|a+b 3|a+bc 4|d 5|d+e 6|d+e+f",
+    ),
+    (
+        "SELECT id, STRING_AGG(x, \"zz\") OVER (PARTITION BY g ORDER BY id) FROM t ORDER BY id",
+        "1|a 2|azzb 3|azzbzzc 4|d 5|dzze 6|dzzezzf",
     ),
     (
         "SELECT id, STRING_AGG(x, s) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) \
