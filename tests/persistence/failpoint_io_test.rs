@@ -1727,3 +1727,56 @@ fn a_column_change_that_fails_to_record_leaves_the_rows_as_they_were() {
         );
     }
 }
+
+#[test]
+fn a_rollback_that_cannot_log_a_restored_table_fails() {
+    let _guard = failpoint_guard();
+    for end in ["ROLLBACK", "ROLLBACK TO SAVEPOINT s"] {
+        let dir = tempdir().unwrap();
+        let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+        for sql in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY)",
+            "BEGIN",
+            "SAVEPOINT s",
+            "DROP TABLE t",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        test_failpoints::WAL_WRITE_FAIL.store(true, Ordering::Release);
+        let ended = db.execute(end, ());
+        test_failpoints::WAL_WRITE_FAIL.store(false, Ordering::Release);
+        assert!(
+            ended.is_err(),
+            "{end} reported success though the restored table was not logged"
+        );
+        let _ = db.close();
+    }
+}
+
+#[test]
+fn a_rollback_restores_a_table_whose_drop_failed_after_it_went() {
+    let _guard = failpoint_guard();
+    let dir = tempdir().unwrap();
+    let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY)",
+        "INSERT INTO t VALUES (1)",
+        "PRAGMA CHECKPOINT",
+        "BEGIN",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    test_failpoints::MANIFEST_WRITE_FAIL.store(true, Ordering::Release);
+    let dropped = db.execute("DROP TABLE t", ());
+    test_failpoints::MANIFEST_WRITE_FAIL.store(false, Ordering::Release);
+    assert!(
+        dropped.is_err(),
+        "the DROP did not reach the failing manifest write"
+    );
+    db.execute("ROLLBACK", ()).unwrap();
+    assert!(
+        db.query_one::<i64, _>("SELECT COUNT(*) FROM t", ()).is_ok(),
+        "the rollback did not restore t"
+    );
+    let _ = db.close();
+}
