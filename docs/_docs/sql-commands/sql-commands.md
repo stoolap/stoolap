@@ -719,6 +719,9 @@ ALTER TABLE users MODIFY COLUMN age FLOAT;
 
 -- Rename table
 ALTER TABLE users RENAME TO customers;
+
+-- Set the next AUTO_INCREMENT id
+ALTER TABLE users AUTO_INCREMENT = 1000;
 ```
 
 ### DROP TABLE

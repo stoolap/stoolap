@@ -77,6 +77,21 @@ ALTER TABLE users RENAME TO system_users;
 
 All data is accessible via the new name. The old table name is no longer valid. The new name may not be one a table or a view already holds.
 
+## AUTO_INCREMENT
+
+Set the next id a table's `AUTO_INCREMENT` column generates:
+
+```sql
+ALTER TABLE orders AUTO_INCREMENT = 1000;
+INSERT INTO orders (item) VALUES ('first');   -- id = 1000
+```
+
+The `=` is optional, and `AUTOINCREMENT` is accepted as well. The value is a positive integer.
+
+The counter only moves up. A value at or below an id the table has already handed out returns an error and leaves the counter as it was; that includes ids of deleted rows, explicitly inserted ids and ids a rolled-back insert took. A table without an `AUTO_INCREMENT` column returns an error.
+
+The change takes effect at once and a ROLLBACK of an open transaction does not undo it. It survives a reopen and a crash. TRUNCATE TABLE starts the ids at 1 again.
+
 ## Persistence
 
 All ALTER TABLE operations are recorded in the WAL and survive crash recovery:
