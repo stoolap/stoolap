@@ -268,6 +268,18 @@ const CASES: &[(&[&str], &str)] = &[
         ],
         "ok ok ok ok ok ok taken ok => 1:10,2:20,5:50",
     ),
+    (
+        &[
+            "BEGIN",
+            "INSERT INTO t VALUES (1, 30, 0), (5, 30, 0) ON DUPLICATE KEY UPDATE u = excluded.u",
+            "COMMIT",
+        ],
+        "ok ok ok => 1:30,2:20",
+    ),
+    (
+        &["INSERT INTO t VALUES (1, 30, 0), (5, 30, 0) ON DUPLICATE KEY UPDATE u = excluded.u"],
+        "ok => 1:30,2:20",
+    ),
 ];
 
 #[test]
@@ -384,6 +396,28 @@ fn an_installed_transaction_judges_the_keys_of_an_index_built_before() {
         if let Some(mut tx) = executor.take_transaction() {
             tx.rollback().unwrap();
         }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_unique_index_built_beside_a_transaction_judges_its_earlier_rows() {
+    let mut wrong = Vec::new();
+    for rows in [Rows::Hot, Rows::Sealed, Rows::Mixed] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = database(rows, &dir);
+        db.execute("UPDATE t SET w = id", ()).unwrap();
+        let other = db.clone();
+        db.execute("BEGIN", ()).unwrap();
+        db.execute("INSERT INTO t VALUES (3, 30, 7)", ()).unwrap();
+        other
+            .execute("CREATE UNIQUE INDEX t_w ON t (w)", ())
+            .unwrap();
+        let inserted = db.execute("INSERT INTO t VALUES (4, 40, 7)", ());
+        if !matches!(inserted, Err(stoolap::Error::UniqueConstraint { .. })) {
+            wrong.push(format!("{rows:?}: {:?}", inserted.map(|_| ())));
+        }
+        db.execute("ROLLBACK", ()).unwrap();
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }

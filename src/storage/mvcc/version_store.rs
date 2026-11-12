@@ -7532,18 +7532,16 @@ impl TransactionVersionStore {
             return;
         }
         self.tracking = Some(Box::default());
-        let written: Vec<i64> = self.iter_local().map(|(row_id, _)| row_id).collect();
-        self.enter_row_keys(written);
+        // The first read of the indexes enters every key the rows hold
+        if self.has_local_changes() {
+            self.unique_indexes();
+        }
     }
 
-    /// Enters the unique keys the latest versions of `rows` hold
-    fn enter_row_keys(&mut self, rows: Vec<i64>) {
-        if rows.is_empty() || !self.parent_store.may_hold_unique_beside_key() {
-            return;
-        }
-        let indexes: UniqueIndexes = self.unique_indexes().iter().cloned().collect();
+    /// Enters the keys of `indexes` the latest versions of `rows` hold
+    fn enter_row_keys(&mut self, rows: Vec<i64>, indexes: &[Arc<dyn Index>]) {
         for row_id in rows {
-            for index in &indexes {
+            for index in indexes {
                 let columns = index.column_ids();
                 let hash = (self.get_latest_local(row_id))
                     .filter(|version| !version.is_deleted())
@@ -7580,24 +7578,39 @@ impl TransactionVersionStore {
     }
 
     /// The unique indexes beside the key a tracking transaction judges,
-    /// read again only once the parent's indexes changed; none untracked
+    /// read again only once the parent's indexes changed, the keys the rows
+    /// hold entered for each index new to it; none untracked
     pub(crate) fn unique_indexes(&mut self) -> &[Arc<dyn Index>] {
         let Some(tracking) = self.tracking.as_deref_mut() else {
             return &[];
         };
         let generation = self.parent_store.unique_generation.load(Ordering::Acquire);
         if (tracking.unique_indexes.as_ref()).is_none_or(|(read, _)| *read != generation) {
-            tracking.unique_indexes = Some(self.parent_store.unique_indexes_beside_key());
+            let read = self.parent_store.unique_indexes_beside_key();
+            let held = (tracking.unique_indexes.as_ref()).map_or(&[][..], |(_, held)| held);
+            let added: UniqueIndexes = (read.1.iter())
+                .filter(|index| {
+                    !held
+                        .iter()
+                        .any(|old| std::ptr::addr_eq(Arc::as_ptr(old), Arc::as_ptr(index)))
+                })
+                .cloned()
+                .collect();
+            tracking.unique_indexes = Some(read);
+            if !added.is_empty() {
+                let written: Vec<i64> = self.iter_local().map(|(row_id, _)| row_id).collect();
+                self.enter_row_keys(written, &added);
+            }
         }
-        tracking
-            .unique_indexes
-            .as_ref()
+        (self.tracking.as_deref())
+            .and_then(|tracking| tracking.unique_indexes.as_ref())
             .map_or(&[], |(_, indexes)| indexes)
     }
 
     /// Notes that a write is giving `row_id` the row `new` in place of the
     /// version it holds now, when a unique key differs, for the statement's
-    /// end to judge; a new row's insert judged its keys itself
+    /// end to judge, and enters the new key for later rows to meet; a new
+    /// row's insert judged its keys itself
     fn note_key_change(&mut self, row_id: i64, new: &Row) {
         if self.tracking.is_none() || !self.parent_store.may_hold_unique_beside_key() {
             return;
@@ -7620,11 +7633,22 @@ impl TransactionVersionStore {
             .unique_indexes
             .as_ref()
             .map_or(&[][..], |(_, all)| all);
-        let changed = indexes.iter().any(|index| {
-            (index.column_ids().iter()).any(|&id| old.get(id as usize) != new.get(id as usize))
-        });
+        let mut entered: SmallVec<[(SmallVec<[i32; 4]>, u64); 2]> = SmallVec::new();
+        let mut changed = false;
+        for index in indexes {
+            let columns = index.column_ids();
+            if (columns.iter()).any(|&id| old.get(id as usize) != new.get(id as usize)) {
+                changed = true;
+                if let Some(hash) = row_key_hash(new, columns) {
+                    entered.push((SmallVec::from_slice(columns), hash));
+                }
+            }
+        }
         if changed {
             tracking.key_changes.push(row_id);
+        }
+        for (columns, hash) in entered {
+            self.enter_key(&columns, hash, row_id);
         }
     }
 
@@ -7699,8 +7723,10 @@ impl TransactionVersionStore {
         values: &[Value],
         row_id: i64,
     ) -> Result<Option<i64>, Error> {
-        // A claim judges against every key the rows hold, so it tracks them all
+        // A claim judges against every key the rows hold, so it tracks them
+        // all, of an index that came since too
         self.track_keys();
+        self.unique_indexes();
         let hash = key_hash(values);
         if let Some(holder) = self.key_holder(index, values, hash, row_id)? {
             return Ok(Some(holder));
@@ -9314,7 +9340,10 @@ impl TransactionVersionStore {
                 !versions.is_empty()
             });
         }
-        self.enter_row_keys(restored);
+        if !restored.is_empty() {
+            let indexes: UniqueIndexes = self.unique_indexes().iter().cloned().collect();
+            self.enter_row_keys(restored, &indexes);
+        }
         // A layout no surviving row was written under is not the
         // transaction's any more
         self.bound.retain(|(_, first)| *first <= timestamp);
