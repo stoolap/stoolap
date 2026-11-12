@@ -16,6 +16,7 @@
 
 mod bug_manifest_version_fail_closed_test;
 mod bug_unique_lost_after_reopen_test;
+mod checkpoint_catalog_copy_test;
 mod dml_lsn_receipt_test;
 mod drop_rename_replay_test;
 mod durability_test;

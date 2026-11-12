@@ -215,7 +215,7 @@ A table rename moves side files with their volumes; DROP TABLE, TRUNCATE and com
 
 1. **Seal**: Move hot buffer rows into new immutable `.vol` files (per-table seal fence ensures DML consistency)
 2. **Fence**: Brief exclusive check that all hot buffers are empty, advance WAL checkpoint LSN
-3. **Re-record DDL**: Write DDL entries after checkpoint LSN so they survive WAL truncation
+3. **Re-record DDL**: Write DDL entries after checkpoint LSN so they survive WAL truncation. A crash before every manifest is durable replays them after the records below the new boundary, and a table copy finding its table already replayed leaves it, with its rows, as it is
 4. **Persist manifests**: Write `manifest.bin` per table (volume list, tombstones, checkpoint LSN) atomically via fsync-before-rename
 5. **WAL truncate**: Remove WAL entries before checkpoint LSN (only when all manifests are persisted)
 6. **Compact**: Merge sub-target, oversized, and tombstoned volumes into target-sized outputs. Runs inline for explicit `PRAGMA CHECKPOINT`, offloaded to a background thread for the periodic automatic cycle.
