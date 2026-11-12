@@ -92,6 +92,20 @@ When inserting or updating a row that affects a unique index:
 5. For committed transactions, the uniqueness check is final
 6. For active transactions, uniqueness is enforced optimistically
 
+### When Uniqueness Is Checked
+
+A statement's new keys are judged against the rows as the whole statement leaves them, whether the rows are in memory or sealed into volumes. One statement may therefore swap keys among its rows, as in `UPDATE t SET u = CASE id WHEN 1 THEN 20 WHEN 2 THEN 10 END`, or shift them, as in `UPDATE t SET u = u + 10`. A statement that leaves two rows with one key fails, and in autocommit it changes nothing.
+
+Inside an explicit transaction, these fail at the statement:
+- an `INSERT` whose key a committed row holds;
+- an `UPDATE` that gives a sealed row a key an in-memory row holds;
+- an `UPDATE` that gives two of its rows one key when one of them is sealed.
+
+Everything else waits for `COMMIT`, which then rolls the whole transaction back:
+- an `UPDATE` that gives an in-memory row a key another row holds;
+- an `UPDATE` that gives a sealed row a key another sealed row holds;
+- two rows the transaction itself wrote, in one statement or in two, that share one key.
+
 ### NULL Handling
 
 Stoolap follows the SQL standard for handling NULL values in unique indexes:
@@ -218,5 +232,5 @@ fn check_uniqueness(
 Current limitations of Stoolap's unique index implementation:
 
 1. **No Partial Unique Indexes** - Cannot create unique indexes that apply only to a subset of rows
-2. **No Deferrable Constraints** - Uniqueness is always enforced immediately, not at transaction end
+2. **No Deferrable Constraints** - A constraint cannot be declared `DEFERRABLE` or switched with `SET CONSTRAINTS`; when uniqueness is checked is described above
 3. **Performance with Many Indexes** - Multiple unique indexes can impact write performance

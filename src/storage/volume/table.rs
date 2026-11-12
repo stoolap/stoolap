@@ -576,12 +576,8 @@ enum ZoneBound<'z> {
 struct ColdPrepare {
     /// The rows the setter ran on, with the volume each was read from
     visited: FxHashMap<i64, u64>,
-    /// The rows a new version is prepared for: their old keys are gone
-    /// once the statement applies
-    shadowed: FxHashSet<i64>,
     /// The volumes walked whole at a settled generation
     seen_segments: FxHashSet<u64>,
-    unique_indexes: Option<Vec<ColdUnique>>,
     changes: Vec<ColdChange>,
     /// The ids named by the statement that no cold volume holds
     hot_ids: Vec<i64>,
@@ -625,6 +621,21 @@ type ColdUnique = (String, Vec<String>, smallvec::SmallVec<[usize; 4]>);
 /// The schema positions of `index`'s columns
 fn unique_positions(index: &dyn Index) -> smallvec::SmallVec<[usize; 4]> {
     index.column_ids().iter().map(|&id| id as usize).collect()
+}
+
+/// Whether one of `changes` gives its sealed row another key of a unique
+/// index of `hot` that is not the primary key
+fn cold_keys_changed(hot: &dyn Table, changes: &[ColdChange]) -> Result<bool> {
+    let mut changed = false;
+    hot.for_each_unique_non_pk_index(&mut |index| {
+        let at = index.column_ids();
+        changed |= changes.iter().any(|change| {
+            at.iter()
+                .any(|&id| change.old_row.get(id as usize) != change.new_row.get(id as usize))
+        });
+        Ok(())
+    })?;
+    Ok(changed)
 }
 
 /// What a DELETE has prepared so far, across the rounds a landing seal
@@ -1934,36 +1945,6 @@ impl SegmentedTable {
         self.find_segment_row_id_by_values_with_snapshot(&snapshot, None, col_indices, values)
     }
 
-    /// Statement-snapshot variant: the unique lookup runs entirely
-    /// against the statement's captured view, so it cannot need a live
-    /// cold reload after the statement has already mutated state.
-    fn find_segment_row_id_by_values_in_stmt(
-        &self,
-        snap: &super::manifest::StatementSnapshot,
-        col_indices: &[usize],
-        values: &[&Value],
-    ) -> Result<Option<i64>> {
-        if col_indices.is_empty() || col_indices.len() != values.len() {
-            return Ok(None);
-        }
-        let defaults: smallvec::SmallVec<[Value; 4]> = col_indices
-            .iter()
-            .map(|&ci| self.column_default(ci))
-            .collect();
-        let rid =
-            match self
-                .segment_mgr
-                .find_row_id_by_values_in(snap, col_indices, values, &defaults)?
-            {
-                Some(rid) => rid,
-                None => return Ok(None),
-            };
-        if self.segment_mgr.is_pending_tombstone(self.pending(), rid) {
-            return Ok(None);
-        }
-        Ok(Some(rid))
-    }
-
     fn find_segment_row_id_by_values_with_snapshot(
         &self,
         snapshot: &super::manifest::ColdSnapshot,
@@ -2207,34 +2188,19 @@ impl SegmentedTable {
     /// read from: a hot version or a tombstone since is another
     /// transaction's change; a row moved to another volume is the same
     /// row when it reads the same, as compaction leaves it, and a
-    /// change otherwise. Their new keys are checked again on `snap`
+    /// change otherwise
     fn revalidate_prepared(
         &self,
         snap: &super::manifest::StatementSnapshot,
         cut: &CommitCut,
         prep: &mut ColdPrepare,
     ) -> Result<()> {
-        let checks_unique = self.hot.has_unique_non_pk_indexes();
         let ColdPrepare {
-            changes,
-            visited,
-            shadowed,
-            unique_indexes,
-            ..
+            changes, visited, ..
         } = prep;
         for change in changes.iter() {
             let read_from = visited.entry(change.row_id).or_insert(u64::MAX);
             self.revalidate_row(snap, cut, change.row_id, &change.old_row, read_from)?;
-            // A row a seal registered since the earlier round may hold the key
-            if checks_unique {
-                self.check_cold_unique_for_update(
-                    &change.new_row,
-                    change.row_id,
-                    Some(snap),
-                    shadowed,
-                    unique_indexes,
-                )?;
-            }
         }
         Ok(())
     }
@@ -2307,7 +2273,7 @@ impl SegmentedTable {
                     continue;
                 }
             }
-            self.prepare_cold_row(snap, seg_id, row_id, row, setter, prep)?;
+            self.prepare_cold_row(seg_id, row_id, row, setter, prep)?;
         }
         Ok(())
     }
@@ -2361,7 +2327,7 @@ impl SegmentedTable {
                         continue;
                     }
                 }
-                self.prepare_cold_row(snap, *seg_id, row_id, row, setter, prep)?;
+                self.prepare_cold_row(*seg_id, row_id, row, setter, prep)?;
             }
         }
         Ok(())
@@ -2370,7 +2336,6 @@ impl SegmentedTable {
     /// Runs the setter on one cold row and keeps its new version
     fn prepare_cold_row(
         &self,
-        snap: &super::manifest::StatementSnapshot,
         seg_id: u64,
         row_id: i64,
         row: Row,
@@ -2383,19 +2348,9 @@ impl SegmentedTable {
             prep.visited.insert(row_id, seg_id);
             return Ok(());
         }
-        // The unique keys checked are the ones the publish writes
+        // The unique keys the commit checks are the ones the publish writes
         self.hot.validate_row(&mut new_row)?;
-        if self.hot.has_unique_non_pk_indexes() {
-            self.check_cold_unique_for_update(
-                &new_row,
-                row_id,
-                Some(snap),
-                &prep.shadowed,
-                &mut prep.unique_indexes,
-            )?;
-        }
         prep.visited.insert(row_id, seg_id);
-        prep.shadowed.insert(row_id);
         prep.changes.push(ColdChange {
             row_id,
             old_row,
@@ -2527,8 +2482,11 @@ impl SegmentedTable {
         mut plan: PlannedUpdate,
         planned: Result<()>,
     ) -> Result<i32> {
-        // A hot row's new key is checked against the volumes only at commit
+        // A new key, a hot row's or a sealed one's, is checked against the
+        // volumes only at commit, so a statement may swap keys among its rows
         plan.compare_hot_keys = segment_mgr.has_segments();
+        let cold_keys_changed =
+            !plan.cold.is_empty() && cold_keys_changed(hot.as_ref(), &plan.cold)?;
         let count = match planned.and_then(|()| hot.publish_update(&mut plan)) {
             Ok(count) => count,
             Err(e) => {
@@ -2544,62 +2502,12 @@ impl SegmentedTable {
         for change in &plan.cold {
             segment_mgr.add_pending_tombstone(txn_id, change.row_id);
         }
-        if plan.hot_keys_changed {
+        if plan.hot_keys_changed || cold_keys_changed {
             segment_mgr.mark_txn_unchecked(txn_id);
         } else if count > 0 {
             segment_mgr.record_txn_seal_generation(txn_id);
         }
         Ok(count)
-    }
-
-    /// `shadowed` are the cold rows this statement already prepared a new
-    /// version for: their old keys are gone once the statement applies,
-    /// so they are no conflict for a later row's new keys
-    fn check_cold_unique_for_update(
-        &self,
-        new_row: &Row,
-        exclude_row_id: i64,
-        snap: Option<&super::manifest::StatementSnapshot>,
-        shadowed: &FxHashSet<i64>,
-        unique_indexes: &mut Option<Vec<ColdUnique>>,
-    ) -> Result<()> {
-        if unique_indexes.is_none() {
-            *unique_indexes = Some(self.cold_unique_indexes()?);
-        }
-        let schema = self.hot.schema();
-        for (idx_name, col_names, col_indices) in unique_indexes.iter().flatten() {
-            let coerced: smallvec::SmallVec<[Value; 4]> = col_indices
-                .iter()
-                .filter_map(|&idx| {
-                    let val = new_row.get(idx)?;
-                    let target_type = schema.columns[idx].data_type;
-                    Some(val.coerce_to_type(target_type))
-                })
-                .collect();
-            if coerced.len() != col_indices.len() || coerced.iter().any(|v| v.is_null()) {
-                continue;
-            }
-            let values: smallvec::SmallVec<[&Value; 4]> = coerced.iter().collect();
-
-            let found = match snap {
-                Some(snap) => {
-                    self.find_segment_row_id_by_values_in_stmt(snap, col_indices, &values)?
-                }
-                None => self.find_segment_row_id_by_values(col_indices, &values)?,
-            };
-            if let Some(found_id) = found {
-                if found_id != exclude_row_id && !shadowed.contains(&found_id) {
-                    drop(values);
-                    return Err(crate::core::Error::UniqueConstraint {
-                        index: idx_name.to_string(),
-                        column: col_names.join(", "),
-                        value: coerced.into_vec().into(),
-                        row_id: found_id,
-                    });
-                }
-            }
-        }
-        Ok(())
     }
 
     fn cold_unique_indexes(&self) -> Result<Vec<ColdUnique>> {
