@@ -7379,6 +7379,22 @@ pub(crate) fn key_hash<'v>(values: impl IntoIterator<Item = &'v Value>) -> u64 {
     hasher.finish()
 }
 
+/// The rows entered among `keys` for a key of `columns` hashed `hash`
+fn key_bucket<'k>(
+    keys: &'k mut LocalKeys,
+    columns: &[i32],
+    hash: u64,
+) -> &'k mut SmallVec<[i64; 1]> {
+    let at = match keys.iter().position(|(held, _)| held.as_slice() == columns) {
+        Some(at) => at,
+        None => {
+            keys.push((SmallVec::from_slice(columns), FxHashMap::default()));
+            keys.len() - 1
+        }
+    };
+    keys[at].1.entry(hash).or_default()
+}
+
 /// The hash of the key `row` holds in `columns`, none when one is NULL
 fn row_key_hash(row: &Row, columns: &[i32]) -> Option<u64> {
     let values: Option<SmallVec<[&Value; 4]>> = (columns.iter())
@@ -7633,22 +7649,22 @@ impl TransactionVersionStore {
             .unique_indexes
             .as_ref()
             .map_or(&[][..], |(_, all)| all);
-        let mut entered: SmallVec<[(SmallVec<[i32; 4]>, u64); 2]> = SmallVec::new();
         let mut changed = false;
         for index in indexes {
             let columns = index.column_ids();
             if (columns.iter()).any(|&id| old.get(id as usize) != new.get(id as usize)) {
                 changed = true;
+                // Entered with no scan: the statement end's claim prunes
                 if let Some(hash) = row_key_hash(new, columns) {
-                    entered.push((SmallVec::from_slice(columns), hash));
+                    let rows = key_bucket(&mut tracking.local_keys, columns, hash);
+                    if rows.last() != Some(&row_id) {
+                        rows.push(row_id);
+                    }
                 }
             }
         }
         if changed {
             tracking.key_changes.push(row_id);
-        }
-        for (columns, hash) in entered {
-            self.enter_key(&columns, hash, row_id);
         }
     }
 
@@ -7743,15 +7759,7 @@ impl TransactionVersionStore {
         let Some(tracking) = self.tracking.as_deref_mut() else {
             return;
         };
-        let keys = &mut tracking.local_keys;
-        let at = match keys.iter().position(|(held, _)| held.as_slice() == columns) {
-            Some(at) => at,
-            None => {
-                keys.push((SmallVec::from_slice(columns), FxHashMap::default()));
-                keys.len() - 1
-            }
-        };
-        let rows = keys[at].1.entry(hash).or_default();
+        let rows = key_bucket(&mut tracking.local_keys, columns, hash);
         rows.retain(|held| {
             let held = *held;
             held != row_id
