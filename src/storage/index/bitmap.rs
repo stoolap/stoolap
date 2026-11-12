@@ -730,10 +730,10 @@ impl Index for BitmapIndex {
         RowIdVec::from_vec(collected)
     }
 
-    fn get_all_values(&self) -> Vec<Value> {
+    fn get_all_values(&self) -> Option<Vec<Value>> {
         let bitmaps = self.bitmaps.read();
         // Dereference CompactArc<Value> to clone inner Value
-        bitmaps.keys().map(|arc| (**arc).clone()).collect()
+        Some(bitmaps.keys().map(|arc| (**arc).clone()).collect())
     }
 
     fn distinct_keys_hint(&self) -> Option<usize> {

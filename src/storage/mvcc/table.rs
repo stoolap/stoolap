@@ -4835,12 +4835,13 @@ impl Table for MVCCTable {
         }
 
         // Fallback path: Get all values and sort (for non-B-tree indexes)
-        let all_values = index.get_all_values();
+        let Some(all_values) = index.get_all_values() else {
+            return Ok(None);
+        };
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::ordered_values_sorted(all_values.len());
 
-        // If the index doesn't support get_all_values (returns empty), return None
-        // to let the regular query execution path handle ORDER BY + LIMIT
+        // No value leaves ORDER BY + LIMIT to the regular query execution path
         if all_values.is_empty() {
             return Ok(None);
         }
@@ -4953,7 +4954,9 @@ impl Table for MVCCTable {
         };
 
         // Get all unique values from the index (partition keys)
-        let all_values = index.get_all_values();
+        let Some(all_values) = index.get_all_values() else {
+            return Ok(None);
+        };
         if all_values.is_empty() {
             return Ok(Some(Vec::new()));
         }
@@ -5004,7 +5007,7 @@ impl Table for MVCCTable {
             };
             let values = index.get_all_values();
             if self.index_view_epoch() == Some(epoch) {
-                return Ok(Some(values));
+                return Ok(values);
             }
         }
     }

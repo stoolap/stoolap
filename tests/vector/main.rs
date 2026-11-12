@@ -14,6 +14,7 @@
 
 //! Vectors and HNSW indexes
 
+mod hnsw_column_values_test;
 mod hnsw_equality_test;
 mod hnsw_lifecycle_test;
 mod keyless_sealed_hnsw_test;

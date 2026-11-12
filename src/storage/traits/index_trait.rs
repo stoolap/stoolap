@@ -382,11 +382,10 @@ pub trait Index: Send + Sync {
         None // Default implementation - override in concrete indexes
     }
 
-    /// Returns all unique values in the index (for ORDER BY optimization)
-    ///
-    /// This enables sorted iteration through unique values for TOP-N queries.
-    fn get_all_values(&self) -> Vec<Value> {
-        Vec::new() // Default implementation - override in concrete indexes
+    /// Every distinct value the index holds, NULL included; None when the
+    /// index cannot list them, or is closed
+    fn get_all_values(&self) -> Option<Vec<Value>> {
+        None
     }
 
     /// Returns the count of distinct non-null values in the index
