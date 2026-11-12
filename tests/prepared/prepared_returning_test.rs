@@ -43,111 +43,108 @@ fn rows(result: stoolap::Result<stoolap::Rows>) -> stoolap::Result<String> {
     Ok(out.join(" "))
 }
 
-const REFUSED: &str = "inside a transaction";
-
 /// Each statement with the rows it returns from `1:10 2:20 3:30 4:40`, and
-/// after a transaction inserted `(7, 70)` first; None where a transaction
-/// refuses it
-const STATEMENTS: &[(&str, &str, Option<&str>)] = &[
+/// after a transaction inserted `(7, 70)` first
+const STATEMENTS: &[(&str, &str, &str)] = &[
     (
         "INSERT INTO t VALUES (5, 1) RETURNING id, (SELECT MAX(x) FROM u)",
         "5:2",
-        Some("5:2"),
+        "5:2",
     ),
     (
         "INSERT INTO t VALUES (5, 2), (6, 1) RETURNING id, (SELECT x FROM u WHERE u.id = t.b)",
         "5:2 6:1",
-        Some("5:2 6:1"),
+        "5:2 6:1",
     ),
     (
         "INSERT INTO t VALUES (5, 0), (6, 0) RETURNING id, (SELECT COUNT(*) FROM t)",
         "5:4 6:4",
-        Some("5:5 6:5"),
+        "5:5 6:5",
     ),
     (
         "INSERT INTO t VALUES (5, 25) RETURNING id, (SELECT COUNT(*) FROM t AS o WHERE o.b < t.b)",
         "5:2",
-        None,
+        "5:2",
     ),
     (
         "INSERT INTO t VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET b = 2 RETURNING id, (SELECT x FROM u WHERE u.id = t.b)",
         "1:2",
-        Some("1:2"),
+        "1:2",
     ),
     (
         "INSERT INTO t VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET b = 99 RETURNING id, (SELECT o.b FROM t AS o WHERE o.id = t.id)",
         "1:10",
-        None,
+        "1:10",
     ),
     (
         "INSERT INTO t VALUES (1, 0), (5, 0) ON CONFLICT (id) DO NOTHING RETURNING id, (SELECT MAX(b) FROM t)",
         "5:40",
-        Some("5:70"),
+        "5:70",
     ),
     (
         "INSERT INTO t SELECT id + 4, x FROM u RETURNING id, (SELECT SUM(x) FROM u)",
         "5:3 6:3",
-        Some("5:3 6:3"),
+        "5:3 6:3",
     ),
     (
         "UPDATE t SET b = b + 1 WHERE id <= 2 RETURNING id, (SELECT x FROM u WHERE u.id = t.id)",
         "1:1 2:2",
-        Some("1:1 2:2"),
+        "1:1 2:2",
     ),
     (
         "UPDATE t SET b = 2 WHERE id = 3 RETURNING id, (SELECT x FROM u WHERE u.id = t.b)",
         "3:2",
-        Some("3:2"),
+        "3:2",
     ),
     (
         "UPDATE t SET b = 0 WHERE id = 1 RETURNING id, (SELECT SUM(b) FROM t)",
         "1:100",
-        Some("1:170"),
+        "1:170",
     ),
     (
         "UPDATE t SET b = 0 WHERE id = 1 RETURNING id, (SELECT o.b FROM t AS o WHERE o.id = t.id)",
         "1:10",
-        None,
+        "1:10",
     ),
     (
         "UPDATE t SET b = (SELECT MAX(x) FROM u) WHERE id = 1 RETURNING id, b + (SELECT MIN(x) FROM u)",
         "1:3",
-        Some("1:3"),
+        "1:3",
     ),
     (
         "DELETE FROM t WHERE id = 1 RETURNING id, (SELECT MAX(x) FROM u)",
         "1:2",
-        Some("1:2"),
+        "1:2",
     ),
     (
         "DELETE FROM t WHERE id <= 2 RETURNING id, (SELECT COUNT(*) FROM t)",
         "1:4 2:4",
-        Some("1:5 2:5"),
+        "1:5 2:5",
     ),
     (
         "DELETE FROM t WHERE id = 2 RETURNING id, (SELECT COUNT(*) FROM t AS o WHERE o.b < t.b)",
         "2:1",
-        None,
+        "2:1",
     ),
     (
         "DELETE FROM t WHERE id IN (SELECT id FROM u) RETURNING id, (SELECT x FROM u WHERE u.id = t.id)",
         "1:1 2:2",
-        Some("1:1 2:2"),
+        "1:1 2:2",
     ),
     (
         "UPDATE t SET b = 0 WHERE id = 1 RETURNING id, (SELECT SUM(b) FROM tv)",
         "1:100",
-        Some("1:170"),
+        "1:170",
     ),
     (
         "UPDATE t SET b = 0 WHERE id = 1 RETURNING id, (SELECT o.b FROM tv AS o WHERE o.id = t.id)",
         "1:10",
-        None,
+        "1:10",
     ),
     (
         "INSERT INTO t VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET b = 99 RETURNING id, (SELECT o.b FROM tv AS o WHERE o.id = t.id)",
         "1:10",
-        None,
+        "1:10",
     ),
 ];
 
@@ -177,13 +174,12 @@ fn a_returning_subquery_reads_the_tables_as_the_statement_found_them() {
                     .unwrap();
                 let (got, want) = if context == "autocommit" {
                     let got = rows(db.query(sql, ())).map_err(|e| e.to_string());
-                    (got, Ok(returned.to_string()))
+                    (got, *returned)
                 } else {
                     let mut tx = db.begin().unwrap();
-                    let want = match (context, returned_after_write) {
-                        (_, None) => Err(REFUSED),
-                        ("after a write", Some(after)) => Ok(after.to_string()),
-                        _ => Ok(returned.to_string()),
+                    let want = match context {
+                        "after a write" => returned_after_write,
+                        _ => returned,
                     };
                     if context == "after a write" {
                         tx.execute("INSERT INTO t VALUES (7, 70)", ()).unwrap();
@@ -197,14 +193,9 @@ fn a_returning_subquery_reads_the_tables_as_the_statement_found_them() {
                         }
                     }
                     tx.rollback().unwrap();
-                    (got, want)
+                    (got, *want)
                 };
-                let right = match (&got, &want) {
-                    (Ok(got), Ok(want)) => got == want,
-                    (Err(got), Err(want)) => got.contains(want),
-                    _ => false,
-                };
-                if !right {
+                if got.as_deref() != Ok(want) {
                     wrong.push(format!(
                         "{sql} (sealed: {sealed}, {level}, {context}): {got:?}, want {want:?}"
                     ));
@@ -338,14 +329,14 @@ fn a_failing_returning_read_writes_nothing() {
 }
 
 #[test]
-fn a_view_defined_again_decides_whether_returning_reads_the_target() {
+fn a_view_defined_again_is_read_as_the_statement_found_it() {
     let db = Database::open("memory://prepared_returning_view_redefined").unwrap();
     setup(&db);
     const SQL: &str =
-        "UPDATE t SET b = 11 WHERE id = 1 RETURNING id, (SELECT v.b FROM v WHERE v.id = t.id)";
-    for (first, then, refused) in [
-        ("SELECT id, b FROM t", "SELECT id, x AS b FROM u", false),
-        ("SELECT id, x AS b FROM u", "SELECT id, b FROM t", true),
+        "UPDATE t SET b = 12 WHERE id = 1 RETURNING id, (SELECT v.b FROM v WHERE v.id = t.id)";
+    for (first, then, returned) in [
+        ("SELECT id, b FROM t", "SELECT id, x AS b FROM u", "1:1"),
+        ("SELECT id, x AS b FROM u", "SELECT id, b FROM t", "1:12"),
     ] {
         db.execute("DROP VIEW IF EXISTS v", ()).unwrap();
         db.execute(&format!("CREATE VIEW v AS {first}"), ())
@@ -356,12 +347,6 @@ fn a_view_defined_again_decides_whether_returning_reads_the_target() {
         db.execute("BEGIN", ()).unwrap();
         let got = rows(db.query(SQL, ())).map_err(|e| e.to_string());
         db.execute("ROLLBACK", ()).unwrap();
-        match refused {
-            true => assert!(
-                got.as_ref().is_err_and(|e| e.contains(REFUSED)),
-                "{then}: {got:?}"
-            ),
-            false => assert_eq!(got, Ok("1:1".to_string()), "{then}"),
-        }
+        assert_eq!(got.as_deref(), Ok(returned), "{then}");
     }
 }

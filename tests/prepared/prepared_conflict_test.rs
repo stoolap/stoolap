@@ -44,81 +44,78 @@ fn rows(result: stoolap::Result<stoolap::Rows>) -> String {
         .join(" ")
 }
 
-const REFUSED: &str = "inside a transaction";
-
 /// Each statement with the table it leaves after `1:10 2:20 3:30 4:40`, and
-/// after a transaction inserted `(7, 70)` first; None where a transaction
-/// refuses it
-const STATEMENTS: &[(&str, &str, Option<&str>)] = &[
+/// after a transaction inserted `(7, 70)` first
+const STATEMENTS: &[(&str, &str, &str)] = &[
     (
         "INSERT INTO t VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET b = (SELECT MAX(b) FROM t)",
         "1:40 2:20 3:30 4:40",
-        Some("1:70 2:20 3:30 4:40 7:70"),
+        "1:70 2:20 3:30 4:40 7:70",
     ),
     (
         "INSERT INTO t VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET b = (SELECT x FROM u WHERE u.id = excluded.b)",
         "1:2 2:20 3:30 4:40",
-        Some("1:2 2:20 3:30 4:40 7:70"),
+        "1:2 2:20 3:30 4:40 7:70",
     ),
     (
         "INSERT INTO t VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET b = (SELECT COUNT(*) FROM t AS o WHERE o.b > t.b)",
         "1:3 2:20 3:30 4:40",
-        None,
+        "1:4 2:20 3:30 4:40 7:70",
     ),
     (
         "INSERT INTO t VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET b = 99 WHERE EXISTS (SELECT 1 FROM u WHERE x = 2)",
         "1:99 2:20 3:30 4:40",
-        Some("1:99 2:20 3:30 4:40 7:70"),
+        "1:99 2:20 3:30 4:40 7:70",
     ),
     (
         "INSERT INTO t VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET b = 99 WHERE EXISTS (SELECT 1 FROM u WHERE x = 5)",
         "1:10 2:20 3:30 4:40",
-        Some("1:10 2:20 3:30 4:40 7:70"),
+        "1:10 2:20 3:30 4:40 7:70",
     ),
     (
         "INSERT INTO t VALUES (1, 0), (2, 0) ON CONFLICT (id) DO UPDATE SET b = (SELECT SUM(b) FROM t)",
         "1:100 2:100 3:30 4:40",
-        Some("1:170 2:170 3:30 4:40 7:70"),
+        "1:170 2:170 3:30 4:40 7:70",
     ),
     (
         "INSERT INTO t VALUES (1, 0), (2, 0) ON CONFLICT (id) DO UPDATE SET b = (SELECT SUM(o.b) FROM t AS o WHERE o.id <> t.id)",
         "1:90 2:80 3:30 4:40",
-        None,
+        "1:160 2:150 3:30 4:40 7:70",
     ),
     (
         "INSERT INTO t VALUES (1, 0) ON DUPLICATE KEY UPDATE b = (SELECT MAX(b) FROM t)",
         "1:40 2:20 3:30 4:40",
-        Some("1:70 2:20 3:30 4:40 7:70"),
+        "1:70 2:20 3:30 4:40 7:70",
     ),
     (
         "INSERT INTO t VALUES (1, (SELECT MAX(b) FROM t)) ON CONFLICT (id) DO UPDATE SET b = excluded.b + 1",
         "1:41 2:20 3:30 4:40",
-        Some("1:71 2:20 3:30 4:40 7:70"),
+        "1:71 2:20 3:30 4:40 7:70",
     ),
     (
         "INSERT INTO t VALUES (1, (SELECT x FROM u WHERE id = 1)), (9, (SELECT MAX(b) FROM t)) ON CONFLICT (id) DO NOTHING",
         "1:10 2:20 3:30 4:40 9:40",
-        Some("1:10 2:20 3:30 4:40 7:70 9:70"),
+        "1:10 2:20 3:30 4:40 7:70 9:70",
     ),
     (
         "INSERT INTO t SELECT id, x FROM u ON CONFLICT (id) DO UPDATE SET b = (SELECT MAX(b) FROM t)",
         "1:40 2:40 3:30 4:40",
-        Some("1:70 2:70 3:30 4:40 7:70"),
+        "1:70 2:70 3:30 4:40 7:70",
     ),
     (
         "INSERT INTO t SELECT id, x FROM u ON CONFLICT (id) DO UPDATE SET b = excluded.b + (SELECT x FROM u WHERE id = 2)",
         "1:3 2:4 3:30 4:40",
-        Some("1:3 2:4 3:30 4:40 7:70"),
+        "1:3 2:4 3:30 4:40 7:70",
     ),
     (
         "INSERT INTO t VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET b = (SELECT MAX(b) FROM tv)",
         "1:40 2:20 3:30 4:40",
-        Some("1:70 2:20 3:30 4:40 7:70"),
+        "1:70 2:20 3:30 4:40 7:70",
     ),
     (
         "INSERT INTO t VALUES (1, 0) ON CONFLICT (id) DO UPDATE SET b = (SELECT COUNT(*) FROM tv AS o WHERE o.b > t.b)",
         "1:3 2:20 3:30 4:40",
-        None,
+        "1:4 2:20 3:30 4:40 7:70",
     ),
 ];
 
@@ -144,14 +141,13 @@ fn an_on_conflict_subquery_reads_the_tables_as_the_statement_found_them() {
                     let got = db.execute(sql, ()).map_err(|e| e.to_string());
                     (
                         got.map(|_| rows(db.query("SELECT id, b FROM t ORDER BY id", ()))),
-                        Ok(left.to_string()),
+                        *left,
                     )
                 } else {
                     let mut tx = db.begin().unwrap();
-                    let want = match (context, left_after_write) {
-                        (_, None) => Err(REFUSED),
-                        ("after a write", Some(left)) => Ok(left.to_string()),
-                        _ => Ok(left.to_string()),
+                    let want = match context {
+                        "after a write" => left_after_write,
+                        _ => left,
                     };
                     if context == "after a write" {
                         tx.execute("INSERT INTO t VALUES (7, 70)", ()).unwrap();
@@ -159,14 +155,9 @@ fn an_on_conflict_subquery_reads_the_tables_as_the_statement_found_them() {
                     let got = tx.execute(sql, ()).map_err(|e| e.to_string());
                     let got = got.map(|_| rows(tx.query("SELECT id, b FROM t ORDER BY id", ())));
                     tx.rollback().unwrap();
-                    (got, want)
+                    (got, *want)
                 };
-                let right = match (&got, &want) {
-                    (Ok(got), Ok(want)) => got == want,
-                    (Err(got), Err(want)) => got.contains(want),
-                    _ => false,
-                };
-                if !right {
+                if got.as_deref() != Ok(want) {
                     wrong.push(format!(
                         "{sql} (sealed: {sealed}, {context}): {got:?}, want {want:?}"
                     ));

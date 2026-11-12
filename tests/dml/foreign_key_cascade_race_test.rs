@@ -140,3 +140,36 @@ fn a_delete_set_null_leaves_a_child_that_moved_to_another_parent_after_it_was_re
         "the SET NULL cleared a child that no longer named 1"
     );
 }
+
+#[test]
+fn an_upsert_s_later_conflict_cascades_into_a_table_created_after_its_first() {
+    let _guard = test_failpoints::FailpointGuard::new();
+    let db = Database::open("memory://fk_cascade_race_new_child_table").unwrap();
+    for sql in [
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, k INTEGER UNIQUE)",
+        "CREATE TABLE c1 (id INTEGER PRIMARY KEY, pk INTEGER REFERENCES p(k) ON UPDATE CASCADE)",
+        "INSERT INTO p VALUES (1, 1), (2, 2)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let other = db.clone();
+    test_failpoints::after_cascade_targets_read(move || {
+        std::thread::spawn(move || {
+            other.execute(
+                "CREATE TABLE c2 (id INTEGER PRIMARY KEY, pk INTEGER REFERENCES p(k) ON UPDATE CASCADE)",
+                (),
+            )?;
+            other.execute("INSERT INTO c2 VALUES (1, 2)", ())
+        })
+        .join()
+        .unwrap()
+        .unwrap();
+    });
+    db.execute(
+        "INSERT INTO p VALUES (1, 11), (2, 12) ON CONFLICT (id) DO UPDATE SET k = excluded.k",
+        (),
+    )
+    .unwrap();
+    let pk: i64 = db.query_one("SELECT pk FROM c2 WHERE id = 1", ()).unwrap();
+    assert_eq!(pk, 12, "the second conflict's cascade did not reach c2");
+}

@@ -32,7 +32,8 @@ use std::cell::Cell;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
 use crate::common::{I64Map, I64Set};
 use crate::core::{Error, ForeignKeyAction, ForeignKeyConstraint, Result, Schema, Value};
@@ -948,24 +949,32 @@ pub(crate) fn enforce_update_actions(
     engine: &MVCCEngine,
     txn_id: i64,
     table: &str,
-    changes: Vec<(usize, Vec<(Value, Value)>)>,
+    mut changes: Vec<(usize, Vec<(Value, Value)>)>,
     pending: Option<&mut PendingParents<'_>>,
+    plans: &mut UpdatePlans,
 ) -> Result<()> {
+    changes.sort_unstable_by_key(|(column, _)| *column);
     let roots = changes.len();
-    let mut columns: Vec<Changed> = changes
-        .into_iter()
-        .map(|(column, values)| {
-            let mut root = Changed::new(table, column);
-            root.done = true;
-            root.values = values
-                .into_iter()
-                .map(|(old, new)| Taken::new(old, new, 0))
-                .collect();
-            root.mark_changed();
-            root
-        })
-        .collect();
-    let actions = find_update_actions(engine, &mut columns)?;
+    let plan = plans.find(engine, table, changes.iter().map(|(column, _)| *column))?;
+    let mut columns: Vec<Changed> = plan.shapes.iter().map(Changed::new).collect();
+    for (root, (_, values)) in columns.iter_mut().zip(changes) {
+        root.done = true;
+        root.values = values
+            .into_iter()
+            .map(|(old, new)| Taken::new(old, new, 0))
+            .collect();
+        root.mark_changed();
+    }
+    for at in roots..columns.len() {
+        let Some(root) = columns[at].shape.shadows else {
+            continue;
+        };
+        if columns[root].values.len() > WRITTEN_INLINE {
+            let written = columns[root].values.iter().map(|t| t.new.clone()).collect();
+            columns[at].written = written;
+        }
+    }
+    let actions = &plan.actions;
     // Each column's actions run once every action into it has
     let mut ready: Vec<usize> = (0..roots).collect();
     while let Some(at) = ready.pop() {
@@ -974,7 +983,7 @@ pub(crate) fn enforce_update_actions(
         }
         for action in actions.iter().filter(|a| a.from == at) {
             run_update_action(engine, txn_id, &mut columns, action, at < roots)?;
-            if let Some(to) = action.to {
+            if let Some(to) = action.to.filter(|_| action.counted) {
                 let into = &mut columns[to];
                 into.waiting -= 1;
                 if into.waiting == 0 && !into.done {
@@ -993,24 +1002,76 @@ pub(crate) fn enforce_update_actions(
     check_changed(engine, txn_id, &columns[roots..], pending)
 }
 
-/// A column that the ON UPDATE actions of one statement change
-struct Changed {
+/// The ON UPDATE keys beneath the columns a statement changes in a table,
+/// which depend on the schema alone: each column a key writes, and each key
+pub(crate) struct UpdatePlan {
+    /// The changed columns it starts from, in order
+    roots: SmallVec<[usize; 2]>,
+    shapes: Vec<Shape>,
+    actions: Vec<UpdateAction>,
+}
+
+/// The plan a statement's last call used for its target, with the schema
+/// epoch it was found at: an upsert's conflicts that change the same columns
+/// share it while no table's definition changes
+#[derive(Default)]
+pub(crate) struct UpdatePlans(Option<(u64, UpdatePlan)>);
+
+impl UpdatePlans {
+    fn find(
+        &mut self,
+        engine: &MVCCEngine,
+        table: &str,
+        roots: impl Iterator<Item = usize> + Clone,
+    ) -> Result<&UpdatePlan> {
+        let epoch = engine.schema_epoch();
+        let kept = self
+            .0
+            .as_ref()
+            .is_some_and(|(at, plan)| *at == epoch && plan.roots.iter().copied().eq(roots.clone()));
+        if !kept {
+            self.0 = Some((epoch, plan_update_actions(engine, table, roots.collect())?));
+        }
+        match &self.0 {
+            Some((_, plan)) => Ok(plan),
+            None => Err(Error::internal("an update plan was not kept")),
+        }
+    }
+}
+
+/// A column the keys of a plan start from or write
+struct Shape {
     table: String,
     column: usize,
+    /// The keys whose action writes into the column, each a bit of `Taken::from`
+    into: Vec<ForeignKeyConstraint>,
+    /// The root the statement changed this same column in: rows holding
+    /// one of its new values are the statement's writes, which no key reaches
+    shadows: Option<usize>,
+    /// The keys into the column it waits for
+    waiting: usize,
+}
+
+/// A column that the ON UPDATE actions of one statement change
+struct Changed<'p> {
+    shape: &'p Shape,
     /// Each distinct value the column's rows held at the statement's start
     values: Vec<Taken>,
     by_value: FxHashMap<Value, usize>,
     /// Each row an action reached and the place of its start value in `values`
     rows: I64Map<usize>,
-    /// The keys whose action writes into the column, each a bit of `Taken::from`
-    into: Vec<ForeignKeyConstraint>,
     depth: usize,
     /// The actions into the column that have not run yet
     waiting: usize,
     done: bool,
     /// The child table's store and layout `column` was read from
     token: Option<LayoutToken>,
+    /// The shadowed root's new values when they are too many to look through
+    written: FxHashSet<Value>,
 }
+
+/// Up to this many values a statement wrote are looked through, not hashed
+const WRITTEN_INLINE: usize = 8;
 
 /// What one start value of a column becomes
 struct Taken {
@@ -1037,6 +1098,8 @@ struct UpdateAction {
     to: Option<usize>,
     /// The key's bit in the `into` of its `to`
     bit: usize,
+    /// Whether `to` waits for it: every key but one round a cycle
+    counted: bool,
     child_table: String,
     fk: ForeignKeyConstraint,
 }
@@ -1056,19 +1119,18 @@ impl Taken {
     }
 }
 
-impl Changed {
-    fn new(table: &str, column: usize) -> Self {
+impl<'p> Changed<'p> {
+    fn new(shape: &'p Shape) -> Self {
         Changed {
-            table: table.to_string(),
-            column,
+            shape,
             values: Vec::new(),
             by_value: FxHashMap::default(),
             rows: I64Map::new(),
-            into: Vec::new(),
             depth: 0,
-            waiting: 0,
+            waiting: shape.waiting,
             done: false,
             token: None,
+            written: FxHashSet::default(),
         }
     }
 
@@ -1090,9 +1152,9 @@ impl Changed {
             if let Some(error) = taken.refused.take() {
                 return Err(error);
             }
-            if let (Some(clash), Some(fk)) = (&taken.clash, self.into.first()) {
+            if let (Some(clash), Some(fk)) = (&taken.clash, self.shape.into.first()) {
                 return Err(Error::foreign_key_violation(
-                    &self.table,
+                    &self.shape.table,
                     &fk.column_name,
                     &fk.referenced_table,
                     &fk.referenced_column,
@@ -1159,12 +1221,22 @@ fn cascade_depth_exceeded() -> Error {
     ))
 }
 
-/// Every ON UPDATE key beneath the changed columns of `columns`, adding
-/// to it each child column a CASCADE or SET NULL key writes
-fn find_update_actions(
+/// The plan of every ON UPDATE key beneath the changed columns `roots` of
+/// `table`, with each child column a CASCADE or SET NULL key writes
+fn plan_update_actions(
     engine: &MVCCEngine,
-    columns: &mut Vec<Changed>,
-) -> Result<Vec<UpdateAction>> {
+    table: &str,
+    roots: SmallVec<[usize; 2]>,
+) -> Result<UpdatePlan> {
+    let shape = |table: &str, column: usize| Shape {
+        table: table.to_string(),
+        column,
+        into: Vec::new(),
+        shadows: None,
+        waiting: 0,
+    };
+    let mut columns: Vec<Shape> = roots.iter().map(|&column| shape(table, column)).collect();
+    let roots_len = roots.len();
     let mut actions = Vec::new();
     let mut next = 0;
     while next < columns.len() {
@@ -1180,19 +1252,20 @@ fn find_update_actions(
                 ForeignKeyAction::Cascade | ForeignKeyAction::SetNull => {
                     let child_schema = engine.get_table_schema(child_table)?;
                     let child_column = key_position(&child_schema, fk)?;
-                    let at = match columns
-                        .iter()
-                        .position(|c| c.column == child_column && c.table == *child_table)
-                    {
-                        Some(at) => at,
+                    let same = |c: &Shape| c.column == child_column && c.table == *child_table;
+                    // A column the statement changed has its own values: a key
+                    // into it writes a column of its own
+                    let at = match columns[roots_len..].iter().position(same) {
+                        Some(at) => roots_len + at,
                         None => {
-                            columns.push(Changed::new(child_table, child_column));
+                            let mut into = shape(child_table, child_column);
+                            into.shadows = columns[..roots_len].iter().position(same);
+                            columns.push(into);
                             columns.len() - 1
                         }
                     };
                     let into = &mut columns[at];
                     into.into.push(fk.clone());
-                    into.waiting += 1;
                     (Some(at), into.into.len() - 1)
                 }
             };
@@ -1200,13 +1273,65 @@ fn find_update_actions(
                 from: next,
                 to,
                 bit,
+                counted: false,
                 child_table: child_table.clone(),
                 fk: fk.clone(),
             });
         }
         next += 1;
     }
-    Ok(actions)
+    count_waits(&mut actions, &mut columns, roots_len);
+    Ok(UpdatePlan {
+        roots,
+        shapes: columns,
+        actions,
+    })
+}
+
+/// Makes each column wait for the keys into it a walk from the roots meets
+/// before the column, every key but one leading back round a cycle; such a
+/// key is not waited for, and reaching a row through it is refused
+fn count_waits(actions: &mut [UpdateAction], columns: &mut [Shape], roots: usize) {
+    // Columns are found in order, so each one's keys are one run of
+    // `actions`; a graph of up to eight columns walks without the heap
+    let mut first: SmallVec<[usize; 9]> = smallvec::smallvec![actions.len(); columns.len() + 1];
+    for (at, action) in actions.iter().enumerate().rev() {
+        first[action.from] = at;
+    }
+    for column in (0..columns.len()).rev() {
+        first[column] = first[column].min(first[column + 1]);
+    }
+    const NEW: u8 = 0;
+    const OPEN: u8 = 1;
+    const DONE: u8 = 2;
+    let mut state: SmallVec<[u8; 8]> = smallvec::smallvec![NEW; columns.len()];
+    let mut walk: SmallVec<[(usize, usize); 8]> = SmallVec::new();
+    for root in 0..roots {
+        state[root] = OPEN;
+        walk.push((root, first[root]));
+        while let Some((column, at)) = walk.last_mut() {
+            let column = *column;
+            if *at == first[column + 1] {
+                state[column] = DONE;
+                walk.pop();
+                continue;
+            }
+            let action = *at;
+            *at += 1;
+            let Some(to) = actions[action].to else {
+                continue;
+            };
+            if state[to] == OPEN {
+                continue;
+            }
+            actions[action].counted = true;
+            columns[to].waiting += 1;
+            if state[to] == NEW {
+                state[to] = OPEN;
+                walk.push((to, first[to]));
+            }
+        }
+    }
 }
 
 /// Runs `action` over the changed values of its column, recording what each
@@ -1265,7 +1390,7 @@ fn run_update_action(
     let col_idx = key_position(child_schema, fk)?;
     // Every read of the column and its write are of one layout
     let token = child.layout_token();
-    if col_idx != columns[to].column || columns[to].token.is_some_and(|t| t != token) {
+    if col_idx != columns[to].shape.column || columns[to].token.is_some_and(|t| t != token) {
         return Err(Error::SchemaChanged {
             table: child_table.to_string(),
         });
@@ -1277,7 +1402,16 @@ fn run_update_action(
     let set_null = fk.on_update == ForeignKeyAction::SetNull;
     let mut reached = false;
     for (old_value, new_value) in &changes {
-        if !child_rows_exist(engine, txn_id, child_table, fk, old_value)? {
+        // A row holding a value the statement wrote into the column is that write
+        let written = columns[to].shape.shadows.is_some_and(|root| {
+            match columns[root].values.len() > WRITTEN_INLINE {
+                true => {
+                    (columns[to].written).contains(&key_value(child_schema, col_idx, old_value))
+                }
+                false => (columns[root].values.iter()).any(|t| same_value(&t.new, old_value)),
+            }
+        });
+        if written || !child_rows_exist(engine, txn_id, child_table, fk, old_value)? {
             continue;
         }
         check_children_seen(engine, txn_id, child_table, fk, old_value)?;
@@ -1347,12 +1481,13 @@ fn run_update_action(
 fn write_changed(engine: &MVCCEngine, txn_id: i64, columns: &[Changed]) -> Result<()> {
     let mut tables: Vec<&str> = Vec::new();
     for column in columns {
-        if column.values.iter().any(|t| t.changed) && !tables.contains(&column.table.as_str()) {
-            tables.push(&column.table);
+        let table = column.shape.table.as_str();
+        if column.values.iter().any(|t| t.changed) && !tables.contains(&table) {
+            tables.push(table);
         }
     }
     for table in tables {
-        let of_table: Vec<&Changed> = columns.iter().filter(|c| c.table == table).collect();
+        let of_table: Vec<&Changed> = columns.iter().filter(|c| c.shape.table == table).collect();
         let mut ids: Vec<i64> = Vec::new();
         for column in &of_table {
             ids.extend(
@@ -1373,7 +1508,7 @@ fn write_changed(engine: &MVCCEngine, txn_id: i64, columns: &[Changed]) -> Resul
         }
         let schema = child.schema();
         let checks = super::dml::checks_reading(super::dml::compile_check_programs(schema)?, |c| {
-            of_table.iter().any(|column| column.column == c)
+            of_table.iter().any(|column| column.shape.column == c)
         });
         let pk = schema.pk_column_index();
         let mut vm = super::expression::ExprVM::new();
@@ -1388,10 +1523,10 @@ fn write_changed(engine: &MVCCEngine, txn_id: i64, columns: &[Changed]) -> Resul
                 let taken = &column.values[at];
                 if taken.changed
                     && row
-                        .get(column.column)
+                        .get(column.shape.column)
                         .is_some_and(|v| same_value(v, &taken.old))
                 {
-                    apply.push((column.column, taken));
+                    apply.push((column.shape.column, taken));
                 }
             }
             if apply.is_empty() {
@@ -1434,20 +1569,21 @@ fn check_changed(
         if !column.values.iter().any(checked) {
             continue;
         }
-        let schema = engine.get_table_schema(&column.table)?;
+        let (table, shape) = (&column.shape.table, column.shape);
+        let schema = engine.get_table_schema(table)?;
         for fk in schema
             .foreign_keys
             .iter()
-            .filter(|k| k.column_index == column.column)
+            .filter(|k| k.column_index == shape.column)
         {
-            let bit = column.into.iter().position(|k| same_key(k, fk));
+            let bit = shape.into.iter().position(|k| same_key(k, fk));
             for taken in column.values.iter().filter(|t| checked(t)) {
                 if bit.is_some_and(|b| b < 64 && taken.from & (1 << b) != 0) {
                     continue;
                 }
                 match pending.as_deref_mut() {
-                    Some(pending) => pending.ask(engine, txn_id, &column.table, fk, &taken.new)?,
-                    None => validate_fk_value(engine, txn_id, fk, &taken.new, &column.table)?,
+                    Some(pending) => pending.ask(engine, txn_id, table, fk, &taken.new)?,
+                    None => validate_fk_value(engine, txn_id, fk, &taken.new, table)?,
                 }
             }
         }

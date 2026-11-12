@@ -764,34 +764,6 @@ impl Executor {
                     .is_ok())
     }
 
-    /// The refusal of a RETURNING value read for each row returned whose
-    /// block reads the target inside a transaction
-    fn returning_reads_target() -> Error {
-        Error::invalid_argument(
-            "a RETURNING subquery that reads the row returned cannot read the target table \
-             inside a transaction",
-        )
-    }
-
-    /// Refuse an INSERT whose block read for each conflict or row returned
-    /// reads the target inside a transaction, where it would see the
-    /// statement's writes
-    fn refuse_target_reads_in_transaction(
-        run: &super::prepared_select::DmlRunner,
-        in_transaction: bool,
-    ) -> Result<()> {
-        if in_transaction && run.conflict_reads_target() {
-            return Err(Error::invalid_argument(
-                "an ON CONFLICT subquery that reads the row met or the excluded row \
-                 cannot read the target table inside a transaction",
-            ));
-        }
-        if in_transaction && run.returning_reads_target() {
-            return Err(Self::returning_reads_target());
-        }
-        Ok(())
-    }
-
     /// The answer of each VALUES subquery with its row and position, all
     /// read before the statement writes a row
     fn insert_value_answers(run: &super::prepared_select::DmlRunner) -> Result<ValueAnswers> {
@@ -946,7 +918,6 @@ impl Executor {
             let run = &*runner.insert(super::prepared_select::DmlRunner::new(
                 self, &prepared, ctx, tables, 0,
             )?);
-            Self::refuse_target_reads_in_transaction(run, active_txn_id.is_some())?;
             // The statement is copied only for the VALUES answers it takes
             let mut answered_ctx = std::borrow::Cow::Borrowed(ctx);
             let mut answered = std::borrow::Cow::Borrowed(stmt);
@@ -1089,6 +1060,8 @@ impl Executor {
         };
         // Keys into this table whose parent is a later row of the statement
         let mut pending_parents = super::foreign_key::PendingParents::new(table_name);
+        // The ON UPDATE keys the upsert's conflicts reach, found once
+        let mut update_plans = super::foreign_key::UpdatePlans::default();
 
         // Create VM for constant expression evaluation (reused for all INSERT values)
         use super::expression::{ExecuteContext, ExprVM};
@@ -1268,7 +1241,7 @@ impl Executor {
                                 ctx,
                                 (has_returning, widened),
                                 conflict,
-                                &mut pending_parents,
+                                (&mut pending_parents, &mut update_plans),
                             ) {
                                 Ok((updated, returned)) => {
                                     if let Some(updated_row) = returned {
@@ -1318,7 +1291,7 @@ impl Executor {
                                         ctx,
                                         (has_returning, widened),
                                         conflict,
-                                        &mut pending_parents,
+                                        (&mut pending_parents, &mut update_plans),
                                     ) {
                                         Ok((updated, returned)) => {
                                             if let Some(updated_row) = returned {
@@ -1557,7 +1530,7 @@ impl Executor {
                                 ctx,
                                 (has_returning, widened),
                                 conflict,
-                                &mut pending_parents,
+                                (&mut pending_parents, &mut update_plans),
                             ) {
                                 Ok((updated, returned)) => {
                                     if let Some(updated_row) = returned {
@@ -1608,7 +1581,7 @@ impl Executor {
                                         ctx,
                                         (has_returning, widened),
                                         conflict,
-                                        &mut pending_parents,
+                                        (&mut pending_parents, &mut update_plans),
                                     ) {
                                         Ok((updated, returned)) => {
                                             if let Some(updated_row) = returned {
@@ -2038,7 +2011,6 @@ impl Executor {
             let run = &*runner.insert(super::prepared_select::DmlRunner::new(
                 self, &prepared, ctx, tables, 0,
             )?);
-            Self::refuse_target_reads_in_transaction(run, active_txn_id.is_some())?;
             answers = Self::insert_value_answers(run)?;
             if run.returning().is_none() {
                 // Every value is read: the blocks' tables close before a row is written
@@ -2523,9 +2495,6 @@ impl Executor {
                 tables,
                 table.row_count_hint(),
             )?;
-            if !should_auto_commit && run.returning_reads_target() {
-                return Err(Self::returning_reads_target());
-            }
             Some(run)
         } else {
             None
@@ -2906,6 +2875,7 @@ impl Executor {
                     table_name,
                     by_column.into_iter().collect(),
                     None,
+                    &mut Default::default(),
                 )?;
             }
         }
@@ -3079,9 +3049,6 @@ impl Executor {
                 tables,
                 table.row_count_hint(),
             )?;
-            if !should_auto_commit && run.returning_reads_target() {
-                return Err(Self::returning_reads_target());
-            }
             Some(run)
         } else {
             None
@@ -3684,7 +3651,10 @@ impl Executor {
         ctx: &ExecutionContext,
         (capture_row, returns_id): (bool, bool),
         conflict: Option<&ConflictRun<'_, '_>>,
-        pending_parents: &mut super::foreign_key::PendingParents<'_>,
+        (pending_parents, update_plans): (
+            &mut super::foreign_key::PendingParents<'_>,
+            &mut super::foreign_key::UpdatePlans,
+        ),
     ) -> Result<(bool, Option<Row>)> {
         // Build a WHERE clause to find the specific row
         // Use schema's cached pk_column_index for O(1) lookup
@@ -3936,6 +3906,7 @@ impl Executor {
                 &schema.table_name,
                 by_column,
                 Some(pending_parents),
+                update_plans,
             )?;
         }
 

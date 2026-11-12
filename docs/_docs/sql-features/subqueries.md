@@ -419,7 +419,7 @@ INSERT INTO orders VALUES (7, 'B', 0)
 ON CONFLICT (id) DO UPDATE SET price = (SELECT price FROM catalog WHERE catalog.code = excluded.code);
 ```
 
-Outside an explicit transaction the statement reads one snapshot. Inside one, a value read for each conflict would see the rows this statement has already written, so such a value may not read the target table there, directly or through a view; the statement fails with an error instead. Another table is read as the statement found it in both cases: a value does not see the rows the foreign key actions of an earlier conflict changed, only the writes of earlier statements in the transaction.
+A value read for each conflict reads every table as the statement found it, the target too, directly or through a view, inside an explicit transaction as well: it sees the writes of earlier statements in the transaction, not the rows this statement has already written or the rows the foreign key actions of an earlier conflict changed.
 
 ### Subqueries in RETURNING
 
@@ -435,7 +435,7 @@ DELETE FROM orders WHERE created < '2024-01-01'
 RETURNING id, (SELECT COUNT(*) FROM orders);
 ```
 
-A subquery that reads the target table reads it as the statement found it, so for an `UPDATE` it returns a row's old values. Inside an explicit transaction a value read for each row returned may not read the target table, as in `ON CONFLICT`; the statement fails with an error instead. A child table the statement's `CASCADE` or `SET NULL` actions write is read as the statement found it too, in a transaction as well:
+A subquery that reads the target table reads it as the statement found it, so for an `UPDATE` it returns a row's old values, inside an explicit transaction too. A child table the statement's `CASCADE` or `SET NULL` actions write is read as the statement found it as well:
 
 ```sql
 -- children references parents(id) ON DELETE CASCADE; parent 1 has 2 children
@@ -703,8 +703,6 @@ Currently, Stoolap supports the following subquery features:
 A subquery that no [prepared](#prepared-subqueries) plan runs is refused with an error rather than answered, in any statement and at any depth; `EXPLAIN` shows the statement as `Prepared: no (reason)`. Among the positions refused:
 
 - A subquery in `RETURNING` outside the [prepared](#prepared-subqueries) shape
-- Inside an explicit transaction, a subquery in `ON CONFLICT ... DO UPDATE` that reads the target table, in a value that reads the row met or the excluded row
-- Inside an explicit transaction, a subquery in `RETURNING` that reads the target table, in a value that reads the row returned
 - An `UPDATE` that sets one column from a correlated subquery and another from an uncorrelated one, when one of its subqueries is outside the [prepared](#prepared-subqueries) shape
 - `DISTINCT ON` expressions in a query that neither groups nor has window functions, and a `GROUP BY` expression outside the [prepared](#prepared-subqueries) shape
 - `HAVING` in a query that also has window functions, outside the [prepared](#prepared-subqueries) shape

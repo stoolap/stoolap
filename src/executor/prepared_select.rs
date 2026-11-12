@@ -4873,7 +4873,7 @@ impl PreparedSubquery {
         };
         let grouped = self.grouping.as_ref().and_then(|g| g.statement.as_deref());
         let derived = match &self.source {
-            Some(BlockSource::Derived(run, _)) => Some(&**run),
+            Some(BlockSource::Derived(run)) => Some(&**run),
             _ => None,
         };
         [own, grouped, derived].into_iter().flatten()
@@ -4969,37 +4969,16 @@ impl PreparedSubquery {
             _ => 1,
         }
     }
-
-    /// Whether the block may read `table`: its own table, or one its view's
-    /// query reads, any when they are not known. A CTE's rows are read before
-    /// the statement writes; a VALUES list or table function reads none
-    fn may_read(&self, table: &str) -> bool {
-        if let Answer::Statement(_, block) = &self.answer {
-            return block
-                .tables
-                .as_ref()
-                .is_none_or(|tables| tables.iter().any(|read| read == table));
-        }
-        match &self.source {
-            None => self.table.as_deref() == Some(table),
-            Some(BlockSource::View(_, tables, _) | BlockSource::Derived(_, tables)) => tables
-                .as_ref()
-                .is_none_or(|tables| tables.iter().any(|read| read == table)),
-            Some(_) => false,
-        }
-    }
 }
 
 /// What a block reads in place of a table, materialized once per run
 /// before the statement's rows, as the statement's own source is
 #[derive(Debug)]
 enum BlockSource {
-    /// A view, with the tables its query reads, None when they are not
-    /// known, and the query its columns were named for
-    View(SmartString, Option<Vec<SmartString>>, String),
-    /// A derived table that reads no enclosing scope, with the tables its
-    /// statement reads
-    Derived(Box<StatementRun>, Option<Vec<SmartString>>),
+    /// A view, with the query its columns were named for
+    View(SmartString, String),
+    /// A derived table that reads no enclosing scope
+    Derived(Box<StatementRun>),
     Cte(SmartString),
     /// A VALUES list, with its rows compiled or the error compiling them
     /// raises when the block reads them
@@ -5139,13 +5118,11 @@ enum Answer {
 }
 
 /// A block whose derived table reads an enclosing scope: the block with
-/// each name bound beyond it reading a slot, what it answers, and the
-/// tables it reads, None when they are not known
+/// each name bound beyond it reading a slot, and what it answers
 #[derive(Debug)]
 struct StatementBlock {
     run: StatementRun,
     form: StatementForm,
-    tables: Option<Vec<SmartString>>,
     /// Whether it computes a window function
     windowed: bool,
     /// The values each of its rows gives, its stars counted; 0 for an EXISTS
@@ -6442,8 +6419,7 @@ impl Builder<'_> {
         // One that binds nothing beyond itself keeps its answer across
         // statements while the tables it reads, all known, stay as they were
         let uncorrelated = !work.reads_parent && work.delegated.is_empty();
-        let tables = executor.read_tables(&statement);
-        let kept_tables = tables.clone().filter(|_| uncorrelated);
+        let kept_tables = executor.read_tables(&statement).filter(|_| uncorrelated);
         let kept = Kept {
             identity_key: ExprKey::exact(&identity),
             identity: Arc::new(identity),
@@ -6459,7 +6435,6 @@ impl Builder<'_> {
             Form::Members { read_as, test, .. } => StatementForm::Members(read_as, test),
         };
         let block = StatementBlock {
-            tables,
             run: StatementRun {
                 statement,
                 classification: std::sync::OnceLock::new(),
@@ -6914,13 +6889,8 @@ impl Builder<'_> {
             Named::View(view) => view,
             Named::Table => return Ok(None),
         };
-        let parsed = self.executor.parse_view_statement(&view.query)?;
-        let tables = match parsed.statement.as_ref() {
-            Statement::Select(select) => self.executor.read_tables(select),
-            _ => None,
-        };
         let named = view_names(self.executor, &view, self.ctx, true)?;
-        let source = BlockSource::View(name.into(), tables, view.query.clone());
+        let source = BlockSource::View(name.into(), view.query.clone());
         Ok(Some((source, named)))
     }
 
@@ -7027,9 +6997,8 @@ impl Builder<'_> {
                     classification: std::sync::OnceLock::new(),
                     compiled: NestedPlan::default(),
                 };
-                let tables = executor.read_tables(&derived.subquery);
                 let name = derived.alias.as_ref().map(|a| a.value_lower.clone());
-                FromEntry::Source(name, BlockSource::Derived(Box::new(run), tables), columns)
+                FromEntry::Source(name, BlockSource::Derived(Box::new(run)), columns)
             }
             _ => return Err(Error::internal("a prepared subquery without one table")),
         })
@@ -10432,8 +10401,6 @@ struct PreparedReturning {
     /// The names of the result's columns, shared by every execution
     names: CompactArc<Vec<String>>,
     programs: Vec<SharedProgram>,
-    /// A value read for each row returned holds a block that reads the target
-    reads_target: bool,
 }
 
 /// An INSERT's ON CONFLICT SET values and DO UPDATE WHERE, over the row
@@ -10442,15 +10409,12 @@ struct PreparedConflict {
     /// The target's columns the joined row is laid out for
     columns: CompactArc<Vec<String>>,
     upsert: Arc<super::dml::CompiledUpsert>,
-    /// A value read for each conflict holds a block that reads the target
-    reads_target: bool,
 }
 
 impl std::fmt::Debug for PreparedConflict {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PreparedConflict")
             .field("columns", &self.columns)
-            .field("reads_target", &self.reads_target)
             .finish_non_exhaustive()
     }
 }
@@ -10619,9 +10583,7 @@ impl PreparedDml {
         if let (Some(sites), Some(joined)) = (conflict, &joined) {
             let scopes = [joined];
             let chain = Chain { scopes: &scopes };
-            let mut reads_target = false;
             let mut per_value = |builder: &mut Builder<'_>, value: &Expression| {
-                let first = builder.subqueries.len();
                 let mut value_work = Rewritten::default();
                 let rewritten_value = builder.rewrite(&chain, None, value, &mut value_work)?;
                 if !value_work.reads_row && !is_leaf(value) && !volatile(value, global_registry()) {
@@ -10629,11 +10591,6 @@ impl PreparedDml {
                     run_slots.push((slot, rewritten_value));
                     return Ok(slot_parameter(slot));
                 }
-                // Read for each conflict, after the statement's earlier writes
-                reads_target |= builder.subqueries[first..]
-                    .iter()
-                    .flatten()
-                    .any(|sq| sq.may_read(sites.table));
                 Ok::<_, Error>(rewritten_value)
             };
             let (site_sets, site_where) = Executor::conflict_sets(sites.schema, sites.stmt)?;
@@ -10645,7 +10602,7 @@ impl PreparedDml {
                 .as_ref()
                 .map(|clause| per_value(&mut builder, clause))
                 .transpose()?;
-            conflict_parts = Some((sets, where_, reads_target));
+            conflict_parts = Some((sets, where_));
         }
         // RETURNING reads the row returned, `*` each of its columns
         let returning_scope = returning
@@ -10659,14 +10616,12 @@ impl PreparedDml {
         if let (Some(sites), Some(returning_scope)) = (returning, &returning_scope) {
             let scopes = [returning_scope];
             let chain = Chain { scopes: &scopes };
-            let mut reads_target = false;
             let mut values = Vec::with_capacity(sites.values.len());
             for value in sites.values.iter().map(unaliased) {
                 if matches!(value, Expression::Star(_)) {
                     values.extend((0..sites.schema.columns.len()).map(|i| chain.column(0, i)));
                     continue;
                 }
-                let first = builder.subqueries.len();
                 let mut value_work = Rewritten::default();
                 let rewritten_value = builder.rewrite(&chain, None, value, &mut value_work)?;
                 if !value_work.reads_row && !is_leaf(value) && !volatile(value, global_registry()) {
@@ -10675,14 +10630,9 @@ impl PreparedDml {
                     values.push(slot_parameter(slot));
                     continue;
                 }
-                // Read for each row returned, after the statement's writes
-                reads_target |= builder.subqueries[first..]
-                    .iter()
-                    .flatten()
-                    .any(|sq| sq.may_read(sites.table));
                 values.push(rewritten_value);
             }
-            returning_parts = Some((values, reads_target));
+            returning_parts = Some(values);
         }
         let mut read_as = FxHashMap::default();
         if let Some(parts) = &where_parts {
@@ -10708,7 +10658,7 @@ impl PreparedDml {
             })
             .collect::<Result<Vec<_>>>()?;
         let prepared_conflict = match (conflict, &joined, conflict_parts) {
-            (Some(sites), Some(_), Some((sets, where_, reads_target))) => {
+            (Some(sites), Some(_), Some((sets, where_))) => {
                 let over_joined =
                     CompileContext::bound(global_registry()).with_prepared_subqueries();
                 let updates = sets
@@ -10731,13 +10681,12 @@ impl PreparedDml {
                         where_,
                         Executor::conflict_widens(sites.schema, sites.stmt),
                     )?),
-                    reads_target,
                 })
             }
             _ => None,
         };
         let prepared_returning = match (returning, &returning_scope, returning_parts) {
-            (Some(sites), Some(_), Some((values, reads_target))) => {
+            (Some(sites), Some(_), Some(values)) => {
                 let over_returned =
                     CompileContext::bound(global_registry()).with_prepared_subqueries();
                 let columns = sites.schema.column_names_arc();
@@ -10748,7 +10697,6 @@ impl PreparedDml {
                         .iter()
                         .map(|value| compile_with(&over_returned, value))
                         .collect::<Result<Vec<_>>>()?,
-                    reads_target,
                 })
             }
             _ => None,
@@ -12142,15 +12090,6 @@ impl<'a> DmlRunner<'a> {
             .map(|conflict| &conflict.upsert)
     }
 
-    /// Whether a value read for each conflict holds a block that reads the
-    /// target, which inside a transaction would see the statement's writes
-    pub(crate) fn conflict_reads_target(&self) -> bool {
-        self.prepared
-            .conflict
-            .as_ref()
-            .is_some_and(|conflict| conflict.reads_target)
-    }
-
     /// The RETURNING's programs over the row returned, one for each column
     /// of its result; None without a prepared one
     pub(crate) fn returning(&self) -> Option<&'a [SharedProgram]> {
@@ -12167,16 +12106,6 @@ impl<'a> DmlRunner<'a> {
             .returning
             .as_ref()
             .map(|returning| &returning.names)
-    }
-
-    /// Whether a RETURNING value read for each row returned holds a block
-    /// that reads the target, which inside a transaction would see the
-    /// statement's writes
-    pub(crate) fn returning_reads_target(&self) -> bool {
-        self.prepared
-            .returning
-            .as_ref()
-            .is_some_and(|returning| returning.reads_target)
     }
 }
 
@@ -12892,7 +12821,7 @@ impl Executor {
     /// named its columns for; a view's query may have changed since
     fn source_holds(&self, source: &BlockSource) -> Result<bool> {
         Ok(match source {
-            BlockSource::View(name, _, query) => self
+            BlockSource::View(name, query) => self
                 .engine
                 .get_view_lowercase(name)?
                 .is_some_and(|view| view.query == *query),
@@ -13243,26 +13172,10 @@ impl Executor {
             let inner_ctx = ctx
                 .with_incremented_query_depth()
                 .with_table_use(TableUse::ReadAsFound(cut));
-            // A block read for each conflict or row returned that reads the
-            // target would see the statement's writes: it reads a snapshot taken before them
-            let reads_target = prepared.conflict.as_ref().is_some_and(|c| c.reads_target)
-                || prepared.returning.as_ref().is_some_and(|r| r.reads_target);
-            let snapshot_ctx = match through {
-                Some(_) if reads_target => {
-                    let snapshot = self.new_statement_snapshot(
-                        self.isolation_level(),
-                        inner_ctx.statement_view(),
-                    )?;
-                    Some(inner_ctx.with_statement_snapshot(snapshot))
-                }
-                _ => None,
-            };
-            let block_ctx = snapshot_ctx.as_ref().unwrap_or(&inner_ctx);
-            let through = through.filter(|_| snapshot_ctx.is_none());
             if let Some(tables) =
-                PreparedRunner::open_tables(self, &prepared.blocks, block_ctx, through)?
+                PreparedRunner::open_tables(self, &prepared.blocks, &inner_ctx, through)?
             {
-                let inner_ctx = Some(snapshot_ctx.unwrap_or(inner_ctx));
+                let inner_ctx = Some(inner_ctx);
                 return Ok((prepared, DmlTables { tables, inner_ctx }));
             }
             if fresh {
