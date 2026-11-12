@@ -173,6 +173,45 @@ fn a_reading_statement_counts_as_active_and_none_starts_while_none_is_admitted()
 }
 
 #[test]
+fn an_admitted_statement_reads_as_of_after_admission_stops() {
+    let db = Database::open("memory://streamed_view_read_as_of").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1), (2, 2)", ())
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1, 1, 10), (2, 2, 20)", ())
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let before: String = db.query_one("SELECT CAST(NOW() AS TEXT)", ()).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    db.execute("UPDATE u SET v = v + 100", ()).unwrap();
+    let read = db
+        .prepare(
+            "SELECT t.id, (SELECT MAX(x.v) FROM u AS OF TIMESTAMP $1 x WHERE x.k = t.k) \
+             FROM t ORDER BY t.id",
+        )
+        .unwrap();
+    let registry = db.engine().registry();
+    let (stopper, stopped) = (Arc::clone(&registry), Rc::new(Cell::new(false)));
+    let flag = Rc::clone(&stopped);
+    fp::after_select_table_opened(move || {
+        stopper.stop_accepting_transactions();
+        flag.set(true);
+    });
+    let rows: stoolap::Result<Vec<(i64, i64)>> = read
+        .query((before.as_str(),))
+        .and_then(|rows| rows.map(pair).collect());
+    registry.start_accepting_transactions();
+    assert!(stopped.get(), "admission stopped as the table opened");
+    assert_eq!(rows.unwrap(), [(1, 10), (2, 20)]);
+}
+
+#[test]
 fn a_read_committed_session_under_a_snapshot_default_reads_sealed_deletes() {
     let dir = tempfile::tempdir().unwrap();
     let db = open_file(dir.path());

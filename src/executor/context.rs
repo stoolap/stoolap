@@ -550,23 +550,31 @@ pub fn clear_all_thread_local_caches() {
 pub struct StatementSnapshot(Arc<SnapshotState>);
 
 struct SnapshotState {
-    /// Locked without allocating: every run of a statement opens one. With
-    /// a view and nothing written it begins only when a read needs it
-    transaction: parking_lot::Mutex<Option<Box<dyn crate::storage::traits::Transaction>>>,
-    /// The engine a read under the view opens its table on, and the
-    /// transaction begins on when one is asked for
-    begun_on: Option<Arc<crate::storage::mvcc::engine::MVCCEngine>>,
-    /// Counts the reads without a transaction as one, as long as they last
-    _admitted: Option<crate::storage::mvcc::registry::ReaderAdmission>,
+    reads: SnapshotReads,
     /// Whether its reads see each commit as it lands (READ COMMITTED with
     /// no statement view), so a result read through it is no older than a
     /// stamp taken before the read
     reads_latest: bool,
-    /// The statement view its tables are read through
-    view: Option<StatementView>,
     /// What is written through its transaction: nothing for the executor's
     /// own, maybe anything for one a caller gave through `get_table`
     table_use: TableUse,
+}
+
+/// What a statement snapshot opens its tables through
+enum SnapshotReads {
+    /// A transaction, locked without allocating, and the statement view
+    /// its tables are read through when the statement has one
+    Transaction {
+        transaction: parking_lot::Mutex<Box<dyn crate::storage::traits::Transaction>>,
+        view: Option<StatementView>,
+    },
+    /// The view alone, for reads that write nothing: the engine opens the
+    /// tables, and the registry counts the reads as a transaction
+    View {
+        view: StatementView,
+        engine: Arc<crate::storage::mvcc::engine::MVCCEngine>,
+        _admitted: crate::storage::mvcc::registry::ReaderAdmission,
+    },
 }
 
 impl StatementSnapshot {
@@ -577,87 +585,49 @@ impl StatementSnapshot {
         isolation: crate::core::IsolationLevel,
         view: Option<StatementView>,
     ) -> Self {
-        Self::with_use(
-            Some(transaction),
-            None,
-            None,
-            isolation,
-            view,
-            TableUse::Write,
-        )
+        let reads_latest =
+            isolation == crate::core::IsolationLevel::ReadCommitted && view.is_none();
+        let transaction = parking_lot::Mutex::new(transaction);
+        Self(Arc::new(SnapshotState {
+            reads: SnapshotReads::Transaction { transaction, view },
+            reads_latest,
+            table_use: TableUse::Write,
+        }))
     }
 
-    /// The executor's own reads on `engine`: nothing writes through the
-    /// transaction, so its tables open without a local store. Under a view
-    /// a read needs no transaction, and one begins only when asked for
+    /// The executor's own reads on `engine`, at `isolation`: nothing is
+    /// written through them, so a table opens without a local store, and
+    /// under a view without a transaction
     pub(crate) fn for_reads(
         engine: &Arc<crate::storage::mvcc::engine::MVCCEngine>,
         isolation: crate::core::IsolationLevel,
         view: Option<StatementView>,
     ) -> crate::core::Result<Self> {
         use crate::storage::traits::Engine;
-        let (transaction, admitted) = match view {
-            Some(_) => {
-                let admitted = engine.registry_ref().admit_reader().ok_or_else(|| {
+        let reads_latest =
+            isolation == crate::core::IsolationLevel::ReadCommitted && view.is_none();
+        let reads = match view {
+            Some(view) => SnapshotReads::View {
+                view,
+                engine: Arc::clone(engine),
+                _admitted: engine.registry_ref().admit_reader().ok_or_else(|| {
                     crate::core::Error::internal(
                         "transaction registry is not accepting new transactions",
                     )
-                })?;
-                (None, Some(admitted))
-            }
-            None => (Some(engine.begin_transaction_with_level(isolation)?), None),
+                })?,
+            },
+            None => SnapshotReads::Transaction {
+                transaction: parking_lot::Mutex::new(
+                    engine.begin_transaction_with_level(isolation)?,
+                ),
+                view: None,
+            },
         };
-        let engine = Some(Arc::clone(engine));
-        Ok(Self::with_use(
-            transaction,
-            engine,
-            admitted,
-            isolation,
-            view,
-            TableUse::Read,
-        ))
-    }
-
-    fn with_use(
-        transaction: Option<Box<dyn crate::storage::traits::Transaction>>,
-        begun_on: Option<Arc<crate::storage::mvcc::engine::MVCCEngine>>,
-        admitted: Option<crate::storage::mvcc::registry::ReaderAdmission>,
-        isolation: crate::core::IsolationLevel,
-        view: Option<StatementView>,
-        table_use: TableUse,
-    ) -> Self {
-        Self(Arc::new(SnapshotState {
-            transaction: parking_lot::Mutex::new(transaction),
-            begun_on,
-            _admitted: admitted,
-            reads_latest: isolation == crate::core::IsolationLevel::ReadCommitted && view.is_none(),
-            view,
-            table_use,
-        }))
-    }
-
-    /// Runs `f` on the transaction, begun now when it has not been yet
-    fn with_transaction<T>(
-        &self,
-        f: impl FnOnce(&dyn crate::storage::traits::Transaction) -> crate::core::Result<T>,
-    ) -> crate::core::Result<T> {
-        use crate::storage::traits::Engine;
-        let mut slot = self.0.transaction.lock();
-        let transaction = match (slot.take(), &self.0.begun_on) {
-            (Some(transaction), _) => transaction,
-            // Only a snapshot with a view begins late, and a view is read committed's
-            (None, Some(engine)) => {
-                engine.begin_transaction_with_level(crate::core::IsolationLevel::ReadCommitted)?
-            }
-            (None, None) => {
-                return Err(crate::core::Error::internal(
-                    "a statement snapshot lost its transaction",
-                ))
-            }
-        };
-        let result = f(&*transaction);
-        *slot = Some(transaction);
-        result
+        Ok(Self(Arc::new(SnapshotState {
+            reads,
+            reads_latest,
+            table_use: TableUse::Read,
+        })))
     }
 
     /// Whether its reads see each commit as it lands
@@ -673,30 +643,40 @@ impl StatementSnapshot {
 
     /// The statement view its tables are read through
     pub(crate) fn view(&self) -> Option<&StatementView> {
-        self.0.view.as_ref()
+        match &self.0.reads {
+            SnapshotReads::Transaction { view, .. } => view.as_ref(),
+            SnapshotReads::View { view, .. } => Some(view),
+        }
     }
 
+    /// The table `name`; read only when the snapshot reads through its view
     pub fn get_table(
         &self,
         name: &str,
     ) -> crate::core::Result<Box<dyn crate::storage::traits::Table>> {
-        self.with_transaction(|transaction| transaction.get_table(name))
+        match &self.0.reads {
+            SnapshotReads::Transaction { transaction, .. } => transaction.lock().get_table(name),
+            SnapshotReads::View { view, engine, .. } => engine.read_table_in_view(name, view),
+        }
     }
 
-    /// The table read through `view`, None reading the newest committed state
+    /// The table read through `view`, None reading the newest committed
+    /// state, or the snapshot's own view when it reads through one
     pub(crate) fn statement_table_at(
         &self,
         name: &str,
         view: Option<&StatementView>,
     ) -> crate::core::Result<Box<dyn crate::storage::traits::Table>> {
-        if let (Some(view), Some(engine), TableUse::Read) =
-            (view, &self.0.begun_on, self.0.table_use)
-        {
-            return engine.read_table_in_view(name, view);
+        match &self.0.reads {
+            SnapshotReads::Transaction { transaction, .. } => {
+                transaction
+                    .lock()
+                    .get_read_table_at(name, view, self.0.table_use)
+            }
+            SnapshotReads::View {
+                view: own, engine, ..
+            } => engine.read_table_in_view(name, view.unwrap_or(own)),
         }
-        self.with_transaction(|transaction| {
-            transaction.get_read_table_at(name, view, self.0.table_use)
-        })
     }
 
     /// Every row of `name` as it stood at `point`
@@ -705,7 +685,14 @@ impl StatementSnapshot {
         name: &str,
         point: &crate::storage::mvcc::commit_log::ReadPoint,
     ) -> crate::core::Result<crate::core::RowVec> {
-        self.with_transaction(|transaction| transaction.rows_at(name, point))
+        match &self.0.reads {
+            SnapshotReads::Transaction { transaction, .. } => {
+                transaction.lock().rows_at(name, point)
+            }
+            SnapshotReads::View { view, engine, .. } => {
+                engine.read_table_in_view(name, view)?.rows_at(point, None)
+            }
+        }
     }
 }
 
