@@ -396,6 +396,16 @@ pub struct ViewState {
     leases: AtomicUsize,
 }
 
+/// A reader without a transaction counted among the active transactions,
+/// so what waits for them waits for it too
+pub(crate) struct ReaderAdmission(Arc<TransactionRegistry>);
+
+impl Drop for ReaderAdmission {
+    fn drop(&mut self) {
+        self.0.active_txn_count.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// One statement's view of the commits: those complete at its start, read
 /// through `is_visible_at`. Registered while a handle lives, so maintenance
 /// keeps what it reads and the commit metadata it asks about
@@ -1760,6 +1770,17 @@ impl TransactionRegistry {
     /// Checks if the registry is accepting new transactions.
     pub fn is_accepting(&self) -> bool {
         self.accepting.load(Ordering::Acquire)
+    }
+
+    /// Admits a statement that reads through its view without a transaction
+    /// as a transaction begins: None while not accepting, else counted
+    /// active until the admission drops
+    pub(crate) fn admit_reader(self: &Arc<Self>) -> Option<ReaderAdmission> {
+        if !self.accepting.load(Ordering::Acquire) {
+            return None;
+        }
+        self.active_txn_count.fetch_add(1, Ordering::Relaxed);
+        Some(ReaderAdmission(Arc::clone(self)))
     }
 
     /// Gets the count of active transactions.

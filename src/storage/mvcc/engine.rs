@@ -9543,6 +9543,25 @@ impl MVCCEngine {
         store.check_token(token)?;
         Ok(Some(result))
     }
+
+    /// The table `name` read as `view` sees it, by a reader that writes
+    /// nothing and so needs no transaction of its own
+    pub(crate) fn read_table_in_view(
+        &self,
+        name: &str,
+        view: &crate::storage::mvcc::registry::StatementView,
+    ) -> Result<Box<dyn Table>> {
+        if !self.is_open() {
+            return Err(Error::EngineNotOpen);
+        }
+        self.operations().get_table_for_transaction(
+            INVALID_TRANSACTION_ID + 1,
+            name,
+            None,
+            Some(view.clone()),
+            TableUse::Read,
+        )
+    }
 }
 
 // =============================================================================
@@ -10231,7 +10250,10 @@ impl TransactionEngineOperations for EngineOperations {
         let table = open(version_store).with_view(view.clone());
         admit(&table)?;
         mgr.check_schema_generation(schema_generation)?;
+        // A read through a statement view is read committed's, whatever the
+        // engine's default: the view, not a begin point, decides what it sees
         let snapshot_seq = (table_use != TableUse::KeyCheck
+            && view.is_none()
             && self.registry.get_isolation_level(txn_id)
                 == crate::IsolationLevel::SnapshotIsolation)
             .then(|| self.registry.get_transaction_begin_sequence(txn_id) as u64);
