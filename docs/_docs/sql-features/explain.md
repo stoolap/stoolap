@@ -448,6 +448,24 @@ Limit 5
         Index __pk_products_id (id range)
 ```
 
+With no WHERE, an ORDER BY of several columns in one direction, all ASC or all DESC, reads the rows the same way through a multi-column index whose leading columns are those columns, in that order: `IndexOrder` names them all, and each column's NULLs go where the ORDER BY puts them. Under an OFFSET that reaches past a quarter of the table's rows, inside a transaction holding rows of its own, over a FLOAT column or over sealed rows, the run takes the `TopN` after `else` instead:
+
+```sql
+CREATE INDEX idx_category_value ON products (category, value);
+EXPLAIN SELECT * FROM products ORDER BY category, value LIMIT 5;
+```
+
+Output:
+```
+plan
+----
+Limit 5
+  Project id, name, category, value
+    IndexOrder products category, value ASC
+    else TopN category ASC, value ASC
+      SeqScan products
+```
+
 A LIMIT or OFFSET given as a parameter or a subquery is read on each run and takes the same plan; EXPLAIN shows it as written:
 
 ```sql

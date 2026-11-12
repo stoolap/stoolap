@@ -85,6 +85,132 @@ impl Ord for CompositeKey {
     }
 }
 
+/// The least value past NULL: every value but NULL sorts at or after it
+const PAST_NULL: Value = Value::Boolean(false);
+
+/// The keys from `low` on, below `upper` when given
+fn from_below<'k>(
+    low: &'k CompositeKey,
+    upper: Option<&'k CompositeKey>,
+) -> (Bound<&'k CompositeKey>, Bound<&'k CompositeKey>) {
+    (
+        Bound::Included(low),
+        upper.map_or(Bound::Unbounded, Bound::Excluded),
+    )
+}
+
+/// A walk of the sorted keys in the order of their first
+/// `nulls_first.len()` columns, each column's NULL keys first or last
+struct KeyOrder<'a> {
+    keys: &'a BTreeMap<CompositeKey, IdList>,
+    ascending: bool,
+    nulls_first: &'a [bool],
+}
+
+impl KeyOrder<'_> {
+    /// Walks the keys starting with `prefix`, below `upper` when given, from
+    /// the column after `prefix` on; false once `visit` stops
+    fn walk(
+        &self,
+        prefix: &mut Vec<Value>,
+        upper: Option<&CompositeKey>,
+        visit: &mut dyn FnMut(i64, &[Value]) -> bool,
+    ) -> bool {
+        let Some(&nulls_first) = self.nulls_first.get(prefix.len()) else {
+            return self.rows(prefix, upper, visit);
+        };
+        self.part(prefix, upper, nulls_first, visit)
+            && self.part(prefix, upper, !nulls_first, visit)
+    }
+
+    /// Every row of the keys that start with `prefix`, below `upper`: they
+    /// tie on the ordered columns, so they are read in key order
+    fn rows(
+        &self,
+        prefix: &[Value],
+        upper: Option<&CompositeKey>,
+        visit: &mut dyn FnMut(i64, &[Value]) -> bool,
+    ) -> bool {
+        let start = CompositeKey(prefix.to_vec());
+        let range = self.keys.range((
+            Bound::Included(&start),
+            upper.map_or(Bound::Unbounded, Bound::Excluded),
+        ));
+        let mut emit =
+            |(key, rows): (&CompositeKey, &IdList)| rows.iter().all(|id| visit(id, &key.0));
+        if self.ascending {
+            range
+                .take_while(|(key, _)| key.0.starts_with(prefix))
+                .all(&mut emit)
+        } else {
+            range
+                .rev()
+                .take_while(|(key, _)| key.0.starts_with(prefix))
+                .all(&mut emit)
+        }
+    }
+
+    /// The keys starting with `prefix` whose next column is NULL when
+    /// `null`, else the others, each value of that column in turn
+    fn part(
+        &self,
+        prefix: &mut Vec<Value>,
+        upper: Option<&CompositeKey>,
+        null: bool,
+        visit: &mut dyn FnMut(i64, &[Value]) -> bool,
+    ) -> bool {
+        let level = prefix.len();
+        prefix.push(PAST_NULL);
+        let past_null = CompositeKey(prefix.clone());
+        prefix.pop();
+        if null {
+            prefix.push(Value::null_unknown());
+            let walked = self.walk(prefix, Some(&past_null), visit);
+            prefix.pop();
+            return walked;
+        }
+        if self.ascending {
+            let mut next = self.keys.range(from_below(&past_null, upper)).next();
+            while let Some((key, _)) = next.filter(|(key, _)| key.0.starts_with(prefix)) {
+                prefix.push(key.0[level].clone());
+                let group = CompositeKey(prefix.clone());
+                let walked = self.walk(prefix, upper, visit);
+                // The next value: the first key past the group
+                next = walked
+                    .then(|| {
+                        self.keys
+                            .range(&group..)
+                            .find(|(key, _)| !key.0.starts_with(prefix))
+                    })
+                    .flatten();
+                prefix.pop();
+                if !walked {
+                    return false;
+                }
+            }
+            return true;
+        }
+        // Descending, each group's keys lie below the group read before it
+        let mut below = upper.cloned();
+        while let Some((key, _)) = self
+            .keys
+            .range(from_below(&past_null, below.as_ref()))
+            .next_back()
+            .filter(|(key, _)| key.0.starts_with(prefix))
+        {
+            prefix.push(key.0[level].clone());
+            let group = CompositeKey(prefix.clone());
+            let walked = self.walk(prefix, below.as_ref(), visit);
+            prefix.pop();
+            if !walked {
+                return false;
+            }
+            below = Some(group);
+        }
+        true
+    }
+}
+
 impl std::hash::Hash for CompositeKey {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         for v in &self.0 {
@@ -980,6 +1106,29 @@ impl Index for MultiColumnIndex {
         true
     }
 
+    fn walk_keys_ordered(
+        &self,
+        ascending: bool,
+        nulls_first: &[bool],
+        visit: &mut dyn FnMut(i64, &[Value]) -> bool,
+    ) -> bool {
+        if self.closed.load(AtomicOrdering::Acquire)
+            || nulls_first.is_empty()
+            || nulls_first.len() > self.column_ids.len()
+        {
+            return false;
+        }
+        self.ensure_btree_built();
+        let sorted_values = self.sorted_values.read();
+        let order = KeyOrder {
+            keys: &sorted_values,
+            ascending,
+            nulls_first,
+        };
+        order.walk(&mut Vec::with_capacity(nulls_first.len()), None, visit);
+        true
+    }
+
     fn get_row_ids_equal_into(&self, values: &[Value], buffer: &mut Vec<i64>) {
         if self.closed.load(AtomicOrdering::Acquire) {
             return;
@@ -1045,6 +1194,79 @@ impl Index for MultiColumnIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_keys_walk_places_each_columns_nulls_where_it_is_asked() {
+        let index = MultiColumnIndex::new(
+            "idx".into(),
+            "t".into(),
+            vec!["a".into(), "b".into(), "c".into()],
+            vec![0, 1, 2],
+            vec![DataType::Integer; 3],
+            false,
+            0,
+        );
+        let value = |v: i64| match v {
+            0 => Value::null_unknown(),
+            v => Value::Integer(v),
+        };
+        let mut id = 0;
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        for a in [2, 0, 1, 3] {
+            for b in [0, 2, 1] {
+                for c in [1, 0] {
+                    for _ in 0..2 {
+                        id += 1;
+                        let key = vec![value(a), value(b), value(c)];
+                        index.add(&key, id, id).unwrap();
+                        rows.push(key);
+                    }
+                }
+            }
+        }
+        // NULL is 0 above: first or last as asked, the rest by value
+        let rank = |v: &Value, ascending: bool, nulls_first: bool| match v {
+            Value::Integer(v) if ascending => (1, *v),
+            Value::Integer(v) => (1, -*v),
+            _ if nulls_first => (0, 0),
+            _ => (2, 0),
+        };
+        for columns in 1..=3usize {
+            for ascending in [true, false] {
+                for pattern in 0..(1 << columns) {
+                    let nulls_first: Vec<bool> =
+                        (0..columns).map(|i| pattern & (1 << i) != 0).collect();
+                    let mut want: Vec<Vec<Value>> =
+                        rows.iter().map(|key| key[..columns].to_vec()).collect();
+                    want.sort_by_key(|key| {
+                        key.iter()
+                            .zip(&nulls_first)
+                            .map(|(v, &first)| rank(v, ascending, first))
+                            .collect::<Vec<_>>()
+                    });
+                    let mut got = Vec::new();
+                    assert!(
+                        index.walk_keys_ordered(ascending, &nulls_first, &mut |_, key| {
+                            got.push(key[..columns].to_vec());
+                            true
+                        })
+                    );
+                    assert_eq!(
+                        got, want,
+                        "{columns} columns, ascending {ascending}, {nulls_first:?}"
+                    );
+                    let mut visited = 0;
+                    index.walk_keys_ordered(ascending, &nulls_first, &mut |_, _| {
+                        visited += 1;
+                        visited < 5
+                    });
+                    assert_eq!(visited, 5, "a walk stops when asked");
+                }
+            }
+        }
+        assert!(!index.walk_keys_ordered(true, &[true; 4], &mut |_, _| true));
+        assert!(!index.walk_keys_ordered(true, &[], &mut |_, _| true));
+    }
 
     #[test]
     fn a_removal_that_empties_a_group_drops_its_walk_order() {

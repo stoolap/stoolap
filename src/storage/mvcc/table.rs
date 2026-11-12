@@ -5043,6 +5043,88 @@ impl Table for MVCCTable {
         Ok(Some(rows))
     }
 
+    fn collect_rows_ordered_by_index_keys(
+        &self,
+        keys: &[(&str, bool)],
+        ascending: bool,
+        (limit, offset): (usize, usize),
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<RowVec>> {
+        let needed = limit.saturating_add(offset);
+        if needed == 0 {
+            return Ok(Some(RowVec::new()));
+        }
+        // Each row walked costs about twice a row sorted: past a quarter of
+        // the rows the sort answers sooner
+        if needed.saturating_mul(4) > self.version_store.committed_row_count() {
+            return Ok(None);
+        }
+        // The index order holds for the rows only while the index holds what
+        // this statement sees
+        let Some(epoch) = self.index_view_epoch() else {
+            return Ok(None);
+        };
+        let schema = &self.cached_schema;
+        let mut columns: SmallVec<[usize; 4]> = SmallVec::with_capacity(keys.len());
+        let mut names: SmallVec<[&str; 4]> = SmallVec::with_capacity(keys.len());
+        for &(name, _) in keys {
+            let Some(at) = schema.columns.iter().position(|c| eq_names(&c.name, name)) else {
+                return Ok(None);
+            };
+            // NaN sorts by rules the key order does not follow
+            if schema.columns[at].data_type == DataType::Float {
+                return Ok(None);
+            }
+            columns.push(at);
+            names.push(name);
+        }
+        let Some(index) = index_plan::keys_order_index(&self.version_store, &names) else {
+            return Ok(None);
+        };
+        let nulls_first: SmallVec<[bool; 4]> = keys.iter().map(|&(_, first)| first).collect();
+        let mut rows = RowVec::with_capacity(needed.min(1024));
+        // A row whose visible values differ from its key was changed between
+        // the index and the version this statement sees: the full sort answers
+        let mut stale = false;
+        // A cancel is seen every hundred rows, and raised once the walk has
+        // let the index go
+        let (mut visits, mut cancel) = (0usize, false);
+        let walked = index.walk_keys_ordered(ascending, &nulls_first, &mut |row_id, key| {
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::hot_top_k_visited();
+            visits += 1;
+            if visits % 100 == 0 && cancelled() {
+                cancel = true;
+                return false;
+            }
+            if let Some(version) = self
+                .version_store
+                .get_visible_version(row_id, self.reader())
+                .filter(|version| !version.is_deleted())
+            {
+                let row = self.normalize_row_to_schema(version.data, schema);
+                if columns
+                    .iter()
+                    .zip(key)
+                    .any(|(&at, key)| row.get(at) != Some(key))
+                {
+                    stale = true;
+                    return false;
+                }
+                rows.push((row_id, row));
+            }
+            rows.len() < needed
+        });
+        if cancel {
+            return Err(Error::QueryCancelled);
+        }
+        if !walked || stale || self.index_view_epoch() != Some(epoch) {
+            return Ok(None);
+        }
+        self.check_read()?;
+        Ok(Some(rows.into_iter().skip(offset).take(limit).collect()))
+    }
+
     fn collect_rows_pk_keyset(
         &self,
         start_after: Option<i64>,

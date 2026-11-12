@@ -7047,6 +7047,21 @@ impl Table for SegmentedTable {
         })
     }
 
+    fn collect_rows_ordered_by_index_keys(
+        &self,
+        keys: &[(&str, bool)],
+        ascending: bool,
+        cut: (usize, usize),
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<RowVec>> {
+        if let Some(result) = self
+            .unsealed(|hot| hot.collect_rows_ordered_by_index_keys(keys, ascending, cut, cancelled))
+        {
+            return result;
+        }
+        Ok(None)
+    }
+
     fn collect_rows_pk_keyset(
         &self,
         start_after: Option<i64>,

@@ -1326,6 +1326,23 @@ pub trait Table: Send + Sync {
         Ok(None) // Default implementation - override in concrete tables
     }
 
+    /// Up to `limit` rows past `offset` in the order of `keys`, each a column
+    /// and whether its NULLs come before its values, all ascending or all
+    /// descending, read by walking the index whose leading columns they are.
+    /// None when the table cannot read them so, which leaves them to a sort.
+    /// The walk asks `cancelled` as it goes and, once it is true, stops and
+    /// fails with `QueryCancelled` after letting the index go
+    fn collect_rows_ordered_by_index_keys(
+        &self,
+        keys: &[(&str, bool)],
+        ascending: bool,
+        (limit, offset): (usize, usize),
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Option<RowVec>> {
+        let _ = (keys, ascending, limit, offset, cancelled);
+        Ok(None)
+    }
+
     /// The index walk `index_plan::top_k_walk` picks for a top-k read of
     /// `column_name` under `where_expr`; None when no index walks it
     fn top_k_walk(&self, where_expr: &dyn Expression, column_name: &str) -> Option<IndexPlan> {

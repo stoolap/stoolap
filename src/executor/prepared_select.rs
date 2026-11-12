@@ -96,8 +96,8 @@ use super::window::{
 use super::Executor;
 use crate::planner::block::{self as block_plan, BlockRuns, CallRead};
 use crate::planner::{
-    distinct_values_column, nearest_read, ordered_read, scan_choice, KeyRead, NearestRead,
-    OrderedRead, Plan, PlanText, Read, ScanChoice, Step,
+    distinct_values_column, keys_ordered_read, nearest_read, ordered_read, scan_choice, KeyRead,
+    NearestRead, OrderedRead, Plan, PlanText, Read, ScanChoice, Step,
 };
 use crate::storage::mvcc::VersionStore;
 
@@ -4419,7 +4419,12 @@ impl PreparedSelect {
                 names: &self.output_columns[..self.visible],
                 pushed,
                 ordered: Executor::ordered_read_column(stmt)
-                    .map(|(column, ascending, _)| (column, ascending)),
+                    .map(|(column, ascending, _)| (column.into(), ascending))
+                    .or_else(|| {
+                        let (keys, ascending) = Executor::ordered_read_keys(stmt)?;
+                        let columns: Vec<&str> = keys.iter().map(|&(c, _)| c).collect();
+                        Some((columns.join(", ").into(), ascending))
+                    }),
                 empty_unless,
                 body,
                 keyed,
@@ -9123,6 +9128,21 @@ impl PreparedSelect {
                             where_.pushed == where_.conjuncts,
                             stmt.offset.is_some(),
                         )
+                    })
+                    .or_else(|| {
+                        let (keys, _) = Executor::ordered_read_keys(stmt)?;
+                        let columns: SmallVec<[&str; 4]> = keys.iter().map(|&(c, _)| c).collect();
+                        let present = columns.iter().all(|column| schema.has_column(column));
+                        (stmt.limit.is_some() && !stmt.distinct && present)
+                            .then(|| {
+                                keys_ordered_read(
+                                    &store,
+                                    &columns,
+                                    where_.pushdown.as_ref(),
+                                    where_.pushed == where_.conjuncts,
+                                )
+                            })
+                            .flatten()
                     });
                 // An ORDER BY of a vector distance under a LIMIT reads the
                 // nearest rows first; the key is the item the ORDER BY binds
@@ -14126,6 +14146,9 @@ impl Executor {
         };
         let ordered = match (&source, limit, planned_order) {
             _ if keeps_none => None,
+            (StatementSource::Table(table), Some(limit), Some(OrderedRead::IndexKeys)) => {
+                runner.keys_ordered_rows(&prepared.where_, &**table, ctx, stmt, limit, offset)?
+            }
             (StatementSource::Table(table), Some(limit), Some(read)) => {
                 match Self::ordered_read_column(stmt) {
                     Some(key) => runner.ordered_rows(
@@ -15758,7 +15781,7 @@ impl<'a> PreparedRunner<'a> {
                 Some(None) => Some(RowVec::new()),
                 None => None,
             },
-            OrderedRead::TopK => None,
+            OrderedRead::TopK | OrderedRead::IndexKeys => None,
         };
         if walked.is_some() {
             match read {
@@ -15784,6 +15807,48 @@ impl<'a> PreparedRunner<'a> {
         ctx.check_cancelled()?;
         if rows.is_some() {
             super::result::OrderLimitPath::PreparedTopK.taken();
+        }
+        Ok(rows)
+    }
+
+    /// The rows of `table` an ORDER BY of several columns in one direction
+    /// keeps past `offset`, at most `limit`, read by walking the index they
+    /// lead. None when the table declines the walk, which leaves them to the
+    /// statement's sort
+    fn keys_ordered_rows(
+        &self,
+        where_: &PreparedWhere,
+        table: &dyn Table,
+        ctx: &ExecutionContext,
+        stmt: &SelectStatement,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Option<RowVec>> {
+        let Some((keys, ascending)) = Executor::ordered_read_keys(stmt) else {
+            return Ok(None);
+        };
+        let Some((storage_expr, scanned_whole, ..)) =
+            self.where_scan(where_, None, None, table, ctx)?
+        else {
+            return Ok(Some(RowVec::new()));
+        };
+        if !scanned_whole || storage_expr.is_some() {
+            return Ok(None);
+        }
+        let keys: SmallVec<[(&str, bool); 4]> = keys
+            .iter()
+            .map(|&(column, nulls)| (column, crate::core::value::nulls_first(ascending, nulls)))
+            .collect();
+        let cancelled = || ctx.is_cancelled();
+        let rows = table.collect_rows_ordered_by_index_keys(
+            &keys,
+            ascending,
+            (limit, offset),
+            &cancelled,
+        )?;
+        ctx.check_cancelled()?;
+        if rows.is_some() {
+            super::result::OrderLimitPath::PreparedIndexKeys.taken();
         }
         Ok(rows)
     }

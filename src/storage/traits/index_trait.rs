@@ -228,6 +228,21 @@ pub trait Index: Send + Sync {
         false
     }
 
+    /// Visits the row ids in the order of the first `nulls_first.len()` key
+    /// columns, all ascending or all descending, each column's NULL keys
+    /// first or last as `nulls_first` says for it. `visit` gets the row id
+    /// and its whole key and returns false to stop. Returns false when the
+    /// index cannot walk in that order.
+    fn walk_keys_ordered(
+        &self,
+        ascending: bool,
+        nulls_first: &[bool],
+        visit: &mut dyn FnMut(i64, &[Value]) -> bool,
+    ) -> bool {
+        let _ = (ascending, nulls_first, visit);
+        false
+    }
+
     /// Returns row IDs with the given values (convenience method)
     ///
     /// This is a simplified version of `find` that returns only row IDs.

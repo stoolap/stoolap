@@ -28,9 +28,22 @@ use crate::core::{DataType, Result, Row, RowVec, Value, ValueSet};
 use crate::parser::ast::*;
 use crate::storage::traits::{ScanAccess, Table};
 
+use smallvec::SmallVec;
+
 use super::expression::RowFilter;
 use super::utils::order_by_names_an_alias;
 use super::Executor;
+
+/// The table column an ORDER BY key names as written; None for an
+/// expression or a SELECT alias
+fn order_column<'s>(order_by: &'s OrderByExpression, stmt: &SelectStatement) -> Option<&'s str> {
+    let column = match &order_by.expression {
+        Expression::Identifier(id) => id.value.as_str(),
+        Expression::QualifiedIdentifier(qid) => qid.name.value.as_str(),
+        _ => return None,
+    };
+    (!order_by_names_an_alias(&order_by.expression, stmt)).then_some(column)
+}
 
 /// The most rows a LIMIT's fetch by primary key reads in one batch
 const FETCH_BATCH_ROWS: usize = 1024;
@@ -69,15 +82,28 @@ impl Executor {
         let [order_by] = stmt.order_by.as_slice() else {
             return None;
         };
-        let column_name = match &order_by.expression {
-            Expression::Identifier(id) => id.value.as_str(),
-            Expression::QualifiedIdentifier(qid) => qid.name.value.as_str(),
-            _ => return None,
-        };
-        if order_by_names_an_alias(&order_by.expression, stmt) {
-            return None;
-        }
+        let column_name = order_column(order_by, stmt)?;
         Some((column_name, order_by.ascending, order_by.nulls_first))
+    }
+
+    /// The table columns `stmt`'s ORDER BY sorts by, two or more, all in one
+    /// direction, each with its NULLS clause, and that direction: what a walk
+    /// of an index's keys answers; None for any other ORDER BY
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn ordered_read_keys(
+        stmt: &SelectStatement,
+    ) -> Option<(SmallVec<[(&str, Option<bool>); 4]>, bool)> {
+        let [first, _, ..] = stmt.order_by.as_slice() else {
+            return None;
+        };
+        let mut keys = SmallVec::with_capacity(stmt.order_by.len());
+        for order_by in &stmt.order_by {
+            if order_by.ascending != first.ascending {
+                return None;
+            }
+            keys.push((order_column(order_by, stmt)?, order_by.nulls_first));
+        }
+        Some((keys, first.ascending))
     }
 
     /// Extract window ORDER BY information for optimization
