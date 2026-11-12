@@ -135,7 +135,7 @@ fn a_recovery_whose_wal_rotation_poisons_the_wal_fails_the_open_when_no_truncati
     use stoolap::test_failpoints;
     let _guard = test_failpoints::FailpointGuard::new();
     let root = tempfile::tempdir().unwrap();
-    crashed(root.path());
+    let want = crashed(root.path());
     let dir = root.path().join("1");
     // The catalog copies rotate the WAL past its size, the rotation's sync of
     // the retired file fails, and a failed manifest write skips the truncation
@@ -149,4 +149,8 @@ fn a_recovery_whose_wal_rotation_poisons_the_wal_fails_the_open_when_no_truncati
         "an open whose WAL refuses every write fails: {:?}",
         opened.as_ref().err()
     );
+    drop(opened);
+    let db = Database::open(&dsn(&dir)).unwrap();
+    assert_eq!(sum(&db), want, "the next open recovers the rows");
+    db.close().unwrap();
 }
