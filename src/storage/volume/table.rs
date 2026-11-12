@@ -1482,28 +1482,34 @@ impl SegmentedTable {
             Some(Domain::Timestamp) => super::writer::timestamp_value,
             _ => return Ok(false),
         };
-        distinct.reserve(entry.n_keys as usize);
         let null = match shown {
             None => {
+                distinct.reserve(entry.n_keys as usize);
                 reader
                     .each_key_page(|keys| distinct.extend(keys.iter().map(|&key| value(key))))
                     .map_err(side_error)?;
                 zone.null_count > 0
             }
             Some(bits) => {
+                let rows = shown_count(bits, cs.volume.meta.row_count);
                 let shown = |p: u32| {
                     bits.get(p as usize >> 6)
                         .is_some_and(|w| w >> (p & 63) & 1 != 0)
                 };
-                let keyed = reader
-                    .each_shown_key(shown, |key| {
-                        distinct.insert(value(key));
-                    })
-                    .map_err(side_error)?;
+                distinct.reserve(rows.min(entry.n_keys) as usize);
+                // A refusal comes before any key, so the scan still answers
+                let keyed = match reader.each_shown_key(shown, |key| {
+                    distinct.insert(value(key));
+                }) {
+                    Ok(keyed) => keyed,
+                    Err(error) if is_refused(&error) => {
+                        READS.count(&READS.refused, 1);
+                        return Ok(false);
+                    }
+                    Err(error) => return Err(side_error(error)),
+                };
                 // Shown rows past the shown keyed positions hold NULL
-                with_null
-                    && zone.null_count > 0
-                    && shown_count(bits, cs.volume.meta.row_count) > keyed
+                zone.null_count > 0 && rows > keyed
             }
         };
         if with_null && null {

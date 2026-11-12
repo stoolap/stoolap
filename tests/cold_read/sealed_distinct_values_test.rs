@@ -388,4 +388,19 @@ fn a_sealed_numeric_distinct_that_hides_rows_reads_no_block() {
         assert_eq!(got, model_values(&model, c), "DISTINCT {c}");
         assert_eq!(read, 0, "the side files' shown keys answer DISTINCT {c}");
     }
+    // Key page copies the budget refuses send each volume through the scan
+    db.engine().cold_volumes_for_test("w");
+    for c in ["i", "ts", "h"] {
+        stoolap::test_failpoints::refuse_key_copies(usize::MAX);
+        let before = block_file_reads();
+        let got: BTreeSet<String> = db
+            .query(&format!("SELECT DISTINCT {c} FROM w"), ())
+            .unwrap()
+            .map(|row| render(row.unwrap().get_value(0).unwrap()))
+            .collect();
+        let read = block_file_reads().0 - before.0;
+        stoolap::test_failpoints::refuse_key_copies(0);
+        assert_eq!(got, model_values(&model, c), "refused DISTINCT {c}");
+        assert!(read > 0, "the scan answers refused DISTINCT {c}");
+    }
 }

@@ -2363,17 +2363,29 @@ impl Reader {
     }
 
     /// Hands `each` every key with a position `shown` holds, in key order,
-    /// and returns how many positions `shown` holds
+    /// and returns how many positions `shown` holds. The copy of a key page
+    /// is charged first: a refusal comes before any key
     pub fn each_shown_key(
         &self,
         shown: impl Fn(u32) -> bool,
         mut each: impl FnMut(i64),
     ) -> std::io::Result<u64> {
         let col = column_of(self)?;
-        let (mut keys, mut ends) = (Vec::new(), Vec::new());
+        let room = KEYS_PER_PAGE.min(col.n_keys as usize);
+        #[cfg(feature = "test-failpoints")]
+        if crate::test_failpoints::key_copies_refused() {
+            return Err(refused("a key page's copy, by the test"));
+        }
+        let _copies = INDEX_PAGES
+            .try_reserve(room * (std::mem::size_of::<i64>() + std::mem::size_of::<u64>()))
+            .ok_or_else(|| refused("a key page's copy"))?;
+        let (mut keys, mut ends) = (Vec::with_capacity(room), Vec::with_capacity(room));
         let mut count = 0u64;
         for (number, meta) in col.key_pages.iter().enumerate() {
             self.with_page(PageKind::Keys, number, |content| match content {
+                PageContent::Keys { keys: k, .. } if k.len() > room => {
+                    Err(invalid("key page longer than its entry"))
+                }
                 PageContent::Keys { keys: k, ends: e } => {
                     keys.clear();
                     keys.extend_from_slice(k);
@@ -6912,6 +6924,50 @@ mod tests {
         assert_eq!(
             INDEX_PAGES.stats().charged_bytes,
             baseline.charged_bytes,
+            "everything released"
+        );
+    }
+
+    #[test]
+    fn a_shown_key_walk_charges_its_key_copies_and_a_refusal_hands_on_no_key() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sidx");
+        let pairs: Vec<(u32, i64)> = (0..200_000u32).map(|p| (p, (p % 40_000) as i64)).collect();
+        build(&path, pairs, WORKSPACE);
+        INDEX_PAGES.clear();
+        let baseline = INDEX_PAGES.stats().charged_bytes;
+        let file = Arc::new(IndexFile::open(&path, 5).unwrap());
+        let reader = file.reader(1, 1).unwrap();
+        INDEX_PAGES.set_budget_bytes(INDEX_PAGES.stats().charged_bytes as u64);
+        let mut keys = 0;
+        let err = reader.each_shown_key(|_| true, |_| keys += 1).unwrap_err();
+        assert!(is_refused(&err), "{err}");
+        assert_eq!(keys, 0, "a refused walk hands on no key");
+        INDEX_PAGES.set_budget_bytes(DEFAULT_BUDGET_BYTES);
+        let before = INDEX_PAGES.stats().charged_bytes;
+        let mut least = usize::MAX;
+        let shown = reader
+            .each_shown_key(
+                |p| p % 2 == 0,
+                |_| {
+                    keys += 1;
+                    least = least.min(INDEX_PAGES.stats().charged_bytes);
+                },
+            )
+            .unwrap();
+        assert_eq!((shown, keys), (100_000, 20_000), "the even keys' positions");
+        let copies = KEYS_PER_PAGE * (std::mem::size_of::<i64>() + std::mem::size_of::<u64>());
+        assert!(
+            least >= before + copies,
+            "charged {least} while the walk runs, at least {before} + {copies} for the copies"
+        );
+        drop(reader);
+        drop(file);
+        INDEX_PAGES.clear();
+        assert_eq!(
+            INDEX_PAGES.stats().charged_bytes,
+            baseline,
             "everything released"
         );
     }
