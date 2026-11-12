@@ -3744,14 +3744,13 @@ impl Table for MVCCTable {
         )
     }
 
-    // A walk that keeps NULL out has no NULLs to place
     fn scan_top_k(
         &self,
         walk: Option<&IndexPlan>,
         where_expr: Option<&dyn Expression>,
         column_name: &str,
         ascending: bool,
-        _nulls_first: bool,
+        nulls_first: bool,
         limit: usize,
         offset: usize,
         _columns: Option<&[bool]>,
@@ -3783,11 +3782,29 @@ impl Table for MVCCTable {
             return Ok(None);
         };
         let column = &schema.columns[col_idx];
-        // NULL and NaN sort by rules the key order does not follow
-        let null_free = !column.nullable || index_plan::excludes_null(expr, schema, column_name);
-        if !null_free || column.data_type == DataType::Float {
+        // NaN sorts by rules the key order does not follow
+        if column.data_type == DataType::Float {
             return Ok(None);
         }
+        // The index orders the NULL keys first: a column that may hold one
+        // here is walked in two parts, the NULL keys where the query puts them
+        let nulls = column.nullable && !index_plan::excludes_null(expr, schema, column_name);
+        let null = Value::null_unknown();
+        let keys = (
+            plan.lower
+                .as_ref()
+                .map(|(value, inclusive)| (value, *inclusive))
+                .or(nulls.then_some((&null, false))),
+            plan.upper
+                .as_ref()
+                .map(|(value, inclusive)| (value, *inclusive)),
+        );
+        let null_keys = (Some((&null, true)), Some((&null, true)));
+        let parts = match (nulls, nulls_first) {
+            (false, _) => [Some(keys), None],
+            (true, true) => [Some(null_keys), Some(keys)],
+            (true, false) => [Some(keys), Some(null_keys)],
+        };
 
         // A commit updates the indexes before its versions are visible, and
         // a key moved by it may sit anywhere in the walk: the walk stands
@@ -3804,44 +3821,46 @@ impl Table for MVCCTable {
         let mut stale = false;
         let fallible = expr.can_fail();
         let mut failed = None;
-        let walked = plan.index.walk_prefix_ordered(
-            &plan.prefix,
-            plan.lower
-                .as_ref()
-                .map(|(value, inclusive)| (value, *inclusive)),
-            plan.upper
-                .as_ref()
-                .map(|(value, inclusive)| (value, *inclusive)),
-            ascending,
-            &mut |row_id, key_value| {
-                #[cfg(feature = "test-failpoints")]
-                crate::test_failpoints::hot_top_k_visited();
-                // A version comes back only when it is visible and its
-                // deletion, if any, is not: the raw deleted flag may belong
-                // to an aborted or unfinished transaction
-                if let Some(version) = self
-                    .version_store
-                    .get_visible_version(row_id, self.reader())
-                {
-                    let row = self.normalize_row_to_schema(version.data, schema);
-                    if row.get(col_idx) != Some(key_value) {
-                        stale = true;
-                        return false;
-                    }
-                    // The index may be ahead of this transaction's view of
-                    // the row, so the whole WHERE is checked on the row
-                    match passes(expr, fallible, &row) {
-                        Ok(true) => rows.push((row_id, row)),
-                        Ok(false) => {}
-                        Err(e) => {
-                            failed = Some(e);
+        let mut walked = true;
+        for (lower, upper) in parts.into_iter().flatten() {
+            if !walked || stale || failed.is_some() || rows.len() >= needed {
+                break;
+            }
+            walked = plan.index.walk_prefix_ordered(
+                &plan.prefix,
+                lower,
+                upper,
+                ascending,
+                &mut |row_id, key_value| {
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::hot_top_k_visited();
+                    // A version comes back only when it is visible and its
+                    // deletion, if any, is not: the raw deleted flag may belong
+                    // to an aborted or unfinished transaction
+                    if let Some(version) = self
+                        .version_store
+                        .get_visible_version(row_id, self.reader())
+                    {
+                        let row = self.normalize_row_to_schema(version.data, schema);
+                        if row.get(col_idx) != Some(key_value) {
+                            stale = true;
                             return false;
                         }
+                        // The index may be ahead of this transaction's view of
+                        // the row, so the whole WHERE is checked on the row
+                        match passes(expr, fallible, &row) {
+                            Ok(true) => rows.push((row_id, row)),
+                            Ok(false) => {}
+                            Err(e) => {
+                                failed = Some(e);
+                                return false;
+                            }
+                        }
                     }
-                }
-                rows.len() < needed
-            },
-        );
+                    rows.len() < needed
+                },
+            );
+        }
         if let Some(e) = failed {
             return Err(e);
         }
