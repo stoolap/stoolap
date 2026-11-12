@@ -29,6 +29,7 @@ mod create_table_failure_test;
 mod ddl_transaction_test;
 mod direct_table_commit_test;
 mod dirty_read_test;
+mod failed_commit_table_test;
 mod isolation_level_test;
 mod join_sees_own_updates_test;
 mod mvcc_isolation_sql_test;

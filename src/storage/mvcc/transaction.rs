@@ -476,15 +476,15 @@ impl MvccTransaction {
         first_error.map_or(Ok(()), Err)
     }
 
-    /// The undo of a transaction dropped while active, which has no caller
-    /// to hand an error to
-    fn undo_dropped_transaction(
+    /// The undo of a transaction whose caller gets no undo error: dropped
+    /// while active, or failed in its commit with an error of its own
+    fn undo_unreported(
         ops: &dyn TransactionEngineOperations,
         txn_id: i64,
         changes: &[TableChange],
     ) {
         if let Err(e) = Self::undo_table_changes(ops, txn_id, changes) {
-            eprintln!("Warning: a dropped transaction's table changes were not all undone: {e}");
+            eprintln!("Warning: a transaction's table changes were not all undone: {e}");
         }
         ops.end_table_creates(txn_id);
     }
@@ -668,6 +668,9 @@ impl Transaction for MvccTransaction {
                     self.registry.abort_transaction(self.id);
                     ops.rollback_all_tables(self.id, self.handed_out());
                     self.state = TransactionState::RolledBack;
+                    // Its table changes go as a rollback's do, outside the fence
+                    drop((publish, _seal_guard));
+                    Self::undo_unreported(ops.as_ref(), self.id, &self.table_changes);
                     self.cleanup();
                     return Err(e);
                 }
@@ -698,6 +701,9 @@ impl Transaction for MvccTransaction {
                         ops.finish_all_tables(self.id);
                     }
                     self.state = TransactionState::RolledBack;
+                    // Its table changes go as a rollback's do, outside the fence
+                    drop((publish, _seal_guard));
+                    Self::undo_unreported(ops.as_ref(), self.id, &self.table_changes);
                     self.cleanup();
                     return Err(e);
                 }
@@ -1142,12 +1148,12 @@ impl Drop for MvccTransaction {
                     let (ops, id) = (Arc::clone(ops), self.id);
                     let changes = std::mem::take(&mut self.table_changes);
                     gate.finish_after_statements(Box::new(move || {
-                        Self::undo_dropped_transaction(ops.as_ref(), id, &changes);
+                        Self::undo_unreported(ops.as_ref(), id, &changes);
                         ops.rollback_all_tables(id, true);
                         ops.release_keys(id);
                     }));
                 } else {
-                    Self::undo_dropped_transaction(ops.as_ref(), self.id, &self.table_changes);
+                    Self::undo_unreported(ops.as_ref(), self.id, &self.table_changes);
 
                     // Clean up txn_version_stores to prevent memory leak
                     // This is critical for read-only transactions that call get_table()
