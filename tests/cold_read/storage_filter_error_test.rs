@@ -301,7 +301,10 @@ mod written_by_the_filter {
     use stoolap::core::{Operator, Result, Row, Value};
     use stoolap::functions::scalar::{AbsFunction, SleepFunction};
     use stoolap::functions::{FunctionInfo, ScalarFunction};
-    use stoolap::storage::expression::{AndExpr, Expression, FunctionArg, FunctionExpr};
+    use stoolap::storage::expression::{
+        AndExpr, ComparisonExpr, Expression, FunctionArg, FunctionExpr,
+    };
+    use stoolap::storage::mvcc::index_plan::IndexPlan;
     use stoolap::storage::traits::{Engine, ScanAccess, Table};
     use stoolap::Database;
 
@@ -430,5 +433,243 @@ mod written_by_the_filter {
             }),
         );
         assert_eq!(updated, Some(Ok(1)));
+    }
+
+    thread_local! {
+        static TRIGGER: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Runs `WRITE` on another handle of the same transaction when asked of
+    /// the row whose id is `TRIGGER`, and answers 1
+    struct WritesAt;
+
+    impl ScalarFunction for WritesAt {
+        fn name(&self) -> &str {
+            "WRITES_AT"
+        }
+
+        fn info(&self) -> FunctionInfo {
+            SleepFunction.info()
+        }
+
+        fn evaluate(&self, args: &[Value]) -> Result<Value> {
+            if args.first() == Some(&Value::Integer(TRIGGER.with(|t| t.get()))) {
+                WritesOnce.evaluate(args)?;
+            }
+            Ok(Value::Integer(1))
+        }
+
+        fn clone_box(&self) -> Box<dyn ScalarFunction> {
+            Box::new(Self)
+        }
+    }
+
+    type Read = fn(&mut dyn Table, &dyn Expression) -> Result<usize>;
+
+    /// Runs `read` on `w (id, v, x)`, indexed on `v` when `indexed`, under a
+    /// filter that inserts a row through a second handle of the transaction
+    /// when it is asked of one row: the row the transaction wrote, a
+    /// committed row beside it, and a committed row with none written
+    fn read_writing(dsn: &'static str, indexed: bool, read: Read) {
+        for (case, own, trigger) in [
+            ("own", true, 3),
+            ("committed", true, 1),
+            ("clean", false, 1),
+        ] {
+            let finished = read_writing_at(format!("{dsn}_{case}"), indexed, own, trigger, read);
+            assert!(finished.is_some(), "{case}: the read did not finish");
+            assert!(
+                matches!(finished, Some(Ok(_))),
+                "{case}: the read failed: {finished:?}"
+            );
+        }
+    }
+
+    fn read_writing_at(
+        dsn: String,
+        indexed: bool,
+        own: bool,
+        trigger: i64,
+        read: Read,
+    ) -> Option<std::result::Result<usize, String>> {
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            TRIGGER.with(|t| t.set(trigger));
+            let db = Database::open(&dsn).unwrap();
+            db.execute(
+                "CREATE TABLE w (id INTEGER PRIMARY KEY, v INTEGER, x INTEGER)",
+                (),
+            )
+            .unwrap();
+            if indexed {
+                db.execute("CREATE INDEX w_v ON w (v)", ()).unwrap();
+            }
+            db.execute("INSERT INTO w VALUES (1, 1, 0), (2, 1, 0)", ())
+                .unwrap();
+            let tx = db.engine().begin_transaction().unwrap();
+            let mut first = tx.get_table("w").unwrap();
+            if own {
+                first
+                    .insert(Row::from_values(vec![
+                        Value::Integer(3),
+                        Value::Integer(1),
+                        Value::Integer(0),
+                    ]))
+                    .unwrap();
+            }
+            OTHER.with(|other| *other.borrow_mut() = Some(tx.get_table("w").unwrap()));
+            WRITE.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(|table: &mut dyn Table| {
+                    table.insert(Row::from_values(vec![
+                        Value::Integer(9),
+                        Value::Integer(1),
+                        Value::Integer(0),
+                    ]))?;
+                    Ok(())
+                }))
+            });
+            let writes = FunctionExpr::new(
+                Arc::new(WritesAt),
+                vec![FunctionArg::Column("id".to_string())],
+                Operator::Eq,
+                Value::Integer(1),
+            );
+            let mut filter: Box<dyn Expression> = if indexed {
+                Box::new(AndExpr::new(vec![
+                    Box::new(ComparisonExpr::eq("v", Value::Integer(1))),
+                    Box::new(writes),
+                ]))
+            } else {
+                Box::new(writes)
+            };
+            filter.prepare_for_schema(first.schema());
+            let read = read(first.as_mut(), filter.as_ref());
+            let _ = done.send(read.map_err(|e| e.to_string()));
+        });
+        finished
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .ok()
+    }
+
+    fn indexed(table: &dyn Table, filter: &dyn Expression) -> IndexPlan {
+        table.index_plan(filter).expect("an index plan over w_v")
+    }
+
+    #[test]
+    fn a_scan_filter_may_write_through_another_handle_of_its_transaction() {
+        read_writing("memory://filter_writes_scan", false, |table, filter| {
+            let mut scanner = table.scan(&[0, 1, 2], Some(filter))?;
+            let mut rows = 0;
+            while scanner.next() {
+                rows += 1;
+            }
+            match scanner.err() {
+                Some(e) => Err(e.clone()),
+                None => Ok(rows),
+            }
+        });
+    }
+
+    #[test]
+    fn a_collect_filter_may_write_through_another_handle_of_its_transaction() {
+        read_writing("memory://filter_writes_collect", false, |table, filter| {
+            Ok(table.collect_all_rows(Some(filter))?.len())
+        });
+    }
+
+    #[test]
+    fn a_limited_collect_filter_may_write_through_another_handle_of_its_transaction() {
+        read_writing("memory://filter_writes_limit", false, |table, filter| {
+            Ok(table.collect_rows_with_limit(Some(filter), 10, 0)?.len())
+        });
+    }
+
+    #[test]
+    fn an_unordered_limited_filter_may_write_through_another_handle_of_its_transaction() {
+        read_writing(
+            "memory://filter_writes_unordered",
+            false,
+            |table, filter| {
+                Ok(table
+                    .collect_rows_with_limit_unordered(Some(filter), 10, 0)?
+                    .len())
+            },
+        );
+    }
+
+    #[test]
+    fn an_indexed_collect_filter_may_write_through_another_handle_of_its_transaction() {
+        read_writing("memory://filter_writes_indexed", true, |table, filter| {
+            let plan = indexed(table, filter);
+            Ok(table
+                .collect_access_rows(ScanAccess::Index(&plan), Some(filter))?
+                .len())
+        });
+    }
+
+    #[test]
+    fn an_indexed_limited_filter_may_write_through_another_handle_of_its_transaction() {
+        read_writing(
+            "memory://filter_writes_indexed_limit",
+            true,
+            |table, filter| {
+                let plan = indexed(table, filter);
+                Ok(table
+                    .collect_access_rows_with_limit(ScanAccess::Index(&plan), Some(filter), 10, 0)?
+                    .len())
+            },
+        );
+    }
+
+    #[test]
+    fn a_fetch_by_ids_filter_may_write_through_another_handle_of_its_transaction() {
+        read_writing("memory://filter_writes_fetch", false, |table, filter| {
+            Ok(table.fetch_rows_by_ids(&[1, 2, 3], filter)?.len())
+        });
+    }
+
+    #[test]
+    fn a_delete_filter_may_write_through_another_handle_of_its_transaction() {
+        read_writing("memory://filter_writes_delete", false, |table, filter| {
+            Ok(table.delete(ScanAccess::Seq, Some(filter))? as usize)
+        });
+    }
+
+    #[test]
+    fn an_indexed_delete_filter_may_write_through_another_handle_of_its_transaction() {
+        read_writing(
+            "memory://filter_writes_indexed_delete",
+            true,
+            |table, filter| {
+                let plan = indexed(table, filter);
+                Ok(table.delete(ScanAccess::Index(&plan), Some(filter))? as usize)
+            },
+        );
+    }
+
+    #[test]
+    fn an_update_filter_over_its_own_rows_may_write_through_another_handle() {
+        read_writing("memory://filter_writes_update", false, |table, filter| {
+            Ok(
+                table.update(ScanAccess::Seq, Some(filter), &mut |_, row| Ok((row, true)))?
+                    as usize,
+            )
+        });
+    }
+
+    #[test]
+    fn an_indexed_update_filter_may_write_through_another_handle_of_its_transaction() {
+        read_writing(
+            "memory://filter_writes_indexed_update",
+            true,
+            |table, filter| {
+                let plan = indexed(table, filter);
+                Ok(
+                    table.update(ScanAccess::Index(&plan), Some(filter), &mut |_, row| {
+                        Ok((row, true))
+                    })? as usize,
+                )
+            },
+        );
     }
 }

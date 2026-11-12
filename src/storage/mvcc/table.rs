@@ -118,6 +118,43 @@ impl LocalRows<'_> {
     }
 }
 
+/// The ids of the transaction's own rows, deletes among them: each hides
+/// the committed copy of its row
+struct LocalIds {
+    ids: I64Set,
+    min: bool,
+}
+
+impl LocalIds {
+    fn hides(&self, row_id: i64) -> bool {
+        if row_id == i64::MIN {
+            self.min
+        } else {
+            self.ids.contains(row_id)
+        }
+    }
+}
+
+/// Keeps, in order, the entries of `entries` from `start` on whose row
+/// `filter` keeps, and returns how many entries are left. Run with no guard
+/// on the transaction's rows held: a filter may write through another handle
+fn keep_passing<T>(
+    entries: &mut [T],
+    start: usize,
+    row: impl Fn(&T) -> &Row,
+    filter: &dyn Expression,
+    fallible: bool,
+) -> Result<usize> {
+    let mut kept = start;
+    for i in start..entries.len() {
+        if passes(filter, fallible, row(&entries[i]))? {
+            entries.swap(kept, i);
+            kept += 1;
+        }
+    }
+    Ok(kept)
+}
+
 /// Where a WHERE conjunction sits on a multi-column index: equalities on the
 /// leading columns and the bounds on the column after them
 struct PrefixPlan {
@@ -1380,8 +1417,7 @@ impl MVCCTable {
             return Ok(Some(RowVec::new()));
         }
 
-        let txn_versions = self.local();
-        if txn_versions.has_local_changes() {
+        if self.local().has_local_changes() {
             return Ok(None); // Fall through to full path
         }
 
@@ -2028,6 +2064,37 @@ impl MVCCTable {
         (token() == Some(quiet)).then_some(count)
     }
 
+    /// The ids of the transaction's own rows in `txn_versions`
+    fn local_ids(txn_versions: &LocalRows<'_>) -> LocalIds {
+        let mut ids = LocalIds {
+            ids: I64Set::new(),
+            min: false,
+        };
+        for (row_id, _) in txn_versions.iter_local() {
+            if row_id == i64::MIN {
+                ids.min = true;
+            } else {
+                ids.ids.insert(row_id);
+            }
+        }
+        ids
+    }
+
+    /// The transaction's own rows in `txn_versions` it did not delete, as
+    /// the schema reads them, of the ids `named` holds when given; the guard
+    /// goes with them, so a filter asked of them runs without it
+    fn local_rows(&self, txn_versions: LocalRows<'_>, named: Option<&LocalIds>) -> RowVec {
+        let mut rows = RowVec::new();
+        for (row_id, version) in txn_versions.iter_local() {
+            if version.is_deleted() || named.is_some_and(|ids| !ids.hides(row_id)) {
+                continue;
+            }
+            let row = self.normalize_row_to_schema(version.data.clone(), &self.cached_schema);
+            rows.push((row_id, row));
+        }
+        rows
+    }
+
     /// Collect all visible rows, optionally filtered
     ///
     /// Optimized to use batch fetch even when there are local changes,
@@ -2042,6 +2109,7 @@ impl MVCCTable {
         let has_local = txn_versions.has_local_changes();
 
         if !has_local {
+            drop(txn_versions);
             // No local versions - use thread-local cached Vec for zero-allocation reuse
             // Arena storage provides 50x+ faster scans via contiguous memory access
             if let Some(expr) = filter {
@@ -2083,23 +2151,16 @@ impl MVCCTable {
             .version_store
             .get_all_visible_rows_cached(self.reader());
 
-        // Step 2: Build set of local row IDs for quick lookup (I64Set for fast i64 lookups)
-        let mut local_row_ids = I64Set::new();
-        let mut local_has_i64_min = false;
-        for (row_id, _) in txn_versions.iter_local() {
-            if row_id == i64::MIN {
-                local_has_i64_min = true;
-            } else {
-                local_row_ids.insert(row_id);
-            }
-        }
+        // Step 2: The local rows and their ids, the guard let go
+        let local_ids = Self::local_ids(&txn_versions);
+        let local_rows = self.local_rows(txn_versions, None);
 
         // Step 3: Pre-allocate result
-        let mut rows = RowVec::with_capacity(global_rows.len() + local_row_ids.len());
+        let mut rows = RowVec::with_capacity(global_rows.len() + local_rows.len());
 
         // Step 4: Add global rows that don't have local overrides
         for (row_id, row) in global_rows {
-            if (row_id == i64::MIN && local_has_i64_min) || local_row_ids.contains(row_id) {
+            if local_ids.hides(row_id) {
                 continue; // Local version takes precedence
             }
             // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
@@ -2113,12 +2174,7 @@ impl MVCCTable {
         }
 
         // Step 5: Add local versions (both updates and inserts)
-        for (row_id, version) in txn_versions.iter_local() {
-            if version.is_deleted() {
-                continue;
-            }
-            // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
-            let row = self.normalize_row_to_schema(version.data.clone(), schema);
+        for (row_id, row) in local_rows {
             if let Some(expr) = filter {
                 if !passes(expr, fallible, &row)? {
                     continue;
@@ -2174,6 +2230,7 @@ impl MVCCTable {
         let has_local = txn_versions.has_local_changes();
 
         if !has_local {
+            drop(txn_versions);
             // No local versions - use optimized path with true LIMIT pushdown
             let raw_rows = if let Some(expr) = filter {
                 // With filter + limit: use filtered limit pushdown
@@ -2205,16 +2262,9 @@ impl MVCCTable {
             .version_store
             .get_all_visible_rows_cached(self.reader());
 
-        // Build set of local row IDs for quick lookup
-        let mut local_row_ids = I64Set::new();
-        let mut local_has_i64_min = false;
-        for (row_id, _) in txn_versions.iter_local() {
-            if row_id == i64::MIN {
-                local_has_i64_min = true;
-            } else {
-                local_row_ids.insert(row_id);
-            }
-        }
+        // The local rows' ids, the guard let go until the rows are read
+        let local_ids = Self::local_ids(&txn_versions);
+        drop(txn_versions);
 
         // A user-supplied limit can be i64::MAX; only pre-allocate what
         // can actually be returned
@@ -2223,7 +2273,7 @@ impl MVCCTable {
 
         // Add global rows that don't have local overrides
         for (row_id, row) in global_rows {
-            if (row_id == i64::MIN && local_has_i64_min) || local_row_ids.contains(row_id) {
+            if local_ids.hides(row_id) {
                 continue; // Local version takes precedence
             }
             let row = self.normalize_row_to_schema(row, schema);
@@ -2241,12 +2291,9 @@ impl MVCCTable {
             count += 1;
         }
 
-        // Add local versions (both updates and inserts)
-        for (row_id, version) in txn_versions.iter_local() {
-            if version.is_deleted() {
-                continue;
-            }
-            let row = self.normalize_row_to_schema(version.data.clone(), schema);
+        // Add local versions (both updates and inserts), of the ids the
+        // global rows above gave way to
+        for (row_id, row) in self.local_rows(self.local(), Some(&local_ids)) {
             if let Some(expr) = filter {
                 if !passes(expr, fallible, &row)? {
                     continue;
@@ -2336,6 +2383,7 @@ impl MVCCTable {
         let has_local = txn_versions.has_local_changes();
 
         if !has_local {
+            drop(txn_versions);
             // No local versions - use optimized unordered path with true early termination
             let raw_rows = if let Some(expr) = filter {
                 self.version_store
@@ -2504,16 +2552,16 @@ impl MVCCTable {
                         if let Some(local) = txn_versions.get_local_version(row_id) {
                             if !local.is_deleted() {
                                 let row = self.normalize_row_to_schema(local.data.clone(), schema);
-                                // The index may match in part
-                                if passes(expr, fallible, &row)? {
-                                    plan.hot.push((row_id, row, self.local_read(local)));
-                                }
+                                plan.hot.push((row_id, row, self.local_read(local)));
                             }
                         } else {
                             remaining_row_ids.push(row_id);
                         }
                     }
                 }
+                // The index may match in part
+                let kept = keep_passing(&mut plan.hot, start, |(_, row, _)| row, expr, fallible)?;
+                plan.hot.truncate(kept);
                 if !remaining_row_ids.is_empty() {
                     let batch_rows = self
                         .version_store
@@ -2570,6 +2618,7 @@ impl MVCCTable {
         // it deleted leaves, a row it rewrote is read as it wrote it, and a
         // row only it inserted joins. With a WHERE, a committed row it wrote
         // leaves too, and its own version is judged with the rows it inserted
+        let joined;
         {
             let txn_versions = self.local();
             if txn_versions.has_local_changes() {
@@ -2588,6 +2637,7 @@ impl MVCCTable {
                 }
                 plan.hot.truncate(kept);
             }
+            joined = plan.hot.len();
             for (row_id, version) in txn_versions.iter_local() {
                 if skipped(row_id)
                     || version.is_deleted()
@@ -2597,13 +2647,12 @@ impl MVCCTable {
                     continue;
                 }
                 let row = self.normalize_row_to_schema(version.data.clone(), schema);
-                if let Some(expr) = where_expr {
-                    if !passes(expr, fallible, &row)? {
-                        continue;
-                    }
-                }
                 plan.hot.push((row_id, row, self.local_read(version)));
             }
+        }
+        if let Some(expr) = where_expr {
+            let kept = keep_passing(&mut plan.hot, joined, |(_, row, _)| row, expr, fallible)?;
+            plan.hot.truncate(kept);
         }
         self.set_planned(plan, start, setter)
     }
@@ -3041,14 +3090,13 @@ impl Table for MVCCTable {
             global_row_ids.reserve(row_ids.len().min(4096));
 
             // Step 1: Check local versions first (uncommitted changes in this transaction)
+            let start = rows.len();
             for &row_id in row_ids {
                 if let Some(version) = txn_versions.get_local_version(row_id) {
                     if !version.is_deleted() {
                         // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
                         let row = self.normalize_row_to_schema(version.data.clone(), schema);
-                        if passes(filter, fallible, &row)? {
-                            rows.push((row_id, row));
-                        }
+                        rows.push((row_id, row));
                     }
                     // Skip global lookup - local version takes precedence
                 } else {
@@ -3056,8 +3104,12 @@ impl Table for MVCCTable {
                     global_row_ids.push(row_id);
                 }
             }
+            drop(txn_versions);
+            let kept = keep_passing(rows.as_mut_slice(), start, |(_, row)| row, filter, fallible)?;
+            rows.truncate(kept);
             &global_row_ids
         } else {
+            drop(txn_versions);
             row_ids
         };
 
@@ -3472,11 +3524,7 @@ impl Table for MVCCTable {
                     for row_id in filtered_row_ids {
                         if let Some(local) = txn_versions.get_local_version(row_id) {
                             if !local.is_deleted() {
-                                let row = local.data.clone();
-                                // Re-apply filter (index may be partial match)
-                                if passes(expr, fallible, &row)? {
-                                    rows_to_delete.push((row_id, row));
-                                }
+                                rows_to_delete.push((row_id, local.data.clone()));
                             }
                             // Already locally deleted — skip, don't fall through
                         } else {
@@ -3484,6 +3532,15 @@ impl Table for MVCCTable {
                         }
                     }
                 }
+                // Re-apply filter (index may be partial match)
+                let kept = keep_passing(
+                    rows_to_delete.as_mut_slice(),
+                    0,
+                    |(_, row)| row,
+                    expr,
+                    fallible,
+                )?;
+                rows_to_delete.truncate(kept);
 
                 // Step 2: Batch fetch remaining from version store (1 lock for N rows)
                 if !remaining_row_ids.is_empty() {
