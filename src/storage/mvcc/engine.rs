@@ -1497,26 +1497,8 @@ impl MVCCEngine {
                         stores.values().any(|s| s.committed_row_count() > 0)
                     };
                     if has_hot_rows {
-                        self.force_seal_all.store(true, Ordering::Release);
-                        if let Err(e) = self.seal_hot_buffers() {
-                            eprintln!("Warning: post-recovery seal failed: {}", e);
-                        }
-                        self.force_seal_all.store(false, Ordering::Release);
-
-                        // Persist manifests so sealed volumes survive another
-                        // crash. Don't advance checkpoint_lsn or truncate WAL
-                        // here — the WAL may be corrupt (that's why recovery
-                        // ran). The first clean checkpoint (background thread
-                        // or close_engine) will advance and truncate safely.
-                        {
-                            let mgr_arcs: Vec<_> = {
-                                let mgrs = self.segment_managers.read().unwrap();
-                                mgrs.values().cloned().collect()
-                            };
-                            for mgr in &mgr_arcs {
-                                let _ = mgr.persist_manifest_only();
-                            }
-                        }
+                        // A checkpoint, so the next recovery starts past the log sealed here
+                        self.checkpoint_cycle_inner(true)?;
                     }
                     self.loading_from_disk.store(true, Ordering::Release);
                 }
@@ -6735,6 +6717,10 @@ impl MVCCEngine {
             }
         }
 
+        // A WAL any step above poisoned, its error swallowed or not, refuses every write
+        if let Some(ref pm) = *self.persistence {
+            pm.check_wal_writable()?;
+        }
         Ok(())
     }
 

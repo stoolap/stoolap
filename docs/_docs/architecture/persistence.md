@@ -327,7 +327,7 @@ When opening a database, Stoolap performs recovery automatically:
    - Only committed transactions are applied
 4. **Rebuild Indexes**: Populate hot indexes from recovered data
 5. **Sync Auto-increment**: Ensure counters account for cold segment max row IDs
-6. **Post-recovery Seal**: If hot buffer has rows from WAL replay, seal them immediately to cold volumes. This prevents query slowness from a large hot buffer. Manifests are persisted so the sealed data survives another crash.
+6. **Post-recovery Checkpoint**: If WAL replay left rows in the hot buffer, a checkpoint runs before the database accepts queries, as it does at close. It seals them to cold volumes, which keeps queries from scanning a large hot buffer, persists the manifests, moves the recovery boundary past the replayed log and truncates the WAL below it. The next open, after another crash, replays only what was written since, instead of sealing the same log into another volume. The boundary does not move while a table is unavailable or a column type change is incomplete; a checkpoint that fails fails the open.
 7. **Ready for Operations**: Database is now available
 
 Recovery is transparent to the application.

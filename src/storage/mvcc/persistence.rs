@@ -711,6 +711,11 @@ impl PersistenceManager {
         }
     }
 
+    /// The error every write gets once a failed write or sync poisoned the WAL
+    pub fn check_wal_writable(&self) -> Result<()> {
+        self.wal.as_ref().map_or(Ok(()), |wal| wal.check_writable())
+    }
+
     /// Get the checkpoint interval
     pub fn checkpoint_interval(&self) -> Duration {
         self.checkpoint_interval

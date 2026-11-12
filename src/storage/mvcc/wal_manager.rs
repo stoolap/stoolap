@@ -1303,6 +1303,14 @@ impl WALManager {
         self.running.load(Ordering::Acquire)
     }
 
+    /// The error every write gets once a failed write or sync poisoned the WAL
+    pub fn check_writable(&self) -> Result<()> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(poisoned_error());
+        }
+        Ok(())
+    }
+
     /// Get current LSN
     pub fn current_lsn(&self) -> u64 {
         self.current_lsn.load(Ordering::Acquire)
