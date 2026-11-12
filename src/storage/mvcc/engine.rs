@@ -12201,6 +12201,11 @@ mod tests {
         ] {
             db.execute(sql, ()).unwrap();
         }
+        let mut tx = db.begin().unwrap();
+        tx.execute("INSERT INTO t VALUES (3, 30)", ()).unwrap();
+        db.execute("INSERT INTO t VALUES (4, 30)", ()).unwrap();
+        assert!(tx.commit().is_err(), "the commit meets key 30");
+        drop(tx);
         let operations = db.engine().operations();
         assert!(operations.tracking_txns.lock().is_empty(), "tracked ids");
         assert!(!operations.tracking_any.load(Ordering::Acquire), "flag");
