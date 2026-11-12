@@ -305,8 +305,8 @@ pub struct PlanText<'a> {
     pub names: &'a [String],
     /// The conjuncts the read takes
     pub pushed: Option<&'a Expression>,
-    /// The ORDER BY column and direction of an ordered read
-    pub ordered: Option<(&'a str, bool)>,
+    /// The ORDER BY column, or columns, and direction of an ordered read
+    pub ordered: Option<(std::borrow::Cow<'a, str>, bool)>,
     /// The WHERE's constant terms, whose run reads no row unless they hold
     pub empty_unless: Option<String>,
     /// The plan of the statement a source's rows come from
@@ -357,7 +357,12 @@ fn read_lines(read: &Read, text: &PlanText<'_>, lines: &mut Vec<String>) {
     let scan = |scan: Option<&ScanChoice>| {
         scan.map_or_else(Vec::new, |scan| scan.explain(text.table, text.pushed))
     };
-    match (read, text.ordered) {
+    match (
+        read,
+        text.ordered
+            .as_ref()
+            .map(|(c, ascending)| (c.as_ref(), *ascending)),
+    ) {
         (Read::PkGet(key), _) => {
             if text.keyed {
                 alternative(
@@ -447,7 +452,8 @@ fn read_lines(read: &Read, text: &PlanText<'_>, lines: &mut Vec<String>) {
             Some(column),
         ) => {
             alternative(lines, ordered.explain(text.table, column, text.pushed));
-            if *ordered != OrderedRead::TopK {
+            // A walk of several columns' keys has no top-k scan behind it
+            if matches!(ordered, OrderedRead::Index | OrderedRead::Keyset) {
                 let top = OrderedRead::TopK.explain(text.table, column, text.pushed);
                 alternative(lines, top);
             }
@@ -593,6 +599,9 @@ pub enum OrderedRead {
     Keyset,
     /// The table's top-k scan over the column, judging rows by the WHERE
     TopK,
+    /// An ORDER BY of several columns in one direction: the index they lead
+    /// walked in the order of its keys
+    IndexKeys,
 }
 
 /// The nearest-vectors read for an ORDER BY of `call`, a vector distance of
@@ -715,6 +724,20 @@ pub fn ordered_read(
     })
 }
 
+/// The ordered read for an ORDER BY of `columns`, two or more in one
+/// direction, over a table whose indexes `store` holds: the index they
+/// lead walked in key order, for a statement with no WHERE. None leaves
+/// the order to a sort
+pub fn keys_ordered_read(
+    store: &VersionStore,
+    columns: &[&str],
+    pushed: Option<&Expression>,
+    whole: bool,
+) -> Option<OrderedRead> {
+    (whole && pushed.is_none() && index_plan::keys_order_index(store, columns).is_some())
+        .then_some(OrderedRead::IndexKeys)
+}
+
 impl OrderedRead {
     /// The read as EXPLAIN shows it, in place of the scan
     pub fn explain(
@@ -724,7 +747,7 @@ impl OrderedRead {
         pushed: Option<&Expression>,
     ) -> String {
         let name = match self {
-            Self::Index => "IndexOrder",
+            Self::Index | Self::IndexKeys => "IndexOrder",
             Self::Keyset => "Keyset",
             Self::TopK => "TopK",
         };

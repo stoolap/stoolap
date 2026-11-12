@@ -16,6 +16,7 @@
 
 mod bug_contains_orderby_params_test;
 mod general_order_limit_test;
+mod index_keys_order_test;
 mod limit_volatile_once_test;
 mod non_number_order_test;
 mod offset_before_limit_test;

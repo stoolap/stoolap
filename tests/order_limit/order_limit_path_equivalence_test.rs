@@ -184,6 +184,21 @@ const CASES: &[Case] = &[
         "SELECT DISTINCT * FROM t ORDER BY n",
         Some((3, 1)),
     ),
+    // The index on (g, n) walked in the order of its keys
+    case(
+        "memory",
+        "prepared_index_keys",
+        "SELECT id, g, n FROM t ORDER BY g, n LIMIT 4 OFFSET 2",
+        "SELECT DISTINCT id, g, n FROM t ORDER BY g, n",
+        Some((4, 2)),
+    ),
+    case(
+        "memory",
+        "prepared_index_keys",
+        "SELECT * FROM t ORDER BY g DESC, n DESC LIMIT 3",
+        "SELECT DISTINCT * FROM t ORDER BY g DESC, n DESC",
+        Some((3, 0)),
+    ),
     case(
         "memory",
         "prepared_keyset",

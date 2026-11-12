@@ -1082,6 +1082,9 @@ pub(crate) enum OrderLimitPath {
     PreparedProjectFirst,
     /// A prepared subquery block keeping the rows its ORDER BY LIMIT keeps
     PreparedBlockCut,
+    /// A prepared statement's rows read in the order of several columns, by
+    /// walking the index they lead
+    PreparedIndexKeys,
 }
 
 impl OrderLimitPath {
@@ -1094,7 +1097,7 @@ impl OrderLimitPath {
 
 #[cfg(any(test, feature = "test-failpoints"))]
 impl OrderLimitPath {
-    pub(crate) const ALL: [OrderLimitPath; 11] = [
+    pub(crate) const ALL: [OrderLimitPath; 12] = [
         OrderLimitPath::TopN,
         OrderLimitPath::ComputedKeys,
         OrderLimitPath::VectorSearch,
@@ -1106,6 +1109,7 @@ impl OrderLimitPath {
         OrderLimitPath::PreparedTopRows,
         OrderLimitPath::PreparedProjectFirst,
         OrderLimitPath::PreparedBlockCut,
+        OrderLimitPath::PreparedIndexKeys,
     ];
 
     pub(crate) const fn name(self) -> &'static str {
@@ -1121,6 +1125,7 @@ impl OrderLimitPath {
             OrderLimitPath::PreparedTopRows => "prepared_top_rows",
             OrderLimitPath::PreparedProjectFirst => "prepared_project_first",
             OrderLimitPath::PreparedBlockCut => "prepared_block_cut",
+            OrderLimitPath::PreparedIndexKeys => "prepared_index_keys",
         }
     }
 }

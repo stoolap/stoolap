@@ -429,6 +429,21 @@ pub fn excludes_null<T: IndexTerm + ?Sized>(where_: &T, schema: &Schema, column:
     })
 }
 
+/// The multi-column index whose leading columns are `columns`, in that
+/// order, which an ORDER BY of them walks in key order; None leaves the
+/// order to a sort
+pub fn keys_order_index(store: &VersionStore, columns: &[&str]) -> Option<Arc<dyn Index>> {
+    store.get_all_indexes().into_iter().find(|index| {
+        let names = index.column_names();
+        index.index_type() == IndexType::MultiColumn
+            && names.len() >= columns.len()
+            && names
+                .iter()
+                .zip(columns)
+                .all(|(name, column)| eq_names(name, column))
+    })
+}
+
 /// The index a top-k read of `column` walks in key order under `where_`, a
 /// conjunction of comparisons: a multi-column index its equalities lead,
 /// walked on its next column, or the column's own index under bounds on it
