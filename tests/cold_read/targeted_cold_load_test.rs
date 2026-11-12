@@ -267,7 +267,7 @@ fn publication_keeps_a_view_another_reader_published_meanwhile() {
 }
 
 #[test]
-fn unique_candidates_in_seven_volumes_load_and_publish_with_one_map_copy() {
+fn unique_candidates_in_seven_volumes_load_at_commit_with_one_map_copy() {
     let _guard = FailpointGuard::new();
     let dir = tempfile::tempdir().unwrap();
     let db = cold_table(dir.path(), 8);
@@ -288,15 +288,21 @@ fn unique_candidates_in_seven_volumes_load_and_publish_with_one_map_copy() {
         (),
     )
     .unwrap();
-    let after = volume_loads();
-    let clones = stoolap::test_failpoints::segment_map_clones() - clones;
-    assert_eq!(
-        (after.0 - before.0, after.1 - before.1),
-        (8, 8),
-        "the source volume and seven unique candidates"
-    );
-    assert_eq!(clones, 1, "one map copy for the eight volumes");
+    let updated = volume_loads();
+    let update_clones = stoolap::test_failpoints::segment_map_clones() - clones;
     tx.commit().unwrap();
+    let after = volume_loads();
+    let commit_clones = stoolap::test_failpoints::segment_map_clones() - clones - update_clones;
+    assert_eq!(
+        (updated.0 - before.0, updated.1 - before.1, update_clones),
+        (1, 1, 1),
+        "the statement loads the source volume, with one map copy"
+    );
+    assert_eq!(
+        (after.0 - updated.0, after.1 - updated.1, commit_clones),
+        (7, 7, 1),
+        "the commit loads the seven unique candidates, with one map copy"
+    );
     let moved: i64 = db
         .query_one(
             "SELECT COUNT(*) FROM t WHERE id BETWEEN 2 AND 8 AND k % 10000 = 10",

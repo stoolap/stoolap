@@ -412,9 +412,14 @@ fn a_prepared_key_another_row_took_while_a_seal_landed_is_refused() {
     };
     let updated = table.update_by_row_ids(&[1], &mut setter);
     drop(table);
-    let refused = updated.is_err();
     let committed = updated.and_then(|_| txn.commit());
-    assert!(refused, "the statement kept a taken key: {committed:?}");
+    assert!(
+        matches!(
+            committed,
+            Err(stoolap::core::Error::UniqueConstraint { .. })
+        ),
+        "the transaction kept a taken key: {committed:?}"
+    );
     assert_eq!(calls, 1);
     let taken: i64 = db
         .query_one("SELECT COUNT(*) FROM t WHERE k = 99", ())
@@ -998,9 +1003,12 @@ fn a_new_sealed_row_is_checked_with_the_key_it_is_published_with() {
         Ok((row, true))
     });
     drop(table);
-    txn.rollback().unwrap();
+    let committed = updated.and_then(|_| txn.commit());
     assert!(
-        matches!(updated, Err(stoolap::core::Error::UniqueConstraint { .. })),
-        "row 2 took row 1's sealed key: {updated:?}"
+        matches!(
+            committed,
+            Err(stoolap::core::Error::UniqueConstraint { .. })
+        ),
+        "row 2 took row 1's sealed key: {committed:?}"
     );
 }

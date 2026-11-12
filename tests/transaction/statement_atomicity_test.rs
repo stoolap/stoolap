@@ -103,7 +103,7 @@ fn failed_cold_update_releases_claim_without_a_local_version() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(&format!("file://{}/claims", dir.path().display())).unwrap();
     db.execute(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER UNIQUE)",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL UNIQUE)",
         (),
     )
     .unwrap();
@@ -111,7 +111,9 @@ fn failed_cold_update_releases_claim_without_a_local_version() {
         .unwrap();
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     db.execute("BEGIN", ()).unwrap();
-    assert!(db.execute("UPDATE t SET v = 20 WHERE id = 1", ()).is_err());
+    assert!(db
+        .execute("UPDATE t SET v = NULL WHERE id = 1", ())
+        .is_err());
     let other = db.clone();
     assert_eq!(
         other

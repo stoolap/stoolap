@@ -204,6 +204,19 @@ impl RecheckKeys {
     }
 }
 
+/// The name of the unique index of `store` over the columns at `positions`
+fn unique_index_name(store: &VersionStore, positions: &[usize]) -> Option<String> {
+    let mut name = None;
+    let _ = store.for_each_unique_index(|index_name, index| {
+        let columns = index.column_ids().iter().map(|&id| id as usize);
+        if name.is_none() && columns.eq(positions.iter().copied()) {
+            name = Some(index_name.to_string());
+        }
+        Ok(())
+    });
+    name
+}
+
 /// The snapshot a commit's cold recheck read through, let go after the seal
 /// fence: a last owner of a volume takes locks a seal must not wait on, and
 /// may remove a retired file
@@ -10086,7 +10099,8 @@ impl EngineOperations {
                     && !mgr.is_pending_tombstone(Pending::of(txn_id), cold_rid)
                 {
                     return Err(crate::core::Error::UniqueConstraint {
-                        index: col_names.join("_"),
+                        index: unique_index_name(version_store, col_indices)
+                            .unwrap_or_else(|| col_names.join("_")),
                         column: col_names.join(", "),
                         value: coerced.into_vec().into(),
                         row_id: cold_rid,
