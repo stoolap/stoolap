@@ -446,6 +446,23 @@ impl PersistenceManager {
         self.record_ddl_unit(table_name, op, schema_data, false)
     }
 
+    /// Record a DDL operation of transaction `txn_id`, committed only by that
+    /// transaction's marker; None when persistence is off
+    pub fn record_transaction_ddl(
+        &self,
+        txn_id: i64,
+        table_name: &str,
+        op: WALOperationType,
+        schema_data: &[u8],
+    ) -> Result<Option<u64>> {
+        if !self.is_enabled() {
+            return Ok(None);
+        }
+        let wal = self.wal.as_ref().ok_or(Error::WalNotInitialized)?;
+        let entry = WALEntry::new(txn_id, table_name.to_string(), 0, op, schema_data.to_vec());
+        wal.append_entry(entry).map(Some)
+    }
+
     /// The same record, synced whatever the sync mode: a change that is
     /// decided by its record being durable
     pub fn record_ddl_operation_synced(

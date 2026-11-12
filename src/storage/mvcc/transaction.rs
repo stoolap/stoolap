@@ -23,6 +23,7 @@ use std::sync::{Arc, OnceLock};
 
 use crate::core::{Error, IsolationLevel, Result, RowVec, Schema, SchemaColumn};
 use crate::storage::mvcc::commit_log::ReadPoint;
+use crate::storage::mvcc::persistence::DDL_TXN_ID;
 use crate::storage::mvcc::registry::StatementView;
 use crate::storage::mvcc::txn_gate::{GateRef, TxnGate};
 use crate::storage::mvcc::TransactionRegistry;
@@ -124,12 +125,15 @@ pub trait TransactionEngineOperations: Send + Sync {
         table_use: TableUse,
     ) -> Result<Box<dyn Table>>;
 
-    /// Create a new table with `indexes`, reachable only once they are built
+    /// Create a new table with `indexes`, reachable only once they are built,
+    /// its WAL record committed with transaction `txn_id` or, under
+    /// DDL_TXN_ID, on its own
     fn create_table(
         &self,
         name: &str,
         schema: Schema,
         indexes: &[NewIndex],
+        txn_id: i64,
     ) -> Result<Box<dyn Table>>;
 
     /// Drop a table
@@ -453,7 +457,7 @@ impl MvccTransaction {
 
         // Recreate tables that were dropped in this transaction
         for (table_name, schema) in dropped_tables.iter().rev() {
-            if let Err(e) = ops.create_table(table_name, schema.clone(), &[]) {
+            if let Err(e) = ops.create_table(table_name, schema.clone(), &[], DDL_TXN_ID) {
                 eprintln!(
                     "Warning: Failed to recreate table '{}' during DDL rollback: {}",
                     table_name, e
@@ -557,7 +561,7 @@ impl MvccTransaction {
             // Tables dropped after savepoint need to be recreated
             while self.dropped_tables.len() > sp_state.ddl_state.dropped_tables_len {
                 if let Some((table_name, schema)) = self.dropped_tables.pop() {
-                    if let Err(e) = ops.create_table(&table_name, schema, &[]) {
+                    if let Err(e) = ops.create_table(&table_name, schema, &[], DDL_TXN_ID) {
                         eprintln!(
                             "Warning: Failed to recreate table '{}' during savepoint rollback: {}",
                             table_name, e
@@ -830,7 +834,7 @@ impl Transaction for MvccTransaction {
         super::engine::check_new_table(&schema)?;
 
         let ops = self.get_engine_ops()?;
-        let table = ops.create_table(name, schema, indexes)?;
+        let table = ops.create_table(name, schema, indexes, self.id)?;
 
         // Track for rollback - store the table name
         self.created_tables.push(name.to_lowercase());

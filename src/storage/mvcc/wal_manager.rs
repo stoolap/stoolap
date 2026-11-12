@@ -1413,9 +1413,11 @@ impl WALManager {
                 "WAL is poisoned after a write failure; reopen the database",
             ));
         }
-        // Every schema change commits under the one DDL id: a record or a
-        // marker of it written alone could commit a change that failed
-        if entry.operation.is_ddl() || entry.txn_id == crate::storage::mvcc::persistence::DDL_TXN_ID
+        // A schema change commits under the one DDL id, whose record or marker
+        // written alone could commit a change that failed, or under its own
+        // transaction's id, which only that transaction's marker commits
+        if entry.txn_id == crate::storage::mvcc::persistence::DDL_TXN_ID
+            || (entry.operation.is_ddl() && entry.txn_id <= 0)
         {
             return Err(Error::internal(
                 "a schema change is written with its marker as one unit",

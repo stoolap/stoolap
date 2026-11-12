@@ -10091,6 +10091,23 @@ impl EngineOperations {
     }
 
     /// Record pending versions for a table to WAL (helper for commit_all_tables)
+    /// Writes the CreateTable record of `name`: committed by transaction
+    /// `txn_id`'s marker, or under DDL_TXN_ID as a unit of its own
+    fn record_created_table(&self, txn_id: i64, name: &str, schema_data: &[u8]) -> Result<()> {
+        let Some(pm) = self.persistence().as_ref() else {
+            return Ok(());
+        };
+        if self.should_skip_wal() || !pm.is_enabled() {
+            return Ok(());
+        }
+        if txn_id == super::persistence::DDL_TXN_ID {
+            pm.record_ddl_operation(name, WALOperationType::CreateTable, schema_data)?;
+        } else {
+            pm.record_transaction_ddl(txn_id, name, WALOperationType::CreateTable, schema_data)?;
+        }
+        Ok(())
+    }
+
     fn record_table_to_wal(&self, txn_id: i64, table: &MVCCTable) -> Result<()> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::table_wal_record_written();
@@ -10276,10 +10293,12 @@ impl TransactionEngineOperations for EngineOperations {
         name: &str,
         schema: Schema,
         indexes: &[NewIndex],
+        txn_id: i64,
     ) -> Result<Box<dyn Table>> {
         let table_name = name.to_lowercase();
 
         let version_store = new_table_store(&schema, &self.registry, indexes)?;
+        let schema_data = MVCCEngine::serialize_schema(&schema);
 
         // Atomically check-and-insert under write lock to prevent TOCTOU race
         {
@@ -10292,6 +10311,10 @@ impl TransactionEngineOperations for EngineOperations {
         {
             let mut stores = self.version_stores().write().unwrap();
             stores.insert(table_name.clone(), Arc::clone(&version_store));
+        }
+        if let Err(e) = self.record_created_table(txn_id, name, &schema_data) {
+            let _ = self.drop_table(name);
+            return Err(e);
         }
         // The caches keyed by the schema epoch, the foreign key map among them, see the table
         self.ddl

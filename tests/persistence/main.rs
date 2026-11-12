@@ -41,6 +41,7 @@ mod rowid_fixture_test;
 mod snapshot_recovery_test;
 mod snapshot_system_test;
 mod stored_length_test;
+mod transaction_table_replay_test;
 mod vacuum_test;
 mod volume_checkpoint_test;
 mod volume_format_test;
