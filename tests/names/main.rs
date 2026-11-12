@@ -24,6 +24,7 @@ mod column_name_case_test;
 mod column_rename_resolution_test;
 mod column_sources_test;
 mod expression_identity_test;
+mod group_by_final_sigma_test;
 mod grouped_ambiguous_name_test;
 mod keyword_column_test;
 mod missing_name_rule_test;

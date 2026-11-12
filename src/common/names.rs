@@ -41,7 +41,7 @@ pub(crate) fn changes_lowercased(c: char) -> bool {
 /// `f` over the characters of `s` lowercased as `str::to_lowercase` gives
 /// them; a copy is made only for a name holding `Σ`, the one letter it
 /// lowercases by its context
-fn with_lowercase<R>(s: &str, f: impl FnOnce(&mut dyn Iterator<Item = char>) -> R) -> R {
+pub(crate) fn with_lowercase<R>(s: &str, f: impl FnOnce(&mut dyn Iterator<Item = char>) -> R) -> R {
     if s.contains('Σ') {
         f(&mut s.to_lowercase().chars())
     } else {
