@@ -35,11 +35,11 @@ use crate::storage::mvcc::index_plan::{self, IndexPlan, Read};
 use crate::storage::mvcc::registry::{CommitCut, StatementView};
 use crate::storage::mvcc::scanner::{HotScanner, MVCCScanner};
 use crate::storage::mvcc::txn_gate::{GateRef, TxnGate};
-use crate::storage::mvcc::version_store::unique_beside_key;
 use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::mvcc::version_store::Reader;
 use crate::storage::mvcc::version_store::TxnStoreWrite;
 use crate::storage::mvcc::version_store::EVERY_WRITE;
+use crate::storage::mvcc::version_store::{unique_beside_key, unique_error};
 use crate::storage::mvcc::RowVersion;
 use crate::storage::mvcc::{TransactionVersionStore, TxnTableStore, VersionStore};
 use crate::storage::traits::{
@@ -788,46 +788,29 @@ impl MVCCTable {
             .collect()
     }
 
-    /// Refuses a unique `index` this transaction's own new rows break. The
-    /// rows are not entered: the index holds committed rows, the commit
-    /// enters them as it enters any insert, and reads take local rows apart
+    /// Refuses a unique `index` this transaction's own rows break, against
+    /// the committed rows the index holds as the transaction left them and
+    /// against each other; the rows' keys are entered among its own. The
+    /// index holds committed rows, and the commit enters these as any write
     fn check_local_unique(&self, index: &dyn Index, col_indices: &[usize]) -> Result<()> {
-        if !index.is_unique() {
+        if !index.is_unique() || !self.local().has_local_changes() {
             return Ok(());
         }
-        let hnsw = index.as_any().downcast_ref::<HnswIndex>();
-        let txn_versions = self.local();
-        let mut seen: ahash::AHashSet<Vec<Value>> = ahash::AHashSet::new();
-        for (row_id, version) in txn_versions.iter_local() {
-            if version.is_deleted() || self.version_store.quick_check_row_existence(row_id) {
-                continue;
+        let mut store = self.writes()?;
+        let keys: Vec<(i64, SmallVec<[Value; 4]>)> = store
+            .iter_local()
+            .filter(|(_, version)| !version.is_deleted())
+            .filter_map(|(row_id, version)| {
+                let key: Option<SmallVec<[Value; 4]>> = (col_indices.iter())
+                    .map(|&at| version.data.get(at).filter(|v| !v.is_null()).cloned())
+                    .collect();
+                Some((row_id, key?))
+            })
+            .collect();
+        for (row_id, key) in keys {
+            if let Some(holder) = store.claim_key(index, &key, row_id)? {
+                return Err(unique_error(index, &key, holder));
             }
-            let key: Vec<Value> = col_indices
-                .iter()
-                .map(|&idx| {
-                    version
-                        .data
-                        .get(idx)
-                        .cloned()
-                        .unwrap_or(Value::Null(DataType::Null))
-                })
-                .collect();
-            if key.iter().any(Value::is_null) {
-                continue;
-            }
-            // An HNSW index answers no equality lookup; it matches vector bytes
-            let taken = match hnsw {
-                Some(hnsw) => hnsw.find_exact_duplicate(&key[0], row_id, None).is_some(),
-                None => !index.get_row_ids_equal(&key).is_empty(),
-            };
-            if seen.contains(&key) || taken {
-                return Err(Error::unique_constraint(
-                    index.name(),
-                    index.column_names().join(", "),
-                    key,
-                ));
-            }
-            seen.insert(key);
         }
         Ok(())
     }
@@ -1777,9 +1760,37 @@ impl MVCCTable {
         self.cached_schema.pk_column_index()
     }
 
-    /// Check unique index constraints for a row being inserted.
-    fn check_unique_constraints(&self, row: &Row, _row_id: i64) -> Result<()> {
+    /// Check unique index constraints for a row being inserted. A
+    /// transaction that tracks its keys also finds its own rows holding
+    /// one, and enters the row's keys among them
+    fn check_unique_constraints(&self, row: &Row, row_id: i64) -> Result<()> {
         let unique = self.unique_indexes()?;
+        if unique.is_empty() {
+            return Ok(());
+        }
+        let tracks = self.version_store.may_hold_unique_beside_key()
+            && (self.local_store()?.read())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .tracks_keys();
+        if tracks {
+            let key = self.cached_schema.pk_column_index();
+            let mut store = self.writes()?;
+            for index in unique
+                .iter()
+                .filter(|index| unique_beside_key(&***index, key))
+            {
+                let values: Option<SmallVec<[Value; 4]>> = (index.column_ids().iter())
+                    .map(|&id| row.get(id as usize).filter(|v| !v.is_null()).cloned())
+                    .collect();
+                let Some(values) = values else {
+                    continue;
+                };
+                if let Some(holder) = store.claim_key(&**index, &values, row_id)? {
+                    return Err(unique_error(&**index, &values, holder));
+                }
+            }
+            return Ok(());
+        }
         self.find_unique_conflict(row, &unique, &mut |entries, column_ids, values| {
             let txn_versions = self.local();
             entries
@@ -2730,16 +2741,8 @@ impl MVCCTable {
         if plan.compare_hot_keys && !plan.hot.is_empty() {
             plan.hot_keys_changed = self.hot_unique_keys_changed(plan);
         }
-        let unique = if plan.cold.is_empty() {
-            smallvec::SmallVec::new()
-        } else {
-            self.unique_indexes()?
-        };
         let mut txn_versions = self.writes()?;
         let layout = txn_versions.check_planned(plan)?;
-        if !unique.is_empty() {
-            self.check_planned_unique(&unique, &txn_versions, plan)?;
-        }
         let committed = plan
             .hot
             .iter()
@@ -2773,122 +2776,6 @@ impl MVCCTable {
                         .any(|&col_id| row.get(col_id as usize) != read.data.get(col_id as usize))
                 })
             })
-    }
-
-    /// The unique keys of the plan's new sealed rows: free unless a row
-    /// still holds one, where a row the plan sets holds what the plan
-    /// gives it, and no two rows of the plan, one of them sealed, share one
-    fn check_planned_unique(
-        &self,
-        unique: &[Arc<dyn Index>],
-        txn_versions: &TransactionVersionStore,
-        plan: &PlannedUpdate,
-    ) -> Result<()> {
-        let planned: FxHashMap<i64, &Row> = plan
-            .hot
-            .iter()
-            .map(|(row_id, row, _)| (*row_id, row))
-            .chain(
-                plan.cold
-                    .iter()
-                    .map(|change| (change.row_id, &change.new_row)),
-            )
-            .collect();
-        for change in &plan.cold {
-            self.find_unique_conflict(
-                &change.new_row,
-                unique,
-                &mut |entries, column_ids, values| {
-                    entries
-                        .iter()
-                        .filter(|entry| entry.row_id != change.row_id)
-                        .find(|entry| match planned.get(&entry.row_id) {
-                            Some(row) => Self::row_holds(row, column_ids, values),
-                            None => {
-                                let latest = txn_versions.get_latest_local(entry.row_id);
-                                Self::local_holds(latest, column_ids, values)
-                            }
-                        })
-                        .map(|entry| entry.row_id)
-                },
-            )?;
-        }
-        let schema = &self.cached_schema;
-        for index in unique {
-            let column_ids = index.column_ids();
-            let key = |row: &Row| -> Option<u64> {
-                use std::hash::{Hash, Hasher};
-                let mut hasher = rustc_hash::FxHasher::default();
-                for &col_id in column_ids {
-                    let value = row.get(col_id as usize)?;
-                    if value.is_null() {
-                        return None;
-                    }
-                    value.hash(&mut hasher);
-                }
-                Some(hasher.finish())
-            };
-            // (key hash, sealed, position): sealed rows first, then hot rows
-            let mut keys: Vec<(u64, bool, usize)> = plan
-                .cold
-                .iter()
-                .enumerate()
-                .filter_map(|(i, change)| key(&change.new_row).map(|h| (h, true, i)))
-                .chain(
-                    plan.hot
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, (_, row, _))| key(row).map(|h| (h, false, i))),
-                )
-                .collect();
-            keys.sort_unstable();
-            let row_at = |sealed: bool, i: usize| -> (i64, &Row) {
-                if sealed {
-                    (plan.cold[i].row_id, &plan.cold[i].new_row)
-                } else {
-                    (plan.hot[i].0, &plan.hot[i].1)
-                }
-            };
-            for run in keys.chunk_by(|a, b| a.0 == b.0) {
-                // Hot rows sort first; a run of hot rows only is not compared
-                let first_sealed = run.partition_point(|&(_, sealed, _)| !sealed);
-                for (n, &(_, _, a)) in run[first_sealed..].iter().enumerate() {
-                    let (_, row_a) = row_at(true, a);
-                    let values: smallvec::SmallVec<[Value; 4]> = column_ids
-                        .iter()
-                        .filter_map(|&col_id| row_a.get(col_id as usize).cloned())
-                        .collect();
-                    let others = run[..first_sealed]
-                        .iter()
-                        .chain(&run[first_sealed + n + 1..]);
-                    for &(_, sealed_b, b) in others {
-                        #[cfg(any(test, feature = "test-failpoints"))]
-                        crate::test_failpoints::unique_pair_compared();
-                        let (row_id, row_b) = row_at(sealed_b, b);
-                        if Self::row_holds(row_b, column_ids, &values) {
-                            let column = column_ids
-                                .iter()
-                                .map(|&col_id| {
-                                    schema
-                                        .columns
-                                        .get(col_id as usize)
-                                        .map(|c| c.name.as_str())
-                                        .unwrap_or("unknown")
-                                })
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            return Err(Error::UniqueConstraint {
-                                index: index.name().to_string(),
-                                column,
-                                value: values.into_vec().into(),
-                                row_id,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
     }
 }
 
@@ -3075,6 +2962,10 @@ impl Table for MVCCTable {
 
     fn txn_id(&self) -> i64 {
         self.txn_id
+    }
+
+    fn wrote_after(&self, row_id: i64, cut: i64) -> bool {
+        (self.local().get_latest_local(row_id)).is_some_and(|version| version.create_time > cut)
     }
 
     fn layout_token(&self) -> LayoutToken {

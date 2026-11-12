@@ -94,17 +94,11 @@ When inserting or updating a row that affects a unique index:
 
 ### When Uniqueness Is Checked
 
-A statement's new keys are judged against the rows as the whole statement leaves them, whether the rows are in memory or sealed into volumes. One statement may therefore swap keys among its rows, as in `UPDATE t SET u = CASE id WHEN 1 THEN 20 WHEN 2 THEN 10 END`, or shift them, as in `UPDATE t SET u = u + 10`. A statement that leaves two rows with one key fails, and in autocommit it changes nothing.
+A statement's new keys are judged when the statement ends, against the rows as the transaction then sees them: the committed rows, whether in memory or sealed into volumes, as the transaction left them, and the rows its own earlier statements wrote. One statement may therefore swap keys among its rows, as in `UPDATE t SET u = CASE id WHEN 1 THEN 20 WHEN 2 THEN 10 END`, or shift them, as in `UPDATE t SET u = u + 10`. A statement that leaves two rows with one key fails and changes nothing.
 
-Inside an explicit transaction, these fail at the statement:
-- an `INSERT` whose key a committed row holds;
-- an `UPDATE` that gives a sealed row a key an in-memory row holds;
-- an `UPDATE` that gives two of its rows one key when one of them is sealed.
+Inside an explicit transaction the failed statement is undone and the transaction goes on, with every earlier statement kept. A swap spread over two statements, `UPDATE t SET u = 20 WHERE id = 1` then `UPDATE t SET u = 10 WHERE id = 2`, fails at the first one, since it leaves two rows with the key 20; write it as one statement. A key a statement frees, by a `DELETE` or by an `UPDATE` that changes it, may be taken by a later statement of the transaction.
 
-Everything else waits for `COMMIT`, which then rolls the whole transaction back:
-- an `UPDATE` that gives an in-memory row a key another row holds;
-- an `UPDATE` that gives a sealed row a key another sealed row holds;
-- two rows the transaction itself wrote, in one statement or in two, that share one key.
+`COMMIT` judges the keys once more against the rows other transactions committed meanwhile: the first of two transactions to commit a key keeps it, and the other's `COMMIT` fails and rolls it back.
 
 ### NULL Handling
 

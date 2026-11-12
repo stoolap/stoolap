@@ -65,7 +65,15 @@ impl<'a> StatementRollback<'a> {
         }
     }
 
+    /// The statement's result once its new unique keys are judged as it
+    /// leaves the rows; a statement that fails is undone when this drops
     pub(super) fn finish<T>(mut self, result: Result<T>) -> Result<T> {
+        let result = match (result, self.checkpoint) {
+            (Ok(value), Some((txn_id, _))) => {
+                (self.engine.check_statement_keys(txn_id)).map(|()| value)
+            }
+            (result, _) => result,
+        };
         if result.is_ok() {
             self.checkpoint = None;
         }
@@ -869,6 +877,12 @@ impl Executor {
         drop(active_tx);
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::dml_table_opened();
+        // An upsert judges each row's keys against the rows before it, its
+        // own earlier rows included, and refuses a row it already wrote
+        let upsert_cut = crate::storage::mvcc::last_write_order();
+        if stmt.on_duplicate || stmt.do_nothing {
+            self.engine.track_keys(table.txn_id());
+        }
 
         // Prepared subqueries are read before the first write, through this
         // statement's transaction; a commit-time retry runs the statement again
@@ -1234,6 +1248,7 @@ impl Executor {
                                 &mut table,
                                 schema_ref,
                                 row_id,
+                                upsert_cut,
                                 None,
                                 row_values,
                                 stmt,
@@ -1284,6 +1299,7 @@ impl Executor {
                                         &mut table,
                                         schema_ref,
                                         row_id,
+                                        upsert_cut,
                                         Some(column),
                                         row_values,
                                         stmt,
@@ -1523,6 +1539,7 @@ impl Executor {
                                 &mut table,
                                 &schema,
                                 row_id,
+                                upsert_cut,
                                 None,
                                 &row_values,
                                 stmt,
@@ -1574,6 +1591,7 @@ impl Executor {
                                         &mut table,
                                         &schema,
                                         row_id,
+                                        upsert_cut,
                                         Some(column),
                                         &row_values,
                                         stmt,
@@ -3648,6 +3666,7 @@ impl Executor {
         table: &mut Box<dyn Table>,
         schema: &crate::core::Schema,
         row_id: i64,
+        cut: i64,
         conflict_column: Option<&str>,
         insert_values: &[Value],
         stmt: &InsertStatement,
@@ -3660,6 +3679,13 @@ impl Executor {
             &mut super::foreign_key::UpdatePlans,
         ),
     ) -> Result<(bool, Option<Row>)> {
+        // ON CONFLICT names its target; ON DUPLICATE KEY UPDATE, with none,
+        // updates a row an earlier row of the statement wrote again
+        if !stmt.conflict_target.is_empty() && table.wrote_after(row_id, cut) {
+            return Err(Error::invalid_argument(
+                "ON CONFLICT DO UPDATE cannot affect a row a second time in one statement",
+            ));
+        }
         // Build a WHERE clause to find the specific row
         // Use schema's cached pk_column_index for O(1) lookup
         let pk_col = schema

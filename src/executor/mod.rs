@@ -1357,7 +1357,10 @@ impl Executor {
         &self,
         isolation: crate::core::IsolationLevel,
     ) -> Result<Box<dyn Transaction>> {
-        self.engine.begin_transaction_with_level(isolation)
+        let transaction = self.engine.begin_transaction_with_level(isolation)?;
+        // Each statement's unique keys are judged when it ends
+        self.engine.track_keys(transaction.id());
+        Ok(transaction)
     }
 
     /// Get or create a cached plan for a SQL statement.

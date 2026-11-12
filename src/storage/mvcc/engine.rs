@@ -217,6 +217,109 @@ fn unique_index_name(store: &VersionStore, positions: &[usize]) -> Option<String
     name
 }
 
+/// A unique key a statement's write changed: its index's position, its row
+/// and its values
+type StatementKey = (usize, i64, SmallVec<[Value; 4]>);
+
+/// An error unless every unique key that a write of the statement changed
+/// in `txn_store` is held by no other row the transaction sees. The keys
+/// are claimed under the store, then volumes read with it let go, as a
+/// volume read may load a file
+fn check_statement_keys(
+    txn_id: i64,
+    txn_store: &TxnTableStore,
+    mgr: Option<&crate::storage::volume::manifest::SegmentManager>,
+) -> Result<()> {
+    let mut store = txn_store.write_store();
+    let mut rows = store.take_key_changes();
+    rows.sort_unstable();
+    rows.dedup();
+    let indexes: SmallVec<[Arc<dyn Index>; 4]> = store.unique_indexes().iter().cloned().collect();
+    // Each key by its index's position and its row
+    let mut keys: SmallVec<[StatementKey; 1]> = SmallVec::new();
+    for &row_id in &rows {
+        let Some(latest) = store.get_latest_local(row_id).filter(|v| !v.is_deleted()) else {
+            continue;
+        };
+        for (at, index) in indexes.iter().enumerate() {
+            let values: Option<SmallVec<[Value; 4]>> = (index.column_ids().iter())
+                .map(|&id| {
+                    latest
+                        .data
+                        .get(id as usize)
+                        .filter(|v| !v.is_null())
+                        .cloned()
+                })
+                .collect();
+            if let Some(values) = values {
+                keys.push((at, row_id, values));
+            }
+        }
+    }
+    for (at, row_id, values) in &keys {
+        if let Some(holder) = store.claim_key(&*indexes[*at], values, *row_id)? {
+            return Err(super::version_store::unique_error(
+                &*indexes[*at],
+                values,
+                holder,
+            ));
+        }
+    }
+    let Some(mgr) = mgr.filter(|mgr| mgr.has_segments() && !keys.is_empty()) else {
+        return Ok(());
+    };
+    // A committed row only moves from the hot index to a volume, so the
+    // volumes are read after it
+    let schema = Arc::clone(store.parent_store()).schema();
+    drop(store);
+    let snapshot = mgr.statement_snapshot();
+    let mut sealed: SmallVec<[(usize, i64); 1]> = SmallVec::new();
+    for (position, (at, row_id, values)) in keys.iter().enumerate() {
+        let columns: SmallVec<[usize; 4]> = (indexes[*at].column_ids().iter())
+            .map(|&id| id as usize)
+            .collect();
+        let coerced: SmallVec<[Value; 4]> = (values.iter().zip(&columns))
+            .map(|(value, &at)| value.coerce_to_type(schema.columns[at].data_type))
+            .collect();
+        let defaults: SmallVec<[Value; 4]> = columns
+            .iter()
+            .map(|&at| {
+                let column = &schema.columns[at];
+                (column.default_value.clone()).unwrap_or(Value::null(column.data_type))
+            })
+            .collect();
+        let found: SmallVec<[&Value; 4]> = coerced.iter().collect();
+        let holder = mgr.find_row_id_by_values_in(&snapshot, &columns, &found, &defaults)?;
+        if let Some(holder) = holder.filter(|&holder| holder != *row_id) {
+            sealed.push((position, holder));
+        }
+    }
+    mgr.publish_loaded(snapshot.take_loaded());
+    if sealed.is_empty() {
+        return Ok(());
+    }
+    let store = txn_store.write_store();
+    for (position, holder) in sealed {
+        let (at, _, values) = &keys[position];
+        let columns = indexes[*at].column_ids();
+        let holds = match store.get_latest_local(holder) {
+            Some(version) => {
+                !version.is_deleted()
+                    && super::version_store::key_held(&version.data, columns, values)
+            }
+            None => !mgr.is_pending_tombstone(Pending::of(txn_id), holder),
+        };
+        if holds {
+            return Err(super::version_store::unique_error(
+                &*indexes[*at],
+                values,
+                holder,
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The snapshot a commit's cold recheck read through, let go after the seal
 /// fence: a last owner of a volume takes locks a seal must not wait on, and
 /// may remove a retired file
@@ -5289,6 +5392,17 @@ impl MVCCEngine {
         self.operations().rollback_dml_after(txn_id, timestamp);
     }
 
+    /// Judges the unique keys one statement of a transaction gave its rows,
+    /// as the statement leaves them
+    pub(crate) fn check_statement_keys(&self, txn_id: i64) -> Result<()> {
+        self.operations().check_statement_keys(txn_id)
+    }
+
+    /// Has transaction `txn_id` judge its unique keys as it writes them
+    pub(crate) fn track_keys(&self, txn_id: i64) {
+        self.operations().track_keys(txn_id);
+    }
+
     // --- View Management Methods ---
 
     /// Create a new view with the names of its columns, None when they are
@@ -9871,6 +9985,10 @@ struct EngineOperations {
     creating: AtomicBool,
     /// The next creation `new_creation` hands out; 0 stands for none
     next_creation: AtomicU64,
+    /// The open transactions that judge their unique keys as they write them
+    tracking_txns: parking_lot::Mutex<FxHashSet<i64>>,
+    /// Whether `tracking_txns` has an entry, so a store or an end skips its lock
+    tracking_any: AtomicBool,
 }
 
 // EngineOperations is Send + Sync because all fields are Arc-wrapped thread-safe types
@@ -9983,7 +10101,24 @@ impl EngineOperations {
             holding_keys: AtomicBool::new(false),
             creating: AtomicBool::new(false),
             next_creation: AtomicU64::new(1),
+            tracking_txns: parking_lot::Mutex::new(FxHashSet::default()),
+            tracking_any: AtomicBool::new(false),
         }
+    }
+
+    /// Whether transaction `txn_id` judges its unique keys as it writes them
+    fn tracks_keys(&self, txn_id: i64) -> bool {
+        self.tracking_any.load(Ordering::Acquire) && self.tracking_txns.lock().contains(&txn_id)
+    }
+
+    /// Lets go of transaction `txn_id`'s tracking at its end
+    fn end_tracking(&self, txn_id: i64) {
+        if !self.tracking_any.load(Ordering::Acquire) {
+            return;
+        }
+        let mut txns = self.tracking_txns.lock();
+        txns.remove(&txn_id);
+        self.tracking_any.store(!txns.is_empty(), Ordering::Release);
     }
 
     /// Holds `value` of `table`'s column at position `at`, named `column`,
@@ -10339,10 +10474,12 @@ impl TransactionEngineOperations for EngineOperations {
                     (Some(Arc::clone(cached)), None)
                 } else {
                     let layout = version_store.layout();
-                    let new_store = Arc::new(TxnTableStore::admitted_at(
-                        TransactionVersionStore::new(Arc::clone(&version_store), txn_id),
-                        layout,
-                    ));
+                    let mut store =
+                        TransactionVersionStore::new(Arc::clone(&version_store), txn_id);
+                    if self.tracks_keys(txn_id) {
+                        store.track_keys();
+                    }
+                    let new_store = Arc::new(TxnTableStore::admitted_at(store, layout));
                     txn_tables.push((
                         table_name_lower.clone().into_owned().into(),
                         Arc::clone(&new_store),
@@ -11119,6 +11256,7 @@ impl TransactionEngineOperations for EngineOperations {
     }
 
     fn finish_all_tables(&self, txn_id: i64) {
+        self.end_tracking(txn_id);
         let removed = self.txn_version_stores().write().unwrap().remove(txn_id);
         if let Some(tables) = removed {
             Self::discard_stores(&tables);
@@ -11126,6 +11264,7 @@ impl TransactionEngineOperations for EngineOperations {
     }
 
     fn rollback_all_tables(&self, txn_id: i64, handed_out: bool) {
+        self.end_tracking(txn_id);
         // A transaction that opened no store of its own touched no table
         if let Ok(cache) = self.txn_version_stores().read() {
             if cache.get(txn_id).is_none() {
@@ -11207,6 +11346,46 @@ impl TransactionEngineOperations for EngineOperations {
                 .write_store()
                 .rollback_to_timestamp_with_pending(timestamp, &pending);
         }
+    }
+
+    fn track_keys(&self, txn_id: i64) {
+        self.tracking_txns.lock().insert(txn_id);
+        self.tracking_any.store(true, Ordering::Release);
+        let cache =
+            (self.txn_version_stores().read()).unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (_, store) in cache.get(txn_id).into_iter().flatten() {
+            store.write_store().track_keys();
+        }
+    }
+
+    fn check_statement_keys(&self, txn_id: i64) -> Result<()> {
+        let cache =
+            (self.txn_version_stores().read()).unwrap_or_else(std::sync::PoisonError::into_inner);
+        let touched: smallvec::SmallVec<[(crate::common::SmartString, Arc<TxnTableStore>); 4]> =
+            cache
+                .get(txn_id)
+                .map(|tables| {
+                    tables
+                        .iter()
+                        .map(|(name, store)| (name.clone(), Arc::clone(store)))
+                        .collect()
+                })
+                .unwrap_or_default();
+        drop(cache);
+        for (name, txn_store) in &touched {
+            let poisoned = |_| Error::internal("transaction store lock poisoned");
+            if !txn_store.read().map_err(poisoned)?.has_key_changes() {
+                continue;
+            }
+            let mgr = self
+                .segment_managers
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(name.as_str())
+                .cloned();
+            check_statement_keys(txn_id, txn_store, mgr.as_deref())?;
+        }
+        Ok(())
     }
 
     fn acquire_seal_fence(&self) -> Option<SealFenceGuard> {

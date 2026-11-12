@@ -352,6 +352,8 @@ SELECT host, metric, value FROM staging
 ON CONFLICT (host, metric) DO UPDATE SET value = EXCLUDED.value;
 ```
 
+Each row of an upsert is judged against the rows before it, the ones its own statement and the earlier statements of its transaction wrote included. With `ON CONFLICT DO NOTHING`, a row whose key an earlier row of the same statement took is skipped, so `INSERT INTO t VALUES (20, 200), (21, 200) ON CONFLICT (u) DO NOTHING` inserts the first row only. With `ON CONFLICT (...) DO UPDATE`, a row that meets a row the same statement already inserted or updated fails the statement: `ON CONFLICT DO UPDATE cannot affect a row a second time in one statement`. `ON DUPLICATE KEY UPDATE`, which names no conflict target, updates such a row again instead.
+
 See [ON DUPLICATE KEY UPDATE]({% link _docs/sql-features/on-duplicate-key-update.md %}) for detailed documentation.
 
 #### INSERT INTO ... SELECT

@@ -254,6 +254,13 @@ pub trait TransactionEngineOperations: Send + Sync {
     /// Discard later DML across all touched tables, including cold claims.
     fn rollback_dml_after(&self, txn_id: i64, timestamp: i64);
 
+    /// An error unless every unique key the transaction's writes changed
+    /// since its last statement ended is held by no other row it sees
+    fn check_statement_keys(&self, txn_id: i64) -> Result<()>;
+
+    /// Has the transaction judge its unique keys as it writes them
+    fn track_keys(&self, txn_id: i64);
+
     /// Changes a column's definition as a DDL statement does: under the DDL
     /// guard, in every layer, with the table closed
     fn change_column_type(&self, change: &super::engine::ColumnTypeChange<'_>) -> Result<()> {

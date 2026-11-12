@@ -3200,19 +3200,6 @@ pub(crate) fn cold_only_rows_claimed() {
 }
 
 thread_local! {
-    static UNIQUE_PAIRS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// Pairs of an UPDATE's planned rows this thread compared for one unique key
-pub fn unique_pairs_compared() -> usize {
-    UNIQUE_PAIRS.with(std::cell::Cell::get)
-}
-
-pub(crate) fn unique_pair_compared() {
-    UNIQUE_PAIRS.with(|n| n.set(n.get() + 1));
-}
-
-thread_local! {
     static COLD_RECHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -3784,7 +3771,6 @@ pub fn reset_all() {
     DROP_HOT_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_CLAIM_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_ONLY_CLAIMED_HOOK.with(|slot| *slot.borrow_mut() = None);
-    UNIQUE_PAIRS.with(|n| n.set(0));
     COLD_RECHECKS.with(|n| n.set(0));
     TXN_GATE_LOOKUPS.with(|n| n.set(0));
     TXN_GATE_ADMISSIONS.with(|n| n.set(0));

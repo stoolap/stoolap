@@ -4815,6 +4815,10 @@ impl Table for SegmentedTable {
         self.hot.txn_id()
     }
 
+    fn wrote_after(&self, row_id: i64, cut: i64) -> bool {
+        self.hot.wrote_after(row_id, cut)
+    }
+
     // =========================================================================
     // DDL — delegate to hot buffer
     // =========================================================================

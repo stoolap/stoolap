@@ -1322,6 +1322,11 @@ pub struct VersionStore {
     /// Odd while something other than a commit changes the indexes or the
     /// rows wholesale (a truncate, a cast, a rebinding), moved after it
     index_epoch: AtomicU64,
+    /// Whether a unique index other than the primary key's is in the map,
+    /// set with the map under its write lock
+    unique_beside_key: AtomicBool,
+    /// Moved by each change of the map that may change its unique indexes
+    unique_generation: AtomicU64,
     /// Moved by every column added or dropped: the rows are laid out as
     /// the schema says from then on, and a transaction that wrote under
     /// the layout before cannot commit its rows
@@ -1501,6 +1506,8 @@ impl VersionStore {
             removal_history: RwLock::new(RemovalHistory::default()),
             membership_seq: AtomicI64::new(0),
             index_epoch: AtomicU64::new(0),
+            unique_beside_key: AtomicBool::new(false),
+            unique_generation: AtomicU64::new(0),
             layout: AtomicU64::new(0),
             pending_cut: Mutex::new(None),
             store_id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
@@ -1544,6 +1551,8 @@ impl VersionStore {
             removal_history: RwLock::new(RemovalHistory::default()),
             membership_seq: AtomicI64::new(0),
             index_epoch: AtomicU64::new(0),
+            unique_beside_key: AtomicBool::new(false),
+            unique_generation: AtomicU64::new(0),
             layout: AtomicU64::new(0),
             pending_cut: Mutex::new(None),
             store_id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
@@ -1811,6 +1820,7 @@ impl VersionStore {
                     }
                 }
             }
+            self.note_unique_set(&indexes);
             taken
         };
         self.publish_epoch.fetch_add(1, Ordering::SeqCst);
@@ -2084,7 +2094,7 @@ impl VersionStore {
         *self.zone_maps.write() = None;
         let replaced: Vec<Arc<dyn Index>> = {
             let mut current = self.indexes.write();
-            indexes
+            let replaced = indexes
                 .into_iter()
                 .filter_map(|(name, index)| match current.get_mut(&name) {
                     Some(entry) => Some(std::mem::replace(&mut entry.index, index)),
@@ -2093,7 +2103,9 @@ impl VersionStore {
                         None
                     }
                 })
-                .collect()
+                .collect();
+            self.note_unique_set(&current);
+            replaced
         };
         self.publish_epoch.fetch_add(1, Ordering::SeqCst);
         self.index_epoch.fetch_add(2, Ordering::SeqCst);
@@ -5549,10 +5561,42 @@ impl VersionStore {
         parking_lot::Mutex::lock_arc(&self.upsert_mutex)
     }
 
+    /// Notes whether `indexes`, held under their write lock, hold a unique
+    /// index that is not the primary key's own
+    fn note_unique_set(&self, indexes: &FxHashMap<String, IndexEntry>) {
+        let unique = indexes.values().any(|entry| {
+            entry.index.is_unique()
+                && entry.index.index_type() != crate::core::IndexType::PrimaryKey
+        });
+        self.unique_beside_key.store(unique, Ordering::Release);
+        self.unique_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Whether a unique index other than the primary key's may be in the
+    /// map: a transaction tracks the keys its writes give when one is
+    pub(crate) fn may_hold_unique_beside_key(&self) -> bool {
+        self.unique_beside_key.load(Ordering::Acquire)
+    }
+
+    /// The unique indexes beside the key, with the generation they were
+    /// read at
+    fn unique_indexes_beside_key(&self) -> (u64, UniqueIndexes) {
+        let generation = self.unique_generation.load(Ordering::Acquire);
+        let key = self.schema().pk_column_index();
+        let indexes = self.indexes.read();
+        let unique = (indexes.values())
+            .map(|entry| &entry.index)
+            .filter(|index| unique_beside_key(&***index, key))
+            .cloned()
+            .collect();
+        (generation, unique)
+    }
+
     /// Add an index, with no identity until the catalog issues one
     pub fn add_index(&self, name: String, index: Arc<dyn Index>) {
         let mut indexes = self.indexes.write();
         indexes.insert(name, IndexEntry::new(index));
+        self.note_unique_set(&indexes);
         // Built from the newest rows: a view that misses a commit before it
         // does not find its rows by it
         self.note_index_removal();
@@ -5562,7 +5606,9 @@ impl VersionStore {
     /// Remove an index
     pub fn remove_index(&self, name: &str) -> Option<Arc<dyn Index>> {
         let mut indexes = self.indexes.write();
-        indexes.remove(name).map(|entry| entry.index)
+        let removed = indexes.remove(name).map(|entry| entry.index);
+        self.note_unique_set(&indexes);
+        removed
     }
 
     /// Records the identity the catalog issued to `name`'s definition,
@@ -7282,6 +7328,55 @@ pub struct TransactionVersionStore {
     /// The layout of the handle about to write, for the row it writes, and
     /// whether that handle is older than one admitted since
     writing: Option<(u64, bool)>,
+    /// The keys of a transaction that judges its unique keys as it writes
+    /// them, an explicit transaction or an upsert, rather than at commit alone
+    tracking: Option<Box<KeyTracking>>,
+}
+
+/// What a transaction that judges its unique keys as it writes them keeps
+#[derive(Default)]
+struct KeyTracking {
+    /// Every unique key a local row was given that differs from its
+    /// committed one, by the index's columns and the key's hash; never
+    /// pruned, each a candidate its row's latest version confirms
+    local_keys: LocalKeys,
+    /// The rows whose unique keys a write changed since the statement began,
+    /// judged when it ends
+    key_changes: Vec<i64>,
+    /// The unique indexes beside the key, by the generation of the parent's
+    /// indexes they were read at
+    unique_indexes: Option<(u64, UniqueIndexes)>,
+}
+
+/// A table's unique indexes beside its key
+type UniqueIndexes = SmallVec<[Arc<dyn Index>; 4]>;
+
+/// Rows by the columns of a unique index, few, and the hash of a key
+pub(crate) type LocalKeys = Vec<(SmallVec<[i32; 4]>, FxHashMap<u64, SmallVec<[i64; 1]>>)>;
+
+/// Whether `row` holds `values` in the columns `columns`
+pub(crate) fn key_held(row: &Row, columns: &[i32], values: &[Value]) -> bool {
+    (columns.iter().zip(values)).all(|(&id, value)| row.get(id as usize) == Some(value))
+}
+
+/// The error of the key `values` of `index` that the row `holder` holds
+pub(crate) fn unique_error(index: &dyn Index, values: &[Value], holder: i64) -> Error {
+    Error::UniqueConstraint {
+        index: index.name().to_string(),
+        column: index.column_names().join(", "),
+        value: values.to_vec().into(),
+        row_id: holder,
+    }
+}
+
+/// The hash a unique key is kept under among a transaction's own holders
+pub(crate) fn key_hash<'v>(values: impl IntoIterator<Item = &'v Value>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    for value in values {
+        value.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// No row of the transaction is held yet
@@ -7417,7 +7512,164 @@ impl TransactionVersionStore {
             applied: Mutex::new(SmallVec::new()),
             bound: SmallVec::new(),
             writing: None,
+            tracking: None,
         }
+    }
+
+    /// Judges the unique keys this transaction writes from now on as it
+    /// writes them, as an explicit transaction and an upsert do
+    pub(crate) fn track_keys(&mut self) {
+        self.tracking.get_or_insert_with(Box::default);
+    }
+
+    /// Whether the transaction judges its unique keys as it writes them
+    pub(crate) fn tracks_keys(&self) -> bool {
+        self.tracking.is_some()
+    }
+
+    /// The store this transaction's rows are written against
+    pub(crate) fn parent_store(&self) -> &Arc<VersionStore> {
+        &self.parent_store
+    }
+
+    /// The unique indexes beside the key a tracking transaction judges,
+    /// read again only once the parent's indexes changed; none untracked
+    pub(crate) fn unique_indexes(&mut self) -> &[Arc<dyn Index>] {
+        let Some(tracking) = self.tracking.as_deref_mut() else {
+            return &[];
+        };
+        let generation = self.parent_store.unique_generation.load(Ordering::Acquire);
+        if (tracking.unique_indexes.as_ref()).is_none_or(|(read, _)| *read != generation) {
+            tracking.unique_indexes = Some(self.parent_store.unique_indexes_beside_key());
+        }
+        tracking
+            .unique_indexes
+            .as_ref()
+            .map_or(&[], |(_, indexes)| indexes)
+    }
+
+    /// Notes that a write is giving `row_id` the row `new` in place of the
+    /// version it holds now, when a unique key differs, for the statement's
+    /// end to judge; a new row's insert judged its keys itself
+    fn note_key_change(&mut self, row_id: i64, new: &Row) {
+        if self.tracking.is_none() || !self.parent_store.may_hold_unique_beside_key() {
+            return;
+        }
+        self.unique_indexes();
+        let latest = (self.local_versions.as_ref())
+            .and_then(|versions| versions.get(row_id))
+            .and_then(|versions| versions.last());
+        let old = match latest {
+            Some(version) => (!version.is_deleted()).then_some(&version.data),
+            None => (self.write_set.as_ref())
+                .and_then(|ws| ws.get(row_id))
+                .and_then(|entry| entry.read_version.as_ref())
+                .map(|version| &version.data),
+        };
+        let (Some(old), Some(tracking)) = (old, self.tracking.as_deref_mut()) else {
+            return;
+        };
+        let indexes = tracking
+            .unique_indexes
+            .as_ref()
+            .map_or(&[][..], |(_, all)| all);
+        let changed = indexes.iter().any(|index| {
+            (index.column_ids().iter()).any(|&id| old.get(id as usize) != new.get(id as usize))
+        });
+        if changed {
+            tracking.key_changes.push(row_id);
+        }
+    }
+
+    /// The rows whose unique keys a write changed since the last statement
+    /// end, handed over
+    pub(crate) fn take_key_changes(&mut self) -> Vec<i64> {
+        (self.tracking.as_deref_mut()).map_or_else(Vec::new, |t| std::mem::take(&mut t.key_changes))
+    }
+
+    /// Whether a write changed a unique key since the last statement end
+    pub(crate) fn has_key_changes(&self) -> bool {
+        self.tracking
+            .as_ref()
+            .is_some_and(|t| !t.key_changes.is_empty())
+    }
+
+    /// The row other than `except` the transaction sees holding the key
+    /// `values` of `index`, hashed `hash`: a committed row the index finds
+    /// that the transaction left holding it, or one of its own rows
+    pub(crate) fn key_holder(
+        &self,
+        index: &dyn Index,
+        values: &[Value],
+        hash: u64,
+        except: i64,
+    ) -> Result<Option<i64>, Error> {
+        let columns = index.column_ids();
+        let holds = |row_id: i64, committed: bool| match self.get_latest_local(row_id) {
+            Some(version) => !version.is_deleted() && key_held(&version.data, columns, values),
+            None => committed,
+        };
+        let hnsw = index
+            .as_any()
+            .downcast_ref::<crate::storage::index::HnswIndex>();
+        match (hnsw, values) {
+            (Some(hnsw), [value]) => {
+                let mut passed = crate::common::I64Set::default();
+                while let Some(row_id) = hnsw.find_exact_duplicate(value, except, Some(&passed)) {
+                    if holds(row_id, true) {
+                        return Ok(Some(row_id));
+                    }
+                    passed.insert(row_id);
+                }
+            }
+            _ => {
+                for entry in index.find(values)? {
+                    if entry.row_id != except && holds(entry.row_id, true) {
+                        return Ok(Some(entry.row_id));
+                    }
+                }
+            }
+        }
+        let local = (self.tracking.as_deref())
+            .and_then(|t| {
+                t.local_keys
+                    .iter()
+                    .find(|(held, _)| held.as_slice() == columns)
+            })
+            .and_then(|(_, by_hash)| by_hash.get(&hash));
+        Ok(local
+            .into_iter()
+            .flatten()
+            .copied()
+            .find(|&row_id| row_id != except && holds(row_id, false)))
+    }
+
+    /// The holder [`Self::key_holder`] finds, or none, `row_id` then entered
+    /// as one of the transaction's own rows holding the key
+    pub(crate) fn claim_key(
+        &mut self,
+        index: &dyn Index,
+        values: &[Value],
+        row_id: i64,
+    ) -> Result<Option<i64>, Error> {
+        let hash = key_hash(values);
+        if let Some(holder) = self.key_holder(index, values, hash, row_id)? {
+            return Ok(Some(holder));
+        }
+        let columns = index.column_ids();
+        let keys = &mut self.tracking.get_or_insert_with(Box::default).local_keys;
+        let at = match keys.iter().position(|(held, _)| held.as_slice() == columns) {
+            Some(at) => at,
+            None => {
+                keys.push((SmallVec::from_slice(columns), FxHashMap::default()));
+                keys.len() - 1
+            }
+        };
+        let rows = keys[at].1.entry(hash).or_default();
+        if !rows.contains(&row_id) {
+            rows.push(row_id);
+        }
+        Ok(None)
     }
 
     /// Takes back everything this transaction's commit applied before its
@@ -7623,6 +7875,9 @@ impl TransactionVersionStore {
             .is_some_and(|lv| lv.contains_key(row_id));
 
         if has_local {
+            if !is_delete {
+                self.note_key_change(row_id, &rv.data);
+            }
             // Already have local version - just append
             self.ensure_local_versions()
                 .get_mut(row_id)
@@ -7662,6 +7917,9 @@ impl TransactionVersionStore {
                 if row_exists {
                     self.parent_store.try_claim_row(row_id, self.txn_id)?;
                 }
+            }
+            if !is_delete {
+                self.note_key_change(row_id, &rv.data);
             }
             self.ensure_local_versions().insert(row_id, smallvec![rv]);
         }
@@ -7720,6 +7978,9 @@ impl TransactionVersionStore {
             .is_some_and(|lv| lv.contains_key(row_id));
 
         if has_local {
+            if !is_delete {
+                self.note_key_change(row_id, &rv.data);
+            }
             // Already have local version - just append
             self.ensure_local_versions()
                 .get_mut(row_id)
@@ -7753,6 +8014,9 @@ impl TransactionVersionStore {
                 // Claim the row for update
                 self.parent_store.try_claim_row(row_id, self.txn_id)?;
             }
+            if !is_delete {
+                self.note_key_change(row_id, &rv.data);
+            }
             self.ensure_local_versions().insert(row_id, smallvec![rv]);
         }
         Ok(())
@@ -7785,9 +8049,16 @@ impl TransactionVersionStore {
             let rv = RowVersion::new_with_timestamp(self.txn_id, data, now);
 
             // Check if already in local versions (already processed in this transaction)
-            if let Some(versions) = self.ensure_local_versions().get_mut(row_id) {
-                // Append new version to history
-                versions.push(rv);
+            if self
+                .local_versions
+                .as_ref()
+                .is_some_and(|lv| lv.contains_key(row_id))
+            {
+                self.note_key_change(row_id, &rv.data);
+                if let Some(versions) = self.ensure_local_versions().get_mut(row_id) {
+                    // Append new version to history
+                    versions.push(rv);
+                }
                 continue;
             }
 
@@ -7822,6 +8093,7 @@ impl TransactionVersionStore {
             }
 
             // Insert new version history for this row
+            self.note_key_change(row_id, &rv.data);
             self.ensure_local_versions().insert(row_id, smallvec![rv]);
         }
         Ok(())
@@ -7903,6 +8175,7 @@ impl TransactionVersionStore {
             }
             let data = Row::from_arc(std::mem::take(&mut change.new_row).into_arc());
             let rv = RowVersion::new_with_timestamp(txn_id, data, now);
+            self.note_key_change(change.row_id, &rv.data);
             self.ensure_local_versions()
                 .insert(change.row_id, smallvec![rv]);
         }
@@ -7910,6 +8183,7 @@ impl TransactionVersionStore {
             let rv = RowVersion::new_with_timestamp(txn_id, Row::from_arc(data.into_arc()), now);
             // A version of this transaction is never a committed one
             if read.txn_id == txn_id {
+                self.note_key_change(row_id, &rv.data);
                 if let Some(versions) = self.ensure_local_versions().get_mut(row_id) {
                     versions.push(rv);
                 }
@@ -7923,6 +8197,7 @@ impl TransactionVersionStore {
                     shared: false,
                 });
             }
+            self.note_key_change(row_id, &rv.data);
             self.ensure_local_versions().insert(row_id, smallvec![rv]);
         }
     }
@@ -8955,6 +9230,11 @@ impl TransactionVersionStore {
     /// `pending` contains sorted row IDs after the cold rollback.
     pub(crate) fn rollback_to_timestamp_with_pending(&mut self, timestamp: i64, pending: &[i64]) {
         debug_assert!(pending.windows(2).all(|pair| pair[0] < pair[1]));
+        // The keys the undone writes changed are not judged; their entries
+        // among the local keys find no row holding them
+        if let Some(tracking) = self.tracking.as_deref_mut() {
+            tracking.key_changes.clear();
+        }
         if let Some(local_versions) = self.local_versions.as_mut() {
             local_versions.retain(|_, versions| {
                 versions.retain(|v| v.create_time <= timestamp);

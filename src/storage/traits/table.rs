@@ -297,6 +297,13 @@ pub trait Table: Send + Sync {
     /// Used by FK enforcement to participate in the caller's transaction.
     fn txn_id(&self) -> i64;
 
+    /// Whether this handle's transaction wrote `row_id` after write order
+    /// `cut`, as an upsert asks of the row a conflict names
+    fn wrote_after(&self, row_id: i64, cut: i64) -> bool {
+        let _ = (row_id, cut);
+        false
+    }
+
     /// The table instance and row layout this handle's schema describes:
     /// positions resolved from `schema()` are valid against this token only
     fn layout_token(&self) -> LayoutToken;
