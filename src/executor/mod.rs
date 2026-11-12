@@ -1329,6 +1329,8 @@ impl Executor {
     /// while keeping the transaction's uncommitted changes visible.
     pub fn install_transaction(&self, tx: Box<dyn Transaction>) {
         let _gate = self.enter(true);
+        // Each statement's unique keys are judged when it ends
+        self.engine.track_keys(tx.id());
         let mut active_tx = self.active_transaction.lock().unwrap();
         *active_tx = Some(ActiveTransaction {
             transaction: tx,

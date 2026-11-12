@@ -279,6 +279,23 @@ pub(crate) fn transaction_begun() {
 }
 
 thread_local! {
+    static STATEMENT_INDEXES_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when a statement's end next has read a table's
+/// unique indexes, before it checks they are of the layout it read.
+pub fn after_statement_indexes(hook: impl FnOnce() + 'static) {
+    STATEMENT_INDEXES_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn statement_indexes_read() {
+    let hook = STATEMENT_INDEXES_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static COMMIT_VISIBLE_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 

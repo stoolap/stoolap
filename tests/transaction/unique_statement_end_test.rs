@@ -255,6 +255,19 @@ const CASES: &[(&[&str], &str)] = &[
         &["INSERT INTO t VALUES (11, 110, 0), (11, 111, 0) ON DUPLICATE KEY UPDATE u = 112"],
         "ok => 1:10,2:20,11:112",
     ),
+    (
+        &[
+            "BEGIN",
+            "INSERT INTO t VALUES (5, 50, 0)",
+            "SAVEPOINT s",
+            "DELETE FROM t WHERE id = 5",
+            "INSERT INTO t VALUES (6, 50, 0)",
+            "ROLLBACK TO SAVEPOINT s",
+            "INSERT INTO t VALUES (7, 50, 0)",
+            "COMMIT",
+        ],
+        "ok ok ok ok ok ok taken ok => 1:10,2:20,5:50",
+    ),
 ];
 
 #[test]
@@ -268,6 +281,25 @@ fn a_transaction_s_statement_is_judged_by_the_keys_it_leaves() {
             if got != *want {
                 wrong.push(format!("{rows:?} {steps:?}\n  got  {got}\n  want {want}"));
             }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn an_installed_transaction_is_judged_at_the_statement_end() {
+    let mut wrong = Vec::new();
+    for rows in [Rows::Hot, Rows::Sealed, Rows::Mixed] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = database(rows, &dir);
+        let executor = stoolap::Executor::new(std::sync::Arc::clone(db.engine()));
+        executor.install_transaction(executor.begin_transaction().unwrap());
+        let updated = executor.execute("UPDATE t SET u = 20 WHERE id = 1");
+        if !matches!(updated, Err(stoolap::Error::UniqueConstraint { .. })) {
+            wrong.push(format!("{rows:?}: {:?}", updated.map(|_| ())));
+        }
+        if let Some(mut tx) = executor.take_transaction() {
+            tx.rollback().unwrap();
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));

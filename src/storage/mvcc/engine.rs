@@ -234,7 +234,7 @@ fn check_statement_keys(
     let mut rows = store.take_key_changes();
     rows.sort_unstable();
     rows.dedup();
-    let indexes: SmallVec<[Arc<dyn Index>; 4]> = store.unique_indexes().iter().cloned().collect();
+    let (indexes, schema) = store.unique_indexes_in_layout()?;
     // Each key by its index's position and its row
     let mut keys: SmallVec<[StatementKey; 1]> = SmallVec::new();
     for &row_id in &rows {
@@ -270,7 +270,6 @@ fn check_statement_keys(
     };
     // A committed row only moves from the hot index to a volume, so the
     // volumes are read after it
-    let schema = Arc::clone(store.parent_store()).schema();
     drop(store);
     let snapshot = mgr.statement_snapshot();
     let mut sealed: SmallVec<[(usize, i64); 1]> = SmallVec::new();

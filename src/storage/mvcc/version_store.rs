@@ -7337,8 +7337,8 @@ pub struct TransactionVersionStore {
 #[derive(Default)]
 struct KeyTracking {
     /// Every unique key a local row was given that differs from its
-    /// committed one, by the index's columns and the key's hash; never
-    /// pruned, each a candidate its row's latest version confirms
+    /// committed one, by the index's columns and the key's hash; each a
+    /// candidate its row's latest version confirms
     local_keys: LocalKeys,
     /// The rows whose unique keys a write changed since the statement began,
     /// judged when it ends
@@ -7349,7 +7349,7 @@ struct KeyTracking {
 }
 
 /// A table's unique indexes beside its key
-type UniqueIndexes = SmallVec<[Arc<dyn Index>; 4]>;
+pub(crate) type UniqueIndexes = SmallVec<[Arc<dyn Index>; 4]>;
 
 /// Rows by the columns of a unique index, few, and the hash of a key
 pub(crate) type LocalKeys = Vec<(SmallVec<[i32; 4]>, FxHashMap<u64, SmallVec<[i64; 1]>>)>;
@@ -7377,6 +7377,14 @@ pub(crate) fn key_hash<'v>(values: impl IntoIterator<Item = &'v Value>) -> u64 {
         value.hash(&mut hasher);
     }
     hasher.finish()
+}
+
+/// The hash of the key `row` holds in `columns`, none when one is NULL
+fn row_key_hash(row: &Row, columns: &[i32]) -> Option<u64> {
+    let values: Option<SmallVec<[&Value; 4]>> = (columns.iter())
+        .map(|&id| row.get(id as usize).filter(|v| !v.is_null()))
+        .collect();
+    values.map(key_hash)
 }
 
 /// No row of the transaction is held yet
@@ -7527,9 +7535,23 @@ impl TransactionVersionStore {
         self.tracking.is_some()
     }
 
-    /// The store this transaction's rows are written against
-    pub(crate) fn parent_store(&self) -> &Arc<VersionStore> {
-        &self.parent_store
+    /// The unique indexes beside the key and the schema, read in one layout
+    /// of the parent, refused as SchemaChanged unless the transaction's rows
+    /// are held in it
+    pub(crate) fn unique_indexes_in_layout(
+        &mut self,
+    ) -> Result<(UniqueIndexes, CompactArc<Schema>), Error> {
+        let (schema, layout) = self.parent_store.schema_and_layout();
+        let indexes: UniqueIndexes = self.unique_indexes().iter().cloned().collect();
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::statement_indexes_read();
+        let moved = is_closed(layout) || self.parent_store.layout() != layout;
+        if moved || self.layout_bound().is_some_and(|bound| bound != layout) {
+            return Err(Error::SchemaChanged {
+                table: self.parent_store.table_name.to_string(),
+            });
+        }
+        Ok((indexes, schema))
     }
 
     /// The unique indexes beside the key a tracking transaction judges,
@@ -7656,7 +7678,15 @@ impl TransactionVersionStore {
         if let Some(holder) = self.key_holder(index, values, hash, row_id)? {
             return Ok(Some(holder));
         }
-        let columns = index.column_ids();
+        self.enter_key(index.column_ids(), hash, row_id);
+        Ok(None)
+    }
+
+    /// Enters `row_id` among the rows holding a key of `columns` hashed
+    /// `hash`, dropping those whose latest version holds no key so hashed:
+    /// a rollback to a savepoint enters the rows it gives back again
+    fn enter_key(&mut self, columns: &[i32], hash: u64, row_id: i64) {
+        let local_versions = self.local_versions.as_ref();
         let keys = &mut self.tracking.get_or_insert_with(Box::default).local_keys;
         let at = match keys.iter().position(|(held, _)| held.as_slice() == columns) {
             Some(at) => at,
@@ -7666,10 +7696,16 @@ impl TransactionVersionStore {
             }
         };
         let rows = keys[at].1.entry(hash).or_default();
-        if !rows.contains(&row_id) {
-            rows.push(row_id);
-        }
-        Ok(None)
+        rows.retain(|held| {
+            let held = *held;
+            held != row_id
+                && (local_versions.and_then(|all| all.get(held)))
+                    .and_then(|versions| versions.last())
+                    .filter(|version| !version.is_deleted())
+                    .and_then(|version| row_key_hash(&version.data, columns))
+                    == Some(hash)
+        });
+        rows.push(row_id);
     }
 
     /// Takes back everything this transaction's commit applied before its
@@ -9235,11 +9271,32 @@ impl TransactionVersionStore {
         if let Some(tracking) = self.tracking.as_deref_mut() {
             tracking.key_changes.clear();
         }
+        // Rows given back an earlier version, whose keys are entered again
+        let mut restored: Vec<i64> = Vec::new();
+        let tracks = self.tracking.is_some();
         if let Some(local_versions) = self.local_versions.as_mut() {
-            local_versions.retain(|_, versions| {
+            local_versions.retain(|row_id, versions| {
+                let before = versions.len();
                 versions.retain(|v| v.create_time <= timestamp);
+                if tracks && versions.len() != before && !versions.is_empty() {
+                    restored.push(row_id);
+                }
                 !versions.is_empty()
             });
+        }
+        if !restored.is_empty() {
+            let indexes: UniqueIndexes = self.unique_indexes().iter().cloned().collect();
+            for row_id in restored {
+                for index in &indexes {
+                    let columns = index.column_ids();
+                    let hash = (self.get_latest_local(row_id))
+                        .filter(|version| !version.is_deleted())
+                        .and_then(|version| row_key_hash(&version.data, columns));
+                    if let Some(hash) = hash {
+                        self.enter_key(columns, hash, row_id);
+                    }
+                }
+            }
         }
         // A layout no surviving row was written under is not the
         // transaction's any more
@@ -9913,6 +9970,39 @@ mod tests {
 
     fn test_schema() -> Schema {
         SchemaBuilder::new("test_table").build()
+    }
+
+    #[test]
+    fn a_key_taken_and_given_up_again_keeps_one_row_entered() {
+        use crate::core::types::DataType;
+        use crate::storage::index::HashIndex;
+        let store = Arc::new(VersionStore::new("t".to_string(), test_schema()));
+        let index = Arc::new(HashIndex::new(
+            "t_u".to_string(),
+            "t".to_string(),
+            vec!["u".to_string()],
+            vec![1],
+            vec![DataType::Integer],
+            true,
+            0,
+        ));
+        store.add_index("t_u".to_string(), index.clone());
+        let mut txn = TransactionVersionStore::new(Arc::clone(&store), 1);
+        txn.track_keys();
+        let key = [Value::from(1i64)];
+        for row_id in 1..=50 {
+            assert_eq!(txn.claim_key(&*index, &key, row_id).unwrap(), None);
+            let row = Row::from(vec![Value::from(row_id), Value::from(1i64)]);
+            txn.put(row_id, row.clone(), false).unwrap();
+            txn.put(row_id, row, true).unwrap();
+        }
+        let tracking = txn.tracking.as_deref().unwrap();
+        let entered: usize = tracking.local_keys[0]
+            .1
+            .values()
+            .map(|rows| rows.len())
+            .sum();
+        assert_eq!(entered, 1, "rows entered for the key");
     }
 
     /// The layout admission sees is the one the transaction's rows are held
