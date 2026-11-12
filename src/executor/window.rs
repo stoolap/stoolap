@@ -3493,6 +3493,9 @@ impl Executor {
             }
             _ => None,
         };
+        // NTH_VALUE's n, kept from the first frame that reads it when it is
+        // one for the statement
+        let mut nth_once: Option<Option<usize>> = None;
 
         for (i, &row_idx) in row_indices.iter().enumerate() {
             // Handle special functions
@@ -3534,17 +3537,29 @@ impl Executor {
                         )?,
                         // NTH_VALUE's n evaluates only for a frame that is not empty
                         "NTH_VALUE" if frame_start >= frame_end => Value::null_unknown(),
-                        "NTH_VALUE" => match count_at(&mut vm, row_idx, 1)? {
-                            Some(n) => Self::compute_nth_value_indexed(
-                                n,
-                                all_rows,
-                                row_indices,
-                                input,
-                                frame_start,
-                                frame_end,
-                            ),
-                            None => Value::null_unknown(),
-                        },
+                        "NTH_VALUE" => {
+                            let n = match nth_once {
+                                Some(n) => n,
+                                None => {
+                                    let n = count_at(&mut vm, row_idx, 1)?;
+                                    if args.count.is_none() {
+                                        nth_once = Some(n);
+                                    }
+                                    n
+                                }
+                            };
+                            match n {
+                                Some(n) => Self::compute_nth_value_indexed(
+                                    n,
+                                    all_rows,
+                                    row_indices,
+                                    input,
+                                    frame_start,
+                                    frame_end,
+                                ),
+                                None => Value::null_unknown(),
+                            }
+                        }
                         _ => unreachable!(),
                     }
                 }

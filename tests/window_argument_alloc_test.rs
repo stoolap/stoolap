@@ -90,3 +90,34 @@ fn a_computed_window_argument_costs_its_compile_alone() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+/// The allocations one warm run of `sql`, prepared, takes over 2000 rows
+/// with `$1` a TEXT vector
+fn vector_run(db: &Database, sql: &str) -> usize {
+    let stmt = db.prepare(sql).unwrap();
+    let run = || stmt.query(("[1.0, 2.0]",)).unwrap().count();
+    assert_eq!(run(), 2_000, "{sql}");
+    let before = ALLOCATIONS.with(Cell::get);
+    run();
+    ALLOCATIONS.with(Cell::get) - before
+}
+
+#[test]
+fn a_constant_nth_value_n_is_read_once_per_partition() {
+    let db = Database::open("memory://window_argument_alloc_nth").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO t SELECT value FROM generate_series(1, 2000)",
+        (),
+    )
+    .unwrap();
+    let computed = "SELECT NTH_VALUE(id, CAST(VEC_DISTANCE_L2($1, $1) AS INTEGER) + 1) \
+                    OVER (ORDER BY id) FROM t";
+    let written = "SELECT NTH_VALUE(id, 1) OVER (ORDER BY id), $1 IS NULL FROM t";
+    let (computed_cost, written_cost) = (vector_run(&db, computed), vector_run(&db, written));
+    assert!(
+        computed_cost < written_cost + 200,
+        "{computed}: {computed_cost}, {written_cost} with n written"
+    );
+}
