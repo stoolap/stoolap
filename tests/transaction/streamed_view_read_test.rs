@@ -23,8 +23,9 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use stoolap::storage::traits::Engine;
 use stoolap::test_failpoints as fp;
-use stoolap::{Database, Error, Rows};
+use stoolap::{Database, Error, IsolationLevel, Rows};
 
 const RANGE: &str = "SELECT id, v FROM t WHERE id > $1 AND id < $2";
 const CHANGES: &[&str] = &[
@@ -134,26 +135,63 @@ fn a_streamed_range_reads_through_its_view_alone() {
     let db = Database::open("memory://streamed_view_read_alone").unwrap();
     fill(&db, false);
     let range = db.prepare(RANGE).unwrap();
-    let active_at_open = || {
-        let (engine, opened) = (Arc::clone(db.engine()), Rc::new(Cell::new(None)));
-        let seen = Rc::clone(&opened);
-        fp::after_select_table_opened(move || seen.set(Some(engine.registry().active_count())));
-        let rows: Vec<(i64, i64)> = range
-            .query((0, 100))
-            .unwrap()
-            .map(|row| pair(row).unwrap())
-            .collect();
-        assert_eq!(rows.len(), BEFORE.len());
-        opened.get()
+    let next_id = || db.engine().begin_transaction().unwrap().id();
+    let begun = || {
+        let before = next_id();
+        let rows = range.query((0, 100)).unwrap().count();
+        assert_eq!(rows, BEFORE.len());
+        next_id() - before - 1
     };
-    let read_committed = active_at_open();
+    let read_committed = begun();
     db.execute("SET isolation_level = 'SNAPSHOT'", ()).unwrap();
-    let snapshot = active_at_open();
+    let snapshot = begun();
     assert_eq!(
         (read_committed, snapshot),
-        (Some(0), Some(1)),
-        "transactions open as the table opens, under read committed and under snapshot"
+        (0, 1),
+        "transactions begun by a read, under read committed and under snapshot"
     );
+}
+
+#[test]
+fn a_reading_statement_counts_as_active_and_none_starts_while_none_is_admitted() {
+    let db = Database::open("memory://streamed_view_read_admitted").unwrap();
+    fill(&db, false);
+    let range = db.prepare(RANGE).unwrap();
+    let (engine, opened) = (Arc::clone(db.engine()), Rc::new(Cell::new(None)));
+    let seen = Rc::clone(&opened);
+    fp::after_select_table_opened(move || seen.set(Some(engine.registry().active_count())));
+    assert_eq!(range.query((0, 100)).unwrap().count(), BEFORE.len());
+    let registry = db.engine().registry();
+    registry.stop_accepting_transactions();
+    let refused = range.query((0, 100)).map(|rows| rows.count());
+    registry.start_accepting_transactions();
+    assert_eq!(
+        (opened.get(), refused.is_err()),
+        (Some(1), true),
+        "active as its table opens, and refused while a restore admits nothing: {refused:?}"
+    );
+}
+
+#[test]
+fn a_read_committed_session_under_a_snapshot_default_reads_sealed_deletes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_file(dir.path());
+    fill(&db, true);
+    db.execute("DELETE FROM t WHERE id IN (2, 5)", ()).unwrap();
+    db.engine()
+        .registry()
+        .set_global_isolation_level(IsolationLevel::SnapshotIsolation);
+    db.execute("SET isolation_level = 'READ COMMITTED'", ())
+        .unwrap();
+    let mut rows: Vec<(i64, i64)> = db
+        .prepare(RANGE)
+        .unwrap()
+        .query((0, 100))
+        .unwrap()
+        .map(|row| pair(row).unwrap())
+        .collect();
+    rows.sort_unstable();
+    assert_eq!(rows, [(1, 10), (3, 30), (4, 40), (6, 60)]);
 }
 
 #[test]

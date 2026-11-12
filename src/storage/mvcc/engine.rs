@@ -10250,7 +10250,10 @@ impl TransactionEngineOperations for EngineOperations {
         let table = open(version_store).with_view(view.clone());
         admit(&table)?;
         mgr.check_schema_generation(schema_generation)?;
+        // A read through a statement view is read committed's, whatever the
+        // engine's default: the view, not a begin point, decides what it sees
         let snapshot_seq = (table_use != TableUse::KeyCheck
+            && view.is_none()
             && self.registry.get_isolation_level(txn_id)
                 == crate::IsolationLevel::SnapshotIsolation)
             .then(|| self.registry.get_transaction_begin_sequence(txn_id) as u64);

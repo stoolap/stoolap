@@ -556,6 +556,8 @@ struct SnapshotState {
     /// The engine a read under the view opens its table on, and the
     /// transaction begins on when one is asked for
     begun_on: Option<Arc<crate::storage::mvcc::engine::MVCCEngine>>,
+    /// Counts the reads without a transaction as one, as long as they last
+    _admitted: Option<crate::storage::mvcc::registry::ReaderAdmission>,
     /// Whether its reads see each commit as it lands (READ COMMITTED with
     /// no statement view), so a result read through it is no older than a
     /// stamp taken before the read
@@ -575,7 +577,14 @@ impl StatementSnapshot {
         isolation: crate::core::IsolationLevel,
         view: Option<StatementView>,
     ) -> Self {
-        Self::with_use(Some(transaction), None, isolation, view, TableUse::Write)
+        Self::with_use(
+            Some(transaction),
+            None,
+            None,
+            isolation,
+            view,
+            TableUse::Write,
+        )
     }
 
     /// The executor's own reads on `engine`: nothing writes through the
@@ -587,14 +596,22 @@ impl StatementSnapshot {
         view: Option<StatementView>,
     ) -> crate::core::Result<Self> {
         use crate::storage::traits::Engine;
-        let transaction = match view {
-            Some(_) => None,
-            None => Some(engine.begin_transaction_with_level(isolation)?),
+        let (transaction, admitted) = match view {
+            Some(_) => {
+                let admitted = engine.registry_ref().admit_reader().ok_or_else(|| {
+                    crate::core::Error::internal(
+                        "transaction registry is not accepting new transactions",
+                    )
+                })?;
+                (None, Some(admitted))
+            }
+            None => (Some(engine.begin_transaction_with_level(isolation)?), None),
         };
         let engine = Some(Arc::clone(engine));
         Ok(Self::with_use(
             transaction,
             engine,
+            admitted,
             isolation,
             view,
             TableUse::Read,
@@ -604,6 +621,7 @@ impl StatementSnapshot {
     fn with_use(
         transaction: Option<Box<dyn crate::storage::traits::Transaction>>,
         begun_on: Option<Arc<crate::storage::mvcc::engine::MVCCEngine>>,
+        admitted: Option<crate::storage::mvcc::registry::ReaderAdmission>,
         isolation: crate::core::IsolationLevel,
         view: Option<StatementView>,
         table_use: TableUse,
@@ -611,6 +629,7 @@ impl StatementSnapshot {
         Self(Arc::new(SnapshotState {
             transaction: parking_lot::Mutex::new(transaction),
             begun_on,
+            _admitted: admitted,
             reads_latest: isolation == crate::core::IsolationLevel::ReadCommitted && view.is_none(),
             view,
             table_use,
