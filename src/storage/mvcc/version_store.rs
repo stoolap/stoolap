@@ -1331,6 +1331,9 @@ pub struct VersionStore {
     pending_cut: Mutex<Option<usize>>,
     /// This store's number, from `NEXT_STORE_ID`
     store_id: u64,
+    /// The creation a transaction made the table with, kept by a restore of
+    /// it; 0 for a table no transaction created
+    creation: AtomicU64,
 }
 
 /// The table instance and row layout a column position was resolved for:
@@ -1501,6 +1504,7 @@ impl VersionStore {
             layout: AtomicU64::new(0),
             pending_cut: Mutex::new(None),
             store_id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
+            creation: AtomicU64::new(0),
         }
     }
 
@@ -1543,6 +1547,7 @@ impl VersionStore {
             layout: AtomicU64::new(0),
             pending_cut: Mutex::new(None),
             store_id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
+            creation: AtomicU64::new(0),
         }
     }
 
@@ -5885,6 +5890,17 @@ impl VersionStore {
     /// Check if the version store is closed
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+
+    /// The creation a transaction made this table with, 0 for none
+    pub(crate) fn creation(&self) -> u64 {
+        self.creation.load(Ordering::Acquire)
+    }
+
+    /// Gives the table the creation a transaction makes it with, before
+    /// the table is published
+    pub(crate) fn set_creation(&self, creation: u64) {
+        self.creation.store(creation, Ordering::Release);
     }
 
     /// Marks the table's volumes incomplete for the rest of the process

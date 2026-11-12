@@ -241,7 +241,7 @@ impl Executor {
         ctx: &ExecutionContext,
         plan: Option<&NestedPlan>,
     ) -> Result<Box<dyn QueryResult>> {
-        let _ddl = self.engine.ddl_guard();
+        let _ddl = self.engine.ddl_statement_guard()?;
         let table_name = &stmt.table_name.value;
 
         // Check if table already exists
@@ -643,7 +643,7 @@ impl Executor {
         stmt: &DropTableStatement,
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        let _ddl = self.engine.ddl_guard();
+        let _ddl = self.engine.ddl_statement_guard()?;
         let table_name = &stmt.table_name.value;
 
         // Check if table exists
@@ -688,7 +688,7 @@ impl Executor {
         stmt: &CreateIndexStatement,
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        let _ddl = self.engine.ddl_guard();
+        let _ddl = self.engine.ddl_statement_guard()?;
         let table_name = &stmt.table_name.value;
         let index_name = &stmt.index_name.value;
 
@@ -943,7 +943,7 @@ impl Executor {
         stmt: &DropIndexStatement,
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        let _ddl = self.engine.ddl_guard();
+        let _ddl = self.engine.ddl_statement_guard()?;
         let index_name = &stmt.index_name.value;
 
         // Get table name if specified
@@ -1050,7 +1050,7 @@ impl Executor {
         // the log replays the changes in the order they were made
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::alter_ddl_guard_next();
-        let _ddl = self.engine.ddl_guard();
+        let _ddl = self.engine.ddl_statement_guard()?;
 
         // Get the table for modifications
         let mut tx = self.begin_transaction()?;
@@ -1400,7 +1400,7 @@ impl Executor {
             }
         }
 
-        let _ddl = self.engine.ddl_guard();
+        let _ddl = self.engine.ddl_statement_guard()?;
 
         // Check if a table with the same name exists
         if self.engine.table_exists(view_name)? {
@@ -1420,7 +1420,7 @@ impl Executor {
         stmt: &DropViewStatement,
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        let _ddl = self.engine.ddl_guard();
+        let _ddl = self.engine.ddl_statement_guard()?;
         let view_name = &stmt.view_name.value;
 
         // Drop the view (engine handles if_exists logic)

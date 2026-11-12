@@ -896,8 +896,9 @@ type FkReverseCache = (u64, StringMap<Arc<Vec<(String, ForeignKeyConstraint)>>>)
 /// What a DDL change shares with the transactions that can make one
 struct DdlShared {
     /// Held across a DDL statement's schema change and its WAL record, so
-    /// the log replays in the order the changes were applied
-    serial: parking_lot::Mutex<()>,
+    /// the log replays in the order the changes were applied; the thread
+    /// holding it takes it again for an undo, never for a DDL statement
+    serial: parking_lot::ReentrantMutex<()>,
     /// Schema epoch counter - increments on any CREATE/ALTER/DROP TABLE
     /// Used for fast cache invalidation without HashMap lookup
     schema_epoch: AtomicU64,
@@ -913,6 +914,18 @@ struct DdlShared {
 }
 
 impl DdlShared {
+    /// The DDL guard, waited for while another thread holds it
+    fn guard(&self) -> parking_lot::ReentrantMutexGuard<'_, ()> {
+        #[cfg(feature = "test-failpoints")]
+        {
+            if let Some(guard) = self.serial.try_lock() {
+                return guard;
+            }
+            crate::test_failpoints::ddl_guard_waiting();
+        }
+        self.serial.lock()
+    }
+
     /// An error when `store`'s table has a column of the row identity's
     /// name, as only an older build let one: it serves DDL alone
     #[inline]
@@ -1296,7 +1309,7 @@ impl MVCCEngine {
             loading_from_disk: Arc::new(AtomicBool::new(false)),
             file_lock: Mutex::new(None),
             ddl: Arc::new(DdlShared {
-                serial: parking_lot::Mutex::new(()),
+                serial: parking_lot::ReentrantMutex::new(()),
                 schema_epoch: AtomicU64::new(0),
                 name_epochs: parking_lot::RwLock::new(FxHashMap::default()),
                 name_floor: AtomicU64::new(0),
@@ -4824,8 +4837,20 @@ impl MVCCEngine {
     /// Serializes a DDL statement's schema change with its WAL record
     /// against other DDL and against a checkpoint's re-recording of the
     /// catalog, so replay applies the changes in the order they were made
-    pub fn ddl_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
-        self.ddl.serial.lock()
+    pub fn ddl_guard(&self) -> parking_lot::ReentrantMutexGuard<'_, ()> {
+        self.ddl.guard()
+    }
+
+    /// The DDL guard for a DDL statement, refused on a thread that holds it:
+    /// a function a DDL statement calls runs no DDL statement of its own,
+    /// which would land between that statement's checks and its change
+    pub fn ddl_statement_guard(&self) -> Result<parking_lot::ReentrantMutexGuard<'_, ()>> {
+        if self.ddl.serial.is_owned_by_current_thread() {
+            return Err(Error::NotSupported(
+                "a DDL statement inside a function another DDL statement calls".to_string(),
+            ));
+        }
+        Ok(self.ddl.guard())
     }
 
     /// After an index of `table_name` is dropped: the side file of every
@@ -9824,11 +9849,79 @@ struct EngineOperations {
     holding_keys: AtomicBool,
     /// Whether `creating_txns` has an entry, so an end without one skips its lock
     creating: AtomicBool,
+    /// The next creation `new_creation` hands out; 0 stands for none
+    next_creation: AtomicU64,
 }
 
 // EngineOperations is Send + Sync because all fields are Arc-wrapped thread-safe types
 
 impl EngineOperations {
+    /// Drops the table named `name`; with `creation`, only the table made
+    /// with it, false when the name holds another table now
+    fn drop_table_of(&self, name: &str, creation: Option<u64>) -> Result<bool> {
+        let table_name_lower = name.to_lowercase();
+        // A view taken before the rows go, or while they go, is overtaken
+        let _destruction = self.registry.begin_destruction();
+
+        // Remove schema and clean up FK references in child tables
+        let mut neighbors = {
+            let mut schemas = self.schemas().write().unwrap();
+            if let Some(creation) = creation {
+                let made = self.version_stores().read().unwrap();
+                if made.get(&table_name_lower).map(|s| s.creation()) != Some(creation) {
+                    return Ok(false);
+                }
+            }
+            let Some(removed) = schemas.remove(&table_name_lower) else {
+                return Err(Error::TableNotFound(table_name_lower.to_string()));
+            };
+            let neighbors = fk_neighbors(&schemas, Some(&removed), &table_name_lower);
+            let version_stores = self.version_stores().read().unwrap();
+            strip_fk_references(&mut schemas, &version_stores, &table_name_lower);
+            neighbors
+        };
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::table_unlisted();
+        // Close and remove version store
+        {
+            let mut stores = self.version_stores().write().unwrap();
+            if let Some(store) = stores.remove(&table_name_lower) {
+                store.close();
+            }
+        }
+
+        // Record DDL to WAL so the drop survives crash recovery
+        if !self.should_skip_wal() {
+            if let Some(ref pm) = *self.persistence() {
+                if pm.is_enabled() {
+                    pm.record_ddl_operation(name, WALOperationType::DropTable, &[])?;
+                }
+            }
+        }
+
+        // Clear in-memory segment state (prevents phantom rows on re-create)
+        let mgr = self
+            .segment_managers
+            .read()
+            .unwrap()
+            .get(&table_name_lower)
+            .cloned();
+        if let Some(mgr) = &mgr {
+            mgr.clear();
+            mgr.persist()?;
+        }
+        self.segment_managers
+            .write()
+            .unwrap()
+            .remove(&table_name_lower);
+        remove_dropped_table_files(self.persistence(), &table_name_lower, mgr.as_deref())?;
+
+        neighbors.push(table_name_lower);
+        self.ddl
+            .changed(&neighbors.iter().map(String::as_str).collect::<Vec<_>>());
+        Ok(true)
+    }
+
     /// Lets the rows and claims of stores a handle handed out may hold past
     /// the transaction's end go now, once its statements are done
     fn discard_stores(tables: &[TxnTableEntry]) {
@@ -9869,6 +9962,7 @@ impl EngineOperations {
             key_holders: parking_lot::Mutex::new(crate::common::new_i64_map()),
             holding_keys: AtomicBool::new(false),
             creating: AtomicBool::new(false),
+            next_creation: AtomicU64::new(1),
         }
     }
 
@@ -10315,10 +10409,12 @@ impl TransactionEngineOperations for EngineOperations {
         schema: Schema,
         indexes: &[NewIndex],
         txn_id: i64,
+        creation: u64,
     ) -> Result<Box<dyn Table>> {
         let table_name = name.to_lowercase();
 
         let version_store = new_table_store(&schema, &self.registry, indexes)?;
+        version_store.set_creation(creation);
         let schema_data = MVCCEngine::serialize_schema(&schema);
 
         // Atomically check-and-insert under write lock to prevent TOCTOU race
@@ -10355,59 +10451,42 @@ impl TransactionEngineOperations for EngineOperations {
     }
 
     fn drop_table(&self, name: &str) -> Result<()> {
-        let table_name_lower = name.to_lowercase();
-        // A view taken before the rows go, or while they go, is overtaken
-        let _destruction = self.registry.begin_destruction();
+        self.drop_table_of(name, None).map(|_| ())
+    }
 
-        // Remove schema and clean up FK references in child tables
-        let mut neighbors = {
-            let mut schemas = self.schemas().write().unwrap();
-            let Some(removed) = schemas.remove(&table_name_lower) else {
-                return Err(Error::TableNotFound(table_name_lower.to_string()));
-            };
-            let neighbors = fk_neighbors(&schemas, Some(&removed), &table_name_lower);
-            let version_stores = self.version_stores().read().unwrap();
-            strip_fk_references(&mut schemas, &version_stores, &table_name_lower);
-            neighbors
-        };
-        // Close and remove version store
-        {
-            let mut stores = self.version_stores().write().unwrap();
-            if let Some(store) = stores.remove(&table_name_lower) {
-                store.close();
-            }
-        }
+    fn new_creation(&self) -> u64 {
+        self.next_creation.fetch_add(1, Ordering::Relaxed)
+    }
 
-        // Record DDL to WAL so the drop survives crash recovery
-        if !self.should_skip_wal() {
-            if let Some(ref pm) = *self.persistence() {
-                if pm.is_enabled() {
-                    pm.record_ddl_operation(name, WALOperationType::DropTable, &[])?;
-                }
-            }
-        }
-
-        // Clear in-memory segment state (prevents phantom rows on re-create)
-        let mgr = self
-            .segment_managers
+    fn table_creation(&self, name: &str) -> u64 {
+        self.version_stores()
             .read()
             .unwrap()
-            .get(&table_name_lower)
-            .cloned();
-        if let Some(mgr) = &mgr {
-            mgr.clear();
-            mgr.persist()?;
-        }
-        self.segment_managers
-            .write()
-            .unwrap()
-            .remove(&table_name_lower);
-        remove_dropped_table_files(self.persistence(), &table_name_lower, mgr.as_deref())?;
+            .get(&*to_lowercase_cow(name))
+            .map_or(0, |store| store.creation())
+    }
 
-        neighbors.push(table_name_lower);
-        self.ddl
-            .changed(&neighbors.iter().map(String::as_str).collect::<Vec<_>>());
-        Ok(())
+    fn drop_created(&self, creation: u64) -> Result<()> {
+        loop {
+            let name = self
+                .version_stores()
+                .read()
+                .unwrap()
+                .iter()
+                .find(|(_, store)| store.creation() == creation)
+                .map(|(name, _)| name.clone());
+            let Some(name) = name else {
+                return Ok(());
+            };
+            // A rename between the search and the drop searches again
+            if self.drop_table_of(&name, Some(creation))? {
+                return Ok(());
+            }
+        }
+    }
+
+    fn ddl_guard(&self) -> parking_lot::ReentrantMutexGuard<'_, ()> {
+        self.ddl.guard()
     }
 
     fn list_tables(&self) -> Result<Vec<String>> {
@@ -11061,7 +11140,7 @@ impl TransactionEngineOperations for EngineOperations {
     }
 
     fn change_column_type(&self, change: &ColumnTypeChange<'_>) -> Result<()> {
-        let _ddl = self.ddl.serial.lock();
+        let _ddl = self.ddl.guard();
         retype::change_column_type(
             &retype::Shared {
                 version_stores: &self.version_stores,

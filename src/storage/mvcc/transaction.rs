@@ -34,12 +34,15 @@ use crate::storage::Expression;
 /// A table change of the transaction; the changes are undone in reverse order
 #[derive(Debug, Clone)]
 enum TableChange {
-    Created(String),
-    /// A dropped table's name and schema, and whether this transaction
-    /// created it, so a restore is logged with the creating record
+    /// The creation of a table, found by it whatever its name
+    Created(u64),
+    /// A dropped table's name, schema and creation, which a restore gives
+    /// back, and whether this transaction created it, so a restore is logged
+    /// with the creating record
     Dropped {
         name: String,
         schema: Box<Schema>,
+        creation: u64,
         created_here: bool,
     },
 }
@@ -128,17 +131,32 @@ pub trait TransactionEngineOperations: Send + Sync {
 
     /// Create a new table with `indexes`, reachable only once they are built,
     /// its WAL record committed with transaction `txn_id` or, under
-    /// DDL_TXN_ID, on its own
+    /// DDL_TXN_ID, on its own; `creation` is the table's creation, 0 for none
     fn create_table(
         &self,
         name: &str,
         schema: Schema,
         indexes: &[NewIndex],
         txn_id: i64,
+        creation: u64,
     ) -> Result<Box<dyn Table>>;
 
     /// Drop a table
     fn drop_table(&self, name: &str) -> Result<()>;
+
+    /// A creation no table has yet, for a table a transaction creates
+    fn new_creation(&self) -> u64;
+
+    /// The creation of the table named `name`, 0 for none or no table
+    fn table_creation(&self, name: &str) -> u64;
+
+    /// Drops the table made with `creation`, under whatever name it has
+    /// now; none left is not an error
+    fn drop_created(&self, creation: u64) -> Result<()>;
+
+    /// The guard a DDL statement holds, so an undo of table changes runs
+    /// as one: no other DDL lands between its catalog, store and log steps
+    fn ddl_guard(&self) -> parking_lot::ReentrantMutexGuard<'_, ()>;
 
     /// List all tables
     fn list_tables(&self) -> Result<Vec<String>>;
@@ -456,16 +474,19 @@ impl MvccTransaction {
         changes: &[TableChange],
     ) -> Result<()> {
         let mut first_error = None;
+        // Only with changes, so a rollback of rows alone takes no lock
+        let _ddl = (!changes.is_empty()).then(|| ops.ddl_guard());
         for change in changes.iter().rev() {
             let undone = match change {
-                TableChange::Created(name) => ops.drop_table(name),
+                TableChange::Created(creation) => ops.drop_created(*creation),
                 TableChange::Dropped {
                     name,
                     schema,
+                    creation,
                     created_here,
                 } => {
                     let logged_as = if *created_here { txn_id } else { DDL_TXN_ID };
-                    ops.create_table(name, Schema::clone(schema), &[], logged_as)
+                    ops.create_table(name, Schema::clone(schema), &[], logged_as, *creation)
                         .map(|_| ())
                 }
             };
@@ -476,15 +497,15 @@ impl MvccTransaction {
         first_error.map_or(Ok(()), Err)
     }
 
-    /// The undo of a transaction dropped while active, which has no caller
-    /// to hand an error to
-    fn undo_dropped_transaction(
+    /// The undo of a transaction whose caller gets no undo error: dropped
+    /// while active, or failed in its commit with an error of its own
+    fn undo_unreported(
         ops: &dyn TransactionEngineOperations,
         txn_id: i64,
         changes: &[TableChange],
     ) {
         if let Err(e) = Self::undo_table_changes(ops, txn_id, changes) {
-            eprintln!("Warning: a dropped transaction's table changes were not all undone: {e}");
+            eprintln!("Warning: a transaction's table changes were not all undone: {e}");
         }
         ops.end_table_creates(txn_id);
     }
@@ -668,6 +689,9 @@ impl Transaction for MvccTransaction {
                     self.registry.abort_transaction(self.id);
                     ops.rollback_all_tables(self.id, self.handed_out());
                     self.state = TransactionState::RolledBack;
+                    // Its table changes go as a rollback's do, outside the fence
+                    drop((publish, _seal_guard));
+                    Self::undo_unreported(ops.as_ref(), self.id, &self.table_changes);
                     self.cleanup();
                     return Err(e);
                 }
@@ -698,6 +722,9 @@ impl Transaction for MvccTransaction {
                         ops.finish_all_tables(self.id);
                     }
                     self.state = TransactionState::RolledBack;
+                    // Its table changes go as a rollback's do, outside the fence
+                    drop((publish, _seal_guard));
+                    Self::undo_unreported(ops.as_ref(), self.id, &self.table_changes);
                     self.cleanup();
                     return Err(e);
                 }
@@ -832,11 +859,9 @@ impl Transaction for MvccTransaction {
         super::engine::check_new_table(&schema)?;
 
         let ops = self.get_engine_ops()?;
-        let table = ops.create_table(name, schema, indexes, self.id)?;
-
-        // Track for rollback - store the table name
-        self.table_changes
-            .push(TableChange::Created(name.to_lowercase()));
+        let creation = ops.new_creation();
+        let table = ops.create_table(name, schema, indexes, self.id, creation)?;
+        self.table_changes.push(TableChange::Created(creation));
 
         Ok(table)
     }
@@ -863,6 +888,7 @@ impl Transaction for MvccTransaction {
         };
 
         let ops = self.get_engine_ops()?;
+        let creation = ops.table_creation(name);
         let dropped = ops.drop_table(name);
         let name_lower = name.to_lowercase();
         // A drop that fails after the catalog lets go of the table still dropped it
@@ -875,18 +901,15 @@ impl Transaction for MvccTransaction {
         }
 
         // Save schema for potential rollback (note: data cannot be recovered)
-        let created_here = self
-            .table_changes
-            .iter()
-            .rev()
-            .find_map(|change| match change {
-                TableChange::Created(created) => (*created == name_lower).then_some(true),
-                TableChange::Dropped { name, .. } => (*name == name_lower).then_some(false),
-            })
-            == Some(true);
+        let created_here = creation != 0
+            && self
+                .table_changes
+                .iter()
+                .any(|change| matches!(change, TableChange::Created(c) if *c == creation));
         self.table_changes.push(TableChange::Dropped {
             name: name_lower,
             schema: Box::new(schema),
+            creation,
             created_here,
         });
 
@@ -1142,12 +1165,12 @@ impl Drop for MvccTransaction {
                     let (ops, id) = (Arc::clone(ops), self.id);
                     let changes = std::mem::take(&mut self.table_changes);
                     gate.finish_after_statements(Box::new(move || {
-                        Self::undo_dropped_transaction(ops.as_ref(), id, &changes);
+                        Self::undo_unreported(ops.as_ref(), id, &changes);
                         ops.rollback_all_tables(id, true);
                         ops.release_keys(id);
                     }));
                 } else {
-                    Self::undo_dropped_transaction(ops.as_ref(), self.id, &self.table_changes);
+                    Self::undo_unreported(ops.as_ref(), self.id, &self.table_changes);
 
                     // Clean up txn_version_stores to prevent memory leak
                     // This is critical for read-only transactions that call get_table()
