@@ -13148,12 +13148,14 @@ impl Executor {
                 }
         };
         // The blocks open before the statement's first write and read the
-        // transaction's rows as they stood then
+        // transaction's rows as they stood then; a read inside a block keeps its cut
+        let cut = match ctx.table_use() {
+            TableUse::ReadAsFound(cut) => cut,
+            _ => crate::storage::mvcc::last_write_order(),
+        };
         let inner_ctx = ctx
             .with_incremented_query_depth()
-            .with_table_use(TableUse::ReadAsFound(
-                crate::storage::mvcc::last_write_order(),
-            ));
+            .with_table_use(TableUse::ReadAsFound(cut));
         // A column change between taking the plan and opening a block's
         // table prepares again, against the table as it now is
         let mut fresh = false;

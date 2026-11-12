@@ -166,7 +166,7 @@ const CASES: &[Case] = &[
     },
     Case {
         sql: "DELETE FROM p WHERE id = 1 RETURNING \
-              (SELECT COUNT(*) FROM cd WHERE cd.pd = p.id LIMIT (SELECT COUNT(*) FROM cd))",
+              (SELECT COUNT(*) FROM cd WHERE cd.pd = p.id LIMIT (SELECT COUNT(*) FROM cd WHERE pd = 1))",
         params: &[],
         returned: &[&[2]],
         after: &[("SELECT COUNT(*) FROM cd", 1)],
