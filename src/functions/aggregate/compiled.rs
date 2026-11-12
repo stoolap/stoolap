@@ -332,6 +332,21 @@ impl CompiledAggregate {
         }
     }
 
+    /// Accumulates a value with the later arguments its row reads, and the
+    /// call's ORDER BY keys for it when it orders its input
+    #[inline]
+    pub fn accumulate_with_args(
+        &mut self,
+        value: &Value,
+        args: &[Value],
+        sort_keys: Option<Vec<Value>>,
+    ) {
+        match self {
+            CompiledAggregate::Dynamic(state) => state.accumulate_with_args(value, args, sort_keys),
+            other => other.accumulate(value),
+        }
+    }
+
     /// Accumulate a value into the aggregate
     ///
     /// This is the hot path - all code here should be as fast as possible.

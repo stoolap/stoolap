@@ -663,6 +663,9 @@ pub struct SqlAggregateFunction {
     /// The extra arguments as written when one is not a literal, which a
     /// subquery block evaluates for each call; None otherwise
     pub(crate) extra_exprs: Option<Box<[Expression]>>,
+    /// The extra arguments when one of them is not one value for the call,
+    /// all then read for each row as the first is
+    pub(crate) row_args: Option<Box<[Expression]>>,
     /// The expression to evaluate for each row (for SUM(val * 2), AVG(a + b), etc.)
     /// If None, use column directly; if Some, evaluate expression first
     pub expression: Option<Expression>,
@@ -692,7 +695,9 @@ impl SqlAggregateFunction {
         if self.expression.is_some() {
             modifiers = modifiers.and(Modifiers::EXPRESSION);
         }
-        if self.extra_written {
+        if self.row_args.is_some() {
+            modifiers = modifiers.and(Modifiers::ROW_ARGS);
+        } else if self.extra_written {
             modifiers = modifiers.and(Modifiers::EXTRA_ARGS);
         }
         modifiers
@@ -819,6 +824,8 @@ impl Modifiers {
     pub(crate) const EXPRESSION: Modifiers = Modifiers(1 << 3);
     /// Arguments after the first, such as a separator
     pub(crate) const EXTRA_ARGS: Modifiers = Modifiers(1 << 4);
+    /// Arguments after the first read for each row
+    pub(crate) const ROW_ARGS: Modifiers = Modifiers(1 << 5);
 
     pub(crate) const fn and(self, other: Modifiers) -> Modifiers {
         Modifiers(self.0 | other.0)
@@ -832,6 +839,9 @@ impl Modifiers {
 
 /// An aggregate call's extra argument values and the error one of them gave
 pub(crate) type ExtraArgs = (Vec<Value>, Option<crate::core::Error>);
+
+/// An aggregate call's extra arguments when they are read for each row
+type RowArgs = Option<Box<[Expression]>>;
 
 /// What a parse of aggregate calls does with their extra arguments
 #[derive(Clone, Copy)]
@@ -888,7 +898,6 @@ pub(crate) fn aggregate_extra_args(
         let value = match literal_extra_arg(arg) {
             Some(value) => value,
             None => {
-                extra_arg_constant(arg, blocks)?;
                 let compiled;
                 let program = match held.and_then(|held| held.get(at)) {
                     Some(held) => super::expression::held_once(held, arg, blocks.is_some())?,
@@ -950,26 +959,32 @@ fn written_extra_args(args: &[Expression]) -> Option<Box<[Expression]>> {
     (!extra.iter().all(is_literal_extra_arg)).then(|| extra.into())
 }
 
-/// An error unless `arg`, an aggregate argument after the first, is one
-/// value for the call: it reads no row the aggregate reads, a block in it
-/// answered by `blocks`
-fn extra_arg_constant(arg: &Expression, blocks: Option<&dyn SubqueryExecutor>) -> Result<()> {
+/// The arguments after the first of a call to `args` when one of them is
+/// not one value for the call: it reads a row the aggregate reads or draws
+/// a value per call, a block in it answered by `blocks`
+pub(crate) fn row_args(
+    args: &[Expression],
+    blocks: Option<&dyn SubqueryExecutor>,
+) -> Option<Box<[Expression]>> {
+    let later = args.get(1..)?;
     let reads_parent = |id| blocks.is_none_or(|blocks| blocks.reads_parent(id));
-    super::volatility::read_once(
-        arg,
-        crate::functions::registry::global_registry(),
-        super::volatility::AGGREGATE_ARGUMENT,
-        (true, &reads_parent),
-    )
+    let registry = crate::functions::registry::global_registry();
+    let once = |arg: &Expression| {
+        is_literal_extra_arg(arg)
+            || super::volatility::statement_constant_in(arg, registry, (true, &reads_parent))
+    };
+    (!later.iter().all(once)).then(|| later.into())
 }
 
 /// What one aggregate call reads from each input row, compiled once: the
-/// FILTER that decides whether the row counts, the argument expression, and
-/// the keys of the call's own ORDER BY
+/// FILTER that decides whether the row counts, the argument expression, the
+/// arguments after the first when read for each row, and the keys of the
+/// call's own ORDER BY
 #[derive(Clone, Debug)]
 pub(crate) struct CallInputs {
     filter: Option<super::expression::SharedProgram>,
     argument: Option<super::expression::SharedProgram>,
+    args: Vec<super::expression::SharedProgram>,
     order: Vec<super::expression::SharedProgram>,
 }
 
@@ -985,6 +1000,9 @@ impl CallInputs {
                 Ok(CallInputs {
                     filter: agg.filter.as_ref().map(&compile).transpose()?,
                     argument: agg.expression.as_ref().map(&compile).transpose()?,
+                    args: (agg.row_args.iter().flatten())
+                        .map(&compile)
+                        .collect::<Result<_>>()?,
                     order: agg
                         .order_by
                         .iter()
@@ -1007,7 +1025,8 @@ impl CallInputs {
         row: &super::expression::ExecuteContext<'_>,
         agg: &SqlAggregateFunction,
     ) -> Result<()> {
-        if self.filter.is_none() && self.argument.is_none() && self.order.is_empty() {
+        let programs = self.filter.is_some() || self.argument.is_some();
+        if !programs && self.args.is_empty() && self.order.is_empty() {
             if let Some(value) = column {
                 state.accumulate(value);
             }
@@ -1016,7 +1035,8 @@ impl CallInputs {
         self.feed_programs(state, column, vm, row, agg)
     }
 
-    /// `feed` for a call with a FILTER, an argument expression or ORDER BY
+    /// `feed` for a call with a FILTER, an argument expression, arguments
+    /// read for each row or ORDER BY
     fn feed_programs(
         &self,
         state: &mut CompiledAggregate,
@@ -1048,6 +1068,9 @@ impl CallInputs {
                 None => return Ok(()),
             },
         };
+        if !self.args.is_empty() {
+            return self.feed_args(state, value, vm.get_or_insert_with(ExprVM::new), row);
+        }
         if !self.order.is_empty() && state.supports_order_by() {
             let vm = vm.get_or_insert_with(ExprVM::new);
             let mut keys = Vec::with_capacity(self.order.len());
@@ -1058,6 +1081,33 @@ impl CallInputs {
         } else {
             state.accumulate(value);
         }
+        Ok(())
+    }
+
+    /// `feed_programs` for a call that reads its later arguments for each row
+    #[inline(never)]
+    fn feed_args(
+        &self,
+        state: &mut CompiledAggregate,
+        value: &Value,
+        vm: &mut ExprVM,
+        row: &super::expression::ExecuteContext<'_>,
+    ) -> Result<()> {
+        let mut args = smallvec::SmallVec::<[Value; 1]>::new();
+        for program in &self.args {
+            args.push(vm.execute(program, row)?);
+        }
+        let keys = match !self.order.is_empty() && state.supports_order_by() {
+            true => {
+                let mut keys = Vec::with_capacity(self.order.len());
+                for program in &self.order {
+                    keys.push(vm.execute(program, row)?);
+                }
+                Some(keys)
+            }
+            false => None,
+        };
+        state.accumulate_with_args(value, &args, keys);
         Ok(())
     }
 }
@@ -2778,7 +2828,7 @@ impl Executor {
                         }
                     }
 
-                    let (column, distinct, (extra_args, extra_error), expression) =
+                    let (column, distinct, (extra_args, extra_error), expression, row_args) =
                         self.extract_agg_column(&func.arguments, ctx)?;
                     let column_lower = column.to_lowercase();
                     aggregations.push(SqlAggregateFunction {
@@ -2791,7 +2841,8 @@ impl Executor {
                         extra_args,
                         extra_written: func.arguments.len() > 1,
                         extra_error,
-                        extra_exprs: ctx.written(&func.arguments),
+                        extra_exprs: ctx.written(&func.arguments).filter(|_| row_args.is_none()),
+                        row_args,
                         expression,
                         order_by: func.order_by.clone(),
                         filter: func.filter.as_ref().map(|f| (**f).clone()),
@@ -2945,7 +2996,7 @@ impl Executor {
                         }
                     }
 
-                    let (column, distinct, (extra_args, extra_error), expression) =
+                    let (column, distinct, (extra_args, extra_error), expression, row_args) =
                         self.extract_agg_column(&func.arguments, ctx)?;
                     let column_lower = column.to_lowercase();
                     aggregations.push(SqlAggregateFunction {
@@ -2958,7 +3009,8 @@ impl Executor {
                         extra_args,
                         extra_written: func.arguments.len() > 1,
                         extra_error,
-                        extra_exprs: ctx.written(&func.arguments),
+                        extra_exprs: ctx.written(&func.arguments).filter(|_| row_args.is_none()),
+                        row_args,
                         expression,
                         order_by: func.order_by.clone(),
                         filter: func.filter.as_ref().map(|f| (**f).clone()),
@@ -2993,13 +3045,14 @@ impl Executor {
     /// - extra_args: Additional arguments (e.g., separator for STRING_AGG) and
     ///   the error one gave, see [`aggregate_extra_args`]
     /// - expression: The expression to evaluate (Some for complex expressions like val * 2)
+    /// - row_args: The extra arguments when they are read for each row, see [`row_args`]
     fn extract_agg_column(
         &self,
         args: &[Expression],
         ctx: ExtraArgsRead<'_>,
-    ) -> Result<(String, bool, ExtraArgs, Option<Expression>)> {
+    ) -> Result<(String, bool, ExtraArgs, Option<Expression>, RowArgs)> {
         if args.is_empty() {
-            return Ok(("*".to_string(), false, (Vec::new(), None), None));
+            return Ok(("*".to_string(), false, (Vec::new(), None), None, None));
         }
 
         let (column, distinct, expression) = match &args[0] {
@@ -3019,24 +3072,24 @@ impl Executor {
         };
 
         let later = args.get(1..).unwrap_or_default();
+        let blocks = match ctx {
+            ExtraArgsRead::With(_, blocks) => blocks,
+            _ => None,
+        };
+        let row_args = row_args(args, blocks);
         let extra = match ctx {
+            _ if row_args.is_some() => (Vec::new(), None),
             ExtraArgsRead::With(ctx, blocks) => aggregate_extra_args(later, ctx, blocks, None)?,
             // A call that reads one of them for each run keeps them all written
-            ExtraArgsRead::Block if written_extra_args(args).is_some() => {
-                for arg in args.iter().skip(1) {
-                    if !is_literal_extra_arg(arg) {
-                        extra_arg_constant(arg, None)?;
-                    }
-                }
+            ExtraArgsRead::Block | ExtraArgsRead::Held if written_extra_args(args).is_some() => {
                 (Vec::new(), None)
             }
-            ExtraArgsRead::Held if written_extra_args(args).is_some() => (Vec::new(), None),
             ExtraArgsRead::Block | ExtraArgsRead::Held => {
                 aggregate_extra_args(later, None, None, None)?
             }
             ExtraArgsRead::Unread => (Vec::new(), None),
         };
-        Ok((column, distinct, extra, expression))
+        Ok((column, distinct, extra, expression, row_args))
     }
 
     /// Parse GROUP BY clause

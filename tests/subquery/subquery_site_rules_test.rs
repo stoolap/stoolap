@@ -249,10 +249,8 @@ fn test_window_control_argument_reading_the_row() {
     let db = setup("site_window_control");
     let sql = "SELECT id, NTILE((SELECT MAX(x) FROM u WHERE u.x = t.a)) OVER (ORDER BY id) FROM t ORDER BY id";
     let got = rows(&db, sql);
-    assert!(
-        matches!(&got, Err(e) if e.contains("the bucket count of NTILE must not read the row")),
-        "{sql} answered {got:?}"
-    );
+    let want: Vec<Vec<String>> = (1..=6).map(|id| vec![id.to_string(), "1".into()]).collect();
+    assert_eq!(got, Ok(want), "{sql}");
 }
 
 #[test]

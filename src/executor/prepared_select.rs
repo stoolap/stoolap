@@ -89,7 +89,7 @@ use super::utils::{
     strip_table_qualifier, value_to_expression, visit_column_refs, visit_column_refs_outside,
     where_without_aggregates, QUALIFIER_SEP,
 };
-use super::volatility::{expression_volatility, read_once_argument, statement_draws_per_call};
+use super::volatility::{expression_volatility, statement_draws_per_call};
 use super::window::{
     HeldWindow, WindowOutput, WindowPreGroupedState, WindowPreSortedState, WindowRows,
 };
@@ -425,21 +425,10 @@ impl<'a> Family<'a> {
                     Site::GroupedList => Site::GroupedOutput,
                     _ => return Err("a window function outside the SELECT list"),
                 };
-                // An argument the call reads once runs a subquery once
                 let call = &window.function;
-                for (i, arg) in call.arguments.iter().enumerate() {
-                    let at = match read_once_argument(&call.function, i, true) {
-                        Some(_) => Site::Subqueries,
-                        None => inner,
-                    };
-                    if !matches!(arg, Expression::Star(_)) {
-                        self.expression(arg, scopes, at, found)?;
-                    }
-                }
-                let read = call
-                    .filter
-                    .as_deref()
-                    .into_iter()
+                let read = (call.arguments.iter())
+                    .filter(|arg| !matches!(arg, Expression::Star(_)))
+                    .chain(call.filter.as_deref())
                     .chain(call.order_by.iter().map(|o| &o.expression));
                 for expr in read {
                     self.expression(expr, scopes, inner, found)?;

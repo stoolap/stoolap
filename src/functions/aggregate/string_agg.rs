@@ -14,11 +14,21 @@
 
 //! STRING_AGG aggregate function
 
+use std::borrow::Cow;
+
 use crate::core::{Result, Value};
-use crate::functions::scalar::value_to_string;
 use crate::functions::{
     AggregateFunction, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType,
 };
+
+/// A row's separator as its text, read as CONCAT_WS reads its own; None
+/// for a NULL one
+fn separator_text(separator: &Value) -> Option<Cow<'_, str>> {
+    match separator.text_form() {
+        None if separator.is_null() => None,
+        text => Some(text.unwrap_or_default()),
+    }
+}
 
 /// Entry for ordered aggregation - stores value with its sort keys
 #[derive(Clone)]
@@ -27,33 +37,81 @@ struct OrderedEntry {
     sort_keys: Vec<Value>,
 }
 
+/// Appends `value` to `out`, after `separator` unless it is the first value
+/// or the separator is NULL
+fn join(out: &mut Option<String>, value: &str, separator: Option<&str>) {
+    match out {
+        None => *out = Some(value.to_owned()),
+        Some(out) => {
+            out.push_str(separator.unwrap_or_default());
+            out.push_str(value);
+        }
+    }
+}
+
 /// STRING_AGG aggregate function
 ///
-/// Concatenates all non-NULL string values with a configurable separator.
-/// Similar to GROUP_CONCAT in MySQL or STRING_AGG in PostgreSQL.
+/// Concatenates all non-NULL string values, each after the first preceded
+/// by the separator its row reads, nothing for a NULL one.
 ///
 /// Usage:
 ///   STRING_AGG(column)           -- Uses comma as default separator
 ///   STRING_AGG(column, ' | ')    -- Uses custom separator
 ///   STRING_AGG(column ORDER BY x) -- With ordering
 pub struct StringAggFunction {
-    values: Vec<String>,
+    /// The values joined so far in arrival order, when none is sorted
+    joined: Option<String>,
     /// Values with sort keys (used when ORDER BY is specified)
     ordered_entries: Vec<OrderedEntry>,
+    /// Each entry's own separator, by position, when its row reads one
+    row_separators: Vec<Value>,
     /// Sort directions: true = ASC, false = DESC
     order_keys: Vec<crate::functions::AggregateOrder>,
     /// Whether ORDER BY is active
     has_order_by: bool,
-    /// Separator between values (default: ","); None for a NULL one, which
-    /// makes the result NULL as CONCAT_WS does
+    /// The call's separator (default: ","), None for a NULL one
     separator: Option<String>,
+}
+
+impl StringAggFunction {
+    /// Takes `value` with its row's separator `row`, the call's without
+    /// one, and its sort keys
+    #[inline(always)]
+    fn push(&mut self, value: &Value, row: Option<&Value>, sort_keys: Option<Vec<Value>>) {
+        // STRING_AGG ignores NULLs; a value is joined as its text form
+        let Some(value) = value.text_form() else {
+            return;
+        };
+        match (sort_keys, row) {
+            (Some(sort_keys), row) => {
+                if let Some(row) = row {
+                    self.row_separators.push(row.clone());
+                }
+                self.ordered_entries.push(OrderedEntry {
+                    value: value.into_owned(),
+                    sort_keys,
+                });
+            }
+            (None, None) => join(&mut self.joined, &value, self.separator.as_deref()),
+            (None, Some(row)) => join(&mut self.joined, &value, separator_text(row).as_deref()),
+        }
+    }
+
+    /// The separator of the entry at `at`
+    fn separator_of(&self, at: usize) -> Option<Cow<'_, str>> {
+        match self.row_separators.get(at) {
+            Some(separator) => separator_text(separator),
+            None => self.separator.as_deref().map(Cow::Borrowed),
+        }
+    }
 }
 
 impl Default for StringAggFunction {
     fn default() -> Self {
         Self {
-            values: Vec::new(),
+            joined: None,
             ordered_entries: Vec::new(),
+            row_separators: Vec::new(),
             order_keys: Vec::new(),
             has_order_by: false,
             separator: Some(",".to_string()),
@@ -81,9 +139,8 @@ impl AggregateFunction for StringAggFunction {
     }
 
     fn configure(&mut self, options: &[Value]) {
-        // First option is the separator, read as CONCAT_WS reads its own
         if let Some(sep) = options.first() {
-            self.separator = (!sep.is_null()).then(|| value_to_string(sep));
+            self.separator = separator_text(sep).map(Cow::into_owned);
         }
     }
 
@@ -97,58 +154,58 @@ impl AggregateFunction for StringAggFunction {
     }
 
     fn accumulate(&mut self, value: &Value) {
-        // STRING_AGG ignores NULLs; a value is joined as its text form
-        let Some(s) = value.as_string() else {
-            return;
-        };
-
-        self.values.push(s);
+        self.push(value, None, None);
     }
 
     fn accumulate_with_sort_key(&mut self, value: &Value, sort_keys: Vec<Value>) {
-        let Some(s) = value.as_string() else {
-            return;
-        };
+        self.push(value, None, Some(sort_keys));
+    }
 
-        self.ordered_entries.push(OrderedEntry {
-            value: s,
-            sort_keys,
-        });
+    fn accumulate_with_args(
+        &mut self,
+        value: &Value,
+        args: &[Value],
+        sort_keys: Option<Vec<Value>>,
+    ) {
+        self.push(value, args.first(), sort_keys);
     }
 
     fn result(&self) -> Result<Value> {
-        // Get the values to output, potentially sorted
-        let values_to_output: Vec<&str> = if self.has_order_by && !self.ordered_entries.is_empty() {
-            // Sort the entries by their sort keys
-            let mut entries: Vec<&OrderedEntry> = self.ordered_entries.iter().collect();
+        if !self.has_order_by || self.ordered_entries.is_empty() {
+            if let Some(joined) = &self.joined {
+                return Ok(Value::text(joined));
+            }
+        }
+        // Sorted by their keys under ORDER BY, else in arrival order
+        let mut entries: Vec<&OrderedEntry> = self.ordered_entries.iter().collect();
+        if self.has_order_by {
             let keys = &self.order_keys;
-
             entries.sort_by(|a, b| super::compare_sort_keys(&a.sort_keys, &b.sort_keys, keys));
-
-            entries.iter().map(|e| e.value.as_str()).collect()
-        } else if !self.values.is_empty() {
-            self.values.iter().map(|s| s.as_str()).collect()
-        } else if !self.ordered_entries.is_empty() {
-            // Has ordered entries but no ORDER BY configured - use insertion order
-            self.ordered_entries
-                .iter()
-                .map(|e| e.value.as_str())
-                .collect()
-        } else {
+        }
+        let Some((first, rest)) = entries.split_first() else {
             return Ok(Value::null_unknown());
         };
-
-        match &self.separator {
-            Some(separator) if !values_to_output.is_empty() => {
-                Ok(Value::text(values_to_output.join(separator)))
-            }
-            _ => Ok(Value::null_unknown()),
+        // An entry's position in arrival order, which its own separator has
+        let base = self.ordered_entries.as_ptr() as usize;
+        let at = |entry: &OrderedEntry| {
+            (entry as *const OrderedEntry as usize - base) / std::mem::size_of::<OrderedEntry>()
+        };
+        // Room for the values and the call's separators; a row's own may grow it
+        let values = entries.iter().map(|e| e.value.len()).sum::<usize>();
+        let separators = rest.len() * self.separator.as_deref().map_or(0, str::len);
+        let mut joined = String::with_capacity(values + separators);
+        joined.push_str(&first.value);
+        for entry in rest {
+            joined.push_str(self.separator_of(at(entry)).as_deref().unwrap_or_default());
+            joined.push_str(&entry.value);
         }
+        Ok(Value::text(joined))
     }
 
     fn reset(&mut self) {
-        self.values.clear();
+        self.joined = None;
         self.ordered_entries.clear();
+        self.row_separators.clear();
         // Note: order_keys and has_order_by are kept as they're configuration
     }
 
@@ -200,6 +257,15 @@ impl AggregateFunction for GroupConcatFunction {
 
     fn accumulate_with_sort_key(&mut self, value: &Value, sort_keys: Vec<Value>) {
         self.inner.accumulate_with_sort_key(value, sort_keys);
+    }
+
+    fn accumulate_with_args(
+        &mut self,
+        value: &Value,
+        args: &[Value],
+        sort_keys: Option<Vec<Value>>,
+    ) {
+        self.inner.accumulate_with_args(value, args, sort_keys);
     }
 
     fn result(&self) -> Result<Value> {

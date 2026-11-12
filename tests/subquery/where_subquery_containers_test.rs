@@ -1211,13 +1211,16 @@ fn test_navigation_window_control_argument() {
             .collect::<Vec<_>>(),
         "NTH_VALUE n"
     );
-    // One value per partition, so an argument reading the row is refused
-    assert!(
-        db.query(
+    // Read at the partition's first row, whose orders' user is 1
+    assert_eq!(
+        rows(
+            &db,
             "SELECT u.id, NTILE((SELECT MAX(x.user_id) FROM orders x WHERE x.user_id = u.id)) OVER (ORDER BY u.id) FROM users u WHERE u.id <= 4 ORDER BY u.id",
-            ()
-        )
-        .is_err(),
+        ),
+        [("1", "1"), ("2", "1"), ("3", "1"), ("4", "1")]
+            .iter()
+            .map(|(a, b)| vec![a.to_string(), b.to_string()])
+            .collect::<Vec<_>>(),
         "correlated control argument"
     );
 }

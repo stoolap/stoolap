@@ -62,18 +62,52 @@ fn window_argument_value<'a>(
     }
 }
 
-/// One frame of an aggregate that orders its own input
-fn accumulate_ordered_frame(
+/// What a window aggregate reads at each row it accumulates
+#[derive(Clone, Copy)]
+struct AggregateInput<'a> {
+    rows: &'a [(i64, Row)],
+    column: Option<usize>,
+    values: &'a [Value],
+    /// The keys the call's own ORDER BY gives each row, when it orders its input
+    keys: Option<&'a [Vec<Value>]>,
+    /// The arguments after the first of each row, `width` to a row, when
+    /// they are read for each row
+    args: &'a [Value],
+    width: usize,
+}
+
+/// Accumulates the rows of `frame`
+#[inline(always)]
+fn accumulate_frame(
     agg_func: &mut crate::functions::aggregate::AggregateState,
     frame: &[usize],
-    rows: &[(i64, Row)],
-    arg_col_idx: Option<usize>,
-    expression_values: &[Value],
-    keys: &[Vec<Value>],
+    input: AggregateInput,
 ) {
-    for &idx in frame {
-        let value = window_argument_value(rows, idx, arg_col_idx, expression_values);
-        agg_func.accumulate_with_sort_key(value, keys[idx].clone());
+    let AggregateInput {
+        rows,
+        column,
+        values,
+        ..
+    } = input;
+    match (input.width, input.keys) {
+        (0, None) => {
+            for &idx in frame {
+                agg_func.accumulate(window_argument_value(rows, idx, column, values));
+            }
+        }
+        (0, Some(keys)) => {
+            for &idx in frame {
+                let value = window_argument_value(rows, idx, column, values);
+                agg_func.accumulate_with_sort_key(value, keys[idx].clone());
+            }
+        }
+        (width, keys) => {
+            for &idx in frame {
+                let value = window_argument_value(rows, idx, column, values);
+                let args = &input.args[idx * width..][..width];
+                agg_func.accumulate_with_args(value, args, keys.map(|keys| keys[idx].clone()));
+            }
+        }
     }
 }
 
@@ -146,12 +180,14 @@ pub(crate) struct WindowPrograms {
     filter: [HeldProgram; 1],
     call_order: Box<[HeldProgram]>,
     default: HeldProgram,
+    count: HeldProgram,
+    /// An aggregate's arguments after the first, when read for each row
+    args: Box<[HeldProgram]>,
     /// The arguments read once for the call: an aggregate's after its first,
-    /// the frame's offsets, the count of NTILE, NTH_VALUE, LAG or LEAD
+    /// the frame's offsets
     extra: Box<[HeldOnce]>,
     frame_start: HeldOnce,
     frame_end: HeldOnce,
-    count: HeldOnce,
 }
 
 /// The programs of a held plan's expression items: those `run_window`
@@ -280,7 +316,6 @@ impl ArgSource {
 /// its source says and kept for the call
 struct ConstArg<'w> {
     expr: &'w Expression,
-    deterministic: bool,
     source: ArgSource,
     /// The error of an argument that reads the row, raised when it is read
     reads_row: Option<Error>,
@@ -305,7 +340,6 @@ impl<'w> ConstArg<'w> {
         };
         Self {
             expr,
-            deterministic: expr_is_deterministic(expr, registry),
             source,
             reads_row,
             held,
@@ -328,36 +362,86 @@ impl<'w> ConstArg<'w> {
             }
         }
     }
+}
 
-    /// Whether the argument holds a subquery, which only the statement's
-    /// blocks answer
-    fn reads_blocks(&self) -> bool {
-        Executor::has_subqueries(self.expr)
+/// An argument a window function that is no aggregate reads at a row, as
+/// it reads its input: LAG and LEAD's offset and default, NTILE's and
+/// NTH_VALUE's n
+struct RowArg<'w> {
+    expr: &'w Expression,
+    source: ArgSource,
+    /// Its program, as the input's is compiled
+    program: OnceLock<Result<SharedProgram>>,
+    /// Its program when a prepared statement holds it
+    held: Option<&'w HeldProgram>,
+}
+
+impl<'w> RowArg<'w> {
+    fn new(expr: &'w Expression, held: Option<&'w HeldProgram>) -> Self {
+        Self {
+            expr,
+            source: ArgSource::of(expr),
+            program: OnceLock::new(),
+            held,
+        }
+    }
+
+    /// Whether it is a literal or a parameter, one value at every row
+    fn fixed(&self) -> bool {
+        !matches!(self.source, ArgSource::Program(_))
+    }
+
+    /// Its program over the input `columns`, a group item or aggregate read
+    /// from its slot in `slots`, compiled on first read; None for a literal
+    /// or a parameter, read without one
+    fn program(
+        &self,
+        (columns, slots): (&[String], &FxHashMap<ExprKey, usize>),
+        (ctx, blocks): (&ExecutionContext, Option<&dyn SubqueryExecutor>),
+    ) -> Result<Option<&Program>> {
+        if self.fixed() {
+            return Ok(None);
+        }
+        let slots = Some(slots);
+        let program = self.program.get_or_init(|| match self.held {
+            Some(held) => held_program(self.expr, held, columns, slots, ctx, blocks),
+            None => row_program(self.expr, columns, slots, ctx, blocks),
+        });
+        program.as_deref().map(Some).map_err(Clone::clone)
+    }
+
+    /// Its value at `row`, `program` the one [`Self::program`] gave
+    fn value(
+        &self,
+        program: Option<&Program>,
+        vm: &mut ExprVM,
+        row: &Row,
+        (ctx, blocks): (&ExecutionContext, Option<&dyn SubqueryExecutor>),
+    ) -> Result<Value> {
+        match (program, &self.source) {
+            (Some(program), _) => vm.execute(program, &run_context(row, ctx, blocks)),
+            (None, ArgSource::Literal(value)) => Ok(value.clone()),
+            (None, _) => evaluate_once(self.expr, Some(ctx)),
+        }
     }
 }
 
-/// A constant argument as one partition reads it: a deterministic one
-/// evaluates once, a volatile one (RANDOM and friends) on every read
-struct PartitionArg<'a, 'w> {
-    arg: &'a ConstArg<'w>,
-    cached: Option<Value>,
+/// The programs of a call's [`RowArg`]s, None for one read without one
+#[derive(Clone, Copy, Default)]
+struct ArgPrograms<'p> {
+    count: Option<&'p Program>,
+    default: Option<&'p Program>,
 }
 
-impl<'a, 'w> PartitionArg<'a, 'w> {
-    fn new(arg: &'a ConstArg<'w>) -> Self {
-        Self { arg, cached: None }
-    }
-
-    fn value(&mut self, read: (&ExecutionContext, Option<&dyn SubqueryExecutor>)) -> Result<Value> {
-        if !self.arg.deterministic {
-            return self.arg.evaluate(read);
-        }
-        if let Some(v) = &self.cached {
-            return Ok(v.clone());
-        }
-        let v = self.arg.evaluate(read)?;
-        self.cached = Some(v.clone());
-        Ok(v)
+/// The position of the argument of a window function that is no aggregate
+/// counting rows, and its name: NTILE's, LAG and LEAD's offset, NTH_VALUE's n
+fn count_argument(function: &str) -> Option<(usize, &'static str)> {
+    match function {
+        "NTILE" => Some((0, "the bucket count of NTILE")),
+        "LEAD" => Some((1, "the offset of LEAD")),
+        "LAG" => Some((1, "the offset of LAG")),
+        "NTH_VALUE" => Some((1, "the n of NTH_VALUE")),
+        _ => None,
     }
 }
 
@@ -367,13 +451,11 @@ impl<'a, 'w> PartitionArg<'a, 'w> {
 struct CallArgs<'w> {
     frame_start: Option<ConstArg<'w>>,
     frame_end: Option<ConstArg<'w>>,
-    count: Option<ConstArg<'w>>,
-    /// LAG and LEAD's default, which may read the row
-    default: Option<(&'w Expression, ArgSource)>,
-    /// The default's program, as the input's is compiled
-    default_program: OnceLock<Result<SharedProgram>>,
-    /// The default's program when a prepared statement holds it
-    held_default: Option<&'w HeldProgram>,
+    /// NTILE's n, read at the first row of each partition; LAG and LEAD's
+    /// offset and NTH_VALUE's n, read at each row
+    count: Option<RowArg<'w>>,
+    /// LAG and LEAD's default, read at each row
+    default: Option<RowArg<'w>>,
     /// A value function's first argument for each row, when it is not a column
     input: Vec<Value>,
 }
@@ -422,69 +504,76 @@ impl<'w> CallArgs<'w> {
             frame_start: frame.and_then(|f| offset_of(&f.start, held.map(|h| &h.frame_start))),
             frame_end: (frame.and_then(|f| f.end.as_ref()))
                 .and_then(|end| offset_of(end, held.map(|h| &h.frame_end))),
-            count: window_count_argument(&wf_info.name).and_then(|(at, what)| {
+            count: count_argument(&wf_info.name).and_then(|(at, _)| {
                 let held = held.map(|h| &h.count);
                 wf_info
                     .arguments
                     .get(at)
-                    .map(|expr| ConstArg::new(expr, registry, what, (blocks, held)))
+                    .map(|expr| RowArg::new(expr, held))
             }),
             default: wf_info
                 .arguments
                 .get(2)
                 .filter(|_| lead_lag)
-                .map(|expr| (expr, ArgSource::of(expr))),
-            default_program: OnceLock::new(),
-            held_default: wf_info.held.as_ref().map(|held| &held.default),
+                .map(|expr| RowArg::new(expr, held.map(|h| &h.default))),
             input: Vec::new(),
         }
     }
 
-    /// The default's program over the input `columns`, a group item or
-    /// aggregate read from its slot in `slots`, compiled on first read;
-    /// None when there is no default or it is read without one
-    fn default_program(
+    /// The programs of the count and the default over the input `columns`,
+    /// a group item or aggregate read from its slot in `slots`
+    fn programs(
         &self,
-        (columns, slots): (&[String], &FxHashMap<ExprKey, usize>),
-        (ctx, blocks): (&ExecutionContext, Option<&dyn SubqueryExecutor>),
-    ) -> Result<Option<&Program>> {
-        let Some((expr, ArgSource::Program(_))) = &self.default else {
-            return Ok(None);
-        };
-        let slots = Some(slots);
-        let program = self
-            .default_program
-            .get_or_init(|| match self.held_default {
-                Some(held) => held_program(expr, held, columns, slots, ctx, blocks),
-                None => row_program(expr, columns, slots, ctx, blocks),
-            });
-        program.as_deref().map(Some).map_err(Clone::clone)
+        over: (&[String], &FxHashMap<ExprKey, usize>),
+        read: (&ExecutionContext, Option<&dyn SubqueryExecutor>),
+    ) -> Result<ArgPrograms<'_>> {
+        let count = self.count.as_ref().map(|arg| arg.program(over, read));
+        let default = self.default.as_ref().map(|arg| arg.program(over, read));
+        Ok(ArgPrograms {
+            count: count.transpose()?.flatten(),
+            default: default.transpose()?.flatten(),
+        })
     }
 
     /// Whether the default or the count read a subquery, which only the
     /// statement's blocks answer, so the partitions read them on this thread
     fn reads_blocks(&self) -> bool {
-        self.count.as_ref().is_some_and(ConstArg::reads_blocks)
-            || self
-                .default
-                .as_ref()
-                .is_some_and(|(expr, _)| Executor::has_subqueries(expr))
+        [&self.count, &self.default]
+            .into_iter()
+            .flatten()
+            .any(|arg| Executor::has_subqueries(arg.expr))
     }
 
     /// LAG and LEAD's default for the current `row`, NULL without one
     fn default_value(
         &self,
-        program: Option<&Program>,
+        programs: ArgPrograms,
         vm: &mut ExprVM,
         row: &Row,
-        (ctx, blocks): (&ExecutionContext, Option<&dyn SubqueryExecutor>),
+        read: (&ExecutionContext, Option<&dyn SubqueryExecutor>),
     ) -> Result<Value> {
-        match (program, &self.default) {
-            (Some(program), _) => vm.execute(program, &run_context(row, ctx, blocks)),
-            (None, Some((_, ArgSource::Literal(value)))) => Ok(value.clone()),
-            (None, Some((expr, _))) => evaluate_once(expr, Some(ctx)),
-            (None, None) => Ok(Value::null_unknown()),
+        match &self.default {
+            Some(arg) => arg.value(programs.default, vm, row, read),
+            None => Ok(Value::null_unknown()),
         }
+    }
+
+    /// The count at `row`, read as `what` of at least `min`; None without one
+    fn count_value(
+        &self,
+        programs: ArgPrograms,
+        vm: &mut ExprVM,
+        row: &Row,
+        (read, what, min): (
+            (&ExecutionContext, Option<&dyn SubqueryExecutor>),
+            &str,
+            i64,
+        ),
+    ) -> Result<Option<usize>> {
+        let Some(arg) = &self.count else {
+            return Ok(None);
+        };
+        window_count(&arg.value(programs.count, vm, row, read)?, what, min).map(Some)
     }
 }
 
@@ -736,7 +825,7 @@ use super::utils::{
     build_column_index_map, derived_aggregate_column_name, for_each_qualified_star_column,
     get_table_alias_from_expr, item_name, qualified, qualified_index, split_qualified,
 };
-use super::volatility::{expression_volatility, read_once, window_count_argument, FRAME_OFFSET};
+use super::volatility::{expression_volatility, read_once, FRAME_OFFSET};
 use super::Executor;
 
 /// Wrapper for parallel writes to disjoint indices in a Vec<Value>.
@@ -808,6 +897,9 @@ pub struct WindowFunctionInfo {
     pub extra_args: Vec<Value>,
     /// The error one of them gave, reported once there is a row to aggregate
     pub extra_error: Option<Error>,
+    /// Whether they are read for each row instead, one of them not one
+    /// value for the call
+    pub(crate) row_args: bool,
     /// The structural identity of its ORDER BY, and of its whole OVER
     /// clause, which caches of sorted values and partitions are keyed by
     pub(crate) order_key: OrderByKey,
@@ -854,6 +946,7 @@ impl WindowPlan<'_> {
                         partition: held_programs(wf.partition_by_exprs.len()),
                         order: held_programs(wf.order_by.len()),
                         call_order: held_programs(wf.call_order_by.len()),
+                        args: held_programs(wf.arguments.len().saturating_sub(1)),
                         extra: (1..wf.arguments.len()).map(|_| HeldOnce::new()).collect(),
                         ..WindowPrograms::default()
                     })
@@ -1475,7 +1568,7 @@ impl Executor {
         };
         let mut plan = plan.holding(held);
         for wf in &mut plan.window_functions {
-            if global_registry().is_aggregate(&wf.name) {
+            if global_registry().is_aggregate(&wf.name) && !wf.row_args {
                 let later = wf.arguments.get(1..).unwrap_or_default();
                 let held = wf.held.as_deref().map(|held| &*held.extra);
                 let read = aggregate_extra_args(later, Some(ctx), blocks, held)?;
@@ -2830,8 +2923,12 @@ impl Executor {
 
         // Build column name
         let column_name = format!("{}()", func.function);
+        let aggregate = global_registry().is_aggregate(&func.function);
+        let row_args = aggregate
+            && super::aggregation::row_args(&func.arguments, read.and_then(|(_, blocks)| blocks))
+                .is_some();
         let (extra_args, extra_error) = match read {
-            Some((ctx, blocks)) if global_registry().is_aggregate(&func.function) => {
+            Some((ctx, blocks)) if aggregate && !row_args => {
                 let later = func.arguments.get(1..).unwrap_or_default();
                 super::aggregation::aggregate_extra_args(later, Some(ctx), blocks, None)?
             }
@@ -2854,6 +2951,7 @@ impl Executor {
             call_order_by: func.order_by.clone().into_boxed_slice(),
             extra_args,
             extra_error,
+            row_args,
             order_key,
             over_key,
             held: None,
@@ -3163,11 +3261,21 @@ impl Executor {
             // Each partition writes to its own row indices (guaranteed disjoint).
             let mut results: Vec<Value> = vec![NULL_VALUE; rows.len()];
             let parallel_results = ParallelVec::new(&mut results);
-            let lead_lag_default = args.default_program((columns, group_slots), (ctx, blocks))?;
+            let programs = args.programs((columns, group_slots), (ctx, blocks))?;
 
-            // A default holding a REGEXP is copied once per thread, not per job
+            // An argument holding a REGEXP is copied once per thread, not per job
             #[cfg(feature = "parallel")]
-            let min_len = match lead_lag_default.is_some_and(Program::holds_thread_state) {
+            let held_state = |program: Option<&Program>| {
+                program
+                    .filter(|program| program.holds_thread_state())
+                    .map(Program::worker_copy)
+            };
+            #[cfg(feature = "parallel")]
+            let min_len = match [programs.count, programs.default]
+                .into_iter()
+                .flatten()
+                .any(Program::holds_thread_state)
+            {
                 true => partitions.len().div_ceil(rayon::current_num_threads()),
                 false => 1,
             };
@@ -3176,12 +3284,12 @@ impl Executor {
                 .par_iter()
                 .with_min_len(min_len)
                 .try_for_each_init(
-                    || {
-                        lead_lag_default
-                            .filter(|program| program.holds_thread_state())
-                            .map(Program::worker_copy)
-                    },
-                    |worker, row_indices| -> Result<()> {
+                    || (held_state(programs.count), held_state(programs.default)),
+                    |(count, default), row_indices| -> Result<()> {
+                        let programs = ArgPrograms {
+                            count: count.as_ref().or(programs.count),
+                            default: default.as_ref().or(programs.default),
+                        };
                         // Direct writing: each partition writes to its own indices
                         self.compute_window_for_partition_parallel(
                             &*window_func,
@@ -3195,7 +3303,7 @@ impl Executor {
                             ctx,
                             &frame,
                             &args,
-                            worker.as_ref().or(lead_lag_default),
+                            programs,
                             &parallel_results,
                         )
                     },
@@ -3215,7 +3323,7 @@ impl Executor {
                     ctx,
                     &frame,
                     &args,
-                    lead_lag_default,
+                    programs,
                     &parallel_results,
                 )
             });
@@ -3301,7 +3409,7 @@ impl Executor {
             wf_info,
             &frame,
             args,
-            args.default_program((columns, group_slots), (ctx, blocks))?,
+            args.programs((columns, group_slots), (ctx, blocks))?,
             all_rows,
             &row_indices,
             order_by_values,
@@ -3322,7 +3430,7 @@ impl Executor {
         wf_info: &WindowFunctionInfo,
         frame: &Frame,
         args: &CallArgs,
-        lead_lag_default: Option<&Program>,
+        programs: ArgPrograms,
         all_rows: &[(i64, Row)],
         row_indices: &[usize],
         order_by_values: &ColumnarOrderByValues,
@@ -3357,13 +3465,24 @@ impl Executor {
         let partition_len = row_indices.len();
         let frames = PartitionFrames::new(frame, row_indices, order_by_values);
 
-        // NTH_VALUE's n evaluates only for a frame that is not empty
-        let mut count_arg = args.count.as_ref().map(PartitionArg::new);
-        let mut default_vm = ExprVM::new();
-        let lead_lag_offset = if wf_info.name == "LEAD" {
-            "the offset of LEAD"
-        } else {
-            "the offset of LAG"
+        let mut vm = ExprVM::new();
+        let what = count_argument(&wf_info.name).map_or("", |(_, what)| what);
+        let count_at = |vm: &mut ExprVM, row_idx: usize, min: i64| {
+            args.count_value(
+                programs,
+                vm,
+                &all_rows[row_idx].1,
+                ((ctx, blocks), what, min),
+            )
+        };
+        // NTILE reads its bucket count at the partition's first row; LAG and
+        // LEAD's offset is one value there when written as one
+        let once = match wf_info.name.as_str() {
+            "NTILE" => Some(count_at(&mut vm, row_indices[0], 1)?.unwrap_or(1)),
+            "LEAD" | "LAG" if args.count.as_ref().is_none_or(RowArg::fixed) => {
+                Some(count_at(&mut vm, row_indices[0], 0)?.unwrap_or(1))
+            }
+            _ => None,
         };
 
         for (i, &row_idx) in row_indices.iter().enumerate() {
@@ -3373,33 +3492,17 @@ impl Executor {
                 // instead of cloning into partition_values Vec
                 "LEAD" | "LAG" => Self::compute_lead_lag_indexed(
                     wf_info.name == "LEAD",
-                    match &mut count_arg {
-                        Some(arg) => window_count(&arg.value((ctx, blocks))?, lead_lag_offset, 0)?,
-                        None => 1,
+                    match once {
+                        Some(offset) => offset,
+                        None => count_at(&mut vm, row_idx, 0)?.unwrap_or(1),
                     },
-                    args.default_value(
-                        lead_lag_default,
-                        &mut default_vm,
-                        &all_rows[row_idx].1,
-                        (ctx, blocks),
-                    )?,
+                    args.default_value(programs, &mut vm, &all_rows[row_idx].1, (ctx, blocks))?,
                     all_rows,
                     row_indices,
                     input,
                     i,
                 )?,
-                "NTILE" => Self::compute_ntile(
-                    match &mut count_arg {
-                        Some(arg) => window_count(
-                            &arg.value((ctx, blocks))?,
-                            "the bucket count of NTILE",
-                            1,
-                        )?,
-                        None => 1,
-                    },
-                    partition_len,
-                    i,
-                ),
+                "NTILE" => Self::compute_ntile(once.unwrap_or(1), partition_len, i),
                 "RANK" | "DENSE_RANK" => Self::compute_rank_fast(is_rank, &rank_info, i),
                 "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" => {
                     let (frame_start, frame_end) = frames.bounds(frame, i);
@@ -3420,23 +3523,18 @@ impl Executor {
                             frame_start,
                             frame_end,
                         )?,
-                        "NTH_VALUE" => match &mut count_arg {
-                            Some(arg) if frame_start < frame_end => {
-                                let n = window_count(
-                                    &arg.value((ctx, blocks))?,
-                                    "the n of NTH_VALUE",
-                                    1,
-                                )?;
-                                Self::compute_nth_value_indexed(
-                                    n,
-                                    all_rows,
-                                    row_indices,
-                                    input,
-                                    frame_start,
-                                    frame_end,
-                                )
-                            }
-                            _ => Value::null_unknown(),
+                        // NTH_VALUE's n evaluates only for a frame that is not empty
+                        "NTH_VALUE" if frame_start >= frame_end => Value::null_unknown(),
+                        "NTH_VALUE" => match count_at(&mut vm, row_idx, 1)? {
+                            Some(n) => Self::compute_nth_value_indexed(
+                                n,
+                                all_rows,
+                                row_indices,
+                                input,
+                                frame_start,
+                                frame_end,
+                            ),
+                            None => Value::null_unknown(),
                         },
                         _ => unreachable!(),
                     }
@@ -3509,7 +3607,7 @@ impl Executor {
             wf_info,
             frame,
             args,
-            args.default_program((columns, group_slots), (ctx, blocks))?,
+            args.programs((columns, group_slots), (ctx, blocks))?,
             all_rows,
             &row_indices,
             order_by_values,
@@ -3539,7 +3637,7 @@ impl Executor {
         ctx: &ExecutionContext,
         frame: &Frame,
         args: &CallArgs,
-        lead_lag_default: Option<&Program>,
+        programs: ArgPrograms,
         results: &ParallelVec,
     ) -> Result<()> {
         // Empty fallback for when no precomputed values are provided
@@ -3566,7 +3664,7 @@ impl Executor {
             wf_info,
             frame,
             args,
-            lead_lag_default,
+            programs,
             all_rows,
             &row_indices,
             order_by_values,
@@ -4298,8 +4396,8 @@ impl Executor {
     }
 
     /// The aggregate's argument per row, NULL where its FILTER rejects the
-    /// row; a held plan's FILTER program in `held`, a group item or
-    /// aggregate read from its slot in `slots`
+    /// row, and whether it keeps each row; a held plan's FILTER program in
+    /// `held`, a group item or aggregate read from its slot in `slots`
     #[allow(clippy::too_many_arguments)]
     fn window_filtered_values(
         &self,
@@ -4310,17 +4408,20 @@ impl Executor {
         arg_col_idx: Option<usize>,
         expression_values: &[Value],
         blocks: Option<&dyn SubqueryExecutor>,
-    ) -> Result<Vec<Value>> {
+    ) -> Result<(Vec<Value>, Vec<bool>)> {
         let mut eval = RowPrograms::compile([filter], columns, Some(slots), ctx, blocks, held)?;
         let mut values = Vec::with_capacity(rows.len());
+        let mut kept = Vec::with_capacity(rows.len());
         for (idx, (_, row)) in rows.iter().enumerate() {
-            values.push(if matches!(eval.eval(row)?, Value::Boolean(true)) {
+            let keeps = matches!(eval.eval(row)?, Value::Boolean(true));
+            values.push(if keeps {
                 window_argument_value(rows, idx, arg_col_idx, expression_values).clone()
             } else {
                 Value::null_unknown()
             });
+            kept.push(keeps);
         }
-        Ok(values)
+        Ok((values, kept))
     }
 
     /// The running state of an aggregate window call, built as every
@@ -4431,8 +4532,9 @@ impl Executor {
 
         // A FILTER hides a row by handing the aggregate a NULL, which every
         // aggregate skips, so the frames below read one plain value column
+        let mut kept = Vec::new();
         if let Some(filter) = wf_info.filter.as_deref() {
-            expression_values = self.window_filtered_values(
+            (expression_values, kept) = self.window_filtered_values(
                 (filter, wf_info.held.as_ref().map(|held| &held.filter[..])),
                 rows,
                 (columns, group_slots),
@@ -4448,6 +4550,35 @@ impl Executor {
         let sort_keys =
             self.window_call_sort_keys(wf_info, rows, (columns, group_slots), ctx, blocks)?;
         let keys: Option<&[Vec<Value>]> = (!sort_keys.is_empty()).then_some(&sort_keys);
+
+        // The arguments after the first of each row, when read for each row;
+        // NULL at a row the FILTER rejects, which reads none
+        let later = match wf_info.row_args {
+            true => wf_info.arguments.get(1..).unwrap_or_default(),
+            false => &[],
+        };
+        let mut row_args = Vec::with_capacity(rows.len() * later.len());
+        if !later.is_empty() {
+            let held = wf_info.held.as_ref().map(|held| &*held.args);
+            let mut evals =
+                RowPrograms::compile(later, columns, Some(group_slots), ctx, blocks, held)?;
+            let mut read = Vec::with_capacity(later.len());
+            for (idx, (_, row)) in rows.iter().enumerate() {
+                match kept.get(idx) {
+                    Some(false) => read.resize(later.len(), Value::null_unknown()),
+                    _ => evals.eval_into(row, &mut read)?,
+                }
+                row_args.append(&mut read);
+            }
+        }
+        let input = AggregateInput {
+            rows,
+            column: arg_col_idx,
+            values: &expression_values,
+            keys,
+            args: &row_args,
+            width: later.len(),
+        };
 
         // Use precomputed ORDER BY values from cache if available
         let empty_order_by = ColumnarOrderByValues {
@@ -4538,26 +4669,7 @@ impl Executor {
                         let frame_end = frames.bounds(&frame, i).1;
 
                         // Accumulate only the new values since prev_end
-                        if keys.is_none() {
-                            for &idx in &row_indices[prev_end..frame_end] {
-                                let value = window_argument_value(
-                                    rows,
-                                    idx,
-                                    arg_col_idx,
-                                    &expression_values,
-                                );
-                                agg_func.accumulate(value);
-                            }
-                        } else {
-                            accumulate_ordered_frame(
-                                &mut agg_func,
-                                &row_indices[prev_end..frame_end],
-                                rows,
-                                arg_col_idx,
-                                &expression_values,
-                                sort_keys.as_slice(),
-                            );
-                        }
+                        accumulate_frame(&mut agg_func, &row_indices[prev_end..frame_end], input);
                         if frame_end > prev_end {
                             prev_end = frame_end;
                         }
@@ -4570,26 +4682,11 @@ impl Executor {
                         let (frame_start, frame_end) = frames.bounds(&frame, i);
 
                         // Accumulate values within the frame
-                        if keys.is_none() {
-                            for &idx in &row_indices[frame_start..frame_end] {
-                                let value = window_argument_value(
-                                    rows,
-                                    idx,
-                                    arg_col_idx,
-                                    &expression_values,
-                                );
-                                agg_func.accumulate(value);
-                            }
-                        } else {
-                            accumulate_ordered_frame(
-                                &mut agg_func,
-                                &row_indices[frame_start..frame_end],
-                                rows,
-                                arg_col_idx,
-                                &expression_values,
-                                sort_keys.as_slice(),
-                            );
-                        }
+                        accumulate_frame(
+                            &mut agg_func,
+                            &row_indices[frame_start..frame_end],
+                            input,
+                        );
                         results[row_idx] = Some(agg_func.result()?);
                     }
                 } // end of else (non-incremental path)
@@ -4598,22 +4695,7 @@ impl Executor {
                 let mut agg_func = self.window_aggregate_state(wf_info, keys.is_some())?;
 
                 // Accumulate all values in the partition
-                if keys.is_none() {
-                    for &idx in row_indices {
-                        let value =
-                            window_argument_value(rows, idx, arg_col_idx, &expression_values);
-                        agg_func.accumulate(value);
-                    }
-                } else {
-                    accumulate_ordered_frame(
-                        &mut agg_func,
-                        row_indices,
-                        rows,
-                        arg_col_idx,
-                        &expression_values,
-                        sort_keys.as_slice(),
-                    );
-                }
+                accumulate_frame(&mut agg_func, row_indices, input);
                 let aggregate_result = agg_func.result()?;
 
                 // Assign the same aggregate result to all rows in the partition
@@ -4774,6 +4856,7 @@ mod tests {
             call_order_by: Box::new([]),
             extra_args: Vec::new(),
             extra_error: None,
+            row_args: false,
             order_key: SmallVec::new(),
             over_key: (SmallVec::new(), SmallVec::new()),
             held: None,

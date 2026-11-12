@@ -258,6 +258,22 @@ pub trait AggregateFunction: Send + Sync {
         self.accumulate(value);
     }
 
+    /// Accumulate a value with the call's arguments after the first as its
+    /// row reads them, and its sort keys when the call orders its input.
+    /// Default implementation ignores the arguments.
+    fn accumulate_with_args(
+        &mut self,
+        value: &Value,
+        args: &[Value],
+        sort_keys: Option<Vec<Value>>,
+    ) {
+        let _ = args;
+        match sort_keys {
+            Some(sort_keys) => self.accumulate_with_sort_key(value, sort_keys),
+            None => self.accumulate(value),
+        }
+    }
+
     /// Check if this aggregate supports ORDER BY clause
     ///
     /// If true, the executor will call accumulate_with_sort_key instead of accumulate.
