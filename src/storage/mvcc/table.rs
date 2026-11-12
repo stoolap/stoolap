@@ -4022,6 +4022,17 @@ impl Table for MVCCTable {
         is_unique: bool,
         index_type: Option<IndexType>,
     ) -> Result<()> {
+        self.create_index_beside(name, columns, is_unique, index_type, None)
+    }
+
+    fn create_index_beside(
+        &self,
+        name: &str,
+        columns: &[&str],
+        is_unique: bool,
+        index_type: Option<IndexType>,
+        beside: Option<&str>,
+    ) -> Result<()> {
         if columns.is_empty() {
             return Err(Error::internal("index must have at least one column"));
         }
@@ -4057,7 +4068,11 @@ impl Table for MVCCTable {
         // For single-column indexes, use get_index_by_column
         // For multi-column indexes, check all existing indexes
         if columns.len() == 1 {
-            if let Some(existing_idx) = self.version_store.get_index_by_column(columns[0]) {
+            if let Some(existing_idx) = self
+                .version_store
+                .get_index_by_column(columns[0])
+                .filter(|existing| Some(existing.name()) != beside)
+            {
                 // If the existing index is a PkIndex, silently skip -
                 // the PK column is already covered
                 if existing_idx.index_type() == IndexType::PrimaryKey {

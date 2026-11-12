@@ -7651,6 +7651,17 @@ impl Table for SegmentedTable {
         is_unique: bool,
         index_type: Option<IndexType>,
     ) -> Result<()> {
+        self.create_index_beside(name, columns, is_unique, index_type, None)
+    }
+
+    fn create_index_beside(
+        &self,
+        name: &str,
+        columns: &[&str],
+        is_unique: bool,
+        index_type: Option<IndexType>,
+        beside: Option<&str>,
+    ) -> Result<()> {
         // For unique indexes (non-HNSW), validate cold data has no duplicates first.
         // HNSW unique validation happens during populate_index_from_cold via index.add().
         if is_unique && index_type != Some(IndexType::Hnsw) && self.segment_mgr.has_segments() {
@@ -7658,7 +7669,7 @@ impl Table for SegmentedTable {
         }
 
         self.hot
-            .create_index_with_type(name, columns, is_unique, index_type)?;
+            .create_index_beside(name, columns, is_unique, index_type, beside)?;
         self.populate_if_hnsw(name, columns)
     }
 
