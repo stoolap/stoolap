@@ -7309,6 +7309,8 @@ impl MVCCEngine {
                 .map(|(name, view_def)| (name.clone(), view_def.serialize()))
                 .collect()
         };
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::catalog_copies_taken();
 
         if self.should_skip_wal() {
             return Ok(true);

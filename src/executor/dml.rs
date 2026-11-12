@@ -3426,6 +3426,10 @@ impl Executor {
         // OPTIMIZATION: Use pre-computed lowercase name to avoid allocation per query
         let table_name = &stmt.table_name.value_lower;
 
+        // The id counter's reset and its log record land on one side of a
+        // checkpoint's catalog copies, which carry the counter
+        let _ddl = self.engine.ddl_statement_guard()?;
+
         // Check if there's an active explicit transaction
         let mut active_tx = self.active_transaction.lock().unwrap();
 

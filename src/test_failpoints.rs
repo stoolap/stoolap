@@ -438,6 +438,7 @@ thread_local! {
     static COLUMN_CHANGE_WAITING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static CHECKPOINT_CUT_TAKEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static CHECKPOINT_MANAGERS_TAKEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static CATALOG_COPIES_TAKEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static RETYPE_OUTPUTS_WRITTEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static RETYPE_MANIFEST_WRITTEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static ANALYZE_ROWS_COLLECTED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
@@ -702,6 +703,16 @@ pub fn after_checkpoint_managers_taken(hook: impl FnOnce() + 'static) {
 
 pub(crate) fn checkpoint_managers_taken() {
     run_hook(&CHECKPOINT_MANAGERS_TAKEN_HOOK);
+}
+
+/// Run once on this thread when its next checkpoint took the catalog it
+/// copies into the log, before it writes the copies
+pub fn after_catalog_copies_taken(hook: impl FnOnce() + 'static) {
+    CATALOG_COPIES_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn catalog_copies_taken() {
+    run_hook(&CATALOG_COPIES_TAKEN_HOOK);
 }
 
 /// Run once on this thread when its next column type change wrote the
@@ -3733,6 +3744,7 @@ pub fn reset_all() {
     COLUMN_CHANGE_WAITING_HOOK.with(|slot| *slot.borrow_mut() = None);
     CHECKPOINT_CUT_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     CHECKPOINT_MANAGERS_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
+    CATALOG_COPIES_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     RETYPE_OUTPUTS_WRITTEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     RETYPE_MANIFEST_WRITTEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     ANALYZE_ROWS_COLLECTED_HOOK.with(|slot| *slot.borrow_mut() = None);
