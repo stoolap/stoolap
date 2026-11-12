@@ -1066,6 +1066,9 @@ pub struct MVCCEngine {
     /// (exclusive, brief ~100ms) to create a quiet moment where all_hot_empty can
     /// be true. This enables WAL truncation under continuous writes.
     seal_fence: Arc<parking_lot::RwLock<()>>,
+    /// The open transactions that created a table, entered before the table
+    /// is in `schemas`: the catalog copies wait until they end
+    creating_txns: Arc<parking_lot::Mutex<FxHashSet<i64>>>,
     /// True while a background compaction thread is running.
     /// Background checkpoint skips compaction when set. Forced compaction
     /// (PRAGMA CHECKPOINT, close, restore) waits for it to finish first.
@@ -1296,6 +1299,7 @@ impl MVCCEngine {
             hot_limits,
             checkpoint_mutex: Mutex::new(()),
             seal_fence: Arc::new(parking_lot::RwLock::new(())),
+            creating_txns: Arc::new(parking_lot::Mutex::new(FxHashSet::default())),
             compaction_running: Arc::new(AtomicBool::new(false)),
             backfill_running: AtomicBool::new(false),
             closing: AtomicBool::new(false),
@@ -6668,11 +6672,11 @@ impl MVCCEngine {
         }
         if checkpoint_lsn > 0 {
             // The boundary stays where it was, and the caller learns why
-            self.rerecord_ddl_to_wal()?;
+            let copied = self.rerecord_ddl_to_wal()?;
             // A type change taken past its record while the cut was held
             // and left without its manifest keeps the boundary before it;
             // the re-recording waited out any change in progress
-            if self.has_incomplete_change() {
+            if !copied || self.has_incomplete_change() {
                 checkpoint_lsn = 0;
             }
         }
@@ -7194,7 +7198,10 @@ impl MVCCEngine {
     ///
     /// Order matters: CreateTable must come before CreateIndex for the same table,
     /// because index replay needs the version store to exist.
-    fn rerecord_ddl_to_wal(&self) -> Result<()> {
+    ///
+    /// False, with nothing written, while an open transaction has created a
+    /// table: a copy of it would commit it.
+    fn rerecord_ddl_to_wal(&self) -> Result<bool> {
         // One DDL statement at a time between the read of the catalog and
         // the records written from it: a statement landing in between
         // would replay before the records that carry the state it changed
@@ -7202,6 +7209,9 @@ impl MVCCEngine {
         // Collect CreateTable entries and table names in a single schemas lock
         let (table_entries, table_names_for_indexes): (Vec<(String, Vec<u8>)>, Vec<String>) = {
             let schemas = self.schemas.read().unwrap();
+            if !self.creating_txns.lock().is_empty() {
+                return Ok(false);
+            }
             let entries = schemas
                 .values()
                 .map(|schema| (schema.table_name.clone(), Self::serialize_schema(schema)))
@@ -7257,7 +7267,7 @@ impl MVCCEngine {
         };
 
         if self.should_skip_wal() {
-            return Ok(());
+            return Ok(true);
         }
         let Some(pm) = self
             .persistence
@@ -7265,7 +7275,7 @@ impl MVCCEngine {
             .as_ref()
             .filter(|pm| pm.is_enabled())
         else {
-            return Ok(());
+            return Ok(true);
         };
 
         // Tables first (schemas must exist before indexes), then indexes,
@@ -7301,7 +7311,7 @@ impl MVCCEngine {
             }
         }
         drop(ddl);
-        Ok(())
+        Ok(true)
     }
 
     fn compact_volumes(&self) -> Result<()> {
@@ -9800,6 +9810,8 @@ struct EngineOperations {
         Arc<RwLock<FxHashMap<String, Arc<crate::storage::volume::manifest::SegmentManager>>>>,
     /// Seal fence for WAL truncation safety
     seal_fence: Arc<parking_lot::RwLock<()>>,
+    /// The engine's open transactions that created a table
+    creating_txns: Arc<parking_lot::Mutex<FxHashSet<i64>>>,
     /// Hot size limits shared with the engine
     hot_limits: Arc<HotLimits>,
     /// The engine's DDL guard and schema epoch
@@ -9810,6 +9822,8 @@ struct EngineOperations {
     key_holders: parking_lot::Mutex<I64Map<SmallVec<[Arc<VersionStore>; 2]>>>,
     /// Whether `key_holders` has an entry, so an end without holds skips its lock
     holding_keys: AtomicBool,
+    /// Whether `creating_txns` has an entry, so an end without one skips its lock
+    creating: AtomicBool,
 }
 
 // EngineOperations is Send + Sync because all fields are Arc-wrapped thread-safe types
@@ -9848,11 +9862,13 @@ impl EngineOperations {
             loading_from_disk: Arc::clone(&engine.loading_from_disk),
             segment_managers: Arc::clone(&engine.segment_managers),
             seal_fence: Arc::clone(&engine.seal_fence),
+            creating_txns: Arc::clone(&engine.creating_txns),
             hot_limits: Arc::clone(&engine.hot_limits),
             ddl: Arc::clone(&engine.ddl),
             open: Arc::clone(&engine.open),
             key_holders: parking_lot::Mutex::new(crate::common::new_i64_map()),
             holding_keys: AtomicBool::new(false),
+            creating: AtomicBool::new(false),
         }
     }
 
@@ -10303,6 +10319,10 @@ impl TransactionEngineOperations for EngineOperations {
 
         let version_store = new_table_store(&schema, &self.registry, indexes)?;
         let schema_data = MVCCEngine::serialize_schema(&schema);
+        if txn_id != super::persistence::DDL_TXN_ID {
+            self.creating_txns.lock().insert(txn_id);
+            self.creating.store(true, Ordering::Release);
+        }
 
         // Atomically check-and-insert under write lock to prevent TOCTOU race
         {
@@ -10987,6 +11007,15 @@ impl TransactionEngineOperations for EngineOperations {
         for store in stores.iter().flatten() {
             store.key_holds().release(txn_id);
         }
+    }
+
+    fn end_table_creates(&self, txn_id: i64) {
+        if !self.creating.load(Ordering::Acquire) {
+            return;
+        }
+        let mut txns = self.creating_txns.lock();
+        txns.remove(&txn_id);
+        self.creating.store(!txns.is_empty(), Ordering::Release);
     }
 
     fn finish_all_tables(&self, txn_id: i64) {
