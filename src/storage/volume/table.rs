@@ -1346,9 +1346,13 @@ impl SegmentedTable {
             }
             let cut = self.read_cut();
             let default = self.column_default(col_idx);
+            let side = self
+                .order_side_def(col_idx)
+                .filter(|def| def.kind == KeyKind::OrderedI64);
             for (_, cs) in volumes.iter() {
                 self.volume_distinct(
                     cs,
+                    side.as_ref(),
                     (col_idx, data_type, &default, with_null),
                     (&tombstones, &hot_skip, &cut),
                     &mut distinct,
@@ -1360,11 +1364,12 @@ impl SegmentedTable {
     }
 
     /// Adds the values of `cs` the statement sees to `distinct`: the volume's
-    /// dictionary when it hides no row, else the dictionary ids or values of
-    /// the rows shown. A volume hidden whole is not decoded
+    /// dictionary or the keys of `side` when it hides no row, else the
+    /// dictionary ids or values of the rows shown. A volume hidden whole is not decoded
     fn volume_distinct(
         &self,
         cs: &super::manifest::ColdSegment,
+        side: Option<&SideIndexDef>,
         (col_idx, data_type, default, with_null): (usize, DataType, &Value, bool),
         (tombstones, hot_skip, cut): (&FxHashMap<i64, u64>, &FxHashSet<i64>, &CommitCut),
         distinct: &mut ValueSet,
@@ -1400,6 +1405,11 @@ impl SegmentedTable {
                 }
                 return Ok(());
             }
+            if let Some(def) = side {
+                if Self::side_distinct(cs, def, (phys, data_type, with_null), distinct)? {
+                    return Ok(());
+                }
+            }
         }
         let column = vol.columns.get(phys)?;
         // Values mostly distinct in a sample go to the set whole, hashed once
@@ -1420,6 +1430,53 @@ impl SegmentedTable {
             distinct.insert(column.get_value(i));
         }
         Ok(())
+    }
+
+    /// Adds the keys of `def`'s entry in the side file of `cs` to `distinct`,
+    /// NULL too when `with_null` and the volume holds one; false, adding
+    /// nothing, when the entry is not served or misses a non-null row
+    fn side_distinct(
+        cs: &super::manifest::ColdSegment,
+        def: &SideIndexDef,
+        (phys, data_type, with_null): (usize, DataType, bool),
+        distinct: &mut ValueSet,
+    ) -> Result<bool> {
+        use super::secondary::{is_refused, READS};
+        let Some(side) = cs.side_for(def, Capability::Range) else {
+            return Ok(false);
+        };
+        let (Some(entry), Some(zone)) = (
+            side.directory().entry(def.identity),
+            cs.volume.meta.zone_maps.get(phys),
+        ) else {
+            return Ok(false);
+        };
+        // A NaN has no key
+        if entry.n_positions + zone.null_count as u64 != cs.volume.meta.row_count as u64 {
+            return Ok(false);
+        }
+        let reader = match side.reader(def.identity, 1) {
+            Ok(reader) => reader,
+            Err(error) if is_refused(&error) => {
+                READS.count(&READS.refused, 1);
+                return Ok(false);
+            }
+            Err(error) => return Err(side_error(error)),
+        };
+        let value: fn(i64) -> Value = match def.components.first().map(|c| c.domain) {
+            Some(Domain::Integer) => Value::Integer,
+            Some(Domain::Float) => |key| Value::Float(super::side_index::float_of_key(key)),
+            Some(Domain::Timestamp) => super::writer::timestamp_value,
+            _ => return Ok(false),
+        };
+        distinct.reserve(entry.n_keys as usize);
+        reader
+            .each_key_page(|keys| distinct.extend(keys.iter().map(|&key| value(key))))
+            .map_err(side_error)?;
+        if with_null && zone.null_count > 0 {
+            distinct.insert(Value::null(data_type));
+        }
+        Ok(true)
     }
 
     /// The positions of `cs` the statement sees, as bits; None when it sees
