@@ -20,6 +20,7 @@ mod oracle;
 
 mod add_column_not_null_test;
 mod auto_increment_test;
+mod block_reads_tables_as_found_test;
 mod bug_composite_unique_upsert_test;
 mod bug_conflict_target_test;
 mod bug_insert_select_upsert_dup_test;

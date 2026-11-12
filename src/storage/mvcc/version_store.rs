@@ -7271,6 +7271,9 @@ pub struct TransactionVersionStore {
 /// No row of the transaction is held yet
 const NO_ROWS: u64 = u64::MAX;
 
+/// A write order cut that keeps every write the transaction made
+pub const EVERY_WRITE: i64 = i64::MAX;
+
 /// A transaction's local store for one table, with the admission of the
 /// handles that read it, which takes no lock of the store
 pub struct TxnTableStore {
@@ -8078,24 +8081,31 @@ impl TransactionVersionStore {
     /// Get the latest local version for a specific row, if any.
     #[inline]
     pub fn get_latest_local(&self, row_id: i64) -> Option<&RowVersion> {
-        self.local_versions
-            .as_ref()
-            .and_then(|lv| lv.get(row_id))
-            .and_then(|versions| versions.last())
+        self.local_version_at(row_id, EVERY_WRITE)
+    }
+
+    /// The newest local version of `row_id` written at or before the write
+    /// order `cut`: what a rollback to `cut` would leave of it
+    #[inline]
+    pub fn local_version_at(&self, row_id: i64, cut: i64) -> Option<&RowVersion> {
+        let versions = self.local_versions.as_ref()?.get(row_id)?;
+        versions.iter().rev().find(|v| v.create_time <= cut)
     }
 
     /// Iterate over local versions (returns most recent version per row)
     /// The `column` value and id of every uncommitted row of this
     /// transaction that holds a value there, and the id of every row it
     /// wrote, deleted ones included: the transaction's version of a row is
-    /// the truth about it, whatever key the shared index holds it under
+    /// the truth about it, whatever key the shared index holds it under.
+    /// Only the rows written by the write order `cut` count
     pub fn local_values(
         &self,
         column: usize,
+        cut: i64,
         out: &mut Vec<(Value, i64)>,
         written: &mut crate::common::I64Set,
     ) {
-        for (row_id, version) in self.iter_local() {
+        for (row_id, version) in self.iter_local_at(cut) {
             written.insert(row_id);
             if version.is_deleted() {
                 continue;
@@ -8109,33 +8119,39 @@ impl TransactionVersionStore {
     }
 
     pub fn iter_local(&self) -> impl Iterator<Item = (i64, &RowVersion)> {
+        self.iter_local_at(EVERY_WRITE)
+    }
+
+    /// Each row's newest local version written at or before the write order `cut`
+    pub fn iter_local_at(&self, cut: i64) -> impl Iterator<Item = (i64, &RowVersion)> {
         self.local_versions
             .iter()
             .flat_map(|lv| lv.iter())
-            .filter_map(|(k, versions)| versions.last().map(|v| (k, v)))
+            .filter_map(move |(k, versions)| {
+                let version = versions.iter().rev().find(|v| v.create_time <= cut);
+                version.map(|v| (k, v))
+            })
     }
 
     /// Get the local version for a row (without checking parent)
     /// Returns the most recent version in the transaction's history
     pub fn get_local_version(&self, row_id: i64) -> Option<&RowVersion> {
-        self.local_versions
-            .as_ref()
-            .and_then(|lv| lv.get(row_id))
-            .and_then(|versions| versions.last())
+        self.local_version_at(row_id, EVERY_WRITE)
     }
 
     /// Get a row, checking local versions first then parent store
     pub fn get(&self, row_id: i64) -> Option<Row> {
-        // Check local versions first (get most recent)
-        if let Some(lv) = self.local_versions.as_ref() {
-            if let Some(versions) = lv.get(row_id) {
-                if let Some(local_version) = versions.last() {
-                    if local_version.is_deleted() {
-                        return None;
-                    }
-                    return Some(local_version.data.clone());
-                }
+        self.get_at(row_id, EVERY_WRITE)
+    }
+
+    /// A row as it stood at the write order `cut`: the transaction's version
+    /// then, else the parent store's
+    pub fn get_at(&self, row_id: i64, cut: i64) -> Option<Row> {
+        if let Some(local_version) = self.local_version_at(row_id, cut) {
+            if local_version.is_deleted() {
+                return None;
             }
+            return Some(local_version.data.clone());
         }
 
         // Check parent store

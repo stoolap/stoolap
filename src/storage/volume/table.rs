@@ -44,7 +44,7 @@ use crate::storage::mvcc::index_plan::{self, IndexPlan};
 use crate::storage::mvcc::registry::{CommitCut, StatementView};
 use crate::storage::mvcc::txn_gate::{GateRef, TxnGate};
 use crate::storage::mvcc::version_store::{
-    aggregate_row, grouped_aggregates, AggregateOp, LayoutToken,
+    aggregate_row, grouped_aggregates, AggregateOp, LayoutToken, EVERY_WRITE,
 };
 use crate::storage::traits::table::ScanAccess;
 use crate::storage::traits::{
@@ -53,7 +53,7 @@ use crate::storage::traits::{
 };
 
 use super::column::ZoneMap;
-use super::manifest::SegmentManager;
+use super::manifest::{Pending, SegmentManager};
 use super::scanner::{RowVecScanner, VolumeScanner};
 use super::side_index::{resolve, ByteRange, Capability, Domain, KeyKind, Resolved, SideIndexDef};
 use super::writer::FrozenVolume;
@@ -686,6 +686,9 @@ pub struct SegmentedTable {
     /// The transaction's gate, which admits each statement once for both
     /// layers; the hot table it owns has none
     gate: Option<GateRef>,
+    /// The write order the transaction's pending tombstones are read at, the
+    /// one its hot table reads the transaction's rows at
+    cut: i64,
 }
 
 impl SegmentedTable {
@@ -752,7 +755,7 @@ impl SegmentedTable {
             crate::test_failpoints::cold_volumes_taken();
             let tombstones_arc = &view.ts;
             self.segment_mgr
-                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+                .insert_pending_tombstones_into(self.pending(), &mut hot_skip);
 
             let mut collected = 0usize;
             let mut cold_skipped = 0usize;
@@ -915,7 +918,7 @@ impl SegmentedTable {
                 skip.insert(id);
             }
             self.segment_mgr
-                .insert_pending_tombstones_into(self.txn_id(), &mut skip);
+                .insert_pending_tombstones_into(self.pending(), &mut skip);
 
             let Some(mut all_rows) =
                 self.collect_cold_rows(where_expr, skip, generation, None, &cut)?
@@ -948,7 +951,7 @@ impl SegmentedTable {
                 skip.insert(id);
             }
             self.segment_mgr
-                .insert_pending_tombstones_into(self.txn_id(), &mut skip);
+                .insert_pending_tombstones_into(self.pending(), &mut skip);
 
             let Some(cold) = self.count_cold_rows(&skip, generation, &cut)? else {
                 return Ok(None);
@@ -1032,6 +1035,7 @@ impl SegmentedTable {
             view: None,
             schema_generation,
             gate: None,
+            cut: EVERY_WRITE,
         }
     }
 
@@ -1045,6 +1049,21 @@ impl SegmentedTable {
     pub(crate) fn with_view(mut self, view: Option<StatementView>) -> Self {
         self.view = view;
         self
+    }
+
+    /// The table reads the transaction's pending tombstones as they stood at
+    /// the write order `cut`, as its hot table reads the transaction's rows
+    pub(crate) fn with_cut(mut self, cut: i64) -> Self {
+        self.cut = cut;
+        self
+    }
+
+    /// The transaction's pending tombstones this table's reads see
+    fn pending(&self) -> Pending {
+        Pending {
+            txn_id: self.txn_id(),
+            cut: self.cut,
+        }
     }
 
     /// Whether this handle may see older rows than the newest committed
@@ -1129,6 +1148,7 @@ impl SegmentedTable {
             view: None,
             schema_generation: 0,
             gate: None,
+            cut: EVERY_WRITE,
         }
     }
 
@@ -1278,7 +1298,7 @@ impl SegmentedTable {
         crate::test_failpoints::cold_view_taken();
         self.hot.collect_hot_row_ids_into(hot_skip);
         self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), hot_skip);
+            .insert_pending_tombstones_into(self.pending(), hot_skip);
         Ok((tombstones, volumes))
     }
 
@@ -1647,7 +1667,7 @@ impl SegmentedTable {
             FxHashSet::with_capacity_and_hasher(10_000, Default::default());
         self.hot.collect_hot_row_ids_into(&mut hot_skip);
         self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+            .insert_pending_tombstones_into(self.pending(), &mut hot_skip);
 
         for (_, cs) in volumes.iter() {
             let vol = &cs.volume;
@@ -1842,7 +1862,7 @@ impl SegmentedTable {
                 Some(rid) => rid,
                 None => return Ok(None),
             };
-        if self.segment_mgr.is_pending_tombstone(self.txn_id(), rid) {
+        if self.segment_mgr.is_pending_tombstone(self.pending(), rid) {
             return Ok(None);
         }
         Ok(Some(rid))
@@ -1874,7 +1894,7 @@ impl SegmentedTable {
             None => return Ok(None),
         };
 
-        if self.segment_mgr.is_pending_tombstone(self.txn_id(), rid) {
+        if self.segment_mgr.is_pending_tombstone(self.pending(), rid) {
             return Ok(None);
         }
 
@@ -2214,7 +2234,7 @@ impl SegmentedTable {
             FxHashSet::with_capacity_and_hasher(10_000, Default::default());
         self.hot.collect_hot_row_ids_into(&mut hot_skip);
         self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+            .insert_pending_tombstones_into(self.pending(), &mut hot_skip);
         let fallible = where_expr.is_some_and(|expr| expr.can_fail());
         for (seg_id, cs) in snap.volumes_newest_first().iter() {
             if prep.seen_segments.contains(seg_id) {
@@ -2516,7 +2536,10 @@ impl SegmentedTable {
                         // check_value_exists_in_segments filters committed tombstones.
                         // A row this txn deleted is no key conflict; the
                         // row's unique keys are still checked below
-                        if !self.segment_mgr.is_pending_tombstone(self.txn_id(), row_id) {
+                        if !self
+                            .segment_mgr
+                            .is_pending_tombstone(self.pending(), row_id)
+                        {
                             return Err(crate::core::Error::PrimaryKeyConstraint { row_id });
                         }
                     }
@@ -3640,7 +3663,7 @@ impl SegmentedTable {
                 skip.insert(id);
             }
             self.segment_mgr
-                .insert_pending_tombstones_into(self.txn_id(), &mut skip);
+                .insert_pending_tombstones_into(self.pending(), &mut skip);
 
             // Create lazy cold scanners with the skip set (no eager collection).
             // This avoids O(total_cold_rows) memory allocation that was making
@@ -4171,7 +4194,10 @@ impl SegmentedTable {
         if self.is_row_tombstoned(&snap.tombstones, row_id, cut) {
             return Ok(None);
         }
-        if self.segment_mgr.is_pending_tombstone(self.txn_id(), row_id) {
+        if self
+            .segment_mgr
+            .is_pending_tombstone(self.pending(), row_id)
+        {
             return Ok(None);
         }
         for &seg_id in &snap.seg_ids_newest_first {
@@ -4381,7 +4407,7 @@ impl SegmentedTable {
             hot_skip.reserve(10_000);
             self.hot.collect_hot_row_ids_into(&mut hot_skip);
             self.segment_mgr
-                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+                .insert_pending_tombstones_into(self.pending(), &mut hot_skip);
         }
         let schema = self.hot.schema();
         // The columns the predicate reads; every row matches without one,
@@ -4535,7 +4561,7 @@ impl SegmentedTable {
             smallvec::SmallVec::new()
         } else {
             self.segment_mgr
-                .pending_among(self.txn_id(), deletes.iter().map(|d| d.row_id))
+                .pending_among(self.pending(), deletes.iter().map(|d| d.row_id))
         };
         if !changed.is_empty() {
             changed.sort_unstable();
@@ -4598,7 +4624,10 @@ impl SegmentedTable {
             }
         }
         // Check pending tombstones for this transaction (no Vec clone)
-        if self.segment_mgr.is_pending_tombstone(self.txn_id(), row_id) {
+        if self
+            .segment_mgr
+            .is_pending_tombstone(self.pending(), row_id)
+        {
             return Ok(None);
         }
 
@@ -5073,7 +5102,7 @@ impl Table for SegmentedTable {
                 hot_skip.insert(*id);
             }
             self.segment_mgr
-                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+                .insert_pending_tombstones_into(self.pending(), &mut hot_skip);
 
             let mut ids = Vec::new();
             for (_, cs) in volumes.iter() {
@@ -5227,7 +5256,7 @@ impl Table for SegmentedTable {
                 skip.insert(id);
             }
             self.segment_mgr
-                .insert_pending_tombstones_into(self.txn_id(), &mut skip);
+                .insert_pending_tombstones_into(self.pending(), &mut skip);
 
             let Some(mut all_rows) = self.collect_cold_rows(None, skip, generation, None, &cut)?
             else {
@@ -5421,7 +5450,7 @@ impl Table for SegmentedTable {
                 FxHashSet::with_capacity_and_hasher(10_000, Default::default());
             self.hot.collect_hot_row_ids_into(&mut hot_skip);
             self.segment_mgr
-                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+                .insert_pending_tombstones_into(self.pending(), &mut hot_skip);
 
             let total_cold_rows: usize =
                 view.volumes().map(|(_, cs)| cs.volume.meta.row_count).sum();
@@ -5672,7 +5701,7 @@ impl Table for SegmentedTable {
                 let seg = self.segment_mgr.deduped_row_count()?;
                 #[cfg(feature = "test-failpoints")]
                 crate::test_failpoints::hot_and_cold_reads_split();
-                let pending = self.segment_mgr.pending_tombstone_count(self.txn_id());
+                let pending = self.segment_mgr.pending_tombstone_count(self.pending());
                 let count = seg.saturating_sub(pending) + self.hot.row_count()?;
                 if self.seal_moved(generation) {
                     return Ok(None);
@@ -5691,7 +5720,7 @@ impl Table for SegmentedTable {
 
     fn row_count_hint(&self) -> usize {
         let seg = self.segment_row_count_hint();
-        let pending = self.segment_mgr.pending_tombstone_count(self.txn_id());
+        let pending = self.segment_mgr.pending_tombstone_count(self.pending());
         let overlap = self.segment_mgr.seal_overlap();
         seg.saturating_sub(pending) + self.hot.row_count_hint().saturating_sub(overlap)
     }
@@ -5710,7 +5739,7 @@ impl Table for SegmentedTable {
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::hot_and_cold_reads_split();
             let seg = self.segment_mgr.deduped_row_count()?;
-            let pending = self.segment_mgr.pending_tombstone_count(self.txn_id());
+            let pending = self.segment_mgr.pending_tombstone_count(self.pending());
             let count = seg.saturating_sub(pending) + hot_count;
             Ok((!self.seal_moved(generation)).then_some(Some(count)))
         })
@@ -6847,7 +6876,7 @@ impl Table for SegmentedTable {
                 FxHashSet::with_capacity_and_hasher(10_000, Default::default());
             self.hot.collect_hot_row_ids_into(&mut skip);
             self.segment_mgr
-                .insert_pending_tombstones_into(self.txn_id(), &mut skip);
+                .insert_pending_tombstones_into(self.pending(), &mut skip);
             let tombstones_arc = self.segment_mgr.tombstone_set_arc();
 
             // 3. Get volumes (oldest first — segment_id ascending order).
@@ -7223,7 +7252,7 @@ impl Table for SegmentedTable {
             // Cold rows this transaction deleted or updated are not in the volumes'
             // committed tombstones yet
             self.segment_mgr
-                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+                .insert_pending_tombstones_into(self.pending(), &mut hot_skip);
 
             let volumes = self.segment_mgr.get_volumes_newest_first_lazy();
             // A NaN, which no zone map bounds, comes first descending

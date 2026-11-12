@@ -91,7 +91,7 @@ RETURNING id AS counter, count + 1 next_count, count * 2;
 
 ## Subqueries in RETURNING
 
-A `RETURNING` value may hold a subquery. It sees the tables as the statement found them, and a column of the target in it names the row returned:
+A `RETURNING` value may hold a subquery. It sees the tables as the statement found them, without the rows the statement's foreign key actions change, and a column of the target in it names the row returned:
 
 ```sql
 UPDATE products SET price = price * 1.1 WHERE category_id = 3
