@@ -45,15 +45,23 @@ fn ids(db: &Database) -> Vec<i64> {
         .collect()
 }
 
-fn wal_file(dir: &Path) -> PathBuf {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir.join("wal"))
+fn wal_files(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir.join("wal"))
         .unwrap()
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("log"))
-        .collect();
-    assert_eq!(files.len(), 1, "one WAL file: {files:?}");
-    files.pop().unwrap()
+        .collect()
+}
+
+/// The WAL file records are appended to: the one starting at the highest LSN
+fn wal_file(dir: &Path) -> PathBuf {
+    let start = |p: &PathBuf| -> u64 {
+        let name = p.file_stem().unwrap().to_str().unwrap();
+        name.rsplit_once("-lsn-")
+            .map_or(0, |(_, lsn)| lsn.parse().unwrap())
+    };
+    wal_files(dir).into_iter().max_by_key(start).unwrap()
 }
 
 /// Each record's start, length and flags
@@ -98,9 +106,24 @@ fn fixture(dir: &Path) {
     db.close().unwrap();
 }
 
-/// Opens, commits `more`, and opens twice more: every read after the
-/// first holds what the first read held and every commit made since
-fn reopen_and_write(dir: &Path, expected: &[i64]) {
+/// Rows 1 to 5 sealed by a checkpoint and row 6 left in the WAL: an open
+/// that drops row 6 replays nothing to seal, so it appends to that file
+fn fixture_sealed(dir: &Path) {
+    let db = Database::open(&dsn(dir)).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    for id in 1..=5 {
+        db.execute(&format!("INSERT INTO t VALUES ({id}, {id})"), ())
+            .unwrap();
+    }
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (6, 6)", ()).unwrap();
+    db.close().unwrap();
+}
+
+/// Opens, checks `expected`, commits rows 10 and 11 and closes; the rows
+/// the database then holds
+fn first_session(dir: &Path, expected: &[i64]) -> Vec<i64> {
     let db = Database::open(&dsn(dir)).unwrap();
     assert_eq!(ids(&db), expected, "the first open");
     db.execute("INSERT INTO t VALUES (10, 10)", ()).unwrap();
@@ -109,7 +132,17 @@ fn reopen_and_write(dir: &Path, expected: &[i64]) {
     with_new.extend([10, 11]);
     assert_eq!(ids(&db), with_new, "the rows written after the open");
     db.close().unwrap();
-    drop(db);
+    with_new
+}
+
+/// Opens, commits `more`, and opens twice more: every read after the
+/// first holds what the first read held and every commit made since
+fn reopen_and_write(dir: &Path, expected: &[i64]) {
+    let with_new = first_session(dir, expected);
+    later_sessions(dir, with_new);
+}
+
+fn later_sessions(dir: &Path, mut with_new: Vec<i64>) {
     let db = Database::open(&dsn(dir)).unwrap();
     assert_eq!(ids(&db), with_new, "the second open");
     db.execute("INSERT INTO t VALUES (20, 20)", ()).unwrap();
@@ -121,12 +154,20 @@ fn reopen_and_write(dir: &Path, expected: &[i64]) {
     db.close().unwrap();
 }
 
-/// A reopen appends after the last whole record, never after torn bytes
-fn assert_whole_records(dir: &Path) {
+/// A reopen appends after the last whole record, never after torn bytes:
+/// `torn` grew past `before`, and every file holds whole records
+fn assert_whole_records(dir: &Path, torn: &Path, before: u64) {
     assert!(
-        whole_records(&std::fs::read(wal_file(dir)).unwrap()),
-        "the WAL holds whole records only"
+        std::fs::metadata(torn).unwrap().len() > before,
+        "records were appended to the file the crash cut"
     );
+    for file in wal_files(dir) {
+        assert!(
+            whole_records(&std::fs::read(&file).unwrap()),
+            "{} holds whole records only",
+            file.display()
+        );
+    }
 }
 
 /// The last commit marker cut short commits nothing, at the first open
@@ -135,14 +176,16 @@ fn assert_whole_records(dir: &Path) {
 fn a_cut_last_record_commits_nothing_and_later_commits_stay() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    fixture(dir.path());
+    fixture_sealed(dir.path());
     let wal = wal_file(dir.path());
-    let len = std::fs::metadata(&wal).unwrap().len();
+    let bytes = std::fs::read(&wal).unwrap();
+    let (start, _, _) = *records(&bytes).last().unwrap();
     let file = std::fs::OpenOptions::new().write(true).open(&wal).unwrap();
-    file.set_len(len - 7).unwrap();
+    file.set_len(bytes.len() as u64 - 7).unwrap();
     drop(file);
-    reopen_and_write(dir.path(), &[1, 2, 3, 4, 5]);
-    assert_whole_records(dir.path());
+    let with_new = first_session(dir.path(), &[1, 2, 3, 4, 5]);
+    assert_whole_records(dir.path(), &wal, start as u64);
+    later_sessions(dir.path(), with_new);
 }
 
 /// A record header after the last record, its body never written: it is
@@ -152,7 +195,7 @@ fn a_header_without_its_body_is_dropped_and_later_commits_stay() {
     let _serial = serial();
     use std::io::Write;
     let dir = tempfile::tempdir().unwrap();
-    fixture(dir.path());
+    fixture_sealed(dir.path());
     let wal = wal_file(dir.path());
     let bytes = std::fs::read(&wal).unwrap();
     // The last record's header with a longer body claimed and 10 bytes of it
@@ -164,8 +207,9 @@ fn a_header_without_its_body_is_dropped_and_later_commits_stay() {
     file.write_all(&header).unwrap();
     file.write_all(&[0xAB; 10]).unwrap();
     drop(file);
-    reopen_and_write(dir.path(), &[1, 2, 3, 4, 5, 6]);
-    assert_whole_records(dir.path());
+    let with_new = first_session(dir.path(), &[1, 2, 3, 4, 5, 6]);
+    assert_whole_records(dir.path(), &wal, bytes.len() as u64);
+    later_sessions(dir.path(), with_new);
 }
 
 /// A commit marker cut short in the middle of the file, the records
@@ -330,8 +374,13 @@ fn an_open_without_the_lock_cuts_nothing() {
     fixture(dir.path());
     let owner = Database::open(&dsn(dir.path())).unwrap();
     let wal = wal_file(dir.path());
-    let bytes = std::fs::read(&wal).unwrap();
-    // The owner's record in flight: its header and part of its body
+    // The owner's record in flight in the file it appends to: the header and
+    // part of the body of a record its WAL holds
+    let bytes = wal_files(dir.path())
+        .iter()
+        .map(|file| std::fs::read(file).unwrap())
+        .max_by_key(Vec::len)
+        .unwrap();
     let (start, _, _) = *records(&bytes).last().unwrap();
     let mut file = std::fs::OpenOptions::new().append(true).open(&wal).unwrap();
     file.write_all(&bytes[start..start + 40]).unwrap();
@@ -361,20 +410,34 @@ fn a_commit_that_fails_after_the_cut_is_taken_back() {
     use stoolap::test_failpoints;
     let _guard = serial();
     let dir = tempfile::tempdir().unwrap();
-    fixture(dir.path());
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(wal_file(dir.path()))
-        .unwrap();
+    fixture_sealed(dir.path());
+    let wal = wal_file(dir.path());
+    // Row 6's commit marker goes, so the open replays nothing to seal and
+    // keeps appending to this file
+    let (start, _, _) = *records(&std::fs::read(&wal).unwrap()).last().unwrap();
+    let file = std::fs::OpenOptions::new().write(true).open(&wal).unwrap();
+    file.set_len(start as u64).unwrap();
+    drop(file);
+    let mut file = std::fs::OpenOptions::new().append(true).open(&wal).unwrap();
     file.write_all(&[0xAB; 8192]).unwrap();
     drop(file);
     let db = Database::open(&dsn(dir.path())).unwrap();
+    assert_eq!(
+        wal_file(dir.path()),
+        wal,
+        "the open appends to the cut file"
+    );
     test_failpoints::WAL_SYNC_FAIL.store(true, Ordering::Release);
     let rejected = db.execute("INSERT INTO t VALUES (10, 10)", ());
     test_failpoints::WAL_SYNC_FAIL.store(false, Ordering::Release);
     assert!(rejected.is_err(), "the commit's sync failed");
     drop(db);
+    assert_eq!(
+        std::fs::metadata(&wal).unwrap().len(),
+        start as u64,
+        "taken back to the end the cut left"
+    );
     let db = Database::open(&dsn(dir.path())).unwrap();
-    assert_eq!(ids(&db), vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(ids(&db), vec![1, 2, 3, 4, 5]);
     db.close().unwrap();
 }
