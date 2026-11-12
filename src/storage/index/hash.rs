@@ -682,9 +682,9 @@ impl Index for HashIndex {
         results
     }
 
-    fn get_all_values(&self) -> Vec<Value> {
+    fn get_all_values(&self) -> Option<Vec<Value>> {
         if self.closed.load(AtomicOrdering::Acquire) {
-            return Vec::new();
+            return None;
         }
         let hash_to_values = self.hash_to_values.read();
         let mut result = Vec::with_capacity(hash_to_values.len());
@@ -696,7 +696,7 @@ impl Index for HashIndex {
                 }
             }
         }
-        result
+        Some(result)
     }
 
     fn get_distinct_count_excluding_null(&self) -> Option<usize> {

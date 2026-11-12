@@ -747,11 +747,11 @@ impl Index for BTreeIndex {
         max
     }
 
-    fn get_all_values(&self) -> Vec<Value> {
+    fn get_all_values(&self) -> Option<Vec<Value>> {
         if self.closed.load(AtomicOrdering::Acquire) {
-            return Vec::new();
+            return None;
         }
-        BTreeIndex::get_all_values(self)
+        Some(BTreeIndex::get_all_values(self))
     }
 
     fn get_distinct_count_excluding_null(&self) -> Option<usize> {

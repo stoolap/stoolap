@@ -813,6 +813,37 @@ const CASES: &[(&str, &str, &str, &str)] = &[
         "SELECT DISTINCT ON (s) s, COUNT(*) FROM t GROUP BY s",
         "SELECT DISTINCT ON (s) s, COUNT(*) FROM t WHERE id + 0 = id GROUP BY s",
     ),
+    // With no call, the groups are the column's distinct values
+    (
+        "memory",
+        "storage_grouped",
+        "SELECT g FROM t GROUP BY g",
+        "SELECT g FROM t WHERE id + 0 = id GROUP BY g",
+    ),
+    (
+        "sealed",
+        "storage_grouped",
+        "SELECT g FROM t GROUP BY g",
+        "SELECT g FROM t WHERE id + 0 = id GROUP BY g",
+    ),
+    (
+        "empty",
+        "storage_grouped",
+        "SELECT g FROM t GROUP BY g",
+        "SELECT g FROM t WHERE id + 0 = id GROUP BY g",
+    ),
+    (
+        "sealed",
+        "storage_grouped",
+        "SELECT g FROM t GROUP BY g HAVING g > 1",
+        "SELECT g FROM t WHERE id + 0 = id GROUP BY g HAVING g > 1",
+    ),
+    (
+        "memory",
+        "storage_grouped",
+        "SELECT g AS k FROM t GROUP BY g ORDER BY k DESC LIMIT 1",
+        "SELECT g AS k FROM t WHERE id + 0 = id GROUP BY g ORDER BY k DESC LIMIT 1",
+    ),
 ];
 
 fn open(db: Database, seal: bool, rows: bool) -> Database {

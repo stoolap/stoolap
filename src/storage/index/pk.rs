@@ -719,7 +719,7 @@ impl Index for PkIndex {
         }
     }
 
-    fn get_all_values(&self) -> Vec<Value> {
+    fn get_all_values(&self) -> Option<Vec<Value>> {
         let inner = self.data.read();
         let mut result = Vec::with_capacity(inner.count);
         for_each_set_bit(&inner.words, |rid| {
@@ -733,7 +733,7 @@ impl Index for PkIndex {
                 result.push(Value::Integer(id));
             }
         }
-        result
+        Some(result)
     }
 
     fn get_distinct_count_excluding_null(&self) -> Option<usize> {

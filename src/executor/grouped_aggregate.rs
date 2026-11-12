@@ -56,6 +56,10 @@ impl Executor {
         plain: bool,
         grouped_names: bool,
     ) -> GroupedSource {
+        // With no call, the groups are the column's distinct values
+        if plain && aggregations.is_empty() {
+            return GroupedSource::Storage;
+        }
         if !plain
             || aggregations.is_empty()
             || Self::aggregates_hold_subquery(stmt)
@@ -163,8 +167,9 @@ impl Executor {
         }
         // A table that declines its own grouping is walked by its index when
         // the walk may read the groups
-        let walks = source == GroupedSource::SortedStream
-            || Self::sorts_groups(stmt, classification, &aggregations, grouped_names);
+        let walks = !aggregations.is_empty()
+            && (source == GroupedSource::SortedStream
+                || Self::sorts_groups(stmt, classification, &aggregations, grouped_names));
         Ok(Some(AggregatePlan {
             aggregations,
             read: AggregateRead::Grouped {
@@ -251,6 +256,16 @@ impl Executor {
         columns: &[Option<usize>],
     ) -> Result<Option<RowVec>> {
         use crate::storage::mvcc::version_store::AggregateOp;
+        if aggregations.is_empty() {
+            let column = &table.schema().columns[group_index].name_lower;
+            let values = table.get_partition_values(column)?;
+            return Ok(values.map(|values| {
+                (0i64..)
+                    .zip(values)
+                    .map(|(id, value)| (id, Row::from_values(vec![value])))
+                    .collect()
+            }));
+        }
         let mut ops = Vec::with_capacity(aggregations.len());
         for (agg, &column) in aggregations.iter().zip(columns) {
             let op = match (agg.name.as_str(), agg.column.as_str(), column) {
