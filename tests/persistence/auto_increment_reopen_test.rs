@@ -154,19 +154,24 @@ fn test_truncate_during_catalog_copies_restarts_ids_after_crash() {
     db.execute("INSERT INTO t (v) VALUES ('a'), ('b'), ('c')", ())
         .unwrap();
     let other = db.clone();
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let truncate = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let handle = std::sync::Arc::clone(&truncate);
+    let truncate = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let slot = std::rc::Rc::clone(&truncate);
     stoolap::test_failpoints::after_catalog_copies_taken(move || {
-        *handle.lock().unwrap() = Some(std::thread::spawn(move || {
+        // The TRUNCATE either waits for the checkpoint's guard or lands now
+        let (reached, settled) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let waits = reached.clone();
+            stoolap::test_failpoints::on_ddl_guard_waiting(move || {
+                let _ = waits.send("waits");
+            });
             other.execute("TRUNCATE TABLE t", ()).unwrap();
-            let _ = done_tx.send(());
-        }));
-        // Ahead of the copies when nothing holds it back
-        let _ = done_rx.recv_timeout(std::time::Duration::from_millis(500));
+            let _ = reached.send("landed");
+        });
+        settled.recv().unwrap();
+        *slot.borrow_mut() = Some(handle);
     });
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
-    truncate.lock().unwrap().take().unwrap().join().unwrap();
+    truncate.borrow_mut().take().unwrap().join().unwrap();
     crash_image(&first, &crashed);
     db.close().unwrap();
 
