@@ -711,9 +711,9 @@ impl PersistenceManager {
         }
     }
 
-    /// Whether the WAL refuses every write after a failed write or sync
-    pub fn is_wal_poisoned(&self) -> bool {
-        self.wal.as_ref().is_some_and(|wal| wal.is_poisoned())
+    /// The error every write gets once a failed write or sync poisoned the WAL
+    pub fn check_wal_writable(&self) -> Result<()> {
+        self.wal.as_ref().map_or(Ok(()), |wal| wal.check_writable())
     }
 
     /// Get the checkpoint interval

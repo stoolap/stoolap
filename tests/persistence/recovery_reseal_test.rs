@@ -85,6 +85,9 @@ fn crashed(root: &Path) -> (i64, i64) {
 
 #[test]
 fn a_database_reopened_after_crash_after_crash_seals_its_log_once() {
+    // The failpoint tests here fail WAL syncs process-wide
+    #[cfg(feature = "test-failpoints")]
+    let _guard = stoolap::test_failpoints::FailpointGuard::new();
     let root = tempfile::tempdir().unwrap();
     let want = crashed(root.path());
     let mut counts = Vec::new();
@@ -123,4 +126,27 @@ fn a_recovery_whose_checkpoint_poisons_the_wal_fails_the_open() {
     let db = Database::open(&dsn(&dir)).unwrap();
     assert_eq!(sum(&db), want, "the next open recovers the rows");
     db.close().unwrap();
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_recovery_whose_wal_rotation_poisons_the_wal_fails_the_open_when_no_truncation_follows() {
+    use std::sync::atomic::Ordering;
+    use stoolap::test_failpoints;
+    let _guard = test_failpoints::FailpointGuard::new();
+    let root = tempfile::tempdir().unwrap();
+    crashed(root.path());
+    let dir = root.path().join("1");
+    // The catalog copies rotate the WAL past its size, the rotation's sync of
+    // the retired file fails, and a failed manifest write skips the truncation
+    test_failpoints::RETIRED_WAL_SYNC_FAIL.store(true, Ordering::Release);
+    test_failpoints::MANIFEST_WRITE_FAIL.store(true, Ordering::Release);
+    let opened = Database::open(&format!("{}&wal_max_size=1", dsn(&dir)));
+    test_failpoints::RETIRED_WAL_SYNC_FAIL.store(false, Ordering::Release);
+    test_failpoints::MANIFEST_WRITE_FAIL.store(false, Ordering::Release);
+    assert!(
+        opened.is_err(),
+        "an open whose WAL refuses every write fails: {:?}",
+        opened.as_ref().err()
+    );
 }
