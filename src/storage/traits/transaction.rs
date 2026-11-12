@@ -23,6 +23,14 @@ use crate::storage::mvcc::commit_log::ReadPoint;
 use crate::storage::mvcc::registry::StatementView;
 use crate::storage::traits::{QueryResult, Table};
 
+/// An index a table is created with, built before the table is reachable
+#[derive(Debug, Clone)]
+pub struct NewIndex {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub unique: bool,
+}
+
 /// Transaction represents a database transaction
 ///
 /// This trait defines the interface for transaction operations including
@@ -88,6 +96,14 @@ pub trait Transaction: Send {
 
     /// Creates a new table with the given schema
     fn create_table(&mut self, name: &str, schema: Schema) -> Result<Box<dyn Table>>;
+
+    /// Creates a new table with `indexes`; when one fails no table is made
+    fn create_table_with_indexes(
+        &mut self,
+        name: &str,
+        schema: Schema,
+        indexes: &[NewIndex],
+    ) -> Result<Box<dyn Table>>;
 
     /// Drops a table
     fn drop_table(&mut self, name: &str) -> Result<()>;

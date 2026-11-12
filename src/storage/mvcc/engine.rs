@@ -42,7 +42,7 @@ use crate::storage::mvcc::{
     VersionStore, INVALID_TRANSACTION_ID,
 };
 use crate::storage::traits::transaction::TableUse;
-use crate::storage::traits::{Engine, Index, Table, Transaction};
+use crate::storage::traits::{Engine, Index, NewIndex, Table, Transaction};
 use crate::storage::volume::manifest::Pending;
 
 mod retype;
@@ -571,6 +571,30 @@ fn register_pk_index(schema: &Schema, version_store: &Arc<VersionStore>) {
         ));
         version_store.add_index(index_name, pk_index);
     }
+}
+
+/// The store of a new table `schema`, with its primary key and `indexes`
+/// built before anything can reach it
+fn new_table_store(
+    schema: &Schema,
+    registry: &Arc<TransactionRegistry>,
+    indexes: &[NewIndex],
+) -> Result<Arc<VersionStore>> {
+    let version_store = Arc::new(VersionStore::with_visibility_checker(
+        schema.table_name.clone(),
+        schema.clone(),
+        registry_as_visibility_checker(registry),
+    ));
+    register_pk_index(schema, &version_store);
+    if !indexes.is_empty() {
+        let txn_versions = TransactionVersionStore::new(Arc::clone(&version_store), 0);
+        let table = MVCCTable::new(0, Arc::clone(&version_store), txn_versions);
+        for index in indexes {
+            let columns: Vec<&str> = index.columns.iter().map(String::as_str).collect();
+            table.create_index(&index.name, &columns, index.unique)?;
+        }
+    }
+    Ok(version_store)
 }
 
 // ============================================================================
@@ -3726,6 +3750,16 @@ impl MVCCEngine {
 
     /// Creates a new table
     pub fn create_table(&self, schema: Schema) -> Result<Schema> {
+        self.create_table_with_indexes(schema, &[])
+    }
+
+    /// Creates a new table with `indexes`; when one fails no table is made
+    /// and nothing is written to the WAL
+    pub fn create_table_with_indexes(
+        &self,
+        schema: Schema,
+        indexes: &[NewIndex],
+    ) -> Result<Schema> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -3735,15 +3769,7 @@ impl MVCCEngine {
         // Validate schema before acquiring locks
         self.validate_schema(&schema)?;
 
-        // Create version store for this table
-        let version_store = Arc::new(VersionStore::with_visibility_checker(
-            schema.table_name.clone(),
-            schema.clone(),
-            registry_as_visibility_checker(&self.registry),
-        ));
-
-        // Register virtual PkIndex for INTEGER PRIMARY KEY
-        register_pk_index(&schema, &version_store);
+        let version_store = new_table_store(&schema, &self.registry, indexes)?;
 
         // Prepare WAL data before locks (avoids holding lock during serialization)
         let schema_data = Self::serialize_schema(&schema);
@@ -10192,18 +10218,15 @@ impl TransactionEngineOperations for EngineOperations {
         ))
     }
 
-    fn create_table(&self, name: &str, schema: Schema) -> Result<Box<dyn Table>> {
+    fn create_table(
+        &self,
+        name: &str,
+        schema: Schema,
+        indexes: &[NewIndex],
+    ) -> Result<Box<dyn Table>> {
         let table_name = name.to_lowercase();
 
-        // Create version store for this table (before acquiring locks)
-        let version_store = Arc::new(VersionStore::with_visibility_checker(
-            schema.table_name.clone(),
-            schema.clone(),
-            registry_as_visibility_checker(&self.registry),
-        ));
-
-        // Register PkIndex if table has a primary key
-        register_pk_index(&schema, &version_store);
+        let version_store = new_table_store(&schema, &self.registry, indexes)?;
 
         // Atomically check-and-insert under write lock to prevent TOCTOU race
         {

@@ -25,6 +25,7 @@ mod commit_recheck_outside_test;
 mod commit_recheck_window_test;
 mod commit_window_reads_test;
 mod committed_cache_test;
+mod create_table_failure_test;
 mod ddl_transaction_test;
 mod direct_table_commit_test;
 mod dirty_read_test;
