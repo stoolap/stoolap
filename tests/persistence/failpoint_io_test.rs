@@ -1727,3 +1727,28 @@ fn a_column_change_that_fails_to_record_leaves_the_rows_as_they_were() {
         );
     }
 }
+
+#[test]
+fn a_rollback_that_cannot_log_a_restored_table_fails() {
+    let _guard = failpoint_guard();
+    for end in ["ROLLBACK", "ROLLBACK TO SAVEPOINT s"] {
+        let dir = tempdir().unwrap();
+        let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+        for sql in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY)",
+            "BEGIN",
+            "SAVEPOINT s",
+            "DROP TABLE t",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        test_failpoints::WAL_WRITE_FAIL.store(true, Ordering::Release);
+        let ended = db.execute(end, ());
+        test_failpoints::WAL_WRITE_FAIL.store(false, Ordering::Release);
+        assert!(
+            ended.is_err(),
+            "{end} reported success though the restored table was not logged"
+        );
+        let _ = db.close();
+    }
+}

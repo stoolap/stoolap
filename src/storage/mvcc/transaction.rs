@@ -31,14 +31,17 @@ use crate::storage::traits::transaction::{StatementAccess, TableUse};
 use crate::storage::traits::{NewIndex, QueryResult, Table, Transaction};
 use crate::storage::Expression;
 
-/// DDL state captured at savepoint creation time.
-/// Used to rollback CREATE/DROP TABLE operations when rolling back to a savepoint.
-#[derive(Debug, Clone, Copy)]
-struct SavepointDdlState {
-    /// Number of created_tables entries at savepoint time
-    created_tables_len: usize,
-    /// Number of dropped_tables entries at savepoint time
-    dropped_tables_len: usize,
+/// A table change of the transaction; the changes are undone in reverse order
+#[derive(Debug, Clone)]
+enum TableChange {
+    Created(String),
+    /// A dropped table's name and schema, and whether this transaction
+    /// created it, so a restore is logged with the creating record
+    Dropped {
+        name: String,
+        schema: Box<Schema>,
+        created_here: bool,
+    },
 }
 
 /// State captured when a savepoint is created.
@@ -46,8 +49,8 @@ struct SavepointDdlState {
 struct SavepointState {
     /// Timestamp for rolling back DML changes
     timestamp: i64,
-    /// DDL state for rolling back CREATE/DROP TABLE operations
-    ddl_state: SavepointDdlState,
+    /// Number of table changes made before the savepoint
+    table_changes: usize,
 }
 
 /// MVCC Transaction state
@@ -83,10 +86,8 @@ pub struct MvccTransaction {
     engine_operations: Option<Arc<dyn TransactionEngineOperations>>,
     /// Savepoints in creation order; the same name may appear more than once
     savepoints: Vec<(String, SavepointState)>,
-    /// Tables created in this transaction (for rollback)
-    created_tables: Vec<String>,
-    /// Tables dropped in this transaction (for rollback - stores name and schema)
-    dropped_tables: Vec<(String, Schema)>,
+    /// Tables created and dropped in this transaction, in order
+    table_changes: Vec<TableChange>,
     /// The write gate the handles handed out admit through, made by the
     /// first of them
     gate: OnceLock<GateRef>,
@@ -306,8 +307,7 @@ impl MvccTransaction {
             last_table_name: None,
             engine_operations: None,
             savepoints: Vec::new(),
-            created_tables: Vec::new(),
-            dropped_tables: Vec::new(),
+            table_changes: Vec::new(),
             gate: OnceLock::new(),
             handed_out: AtomicBool::new(false),
         }
@@ -375,8 +375,7 @@ impl MvccTransaction {
         self.tables.clear();
 
         // Clear DDL tracking
-        self.created_tables.clear();
-        self.dropped_tables.clear();
+        self.table_changes.clear();
 
         // Remove transaction isolation level from registry
         self.registry.remove_transaction_isolation_level(self.id);
@@ -438,38 +437,51 @@ impl MvccTransaction {
         self.gate.get().cloned()
     }
 
-    /// Roll back DDL operations (CREATE TABLE / DROP TABLE) in reverse order.
-    /// Used by both explicit rollback() and implicit Drop.
-    fn rollback_ddl(
+    /// Undoes `changes` of transaction `txn_id`, last first; every change is
+    /// undone, and the first that fails is the error. A table this
+    /// transaction created is restored under its id, any other on its own
+    fn undo_table_changes(
         ops: &dyn TransactionEngineOperations,
-        created_tables: &[String],
-        dropped_tables: &[(String, Schema)],
-    ) {
-        // Drop tables that were created in this transaction
-        for table_name in created_tables.iter().rev() {
-            if let Err(e) = ops.drop_table(table_name) {
-                eprintln!(
-                    "Warning: Failed to drop table '{}' during DDL rollback: {}",
-                    table_name, e
-                );
+        txn_id: i64,
+        changes: &[TableChange],
+    ) -> Result<()> {
+        let mut first_error = None;
+        for change in changes.iter().rev() {
+            let undone = match change {
+                TableChange::Created(name) => ops.drop_table(name),
+                TableChange::Dropped {
+                    name,
+                    schema,
+                    created_here,
+                } => {
+                    let logged_as = if *created_here { txn_id } else { DDL_TXN_ID };
+                    ops.create_table(name, Schema::clone(schema), &[], logged_as)
+                        .map(|_| ())
+                }
+            };
+            if let Err(e) = undone {
+                first_error.get_or_insert(e);
             }
         }
+        first_error.map_or(Ok(()), Err)
+    }
 
-        // Recreate tables that were dropped in this transaction
-        for (table_name, schema) in dropped_tables.iter().rev() {
-            if let Err(e) = ops.create_table(table_name, schema.clone(), &[], DDL_TXN_ID) {
-                eprintln!(
-                    "Warning: Failed to recreate table '{}' during DDL rollback: {}",
-                    table_name, e
-                );
-            }
+    /// The undo of a transaction dropped while active, which has no caller
+    /// to hand an error to
+    fn undo_dropped_transaction(
+        ops: &dyn TransactionEngineOperations,
+        txn_id: i64,
+        changes: &[TableChange],
+    ) {
+        if let Err(e) = Self::undo_table_changes(ops, txn_id, changes) {
+            eprintln!("Warning: a dropped transaction's table changes were not all undone: {e}");
         }
     }
 
     /// Check if this is a read-only transaction
     fn is_read_only(&self) -> bool {
         // Check for DDL changes
-        if !self.created_tables.is_empty() || !self.dropped_tables.is_empty() {
+        if !self.table_changes.is_empty() {
             return false;
         }
         // Check for DML changes via engine operations
@@ -493,15 +505,11 @@ impl MvccTransaction {
         let gate = self.hold_writes();
         let _hold = gate.as_ref().map(|gate| gate.hold());
         let timestamp = crate::storage::mvcc::last_write_order();
-        let ddl_state = SavepointDdlState {
-            created_tables_len: self.created_tables.len(),
-            dropped_tables_len: self.dropped_tables.len(),
-        };
         self.savepoints.push((
             name.to_string(),
             SavepointState {
                 timestamp,
-                ddl_state,
+                table_changes: self.table_changes.len(),
             },
         ));
         Ok(())
@@ -544,36 +552,15 @@ impl MvccTransaction {
             ops.rollback_dml_after(self.id, sp_state.timestamp);
         }
 
-        // Rollback DDL: undo CREATE TABLEs after savepoint
-        if let Some(ops) = &self.engine_operations {
-            // Tables created after savepoint need to be dropped
-            while self.created_tables.len() > sp_state.ddl_state.created_tables_len {
-                if let Some(table_name) = self.created_tables.pop() {
-                    if let Err(e) = ops.drop_table(&table_name) {
-                        eprintln!(
-                            "Warning: Failed to drop table '{}' during savepoint rollback: {}",
-                            table_name, e
-                        );
-                    }
-                }
-            }
-
-            // Tables dropped after savepoint need to be recreated
-            while self.dropped_tables.len() > sp_state.ddl_state.dropped_tables_len {
-                if let Some((table_name, schema)) = self.dropped_tables.pop() {
-                    if let Err(e) = ops.create_table(&table_name, schema, &[], DDL_TXN_ID) {
-                        eprintln!(
-                            "Warning: Failed to recreate table '{}' during savepoint rollback: {}",
-                            table_name, e
-                        );
-                    }
-                }
-            }
-        }
+        let after = self.table_changes.split_off(sp_state.table_changes);
+        let undone = match &self.engine_operations {
+            Some(ops) => Self::undo_table_changes(ops.as_ref(), self.id, &after),
+            None => Ok(()),
+        };
 
         self.savepoints.truncate(position + 1);
 
-        Ok(())
+        undone
     }
 
     /// Check if a savepoint exists
@@ -621,8 +608,7 @@ impl Transaction for MvccTransaction {
             .as_ref()
             .is_some_and(|ops| ops.has_pending_dml_changes(self.id));
 
-        let is_read_only =
-            self.created_tables.is_empty() && self.dropped_tables.is_empty() && !has_dml_changes;
+        let is_read_only = self.table_changes.is_empty() && !has_dml_changes;
 
         // Two-phase commit protocol
         if !is_read_only {
@@ -753,10 +739,11 @@ impl Transaction for MvccTransaction {
             self.registry.abort_transaction(self.id);
         }
 
-        // Rollback DDL operations (CREATE TABLE / DROP TABLE) in reverse order
-        if let Some(ops) = &self.engine_operations {
-            Self::rollback_ddl(ops.as_ref(), &self.created_tables, &self.dropped_tables);
-        }
+        // Every step of the rollback runs; a table change it could not undo is its error
+        let undone = match &self.engine_operations {
+            Some(ops) => Self::undo_table_changes(ops.as_ref(), self.id, &self.table_changes),
+            None => Ok(()),
+        };
 
         // Rollback all tables - discard local changes
         for table in self.tables.values_mut() {
@@ -782,7 +769,7 @@ impl Transaction for MvccTransaction {
         // Mark as rolled back
         self.state = TransactionState::RolledBack;
         self.cleanup();
-        Ok(())
+        undone
     }
 
     fn create_savepoint(&mut self, name: &str) -> Result<()> {
@@ -837,7 +824,8 @@ impl Transaction for MvccTransaction {
         let table = ops.create_table(name, schema, indexes, self.id)?;
 
         // Track for rollback - store the table name
-        self.created_tables.push(name.to_lowercase());
+        self.table_changes
+            .push(TableChange::Created(name.to_lowercase()));
 
         Ok(table)
     }
@@ -863,12 +851,25 @@ impl Transaction for MvccTransaction {
             table.schema().clone()
         };
 
-        // Save schema for potential rollback (note: data cannot be recovered)
-        self.dropped_tables.push((name.to_lowercase(), schema));
-
-        // Now drop the table
         let ops = self.get_engine_ops()?;
         ops.drop_table(name)?;
+
+        // Save schema for potential rollback (note: data cannot be recovered)
+        let name_lower = name.to_lowercase();
+        let created_here = self
+            .table_changes
+            .iter()
+            .rev()
+            .find_map(|change| match change {
+                TableChange::Created(created) => (*created == name_lower).then_some(true),
+                TableChange::Dropped { name, .. } => (*name == name_lower).then_some(false),
+            })
+            == Some(true);
+        self.table_changes.push(TableChange::Dropped {
+            name: name_lower,
+            schema: Box::new(schema),
+            created_here,
+        });
 
         // Remove from cache
         self.tables.remove(name);
@@ -1120,16 +1121,14 @@ impl Drop for MvccTransaction {
             if let Some(ops) = &self.engine_operations {
                 if let Some(gate) = own_gate {
                     let (ops, id) = (Arc::clone(ops), self.id);
-                    let created = std::mem::take(&mut self.created_tables);
-                    let dropped = std::mem::take(&mut self.dropped_tables);
+                    let changes = std::mem::take(&mut self.table_changes);
                     gate.finish_after_statements(Box::new(move || {
-                        Self::rollback_ddl(ops.as_ref(), &created, &dropped);
+                        Self::undo_dropped_transaction(ops.as_ref(), id, &changes);
                         ops.rollback_all_tables(id, true);
                         ops.release_keys(id);
                     }));
                 } else {
-                    // Roll back DDL operations (CREATE TABLE / DROP TABLE)
-                    Self::rollback_ddl(ops.as_ref(), &self.created_tables, &self.dropped_tables);
+                    Self::undo_dropped_transaction(ops.as_ref(), self.id, &self.table_changes);
 
                     // Clean up txn_version_stores to prevent memory leak
                     // This is critical for read-only transactions that call get_table()

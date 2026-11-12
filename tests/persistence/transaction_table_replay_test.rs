@@ -95,6 +95,42 @@ const CASES: &[(&[&str], Option<i64>, &[&str])] = &[
         Some(0),
         &[],
     ),
+    (
+        &[
+            "BEGIN",
+            CREATE,
+            "SAVEPOINT s",
+            "DROP TABLE t",
+            "ROLLBACK TO SAVEPOINT s",
+        ],
+        None,
+        &[],
+    ),
+    (
+        &[
+            "BEGIN",
+            CREATE,
+            "SAVEPOINT s",
+            "DROP TABLE t",
+            "ROLLBACK TO SAVEPOINT s",
+            "COMMIT",
+        ],
+        Some(0),
+        &[],
+    ),
+    (&["BEGIN", CREATE, "DROP TABLE t", "ROLLBACK"], None, &[]),
+    (
+        &[
+            "BEGIN",
+            "SAVEPOINT s",
+            CREATE,
+            "DROP TABLE t",
+            "ROLLBACK TO SAVEPOINT s",
+            "COMMIT",
+        ],
+        None,
+        &[],
+    ),
 ];
 
 #[test]
@@ -106,6 +142,14 @@ fn a_transactions_table_is_replayed_as_the_transaction_ended() {
         let db = Database::open(&dsn(dir.path())).unwrap();
         for sql in *statements {
             db.execute(sql, ()).unwrap();
+        }
+        let ended = statements
+            .last()
+            .is_some_and(|sql| *sql == "COMMIT" || *sql == "ROLLBACK")
+            || !statements.contains(&"BEGIN");
+        let live = db.query_one::<i64, _>("SELECT COUNT(*) FROM t", ()).ok();
+        if ended && live != *rows {
+            wrong.push(format!("{statements:?}: live rows {live:?}, want {rows:?}"));
         }
         crash_image(dir.path(), image.path());
         drop(db);
