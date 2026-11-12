@@ -7949,6 +7949,16 @@ impl MVCCEngine {
             // Row-group aligned split: round to 64K boundary so every volume
             // has complete row groups. Optimal for LZ4 compression and zone maps.
             let chunk_size = compaction_chunk_rows(target_volume_rows);
+            // The outputs hold rows of the inputs only, so the newest seal
+            // among the inputs bounds the commits they hold
+            let inputs_seal_seq = mgr
+                .manifest()
+                .segments
+                .iter()
+                .filter(|meta| old_ids.contains(&meta.segment_id))
+                .map(|meta| meta.seal_seq)
+                .max()
+                .unwrap_or(0);
             let mut new_volumes: Vec<(
                 u64,
                 Arc<crate::storage::volume::writer::FrozenVolume>,
@@ -8035,7 +8045,7 @@ impl MVCCEngine {
                         min_row_id: min_id,
                         max_row_id: max_id,
                         creation_lsn: 0,
-                        seal_seq: 0,
+                        seal_seq: inputs_seal_seq,
                         schema_version,
                     },
                 ));

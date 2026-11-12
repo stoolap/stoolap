@@ -41,7 +41,9 @@ use crate::storage::mvcc::version_store::Reader;
 use crate::storage::mvcc::version_store::TxnStoreWrite;
 use crate::storage::mvcc::RowVersion;
 use crate::storage::mvcc::{TransactionVersionStore, TxnTableStore, VersionStore};
-use crate::storage::traits::{Index, PlannedUpdate, QueryResult, ScanAccess, Scanner, Table};
+use crate::storage::traits::{
+    FoundVersions, Index, PlannedUpdate, QueryResult, ScanAccess, Scanner, Table, VersionMark,
+};
 use crate::storage::volume::side_index::{resolve_all, Domain, Resolved};
 use crate::storage::MemoryResult;
 
@@ -183,6 +185,14 @@ fn first_equals(key: &[Value], value: &Value) -> bool {
 
 /// A bound on a column's values with its inclusiveness, None for no bound
 type KeyBound<'a> = Option<(&'a Value, bool)>;
+
+/// A delete of rows found earlier: the ids deleted unless every id was, the
+/// versions taken as found, and the rows changed since, handed back in place
+type FoundDelete<'a> = (
+    &'a mut Option<I64Set>,
+    &'a FoundVersions,
+    &'a mut Vec<(i64, Row, VersionMark)>,
+);
 
 /// Whether `value` lies within the bounds
 fn within(value: &Value, lower: KeyBound<'_>, upper: KeyBound<'_>) -> bool {
@@ -574,12 +584,17 @@ impl MVCCTable {
         normalize_row_to_schema(row, schema)
     }
 
-    /// Deletes `row_ids`. With `scanned` None an id no version of this
+    /// Deletes `row_ids`. With `found` None an id no version of this
     /// transaction or of the store holds is a sealed row, deleted by a
-    /// marker so the log records it; with `scanned` given such an id is a
-    /// row gone since the scan that found it, left alone, and the ids
-    /// deleted are added to `scanned`.
-    fn delete_rows_by_id(&mut self, row_ids: &[i64], scanned: Option<&mut I64Set>) -> Result<i32> {
+    /// marker so the log records it; with `found` given such an id is a row
+    /// gone since the ids were found, left alone, a version not taken as
+    /// found holds every row back and is handed to the rows changed, and
+    /// the set receives the ids deleted unless every id was.
+    fn delete_rows_by_id(
+        &mut self,
+        row_ids: &[i64],
+        found: Option<FoundDelete<'_>>,
+    ) -> Result<i32> {
         let schema = &self.cached_schema;
         // Step 1: Check local versions first
         // Use get_local_version to distinguish "no local version" from "locally deleted"
@@ -607,38 +622,54 @@ impl MVCCTable {
         }
 
         // Step 2: Batch fetch remaining from version store
-        let mut rows_with_originals: Vec<(i64, Row, crate::storage::mvcc::RowVersion)> =
-            Vec::with_capacity(remaining_row_ids.len());
-        // Track which remaining row_ids have hot versions (cold-only rows won't)
-        let mut found_ids = rustc_hash::FxHashSet::default();
-        if !remaining_row_ids.is_empty() {
-            let batch_rows = self
+        let mut rows_with_originals = match remaining_row_ids.is_empty() {
+            true => Vec::new(),
+            false => self
                 .version_store
-                .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
-            for (row_id, row, version) in batch_rows {
-                found_ids.insert(row_id);
-                let row = self.normalize_row_to_schema(row, schema);
-                rows_with_originals.push((row_id, row, version));
-            }
+                .get_visible_versions_for_update(&remaining_row_ids, self.txn_id),
+        };
+        for (_, row, _) in &mut rows_with_originals {
+            *row = self.normalize_row_to_schema(std::mem::take(row), schema);
         }
         self.check_read()?;
 
         // Cold-only row_ids: not in local versions and not in the hot version store.
         // Create phantom delete markers so the WAL records the deletion, enabling
         // tombstone recovery on restart.
-        let cold_only_ids: Vec<i64> = match scanned {
-            Some(scanned) => {
-                for (row_id, _) in &local_deletes {
-                    scanned.insert(*row_id);
+        let cold_only_ids: Vec<i64> = match found {
+            Some((deleted, found, changed)) => {
+                let same = |row_id: i64, version: &RowVersion| {
+                    found.hot(row_id, version.txn_id, version.create_time)
+                };
+                // One version not the one found holds the whole delete back
+                if rows_with_originals
+                    .iter()
+                    .any(|(row_id, _, version)| !same(*row_id, version))
+                {
+                    for (row_id, row, version) in rows_with_originals {
+                        if !same(row_id, &version) {
+                            changed.push((row_id, row, VersionMark::Hot(version.txn_id)));
+                        }
+                    }
+                    return Ok(0);
                 }
-                scanned.extend(found_ids.iter().copied());
+                if local_deletes.len() + rows_with_originals.len() != row_ids.len() {
+                    let local = local_deletes.iter().map(|(row_id, _)| *row_id);
+                    let hot = rows_with_originals.iter().map(|(row_id, ..)| *row_id);
+                    *deleted = Some(local.chain(hot).collect());
+                }
                 Vec::new()
             }
-            None => remaining_row_ids
-                .iter()
-                .filter(|id| !found_ids.contains(id))
-                .copied()
-                .collect(),
+            // Every remaining id has a hot version: the store returns one per id
+            None if rows_with_originals.len() == remaining_row_ids.len() => Vec::new(),
+            None => {
+                let found_ids: I64Set = rows_with_originals.iter().map(|(id, ..)| *id).collect();
+                remaining_row_ids
+                    .iter()
+                    .filter(|id| !found_ids.contains(**id))
+                    .copied()
+                    .collect()
+            }
         };
 
         // Step 3: Claim cold-only rows before acquiring txn_versions lock.
@@ -3164,11 +3195,16 @@ impl Table for MVCCTable {
         self.delete_rows_by_id(row_ids, None)
     }
 
-    fn delete_scanned_rows(&mut self, row_ids: &mut Vec<i64>) -> Result<i32> {
+    fn delete_found(
+        &mut self,
+        row_ids: &mut Vec<i64>,
+        found: &FoundVersions,
+        changed: &mut Vec<(i64, Row, VersionMark)>,
+    ) -> Result<i32> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
-        let mut deleted = I64Set::new();
-        let count = self.delete_rows_by_id(row_ids, Some(&mut deleted))?;
-        if deleted.len() != row_ids.len() {
+        let mut deleted = None;
+        let count = self.delete_rows_by_id(row_ids, Some((&mut deleted, found, changed)))?;
+        if let Some(deleted) = deleted {
             row_ids.retain(|id| deleted.contains(*id));
         }
         Ok(count)

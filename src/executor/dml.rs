@@ -3142,8 +3142,10 @@ impl Executor {
         // Check if this table is referenced by child tables (for FK enforcement)
         let referencing_fks = super::foreign_key::find_referencing_fks(&self.engine, table_name);
 
-        // Get schema info for RETURNING clause processing
-        let column_names_owned = schema.column_names_owned().to_vec();
+        // Schema of the handle the rows are read through (CompactArc ref-count
+        // bump), held past the table's mutable borrows for RETURNING
+        let schema_arc = table.schema_arc();
+        let column_names_owned = schema_arc.column_names_owned();
         let column_count = schema.columns.len();
         // Use schema's cached pk_column_index for O(1) lookup
         let pk_col_idx = schema.pk_column_index();
@@ -3154,24 +3156,18 @@ impl Executor {
         let rows_affected = if needs_memory_filter || has_returning || has_referencing_fks {
             // Complex WHERE expression, RETURNING, or FK enforcement - need to scan rows first
             // Scan all rows, filter with evaluator, collect for RETURNING, delete matching ones by primary key
-            // Schema of the handle the rows are read through (CompactArc ref-count bump)
-            let schema_arc = table.schema_arc();
-
-            // Build column names with effective prefix (alias or table name)
-            // This allows WHERE clauses to reference columns using the alias
-            // OPTIMIZATION: Only build when needed (memory filter or RETURNING)
-            let column_names_with_prefix: Vec<String> = column_names_owned
-                .iter()
-                .map(|c| qualified(effective_name, c))
-                .collect();
 
             // The WHERE the prepared family does not ask, compiled once over
-            // the prefixed columns, so it reads alias.column; a failure to
-            // compile is the error of a row reaching it
+            // the columns prefixed with the alias or table name, so it reads
+            // alias.column; a failure to compile is the error of a row reaching it
             use super::expression::{ExecuteContext, ExprVM};
             let mut delete_vm = ExprVM::new();
             let params = ctx.params();
             let memory_where_program = memory_where_clause.as_ref().map(|expr| {
+                let column_names_with_prefix: Vec<String> = column_names_owned
+                    .iter()
+                    .map(|c| qualified(effective_name, c))
+                    .collect();
                 super::aggregation::compile_over_slots(
                     expr,
                     &column_names_with_prefix,
@@ -3183,8 +3179,17 @@ impl Executor {
             });
             let transaction_id = ctx.transaction_id();
 
-            let mut rows_to_delete: Vec<(Value, Option<Row>)> = Vec::new();
-            let mut rows_to_delete_by_row_id: Vec<(i64, Option<Row>)> = Vec::new();
+            // The commits complete and the volumes held before a row is found:
+            // a version they made or hold is the one found
+            let mut found = crate::storage::traits::FoundVersions::new(
+                self.engine.registry_ref().commit_cut(),
+                table.sealed_volume_ids(),
+            );
+            // The ids of the rows to delete: an integer primary key is the row id
+            let mut row_ids: Vec<i64> = Vec::new();
+            // A RETURNING reads each row found, the row id past its columns when it reads that
+            let returns_widened = has_returning && dml_run.as_ref().is_some_and(|r| r.widens());
+            let mut found_rows: Vec<(i64, Row)> = Vec::new();
             // Each key's values, read as the rows are found from the column
             // it names: a key need not name the primary key
             let fk_columns: Vec<Option<usize>> = referencing_fks
@@ -3198,22 +3203,25 @@ impl Executor {
                 })
                 .collect();
             let mut fk_values: Vec<Vec<Value>> = vec![Vec::new(); fk_columns.len()];
-            // A row to delete, by its primary key or, without one, its row id
+            // Each row's place in `fk_values`, to find whether it changed
+            let mut fk_places: FxHashMap<i64, usize> = FxHashMap::default();
             let mut collect = |row_id: i64, row: &Row| {
-                let row_data = has_returning.then(|| row.clone());
+                if has_referencing_fks {
+                    fk_places.insert(row_id, fk_places.len());
+                }
                 for (values, column) in fk_values.iter_mut().zip(&fk_columns) {
                     if let Some(value) = column.and_then(|c| row.get(c)) {
                         values.push(value.clone());
                     }
                 }
-                match pk_col_idx {
-                    Some(pk_idx) => {
-                        if let Some(pk_value) = row.get(pk_idx) {
-                            rows_to_delete.push((pk_value.clone(), row_data));
-                        }
-                    }
-                    None => rows_to_delete_by_row_id.push((row_id, row_data)),
+                if has_returning {
+                    let row = match returns_widened {
+                        true => super::prepared_select::widened(row.clone(), row_id),
+                        false => row.clone(),
+                    };
+                    found_rows.push((row_id, row));
                 }
+                row_ids.push(row_id);
             };
             // A prepared WHERE's rows are read as a prepared SELECT reads them
             if let Some(run) = dml_run.as_ref().filter(|_| where_prepared) {
@@ -3226,9 +3234,7 @@ impl Executor {
                 })?;
             }
 
-            // Scan all rows and collect IDs of rows to delete; a RETURNING
-            // reading the row id has it past the row's columns
-            let returns_widened = has_returning && dml_run.as_ref().is_some_and(|r| r.widens());
+            // Scan all rows and collect IDs of rows to delete
             let column_indices: Vec<usize> = (0..column_count).collect();
             let mut scanner = if where_prepared {
                 None
@@ -3256,14 +3262,7 @@ impl Executor {
                 };
 
                 if matches {
-                    let row_id = scanner.current_row_id();
-                    match returns_widened {
-                        true => collect(
-                            row_id,
-                            &super::prepared_select::widened(row.clone(), row_id),
-                        ),
-                        false => collect(row_id, row),
-                    }
+                    collect(scanner.current_row_id(), row);
                 }
             }
             if let Some(error) = scanner.as_ref().and_then(|scanner| scanner.err()) {
@@ -3272,22 +3271,28 @@ impl Executor {
             // Drop scanner to release borrow
             drop(scanner);
 
+            // The values a key names that a change of the row can move, kept to
+            // find whether it moved: a primary key value never does
+            let watched: Vec<(usize, usize)> = fk_columns
+                .iter()
+                .enumerate()
+                .filter_map(|(key, column)| {
+                    column.filter(|&c| Some(c) != pk_col_idx).map(|c| (key, c))
+                })
+                .collect();
+            let scanned_values: Vec<Vec<Value>> = watched
+                .iter()
+                .map(|&(key, _)| fk_values[key].clone())
+                .collect();
+
             // The keys' actions are worked out from the rows as found, and
             // a refusal comes before any row goes
             let delete_plan = if has_referencing_fks {
-                let ids: Vec<i64> = rows_to_delete
-                    .iter()
-                    .filter_map(|(pk, _)| match pk {
-                        Value::Integer(id) => Some(*id),
-                        _ => None,
-                    })
-                    .chain(rows_to_delete_by_row_id.iter().map(|(id, _)| *id))
-                    .collect();
                 Some(super::foreign_key::plan_delete_actions(
                     &self.engine,
                     table.txn_id(),
                     table_name,
-                    &ids,
+                    &row_ids,
                     referencing_fks.clone(),
                     fk_values,
                 )?)
@@ -3295,51 +3300,111 @@ impl Executor {
                 None
             };
 
-            // Delete matching rows by primary key
-            let mut delete_count = 0;
-            if !rows_to_delete.is_empty() {
-                // An integer key is the row id, so the rows go in one call,
-                // read once from the volumes they sit in, as the rows named
-                // by id below do
-                let mut row_ids: Vec<i64> = rows_to_delete
-                    .iter()
-                    .map(|(pk, _)| match pk {
-                        Value::Integer(id) => *id,
-                        _ => 0,
-                    })
-                    .collect();
-                #[cfg(any(test, feature = "test-failpoints"))]
-                crate::test_failpoints::delete_rows_scanned();
-                let scanned = row_ids.len();
-                delete_count = table.delete_scanned_rows(&mut row_ids)?;
-                if has_returning {
-                    // A row gone since the scan was not deleted and is not
-                    // returned
-                    if row_ids.len() == scanned {
-                        returning_rows
-                            .extend(rows_to_delete.into_iter().filter_map(|(_, row)| row));
-                    } else {
-                        let deleted: I64Set = row_ids.iter().copied().collect();
-                        returning_rows.extend(rows_to_delete.into_iter().filter_map(
-                            |(pk, row)| match pk {
-                                Value::Integer(id) if deleted.contains(id) => row,
-                                _ => None,
-                            },
-                        ));
+            // A row changed since it was found is asked its WHERE as it is now,
+            // the row id past its columns when the statement's programs read it
+            let no_row = Row::new();
+            let run_ctx = dml_run
+                .as_ref()
+                .filter(|_| where_prepared)
+                .map(|run| run.context(&no_row));
+            let judge_widens = dml_run.as_ref().is_some_and(|r| r.widens());
+            let whole_storage = where_expr.as_deref().filter(|_| !needs_memory_filter);
+            let mut returned: FxHashMap<i64, Row> = FxHashMap::default();
+            let mut judge = |row_id: i64, row: &Row| -> Result<bool> {
+                let widened;
+                let row = match judge_widens {
+                    true => {
+                        widened = super::prepared_select::widened(row.clone(), row_id);
+                        &widened
+                    }
+                    false => row,
+                };
+                let passes = match (&dml_run, &run_ctx, &memory_where_program) {
+                    (Some(run), Some(base), _) => {
+                        let exec_ctx = ExecuteContext { row, ..*base };
+                        run.matches(&mut delete_vm, &exec_ctx)?
+                    }
+                    (_, _, Some(program)) => {
+                        let program = program.as_ref().map_err(Clone::clone)?;
+                        let exec_ctx =
+                            ExecuteContext::new(row).with_run(params, transaction_id, None);
+                        delete_vm.execute_bool_checked(program, &exec_ctx)?
+                    }
+                    _ => match whole_storage {
+                        Some(expr) => {
+                            crate::storage::expression::passes(expr, expr.can_fail(), row)?
+                        }
+                        None => true,
+                    },
+                };
+                // The keys' actions were planned from the row as found
+                if has_referencing_fks {
+                    let place = fk_places.get(&row_id).copied();
+                    let moved = watched
+                        .iter()
+                        .zip(&scanned_values)
+                        .any(|(&(_, c), values)| place.and_then(|p| values.get(p)) != row.get(c));
+                    if !passes || moved {
+                        return Err(Error::internal(format!(
+                            "write conflict: row {row_id} of table '{table_name}' changed while the delete read it"
+                        )));
                     }
                 }
-            } else if !rows_to_delete_by_row_id.is_empty() {
-                // A table without a primary key: the rows are named by the
-                // ids the scan read them under
-                let row_ids: Vec<i64> =
-                    rows_to_delete_by_row_id.iter().map(|(id, _)| *id).collect();
-                delete_count = table.delete_by_row_ids(&row_ids)?;
-                if has_returning {
-                    returning_rows.extend(
-                        rows_to_delete_by_row_id
-                            .into_iter()
-                            .filter_map(|(_, row)| row),
-                    );
+                if passes && has_returning {
+                    returned.insert(row_id, row.clone());
+                }
+                Ok(passes)
+            };
+
+            let mut delete_count = 0;
+            if !row_ids.is_empty() {
+                // The rows go in one call, read once from the volumes they sit in
+                #[cfg(any(test, feature = "test-failpoints"))]
+                crate::test_failpoints::delete_rows_scanned();
+                // A row changed since it was found holds the whole delete back,
+                // so the WHERE never reads a row this statement deleted: it is
+                // judged outside the storage call, its version marked, and
+                // every row is named again
+                let mut changed = Vec::new();
+                // Rounds the changed rows may take before the delete gives up
+                const CHANGED_ROUNDS: usize = 3;
+                let mut rounds = 0;
+                loop {
+                    delete_count = table.delete_found(&mut row_ids, &found, &mut changed)?;
+                    if changed.is_empty() {
+                        break;
+                    }
+                    rounds += 1;
+                    if rounds > CHANGED_ROUNDS {
+                        return Err(Error::internal(format!(
+                            "write conflict: the rows of table '{table_name}' kept changing while the delete read them"
+                        )));
+                    }
+                    let mut refused: Option<I64Set> = None;
+                    for (row_id, row, mark) in changed.drain(..) {
+                        match judge(row_id, &row)? {
+                            true => {
+                                found.judged.insert(row_id, mark);
+                            }
+                            false => {
+                                refused.get_or_insert_with(I64Set::new).insert(row_id);
+                            }
+                        }
+                    }
+                    if let Some(refused) = refused {
+                        row_ids.retain(|id| !refused.contains(*id));
+                    }
+                    if row_ids.is_empty() {
+                        break;
+                    }
+                }
+                // In the order the rows were found, as deleted; a row gone or
+                // no longer passing since then was not deleted and is not returned
+                let mut deleted = row_ids.iter().peekable();
+                for (row_id, row) in found_rows {
+                    if deleted.next_if_eq(&&row_id).is_some() {
+                        returning_rows.push(returned.remove(&row_id).unwrap_or(row));
+                    }
                 }
             }
             if let Some(plan) = delete_plan {
@@ -3374,7 +3439,7 @@ impl Executor {
             return statement_rollback.finish(self.finish_returning(
                 &stmt.returning,
                 returning_rows,
-                &column_names_owned,
+                column_names_owned,
                 ctx,
                 standalone_tx,
                 dml_run.as_ref(),

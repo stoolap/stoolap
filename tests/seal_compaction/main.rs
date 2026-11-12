@@ -21,6 +21,7 @@ mod commit_seal_stamp_test;
 mod compaction_proportion_test;
 mod compaction_publication_order_test;
 mod compaction_publication_visibility_test;
+mod compaction_seal_seq_test;
 mod compaction_tombstone_holders_test;
 mod count_inside_seal_test;
 mod deduped_count_test;

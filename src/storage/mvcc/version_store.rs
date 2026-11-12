@@ -3355,7 +3355,8 @@ impl VersionStore {
     /// Gets visible versions for batch update operations
     ///
     /// Returns (row_id, row_data, original_version) for each visible row.
-    /// The original_version is used for write-set tracking to avoid redundant lookups.
+    /// The original_version, its commit stamp kept, is used for write-set
+    /// tracking to avoid redundant lookups.
     ///
     /// This is optimized for UPDATE operations where we need to:
     /// 1. Read the current row data
@@ -3377,7 +3378,6 @@ impl VersionStore {
             None => return Vec::new(),
         };
 
-        let current_seq = checker.get_current_sequence();
         let mut results = Vec::with_capacity(row_ids.len());
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
@@ -3392,9 +3392,7 @@ impl VersionStore {
                 if checker.is_visible(head_txn_id, txn_id) {
                     // HEAD is visible - check if deleted
                     if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                        let mut version_copy = chain.version.clone();
-                        version_copy.create_time = current_seq;
-                        results.push((row_id, chain.version.data.clone(), version_copy));
+                        results.push((row_id, chain.version.data.clone(), chain.version.clone()));
                     }
                     continue;
                 }
@@ -3409,12 +3407,7 @@ impl VersionStore {
                     if checker.is_visible(version_txn_id, txn_id) {
                         if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id)
                         {
-                            // Create a RowVersion with the correct read_version_seq for tracking
-                            let mut version_copy = e.version.clone();
-                            // Store the current sequence in create_time for later retrieval
-                            // (This is a bit of a hack, but avoids changing the struct)
-                            version_copy.create_time = current_seq;
-                            results.push((row_id, e.version.data.clone(), version_copy));
+                            results.push((row_id, e.version.data.clone(), e.version.clone()));
                         }
                         break;
                     }
