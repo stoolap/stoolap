@@ -107,7 +107,8 @@ fn fixture(dir: &Path) {
 }
 
 /// Rows 1 to 5 sealed by a checkpoint and row 6 left in the WAL: an open
-/// that drops row 6 replays nothing to seal, so it appends to that file
+/// that drops row 6 replays nothing to seal, so it appends to that file.
+/// Row 6 is written after a reopen, under the first id that open handed out
 fn fixture_sealed(dir: &Path) {
     let db = Database::open(&dsn(dir)).unwrap();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
@@ -117,6 +118,9 @@ fn fixture_sealed(dir: &Path) {
             .unwrap();
     }
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.close().unwrap();
+    drop(db);
+    let db = Database::open(&dsn(dir)).unwrap();
     db.execute("INSERT INTO t VALUES (6, 6)", ()).unwrap();
     db.close().unwrap();
 }
@@ -259,13 +263,18 @@ fn a_damaged_commit_marker_commits_nothing() {
 fn a_first_write_after_the_reopen_does_not_commit_the_cut_transaction() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    fixture(dir.path());
+    fixture_sealed(dir.path());
     let wal = wal_file(dir.path());
     let len = std::fs::metadata(&wal).unwrap().len();
     let file = std::fs::OpenOptions::new().write(true).open(&wal).unwrap();
     file.set_len(len - 7).unwrap();
     drop(file);
     let db = Database::open(&dsn(dir.path())).unwrap();
+    assert_eq!(
+        wal_file(dir.path()),
+        wal,
+        "the open appends to the cut file"
+    );
     db.execute("INSERT INTO t VALUES (10, 10)", ()).unwrap();
     db.close().unwrap();
     drop(db);

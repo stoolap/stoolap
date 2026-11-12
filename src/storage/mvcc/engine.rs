@@ -6708,6 +6708,10 @@ impl MVCCEngine {
         if checkpoint_lsn > 0 && all_manifests_persisted {
             if let Some(ref pm) = *self.persistence {
                 if let Err(e) = pm.truncate_wal(checkpoint_lsn) {
+                    // A WAL the truncation poisoned refuses every write after it
+                    if pm.is_wal_poisoned() {
+                        return Err(e);
+                    }
                     eprintln!("Warning: Failed to truncate WAL: {}", e);
                 }
             }

@@ -63,10 +63,10 @@ fn sum(db: &Database) -> (i64, i64) {
     (row.get(0).unwrap(), row.get(1).unwrap())
 }
 
-#[test]
-fn a_database_reopened_after_crash_after_crash_seals_its_log_once() {
-    let root = tempfile::tempdir().unwrap();
-    let first = root.path().join("0");
+/// A sealed table with an UPDATE and a DELETE left in the WAL, crashed into
+/// `root/1`; the rows it holds
+fn crashed(root: &Path) -> (i64, i64) {
+    let first = root.join("0");
     let db = Database::open(&dsn(&first)).unwrap();
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)",
@@ -78,8 +78,15 @@ fn a_database_reopened_after_crash_after_crash_seals_its_log_once() {
         db.execute(sql, ()).unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
     let want = sum(&db);
-    crash_image(&first, &root.path().join("1"));
+    crash_image(&first, &root.join("1"));
     db.close().unwrap();
+    want
+}
+
+#[test]
+fn a_database_reopened_after_crash_after_crash_seals_its_log_once() {
+    let root = tempfile::tempdir().unwrap();
+    let want = crashed(root.path());
     let mut counts = Vec::new();
     for crash in 1..=3 {
         let dir = root.path().join(crash.to_string());
@@ -93,4 +100,27 @@ fn a_database_reopened_after_crash_after_crash_seals_its_log_once() {
         counts.windows(2).all(|w| w[0] == w[1]),
         "volumes after each recovery {counts:?}: a recovery sealed again what the one before sealed"
     );
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_recovery_whose_checkpoint_poisons_the_wal_fails_the_open() {
+    use std::sync::atomic::Ordering;
+    use stoolap::test_failpoints;
+    let _guard = test_failpoints::FailpointGuard::new();
+    let root = tempfile::tempdir().unwrap();
+    let want = crashed(root.path());
+    let dir = root.path().join("1");
+    test_failpoints::RETIRED_WAL_SYNC_FAIL.store(true, Ordering::Release);
+    let opened = Database::open(&dsn(&dir));
+    test_failpoints::RETIRED_WAL_SYNC_FAIL.store(false, Ordering::Release);
+    assert!(
+        opened.is_err(),
+        "an open whose WAL refuses every write fails: {:?}",
+        opened.as_ref().err()
+    );
+    drop(opened);
+    let db = Database::open(&dsn(&dir)).unwrap();
+    assert_eq!(sum(&db), want, "the next open recovers the rows");
+    db.close().unwrap();
 }
