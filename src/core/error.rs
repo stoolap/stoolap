@@ -157,7 +157,7 @@ pub enum Error {
         index: String,
         column: String,
         value: ConflictValues,
-        /// Row ID of the conflicting row (-1 if unknown)
+        /// Row ID of the conflicting row, i64::MIN if unknown: no row has it
         row_id: i64,
     },
 
@@ -403,7 +403,7 @@ impl Error {
             index: index.into(),
             column: column.into(),
             value: value.into(),
-            row_id: -1,
+            row_id: i64::MIN,
         }
     }
 

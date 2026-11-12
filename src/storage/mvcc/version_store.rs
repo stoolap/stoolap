@@ -7525,7 +7525,8 @@ impl TransactionVersionStore {
     }
 
     /// Judges the unique keys this transaction writes from now on as it
-    /// writes them, as an explicit transaction and an upsert do
+    /// writes them, as an explicit transaction and an upsert do, entering
+    /// those its rows already hold
     pub(crate) fn track_keys(&mut self) {
         if self.tracking.is_some() {
             return;
@@ -7698,6 +7699,8 @@ impl TransactionVersionStore {
         values: &[Value],
         row_id: i64,
     ) -> Result<Option<i64>, Error> {
+        // A claim judges against every key the rows hold, so it tracks them all
+        self.track_keys();
         let hash = key_hash(values);
         if let Some(holder) = self.key_holder(index, values, hash, row_id)? {
             return Ok(Some(holder));
@@ -7711,7 +7714,10 @@ impl TransactionVersionStore {
     /// a rollback to a savepoint enters the rows it gives back again
     fn enter_key(&mut self, columns: &[i32], hash: u64, row_id: i64) {
         let local_versions = self.local_versions.as_ref();
-        let keys = &mut self.tracking.get_or_insert_with(Box::default).local_keys;
+        let Some(tracking) = self.tracking.as_deref_mut() else {
+            return;
+        };
+        let keys = &mut tracking.local_keys;
         let at = match keys.iter().position(|(held, _)| held.as_slice() == columns) {
             Some(at) => at,
             None => {

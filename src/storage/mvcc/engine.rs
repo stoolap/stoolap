@@ -11135,6 +11135,7 @@ impl TransactionEngineOperations for EngineOperations {
             let mut cache = self.txn_version_stores().write().unwrap();
             cache.remove(txn_id);
             drop(cache);
+            self.end_tracking(txn_id);
         }
 
         drop(tables_to_commit);
@@ -12186,6 +12187,23 @@ mod tests {
         let engine = MVCCEngine::in_memory();
         assert!(!engine.is_open());
         assert_eq!(engine.get_path(), "memory://");
+    }
+
+    #[test]
+    fn a_committed_transaction_and_upsert_end_their_tracking() {
+        let db = crate::api::Database::open("memory://committed_tracking_ends").unwrap();
+        for sql in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE)",
+            "BEGIN",
+            "INSERT INTO t VALUES (1, 10)",
+            "COMMIT",
+            "INSERT INTO t VALUES (2, 20) ON CONFLICT (u) DO NOTHING",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        let operations = db.engine().operations();
+        assert!(operations.tracking_txns.lock().is_empty(), "tracked ids");
+        assert!(!operations.tracking_any.load(Ordering::Acquire), "flag");
     }
 
     #[test]

@@ -1284,9 +1284,9 @@ impl Executor {
                             };
                             let conflict_rid = *conflict_rid;
                             // Use row_id from the error if available (cold segment check
-                            // already found it). Only fall back to re-search if row_id < 0
-                            // (hot index path sets row_id = -1 when unknown).
-                            let found_row_id = if conflict_rid >= 0 {
+                            // already found it). Only fall back to re-search if row_id is
+                            // i64::MIN (hot index path sets it when unknown).
+                            let found_row_id = if conflict_rid != i64::MIN {
                                 Ok(Some(conflict_rid))
                             } else {
                                 self.find_row_by_unique_index(
@@ -1322,7 +1322,7 @@ impl Executor {
                                 }
                                 Ok(None) => {
                                     if let Error::UniqueConstraint { row_id, .. } = &mut e {
-                                        *row_id = -1;
+                                        *row_id = i64::MIN;
                                     }
                                     return Err(e);
                                 }
@@ -1574,7 +1574,7 @@ impl Executor {
                                 return Err(e);
                             };
                             let conflict_rid = *conflict_rid;
-                            let found_row_id = if conflict_rid >= 0 {
+                            let found_row_id = if conflict_rid != i64::MIN {
                                 Ok(Some(conflict_rid))
                             } else {
                                 self.find_row_by_unique_index(
@@ -1614,7 +1614,7 @@ impl Executor {
                                 }
                                 Ok(None) => {
                                     if let Error::UniqueConstraint { row_id, .. } = &mut e {
-                                        *row_id = -1;
+                                        *row_id = i64::MIN;
                                     }
                                     return Err(e);
                                 }
@@ -3892,9 +3892,9 @@ impl Executor {
 
         // Prefer direct row_id lookup when we have a concrete conflicting row_id.
         // This avoids a second scan on non-PK upserts after conflict resolution.
-        // row_id < 0 means "unknown" (sentinel from UniqueConstraint error).
+        // row_id i64::MIN means "unknown" (sentinel from UniqueConstraint error).
         // A row DO UPDATE ... WHERE left alone is not an updated row
-        let updated = if row_id >= 0 {
+        let updated = if row_id != i64::MIN {
             table.update_by_row_ids(&[row_id], &mut setter)?
         } else {
             let plan = where_expr.as_deref().and_then(|e| table.index_plan(e));

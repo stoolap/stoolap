@@ -331,6 +331,64 @@ fn an_installed_transaction_judges_by_the_rows_it_wrote_before() {
 }
 
 #[test]
+fn an_upsert_updates_the_negative_row_holding_its_key() {
+    let mut wrong = Vec::new();
+    for rows in [Rows::Hot, Rows::Sealed, Rows::Mixed] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = database(rows, &dir);
+        for sql in [
+            "BEGIN",
+            "UPDATE t SET u = 30 WHERE id = 1",
+            "INSERT INTO t VALUES (-2, 10, 0)",
+            "INSERT INTO t VALUES (-3, 10, 7) ON CONFLICT (u) DO UPDATE SET w = excluded.w",
+            "COMMIT",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        let left: Vec<(i64, i64, i64)> = db
+            .query("SELECT id, u, w FROM t ORDER BY id", ())
+            .unwrap()
+            .map(|row| {
+                let row = row.unwrap();
+                let get = |at| row.get::<i64>(at).unwrap();
+                (get(0), get(1), get(2))
+            })
+            .collect();
+        if left != [(-2, 10, 7), (1, 30, 0), (2, 20, 0)] {
+            wrong.push(format!("{rows:?}: {left:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn an_installed_transaction_judges_the_keys_of_an_index_built_before() {
+    use stoolap::core::{Row, Value};
+    let mut wrong = Vec::new();
+    for rows in [Rows::Hot, Rows::Sealed, Rows::Mixed] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = database(rows, &dir);
+        db.execute("UPDATE t SET w = id", ()).unwrap();
+        let executor = stoolap::Executor::new(std::sync::Arc::clone(db.engine()));
+        let tx = executor.begin_transaction().unwrap();
+        let mut table = tx.get_table("t").unwrap();
+        let row = [3, 30, 100].map(Value::Integer).to_vec();
+        table.insert(Row::from(row)).unwrap();
+        table.create_index("t_w", &["w"], true).unwrap();
+        drop(table);
+        executor.install_transaction(tx);
+        let inserted = executor.execute("INSERT INTO t VALUES (4, 30, 200)");
+        if !matches!(inserted, Err(stoolap::Error::UniqueConstraint { .. })) {
+            wrong.push(format!("{rows:?}: {:?}", inserted.map(|_| ())));
+        }
+        if let Some(mut tx) = executor.take_transaction() {
+            tx.rollback().unwrap();
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
 fn a_composite_key_is_judged_at_the_statement_end() {
     let mut wrong = Vec::new();
     for rows in [Rows::Hot, Rows::Sealed, Rows::Mixed] {
