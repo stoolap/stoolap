@@ -213,22 +213,51 @@ fn test_hot_top_k_over_a_non_unique_index_keeps_the_key_order() {
     }
 }
 
-/// The t sequence of `ORDER BY t {order} LIMIT .. OFFSET ..` must match the
-/// full sort by t in that order; NULLs tie, so only t is compared
-fn check_order(db: &Database, where_clause: &str, order: &str, limit: usize, offset: usize) {
-    let t =
-        |sql: &str| -> Vec<Option<i64>> { pairs(db, sql).into_iter().map(|(_, t)| t).collect() };
-    let expected: Vec<Option<i64>> = t(&format!(
-        "SELECT id, t FROM c {where_clause} ORDER BY t {order}, id"
-    ))
-    .into_iter()
-    .skip(offset)
-    .take(limit)
-    .collect();
+/// The t sequence `ORDER BY t {order}` gives over the group's `keys` and
+/// `nulls` NULLs: NULLs last ascending and first descending, unless the
+/// order says NULLS FIRST or NULLS LAST
+fn ordered(order: &str, keys: &[i64], nulls: usize) -> Vec<Option<i64>> {
+    let desc = order.starts_with("DESC");
+    let nulls_first = match order.rsplit(' ').next() {
+        Some("FIRST") => true,
+        Some("LAST") => false,
+        _ => desc,
+    };
+    let mut keys = keys.to_vec();
+    keys.sort_unstable();
+    if desc {
+        keys.reverse();
+    }
+    let keys = keys.into_iter().map(Some);
+    let nulls = std::iter::repeat_n(None, nulls);
+    if nulls_first {
+        nulls.chain(keys).collect()
+    } else {
+        keys.chain(nulls).collect()
+    }
+}
+
+/// The t sequence of `ORDER BY t {order} LIMIT .. OFFSET ..` must be the
+/// slice of `all`, the whole order; NULLs tie, so only t is compared
+fn check_order(
+    db: &Database,
+    where_clause: &str,
+    order: &str,
+    limit: usize,
+    offset: usize,
+    all: &[Option<i64>],
+) {
     let query = format!(
         "SELECT id, t FROM c {where_clause} ORDER BY t {order} LIMIT {limit} OFFSET {offset}"
     );
-    assert_eq!(t(&query), expected, "{query}");
+    let actual: Vec<Option<i64>> = pairs(db, &query).into_iter().map(|(_, t)| t).collect();
+    let expected: Vec<Option<i64>> = all.iter().skip(offset).take(limit).copied().collect();
+    assert_eq!(actual, expected, "{query}");
+}
+
+/// The keys `fill_nullable` gives the group k3 of `n` rows, every tenth NULL
+fn nullable_keys(n: i64) -> Vec<i64> {
+    (1..=n).filter(|t| t % 10 != 0).collect()
 }
 
 const NULL_ORDERS: [&str; 6] = [
@@ -289,9 +318,21 @@ fn test_hot_top_k_places_the_nulls_of_a_nullable_order_column() {
         check(&db, "WHERE g = 'a' AND k = 'k3' AND t < 9", desc, 3, 0);
         check(&db, "WHERE g = 'a' AND k = 'k3' AND t < 9", desc, 3, 1);
     }
+    let all = |order| ordered(order, &[5, 1, 9], 2);
+    assert_eq!(
+        all("DESC NULLS LAST"),
+        vec![Some(9), Some(5), Some(1), None, None]
+    );
     for order in NULL_ORDERS {
         for (limit, offset) in [(1, 0), (3, 0), (3, 1), (2, 3), (10, 0), (2, 5)] {
-            check_order(&db, "WHERE g = 'a' AND k = 'k3'", order, limit, offset);
+            check_order(
+                &db,
+                "WHERE g = 'a' AND k = 'k3'",
+                order,
+                limit,
+                offset,
+                &all(order),
+            );
         }
     }
 }
@@ -300,13 +341,25 @@ fn test_hot_top_k_places_the_nulls_of_a_nullable_order_column() {
 fn test_hot_top_k_crosses_from_the_nulls_to_the_keys_at_any_offset() {
     let db = Database::open("memory://hot_top_k_null_boundary").unwrap();
     fill_nullable(&db, 200);
+    let keys = nullable_keys(200);
+    let above_150: Vec<i64> = keys.iter().copied().filter(|t| *t > 150).collect();
     for order in NULL_ORDERS {
+        let all = ordered(order, &keys, 20);
         for offset in [0, 15, 19, 20, 21, 175, 179, 180, 181, 199, 200] {
-            check_order(&db, "WHERE g = 'a' AND k = 'k3'", order, 3, offset);
+            check_order(&db, "WHERE g = 'a' AND k = 'k3'", order, 3, offset, &all);
         }
         // A group of NULLs alone, and a bound that keeps NULL out
-        check_order(&db, "WHERE g = 'a' AND k = 'k4'", order, 3, 2);
-        check_order(&db, "WHERE g = 'a' AND k = 'k3' AND t > 150", order, 3, 0);
+        let only_nulls = ordered(order, &[], 200);
+        check_order(&db, "WHERE g = 'a' AND k = 'k4'", order, 3, 2, &only_nulls);
+        let bounded = ordered(order, &above_150, 0);
+        check_order(
+            &db,
+            "WHERE g = 'a' AND k = 'k3' AND t > 150",
+            order,
+            3,
+            0,
+            &bounded,
+        );
     }
 }
 
@@ -346,9 +399,13 @@ fn test_hot_top_k_places_the_nulls_over_hot_and_sealed_rows() {
         (),
     )
     .unwrap();
+    // The sealed keys but 5, which went NULL, and the two hot ones
+    let mut keys: Vec<i64> = nullable_keys(200).into_iter().filter(|t| *t != 5).collect();
+    keys.extend([0, 1000]);
     for order in NULL_ORDERS {
+        let all = ordered(order, &keys, 22);
         for offset in [0, 20, 22, 178, 181] {
-            check_order(&db, "WHERE g = 'a' AND k = 'k3'", order, 3, offset);
+            check_order(&db, "WHERE g = 'a' AND k = 'k3'", order, 3, offset, &all);
         }
     }
 }
