@@ -14,10 +14,10 @@
 
 //! ORDER BY one column + LIMIT over hot rows, answered by walking the
 //! multi-column index whose leading columns the WHERE pins, matches the
-//! full sort: ASC and DESC, OFFSET, bounds on the order column, a predicate
-//! the index does not cover, deleted and updated rows, rows written by the
-//! same transaction, duplicate keys in a non-unique index, and hot rows
-//! mixed with sealed ones.
+//! full sort: ASC and DESC, OFFSET, NULLs where the query puts them, bounds
+//! on the order column, a predicate the index does not cover, deleted and
+//! updated rows, rows written by the same transaction, duplicate keys in a
+//! non-unique index, and hot rows mixed with sealed ones.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -213,8 +213,91 @@ fn test_hot_top_k_over_a_non_unique_index_keeps_the_key_order() {
     }
 }
 
+/// The t sequence `ORDER BY t {order}` gives over the group's `keys` and
+/// `nulls` NULLs: NULLs last ascending and first descending, unless the
+/// order says NULLS FIRST or NULLS LAST
+fn ordered(order: &str, keys: &[i64], nulls: usize) -> Vec<Option<i64>> {
+    let desc = order.starts_with("DESC");
+    let nulls_first = match order.rsplit(' ').next() {
+        Some("FIRST") => true,
+        Some("LAST") => false,
+        _ => desc,
+    };
+    let mut keys = keys.to_vec();
+    keys.sort_unstable();
+    if desc {
+        keys.reverse();
+    }
+    let keys = keys.into_iter().map(Some);
+    let nulls = std::iter::repeat_n(None, nulls);
+    if nulls_first {
+        nulls.chain(keys).collect()
+    } else {
+        keys.chain(nulls).collect()
+    }
+}
+
+/// The t sequence of `ORDER BY t {order} LIMIT .. OFFSET ..` must be the
+/// slice of `all`, the whole order; NULLs tie, so only t is compared
+fn check_order(
+    db: &Database,
+    where_clause: &str,
+    order: &str,
+    limit: usize,
+    offset: usize,
+    all: &[Option<i64>],
+) {
+    let query = format!(
+        "SELECT id, t FROM c {where_clause} ORDER BY t {order} LIMIT {limit} OFFSET {offset}"
+    );
+    let actual: Vec<Option<i64>> = pairs(db, &query).into_iter().map(|(_, t)| t).collect();
+    let expected: Vec<Option<i64>> = all.iter().skip(offset).take(limit).copied().collect();
+    assert_eq!(actual, expected, "{query}");
+}
+
+/// The keys `fill_nullable` gives the group k3 of `n` rows, every tenth NULL
+fn nullable_keys(n: i64) -> Vec<i64> {
+    (1..=n).filter(|t| t % 10 != 0).collect()
+}
+
+const NULL_ORDERS: [&str; 6] = [
+    "ASC",
+    "DESC",
+    "ASC NULLS FIRST",
+    "ASC NULLS LAST",
+    "DESC NULLS FIRST",
+    "DESC NULLS LAST",
+];
+
+/// `c` with a nullable t, its group (g 'a', k 'k3') holding 1..=n with
+/// every tenth t NULL, and a group beside it
+fn fill_nullable(db: &Database, n: i64) {
+    db.execute(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY AUTO_INCREMENT, t INTEGER, g TEXT NOT NULL, \
+         k TEXT NOT NULL, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX c_gkt ON c (g, k, t)", ()).unwrap();
+    db.execute(
+        &format!(
+            "INSERT INTO c (t, g, k, v) SELECT CASE WHEN value % 10 = 0 THEN NULL \
+             ELSE value END, 'a', 'k3', value FROM generate_series(1, {n})"
+        ),
+        (),
+    )
+    .unwrap();
+    db.execute(
+        &format!(
+            "INSERT INTO c (t, g, k, v) SELECT NULL, 'a', 'k4', value FROM generate_series(1, {n})"
+        ),
+        (),
+    )
+    .unwrap();
+}
+
 #[test]
-fn test_hot_top_k_declines_a_nullable_order_column() {
+fn test_hot_top_k_places_the_nulls_of_a_nullable_order_column() {
     let db = Database::open("memory://hot_top_k_nullable").unwrap();
     db.execute(
         "CREATE TABLE c (id INTEGER PRIMARY KEY AUTO_INCREMENT, t INTEGER, g TEXT NOT NULL, \
@@ -234,6 +317,96 @@ fn test_hot_top_k_declines_a_nullable_order_column() {
         check(&db, "WHERE g = 'a' AND k = 'k3' AND t >= 2", desc, 3, 0);
         check(&db, "WHERE g = 'a' AND k = 'k3' AND t < 9", desc, 3, 0);
         check(&db, "WHERE g = 'a' AND k = 'k3' AND t < 9", desc, 3, 1);
+    }
+    let all = |order| ordered(order, &[5, 1, 9], 2);
+    assert_eq!(
+        all("DESC NULLS LAST"),
+        vec![Some(9), Some(5), Some(1), None, None]
+    );
+    for order in NULL_ORDERS {
+        for (limit, offset) in [(1, 0), (3, 0), (3, 1), (2, 3), (10, 0), (2, 5)] {
+            check_order(
+                &db,
+                "WHERE g = 'a' AND k = 'k3'",
+                order,
+                limit,
+                offset,
+                &all(order),
+            );
+        }
+    }
+}
+
+#[test]
+fn test_hot_top_k_crosses_from_the_nulls_to_the_keys_at_any_offset() {
+    let db = Database::open("memory://hot_top_k_null_boundary").unwrap();
+    fill_nullable(&db, 200);
+    let keys = nullable_keys(200);
+    let above_150: Vec<i64> = keys.iter().copied().filter(|t| *t > 150).collect();
+    for order in NULL_ORDERS {
+        let all = ordered(order, &keys, 20);
+        for offset in [0, 15, 19, 20, 21, 175, 179, 180, 181, 199, 200] {
+            check_order(&db, "WHERE g = 'a' AND k = 'k3'", order, 3, offset, &all);
+        }
+        // A group of NULLs alone, and a bound that keeps NULL out
+        let only_nulls = ordered(order, &[], 200);
+        check_order(&db, "WHERE g = 'a' AND k = 'k4'", order, 3, 2, &only_nulls);
+        let bounded = ordered(order, &above_150, 0);
+        check_order(
+            &db,
+            "WHERE g = 'a' AND k = 'k3' AND t > 150",
+            order,
+            3,
+            0,
+            &bounded,
+        );
+    }
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_hot_top_k_walks_a_nullable_order_column() {
+    use stoolap::test_failpoints::hot_top_k_visits;
+    let db = Database::open("memory://hot_top_k_null_walk").unwrap();
+    fill_nullable(&db, 1000);
+    for order in NULL_ORDERS {
+        let query =
+            format!("SELECT id FROM c WHERE g = 'a' AND k = 'k3' ORDER BY t {order} LIMIT 3");
+        let before = hot_top_k_visits();
+        ids(&db, &query);
+        let visits = hot_top_k_visits() - before;
+        assert!(
+            (1..=4).contains(&visits),
+            "{query}: the walk visited {visits} rows"
+        );
+    }
+}
+
+#[test]
+fn test_hot_top_k_places_the_nulls_over_hot_and_sealed_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!("file://{}/nulls", dir.path().display())).unwrap();
+    fill_nullable(&db, 200);
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute(
+        "INSERT INTO c (t, g, k, v) VALUES (NULL, 'a', 'k3', 1), (0, 'a', 'k3', 2), \
+         (1000, 'a', 'k3', 3)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE c SET t = NULL WHERE g = 'a' AND k = 'k3' AND t = 5",
+        (),
+    )
+    .unwrap();
+    // The sealed keys but 5, which went NULL, and the two hot ones
+    let mut keys: Vec<i64> = nullable_keys(200).into_iter().filter(|t| *t != 5).collect();
+    keys.extend([0, 1000]);
+    for order in NULL_ORDERS {
+        let all = ordered(order, &keys, 22);
+        for offset in [0, 20, 22, 178, 181] {
+            check_order(&db, "WHERE g = 'a' AND k = 'k3'", order, 3, offset, &all);
+        }
     }
 }
 

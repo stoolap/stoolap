@@ -1454,9 +1454,8 @@ impl Executor {
 #[inline]
 fn sharing_on() -> bool {
     #[cfg(feature = "test-failpoints")]
-    if crate::test_failpoints::LITERAL_SHARING_OFF.load(Ordering::Relaxed) {
-        return false;
-    }
+    return !crate::test_failpoints::LITERAL_SHARING_OFF.load(Ordering::Relaxed);
+    #[cfg(not(feature = "test-failpoints"))]
     true
 }
 
