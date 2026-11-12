@@ -852,10 +852,18 @@ impl Transaction for MvccTransaction {
         };
 
         let ops = self.get_engine_ops()?;
-        ops.drop_table(name)?;
+        let dropped = ops.drop_table(name);
+        let name_lower = name.to_lowercase();
+        // A drop that fails after the catalog lets go of the table still dropped it
+        let gone = dropped.is_ok()
+            || ops
+                .list_tables()
+                .is_ok_and(|tables| !tables.contains(&name_lower));
+        if !gone {
+            return dropped;
+        }
 
         // Save schema for potential rollback (note: data cannot be recovered)
-        let name_lower = name.to_lowercase();
         let created_here = self
             .table_changes
             .iter()
@@ -881,7 +889,7 @@ impl Transaction for MvccTransaction {
             }
         }
 
-        Ok(())
+        dropped
     }
 
     fn get_table(&self, name: &str) -> Result<Box<dyn Table>> {
