@@ -37,15 +37,21 @@ fn indexes(db: &Database, table: &str) -> Vec<(String, bool)> {
 /// The foreign key and the uniqueness of `pid` both hold on `table`, which
 /// holds the row (1, 1) and no row with id 100 or 101
 fn rules_hold(db: &Database, table: &str, unique: bool, wrong: &mut Vec<String>) {
-    if db
-        .execute(&format!("INSERT INTO {table} VALUES (100, 99)"), ())
-        .is_ok()
-    {
-        wrong.push(format!("{table}: a row with no parent was accepted"));
+    let orphan = db.execute(
+        &format!("INSERT INTO {table} (id, pid) VALUES (100, 99)"),
+        (),
+    );
+    if !orphan.is_err_and(|e| e.to_string().contains("foreign key constraint")) {
+        wrong.push(format!(
+            "{table}: a row with no parent was not refused by its key"
+        ));
     }
-    let duplicate = db.execute(&format!("INSERT INTO {table} VALUES (101, 1)"), ());
-    if unique && duplicate.is_ok() {
-        wrong.push(format!("{table}: a duplicate pid was accepted"));
+    let duplicate = db.execute(
+        &format!("INSERT INTO {table} (id, pid) VALUES (101, 1)"),
+        (),
+    );
+    if unique && !duplicate.is_err_and(|e| e.to_string().contains("unique constraint")) {
+        wrong.push(format!("{table}: a duplicate pid was not refused as one"));
     }
 }
 
@@ -203,4 +209,67 @@ fn a_unique_index_replaces_the_key_index_over_sealed_rows_and_after_a_crash() {
     rules_hold(&db, "s", true, &mut wrong);
     db.close().unwrap();
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn an_index_of_the_keys_name_on_another_column_is_not_replaced() {
+    let db = Database::open("memory://fk_unique_index_other_column").unwrap();
+    parent(&db);
+    db.execute(
+        "CREATE TABLE o (id INTEGER PRIMARY KEY, pid INTEGER, x INTEGER, \
+         FOREIGN KEY (pid) REFERENCES p (id))",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO o VALUES (1, 1, 1)", ()).unwrap();
+    for sql in [
+        "DROP INDEX fk_o_pid ON o",
+        "CREATE INDEX fk_o_pid ON o (x)",
+        "CREATE UNIQUE INDEX u_o ON o (pid)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let found = indexes(&db, "o");
+    assert!(
+        found.contains(&("fk_o_pid".to_string(), false))
+            && found.contains(&("u_o".to_string(), true)),
+        "the index on x went with the replacement: {found:?}"
+    );
+}
+
+/// The side files the table's sealed volumes keep
+fn side_files(dir: &Path) -> usize {
+    let mut count = 0;
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            count += side_files(&entry.path());
+        } else if entry.path().extension().is_some_and(|ext| ext == "sidx") {
+            count += 1;
+        }
+    }
+    count
+}
+
+#[test]
+fn a_replaced_key_index_leaves_no_side_file_no_index_serves() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?checkpoint_interval=3600",
+        dir.path().display()
+    ))
+    .unwrap();
+    parent(&db);
+    child(&db, "sh", "(1, 1), (2, 2)");
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let before = side_files(dir.path());
+    db.execute("CREATE UNIQUE INDEX u_sh ON sh (pid) USING HASH", ())
+        .unwrap();
+    let after = side_files(dir.path());
+    db.close().unwrap();
+    assert!(
+        before > 0,
+        "the sealed key index kept no side file to replace"
+    );
+    assert_eq!(after, 0, "the replaced key index left {after} side files");
 }

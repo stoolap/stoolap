@@ -221,15 +221,15 @@ fn fk_index_name(table: &str, column: &str) -> String {
     format!("fk_{table}_{column}")
 }
 
-/// The name of the index CREATE TABLE made for a foreign key's lookups on
-/// `column`, when a foreign key of `schema` reads the column
-fn fk_own_index_name(schema: &crate::core::Schema, column: &str) -> Option<String> {
+/// The name CREATE TABLE gave the index of a foreign key's lookups on
+/// `column`, and the column's id, when a foreign key of `schema` reads it
+fn fk_own_index_name(schema: &crate::core::Schema, column: &str) -> Option<(String, i32)> {
     let (index, col) = schema.find_column(column)?;
     schema
         .foreign_keys
         .iter()
         .any(|fk| fk.column_index == index)
-        .then(|| fk_index_name(&schema.table_name, &col.name))
+        .then(|| (fk_index_name(&schema.table_name, &col.name), col.id as i32))
 }
 
 impl Executor {
@@ -739,11 +739,13 @@ impl Executor {
         // A unique index on a foreign key's column takes the place of the
         // non-unique index CREATE TABLE made for the key's lookups
         let replaces = match column_names.as_slice() {
-            [column] if is_unique => fk_own_index_name(schema, column).filter(|name| {
-                table
-                    .get_index(name)
-                    .is_some_and(|index| !index.is_unique() && index.column_names().len() == 1)
-            }),
+            [column] if is_unique => fk_own_index_name(schema, column)
+                .filter(|(name, column_id)| {
+                    table.get_index(name).is_some_and(|index| {
+                        !index.is_unique() && index.column_ids() == [*column_id]
+                    })
+                })
+                .map(|(name, _)| name),
             _ => None,
         };
 
@@ -928,8 +930,7 @@ impl Executor {
         // The replaced index goes once the new one is in the log, so a crash
         // between the two records replays both
         if let Some(replaced) = &replaces {
-            self.engine.record_drop_index(table_name, replaced)?;
-            table.drop_index(replaced)?;
+            self.drop_recorded_index(table_name, &*table, replaced)?;
         }
         self.engine.index_changed(table_name);
 
@@ -979,17 +980,25 @@ impl Executor {
         let tx = self.begin_transaction()?;
         let table = tx.get_ddl_table(&table_name)?;
 
-        // Record index drop to WAL BEFORE applying in-memory change.
-        // This prevents ghost state where the index is removed from memory
-        // but still exists in WAL (would reappear after crash recovery).
-        self.engine.record_drop_index(&table_name, &index_name)?;
-
-        // Now apply the in-memory change
-        table.drop_index(&index_name)?;
-        self.engine.discard_uncovered_side_files(&table_name);
-        self.engine.index_changed(&table_name);
+        self.drop_recorded_index(&table_name, &*table, &index_name)?;
 
         Ok(Box::new(ExecResult::empty()))
+    }
+
+    /// Drops `index_name` of `table`: recorded first, so a crash cannot
+    /// bring back an index memory no longer has, then the side files no
+    /// index serves any more go
+    fn drop_recorded_index(
+        &self,
+        table_name: &str,
+        table: &dyn crate::storage::traits::Table,
+        index_name: &str,
+    ) -> Result<()> {
+        self.engine.record_drop_index(table_name, index_name)?;
+        table.drop_index(index_name)?;
+        self.engine.discard_uncovered_side_files(table_name);
+        self.engine.index_changed(table_name);
+        Ok(())
     }
 
     /// An error when `column` takes the row identity's name and a view's
