@@ -210,45 +210,91 @@ impl stoolap::functions::ScalarFunction for InSelect {
     }
 }
 
-#[test]
-fn a_rollback_called_from_a_create_as_select_runs_under_its_guard() {
+/// What `CREATE TABLE c AS SELECT TABLE_UNDO_IN_SELECT(id) AS id FROM seed`
+/// leaves, its function running what `arm` makes of another session first
+struct CreatedAsSelect {
+    created: stoolap::core::Result<()>,
+    c: Vec<i64>,
+    n: Option<i64>,
+    closed: stoolap::core::Result<()>,
+}
+
+fn create_as_select(arm: fn(Database) -> Box<dyn FnOnce()>) -> CreatedAsSelect {
     use std::sync::mpsc;
+    use std::sync::Once;
     use std::time::Duration;
 
-    // The failpoint tests here fail WAL syncs process-wide
-    #[cfg(feature = "test-failpoints")]
-    let _guard = stoolap::test_failpoints::FailpointGuard::new();
-    stoolap::functions::registry::global_registry()
-        .register_scalar::<InSelect>()
-        .unwrap();
+    static REGISTER: Once = Once::new();
+    REGISTER.call_once(|| {
+        stoolap::functions::registry::global_registry()
+            .register_scalar::<InSelect>()
+            .unwrap();
+    });
     let (done, finished) = mpsc::channel();
-    std::thread::spawn(move || {
+    let worker = std::thread::spawn(move || {
         let dir = tempfile::tempdir().unwrap();
         let a = Database::open(&format!("file://{}", dir.path().display())).unwrap();
-        let b = a.clone();
         a.execute("CREATE TABLE seed (id INTEGER PRIMARY KEY)", ())
             .unwrap();
         a.execute("INSERT INTO seed VALUES (1)", ()).unwrap();
-        b.execute("BEGIN", ()).unwrap();
-        b.execute("CREATE TABLE n (id INTEGER PRIMARY KEY)", ())
-            .unwrap();
-        IN_SELECT.with(|slot| {
-            *slot.borrow_mut() = Some(Box::new(move || {
-                b.execute("ROLLBACK", ()).unwrap();
-            }))
-        });
+        let call = arm(a.clone());
+        IN_SELECT.with(|slot| *slot.borrow_mut() = Some(call));
         let created = a
             .execute(
                 "CREATE TABLE c AS SELECT TABLE_UNDO_IN_SELECT(id) AS id FROM seed",
                 (),
             )
             .map(|_| ());
-        let _ = done.send((created, rows(&a, "c"), rows(&a, "n")));
+        let c = a
+            .query("SELECT id FROM c", ())
+            .map(|rows| rows.map(|row| row.unwrap().get(0).unwrap()).collect())
+            .unwrap_or_default();
+        let n = rows(&a, "n");
+        let closed = a.close();
+        let _ = done.send(CreatedAsSelect {
+            created,
+            c,
+            n,
+            closed,
+        });
     });
-    let (created, c, n) = finished
+    let outcome = finished
         .recv_timeout(Duration::from_secs(30))
-        .expect("the rollback waited for the guard its own thread holds");
-    assert!(created.is_ok(), "{created:?}");
-    assert_eq!(c, Some(1), "c holds the selected row");
-    assert_eq!(n, None, "the rolled-back table stayed");
+        .expect("the statement waited for the guard its own thread holds");
+    worker.join().unwrap();
+    outcome
+}
+
+#[test]
+fn a_rollback_called_from_a_create_as_select_runs_under_its_guard() {
+    // The failpoint tests here fail WAL syncs process-wide
+    #[cfg(feature = "test-failpoints")]
+    let _guard = stoolap::test_failpoints::FailpointGuard::new();
+    let outcome = create_as_select(|b| {
+        b.execute("BEGIN", ()).unwrap();
+        b.execute("CREATE TABLE n (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        Box::new(move || {
+            b.execute("ROLLBACK", ()).unwrap();
+        })
+    });
+    assert!(outcome.created.is_ok(), "{:?}", outcome.created);
+    assert_eq!(outcome.c, vec![1], "c holds the selected row");
+    assert_eq!(outcome.n, None, "the rolled-back table stayed");
+    assert!(outcome.closed.is_ok(), "{:?}", outcome.closed);
+}
+
+#[test]
+fn a_create_as_select_keeps_its_name_from_a_view_its_function_creates() {
+    // The failpoint tests here fail WAL syncs process-wide
+    #[cfg(feature = "test-failpoints")]
+    let _guard = stoolap::test_failpoints::FailpointGuard::new();
+    let outcome = create_as_select(|b| {
+        Box::new(move || {
+            let _ = b.execute("CREATE VIEW c AS SELECT 99 AS id", ());
+        })
+    });
+    assert!(outcome.created.is_ok(), "{:?}", outcome.created);
+    assert_eq!(outcome.c, vec![1], "c reads the view, not the table");
+    assert!(outcome.closed.is_ok(), "{:?}", outcome.closed);
 }

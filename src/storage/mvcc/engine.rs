@@ -896,8 +896,8 @@ type FkReverseCache = (u64, StringMap<Arc<Vec<(String, ForeignKeyConstraint)>>>)
 /// What a DDL change shares with the transactions that can make one
 struct DdlShared {
     /// Held across a DDL statement's schema change and its WAL record, so
-    /// the log replays in the order the changes were applied; a thread that
-    /// holds it, a callback of its statement among them, takes it again
+    /// the log replays in the order the changes were applied; the thread
+    /// holding it takes it again for an undo, never for a DDL statement
     serial: parking_lot::ReentrantMutex<()>,
     /// Schema epoch counter - increments on any CREATE/ALTER/DROP TABLE
     /// Used for fast cache invalidation without HashMap lookup
@@ -4839,6 +4839,18 @@ impl MVCCEngine {
     /// catalog, so replay applies the changes in the order they were made
     pub fn ddl_guard(&self) -> parking_lot::ReentrantMutexGuard<'_, ()> {
         self.ddl.guard()
+    }
+
+    /// The DDL guard for a DDL statement, refused on a thread that holds it:
+    /// a function a DDL statement calls runs no DDL statement of its own,
+    /// which would land between that statement's checks and its change
+    pub fn ddl_statement_guard(&self) -> Result<parking_lot::ReentrantMutexGuard<'_, ()>> {
+        if self.ddl.serial.is_owned_by_current_thread() {
+            return Err(Error::NotSupported(
+                "a DDL statement inside a function another DDL statement calls".to_string(),
+            ));
+        }
+        Ok(self.ddl.guard())
     }
 
     /// After an index of `table_name` is dropped: the side file of every
