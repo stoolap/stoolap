@@ -32,7 +32,7 @@ use std::cell::Cell;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 use crate::common::{I64Map, I64Set};
@@ -1011,9 +1011,9 @@ struct Changed {
     done: bool,
     /// The child table's store and layout `column` was read from
     token: Option<LayoutToken>,
-    /// The root the statement changed this same column in, whose new values
-    /// are rows the statement wrote and no key reaches
-    shadows: Option<usize>,
+    /// The values the statement wrote into this same column as a root: rows
+    /// holding them are the statement's writes, which no key reaches
+    written: FxHashSet<Value>,
 }
 
 /// What one start value of a column becomes
@@ -1075,7 +1075,7 @@ impl Changed {
             waiting: 0,
             done: false,
             token: None,
-            shadows: None,
+            written: FxHashSet::default(),
         }
     }
 
@@ -1197,9 +1197,12 @@ fn find_update_actions(
                         Some(at) => roots + at,
                         None => {
                             let mut into = Changed::new(child_table, child_column);
-                            into.shadows = columns[..roots]
+                            if let Some(root) = columns[..roots]
                                 .iter()
-                                .position(|c| c.column == child_column && c.table == *child_table);
+                                .find(|c| c.column == child_column && c.table == *child_table)
+                            {
+                                into.written = root.values.iter().map(|t| t.new.clone()).collect();
+                            }
                             columns.push(into);
                             columns.len() - 1
                         }
@@ -1229,8 +1232,8 @@ fn find_update_actions(
 /// key is not waited for, and reaching a row through it is refused
 fn count_waits(actions: &mut [UpdateAction], columns: &mut [Changed], roots: usize) {
     // Columns are found in order, so each one's keys are one run of
-    // `actions`; a graph of a few columns walks without the heap
-    let mut first: SmallVec<[usize; 8]> = smallvec::smallvec![actions.len(); columns.len() + 1];
+    // `actions`; a graph of up to eight columns walks without the heap
+    let mut first: SmallVec<[usize; 9]> = smallvec::smallvec![actions.len(); columns.len() + 1];
     for (at, action) in actions.iter().enumerate().rev() {
         first[action.from] = at;
     }
@@ -1339,9 +1342,9 @@ fn run_update_action(
     let mut reached = false;
     for (old_value, new_value) in &changes {
         // A row holding a value the statement wrote into the column is that write
-        let written = columns[to].shadows.is_some_and(|root| {
-            (columns[root].values.iter()).any(|written| same_value(&written.new, old_value))
-        });
+        let written = &columns[to].written;
+        let written =
+            !written.is_empty() && written.contains(&key_value(child_schema, col_idx, old_value));
         if written || !child_rows_exist(engine, txn_id, child_table, fk, old_value)? {
             continue;
         }

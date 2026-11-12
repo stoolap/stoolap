@@ -70,17 +70,40 @@ fn upsert(db: &Database, set: &str, offset: i64) -> usize {
 
 #[test]
 fn changing_a_referenced_value_costs_an_upsert_a_bounded_number_of_allocations() {
-    let db = Database::open("memory://upsert_key_change_alloc").unwrap();
+    let per_row = extra_per_conflict("upsert_key_change_alloc_one", 1);
+    assert!(
+        per_row <= ONE_CHILD,
+        "{per_row} more allocations per conflict for a referenced value than for n"
+    );
+}
+
+#[test]
+fn seven_children_cost_the_ordering_of_their_keys_no_allocation() {
+    let per_row = extra_per_conflict("upsert_key_change_alloc_seven", 7);
+    assert!(
+        per_row <= SEVEN_CHILDREN,
+        "{per_row} more allocations per conflict for a value seven tables reference"
+    );
+}
+
+/// What a conflict changing `p.code`, which `children` empty tables
+/// reference, allocates over one changing `p.n`
+fn extra_per_conflict(name: &str, children: usize) -> f64 {
+    let db = Database::open(&format!("memory://{name}")).unwrap();
     db.execute(
         "CREATE TABLE p (id INTEGER PRIMARY KEY, code INTEGER UNIQUE, n INTEGER)",
         (),
     )
     .unwrap();
-    db.execute(
-        "CREATE TABLE c (id INTEGER PRIMARY KEY, pc INTEGER REFERENCES p(code) ON UPDATE CASCADE)",
-        (),
-    )
-    .unwrap();
+    for child in 0..children {
+        db.execute(
+            &format!(
+                "CREATE TABLE c{child} (id INTEGER PRIMARY KEY, pc INTEGER REFERENCES p(code) ON UPDATE CASCADE)"
+            ),
+            (),
+        )
+        .unwrap();
+    }
     let rows: Vec<String> = (1..=ROWS).map(|id| format!("({id}, {id}, 0)")).collect();
     db.execute(&format!("INSERT INTO p VALUES {}", rows.join(", ")), ())
         .unwrap();
@@ -88,13 +111,12 @@ fn changing_a_referenced_value_costs_an_upsert_a_bounded_number_of_allocations()
     let unreferenced = upsert(&db, "n = excluded.n + 2", 0);
     upsert(&db, "code = excluded.code", 10_000);
     let referenced = upsert(&db, "code = excluded.code", 20_000);
-    let per_row = referenced.saturating_sub(unreferenced) as f64 / ROWS as f64;
-    assert!(
-        per_row <= LIMIT,
-        "{per_row} more allocations per conflict for a referenced value than for n"
-    );
+    referenced.saturating_sub(unreferenced) as f64 / ROWS as f64
 }
 
-/// 27.15 measured before the walk that orders the keys' actions, which
-/// adds none for a graph of a few columns
-const LIMIT: f64 = 27.5;
+/// 27.15 measured before the walk that orders the keys' actions, a graph
+/// of two columns
+const ONE_CHILD: f64 = 27.5;
+
+/// 115.178 measured before the walk, a graph of eight columns
+const SEVEN_CHILDREN: f64 = 115.5;
