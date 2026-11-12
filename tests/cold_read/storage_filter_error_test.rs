@@ -492,6 +492,28 @@ mod written_by_the_filter {
         trigger: i64,
         read: Read,
     ) -> Option<std::result::Result<usize, String>> {
+        let insert: fn() -> Write = || {
+            Box::new(|table: &mut dyn Table| {
+                table.insert(Row::from_values(vec![
+                    Value::Integer(9),
+                    Value::Integer(1),
+                    Value::Integer(0),
+                ]))?;
+                Ok(())
+            })
+        };
+        run_writing(dsn, indexed, own, trigger, insert, read)
+    }
+
+    /// Runs `read` as `read_writing_at` does, with `write` armed
+    fn run_writing<R: Send + 'static>(
+        dsn: String,
+        indexed: bool,
+        own: bool,
+        trigger: i64,
+        write: fn() -> Write,
+        read: fn(&mut dyn Table, &dyn Expression) -> Result<R>,
+    ) -> Option<std::result::Result<R, String>> {
         let (done, finished) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             TRIGGER.with(|t| t.set(trigger));
@@ -518,16 +540,7 @@ mod written_by_the_filter {
                     .unwrap();
             }
             OTHER.with(|other| *other.borrow_mut() = Some(tx.get_table("w").unwrap()));
-            WRITE.with(|slot| {
-                *slot.borrow_mut() = Some(Box::new(|table: &mut dyn Table| {
-                    table.insert(Row::from_values(vec![
-                        Value::Integer(9),
-                        Value::Integer(1),
-                        Value::Integer(0),
-                    ]))?;
-                    Ok(())
-                }))
-            });
+            WRITE.with(|slot| *slot.borrow_mut() = Some(write()));
             let writes = FunctionExpr::new(
                 Arc::new(WritesAt),
                 vec![FunctionArg::Column("id".to_string())],
@@ -549,6 +562,65 @@ mod written_by_the_filter {
         finished
             .recv_timeout(std::time::Duration::from_secs(10))
             .ok()
+    }
+
+    type Collect = fn(&mut dyn Table, &dyn Expression) -> Result<Vec<(i64, Value)>>;
+
+    fn ids_and_v(rows: stoolap::core::RowVec) -> Vec<(i64, Value)> {
+        let mut rows: Vec<_> = rows
+            .iter()
+            .map(|(id, row)| (*id, row.get(1).cloned().unwrap()))
+            .collect();
+        rows.sort_by_key(|(id, _)| *id);
+        rows
+    }
+
+    #[test]
+    fn a_read_takes_its_transactions_rows_as_they_stood_before_its_filter_changed_them() {
+        let delete: fn() -> Write = || {
+            Box::new(|table: &mut dyn Table| {
+                table.delete_by_row_ids(&[3])?;
+                Ok(())
+            })
+        };
+        let update: fn() -> Write = || {
+            Box::new(|table: &mut dyn Table| {
+                let mut id3 = ComparisonExpr::eq("id", Value::Integer(3));
+                id3.prepare_for_schema(table.schema());
+                table.update(ScanAccess::Seq, Some(&id3), &mut |id, _| {
+                    let row = vec![Value::Integer(id), Value::Integer(5), Value::Integer(0)];
+                    Ok((Row::from_values(row), true))
+                })?;
+                Ok(())
+            })
+        };
+        let reads: [(&str, Collect); 3] = [
+            ("all", |table, filter| {
+                Ok(ids_and_v(table.collect_all_rows(Some(filter))?))
+            }),
+            ("limit", |table, filter| {
+                Ok(ids_and_v(table.collect_rows_with_limit(
+                    Some(filter),
+                    10,
+                    0,
+                )?))
+            }),
+            ("unordered", |table, filter| {
+                Ok(ids_and_v(table.collect_rows_with_limit_unordered(
+                    Some(filter),
+                    10,
+                    0,
+                )?))
+            }),
+        ];
+        let want: Vec<(i64, Value)> = (1..=3).map(|id| (id, Value::Integer(1))).collect();
+        for (change, write) in [("delete", delete), ("update", update)] {
+            for (case, read) in reads {
+                let dsn = format!("memory://filter_changes_own_{change}_{case}");
+                let rows = run_writing(dsn, false, true, 1, write, read);
+                assert_eq!(rows, Some(Ok(want.clone())), "{change}, {case}");
+            }
+        }
     }
 
     fn indexed(table: &dyn Table, filter: &dyn Expression) -> IndexPlan {

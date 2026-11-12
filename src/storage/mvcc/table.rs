@@ -2081,12 +2081,12 @@ impl MVCCTable {
     }
 
     /// The transaction's own rows in `txn_versions` it did not delete, as
-    /// the schema reads them, of the ids `named` holds when given; the guard
-    /// goes with them, so a filter asked of them runs without it
-    fn local_rows(&self, txn_versions: LocalRows<'_>, named: Option<&LocalIds>) -> RowVec {
+    /// the schema reads them; the guard goes with them, so a filter asked of
+    /// them runs without it
+    fn local_rows(&self, txn_versions: LocalRows<'_>) -> RowVec {
         let mut rows = RowVec::new();
         for (row_id, version) in txn_versions.iter_local() {
-            if version.is_deleted() || named.is_some_and(|ids| !ids.hides(row_id)) {
+            if version.is_deleted() {
                 continue;
             }
             let row = self.normalize_row_to_schema(version.data.clone(), &self.cached_schema);
@@ -2153,7 +2153,7 @@ impl MVCCTable {
 
         // Step 2: The local rows and their ids, the guard let go
         let local_ids = Self::local_ids(&txn_versions);
-        let local_rows = self.local_rows(txn_versions, None);
+        let local_rows = self.local_rows(txn_versions);
 
         // Step 3: Pre-allocate result
         let mut rows = RowVec::with_capacity(global_rows.len() + local_rows.len());
@@ -2262,9 +2262,14 @@ impl MVCCTable {
             .version_store
             .get_all_visible_rows_cached(self.reader());
 
-        // The local rows' ids, the guard let go until the rows are read
+        // A filter is asked of the local rows as they stood before it ran,
+        // copied and the guard let go; with none the guard stays, and a row
+        // the limit does not reach is not cloned
         let local_ids = Self::local_ids(&txn_versions);
-        drop(txn_versions);
+        let (txn_versions, local_rows) = match filter {
+            Some(_) => (None, self.local_rows(txn_versions)),
+            None => (Some(txn_versions), RowVec::new()),
+        };
 
         // A user-supplied limit can be i64::MAX; only pre-allocate what
         // can actually be returned
@@ -2291,9 +2296,24 @@ impl MVCCTable {
             count += 1;
         }
 
-        // Add local versions (both updates and inserts), of the ids the
-        // global rows above gave way to
-        for (row_id, row) in self.local_rows(self.local(), Some(&local_ids)) {
+        // Add local versions (both updates and inserts)
+        if let Some(txn_versions) = txn_versions {
+            for (row_id, version) in txn_versions.iter_local() {
+                if version.is_deleted() {
+                    continue;
+                }
+                if count >= offset {
+                    let row = self.normalize_row_to_schema(version.data.clone(), schema);
+                    result.push((row_id, row));
+                    if result.len() >= limit {
+                        return Ok(result);
+                    }
+                }
+                count += 1;
+            }
+            return Ok(result);
+        }
+        for (row_id, row) in local_rows {
             if let Some(expr) = filter {
                 if !passes(expr, fallible, &row)? {
                     continue;
