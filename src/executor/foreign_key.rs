@@ -1011,10 +1011,11 @@ pub(crate) struct UpdatePlan {
     actions: Vec<UpdateAction>,
 }
 
-/// The plans one statement found for its target, by the columns they start
-/// from: an upsert finds them once, not for each conflict
+/// The plan a statement's last call used for its target, with the schema
+/// epoch it was found at: an upsert's conflicts that change the same columns
+/// share it while no table's definition changes
 #[derive(Default)]
-pub(crate) struct UpdatePlans(SmallVec<[UpdatePlan; 1]>);
+pub(crate) struct UpdatePlans(Option<(u64, UpdatePlan)>);
 
 impl UpdatePlans {
     fn find(
@@ -1023,19 +1024,18 @@ impl UpdatePlans {
         table: &str,
         roots: impl Iterator<Item = usize> + Clone,
     ) -> Result<&UpdatePlan> {
-        let found = self
+        let epoch = engine.schema_epoch();
+        let kept = self
             .0
-            .iter()
-            .position(|plan| plan.roots.iter().copied().eq(roots.clone()));
-        let at = match found {
-            Some(at) => at,
-            None => {
-                self.0
-                    .push(plan_update_actions(engine, table, roots.collect())?);
-                self.0.len() - 1
-            }
-        };
-        Ok(&self.0[at])
+            .as_ref()
+            .is_some_and(|(at, plan)| *at == epoch && plan.roots.iter().copied().eq(roots.clone()));
+        if !kept {
+            self.0 = Some((epoch, plan_update_actions(engine, table, roots.collect())?));
+        }
+        match &self.0 {
+            Some((_, plan)) => Ok(plan),
+            None => Err(Error::internal("an update plan was not kept")),
+        }
     }
 }
 
