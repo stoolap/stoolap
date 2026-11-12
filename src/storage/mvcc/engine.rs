@@ -54,6 +54,9 @@ const ALTER_MODIFY_COLUMN: u8 = 4;
 /// The operation byte of an ALTER TABLE ... RENAME TO record
 const ALTER_RENAME_TABLE: u8 = 5;
 
+/// The operation byte of an ALTER TABLE ... AUTO_INCREMENT record
+const ALTER_AUTO_INCREMENT: u8 = 7;
+
 /// The new name a RENAME TO record gives its table: the record holds the
 /// operation byte, then the old name and the new one, each after its length
 fn renamed_to(data: &[u8]) -> Option<String> {
@@ -3503,6 +3506,17 @@ impl MVCCEngine {
                 }
                 self.set_cluster_key(&table_name, key)?;
             }
+            ALTER_AUTO_INCREMENT => {
+                let next = data
+                    .get(pos..pos + 8)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .map(i64::from_le_bytes)
+                    .ok_or_else(|| {
+                        Error::internal("invalid ALTER TABLE data: missing AUTO_INCREMENT value")
+                    })?;
+                self.get_version_store(&table_name)?
+                    .set_auto_increment_counter(next.saturating_sub(1));
+            }
             _ => {
                 return Err(Error::internal(format!(
                     "unknown ALTER TABLE operation type: {}",
@@ -5064,6 +5078,23 @@ impl MVCCEngine {
         column: crate::core::SchemaColumn,
     ) -> Result<()> {
         self.get_version_store(table_name)?.add_column(column)
+    }
+
+    /// Raise `table_name`'s id counter so its next generated id is `next`;
+    /// an error when an id at or past `next` was already handed out
+    pub fn raise_auto_increment(&self, table_name: &str, next: i64) -> Result<()> {
+        let store = self.get_version_store(table_name)?;
+        let handed_out = store.get_auto_increment_counter();
+        if handed_out >= next {
+            return Err(Error::invalid_argument(format!(
+                "AUTO_INCREMENT of table '{}' cannot go below {}: id {} was already handed out",
+                table_name,
+                handed_out.saturating_add(1),
+                handed_out
+            )));
+        }
+        store.set_auto_increment_counter(next - 1);
+        Ok(())
     }
 
     /// Order a table's sealed rows by `key` from the next seal on; the
@@ -9248,6 +9279,16 @@ impl Engine for MVCCEngine {
         for &column in key {
             data.extend_from_slice(&(column as u16).to_le_bytes());
         }
+        self.record_ddl(table_name, WALOperationType::AlterTable, &data)
+    }
+
+    fn record_alter_table_auto_increment(&self, table_name: &str, next: i64) -> Result<()> {
+        // Serialize: operation_type(1) + table_name_len(2) + table_name + next(8)
+        let mut data = Vec::with_capacity(11 + table_name.len());
+        data.push(ALTER_AUTO_INCREMENT);
+        data.extend_from_slice(&(table_name.len() as u16).to_le_bytes());
+        data.extend_from_slice(table_name.as_bytes());
+        data.extend_from_slice(&next.to_le_bytes());
         self.record_ddl(table_name, WALOperationType::AlterTable, &data)
     }
 

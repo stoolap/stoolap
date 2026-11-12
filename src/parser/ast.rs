@@ -3053,6 +3053,8 @@ pub enum AlterTableOperation {
     ClusterBy,
     /// DROP CLUSTER BY: the sealed rows return to row id order
     DropClusterBy,
+    /// AUTO_INCREMENT = n: the next generated id is n
+    AutoIncrement(i64),
 }
 
 /// ALTER TABLE statement
@@ -3103,6 +3105,9 @@ impl fmt::Display for AlterTableStatement {
                 result.push_str(&format!("CLUSTER BY ({})", columns.join(", ")));
             }
             AlterTableOperation::DropClusterBy => result.push_str("DROP CLUSTER BY"),
+            AlterTableOperation::AutoIncrement(next) => {
+                result.push_str(&format!("AUTO_INCREMENT = {}", next))
+            }
         }
         write!(f, "{}", result)
     }

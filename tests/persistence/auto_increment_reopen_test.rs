@@ -123,6 +123,66 @@ fn test_truncate_restarts_ids_after_reopen() {
     assert_eq!(next_id_after_insert(&db, "t"), 1);
 }
 
+/// `statements` on a new table, then a close and a reopen with `params`
+fn reopened_after(statements: &[&str], params: &str) -> (tempfile::TempDir, Database) {
+    let dir = tempdir().unwrap();
+    let dsn = format!("file://{}{params}", dir.path().join("db").display());
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTO_INCREMENT, v TEXT)",
+            (),
+        )
+        .unwrap();
+        for sql in statements {
+            db.execute(sql, ()).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+        db.close().unwrap();
+    }
+    let db = Database::open(&dsn).unwrap();
+    (dir, db)
+}
+
+#[test]
+fn test_alter_auto_increment_survives_a_reopen() {
+    #[cfg(feature = "test-failpoints")]
+    let _guard = stoolap::test_failpoints::FailpointGuard::new();
+    let (_dir, db) = reopened_after(&["ALTER TABLE t AUTO_INCREMENT = 1000"], "");
+    assert_eq!(
+        next_id_after_insert(&db, "t"),
+        1000,
+        "through the catalog copy"
+    );
+}
+
+#[test]
+fn test_alter_auto_increment_survives_a_crash_through_the_log() {
+    #[cfg(feature = "test-failpoints")]
+    let _guard = stoolap::test_failpoints::FailpointGuard::new();
+    let (_dir, db) = reopened_after(
+        &["ALTER TABLE t AUTO_INCREMENT = 1000"],
+        "?checkpoint_on_close=off",
+    );
+    assert_eq!(next_id_after_insert(&db, "t"), 1000, "through the log");
+}
+
+#[test]
+fn test_truncate_after_alter_auto_increment_restarts_ids() {
+    #[cfg(feature = "test-failpoints")]
+    let _guard = stoolap::test_failpoints::FailpointGuard::new();
+    for params in ["", "?checkpoint_on_close=off"] {
+        let (_dir, db) = reopened_after(
+            &[
+                "ALTER TABLE t AUTO_INCREMENT = 1000",
+                "INSERT INTO t (v) VALUES ('a')",
+                "TRUNCATE TABLE t",
+            ],
+            params,
+        );
+        assert_eq!(next_id_after_insert(&db, "t"), 1, "with {params:?}");
+    }
+}
+
 /// The database files as they stand, as a crash would leave them
 #[cfg(feature = "test-failpoints")]
 fn crash_image(from: &std::path::Path, to: &std::path::Path) {

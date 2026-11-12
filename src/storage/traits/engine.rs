@@ -227,6 +227,12 @@ pub trait Engine: Send + Sync {
         Ok(())
     }
 
+    /// Record ALTER TABLE ... AUTO_INCREMENT, the next id it sets
+    fn record_alter_table_auto_increment(&self, table_name: &str, next: i64) -> Result<()> {
+        let _ = (table_name, next);
+        Ok(())
+    }
+
     /// Record ALTER TABLE RENAME TO operation to WAL for persistence
     fn record_alter_table_rename(&self, old_table_name: &str, new_table_name: &str) -> Result<()> {
         // Default implementation does nothing

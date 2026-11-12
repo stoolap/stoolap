@@ -1347,6 +1347,22 @@ impl Executor {
                 self.engine.set_cluster_key(table_name, Vec::new())?;
                 self.engine.record_alter_table_cluster_by(table_name, &[])?;
             }
+            AlterTableOperation::AutoIncrement(next) => {
+                if !table
+                    .schema()
+                    .columns
+                    .iter()
+                    .any(|column| column.auto_increment)
+                {
+                    return Err(Error::invalid_argument(format!(
+                        "table '{}' has no AUTO_INCREMENT column",
+                        table_name
+                    )));
+                }
+                self.engine.raise_auto_increment(table_name, next)?;
+                self.engine
+                    .record_alter_table_auto_increment(table_name, next)?;
+            }
             AlterTableOperation::RenameTable => {
                 if let Some(ref new_name) = stmt.new_table_name {
                     if self.engine.view_exists(&new_name.value)? {

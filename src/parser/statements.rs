@@ -2615,7 +2615,7 @@ impl Parser<'_> {
             && !self.peek_token.literal.eq_ignore_ascii_case("CLUSTER")
         {
             self.add_error(
-                "expected ALTER action (ADD, DROP, RENAME, MODIFY, CLUSTER BY) after table name"
+                "expected ALTER action (ADD, DROP, RENAME, MODIFY, CLUSTER BY, AUTO_INCREMENT) after table name"
                     .to_string(),
             );
             return None;
@@ -2756,9 +2756,40 @@ impl Parser<'_> {
                         None,
                     )
                 }
+                "AUTO_INCREMENT" | "AUTOINCREMENT" => {
+                    if self.peek_token_is_operator("=") {
+                        self.next_token();
+                    }
+                    if self.peek_token.token_type != TokenType::Integer {
+                        self.add_error(format!(
+                            "expected a positive integer after AUTO_INCREMENT at {}",
+                            self.peek_token.position
+                        ));
+                        return None;
+                    }
+                    self.next_token();
+                    let next = match self.cur_token.literal.parse::<i64>() {
+                        Ok(next) if next > 0 => next,
+                        _ => {
+                            self.add_error(format!(
+                                "AUTO_INCREMENT must be between 1 and {}, got {}",
+                                i64::MAX,
+                                self.cur_token.literal
+                            ));
+                            return None;
+                        }
+                    };
+                    (
+                        AlterTableOperation::AutoIncrement(next),
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                }
                 _ => {
                     self.add_error(format!(
-                        "expected ADD, DROP, RENAME, MODIFY, or CLUSTER BY at {}",
+                        "expected ADD, DROP, RENAME, MODIFY, CLUSTER BY or AUTO_INCREMENT at {}",
                         self.cur_token.position
                     ));
                     return None;
