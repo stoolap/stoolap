@@ -96,7 +96,15 @@ When inserting or updating a row that affects a unique index:
 
 A statement's new keys are judged against the rows as the whole statement leaves them, whether the rows are in memory or sealed into volumes. One statement may therefore swap keys among its rows, as in `UPDATE t SET u = CASE id WHEN 1 THEN 20 WHEN 2 THEN 10 END`, or shift them, as in `UPDATE t SET u = u + 10`. A statement that leaves two rows with one key fails, and in autocommit it changes nothing.
 
-Inside an explicit transaction, an `INSERT` whose key a committed row holds fails at the `INSERT`. An `UPDATE` whose new key another row holds, and two rows the transaction itself wrote with one key, are reported at `COMMIT`, which then rolls the transaction back.
+Inside an explicit transaction, these fail at the statement:
+- an `INSERT` whose key a committed row holds;
+- an `UPDATE` that gives a sealed row a key an in-memory row holds;
+- an `UPDATE` that gives two of its rows one key when one of them is sealed.
+
+Everything else waits for `COMMIT`, which then rolls the whole transaction back:
+- an `UPDATE` that gives an in-memory row a key another row holds;
+- an `UPDATE` that gives a sealed row a key another sealed row holds;
+- two rows the transaction itself wrote, in one statement or in two, that share one key.
 
 ### NULL Handling
 
