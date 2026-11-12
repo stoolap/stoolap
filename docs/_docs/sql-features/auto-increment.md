@@ -57,11 +57,11 @@ INSERT INTO products (id, name, price) VALUES (50, 'D', 40);   -- id = 50 (expli
 INSERT INTO products (name, price) VALUES ('E', 50);            -- id = 102 (not 51)
 ```
 
-The counter never regresses. It always generates `max(all_existing_ids) + 1`.
+The counter never regresses. It generates one past the highest id the table has held, deleted rows included.
 
 ## Constraints
 
 - Auto increment is only supported on `INTEGER PRIMARY KEY` columns
 - The counter is maintained per table
 - Gaps in the sequence are allowed (e.g., after deletions or explicit inserts)
-- The counter is not reset by DELETE (only by DROP TABLE + recreate)
+- The counter is not reset by DELETE, nor by closing and reopening a file database; TRUNCATE TABLE and DROP TABLE + recreate start it again at 1

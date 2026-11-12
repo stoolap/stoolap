@@ -2437,11 +2437,14 @@ impl MVCCEngine {
         match entry.operation {
             WALOperationType::CreateTable => {
                 // Deserialize schema from entry data
-                if let Ok(schema) = self.deserialize_schema(&entry.data) {
+                if let Ok((schema, auto_increment)) = self.deserialize_schema(&entry.data) {
                     let table_name = schema.table_name_lower.clone();
                     log.settle_renames_to(&table_name);
                     // A table that has a store is a checkpoint's catalog copy: its rows stay
-                    if self.get_version_store(&table_name).is_ok() {
+                    if let Ok(store) = self.get_version_store(&table_name) {
+                        if let Some(counter) = auto_increment {
+                            store.set_auto_increment_counter(counter);
+                        }
                         return Ok(());
                     }
 
@@ -2454,6 +2457,9 @@ impl MVCCEngine {
 
                     // Register virtual PkIndex for INTEGER PRIMARY KEY
                     register_pk_index(&schema, &version_store);
+                    if let Some(counter) = auto_increment {
+                        version_store.set_auto_increment_counter(counter);
+                    }
 
                     {
                         let mut schemas = self.schemas.write().unwrap();
@@ -2716,8 +2722,9 @@ impl MVCCEngine {
         Ok(())
     }
 
-    /// Deserialize a schema from binary format (WAL format)
-    fn deserialize_schema(&self, data: &[u8]) -> Result<Schema> {
+    /// Deserialize a schema from binary format (WAL format), with the id
+    /// counter a checkpoint's catalog copy ends with
+    fn deserialize_schema(&self, data: &[u8]) -> Result<(Schema, Option<i64>)> {
         use crate::core::SchemaColumn;
 
         if data.len() < 4 {
@@ -2982,11 +2989,15 @@ impl MVCCEngine {
         }
 
         let table_checks = read_table_checks(data, &mut pos)?;
+        let auto_increment = data
+            .get(pos..pos + 8)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(i64::from_le_bytes);
 
         let mut schema = Schema::with_foreign_keys(&table_name, columns, foreign_keys);
         schema.cluster_key = cluster_key;
         schema.table_checks = table_checks;
-        Ok(schema)
+        Ok((schema, auto_increment))
     }
 
     /// Closes the engine (inherent method)
@@ -7236,9 +7247,18 @@ impl MVCCEngine {
             if !self.creating_txns.lock().is_empty() {
                 return Ok(false);
             }
+            // Each copy ends with the table's id counter: the rows that
+            // raised it may be deleted, and the log before the cut goes
+            let stores = self.version_stores.read().unwrap();
             let entries = schemas
-                .values()
-                .map(|schema| (schema.table_name.clone(), Self::serialize_schema(schema)))
+                .iter()
+                .map(|(name, schema)| {
+                    let mut data = Self::serialize_schema(schema);
+                    if let Some(store) = stores.get(name) {
+                        data.extend_from_slice(&store.get_auto_increment_counter().to_le_bytes());
+                    }
+                    (schema.table_name.clone(), data)
+                })
                 .collect();
             let names = schemas.keys().cloned().collect();
             (entries, names)
