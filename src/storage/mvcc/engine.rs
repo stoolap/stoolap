@@ -3794,6 +3794,7 @@ impl MVCCEngine {
             WALOperationType::CreateTable,
             &schema_data,
         )?;
+        self.record_table_indexes(&return_schema.table_name, indexes)?;
 
         // Increment schema epoch for cache invalidation
         self.ddl.changed_table(
@@ -3802,6 +3803,36 @@ impl MVCCEngine {
         );
 
         Ok(return_schema)
+    }
+
+    /// Writes the CreateIndex records of `indexes`, built with new table
+    /// `table_name`, of the type each was built as
+    pub(crate) fn record_table_indexes(
+        &self,
+        table_name: &str,
+        indexes: &[NewIndex],
+    ) -> Result<()> {
+        if indexes.is_empty() {
+            return Ok(());
+        }
+        let store = self.get_version_store(table_name)?;
+        for index in indexes {
+            let index_type = store
+                .get_index(&index.name)
+                .map_or(crate::core::IndexType::BTree, |built| built.index_type());
+            self.record_create_index(
+                table_name,
+                &index.name,
+                &index.columns,
+                index.unique,
+                index_type,
+                None,
+                None,
+                None,
+                None,
+            )?;
+        }
+        Ok(())
     }
 
     /// Drops a table

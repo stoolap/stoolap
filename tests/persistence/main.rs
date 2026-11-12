@@ -23,6 +23,7 @@ mod failpoint_io_test;
 mod file_lock_integration_test;
 mod index_replay_test;
 mod migration_v037_test;
+mod new_table_index_replay_test;
 mod open_session_test;
 mod open_unreadable_volume_test;
 mod persistence_advanced_test;

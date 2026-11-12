@@ -527,23 +527,6 @@ impl Executor {
             columns: vec![c.clone()],
             unique: false,
         }));
-        // The type each index takes on its columns, for its WAL record
-        let index_types: Vec<crate::core::IndexType> = indexes
-            .iter()
-            .map(|index| {
-                let data_types: Vec<DataType> = index
-                    .columns
-                    .iter()
-                    .map(|c| {
-                        schema
-                            .find_column(c)
-                            .map_or(DataType::Null, |(_, col)| col.data_type)
-                    })
-                    .collect();
-                crate::storage::mvcc::table::MVCCTable::index_type_for(&data_types, None)
-            })
-            .collect();
-
         let mut active_tx = self.active_transaction.lock().unwrap();
         match active_tx.as_mut() {
             // The active transaction's rollback drops the table
@@ -551,24 +534,12 @@ impl Executor {
                 tx_state
                     .transaction
                     .create_table_with_indexes(table_name, schema, &indexes)?;
+                self.engine.record_table_indexes(table_name, &indexes)?;
             }
             None => {
                 drop(active_tx);
                 self.engine.create_table_with_indexes(schema, &indexes)?;
             }
-        }
-        for (index, index_type) in indexes.iter().zip(index_types) {
-            self.engine.record_create_index(
-                table_name,
-                &index.name,
-                &index.columns,
-                index.unique,
-                index_type,
-                None,
-                None,
-                None,
-                None,
-            )?;
         }
 
         Ok(Box::new(ExecResult::empty()))
