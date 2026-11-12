@@ -929,6 +929,7 @@ impl Executor {
             // A VALUES row has no target row: its scope is a table without columns
             let (plan, tables) = self.open_prepared_dml(
                 plan_cache,
+                None,
                 &super::prepared_select::NO_COLUMNS,
                 table_name,
                 None,
@@ -2020,6 +2021,7 @@ impl Executor {
             // A VALUES row has no target row: its scope is a table without columns
             let (plan, tables) = self.open_prepared_dml(
                 Some(compiled_cache),
+                None,
                 &super::prepared_select::NO_COLUMNS,
                 table_name,
                 None,
@@ -2483,22 +2485,24 @@ impl Executor {
                 values: &stmt.returning,
             });
         // A plan holding a prepared statement fit for this run answers it
-        let in_family = compiled.is_some_and(|slot| {
+        let held = compiled.and_then(|slot| {
             self.held_prepared_dml(slot, schema, None, returning_sites.as_ref(), ctx)
-                .is_some()
-        }) || self
-            .dml_family(
-                stmt.where_clause.as_deref(),
-                stmt.updates
-                    .values()
-                    .chain(super::prepared_select::returning_values(&stmt.returning)),
-            )
-            .is_ok();
+        });
+        let in_family = held.is_some()
+            || self
+                .dml_family(
+                    stmt.where_clause.as_deref(),
+                    stmt.updates
+                        .values()
+                        .chain(super::prepared_select::returning_values(&stmt.returning)),
+                )
+                .is_ok();
         let where_prepared = in_family && stmt.where_clause.is_some();
         let held_dml;
         let dml_run = if in_family {
             let (prepared, tables) = self.open_prepared_dml(
                 compiled,
+                held,
                 schema,
                 table_name,
                 stmt.where_clause.as_deref(),
@@ -2613,53 +2617,41 @@ impl Executor {
             use super::expression::{ExecuteContext, ExprVM, SharedProgram};
             use super::prepared_select::Candidates;
 
-            let compiled_updates: Vec<(usize, crate::core::DataType, u16, SharedProgram)> =
-                if let Some(run) = &dml_run {
-                    run.sets()
-                        .iter()
-                        .map(|(idx, program)| {
-                            (
-                                *idx,
-                                schema.columns[*idx].data_type,
-                                schema.columns[*idx].vector_dimensions,
-                                program.clone(),
-                            )
-                        })
-                        .collect()
-                } else {
-                    // Compile directly from statement expressions
+            // Each SET column's program: the prepared statement's, else
+            // compiled from the statement's expressions for this run
+            let compiled_sets: Vec<(usize, SharedProgram)> = match &dml_run {
+                Some(_) => Vec::new(),
+                None => {
                     let registry = crate::functions::global_registry();
                     sets.iter()
                         .map(|&(idx, expr)| {
-                            let program = super::aggregation::compile_over_slots(
+                            super::aggregation::compile_over_slots(
                                 expr,
                                 &column_names,
                                 registry,
                                 None,
                                 false,
                                 None,
-                            );
-                            program.map(|program| {
-                                (
-                                    idx,
-                                    schema.columns[idx].data_type,
-                                    schema.columns[idx].vector_dimensions,
-                                    program,
-                                )
-                            })
+                            )
+                            .map(|program| (idx, program))
                         })
                         .collect::<Result<_>>()?
-                };
+                }
+            };
+            let set_programs: &[(usize, SharedProgram)] = match &dml_run {
+                Some(run) => run.sets(),
+                None => &compiled_sets,
+            };
 
-            // The schema the coercion errors name columns from, held past the
-            // setter's mutable borrow of the table
+            // The schema each SET column's type and name are read from, held
+            // past the setter's mutable borrow of the table
             let set_schema = table.schema_arc();
 
             // The CHECK constraints reading an updated column, held by the plan
             let compiled_check_exprs = match &dml_run {
                 Some(run) => run.update_checks(schema)?,
                 None => Arc::new(checks_reading(compile_check_programs(schema)?, |c| {
-                    compiled_updates.iter().any(|(idx, _, _, _)| *idx == c)
+                    set_programs.iter().any(|(idx, _)| *idx == c)
                 })),
             };
 
@@ -2729,8 +2721,9 @@ impl Executor {
                         RowWhere::Failed(error) => return Err(error.clone()),
                     }
 
-                    let mut updates = Vec::with_capacity(compiled_updates.len());
-                    for (idx, col_type, vec_dims, program) in compiled_updates.iter() {
+                    let mut updates = Vec::with_capacity(set_programs.len());
+                    for (idx, program) in set_programs {
+                        let column = &set_schema.columns[*idx];
                         // Propagate VM errors (overflow etc.): silently
                         // skipping a SET column would half-apply the row.
                         // Coercion validates like INSERT and the fast path
@@ -2742,13 +2735,13 @@ impl Executor {
                             );
                         }
                         let v = vm.execute(program, &exec_ctx)?;
-                        let coerced = v.coerce_to_type(*col_type);
+                        let coerced = v.coerce_to_type(column.data_type);
                         validate_coercion(
                             &v,
                             &coerced,
-                            &set_schema.columns[*idx].name,
-                            *col_type,
-                            *vec_dims,
+                            &column.name,
+                            column.data_type,
+                            column.vector_dimensions,
                         )?;
                         updates.push((*idx, coerced));
                     }
@@ -3053,17 +3046,19 @@ impl Executor {
                 values: &stmt.returning,
             });
         // A plan holding a prepared statement fit for this run answers it
-        let in_family = family_now.unwrap_or_else(|| {
-            compiled.is_some_and(|slot| {
+        let held = match family_now {
+            Some(_) => None,
+            None => compiled.and_then(|slot| {
                 self.held_prepared_dml(slot, schema, None, returning_sites.as_ref(), ctx)
-                    .is_some()
-            }) || family()
-        });
+            }),
+        };
+        let in_family = family_now.unwrap_or_else(|| held.is_some() || family());
         let where_prepared = in_family && stmt.where_clause.is_some();
         let held_dml;
         let dml_run = if in_family {
             let (prepared, tables) = self.open_prepared_dml(
                 compiled,
+                held,
                 schema,
                 &SmartString::from(effective_name),
                 stmt.where_clause.as_deref().filter(|_| where_prepared),

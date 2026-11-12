@@ -10381,7 +10381,7 @@ impl Executor {
             &held.blocks,
             &held.holes,
             ctx,
-            inner_ctx,
+            std::borrow::Cow::Owned(inner_ctx),
             tables,
             None,
             None,
@@ -11569,8 +11569,16 @@ impl Executor {
         let Some(tables) = PreparedRunner::open_tables(self, blocks, &inner_ctx, None)? else {
             return Ok(None);
         };
-        let mut runner =
-            PreparedRunner::new(self, blocks, holes, ctx, inner_ctx, tables, None, None);
+        let mut runner = PreparedRunner::new(
+            self,
+            blocks,
+            holes,
+            ctx,
+            std::borrow::Cow::Owned(inner_ctx),
+            tables,
+            None,
+            None,
+        );
         runner.fill_run_slots()?;
         runner.read_ahead(&held.ahead, holes)?;
         Ok(Some(runner))
@@ -11923,7 +11931,8 @@ impl<'f> SideKeep<'f> {
 /// the statement writes, and the context they read under
 pub(crate) struct DmlTables {
     tables: BlockTables,
-    inner_ctx: ExecutionContext,
+    /// The context the blocks read under, None without a block
+    inner_ctx: Option<ExecutionContext>,
 }
 
 /// The rows an UPDATE may write, each asked its WHERE as it is written
@@ -11960,7 +11969,9 @@ impl<'a> DmlRunner<'a> {
             &prepared.blocks,
             &prepared.holes,
             ctx,
-            tables.inner_ctx,
+            tables
+                .inner_ctx
+                .map_or(std::borrow::Cow::Borrowed(ctx), std::borrow::Cow::Owned),
             tables.tables,
             Some(rows),
             None,
@@ -13151,11 +13162,13 @@ impl Executor {
     /// `schema`, named `scope_name`, with its blocks' tables open, through
     /// the statement's own transaction `through` when given; prepared now
     /// when the plan holds none for this schema, these columns and this
-    /// parameter count; a compiled INSERT keeps it beside its own parts
+    /// parameter count; a compiled INSERT keeps it beside its own parts.
+    /// `held` is what [`Self::held_prepared_dml`] found for this run already
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_prepared_dml(
         &self,
         compiled: Option<&RwLock<CompiledExecution>>,
+        mut held: Option<Arc<PreparedDml>>,
         schema: &Schema,
         scope_name: &SmartString,
         where_clause: Option<&Expression>,
@@ -13173,16 +13186,18 @@ impl Executor {
             TableUse::ReadAsFound(cut) => cut,
             _ => crate::storage::mvcc::last_write_order(),
         };
-        let inner_ctx = ctx
-            .with_incremented_query_depth()
-            .with_table_use(TableUse::ReadAsFound(cut));
         // A column change between taking the plan and opening a block's
         // table prepares again, against the table as it now is
         let mut fresh = false;
         loop {
-            let held = compiled
-                .filter(|_| !fresh)
-                .and_then(|slot| self.held_prepared_dml(slot, schema, conflict, returning, ctx));
+            let held = match fresh {
+                true => None,
+                false => held.take().or_else(|| {
+                    compiled.and_then(|slot| {
+                        self.held_prepared_dml(slot, schema, conflict, returning, ctx)
+                    })
+                }),
+            };
             let prepared = match held {
                 Some(prepared) => prepared,
                 None => {
@@ -13217,6 +13232,17 @@ impl Executor {
                     prepared
                 }
             };
+            // Without a block the statement reads no table beside its target
+            if prepared.blocks.subqueries.is_empty() {
+                let tables = DmlTables {
+                    tables: BlockTables::new(),
+                    inner_ctx: None,
+                };
+                return Ok((prepared, tables));
+            }
+            let inner_ctx = ctx
+                .with_incremented_query_depth()
+                .with_table_use(TableUse::ReadAsFound(cut));
             // A block read for each conflict or row returned that reads the
             // target would see the statement's writes: it reads a snapshot taken before them
             let reads_target = prepared.conflict.as_ref().is_some_and(|c| c.reads_target)
@@ -13236,7 +13262,7 @@ impl Executor {
             if let Some(tables) =
                 PreparedRunner::open_tables(self, &prepared.blocks, block_ctx, through)?
             {
-                let inner_ctx = snapshot_ctx.unwrap_or(inner_ctx);
+                let inner_ctx = Some(snapshot_ctx.unwrap_or(inner_ctx));
                 return Ok((prepared, DmlTables { tables, inner_ctx }));
             }
             if fresh {
@@ -14030,7 +14056,7 @@ impl Executor {
             &prepared.blocks,
             &prepared.holes,
             ctx,
-            inner_ctx,
+            std::borrow::Cow::Owned(inner_ctx),
             tables,
             Some(statement_rows),
             statement_limit,
@@ -15091,8 +15117,9 @@ pub(crate) struct PreparedRunner<'a> {
     /// raises once it runs over a row
     window_failure: Option<Box<Error>>,
     transaction_id: Option<u64>,
-    /// The context the subqueries read their tables under
-    ctx: ExecutionContext,
+    /// The context the subqueries read their tables under; a statement
+    /// without one lends its own
+    ctx: std::borrow::Cow<'a, ExecutionContext>,
     /// Each subquery's table, opened before the run reads a row
     tables: BlockTables,
     /// Each subquery's state for this run, by its id
@@ -15316,7 +15343,7 @@ impl<'a> PreparedRunner<'a> {
         prepared: &'a PreparedBlocks,
         holes: &'a HoleSet,
         ctx: &'a ExecutionContext,
-        inner_ctx: ExecutionContext,
+        inner_ctx: std::borrow::Cow<'a, ExecutionContext>,
         tables: BlockTables,
         statement_rows: Option<usize>,
         statement_limit: Option<i64>,
@@ -15380,6 +15407,9 @@ impl<'a> PreparedRunner<'a> {
     /// rows. A WHERE slot's error is kept for a row that reads the slot; any
     /// other's is the statement's
     fn fill_run_slots(&mut self) -> Result<()> {
+        if self.prepared.run_slots.is_empty() {
+            return Ok(());
+        }
         let mut computed: SmallVec<[(usize, Result<Value>); 4]> = SmallVec::new();
         {
             let empty = Row::new();

@@ -1489,6 +1489,7 @@ impl Executor {
         let values = clauses.map(|(count, _)| count.map_or(&[][..], std::slice::from_ref));
         let (prepared, tables) = self.open_prepared_dml(
             slot.map(|slot| slot.compiled.slot()),
+            None,
             &super::prepared_select::NO_COLUMNS,
             &SmartString::default(),
             None,
