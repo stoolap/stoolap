@@ -78,11 +78,49 @@ fn changing_a_referenced_value_costs_an_upsert_a_bounded_number_of_allocations()
 }
 
 #[test]
-fn seven_children_cost_the_ordering_of_their_keys_no_allocation() {
+fn seven_referencing_tables_are_planned_once_per_statement() {
     let per_row = extra_per_conflict("upsert_key_change_alloc_seven", 7);
     assert!(
         per_row <= SEVEN_CHILDREN,
         "{per_row} more allocations per conflict for a value seven tables reference"
+    );
+}
+
+#[test]
+fn a_key_into_a_column_the_upsert_changes_is_planned_once_per_statement() {
+    let db = Database::open("memory://upsert_key_change_alloc_into_changed").unwrap();
+    db.execute(
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, a INTEGER UNIQUE, \
+         b INTEGER UNIQUE REFERENCES s(a) ON UPDATE CASCADE, \
+         c INTEGER REFERENCES s(b) ON UPDATE CASCADE, n INTEGER)",
+        (),
+    )
+    .unwrap();
+    let rows: Vec<String> = (1..=ROWS)
+        .map(|id| format!("({id}, {id}, {id}, NULL, 0)"))
+        .collect();
+    db.execute(&format!("INSERT INTO s VALUES {}", rows.join(", ")), ())
+        .unwrap();
+    let upsert = |set: &str, offset: i64| {
+        let values: Vec<String> = (1..=ROWS)
+            .map(|id| format!("({id}, {key}, {key}, NULL, {id})", key = id + offset))
+            .collect();
+        let sql = format!(
+            "INSERT INTO s VALUES {} ON CONFLICT (id) DO UPDATE SET {set}",
+            values.join(", ")
+        );
+        let before = allocations();
+        db.execute(&sql, ()).unwrap();
+        allocations() - before
+    };
+    upsert("n = excluded.n + 1", 0);
+    let unreferenced = upsert("n = excluded.n + 2", 0);
+    upsert("a = excluded.a, b = excluded.b", ROWS);
+    let referenced = upsert("a = excluded.a, b = excluded.b", 2 * ROWS);
+    let per_row = referenced.saturating_sub(unreferenced) as f64 / ROWS as f64;
+    assert!(
+        per_row <= INTO_CHANGED,
+        "{per_row} more allocations per conflict changing a and the b that references it"
     );
 }
 
@@ -114,9 +152,14 @@ fn extra_per_conflict(name: &str, children: usize) -> f64 {
     referenced.saturating_sub(unreferenced) as f64 / ROWS as f64
 }
 
-/// 27.15 measured before the walk that orders the keys' actions, a graph
-/// of two columns
-const ONE_CHILD: f64 = 27.5;
+// Each bound is what the upsert paid with its keys' plan found once per
+// statement; finding it for each conflict paid 27.15, 115.178 and 95.822
 
-/// 115.178 measured before the walk, a graph of eight columns
-const SEVEN_CHILDREN: f64 = 115.5;
+/// 13.18 measured, a graph of two columns
+const ONE_CHILD: f64 = 13.5;
+
+/// 39.332 measured, a graph of eight columns
+const SEVEN_CHILDREN: f64 = 39.5;
+
+/// 62.89 measured, a key into a column the statement changes
+const INTO_CHANGED: f64 = 63.0;

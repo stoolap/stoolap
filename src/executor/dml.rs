@@ -1060,6 +1060,8 @@ impl Executor {
         };
         // Keys into this table whose parent is a later row of the statement
         let mut pending_parents = super::foreign_key::PendingParents::new(table_name);
+        // The ON UPDATE keys the upsert's conflicts reach, found once
+        let mut update_plans = super::foreign_key::UpdatePlans::default();
 
         // Create VM for constant expression evaluation (reused for all INSERT values)
         use super::expression::{ExecuteContext, ExprVM};
@@ -1239,7 +1241,7 @@ impl Executor {
                                 ctx,
                                 (has_returning, widened),
                                 conflict,
-                                &mut pending_parents,
+                                (&mut pending_parents, &mut update_plans),
                             ) {
                                 Ok((updated, returned)) => {
                                     if let Some(updated_row) = returned {
@@ -1289,7 +1291,7 @@ impl Executor {
                                         ctx,
                                         (has_returning, widened),
                                         conflict,
-                                        &mut pending_parents,
+                                        (&mut pending_parents, &mut update_plans),
                                     ) {
                                         Ok((updated, returned)) => {
                                             if let Some(updated_row) = returned {
@@ -1528,7 +1530,7 @@ impl Executor {
                                 ctx,
                                 (has_returning, widened),
                                 conflict,
-                                &mut pending_parents,
+                                (&mut pending_parents, &mut update_plans),
                             ) {
                                 Ok((updated, returned)) => {
                                     if let Some(updated_row) = returned {
@@ -1579,7 +1581,7 @@ impl Executor {
                                         ctx,
                                         (has_returning, widened),
                                         conflict,
-                                        &mut pending_parents,
+                                        (&mut pending_parents, &mut update_plans),
                                     ) {
                                         Ok((updated, returned)) => {
                                             if let Some(updated_row) = returned {
@@ -2873,6 +2875,7 @@ impl Executor {
                     table_name,
                     by_column.into_iter().collect(),
                     None,
+                    &mut Default::default(),
                 )?;
             }
         }
@@ -3648,7 +3651,10 @@ impl Executor {
         ctx: &ExecutionContext,
         (capture_row, returns_id): (bool, bool),
         conflict: Option<&ConflictRun<'_, '_>>,
-        pending_parents: &mut super::foreign_key::PendingParents<'_>,
+        (pending_parents, update_plans): (
+            &mut super::foreign_key::PendingParents<'_>,
+            &mut super::foreign_key::UpdatePlans,
+        ),
     ) -> Result<(bool, Option<Row>)> {
         // Build a WHERE clause to find the specific row
         // Use schema's cached pk_column_index for O(1) lookup
@@ -3900,6 +3906,7 @@ impl Executor {
                 &schema.table_name,
                 by_column,
                 Some(pending_parents),
+                update_plans,
             )?;
         }
 
