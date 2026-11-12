@@ -3282,6 +3282,25 @@ pub(crate) fn side_walk_refused() -> bool {
     })
 }
 
+thread_local! {
+    /// Shown-key walks this thread still refuses the copies of their key pages
+    static REFUSE_KEY_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Has this thread's next `count` shown-key walks refused the copies of
+/// their key pages
+pub fn refuse_key_copies(count: usize) {
+    REFUSE_KEY_COPIES.with(|n| n.set(count));
+}
+
+pub(crate) fn key_copies_refused() -> bool {
+    REFUSE_KEY_COPIES.with(|n| {
+        let left = n.get();
+        n.set(left.saturating_sub(1));
+        left > 0
+    })
+}
+
 pub(crate) fn unique_read_candidates(count: usize) {
     UNIQUE_READ_CANDIDATES.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
 }

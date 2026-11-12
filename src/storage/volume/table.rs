@@ -90,6 +90,17 @@ type ColdView = (
     Arc<Vec<(u64, super::manifest::ColdSegment)>>,
 );
 
+/// How many positions below `rows` have their bit set
+fn shown_count(bits: &[u64], rows: usize) -> u64 {
+    let (full, tail) = (rows / 64, rows % 64);
+    let ones = |words: &[u64]| words.iter().map(|w| w.count_ones() as u64).sum::<u64>();
+    let last = bits
+        .get(full)
+        .filter(|_| tail > 0)
+        .map_or(0, |w| (w & ((1u64 << tail) - 1)).count_ones());
+    ones(&bits[..full.min(bits.len())]) + last as u64
+}
+
 /// The positions below `rows` whose bit is set, a word at a time; every
 /// position when there are no bits
 #[derive(Clone)]
@@ -1364,8 +1375,8 @@ impl SegmentedTable {
     }
 
     /// Adds the values of `cs` the statement sees to `distinct`: the volume's
-    /// dictionary or the keys of `side` when it hides no row, else the
-    /// dictionary ids or values of the rows shown. A volume hidden whole is not decoded
+    /// dictionary when it hides no row, else the keys of `side` the rows
+    /// shown hold, else their dictionary ids or values. A volume hidden whole is not decoded
     fn volume_distinct(
         &self,
         cs: &super::manifest::ColdSegment,
@@ -1405,10 +1416,11 @@ impl SegmentedTable {
                 }
                 return Ok(());
             }
-            if let Some(def) = side {
-                if Self::side_distinct(cs, def, (phys, data_type, with_null), distinct)? {
-                    return Ok(());
-                }
+        }
+        if let Some(def) = side {
+            let column = (phys, data_type, with_null);
+            if Self::side_distinct(cs, def, shown.as_deref(), column, distinct)? {
+                return Ok(());
             }
         }
         let column = vol.columns.get(phys)?;
@@ -1432,12 +1444,13 @@ impl SegmentedTable {
         Ok(())
     }
 
-    /// Adds the keys of `def`'s entry in the side file of `cs` to `distinct`,
-    /// NULL too when `with_null` and the volume holds one; false, adding
-    /// nothing, when the entry is not served or misses a non-null row
+    /// Adds the keys of `def`'s entry in the side file of `cs` that `shown`
+    /// holds, or all, to `distinct`, NULL too when `with_null` and a shown row
+    /// holds one; false, adding nothing, when the entry is not served or misses a non-null row
     fn side_distinct(
         cs: &super::manifest::ColdSegment,
         def: &SideIndexDef,
+        shown: Option<&[u64]>,
         (phys, data_type, with_null): (usize, DataType, bool),
         distinct: &mut ValueSet,
     ) -> Result<bool> {
@@ -1469,11 +1482,37 @@ impl SegmentedTable {
             Some(Domain::Timestamp) => super::writer::timestamp_value,
             _ => return Ok(false),
         };
-        distinct.reserve(entry.n_keys as usize);
-        reader
-            .each_key_page(|keys| distinct.extend(keys.iter().map(|&key| value(key))))
-            .map_err(side_error)?;
-        if with_null && zone.null_count > 0 {
+        let null = match shown {
+            None => {
+                distinct.reserve(entry.n_keys as usize);
+                reader
+                    .each_key_page(|keys| distinct.extend(keys.iter().map(|&key| value(key))))
+                    .map_err(side_error)?;
+                zone.null_count > 0
+            }
+            Some(bits) => {
+                let rows = shown_count(bits, cs.volume.meta.row_count);
+                let shown = |p: u32| {
+                    bits.get(p as usize >> 6)
+                        .is_some_and(|w| w >> (p & 63) & 1 != 0)
+                };
+                distinct.reserve(rows.min(entry.n_keys) as usize);
+                // A refusal comes before any key, so the scan still answers
+                let keyed = match reader.each_shown_key(shown, |key| {
+                    distinct.insert(value(key));
+                }) {
+                    Ok(keyed) => keyed,
+                    Err(error) if is_refused(&error) => {
+                        READS.count(&READS.refused, 1);
+                        return Ok(false);
+                    }
+                    Err(error) => return Err(side_error(error)),
+                };
+                // Shown rows past the shown keyed positions hold NULL
+                zone.null_count > 0 && rows > keyed
+            }
+        };
+        if with_null && null {
             distinct.insert(Value::null(data_type));
         }
         Ok(true)
