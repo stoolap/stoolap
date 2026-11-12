@@ -764,34 +764,6 @@ impl Executor {
                     .is_ok())
     }
 
-    /// The refusal of a RETURNING value read for each row returned whose
-    /// block reads the target inside a transaction
-    fn returning_reads_target() -> Error {
-        Error::invalid_argument(
-            "a RETURNING subquery that reads the row returned cannot read the target table \
-             inside a transaction",
-        )
-    }
-
-    /// Refuse an INSERT whose block read for each conflict or row returned
-    /// reads the target inside a transaction, where it would see the
-    /// statement's writes
-    fn refuse_target_reads_in_transaction(
-        run: &super::prepared_select::DmlRunner,
-        in_transaction: bool,
-    ) -> Result<()> {
-        if in_transaction && run.conflict_reads_target() {
-            return Err(Error::invalid_argument(
-                "an ON CONFLICT subquery that reads the row met or the excluded row \
-                 cannot read the target table inside a transaction",
-            ));
-        }
-        if in_transaction && run.returning_reads_target() {
-            return Err(Self::returning_reads_target());
-        }
-        Ok(())
-    }
-
     /// The answer of each VALUES subquery with its row and position, all
     /// read before the statement writes a row
     fn insert_value_answers(run: &super::prepared_select::DmlRunner) -> Result<ValueAnswers> {
@@ -946,7 +918,6 @@ impl Executor {
             let run = &*runner.insert(super::prepared_select::DmlRunner::new(
                 self, &prepared, ctx, tables, 0,
             )?);
-            Self::refuse_target_reads_in_transaction(run, active_txn_id.is_some())?;
             // The statement is copied only for the VALUES answers it takes
             let mut answered_ctx = std::borrow::Cow::Borrowed(ctx);
             let mut answered = std::borrow::Cow::Borrowed(stmt);
@@ -2038,7 +2009,6 @@ impl Executor {
             let run = &*runner.insert(super::prepared_select::DmlRunner::new(
                 self, &prepared, ctx, tables, 0,
             )?);
-            Self::refuse_target_reads_in_transaction(run, active_txn_id.is_some())?;
             answers = Self::insert_value_answers(run)?;
             if run.returning().is_none() {
                 // Every value is read: the blocks' tables close before a row is written
@@ -2523,9 +2493,6 @@ impl Executor {
                 tables,
                 table.row_count_hint(),
             )?;
-            if !should_auto_commit && run.returning_reads_target() {
-                return Err(Self::returning_reads_target());
-            }
             Some(run)
         } else {
             None
@@ -3079,9 +3046,6 @@ impl Executor {
                 tables,
                 table.row_count_hint(),
             )?;
-            if !should_auto_commit && run.returning_reads_target() {
-                return Err(Self::returning_reads_target());
-            }
             Some(run)
         } else {
             None
