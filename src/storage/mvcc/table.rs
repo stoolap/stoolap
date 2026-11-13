@@ -75,6 +75,8 @@ pub struct MVCCTable {
     /// The write order the transaction's rows are read at: a block of a
     /// statement reads them as they stood before the statement wrote
     cut: i64,
+    /// Whether this handle has had its store counted among the inserters
+    inserting: bool,
     /// Scans that fell through to the full visible-row walk
     #[cfg(test)]
     full_scans: std::sync::atomic::AtomicU64,
@@ -438,6 +440,7 @@ impl MVCCTable {
             gate: None,
             view: None,
             cut: EVERY_WRITE,
+            inserting: false,
         }
     }
 
@@ -461,6 +464,7 @@ impl MVCCTable {
             gate: None,
             view: None,
             cut: EVERY_WRITE,
+            inserting: false,
         }
     }
 
@@ -479,6 +483,7 @@ impl MVCCTable {
             gate: None,
             view: None,
             cut: EVERY_WRITE,
+            inserting: false,
         }
     }
 
@@ -1908,6 +1913,13 @@ impl MVCCTable {
     /// Returns the row_id on success. The row is modified in-place with auto-increment values.
     #[inline]
     fn prepare_insert(&mut self, row: &mut Row) -> Result<i64> {
+        // Before any id is taken: a lowering of the counter waits or sees it
+        if !self.inserting {
+            (self.local_store()?.read())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .note_inserting();
+            self.inserting = true;
+        }
         // Handle auto-increment for primary key BEFORE validation
         // This allows inserting without specifying the primary key (only if AUTO_INCREMENT)
         if let Some(pk_idx) = self.find_pk_column_index() {

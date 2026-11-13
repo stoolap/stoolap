@@ -77,29 +77,164 @@ fn test_alter_auto_increment_to_the_next_id_changes_nothing() {
 }
 
 #[test]
-fn test_alter_auto_increment_below_a_handed_out_id_is_refused() {
-    let db = open("alter_ai_below");
+fn test_alter_auto_increment_lowers_to_past_the_largest_row() {
+    let db = open("alter_ai_lower");
     db.execute("INSERT INTO t (v) VALUES ('a'), ('b'), ('c')", ())
         .unwrap();
-    let message = error(&db, "ALTER TABLE t AUTO_INCREMENT = 3");
-    assert!(
-        message.contains("cannot go below 4"),
-        "unexpected error: {message}"
-    );
-    db.execute("DELETE FROM t WHERE id = 3", ()).unwrap();
-    let message = error(&db, "ALTER TABLE t AUTO_INCREMENT = 3");
-    assert!(
-        message.contains("cannot go below 4"),
-        "a deleted id stays handed out: {message}"
-    );
+    db.execute("ALTER TABLE t AUTO_INCREMENT = 2", ()).unwrap();
+    assert_eq!(insert(&db, "d"), 4, "one past the largest row");
+    db.execute("DELETE FROM t WHERE id = 4", ()).unwrap();
+    db.execute("ALTER TABLE t AUTO_INCREMENT = 2", ()).unwrap();
+    assert_eq!(insert(&db, "e"), 4, "a deleted row's id is taken again");
     db.execute("INSERT INTO t (id, v) VALUES (500, 'x')", ())
         .unwrap();
-    let message = error(&db, "ALTER TABLE t AUTO_INCREMENT = 100");
-    assert!(
-        message.contains("cannot go below 501"),
-        "an explicit id counts: {message}"
+    db.execute("ALTER TABLE t AUTO_INCREMENT = 100", ())
+        .unwrap();
+    assert_eq!(insert(&db, "f"), 501, "an explicit id counts");
+    db.execute("DELETE FROM t WHERE id >= 500", ()).unwrap();
+    db.execute("ALTER TABLE t AUTO_INCREMENT = 100", ())
+        .unwrap();
+    assert_eq!(insert(&db, "g"), 100);
+}
+
+#[test]
+fn test_alter_auto_increment_below_a_rolled_back_id() {
+    let db = open("alter_ai_rolled_back");
+    assert_eq!(insert(&db, "a"), 1);
+    db.execute("BEGIN", ()).unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (100, 'b')", ())
+        .unwrap();
+    db.execute("ROLLBACK", ()).unwrap();
+    db.execute("ALTER TABLE t AUTO_INCREMENT = 50", ()).unwrap();
+    assert_eq!(insert(&db, "c"), 50);
+}
+
+#[test]
+fn test_alter_auto_increment_lowering_waits_for_uncommitted_rows() {
+    let db = open("alter_ai_pending");
+    let other = db.clone();
+    db.execute("INSERT INTO t (id, v) VALUES (100, 'a')", ())
+        .unwrap();
+    db.execute("DELETE FROM t WHERE id = 100", ()).unwrap();
+    for row in [
+        "INSERT INTO t (v) VALUES ('b')",
+        "INSERT INTO t (id, v) VALUES (70, 'b')",
+    ] {
+        other.execute("BEGIN", ()).unwrap();
+        other.execute(row, ()).unwrap();
+        let message = error(&db, "ALTER TABLE t AUTO_INCREMENT = 50");
+        assert!(message.contains("cannot be lowered"), "{row}: {message}");
+        other.execute("ROLLBACK", ()).unwrap();
+    }
+    db.execute("ALTER TABLE t AUTO_INCREMENT = 50", ()).unwrap();
+    assert_eq!(insert(&db, "c"), 50, "rolled back rows hold no id");
+}
+
+#[test]
+fn test_alter_auto_increment_raises_beside_uncommitted_rows() {
+    let db = open("alter_ai_pending_raise");
+    let other = db.clone();
+    other.execute("BEGIN", ()).unwrap();
+    other.execute("INSERT INTO t (v) VALUES ('a')", ()).unwrap();
+    db.execute("ALTER TABLE t AUTO_INCREMENT = 1000", ())
+        .unwrap();
+    other.execute("COMMIT", ()).unwrap();
+    assert_eq!(insert(&db, "b"), 1000);
+}
+
+#[test]
+fn test_alter_auto_increment_lowering_in_a_transaction_that_inserted() {
+    let db = open("alter_ai_own_rows");
+    db.execute("INSERT INTO t (id, v) VALUES (100, 'a')", ())
+        .unwrap();
+    db.execute("DELETE FROM t WHERE id = 100", ()).unwrap();
+    db.execute("BEGIN", ()).unwrap();
+    assert_eq!(insert(&db, "b"), 101);
+    let message = error(&db, "ALTER TABLE t AUTO_INCREMENT = 50");
+    assert!(message.contains("cannot be lowered"), "{message}");
+    db.execute("COMMIT", ()).unwrap();
+    db.execute("ALTER TABLE t AUTO_INCREMENT = 50", ()).unwrap();
+    assert_eq!(insert(&db, "c"), 102, "the committed row 101 counts");
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_alter_auto_increment_insert_during_lowering_takes_the_lowered_id() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let db = open("alter_ai_insert_during");
+    db.execute("INSERT INTO t (id, v) VALUES (100, 'a')", ())
+        .unwrap();
+    db.execute("DELETE FROM t WHERE id = 100", ()).unwrap();
+    let other = db.clone();
+    let started = Rc::new(RefCell::new(None));
+    let slot = Rc::clone(&started);
+    stoolap::test_failpoints::on_inserters_closed(move || {
+        let (sent, seen) = std::sync::mpsc::channel();
+        let waiting = sent.clone();
+        let thread = std::thread::spawn(move || {
+            stoolap::test_failpoints::on_inserter_waiting(move || {
+                let _ = waiting.send(None);
+            });
+            let id = insert(&other, "b");
+            let _ = sent.send(Some(id));
+            id
+        });
+        *slot.borrow_mut() = Some((thread, seen.recv().unwrap()));
+    });
+    db.execute("ALTER TABLE t AUTO_INCREMENT = 50", ()).unwrap();
+    let (thread, first) = started.take().expect("the lowering ran its hook");
+    assert_eq!(first, None, "the insert waited for the lowering");
+    assert_eq!(thread.join().unwrap(), 50);
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_alter_auto_increment_lowering_during_a_commit_is_refused() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let db = open("alter_ai_during_commit");
+    db.execute("INSERT INTO t (id, v) VALUES (100, 'a')", ())
+        .unwrap();
+    db.execute("DELETE FROM t WHERE id = 100", ()).unwrap();
+    let other = db.clone();
+    let outcome = Rc::new(RefCell::new(None));
+    let slot = Rc::clone(&outcome);
+    stoolap::test_failpoints::after_indexes_published(move || {
+        let result = other.execute("ALTER TABLE t AUTO_INCREMENT = 50", ());
+        *slot.borrow_mut() = Some(result.map_or_else(|e| e.to_string(), |_| "lowered".into()));
+    });
+    db.execute("INSERT INTO t (id, v) VALUES (70, 'b')", ())
+        .unwrap();
+    let outcome = outcome.take().expect("the commit ran its hook");
+    assert!(outcome.contains("cannot be lowered"), "{outcome}");
+    db.execute("ALTER TABLE t AUTO_INCREMENT = 50", ()).unwrap();
+    assert_eq!(insert(&db, "c"), 71, "the committed row 70 counts");
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_alter_auto_increment_lowering_keeps_a_row_whose_deletion_commits() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let db = open("alter_ai_during_delete");
+    db.execute("INSERT INTO t (id, v) VALUES (100, 'a')", ())
+        .unwrap();
+    let other = db.clone();
+    let lowered = Rc::new(RefCell::new(None));
+    let slot = Rc::clone(&lowered);
+    stoolap::test_failpoints::before_commit_visible(move || {
+        let result = other.execute("ALTER TABLE t AUTO_INCREMENT = 50", ());
+        *slot.borrow_mut() = Some(result.map(|_| ()).map_err(|e| e.to_string()));
+    });
+    db.execute("DELETE FROM t WHERE id = 100", ()).unwrap();
+    let lowered = lowered.take().expect("the commit ran its hook");
+    assert_eq!(lowered, Ok(()));
+    assert_eq!(
+        insert(&db, "b"),
+        101,
+        "a deletion not yet visible may still be taken back"
     );
-    assert_eq!(insert(&db, "d"), 501, "a refused ALTER leaves the counter");
 }
 
 #[test]

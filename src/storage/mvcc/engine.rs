@@ -207,6 +207,17 @@ impl RecheckKeys {
     }
 }
 
+/// The largest row id any volume of `mgr` holds, its deleted rows included
+fn max_volume_row_id(mgr: &crate::storage::volume::manifest::SegmentManager) -> Result<i64> {
+    let mut max = 0;
+    for vol in mgr.get_segments_ordered_meta() {
+        if let Some(&last_id) = vol.row_ids()?.iter().max() {
+            max = max.max(last_id);
+        }
+    }
+    Ok(max)
+}
+
 /// The name of the unique index of `store` over the columns at `positions`
 fn unique_index_name(store: &VersionStore, positions: &[usize]) -> Option<String> {
     let mut name = None;
@@ -3638,8 +3649,9 @@ impl MVCCEngine {
                     .ok_or_else(|| {
                         Error::internal("invalid ALTER TABLE data: missing AUTO_INCREMENT value")
                     })?;
-                self.get_version_store(&table_name)?
-                    .set_auto_increment_counter(next.saturating_sub(1));
+                // No transaction is open in replay to hold a row back
+                let store = self.get_version_store(&table_name)?;
+                self.lower_auto_increment(&table_name, &store, next.saturating_sub(1))?;
             }
             _ => {
                 return Err(Error::internal(format!(
@@ -4768,11 +4780,7 @@ impl MVCCEngine {
         };
 
         for (_, mgr, max_vol_row_id) in &mut segment_data {
-            for vol in mgr.get_segments_ordered_meta() {
-                if let Some(&last_id) = vol.row_ids()?.iter().max() {
-                    *max_vol_row_id = (*max_vol_row_id).max(last_id);
-                }
-            }
+            *max_vol_row_id = max_volume_row_id(mgr)?;
         }
 
         let stores = self.version_stores.read().unwrap();
@@ -5204,20 +5212,49 @@ impl MVCCEngine {
         self.get_version_store(table_name)?.add_column(column)
     }
 
-    /// Raise `table_name`'s id counter so its next generated id is `next`;
-    /// an error when an id at or past `next` was already handed out
-    pub fn raise_auto_increment(&self, table_name: &str, next: i64) -> Result<()> {
+    /// Sets `table_name`'s id counter so its next generated id is `next`,
+    /// or the one after the largest id a row holds when that is higher.
+    /// Lowering is refused while a transaction holds rows of the table it
+    /// has not committed
+    pub fn set_auto_increment(&self, table_name: &str, next: i64) -> Result<()> {
         let store = self.get_version_store(table_name)?;
-        let handed_out = store.get_auto_increment_counter();
-        if handed_out >= next {
-            return Err(Error::invalid_argument(format!(
-                "AUTO_INCREMENT of table '{}' cannot go below {}: id {} was already handed out",
-                table_name,
-                handed_out.saturating_add(1),
-                handed_out
-            )));
+        let wanted = next.saturating_sub(1);
+        if store.get_auto_increment_counter() <= wanted {
+            store.set_auto_increment_counter(wanted);
+            return Ok(());
         }
-        store.set_auto_increment_counter(next - 1);
+        store
+            .with_inserters_closed(|| self.lower_auto_increment(table_name, &store, wanted))
+            .unwrap_or_else(|| {
+                Err(Error::invalid_argument(format!(
+                    "AUTO_INCREMENT of table '{}' cannot be lowered while a transaction holds uncommitted rows of it",
+                    table_name
+                )))
+            })
+    }
+
+    /// Sets the id counter of `store` to `wanted`, or to the largest id a
+    /// row holds, hot or in a volume, when that is higher; a deletion not
+    /// yet committed keeps its row
+    fn lower_auto_increment(
+        &self,
+        table_name: &str,
+        store: &VersionStore,
+        wanted: i64,
+    ) -> Result<()> {
+        // Hot first: a seal publishes its volume before the rows leave
+        let hot = store.max_live_row_id(|txn_id| self.registry.is_open(txn_id));
+        let mgr = self
+            .segment_managers
+            .read()
+            .map_err(|_| Error::internal("segment managers lock poisoned"))?
+            .get(to_lowercase_cow(table_name).as_ref())
+            .cloned();
+        let cold = match mgr {
+            Some(mgr) => max_volume_row_id(&mgr)?,
+            None => 0,
+        };
+        store.store_auto_increment_counter(wanted.max(hot).max(cold));
         Ok(())
     }
 

@@ -1359,7 +1359,7 @@ impl Executor {
                         table_name
                     )));
                 }
-                self.engine.raise_auto_increment(table_name, next)?;
+                self.engine.set_auto_increment(table_name, next)?;
                 self.engine
                     .record_alter_table_auto_increment(table_name, next)?;
             }

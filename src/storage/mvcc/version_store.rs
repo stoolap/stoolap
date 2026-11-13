@@ -1267,6 +1267,11 @@ pub struct VersionStore {
     cold_unavailable: AtomicBool,
     /// Auto-increment counter for tables without explicit PK
     auto_increment_counter: AtomicI64,
+    /// Open transactions that may hold rows not yet published here, with
+    /// `LOWERING` set while the id counter is lowered
+    inserters: AtomicUsize,
+    /// Held while the id counter is lowered; an inserter waits on it
+    lowering: parking_lot::Mutex<()>,
     /// Track which transaction has uncommitted changes to each row
     uncommitted_writes: RwLock<I64Map<i64>>,
     /// The holds on this table's keys that foreign keys reference
@@ -1351,6 +1356,18 @@ pub struct LayoutToken {
 
 /// Issues each version store a number no other store in the process takes
 static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The bit of `VersionStore::inserters` set while the id counter is lowered
+const LOWERING: usize = 1 << (usize::BITS - 1);
+
+/// Opens a store's inserters again when dropped
+struct InsertersClosed<'a>(&'a AtomicUsize);
+
+impl Drop for InsertersClosed<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_and(!LOWERING, Ordering::AcqRel);
+    }
+}
 
 /// An odd layout is a table closed for a column change: its rows may be
 /// read under the schema of that layout, and nothing is written under it
@@ -1488,6 +1505,8 @@ impl VersionStore {
             closed: AtomicBool::new(false),
             cold_unavailable: AtomicBool::new(false),
             auto_increment_counter: AtomicI64::new(0),
+            inserters: AtomicUsize::new(0),
+            lowering: parking_lot::Mutex::new(()),
             uncommitted_writes: RwLock::new(new_i64_map()),
             key_holds: KeyHolds::default(),
             visibility_checker: checker,
@@ -1533,6 +1552,8 @@ impl VersionStore {
             closed: AtomicBool::new(false),
             cold_unavailable: AtomicBool::new(false),
             auto_increment_counter: AtomicI64::new(0),
+            inserters: AtomicUsize::new(0),
+            lowering: parking_lot::Mutex::new(()),
             uncommitted_writes: RwLock::new(new_i64_map()),
             key_holds: KeyHolds::default(),
             visibility_checker: checker,
@@ -2156,6 +2177,65 @@ impl VersionStore {
                 return true;
             }
         }
+    }
+
+    /// Counts a transaction about to write rows this store does not hold
+    /// yet, before it takes an id; waits while the id counter is lowered
+    pub(crate) fn enter_inserter(&self) {
+        while self.inserters.fetch_add(1, Ordering::AcqRel) & LOWERING != 0 {
+            self.inserters.fetch_sub(1, Ordering::AcqRel);
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::inserter_waiting();
+            drop(self.lowering.lock());
+        }
+    }
+
+    /// Lets go of a count `enter_inserter` took
+    pub(crate) fn leave_inserter(&self) {
+        self.inserters.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Runs `lower` while no transaction can hold a row this store has not
+    /// published; None when one may hold one
+    pub(crate) fn with_inserters_closed<T>(&self, lower: impl FnOnce() -> T) -> Option<T> {
+        let _lowering = self.lowering.lock();
+        self.inserters
+            .compare_exchange(0, LOWERING, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        let _closed = InsertersClosed(&self.inserters);
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::inserters_closed();
+        Some(lower())
+    }
+
+    /// Sets the auto-increment counter to `value`, lower or higher
+    pub(crate) fn store_auto_increment_counter(&self, value: i64) {
+        self.auto_increment_counter.store(value, Ordering::Release);
+    }
+
+    /// The largest row id whose newest version is a row, or a deletion
+    /// whose transaction `open` says may still take it back; 0 for none
+    pub(crate) fn max_live_row_id(&self, open: impl Fn(i64) -> bool) -> i64 {
+        if self.closed.load(Ordering::Acquire) {
+            return 0;
+        }
+        let mut deleted: SmallVec<[(i64, i64); 4]> = SmallVec::new();
+        let live = {
+            let versions = self.versions.read();
+            let mut live = 0;
+            for (&row_id, entry) in versions.iter_rev() {
+                if !entry.version.is_deleted() {
+                    live = row_id;
+                    break;
+                }
+                deleted.push((row_id, entry.version.deleted_at_txn_id));
+            }
+            live
+        };
+        deleted
+            .into_iter()
+            .find(|&(_, txn_id)| open(txn_id))
+            .map_or(live, |(row_id, _)| row_id.max(live))
     }
 
     /// Returns the current auto-increment value without incrementing
@@ -7340,6 +7420,8 @@ pub struct TransactionVersionStore {
     /// The keys of a transaction that judges its unique keys as it writes
     /// them, an explicit transaction or an upsert, rather than at commit alone
     tracking: Option<Box<KeyTracking>>,
+    /// Whether the parent store counts this transaction among its inserters
+    inserting: AtomicBool,
 }
 
 /// What a transaction that judges its unique keys as it writes them keeps
@@ -7599,6 +7681,27 @@ impl TransactionVersionStore {
             bound: SmallVec::new(),
             writing: None,
             tracking: None,
+            inserting: AtomicBool::new(false),
+        }
+    }
+
+    /// Counts this transaction among the parent store's inserters, once,
+    /// before its first new row takes an id
+    pub(crate) fn note_inserting(&self) {
+        if self.inserting.load(Ordering::Acquire) {
+            return;
+        }
+        self.parent_store.enter_inserter();
+        if self.inserting.swap(true, Ordering::AcqRel) {
+            self.parent_store.leave_inserter();
+        }
+    }
+
+    /// Lets go of the count `note_inserting` took, once the rows are
+    /// published or gone
+    fn stop_inserting(&self) {
+        if self.inserting.swap(false, Ordering::AcqRel) {
+            self.parent_store.leave_inserter();
         }
     }
 
@@ -8854,6 +8957,8 @@ impl TransactionVersionStore {
                     .release_row_claims_batch(&row_ids, self.txn_id);
             }
         }
+        // The rows are the parent store's now, where a lowering sees them
+        self.stop_inserting();
 
         Ok(())
     }
@@ -9590,6 +9695,7 @@ impl TransactionVersionStore {
 
     #[inline(always)]
     fn let_go(&mut self) {
+        self.stop_inserting();
         // A store dropped with its commit's records still held lets them
         // go; a commit that became visible let them go already
         drop(std::mem::take(self.applied.get_mut()));

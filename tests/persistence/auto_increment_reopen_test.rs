@@ -167,6 +167,45 @@ fn test_alter_auto_increment_survives_a_crash_through_the_log() {
 }
 
 #[test]
+fn test_lowered_auto_increment_survives_a_reopen() {
+    #[cfg(feature = "test-failpoints")]
+    let _guard = stoolap::test_failpoints::FailpointGuard::new();
+    for params in ["", "?checkpoint_on_close=off"] {
+        let (_dir, db) = reopened_after(
+            &[
+                "INSERT INTO t (v) VALUES ('a')",
+                "INSERT INTO t (id, v) VALUES (500, 'b')",
+                "DELETE FROM t WHERE id = 500",
+                "ALTER TABLE t AUTO_INCREMENT = 10",
+            ],
+            params,
+        );
+        assert_eq!(next_id_after_insert(&db, "t"), 10, "with {params:?}");
+    }
+}
+
+#[test]
+fn test_lowering_stops_past_a_sealed_deleted_row() {
+    #[cfg(feature = "test-failpoints")]
+    let _guard = stoolap::test_failpoints::FailpointGuard::new();
+    let (_dir, db) = reopened_after(
+        &[
+            "INSERT INTO t (v) VALUES ('a')",
+            "INSERT INTO t (id, v) VALUES (500, 'b')",
+            "PRAGMA CHECKPOINT",
+            "DELETE FROM t WHERE id = 500",
+            "ALTER TABLE t AUTO_INCREMENT = 10",
+        ],
+        "",
+    );
+    assert_eq!(
+        next_id_after_insert(&db, "t"),
+        501,
+        "a volume holds a deleted row's id until compaction drops it"
+    );
+}
+
+#[test]
 fn test_truncate_after_alter_auto_increment_restarts_ids() {
     #[cfg(feature = "test-failpoints")]
     let _guard = stoolap::test_failpoints::FailpointGuard::new();

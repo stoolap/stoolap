@@ -1795,6 +1795,31 @@ pub(crate) fn alter_ddl_guard_next() {
 }
 
 thread_local! {
+    static INSERTERS_CLOSED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static INSERTER_WAITING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next lowering of an id counter has
+/// closed the table to new inserters, before it reads the rows
+pub fn on_inserters_closed(hook: impl FnOnce() + 'static) {
+    INSERTERS_CLOSED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn inserters_closed() {
+    run_hook(&INSERTERS_CLOSED_HOOK);
+}
+
+/// Run once on this thread when its next insert finds the table closed by a
+/// lowering of its id counter, before it waits for it
+pub fn on_inserter_waiting(hook: impl FnOnce() + 'static) {
+    INSERTER_WAITING_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn inserter_waiting() {
+    run_hook(&INSERTER_WAITING_HOOK);
+}
+
+thread_local! {
     static PREPARED_SCALAR_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static PREPARED_PLAN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static PREPARED_EXISTS_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
