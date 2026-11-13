@@ -80,6 +80,11 @@ fn test_parse_allocates_only_for_the_tree() {
         ("UPDATE t SET v = 1 WHERE id = 1", 5),
         ("UPDATE t SET v = v + 1, s = 'x', w = $1 WHERE id = $2", 7),
         ("INSERT INTO t (id, v, s) VALUES (1, 2, 'x')", 4),
+        ("INSERT INTO t (\"é0\", \"é1\", \"é2\") VALUES (1, 2, 3)", 7),
+        (
+            "UPDATE t SET \"é0\" = 1, \"Σa\" = 2, \"σb\" = 3 WHERE id = 1",
+            8,
+        ),
         (
             "INSERT INTO t (id, v, s) VALUES (1, 2, 'x') \
              ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v, s = 'y'",

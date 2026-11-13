@@ -1279,11 +1279,7 @@ impl Parser<'_> {
         mut written: impl Iterator<Item = &'a str>,
         name: &str,
     ) -> bool {
-        let same = |other: &str| match name.is_ascii() && other.is_ascii() {
-            true => name.eq_ignore_ascii_case(other),
-            false => name.to_lowercase() == other.to_lowercase(),
-        };
-        if !written.any(same) {
+        if !written.any(|other| crate::common::names::eq_names(name, other)) {
             return false;
         }
         let name = name.to_lowercase();
