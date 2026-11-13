@@ -120,6 +120,25 @@ pub static WAL_CUT_FAIL: AtomicBool = AtomicBool::new(false);
 /// Fail WAL `sync_locked()` (fsync) with an I/O error
 pub static WAL_SYNC_FAIL: AtomicBool = AtomicBool::new(false);
 
+/// The directory whose databases alone fail their WAL syncs, so tests
+/// beside the one failing them keep theirs
+static WAL_SYNC_FAIL_UNDER: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+/// Fail the WAL syncs of the databases under `dir` from now on; None stops it
+pub fn fail_wal_syncs_under(dir: Option<&std::path::Path>) {
+    *WAL_SYNC_FAIL_UNDER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = dir.map(std::path::Path::to_path_buf);
+}
+
+pub(crate) fn wal_sync_fails_at(wal: &std::path::Path) -> bool {
+    WAL_SYNC_FAIL_UNDER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_deref()
+        .is_some_and(|dir| wal.starts_with(dir))
+}
+
 /// Run every text by its own plan, none shared by its literals
 pub static LITERAL_SHARING_OFF: AtomicBool = AtomicBool::new(false);
 
@@ -438,6 +457,9 @@ thread_local! {
     static COLUMN_CHANGE_WAITING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static CHECKPOINT_CUT_TAKEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static CHECKPOINT_MANAGERS_TAKEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static INDEX_GET_IDS_TAKEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static INDEX_GET_MANAGER_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static KEY_READS_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static CATALOG_COPIES_TAKEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static RETYPE_OUTPUTS_WRITTEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static RETYPE_MANIFEST_WRITTEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
@@ -703,6 +725,36 @@ pub fn after_checkpoint_managers_taken(hook: impl FnOnce() + 'static) {
 
 pub(crate) fn checkpoint_managers_taken() {
     run_hook(&CHECKPOINT_MANAGERS_TAKEN_HOOK);
+}
+
+/// Run once on this thread when its next index key read took the ids the
+/// index holds for its key, before it reads their rows
+pub fn after_index_get_ids_taken(hook: impl FnOnce() + 'static) {
+    INDEX_GET_IDS_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn index_get_ids_taken() {
+    run_hook(&INDEX_GET_IDS_TAKEN_HOOK);
+}
+
+/// Run once on this thread when its next index key read is about to take
+/// its table's segment manager
+pub fn before_index_get_manager_taken(hook: impl FnOnce() + 'static) {
+    INDEX_GET_MANAGER_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn before_index_get_manager() {
+    run_hook(&INDEX_GET_MANAGER_HOOK);
+}
+
+/// Plan the statements this thread plans from now on without a key read,
+/// for a test of what the scan path does under a statement's view
+pub fn plan_without_key_reads() {
+    KEY_READS_OFF.with(|off| off.set(true));
+}
+
+pub(crate) fn key_reads_off() -> bool {
+    KEY_READS_OFF.with(std::cell::Cell::get)
 }
 
 /// Run once on this thread when its next checkpoint took the catalog it
@@ -3721,6 +3773,7 @@ pub fn reset_all() {
     WAL_WRITE_PARTIAL.store(false, Release);
     WAL_CUT_FAIL.store(false, Release);
     WAL_SYNC_FAIL.store(false, Release);
+    fail_wal_syncs_under(None);
     WAL_SCAN_READ_FAIL.store(false, Release);
     SNAPSHOT_WRITE_FAIL.store(false, Release);
     SNAPSHOT_SYNC_FAIL.store(false, Release);
@@ -3776,6 +3829,9 @@ pub fn reset_all() {
     COLUMN_CHANGE_WAITING_HOOK.with(|slot| *slot.borrow_mut() = None);
     CHECKPOINT_CUT_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     CHECKPOINT_MANAGERS_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
+    INDEX_GET_IDS_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
+    INDEX_GET_MANAGER_HOOK.with(|slot| *slot.borrow_mut() = None);
+    KEY_READS_OFF.with(|off| off.set(false));
     CATALOG_COPIES_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     RETYPE_OUTPUTS_WRITTEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     RETYPE_MANIFEST_WRITTEN_HOOK.with(|slot| *slot.borrow_mut() = None);

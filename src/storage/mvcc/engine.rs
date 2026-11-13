@@ -9556,6 +9556,85 @@ impl MVCCEngine {
         Ok(rows)
     }
 
+    /// The rows of a table without sealed rows holding `value` at `column`
+    /// by the column's own index, in the latest committed state of one quiet
+    /// publish epoch, in row id order; None when the table has sealed rows,
+    /// more than `cap` rows may hold the value, the index cannot answer or
+    /// the table publishes or seals meanwhile
+    pub(crate) fn fetch_latest_equal_in(
+        &self,
+        table_name: &str,
+        store: &Arc<VersionStore>,
+        (column, value): (usize, &Value),
+        cap: usize,
+        token: crate::storage::mvcc::version_store::LayoutToken,
+    ) -> Result<Option<crate::core::RowVec>> {
+        use crate::storage::traits::CappedEqual;
+        if !self.is_open() {
+            return Err(Error::EngineNotOpen);
+        }
+        // An unloaded volume is the normal path's to report; no manager is made by name
+        if store.is_cold_unavailable() {
+            return Ok(None);
+        }
+        self.ddl.check_reserved(store)?;
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::before_index_get_manager();
+        // Taken by name, none made; a rename after the check below moves this one
+        let Ok(mgrs) = self.segment_managers.read() else {
+            return Ok(None);
+        };
+        let mgr = mgrs.get(table_name).cloned();
+        drop(mgrs);
+        if !self
+            .get_version_store(table_name)
+            .is_ok_and(|named| Arc::ptr_eq(&named, store))
+        {
+            return Ok(None);
+        }
+        // Ids taken in a settled state; only a persisting database seals
+        let generation = match &mgr {
+            Some(mgr) => {
+                let generation = mgr.settled_seal_generation();
+                if mgr.has_segments() {
+                    return Ok(None);
+                }
+                Some(generation)
+            }
+            None if self.persistence.is_some() => return Ok(None),
+            None => None,
+        };
+        let Some(epoch) = store.publish_epoch_if_quiet() else {
+            return Ok(None);
+        };
+        let schema = store.schema();
+        let (Some(index), Some(name)) = (
+            store.index_on(column),
+            schema.columns.get(column).map(|c| c.name.as_str()),
+        ) else {
+            return Ok(None);
+        };
+        let mut ids = crate::core::RowIdVec::new();
+        let found = crate::storage::mvcc::table::index_equality_candidates(
+            &*index, &schema, name, value, cap, &mut ids,
+        )?;
+        if !matches!(found, Some(CappedEqual::Copied)) {
+            return Ok(None);
+        }
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::index_get_ids_taken();
+        // The rows are hot as their ids were; one gone, sealed or deleted, ends the read
+        let rows = store.get_visible_versions_batch(&ids, (INVALID_TRANSACTION_ID + 1).into());
+        if rows.len() < ids.len()
+            || store.publish_epoch_if_quiet() != Some(epoch)
+            || mgr.map(|mgr| mgr.seal_generation()) != generation
+        {
+            return Ok(None);
+        }
+        store.check_token(token)?;
+        Ok(Some(rows))
+    }
+
     /// The row the volumes of `table_name` hold `value` in at `column`, the
     /// volumes read through the owners one snapshot captured, so a
     /// compaction after it cannot hide the row; no row as an empty answer

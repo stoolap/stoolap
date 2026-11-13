@@ -1661,7 +1661,9 @@ impl WALManager {
         }
 
         #[cfg(any(test, feature = "test-failpoints"))]
-        if crate::test_failpoints::WAL_SYNC_FAIL.load(std::sync::atomic::Ordering::Acquire) {
+        if crate::test_failpoints::WAL_SYNC_FAIL.load(std::sync::atomic::Ordering::Acquire)
+            || crate::test_failpoints::wal_sync_fails_at(&self.path)
+        {
             return Err(Error::internal("failpoint: WAL sync"));
         }
 

@@ -5641,6 +5641,15 @@ impl VersionStore {
         indexes.get(name).map(|entry| Arc::clone(&entry.index))
     }
 
+    /// The index of the column at `column` alone, found by position
+    pub(crate) fn index_on(&self, column: usize) -> Option<Arc<dyn Index>> {
+        self.indexes
+            .read()
+            .values()
+            .find(|entry| entry.index.column_ids() == [column as i32])
+            .map(|entry| Arc::clone(&entry.index))
+    }
+
     /// Get an index by column name (single-column indexes only)
     pub fn get_index_by_column(&self, column_name: &str) -> Option<Arc<dyn Index>> {
         let indexes = self.indexes.read();

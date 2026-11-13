@@ -78,7 +78,26 @@ const CASES: &[(&str, &str, &str)] = &[
         "SELECT o.a, (SELECT i.b FROM k i WHERE i.id = o.id) AS v FROM k o",
         "SELECT o.a, (SELECT i.b FROM k i WHERE i.id + 0 = o.id) AS v FROM k o",
     ),
+    (
+        "index_get",
+        "SELECT id, b FROM m WHERE g = 1",
+        "SELECT id, b FROM m WHERE g + 0 = 1",
+    ),
+    (
+        "index_get",
+        "SELECT b FROM m WHERE g = 2 AND b <> 'q'",
+        "SELECT b FROM m WHERE g + 0 = 2 AND b <> 'q'",
+    ),
+    (
+        "index_get",
+        "SELECT b FROM m WHERE g = 9",
+        "SELECT b FROM m WHERE g + 0 = 9",
+    ),
 ];
+
+/// The paths that read hot rows alone: a sealed table's run reads as its
+/// plan would without them
+const HOT_ONLY: &[&str] = &["index_get"];
 
 fn open(dsn: &str, sealed: bool) -> Database {
     let db = Database::open(dsn).unwrap();
@@ -86,8 +105,11 @@ fn open(dsn: &str, sealed: bool) -> Database {
         "CREATE TABLE k (id INTEGER PRIMARY KEY, a INTEGER, b TEXT, u INTEGER)",
         "CREATE UNIQUE INDEX ku ON k (u)",
         "CREATE TABLE n (a INTEGER, b TEXT)",
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, g INTEGER, b TEXT)",
+        "CREATE INDEX mg ON m (g)",
         "INSERT INTO k VALUES (10, 1, 'x', 100), (20, 2, 'y', 200), (30, 3, 'z', 300)",
         "INSERT INTO n VALUES (1, 'x'), (2, 'y'), (3, 'z')",
+        "INSERT INTO m VALUES (1, 1, 'p'), (2, 2, 'q'), (3, 1, 'r'), (4, 1, 's'), (5, 2, 't')",
     ] {
         db.execute(sql, ()).unwrap();
     }
@@ -133,7 +155,8 @@ fn every_key_read_path_answers_as_a_scan_does() {
             for run in ["first", "held"] {
                 reset_key_read_paths();
                 let got = answer(db, sql);
-                if run == "held" && !key_read_paths_taken().contains(path) {
+                let expected = *layout == "hot" || !HOT_ONLY.contains(path);
+                if run == "held" && key_read_paths_taken().contains(path) != expected {
                     wrong.push(format!(
                         "{layout} {run}: {sql} took {:?}",
                         key_read_paths_taken()

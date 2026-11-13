@@ -50,7 +50,12 @@ fn explained(db: &Database, sql: &str) -> String {
         .unwrap()
         .map(|row| row.unwrap().get::<String>(0).unwrap())
         .filter_map(|line| line.split_whitespace().next().map(str::to_string))
-        .find(|word| matches!(word.as_str(), "PkGet" | "IndexScan" | "SeqScan"))
+        .find(|word| {
+            matches!(
+                word.as_str(),
+                "PkGet" | "IndexGet" | "IndexScan" | "SeqScan"
+            )
+        })
         .unwrap_or_default()
 }
 
@@ -85,7 +90,7 @@ fn explain_shows_the_access_the_run_takes() {
         ran(&db, sql);
         let (keyed, index_ids) = ran(&db, sql);
         match access.as_str() {
-            "PkGet" => assert!(keyed && index_ids == 0, "{sql}: {access}"),
+            "PkGet" | "IndexGet" => assert!(keyed && index_ids == 0, "{sql}: {access}"),
             "IndexScan" => assert!(!keyed && index_ids > 0, "{sql}: {access}"),
             "SeqScan" => assert!(!keyed && index_ids == 0, "{sql}: {access}"),
             other => panic!("{sql}: no planned access in EXPLAIN, {other}"),

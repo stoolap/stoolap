@@ -31,6 +31,8 @@ type Rows = Result<Vec<Vec<Value>>, Error>;
 const OPTS: &str = "?checkpoint_on_close=off&checkpoint_interval=0";
 
 fn rows(db: &Database, sql: &str) -> Rows {
+    // The reads here open their table; a key read opens none
+    fp::plan_without_key_reads();
     db.query(sql, ())?
         .map(|r| {
             r.map(|r| {

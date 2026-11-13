@@ -36,6 +36,8 @@ fn ids(result: stoolap::Result<stoolap::Rows>) -> Result<Vec<i64>, String> {
 #[test]
 fn a_select_reads_the_table_it_opened_by_its_own_indexes() {
     let sql = "SELECT id FROM t WHERE k = 7";
+    // The read here opens its table; a key read opens none
+    stoolap::test_failpoints::plan_without_key_reads();
     for run in ["unprepared", "prepared", "prepared again"] {
         let db = Database::open(&format!("memory://opened_table_access_{run}")).unwrap();
         db.execute(

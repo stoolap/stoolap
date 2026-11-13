@@ -2892,72 +2892,69 @@ impl MVCCTable {
     }
 }
 
-impl MVCCTable {
-    /// The ids `index` itself holds for `key`, under `equality_candidates`'s cap
-    fn index_equality_candidates(
-        &self,
-        index: &dyn Index,
-        column: &str,
-        key: &Value,
-        max: usize,
-        out: &mut Vec<i64>,
-    ) -> Result<Option<crate::storage::traits::CappedEqual>> {
-        match index.index_type() {
-            IndexType::BTree => {
-                #[cfg(feature = "test-failpoints")]
-                let start = out.len();
-                let found =
-                    index.get_row_ids_equal_capped_into(std::slice::from_ref(key), max, out);
-                #[cfg(feature = "test-failpoints")]
-                crate::test_failpoints::equality_candidate_ids_copied(out.len() - start);
-                Ok(found)
-            }
-            IndexType::Hash | IndexType::Bitmap | IndexType::PrimaryKey => {
-                // These match the stored value exactly, so the key takes the column's type
-                let Some(data_type) = self
-                    .cached_schema
-                    .columns
-                    .iter()
-                    .find(|c| eq_names(&c.name_lower, column))
-                    .map(|c| c.data_type)
-                else {
-                    return Ok(None);
-                };
-                let stored = match (data_type, key) {
-                    (DataType::Integer, Value::Float(f)) => {
-                        match crate::executor::Executor::lossless_float_key(*f) {
-                            Some(i) => Value::Integer(i),
-                            None => return Ok(Some(crate::storage::traits::CappedEqual::Copied)),
-                        }
-                    }
-                    (DataType::Float, Value::Integer(i)) => {
-                        match crate::core::value::lossless_f64_from_i64(*i) {
-                            Some(f) => Value::Float(f),
-                            None => return Ok(Some(crate::storage::traits::CappedEqual::Copied)),
-                        }
-                    }
-                    (data_type, key) if key.data_type() == data_type => key.clone(),
-                    _ => return Ok(None),
-                };
-                // An index that caps before it copies answers here
-                let stored = std::slice::from_ref(&stored);
-                let start = out.len();
-                if let Some(found) = index.get_row_ids_equal_capped_into(stored, max, out) {
-                    #[cfg(feature = "test-failpoints")]
-                    crate::test_failpoints::equality_candidate_ids_copied(out.len() - start);
-                    return Ok(Some(found));
-                }
-                index.get_row_ids_equal_into(stored, out);
-                #[cfg(feature = "test-failpoints")]
-                crate::test_failpoints::equality_candidate_ids_copied(out.len() - start);
-                if out.len() - start > max {
-                    out.truncate(start);
-                    return Ok(Some(crate::storage::traits::CappedEqual::OverCap));
-                }
-                Ok(Some(crate::storage::traits::CappedEqual::Copied))
-            }
-            _ => Ok(None),
+/// The ids `index`, on `column` of `schema`, itself holds for `key`, under
+/// `equality_candidates`'s cap
+pub(crate) fn index_equality_candidates(
+    index: &dyn Index,
+    schema: &Schema,
+    column: &str,
+    key: &Value,
+    max: usize,
+    out: &mut Vec<i64>,
+) -> Result<Option<crate::storage::traits::CappedEqual>> {
+    match index.index_type() {
+        IndexType::BTree => {
+            #[cfg(feature = "test-failpoints")]
+            let start = out.len();
+            let found = index.get_row_ids_equal_capped_into(std::slice::from_ref(key), max, out);
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::equality_candidate_ids_copied(out.len() - start);
+            Ok(found)
         }
+        IndexType::Hash | IndexType::Bitmap | IndexType::PrimaryKey => {
+            // These match the stored value exactly, so the key takes the column's type
+            let Some(data_type) = schema
+                .columns
+                .iter()
+                .find(|c| eq_names(&c.name_lower, column))
+                .map(|c| c.data_type)
+            else {
+                return Ok(None);
+            };
+            let stored = match (data_type, key) {
+                (DataType::Integer, Value::Float(f)) => {
+                    match crate::executor::Executor::lossless_float_key(*f) {
+                        Some(i) => Value::Integer(i),
+                        None => return Ok(Some(crate::storage::traits::CappedEqual::Copied)),
+                    }
+                }
+                (DataType::Float, Value::Integer(i)) => {
+                    match crate::core::value::lossless_f64_from_i64(*i) {
+                        Some(f) => Value::Float(f),
+                        None => return Ok(Some(crate::storage::traits::CappedEqual::Copied)),
+                    }
+                }
+                (data_type, key) if key.data_type() == data_type => key.clone(),
+                _ => return Ok(None),
+            };
+            // An index that caps before it copies answers here
+            let stored = std::slice::from_ref(&stored);
+            let start = out.len();
+            if let Some(found) = index.get_row_ids_equal_capped_into(stored, max, out) {
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::equality_candidate_ids_copied(out.len() - start);
+                return Ok(Some(found));
+            }
+            index.get_row_ids_equal_into(stored, out);
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::equality_candidate_ids_copied(out.len() - start);
+            if out.len() - start > max {
+                out.truncate(start);
+                return Ok(Some(crate::storage::traits::CappedEqual::OverCap));
+            }
+            Ok(Some(crate::storage::traits::CappedEqual::Copied))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -4501,7 +4498,7 @@ impl Table for MVCCTable {
             return Ok(None);
         };
         let start = out.len();
-        let found = self.index_equality_candidates(&*index, column, key, max, out)?;
+        let found = index_equality_candidates(&*index, &self.cached_schema, column, key, max, out)?;
         let (Some(view), Some(CappedEqual::Copied)) = (self.view.as_ref(), found) else {
             return Ok(found);
         };

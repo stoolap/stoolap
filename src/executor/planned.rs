@@ -29,14 +29,20 @@ use crate::storage::traits::transaction::{StatementTable, TableUse};
 use crate::storage::traits::{Engine, QueryResult};
 
 use super::context::ExecutionContext;
-use super::expression::{ExecuteContext, ExprVM};
-use super::prepared_select::{first_branch_of, prepared_branch, KeyReadPath, PreparedSelect};
+use super::expression::{ExecuteContext, ExprVM, Program};
+use super::prepared_select::{
+    first_branch_of, prepared_branch, KeyReadBy, KeyReadPath, PreparedSelect,
+};
 use super::query_cache::{check_compiled_token, or_normal_path, CompiledExecution};
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::ExecutorResult;
 use super::row_count::static_row_counts;
 use super::utils::where_without_aggregates;
 use super::Executor;
+
+/// The most rows a non-unique index key read takes; past them the work per
+/// row outweighs the statement setup the read saves
+const INDEX_GET_ROWS: usize = 256;
 
 impl Executor {
     /// `run` over the plan `compiled` holds for `stmt` when it reads a key,
@@ -209,6 +215,7 @@ impl Executor {
                 (table.clone(), &store),
                 (schema, token),
                 (counts.offset, counts.limit),
+                !stmt.order_by.is_empty() || !stmt.distinct_on.is_empty(),
             );
         }
         prepared.quiet = quiet;
@@ -362,6 +369,17 @@ impl Executor {
         // A name the plan does not find is the error of the statement's own
         // run, planned again after it takes its view
         self.with_planned(stmt, compiled, classification, ctx, |planned| {
+            // A snapshot the caller gave that may have written, or reads at its
+            // own point without a view the key reads take, is the plan's to read
+            if ctx
+                .and_then(ExecutionContext::statement_snapshot)
+                .is_some_and(|snapshot| {
+                    !snapshot.writes_nothing()
+                        || (snapshot.view().is_none() && !snapshot.reads_latest())
+                })
+            {
+                return None;
+            }
             // The table's count or bound sees no open transaction's writes
             // and no statement's view: those read the plan's rows
             if let Some(quiet) = &planned.quiet {
@@ -421,9 +439,9 @@ impl Executor {
     ) -> Option<Result<Box<dyn QueryResult>>> {
         // Read through the statement, and `read_planned` inlined: a key read
         // borrowed as an argument has its fields loaded ahead of every row
-        let (plan, unique) = planned.key_read()?;
-        let rows = match unique {
-            false => {
+        let (plan, by) = planned.key_read()?;
+        let rows = match by {
+            KeyReadBy::Pk => {
                 let key = plan.key.integer(params)?;
                 let needed = plan.needed.as_deref();
                 self.fetch_pk_row(
@@ -436,13 +454,17 @@ impl Executor {
                     needed,
                 )
             }
-            true => self
+            KeyReadBy::Unique => self
                 .fetch_unique_row(plan, params, in_txn, view)
                 .transpose()?,
+            KeyReadBy::Index => self
+                .fetch_index_rows(plan, params, in_txn, view)
+                .transpose()?,
         };
-        match unique {
-            false => KeyReadPath::PkGet.taken(),
-            true => KeyReadPath::UniqueGet.taken(),
+        match by {
+            KeyReadBy::Pk => KeyReadPath::PkGet.taken(),
+            KeyReadBy::Unique => KeyReadPath::UniqueGet.taken(),
+            KeyReadBy::Index => KeyReadPath::IndexGet.taken(),
         }
         or_normal_path(rows.and_then(|rows| self.read_planned(plan, rows, params, transaction)))
     }
@@ -484,6 +506,43 @@ impl Executor {
         Ok(rows)
     }
 
+    /// The rows `plan`'s non-unique index holds for its key's value, read as
+    /// the latest committed state; None outside an autocommit read committed
+    /// statement without a view, or when the index or the read declines
+    #[inline(never)]
+    fn fetch_index_rows(
+        &self,
+        plan: &KeyRead,
+        params: &[Value],
+        in_txn: bool,
+        view: Option<&StatementView>,
+    ) -> Result<Option<KeyRows>> {
+        if in_txn
+            || view.is_some()
+            || self.isolation_level() != crate::core::IsolationLevel::ReadCommitted
+        {
+            return Ok(None);
+        }
+        let Some(value) = plan.key.value(params).filter(|value| !value.is_null()) else {
+            return Ok(None);
+        };
+        let Some(store) = plan.store.upgrade().filter(|store| !store.is_closed()) else {
+            return Ok(None);
+        };
+        let rows = self.engine.fetch_latest_equal_in(
+            &plan.table,
+            &store,
+            (plan.key.column(), &value),
+            INDEX_GET_ROWS,
+            plan.token,
+        )?;
+        #[cfg(feature = "test-failpoints")]
+        if rows.is_some() {
+            crate::test_failpoints::note_read("exec.index_get");
+        }
+        Ok(rows.map(KeyRows::Many))
+    }
+
     #[inline(always)]
     fn read_planned(
         &self,
@@ -493,11 +552,30 @@ impl Executor {
         transaction: Option<u64>,
     ) -> Result<Box<dyn QueryResult>> {
         let mut vm: Option<ExprVM> = None;
-        let mut out = RowVec::with_capacity(1);
+        let count = match &rows {
+            KeyRows::One(..) => 1,
+            KeyRows::Many(rows) => rows.len(),
+        };
+        let mut out = RowVec::with_capacity(count);
         let mut passed = 0;
+        // The parameters a program reads as another value are read once a
+        // run of several rows; one row reads them once all the same
+        let bound_filter = plan
+            .filter
+            .as_ref()
+            .filter(|filter| count > 1 && filter.binds_params())
+            .map(|filter| Program::bound(filter.clone(), params));
+        let bound_projection =
+            (count > 1 && plan.projection_binds).then(|| plan.projection.bound(params));
+        let filter = bound_filter.as_ref().or(plan.filter.as_ref());
+        let projection = bound_projection.as_ref().unwrap_or(&plan.projection);
         for (id, row) in rows {
+            // A full LIMIT asks no further row's filter
+            if plan.limit.is_some_and(|limit| out.len() >= limit) {
+                break;
+            }
             let row = normalize_row_to_schema(row, &plan.schema);
-            if let Some(filter) = &plan.filter {
+            if let Some(filter) = filter {
                 let exec = ExecuteContext::new(&row).with_run(params, transaction, None);
                 let vm = vm.get_or_insert_with(ExprVM::new);
                 if !vm.execute_bool_checked(filter, &exec)? {
@@ -508,14 +586,11 @@ impl Executor {
             if passed <= plan.offset {
                 continue;
             }
-            if plan.limit.is_some_and(|limit| out.len() >= limit) {
-                break;
-            }
             if plan.whole_row {
                 out.push((id, row));
                 continue;
             }
-            if let Some(columns) = plan.projection.column_indices() {
+            if let Some(columns) = projection.column_indices() {
                 let values = columns
                     .iter()
                     .map(|&i| row.get(i).cloned().unwrap_or_else(Value::null_unknown));
@@ -523,9 +598,9 @@ impl Executor {
                 continue;
             }
             let exec = ExecuteContext::new(&row).with_run(params, transaction, None);
-            let mut projected = Row::with_capacity(plan.projection.width());
+            let mut projected = Row::with_capacity(projection.width());
             let vm = vm.get_or_insert_with(ExprVM::new);
-            plan.projection.project_into(vm, &exec, &mut projected)?;
+            projection.project_into(vm, &exec, &mut projected)?;
             out.push((id, projected));
         }
         Ok(Box::new(ExecutorResult::with_arc_columns(
