@@ -777,6 +777,17 @@ fn tracker_for(
         .then(|| BuildMatchedTracker::new(build_count))
 }
 
+/// The probe rows of a chunk when `rows` probe across threads: small enough
+/// that few rows still spread over every thread, at most the config's chunk
+#[cfg(feature = "parallel")]
+fn probe_chunk_rows(rows: usize, config: &ParallelConfig) -> usize {
+    let threads = num_threads();
+    let chunk_rows = rows.div_ceil(threads).clamp(1, config.chunk_size.max(1000));
+    #[cfg(feature = "test-failpoints")]
+    crate::test_failpoints::join_probe_chunks(rows, chunk_rows, threads);
+    chunk_rows
+}
+
 /// One hash join's probe: its build side and hash table, keys, shape and
 /// the flags of the build rows met
 #[derive(Clone, Copy)]
@@ -811,25 +822,10 @@ impl Probe<'_> {
         let (matched_rows, unmatched_probe_rows) = {
             #[cfg(feature = "parallel")]
             {
-                // Chunks small enough that a slice of few probe rows still
-                // spreads over every thread
-                let threads = num_threads();
-                let chunk_rows = probe_rows
-                    .len()
-                    .div_ceil(threads)
-                    .clamp(1, config.chunk_size.max(1000));
-                #[cfg(feature = "test-failpoints")]
-                if use_parallel {
-                    crate::test_failpoints::join_probe_chunks(
-                        probe_rows.len(),
-                        chunk_rows,
-                        threads,
-                    );
-                }
                 if use_parallel && join_type == JoinType::Inner {
                     // For INNER joins, we can fully parallelize the probe phase
                     let matches: Vec<Row> = probe_rows
-                        .par_chunks(chunk_rows)
+                        .par_chunks(probe_chunk_rows(probe_rows.len(), config))
                         .flat_map(|chunk| {
                             let mut local_results = Vec::new();
                             for probe_row in chunk {
@@ -866,7 +862,7 @@ impl Probe<'_> {
 
                     // Each chunk returns: (matched_rows, unmatched_probe_rows)
                     let chunk_results: Vec<(Vec<Row>, Vec<Row>)> = probe_rows
-                        .par_chunks(chunk_rows)
+                        .par_chunks(probe_chunk_rows(probe_rows.len(), config))
                         .map(|chunk| {
                             let mut matched_results = Vec::new();
                             let mut unmatched_results = Vec::new();

@@ -462,3 +462,43 @@ mod cancel {
         }
     }
 }
+
+/// Run in a process of its own: a hash join that does not run across
+/// threads leaves the global thread pool for the caller to build
+#[cfg(feature = "parallel")]
+#[test]
+fn a_hash_join_on_one_thread_leaves_the_thread_pool_unbuilt() {
+    use stoolap::core::{Row, Value};
+    use stoolap::executor::{parallel_hash_join, ParallelConfig, ParallelJoinType};
+
+    const NAME: &str =
+        "join_aggregate_parts_test::a_hash_join_on_one_thread_leaves_the_thread_pool_unbuilt";
+    if std::env::var_os("JOIN_POOL_CHILD").is_none() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--test-threads", "1"])
+            .env("JOIN_POOL_CHILD", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+    let rows: Vec<Row> = (0..10)
+        .map(|i| Row::from_values(vec![Value::Integer(i)]))
+        .collect();
+    for config in [ParallelConfig::disabled(), ParallelConfig::default()] {
+        for (probe, build) in [(&rows[..], &rows[..]), (&[][..], &[][..])] {
+            for join_type in [ParallelJoinType::Inner, ParallelJoinType::Full] {
+                parallel_hash_join(probe, build, &[0], &[0], join_type, 1, 1, false, &config);
+            }
+        }
+    }
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build_global()
+        .expect("a hash join on one thread built the global thread pool");
+}
