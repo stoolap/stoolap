@@ -9573,7 +9573,11 @@ impl MVCCEngine {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
-        self.check_cold_available(table_name, store)?;
+        // An unloaded volume is the normal path's to report; no manager is made by name
+        if store.is_cold_unavailable() {
+            return Ok(None);
+        }
+        self.ddl.check_reserved(store)?;
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::before_index_get_manager();
         // Taken by name, none made; a rename after the check below moves this one
@@ -9620,25 +9624,10 @@ impl MVCCEngine {
         }
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::index_get_ids_taken();
-        let rows = match ids.is_empty() {
-            true => crate::core::RowVec::new(),
-            false => {
-                let fetched = self.fetch_rows_by_ids_in(
-                    table_name,
-                    store,
-                    &ids,
-                    token,
-                    true,
-                    Some(epoch),
-                    None,
-                )?;
-                let Some(rows) = fetched else {
-                    return Ok(None);
-                };
-                rows
-            }
-        };
-        if store.publish_epoch_if_quiet() != Some(epoch)
+        // The rows are hot as their ids were; one gone, sealed or deleted, ends the read
+        let rows = store.get_visible_versions_batch(&ids, (INVALID_TRANSACTION_ID + 1).into());
+        if rows.len() < ids.len()
+            || store.publish_epoch_if_quiet() != Some(epoch)
             || mgr.map(|mgr| mgr.seal_generation()) != generation
         {
             return Ok(None);

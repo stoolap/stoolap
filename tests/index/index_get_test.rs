@@ -432,6 +432,59 @@ fn a_snapshot_the_caller_gives_is_read_at_its_own_point() {
 }
 
 #[test]
+fn a_read_committed_snapshot_the_caller_gives_reads_its_own_writes() {
+    use stoolap::core::{IsolationLevel, Row, Value};
+    use stoolap::executor::context::StatementSnapshot;
+    use stoolap::storage::traits::Engine;
+    let db = Database::open("memory://index_get_snapshot_writes").unwrap();
+    for sql in [
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, g INTEGER)",
+        "CREATE INDEX s_g ON s(g)",
+        "INSERT INTO s VALUES (1, 1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let engine = db.engine();
+    let executor = stoolap::Executor::new(std::sync::Arc::clone(engine));
+    let first = |ctx: &stoolap::ExecutionContext, sql: &str| -> Vec<i64> {
+        let mut result = executor.execute_with_context(sql, ctx).unwrap();
+        let mut out = Vec::new();
+        while result.next() {
+            out.push(result.row().get(0).and_then(|v| v.as_int64()).unwrap());
+        }
+        out.sort_unstable();
+        out
+    };
+    let reads: [(&str, &[i64]); 2] = [
+        ("SELECT id FROM s WHERE g = 1", &[1, 2]),
+        ("SELECT id FROM s WHERE id = 2", &[2]),
+    ];
+    for (sql, _) in reads {
+        first(&stoolap::ExecutionContext::new(), sql);
+        first(&stoolap::ExecutionContext::new(), sql);
+    }
+    let snapshot = StatementSnapshot::new(
+        engine.begin_transaction().unwrap(),
+        IsolationLevel::ReadCommitted,
+        None,
+    );
+    snapshot
+        .get_table("s")
+        .unwrap()
+        .insert(Row::from_values(vec![Value::Integer(2), Value::Integer(1)]))
+        .unwrap();
+    let ctx = stoolap::ExecutionContext::new().with_statement_snapshot(snapshot);
+    let wrong: Vec<String> = reads
+        .iter()
+        .filter_map(|(sql, expected)| {
+            let seen = first(&ctx, sql);
+            (seen != *expected).then(|| format!("{sql}: {seen:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "the snapshot's own row: {wrong:?}");
+}
+
+#[test]
 fn explain_names_the_index_read() {
     let dir = tempfile::tempdir().unwrap();
     let db = table("index_get_explain", false, &dir);
@@ -483,6 +536,37 @@ mod windows {
             matches!(found.as_deref(), Ok([1, 5, 9, 13, 17]) | Err(_)),
             "the sealed rows or a refusal, never no row: {found:?}"
         );
+    }
+
+    #[test]
+    fn a_table_renamed_and_sealed_between_the_ids_and_the_rows_keeps_its_old_name_free() {
+        let _guard = FailpointGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db = file_table(&dir, "checkpoint_interval=3600&compact_threshold=1000");
+        assert_eq!(ids(&db, 1), vec![1, 5, 9, 13, 17]);
+        let writer = db.clone();
+        after_index_get_ids_taken(move || {
+            writer.execute("ALTER TABLE o RENAME TO o_old", ()).unwrap();
+            writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        });
+        let found: Result<Vec<i64>, String> = db
+            .query("SELECT id FROM o WHERE g = $1", (1,))
+            .map_err(|e| e.to_string())
+            .map(|rows| {
+                rows.map(|row| row.unwrap().get::<i64>(0).unwrap())
+                    .collect()
+            });
+        assert!(
+            matches!(found.as_deref(), Ok([1, 5, 9, 13, 17]) | Err(_)),
+            "{found:?}"
+        );
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        assert!(
+            !dir.path().join("volumes").join("o").exists(),
+            "no files under the old name"
+        );
+        db.execute("ALTER TABLE o_old RENAME TO o", ())
+            .expect("the old name is free to take back");
     }
 
     #[test]
