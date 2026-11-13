@@ -5052,8 +5052,47 @@ impl Executor {
                                 })
                                 .collect()
                         };
-                        let keys_of = |programs: &[SharedProgram]| {
+                        let counts = row_counts(stmt, ctx)?;
+                        let offset = counts.offset;
+                        let limit = counts.limit.unwrap_or(usize::MAX);
+                        let bounded = offset > 0 || limit != usize::MAX;
+                        // The joined rows' places in the order: under a LIMIT
+                        // or OFFSET, those the statement's top-N keeps past the
+                        // offset, each kept with its keys and its place last
+                        let order_of = |programs: &[SharedProgram]| -> Option<Vec<usize>> {
                             let mut vm = ExprVM::new();
+                            if bounded {
+                                let order: Vec<(Option<usize>, bool, Option<bool>)> =
+                                    (stmt.order_by.iter().enumerate())
+                                        .map(|(at, ob)| (Some(at), ob.ascending, ob.nulls_first))
+                                        .collect();
+                                let compare = move |a: &Row, b: &Row| {
+                                    Self::compare_rows_with_indices(a, b, &order)
+                                };
+                                let mut top = super::result::TopN::new(compare, limit, offset);
+                                // A row the top-N does not keep lends its storage
+                                let mut spare: Vec<Value> = Vec::new();
+                                for (at, (_, row)) in final_rows.iter().enumerate() {
+                                    let exec = super::aggregation::slot_context(row, ctx);
+                                    let mut keys = std::mem::take(&mut spare);
+                                    keys.clear();
+                                    for p in programs {
+                                        keys.push(vm.execute(p, &exec).ok()?);
+                                    }
+                                    keys.push(Value::Integer(at as i64));
+                                    let keyed = Row::from_values(keys);
+                                    if !top.admits(&keyed) {
+                                        spare = keyed.into_values();
+                                    } else if let Some(dropped) = top.push(keyed) {
+                                        spare = dropped.into_values();
+                                    }
+                                }
+                                let place = |keyed: &Row| match keyed.get(programs.len()) {
+                                    Some(Value::Integer(at)) => Some(*at as usize),
+                                    _ => None,
+                                };
+                                return top.into_rows().iter().map(place).collect();
+                            }
                             let mut sort_keys: Vec<Vec<Value>> =
                                 Vec::with_capacity(final_rows.len());
                             for (_, row) in final_rows.iter() {
@@ -5064,25 +5103,7 @@ impl Executor {
                                 }
                                 sort_keys.push(keys);
                             }
-                            Some(sort_keys)
-                        };
-                        let sort_keys = match &prepared {
-                            Some(prepared) => prepared.programs(
-                                |held| {
-                                    matches!(held, JoinProgramKey::OrderKeys { columns }
-                                        if *columns == all_columns)
-                                },
-                                || JoinProgramKey::OrderKeys {
-                                    columns: all_columns.clone(),
-                                },
-                                compile,
-                                keys_of,
-                            ),
-                            None => compile().map(|programs| keys_of(&programs)),
-                        };
-                        if let Ok(Some(sort_keys)) = sort_keys {
-                            // Sort by indices with the shared NULL-aware
-                            // comparator (the standard path's semantics)
+                            // The shared NULL-aware comparator, the standard path's
                             let mut indices: Vec<usize> = (0..final_rows.len()).collect();
                             indices.sort_unstable_by(|&a, &b| {
                                 Self::compare_by_sort_keys_impl(
@@ -5092,25 +5113,34 @@ impl Executor {
                                     stmt.order_by.len(),
                                 )
                             });
-
-                            // Apply LIMIT/OFFSET while reordering: with a
-                            // limit only the needed rows move; otherwise the
-                            // permutation happens in place instead of
-                            // deep-cloning every joined row
-                            let counts = row_counts(stmt, ctx)?;
-                            let offset = counts.offset;
-                            let limit = counts.limit.unwrap_or(usize::MAX);
-
+                            Some(indices)
+                        };
+                        let ordered = match &prepared {
+                            Some(prepared) => prepared.programs(
+                                |held| {
+                                    matches!(held, JoinProgramKey::OrderKeys { columns }
+                                        if *columns == all_columns)
+                                },
+                                || JoinProgramKey::OrderKeys {
+                                    columns: all_columns.clone(),
+                                },
+                                compile,
+                                order_of,
+                            ),
+                            None => compile().map(|programs| order_of(&programs)),
+                        };
+                        if let Ok(Some(indices)) = ordered {
                             // Sorted here, and LIMIT/OFFSET applied below, so
                             // the standard path must not apply OFFSET again
                             order_limit_applied = true;
 
-                            if offset > 0 || limit != usize::MAX {
+                            // The top-N's rows move; without a limit the whole
+                            // order is applied in place instead of deep-cloning
+                            // every joined row
+                            if bounded {
                                 OrderLimitPath::JoinIndexSort.taken();
                                 final_rows = indices
                                     .into_iter()
-                                    .skip(offset)
-                                    .take(limit)
                                     .map(|i| {
                                         (final_rows[i].0, std::mem::take(&mut final_rows[i].1))
                                     })
