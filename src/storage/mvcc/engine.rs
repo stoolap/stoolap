@@ -54,8 +54,13 @@ const ALTER_MODIFY_COLUMN: u8 = 4;
 /// The operation byte of an ALTER TABLE ... RENAME TO record
 const ALTER_RENAME_TABLE: u8 = 5;
 
-/// The operation byte of an ALTER TABLE ... AUTO_INCREMENT record
+/// The operation byte of an ALTER TABLE ... AUTO_INCREMENT record that
+/// raises the counter, holding the next id
 const ALTER_AUTO_INCREMENT: u8 = 7;
+
+/// The operation byte of an ALTER TABLE ... AUTO_INCREMENT record that
+/// lowers the counter, holding the counter it set
+const ALTER_AUTO_INCREMENT_SET: u8 = 8;
 
 /// The new name a RENAME TO record gives its table: the record holds the
 /// operation byte, then the old name and the new one, each after its length
@@ -205,6 +210,17 @@ impl RecheckKeys {
         }
         Ok(())
     }
+}
+
+/// The largest row id any volume of `mgr` holds, its deleted rows included
+fn max_volume_row_id(mgr: &crate::storage::volume::manifest::SegmentManager) -> Result<i64> {
+    let mut max = 0;
+    for vol in mgr.get_segments_ordered_meta() {
+        if let Some(&last_id) = vol.row_ids()?.iter().max() {
+            max = max.max(last_id);
+        }
+    }
+    Ok(max)
 }
 
 /// The name of the unique index of `store` over the columns at `positions`
@@ -3630,16 +3646,22 @@ impl MVCCEngine {
                 }
                 self.set_cluster_key(&table_name, key)?;
             }
-            ALTER_AUTO_INCREMENT => {
-                let next = data
+            ALTER_AUTO_INCREMENT | ALTER_AUTO_INCREMENT_SET => {
+                let value = data
                     .get(pos..pos + 8)
                     .and_then(|bytes| bytes.try_into().ok())
                     .map(i64::from_le_bytes)
                     .ok_or_else(|| {
                         Error::internal("invalid ALTER TABLE data: missing AUTO_INCREMENT value")
                     })?;
-                self.get_version_store(&table_name)?
-                    .set_auto_increment_counter(next.saturating_sub(1));
+                let store = self.get_version_store(&table_name)?;
+                if op_type == ALTER_AUTO_INCREMENT {
+                    store.set_auto_increment_counter(value.saturating_sub(1));
+                } else {
+                    // No transaction is open in replay to hold a row back
+                    let largest = self.largest_row_id(&table_name, &store)?;
+                    store.store_auto_increment_counter(value.max(largest));
+                }
             }
             _ => {
                 return Err(Error::internal(format!(
@@ -4768,11 +4790,7 @@ impl MVCCEngine {
         };
 
         for (_, mgr, max_vol_row_id) in &mut segment_data {
-            for vol in mgr.get_segments_ordered_meta() {
-                if let Some(&last_id) = vol.row_ids()?.iter().max() {
-                    *max_vol_row_id = (*max_vol_row_id).max(last_id);
-                }
-            }
+            *max_vol_row_id = max_volume_row_id(mgr)?;
         }
 
         let stores = self.version_stores.read().unwrap();
@@ -5204,21 +5222,64 @@ impl MVCCEngine {
         self.get_version_store(table_name)?.add_column(column)
     }
 
-    /// Raise `table_name`'s id counter so its next generated id is `next`;
-    /// an error when an id at or past `next` was already handed out
-    pub fn raise_auto_increment(&self, table_name: &str, next: i64) -> Result<()> {
+    /// Sets `table_name`'s id counter so its next generated id is `next`,
+    /// or the one after the largest id a row holds when that is higher.
+    /// Lowering is refused while a transaction holds rows of the table it
+    /// has not committed. The change is logged before an insert can take an
+    /// id under it
+    pub fn set_auto_increment(&self, table_name: &str, next: i64) -> Result<()> {
         let store = self.get_version_store(table_name)?;
-        let handed_out = store.get_auto_increment_counter();
-        if handed_out >= next {
-            return Err(Error::invalid_argument(format!(
-                "AUTO_INCREMENT of table '{}' cannot go below {}: id {} was already handed out",
-                table_name,
-                handed_out.saturating_add(1),
-                handed_out
-            )));
+        let wanted = next.saturating_sub(1);
+        if store.get_auto_increment_counter() <= wanted {
+            store.set_auto_increment_counter(wanted);
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::auto_increment_logging();
+            return self.record_alter_table_auto_increment(table_name, next);
         }
-        store.set_auto_increment_counter(next - 1);
-        Ok(())
+        store
+            .with_inserters_closed(|| {
+                let counter = wanted.max(self.largest_row_id(table_name, &store)?);
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::auto_increment_logging();
+                self.record_auto_increment_set(table_name, counter)?;
+                store.store_auto_increment_counter(counter);
+                Ok(())
+            })
+            .unwrap_or_else(|| {
+                Err(Error::invalid_argument(format!(
+                    "AUTO_INCREMENT of table '{}' cannot be lowered while a transaction holds uncommitted rows of it",
+                    table_name
+                )))
+            })
+    }
+
+    /// The largest id a row of `table_name` holds, hot or in a volume; a
+    /// deletion not yet committed keeps its row
+    fn largest_row_id(&self, table_name: &str, store: &VersionStore) -> Result<i64> {
+        // Hot first: a seal publishes its volume before the rows leave
+        let hot = store.max_live_row_id(|txn_id| self.registry.is_open(txn_id));
+        let mgr = self
+            .segment_managers
+            .read()
+            .map_err(|_| Error::internal("segment managers lock poisoned"))?
+            .get(to_lowercase_cow(table_name).as_ref())
+            .cloned();
+        let cold = match mgr {
+            Some(mgr) => max_volume_row_id(&mgr)?,
+            None => 0,
+        };
+        Ok(hot.max(cold))
+    }
+
+    /// Logs a lowering of `table_name`'s id counter to `counter`
+    fn record_auto_increment_set(&self, table_name: &str, counter: i64) -> Result<()> {
+        // Serialize: operation_type(1) + table_name_len(2) + table_name + counter(8)
+        let mut data = Vec::with_capacity(11 + table_name.len());
+        data.push(ALTER_AUTO_INCREMENT_SET);
+        data.extend_from_slice(&(table_name.len() as u16).to_le_bytes());
+        data.extend_from_slice(table_name.as_bytes());
+        data.extend_from_slice(&counter.to_le_bytes());
+        self.record_ddl(table_name, WALOperationType::AlterTable, &data)
     }
 
     /// Order a table's sealed rows by `key` from the next seal on; the
@@ -10205,8 +10266,13 @@ impl EngineOperations {
     /// the transaction's end go now, once its statements are done
     fn discard_stores(tables: &[TxnTableEntry]) {
         for (_, txn_store) in tables {
-            // A published or read-only store is empty: its drop lets it go
-            if txn_store.read().map_or(true, |store| store.holds_writes()) {
+            // A published or read-only store is empty: its drop lets it go,
+            // but its count among the inserters goes now
+            let holds = txn_store.read().map_or(true, |store| {
+                store.stop_inserting();
+                store.holds_writes()
+            });
+            if holds {
                 txn_store.write_store().discard();
             }
         }

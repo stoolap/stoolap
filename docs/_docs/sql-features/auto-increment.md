@@ -57,18 +57,18 @@ INSERT INTO products (id, name, price) VALUES (50, 'D', 40);   -- id = 50 (expli
 INSERT INTO products (name, price) VALUES ('E', 50);            -- id = 102 (not 51)
 ```
 
-The counter never regresses. It generates one past the highest id the table has held, deleted rows included.
+On its own the counter never regresses. It generates one past the highest id the table has held, deleted rows included. Only `ALTER TABLE ... AUTO_INCREMENT` lowers it.
 
 ## Setting the Next Value
 
-`ALTER TABLE ... AUTO_INCREMENT` raises the counter so the next generated id is the given value:
+`ALTER TABLE ... AUTO_INCREMENT` sets the counter so the next generated id is the given value:
 
 ```sql
 ALTER TABLE products AUTO_INCREMENT = 1000;
 INSERT INTO products (name, price) VALUES ('F', 60);            -- id = 1000
 ```
 
-A value at or below an id the table has already handed out returns an error. See [ALTER TABLE]({{ '/docs/sql-features/alter-table/' | relative_url }}).
+A value at or below the largest id a row holds gives one past that row instead, which lowers the counter after deletes and rolled-back inserts. See [ALTER TABLE]({{ '/docs/sql-features/alter-table/' | relative_url }}).
 
 ## Constraints
 

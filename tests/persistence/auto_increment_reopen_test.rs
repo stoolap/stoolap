@@ -167,6 +167,159 @@ fn test_alter_auto_increment_survives_a_crash_through_the_log() {
 }
 
 #[test]
+fn test_lowered_auto_increment_survives_a_reopen() {
+    #[cfg(feature = "test-failpoints")]
+    let _guard = stoolap::test_failpoints::FailpointGuard::new();
+    for params in ["", "?checkpoint_on_close=off"] {
+        let (_dir, db) = reopened_after(
+            &[
+                "INSERT INTO t (v) VALUES ('a')",
+                "INSERT INTO t (id, v) VALUES (500, 'b')",
+                "DELETE FROM t WHERE id = 500",
+                "ALTER TABLE t AUTO_INCREMENT = 10",
+            ],
+            params,
+        );
+        assert_eq!(next_id_after_insert(&db, "t"), 10, "with {params:?}");
+    }
+}
+
+#[test]
+fn test_lowering_stops_past_a_sealed_deleted_row() {
+    #[cfg(feature = "test-failpoints")]
+    let _guard = stoolap::test_failpoints::FailpointGuard::new();
+    let (_dir, db) = reopened_after(
+        &[
+            "INSERT INTO t (v) VALUES ('a')",
+            "INSERT INTO t (id, v) VALUES (500, 'b')",
+            "PRAGMA CHECKPOINT",
+            "DELETE FROM t WHERE id = 500",
+            "ALTER TABLE t AUTO_INCREMENT = 10",
+        ],
+        "",
+    );
+    assert_eq!(
+        next_id_after_insert(&db, "t"),
+        501,
+        "a volume holds a deleted row's id until compaction drops it"
+    );
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_lowering_beside_a_deletion_keeps_its_id_through_the_log() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let _guard = stoolap::test_failpoints::FailpointGuard::new();
+    let dir = tempdir().unwrap();
+    let dsn = format!(
+        "file://{}?checkpoint_on_close=off",
+        dir.path().join("db").display()
+    );
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTO_INCREMENT, v TEXT)",
+            (),
+        )
+        .unwrap();
+        db.execute("INSERT INTO t (id, v) VALUES (100, 'a')", ())
+            .unwrap();
+        let other = db.clone();
+        let lowered = Rc::new(RefCell::new(None));
+        let slot = Rc::clone(&lowered);
+        stoolap::test_failpoints::before_commit_visible(move || {
+            let result = other.execute("ALTER TABLE t AUTO_INCREMENT = 50", ());
+            *slot.borrow_mut() = Some(result.map(|_| ()).map_err(|e| e.to_string()));
+        });
+        db.execute("DELETE FROM t WHERE id = 100", ()).unwrap();
+        assert_eq!(lowered.take(), Some(Ok(())));
+        db.close().unwrap();
+    }
+    let db = Database::open(&dsn).unwrap();
+    assert_eq!(
+        next_id_after_insert(&db, "t"),
+        101,
+        "the id the ALTER set, not one the replayed deletion frees"
+    );
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_lowering_to_an_exhausted_counter_survives_the_log() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let _guard = stoolap::test_failpoints::FailpointGuard::new();
+    let dir = tempdir().unwrap();
+    let dsn = format!(
+        "file://{}?checkpoint_on_close=off",
+        dir.path().join("db").display()
+    );
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTO_INCREMENT, v TEXT)",
+            (),
+        )
+        .unwrap();
+        db.execute(
+            &format!("INSERT INTO t (id, v) VALUES ({}, 'a')", i64::MAX),
+            (),
+        )
+        .unwrap();
+        let other = db.clone();
+        let lowered = Rc::new(RefCell::new(None));
+        let slot = Rc::clone(&lowered);
+        stoolap::test_failpoints::before_commit_visible(move || {
+            let result = other.execute("ALTER TABLE t AUTO_INCREMENT = 50", ());
+            *slot.borrow_mut() = Some(result.map(|_| ()).map_err(|e| e.to_string()));
+        });
+        db.execute(&format!("DELETE FROM t WHERE id = {}", i64::MAX), ())
+            .unwrap();
+        assert_eq!(lowered.take(), Some(Ok(())));
+        db.close().unwrap();
+    }
+    let db = Database::open(&dsn).unwrap();
+    let error = db
+        .execute("INSERT INTO t (v) VALUES ('new')", ())
+        .expect_err("the counter the ALTER kept is exhausted");
+    assert!(error.to_string().contains("exhausted"), "{error}");
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_raised_auto_increment_keeps_an_id_taken_before_it_was_logged() {
+    let _guard = stoolap::test_failpoints::FailpointGuard::new();
+    let dir = tempdir().unwrap();
+    let dsn = format!(
+        "file://{}?checkpoint_on_close=off",
+        dir.path().join("db").display()
+    );
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTO_INCREMENT, v TEXT)",
+            (),
+        )
+        .unwrap();
+        let other = db.clone();
+        stoolap::test_failpoints::before_auto_increment_logged(move || {
+            other.execute("INSERT INTO t (v) VALUES ('a')", ()).unwrap();
+            other.execute("DELETE FROM t WHERE v = 'a'", ()).unwrap();
+        });
+        db.execute("ALTER TABLE t AUTO_INCREMENT = 1000", ())
+            .unwrap();
+        db.close().unwrap();
+    }
+    let db = Database::open(&dsn).unwrap();
+    assert_eq!(
+        next_id_after_insert(&db, "t"),
+        1001,
+        "a raise does not take back an id handed out before its record"
+    );
+}
+
+#[test]
 fn test_truncate_after_alter_auto_increment_restarts_ids() {
     #[cfg(feature = "test-failpoints")]
     let _guard = stoolap::test_failpoints::FailpointGuard::new();

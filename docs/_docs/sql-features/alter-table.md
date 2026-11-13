@@ -88,7 +88,15 @@ INSERT INTO orders (item) VALUES ('first');   -- id = 1000
 
 The `=` is optional, and `AUTOINCREMENT` is accepted as well. The value is a positive integer.
 
-The counter only moves up. A value at or below an id the table has already handed out returns an error and leaves the counter as it was; that includes ids of deleted rows, explicitly inserted ids and ids a rolled-back insert took. A table without an `AUTO_INCREMENT` column returns an error.
+A value at or below the largest id a row of the table holds sets the next id to one past that row, so the counter can go down to reuse ids of deleted rows and ids a rolled-back insert took:
+
+```sql
+DELETE FROM orders WHERE id >= 1000;
+ALTER TABLE orders AUTO_INCREMENT = 1;
+INSERT INTO orders (item) VALUES ('next');    -- id = largest remaining id + 1
+```
+
+A row whose deletion has not committed yet still counts, and so does a deleted row already moved to cold storage, until compaction drops it. Lowering the counter returns an error while another transaction, or the current one, holds inserted rows of the table it has not committed; raising it does not. A table without an `AUTO_INCREMENT` column returns an error.
 
 The change takes effect at once and a ROLLBACK of an open transaction does not undo it. It survives a reopen and a crash. TRUNCATE TABLE starts the ids at 1 again.
 
