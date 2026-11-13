@@ -1927,6 +1927,10 @@ impl Executor {
         let Some(having) = stmt.having.as_deref() else {
             return Ok(rows);
         };
+        // Each group asks the HAVING's blocks
+        if let Some(blocks) = blocks {
+            blocks.rows_asking(rows.len());
+        }
         // HAVING reads every group item and aggregate from its slot
         let slots = aggregate_slot_keys(group_by_columns, aggregations, &stmt.columns);
         let tmp_result = Box::new(ExecutorResult::new(columns.to_vec(), rows));
@@ -1988,6 +1992,10 @@ impl Executor {
             blocks,
             alone,
         } = slots;
+        // Each group HAVING kept asks the blocks of the items and sort keys
+        if let Some(blocks) = blocks {
+            blocks.rows_asking(having_rows.len());
+        }
         // An ORDER BY key computed over the groups is projected with the items
         let keyed = self.with_order_by_items(stmt);
         let lifted = !std::ptr::eq(stmt, written_stmt);

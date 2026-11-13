@@ -415,6 +415,10 @@ fn missing_parameter(index: usize, provided: usize) -> Error {
 /// whose row or pair of rows a correlated block reads; a `None` answer is
 /// UNKNOWN, and an error is the statement's error
 pub trait SubqueryExecutor {
+    /// Tells the blocks how many rows will ask them, before the first does:
+    /// a grouped statement's groups, known only once it has aggregated
+    fn rows_asking(&self, _rows: usize) {}
+
     /// The scalar block's value
     fn execute_scalar(&self, subquery_index: u16, ctx: &ExecuteContext) -> Result<Value>;
 
