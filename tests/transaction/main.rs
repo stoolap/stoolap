@@ -32,6 +32,7 @@ mod dirty_read_test;
 mod failed_commit_table_test;
 mod isolation_level_test;
 mod join_sees_own_updates_test;
+mod local_key_reads_test;
 mod mvcc_isolation_sql_test;
 mod noview_commit_window_test;
 mod reinsert_deleted_key_in_transaction_test;

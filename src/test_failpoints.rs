@@ -897,6 +897,17 @@ thread_local! {
     static WHERE_PUSHDOWNS_CONVERTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static HOT_INDEX_IDS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static COLD_UPDATE_ROWS_WALKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LOCAL_ROWS_ADDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The transaction's own rows indexed reads on this thread added to what
+/// the committed indexes gave
+pub fn local_rows_added() -> usize {
+    LOCAL_ROWS_ADDED.with(std::cell::Cell::get)
+}
+
+pub(crate) fn local_rows_add(n: usize) {
+    LOCAL_ROWS_ADDED.with(|c| c.set(c.get() + n));
 }
 
 /// Prepared WHEREs whose scan filter was converted from the AST on this thread

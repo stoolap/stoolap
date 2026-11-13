@@ -7436,7 +7436,21 @@ pub struct TransactionVersionStore {
     tracking: Option<Box<KeyTracking>>,
     /// Whether the parent store counts this transaction among its inserters
     inserting: AtomicBool,
+    /// The rows by the keys indexed reads asked for, once they hold enough
+    local_indexes: Mutex<Option<Box<LocalIndexes>>>,
 }
+
+/// The transaction's rows by the keys of the columns its indexed reads
+/// asked for, each set built at the first such read
+#[derive(Default)]
+struct LocalIndexes {
+    by_columns: LocalKeys,
+    /// The rows written since the keys were last brought up to date
+    dirty: crate::common::I64Set,
+}
+
+/// The fewest rows a transaction keeps keys for; fewer are scanned
+const LOCAL_KEYS_FROM: usize = 64;
 
 /// What a transaction that judges its unique keys as it writes them keeps
 #[derive(Default)]
@@ -7696,7 +7710,66 @@ impl TransactionVersionStore {
             writing: None,
             tracking: None,
             inserting: AtomicBool::new(false),
+            local_indexes: Mutex::new(None),
         }
+    }
+
+    /// Marks `row_id` written, for keys built before the write
+    #[inline]
+    fn local_written(&mut self, row_id: i64) {
+        if let Some(indexes) = self.local_indexes.get_mut().as_deref_mut() {
+            indexes.dirty.insert(row_id);
+        }
+    }
+
+    /// The transaction's rows whose newest version holds `key` in
+    /// `columns`, perhaps with others a caller's filter drops; None while it
+    /// holds too few rows to keep keys for, or holds a row written under
+    /// another layout than the reader's `layout`. A NULL in `key` matches no
+    /// row
+    pub(crate) fn local_rows_keyed(
+        &self,
+        layout: u64,
+        columns: &[i32],
+        key: &[&Value],
+    ) -> Option<Vec<i64>> {
+        let local = self.local_versions.as_ref()?;
+        if local.len() < LOCAL_KEYS_FROM || self.bound.iter().any(|(held, _)| *held != layout) {
+            return None;
+        }
+        if key.iter().any(|value| value.is_null()) {
+            return Some(Vec::new());
+        }
+        let newest_hash = |row_id: i64, columns: &[i32]| {
+            (local.get(row_id))
+                .and_then(|versions| versions.last())
+                .filter(|version| !version.is_deleted())
+                .and_then(|version| row_key_hash(&version.data, columns))
+        };
+        let mut held = self.local_indexes.lock();
+        let indexes = held.get_or_insert_with(Box::default);
+        let dirty = std::mem::take(&mut indexes.dirty);
+        for (held_columns, keys) in &mut indexes.by_columns {
+            for row_id in dirty.iter() {
+                keys.set(row_id, newest_hash(row_id, held_columns));
+            }
+        }
+        if !indexes
+            .by_columns
+            .iter()
+            .any(|(held, _)| held.as_slice() == columns)
+        {
+            let keys = key_rows(&mut indexes.by_columns, columns);
+            for (row_id, _) in local.iter() {
+                keys.set(row_id, newest_hash(row_id, columns));
+            }
+        }
+        let keys = key_rows(&mut indexes.by_columns, columns);
+        Some(
+            keys.by_hash
+                .get(&key_hash(key.iter().copied()))
+                .map_or_else(Vec::new, |rows| rows.to_vec()),
+        )
     }
 
     /// Counts this transaction among the parent store's inserters, once,
@@ -8215,6 +8288,7 @@ impl TransactionVersionStore {
     }
 
     pub fn put(&mut self, row_id: i64, data: Row, is_delete: bool) -> Result<(), Error> {
+        self.local_written(row_id);
         // Convert to Shared (Arc) storage immediately for efficient Arc sharing:
         // - get_arc() will return cheap Arc clones (no value cloning)
         // - into_arc() at commit time returns the existing Arc (no clone)
@@ -8320,6 +8394,7 @@ impl TransactionVersionStore {
         original_version: RowVersion,
         is_delete: bool,
     ) -> Result<(), Error> {
+        self.local_written(row_id);
         // Convert to Shared (Arc) storage immediately for efficient Arc sharing
         let data = Row::from_arc(data.into_arc());
 
@@ -8404,6 +8479,7 @@ impl TransactionVersionStore {
         self.note_layout(now)?;
 
         for (row_id, data, original_version) in rows {
+            self.local_written(row_id);
             // Convert to Shared (Arc) storage immediately for efficient Arc sharing
             let data = Row::from_arc(data.into_arc());
 
@@ -8514,6 +8590,7 @@ impl TransactionVersionStore {
             .unwrap_or(0);
         let txn_id = self.txn_id;
         for change in &mut plan.cold {
+            self.local_written(change.row_id);
             let original = RowVersion {
                 txn_id: 0,
                 deleted_at_txn_id: 0,
@@ -8542,6 +8619,7 @@ impl TransactionVersionStore {
                 .insert(change.row_id, smallvec![rv]);
         }
         for (row_id, data, read) in plan.hot.drain(..) {
+            self.local_written(row_id);
             let rv = RowVersion::new_with_timestamp(txn_id, Row::from_arc(data.into_arc()), now);
             // A version of this transaction is never a committed one
             if read.txn_id == txn_id {
@@ -8580,6 +8658,7 @@ impl TransactionVersionStore {
         self.note_layout(timestamp)?;
 
         for (row_id, data) in rows {
+            self.local_written(row_id);
             // Check if we already have a local version
             let has_local = self
                 .local_versions
@@ -8655,6 +8734,7 @@ impl TransactionVersionStore {
         self.note_layout(timestamp)?;
 
         for (row_id, data, original_version) in rows {
+            self.local_written(row_id);
             // Create deleted row version with pre-computed timestamp
             let mut rv = RowVersion::new_with_timestamp(self.txn_id, data, timestamp);
             rv.deleted_at_txn_id = self.txn_id;
@@ -9603,7 +9683,7 @@ impl TransactionVersionStore {
         // Rows given back an earlier version or none, whose keys are entered
         // again or taken out
         let mut restored: Vec<i64> = Vec::new();
-        let tracks = self.tracking.is_some();
+        let tracks = self.tracking.is_some() || self.local_indexes.get_mut().is_some();
         if let Some(local_versions) = self.local_versions.as_mut() {
             local_versions.retain(|row_id, versions| {
                 let before = versions.len();
@@ -9613,6 +9693,9 @@ impl TransactionVersionStore {
                 }
                 !versions.is_empty()
             });
+        }
+        if let Some(indexes) = self.local_indexes.get_mut().as_deref_mut() {
+            indexes.dirty.extend(restored.iter().copied());
         }
         if !restored.is_empty() {
             let indexes: UniqueIndexes = self.unique_indexes().iter().cloned().collect();
@@ -9710,6 +9793,7 @@ impl TransactionVersionStore {
     #[inline(always)]
     fn let_go(&mut self) {
         self.stop_inserting();
+        *self.local_indexes.get_mut() = None;
         // A store dropped with its commit's records still held lets them
         // go; a commit that became visible let them go already
         drop(std::mem::take(self.applied.get_mut()));

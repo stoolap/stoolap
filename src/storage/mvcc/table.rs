@@ -113,6 +113,15 @@ impl LocalRows<'_> {
         self.0.iter().flat_map(move |rows| rows.iter_local_at(cut))
     }
 
+    /// The rows whose newest version holds `key` in `columns`; None under a
+    /// cut, which reads older versions than the keys are of
+    fn keyed(&self, layout: u64, columns: &[i32], key: &[&Value]) -> Option<Vec<i64>> {
+        if self.1 != EVERY_WRITE {
+            return None;
+        }
+        self.0.as_ref()?.local_rows_keyed(layout, columns, key)
+    }
+
     fn values(&self, column: usize, out: &mut Vec<(Value, i64)>, written: &mut I64Set) {
         if let Some(rows) = &self.0 {
             rows.local_values(column, self.1, out, written);
@@ -780,17 +789,144 @@ impl MVCCTable {
     /// inserted or re-keyed. They are handed to the caller unfiltered, so the
     /// expression runs exactly once, in the caller's own per-id handling, as
     /// it does for rows the index returned.
-    fn local_ids_missing_from(&self, indexed: &[i64]) -> Vec<i64> {
+    /// An equality `plan` reads takes only the rows whose keys match it
+    fn local_ids_missing_from(
+        &self,
+        plan: &IndexPlan,
+        expr: &dyn Expression,
+        indexed: &[i64],
+    ) -> Vec<i64> {
         let txn_versions = self.local();
         if !txn_versions.has_local_changes() {
             return Vec::new();
         }
         let present: I64Set = indexed.iter().copied().collect();
-        txn_versions
-            .iter_local()
-            .filter(|(row_id, version)| !version.is_deleted() && !present.contains(*row_id))
-            .map(|(row_id, _)| row_id)
-            .collect()
+        let mut scope = SmallVec::new();
+        index_plan::conjuncts(expr, &self.cached_schema, &mut scope);
+        let ids: Vec<i64> = match self.local_keyed(&txn_versions, plan, &scope) {
+            Some(keyed) => keyed
+                .into_iter()
+                .filter(|row_id| !present.contains(*row_id))
+                .collect(),
+            None => txn_versions
+                .iter_local()
+                .filter(|(row_id, version)| !version.is_deleted() && !present.contains(*row_id))
+                .map(|(row_id, _)| row_id)
+                .collect(),
+        };
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::local_rows_add(ids.len());
+        ids
+    }
+
+    /// The transaction's rows `plan` may name for the conjuncts in `scope`,
+    /// by their keys; None when the plan is not equalities the keys answer
+    fn local_keyed(
+        &self,
+        local: &LocalRows<'_>,
+        plan: &IndexPlan,
+        scope: &[&dyn Expression],
+    ) -> Option<Vec<i64>> {
+        use crate::core::Operator;
+        let schema = &*self.cached_schema;
+        // A value of another type than the column's is compared converted,
+        // which the keys' hashes are not
+        let keyed = |column: i32, value: &Value| {
+            let held = schema.columns.get(column as usize)?.data_type;
+            let asked = value.data_type();
+            let numeric = |t: DataType| matches!(t, DataType::Integer | DataType::Float);
+            (value.is_null()
+                || asked == held
+                    && matches!(
+                        held,
+                        DataType::Integer
+                            | DataType::Float
+                            | DataType::Text
+                            | DataType::Boolean
+                            | DataType::Timestamp
+                    )
+                || numeric(asked) && numeric(held))
+            .then_some(())
+        };
+        let equal = |column: i32| {
+            let name = schema.columns.get(column as usize)?.name.as_str();
+            scope.iter().find_map(|c| match c.get_comparison_info() {
+                Some((n, Operator::Eq, value)) if eq_names(n, name) => Some(value),
+                _ => None,
+            })
+        };
+        match plan {
+            IndexPlan::Read {
+                index,
+                read: Read::Equal,
+            } => {
+                let column = *index.column_ids().first()?;
+                let value = equal(column)?;
+                keyed(column, value)?;
+                local.keyed(self.layout, &[column], &[value])
+            }
+            IndexPlan::Read {
+                index,
+                read: Read::In,
+            } => {
+                let column = *index.column_ids().first()?;
+                let name = schema.columns.get(column as usize)?.name.as_str();
+                let list = scope.iter().find_map(|c| {
+                    c.as_any()
+                        .downcast_ref::<crate::storage::expression::InListExpr>()
+                        .filter(|list| {
+                            !list.is_not()
+                                && list.get_column_name().is_some_and(|n| eq_names(n, name))
+                        })
+                })?;
+                let mut rows = Vec::new();
+                for value in list.get_values() {
+                    keyed(column, value)?;
+                    rows.extend(local.keyed(self.layout, &[column], &[value])?);
+                }
+                rows.sort_unstable();
+                rows.dedup();
+                Some(rows)
+            }
+            IndexPlan::Prefix {
+                index,
+                equal: count,
+                ranged: false,
+            } if *count == index.column_ids().len() => {
+                let columns = index.column_ids();
+                let mut values = SmallVec::<[&Value; 4]>::new();
+                for &column in columns {
+                    let value = equal(column)?;
+                    keyed(column, value)?;
+                    values.push(value);
+                }
+                local.keyed(self.layout, columns, &values)
+            }
+            // Every read narrows the rows: any one's keys hold them all
+            IndexPlan::Intersect(reads) => reads
+                .iter()
+                .find_map(|read| self.local_keyed(local, read, scope)),
+            IndexPlan::Union(reads) => scope
+                .iter()
+                .filter(|c| c.get_or_operands().is_some())
+                .find_map(|&or| {
+                    let mut operands = SmallVec::new();
+                    index_plan::disjuncts(or, schema, &mut operands);
+                    if operands.len() != reads.len() {
+                        return None;
+                    }
+                    let mut rows = Vec::new();
+                    for (read, &operand) in reads.iter().zip(&operands) {
+                        let mut scope = SmallVec::new();
+                        index_plan::conjuncts(operand, schema, &mut scope);
+                        rows.extend(self.local_keyed(local, read, &scope)?);
+                    }
+                    rows.sort_unstable();
+                    rows.dedup();
+                    Some(rows)
+                }),
+            _ => None,
+        }
     }
 
     /// Refuses a unique `index` this transaction's own rows break, against
@@ -1352,16 +1488,15 @@ impl MVCCTable {
                 if !row_ids.is_empty() {
                     return Some(row_ids);
                 }
-                // An empty probe answers "no row" only while the index carries
-                // every key this statement can see: no local writes (they join
-                // the index at commit), no snapshot older than the keys the
-                // index holds (a commit moves a key out of it while the
-                // snapshot still sees the row under the old one), and no
-                // commit taking an entry out meanwhile (it updates the index
-                // before its versions are visible). Otherwise the scan decides.
-                let settled = quiet.is_some()
-                    && self.committed_candidate_epoch() == quiet
-                    && !self.local().has_local_changes();
+                // An empty probe answers "no committed row" only while the
+                // index carries every key this statement can see: no snapshot
+                // older than the keys the index holds (a commit moves a key out
+                // of it while the snapshot still sees the row under the old
+                // one), and no commit taking an entry out meanwhile (it updates
+                // the index before its versions are visible). Otherwise the
+                // scan decides. Local writes join the index at commit: every
+                // caller adds them or declines while the transaction holds any
+                let settled = quiet.is_some() && self.committed_candidate_epoch() == quiet;
                 settled.then_some(row_ids)
             }
             Operator::Gt | Operator::Gte | Operator::Lt | Operator::Lte => {
@@ -2592,11 +2727,17 @@ impl MVCCTable {
 
             // The rows the indexes give, unless they cannot answer for the read
             let indexed = match &access {
-                WriteAccess::Index(index) => self.read_indexes(index, expr),
+                WriteAccess::Index(index) => {
+                    self.read_indexes(index, expr).map(|ids| (ids, *index))
+                }
                 _ => None,
             };
-            if let Some(mut filtered_row_ids) = indexed {
-                filtered_row_ids.extend(self.local_ids_missing_from(&filtered_row_ids));
+            if let Some((mut filtered_row_ids, index)) = indexed {
+                filtered_row_ids.extend(self.local_ids_missing_from(
+                    index,
+                    expr,
+                    &filtered_row_ids,
+                ));
                 plan.hot.reserve_exact(filtered_row_ids.len());
                 let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(filtered_row_ids.len());
                 {
@@ -2898,7 +3039,7 @@ impl MVCCTable {
             return Ok(None);
         };
         if !plan.names_keys() {
-            row_ids.extend(self.local_ids_missing_from(&row_ids));
+            row_ids.extend(self.local_ids_missing_from(plan, filter, &row_ids));
         }
         self.fetch_rows_by_ids(&row_ids, filter).map(Some)
     }
@@ -3452,11 +3593,17 @@ impl Table for MVCCTable {
 
             // The rows the indexes give, unless they cannot answer for the read
             let indexed = match &access {
-                WriteAccess::Index(index) => self.read_indexes(index, expr),
+                WriteAccess::Index(index) => {
+                    self.read_indexes(index, expr).map(|ids| (ids, *index))
+                }
                 _ => None,
             };
-            if let Some(mut filtered_row_ids) = indexed {
-                filtered_row_ids.extend(self.local_ids_missing_from(&filtered_row_ids));
+            if let Some((mut filtered_row_ids, index)) = indexed {
+                filtered_row_ids.extend(self.local_ids_missing_from(
+                    index,
+                    expr,
+                    &filtered_row_ids,
+                ));
                 // OPTIMIZATION: Batch collect rows to delete, then batch put
                 // This reduces lock contention from 2N locks to 2 locks for N rows
                 let mut rows_to_delete = RowVec::with_capacity(filtered_row_ids.len());
@@ -5530,10 +5677,8 @@ mod tests {
     }
 
     #[test]
-    fn a_transaction_with_local_writes_scans_for_an_absent_key() {
+    fn a_transaction_with_local_writes_finds_its_row_for_a_key_the_index_lacks() {
         let (_store, mut table) = indexed_table(100);
-        // A local row with the key the index lacks: the probe is not the
-        // whole truth, the scan finds the local row
         table
             .insert(Row::from_values(vec![
                 Value::Integer(1000),
@@ -5544,7 +5689,56 @@ mod tests {
         assert!(scanner.next());
         assert_eq!(scanner.row().get(0), Some(&Value::Integer(1000)));
         assert!(!scanner.next());
-        assert_eq!(table.full_scans(), 1);
+        assert_eq!(
+            table.full_scans(),
+            0,
+            "the empty probe and the local rows answer without a scan"
+        );
+    }
+
+    /// The rows of `table` holding 1 in the column `x` added after the
+    /// transaction wrote 64 rows, read by key once before when `read_first`
+    fn rows_with_an_added_default(read_first: bool) -> usize {
+        let (_store, mut table) = indexed_table(0);
+        for i in 1..=64 {
+            table
+                .insert(Row::from_values(vec![
+                    Value::Integer(i),
+                    Value::Integer(i * 10),
+                ]))
+                .unwrap();
+        }
+        if read_first {
+            assert!(decided_scan(&table, &equals(&table, 10)).next());
+        }
+        table
+            .create_column_with_default_value(
+                "x",
+                DataType::Integer,
+                true,
+                Some("1".to_string()),
+                Some(Value::Integer(1)),
+            )
+            .unwrap();
+        table.create_index("idx_x", &["x"], false).unwrap();
+        let mut expr = crate::storage::expression::ComparisonExpr::new(
+            "x",
+            crate::core::Operator::Eq,
+            Value::Integer(1),
+        );
+        expr.prepare_for_schema(table.schema());
+        let mut scanner = decided_scan(&table, &expr);
+        let mut found = 0;
+        while scanner.next() {
+            found += 1;
+        }
+        found
+    }
+
+    #[test]
+    fn a_read_by_key_finds_rows_written_before_a_column_was_added() {
+        assert_eq!(rows_with_an_added_default(false), 64);
+        assert_eq!(rows_with_an_added_default(true), 64, "keys read before");
     }
 
     #[test]
