@@ -2232,10 +2232,22 @@ impl VersionStore {
             }
             live
         };
-        deleted
-            .into_iter()
-            .find(|&(_, txn_id)| open(txn_id))
-            .map_or(live, |(row_id, _)| row_id.max(live))
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::live_rows_read();
+        let open_at = deleted.iter().position(|&(_, txn_id)| open(txn_id));
+        // A deletion seen ended may have been taken back since: its commit
+        // puts the row back before the transaction ends
+        let versions = self.versions.read();
+        let restored = deleted[..open_at.unwrap_or(deleted.len())]
+            .iter()
+            .find(|&&(row_id, _)| {
+                versions
+                    .get(row_id)
+                    .is_some_and(|entry| !entry.version.is_deleted())
+            });
+        restored
+            .or(open_at.map(|at| &deleted[at]))
+            .map_or(live, |&(row_id, _)| row_id.max(live))
     }
 
     /// Returns the current auto-increment value without incrementing
@@ -7699,7 +7711,7 @@ impl TransactionVersionStore {
 
     /// Lets go of the count `note_inserting` took, once the rows are
     /// published or gone
-    fn stop_inserting(&self) {
+    pub(crate) fn stop_inserting(&self) {
         if self.inserting.swap(false, Ordering::AcqRel) {
             self.parent_store.leave_inserter();
         }

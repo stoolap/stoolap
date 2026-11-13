@@ -237,6 +237,96 @@ fn test_alter_auto_increment_lowering_keeps_a_row_whose_deletion_commits() {
     );
 }
 
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_alter_auto_increment_lowering_beside_a_failing_deletion_keeps_its_row() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::mpsc::channel;
+    use stoolap::test_failpoints::{on_commit_fence, on_live_rows_read};
+    let db = open("alter_ai_failing_delete");
+    db.execute(
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER UNIQUE)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO u VALUES (1, 1)", ()).unwrap();
+    db.execute("INSERT INTO t (id, v) VALUES (100, 'a')", ())
+        .unwrap();
+    let (ready, on_ready) = channel();
+    let (go, on_go) = channel::<()>();
+    let (published, on_published) = channel();
+    let (fail, on_fail) = channel::<()>();
+    let other = db.clone();
+    let thread = std::thread::spawn(move || {
+        let mut txn = other.begin().unwrap();
+        txn.execute("DELETE FROM t WHERE id = 100", ()).unwrap();
+        txn.execute("UPDATE u SET k = 2 WHERE id = 1", ()).unwrap();
+        ready.send(()).unwrap();
+        on_go.recv().unwrap();
+        // Before u's commit, the second table: t's deletion is published
+        let mut fences = 0;
+        on_commit_fence(move || {
+            fences += 1;
+            if fences == 2 {
+                published.send(()).unwrap();
+                on_fail.recv().unwrap();
+            }
+        });
+        txn.commit().is_err()
+    });
+    on_ready.recv().unwrap();
+    db.execute("INSERT INTO u VALUES (2, 2)", ()).unwrap();
+    go.send(()).unwrap();
+    on_published.recv().unwrap();
+    let failed = Rc::new(RefCell::new(None));
+    let slot = Rc::clone(&failed);
+    on_live_rows_read(move || {
+        fail.send(()).unwrap();
+        *slot.borrow_mut() = Some(thread.join().unwrap());
+    });
+    db.execute("ALTER TABLE t AUTO_INCREMENT = 100", ())
+        .unwrap();
+    assert_eq!(failed.take(), Some(true), "the commit failed on u's key");
+    assert_eq!(
+        insert(&db, "b"),
+        101,
+        "the row the failed commit put back keeps its id"
+    );
+}
+
+#[test]
+fn test_alter_auto_increment_lowering_beside_a_kept_handle_whose_insert_failed() {
+    use stoolap::core::{Row, Value};
+    use stoolap::storage::traits::Engine;
+    for end in ["rollback", "commit"] {
+        let db = Database::open(&format!("memory://alter_ai_kept_handle_{end}")).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTO_INCREMENT, v TEXT NOT NULL)",
+            (),
+        )
+        .unwrap();
+        db.execute("INSERT INTO t (id, v) VALUES (100, 'a')", ())
+            .unwrap();
+        db.execute("DELETE FROM t WHERE id = 100", ()).unwrap();
+        let mut txn = db.engine().begin_transaction().unwrap();
+        let mut table = txn.get_table("t").unwrap();
+        assert!(table
+            .insert(Row::from(vec![
+                Value::null_unknown(),
+                Value::null_unknown()
+            ]))
+            .is_err());
+        match end {
+            "rollback" => txn.rollback().unwrap(),
+            _ => txn.commit().unwrap(),
+        }
+        db.execute("ALTER TABLE t AUTO_INCREMENT = 50", ())
+            .unwrap_or_else(|e| panic!("after the {end}: {e}"));
+        drop(table);
+    }
+}
+
 #[test]
 fn test_alter_auto_increment_is_not_undone_by_a_rollback() {
     let db = open("alter_ai_rollback");

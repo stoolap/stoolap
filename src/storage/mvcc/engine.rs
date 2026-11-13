@@ -5215,16 +5215,19 @@ impl MVCCEngine {
     /// Sets `table_name`'s id counter so its next generated id is `next`,
     /// or the one after the largest id a row holds when that is higher.
     /// Lowering is refused while a transaction holds rows of the table it
-    /// has not committed
-    pub fn set_auto_increment(&self, table_name: &str, next: i64) -> Result<()> {
+    /// has not committed. Returns the next id it set, the one to log
+    pub fn set_auto_increment(&self, table_name: &str, next: i64) -> Result<i64> {
         let store = self.get_version_store(table_name)?;
         let wanted = next.saturating_sub(1);
         if store.get_auto_increment_counter() <= wanted {
             store.set_auto_increment_counter(wanted);
-            return Ok(());
+            return Ok(next);
         }
         store
-            .with_inserters_closed(|| self.lower_auto_increment(table_name, &store, wanted))
+            .with_inserters_closed(|| {
+                let counter = self.lower_auto_increment(table_name, &store, wanted)?;
+                Ok(counter.saturating_add(1))
+            })
             .unwrap_or_else(|| {
                 Err(Error::invalid_argument(format!(
                     "AUTO_INCREMENT of table '{}' cannot be lowered while a transaction holds uncommitted rows of it",
@@ -5235,13 +5238,13 @@ impl MVCCEngine {
 
     /// Sets the id counter of `store` to `wanted`, or to the largest id a
     /// row holds, hot or in a volume, when that is higher; a deletion not
-    /// yet committed keeps its row
+    /// yet committed keeps its row. Returns the counter set
     fn lower_auto_increment(
         &self,
         table_name: &str,
         store: &VersionStore,
         wanted: i64,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         // Hot first: a seal publishes its volume before the rows leave
         let hot = store.max_live_row_id(|txn_id| self.registry.is_open(txn_id));
         let mgr = self
@@ -5254,8 +5257,9 @@ impl MVCCEngine {
             Some(mgr) => max_volume_row_id(&mgr)?,
             None => 0,
         };
-        store.store_auto_increment_counter(wanted.max(hot).max(cold));
-        Ok(())
+        let counter = wanted.max(hot).max(cold);
+        store.store_auto_increment_counter(counter);
+        Ok(counter)
     }
 
     /// Order a table's sealed rows by `key` from the next seal on; the
@@ -10242,8 +10246,13 @@ impl EngineOperations {
     /// the transaction's end go now, once its statements are done
     fn discard_stores(tables: &[TxnTableEntry]) {
         for (_, txn_store) in tables {
-            // A published or read-only store is empty: its drop lets it go
-            if txn_store.read().map_or(true, |store| store.holds_writes()) {
+            // A published or read-only store is empty: its drop lets it go,
+            // but its count among the inserters goes now
+            let holds = txn_store.read().map_or(true, |store| {
+                store.stop_inserting();
+                store.holds_writes()
+            });
+            if holds {
                 txn_store.write_store().discard();
             }
         }

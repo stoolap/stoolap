@@ -205,6 +205,45 @@ fn test_lowering_stops_past_a_sealed_deleted_row() {
     );
 }
 
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_lowering_beside_a_deletion_keeps_its_id_through_the_log() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let _guard = stoolap::test_failpoints::FailpointGuard::new();
+    let dir = tempdir().unwrap();
+    let dsn = format!(
+        "file://{}?checkpoint_on_close=off",
+        dir.path().join("db").display()
+    );
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTO_INCREMENT, v TEXT)",
+            (),
+        )
+        .unwrap();
+        db.execute("INSERT INTO t (id, v) VALUES (100, 'a')", ())
+            .unwrap();
+        let other = db.clone();
+        let lowered = Rc::new(RefCell::new(None));
+        let slot = Rc::clone(&lowered);
+        stoolap::test_failpoints::before_commit_visible(move || {
+            let result = other.execute("ALTER TABLE t AUTO_INCREMENT = 50", ());
+            *slot.borrow_mut() = Some(result.map(|_| ()).map_err(|e| e.to_string()));
+        });
+        db.execute("DELETE FROM t WHERE id = 100", ()).unwrap();
+        assert_eq!(lowered.take(), Some(Ok(())));
+        db.close().unwrap();
+    }
+    let db = Database::open(&dsn).unwrap();
+    assert_eq!(
+        next_id_after_insert(&db, "t"),
+        101,
+        "the id the ALTER set, not one the replayed deletion frees"
+    );
+}
+
 #[test]
 fn test_truncate_after_alter_auto_increment_restarts_ids() {
     #[cfg(feature = "test-failpoints")]

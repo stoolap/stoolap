@@ -1820,6 +1820,20 @@ pub(crate) fn inserter_waiting() {
 }
 
 thread_local! {
+    static LIVE_ROWS_READ_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next lowering of an id counter has read
+/// the newest hot rows, before it asks whether their deletions ended
+pub fn on_live_rows_read(hook: impl FnOnce() + 'static) {
+    LIVE_ROWS_READ_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn live_rows_read() {
+    run_hook(&LIVE_ROWS_READ_HOOK);
+}
+
+thread_local! {
     static PREPARED_SCALAR_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static PREPARED_PLAN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static PREPARED_EXISTS_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
