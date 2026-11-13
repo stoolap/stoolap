@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use crate::api::transaction::Transaction;
 use crate::api::{Database, ParamVec, Rows};
+use crate::common::CompactArc;
 use crate::core::{Error, Result};
 
 use super::rows::pack_all;
@@ -374,24 +375,27 @@ impl StoolapStmt {
     /// A rows handle on `rows`, with the column names this statement keeps
     /// until a DDL changes them
     fn rows_handle(&mut self, rows: Rows) -> *mut StoolapRows {
-        let actual_columns = rows.columns();
-        let column_names = match &self.cached_columns {
-            Some(cached)
-                if cached.len() == actual_columns.len()
+        let source = rows.columns_arc();
+        let column_names = match &mut self.cached_columns {
+            // The same shared names as last time need no comparing
+            Some((names, cached)) if CompactArc::ptr_eq(names, source) => Arc::clone(cached),
+            Some((names, cached))
+                if cached.len() == source.len()
                     && cached
                         .iter()
-                        .zip(actual_columns.iter())
+                        .zip(source.iter())
                         .all(|(c, a)| c.as_bytes() == a.as_str().as_bytes()) =>
             {
+                *names = CompactArc::clone(source);
                 Arc::clone(cached)
             }
             _ => {
-                let names: Vec<CString> = actual_columns
+                let names: Vec<CString> = source
                     .iter()
                     .map(|name| CString::new(name.as_str()).unwrap_or_default())
                     .collect();
                 let arc = Arc::new(names);
-                self.cached_columns = Some(Arc::clone(&arc));
+                self.cached_columns = Some((CompactArc::clone(source), Arc::clone(&arc)));
                 arc
             }
         };

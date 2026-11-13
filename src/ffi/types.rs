@@ -80,14 +80,18 @@ pub struct StoolapDB {
     pub(crate) packed: Vec<u8>,
 }
 
+/// A result's shared column names, and the CStrings built from them
+pub(crate) type CachedColumns = (CompactArc<Vec<String>>, Arc<Vec<CString>>);
+
 /// Opaque handle wrapping a [`Statement`].
 pub struct StoolapStmt {
     pub(crate) stmt: Statement,
     pub(crate) last_error: Option<CString>,
     /// Pre-computed CString for `stoolap_stmt_sql()`.
     pub(crate) sql_cstr: CString,
-    /// Cached column name CStrings (computed on first query, reused thereafter).
-    pub(crate) cached_columns: Option<Arc<Vec<CString>>>,
+    /// Cached column name CStrings (computed on first query, reused thereafter),
+    /// with the shared names of the last result they matched
+    pub(crate) cached_columns: Option<CachedColumns>,
     /// Buffer behind `stoolap_stmt_query_all()`, reused across calls
     pub(crate) packed: Vec<u8>,
     /// Keeps the originating `DatabaseInner` alive so the `Statement`'s `Weak`
