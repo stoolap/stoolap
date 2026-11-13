@@ -448,6 +448,80 @@ impl<'r, 'p> JoinedWhere<'r, 'p> {
     }
 }
 
+/// The rows a join's aggregation reads in one part, about 30 MB of
+/// joined rows of a few columns
+const JOIN_PART_ROWS: usize = 262_144;
+
+/// A join's rows as its operator makes them, those `where_` passes, as an
+/// aggregation reads them, the cancel checked every hundred
+struct JoinedRows<'r, 'p> {
+    stream: JoinStream,
+    where_: Option<JoinedWhere<'r, 'p>>,
+    ctx: &'r ExecutionContext,
+    row: Option<Row>,
+    read: u64,
+}
+
+impl JoinedRows<'_, '_> {
+    fn next_passed(&mut self) -> Result<Option<Row>> {
+        while let Some(row) = self.stream.next_row()? {
+            self.read += 1;
+            if self.read.is_multiple_of(100) {
+                self.ctx.check_cancelled()?;
+            }
+            if let Some(where_) = self.where_.as_mut() {
+                if !where_.matches(&row, None)? {
+                    continue;
+                }
+            }
+            return Ok(Some(row));
+        }
+        Ok(None)
+    }
+}
+
+impl RowSource for JoinedRows<'_, '_> {
+    fn next_row(&mut self) -> Result<Option<&Row>> {
+        self.row = self.next_passed()?;
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::join_part_held(usize::from(self.row.is_some()));
+        Ok(self.row.as_ref())
+    }
+
+    fn held(mut self) -> Result<RowVec> {
+        let mut rows = RowVec::new();
+        while let Some(row) = self.next_passed()? {
+            rows.push((0, row));
+        }
+        Ok(rows)
+    }
+
+    fn each_part(mut self, run: &mut PartRun<'_>) -> Result<()> {
+        #[cfg(feature = "test-failpoints")]
+        let part_rows = crate::test_failpoints::join_part_rows().unwrap_or(JOIN_PART_ROWS);
+        #[cfg(not(feature = "test-failpoints"))]
+        let part_rows = JOIN_PART_ROWS;
+        let mut part = RowVec::new();
+        loop {
+            part.clear();
+            while part.len() < part_rows {
+                match self.next_passed()? {
+                    Some(row) => part.push((0, row)),
+                    None => break,
+                }
+            }
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::join_part_held(part.len());
+            if !part.is_empty() {
+                run(&part)?;
+            }
+            if part.len() < part_rows {
+                return Ok(());
+            }
+        }
+    }
+}
+
 /// A semantic cache answer and its output columns
 type CachedAnswer = (Box<dyn QueryResult>, CompactArc<Vec<String>>);
 
@@ -461,6 +535,7 @@ pub(crate) enum EarlySemantic {
     NotTried,
 }
 
+use super::aggregation::{PartRun, RowSource};
 use super::context::{ExecutionContext, SemanticMiss, StatementSnapshot, TimeoutGuard};
 use super::expr_key::ExprKey;
 use super::expression::SubqueryExecutor;
@@ -468,7 +543,9 @@ use super::expression::{
     CompileContext, ExecuteContext, ExprCompiler, ExprVM, JoinFilter, RowFilter, SharedProgram,
 };
 use super::hash_table::JoinHashTable;
-use super::join_executor::{JoinExecutor, JoinPath, StatementRun, StreamingJoinRequest};
+use super::join_executor::{
+    JoinExecutor, JoinPath, JoinRows, JoinStream, StatementRun, StreamingJoinRequest,
+};
 use super::operator::{Operator, QueryResultOperator};
 use super::operators::hash_join::JoinType as OperatorJoinType;
 use super::operators::index_nested_loop::{
@@ -5626,8 +5703,24 @@ impl Executor {
             blocks: statement_run,
         };
 
-        let join_result = join_executor.execute(join_request)?;
-        let mut result_rows = join_result.rows;
+        // A grouped statement without windows that reads the joined rows as
+        // the join makes them, through no subquery and no merged column,
+        // aggregates them in parts as they are made
+        let in_parts = classification.has_aggregation
+            && !classification.has_window_functions
+            && blocks.as_deref().is_none_or(|held| !held.asks_sites())
+            && coalesced.is_empty()
+            && excluded_column_indices.is_empty()
+            && join_col_renames.is_empty()
+            && side_names.is_empty()
+            && !Self::grouped_family_reach(stmt, classification);
+        let (mut result_rows, stream) = match in_parts {
+            true => match join_executor.execute_each(join_request)? {
+                JoinRows::Held(rows) => (rows, None),
+                JoinRows::Streamed(stream) => (RowVec::new(), Some(stream)),
+            },
+            false => (join_executor.execute(join_request)?.rows, None),
+        };
         if !coalesced.is_empty() {
             for (_, row) in result_rows.iter_mut() {
                 for &(left, right) in &coalesced {
@@ -5653,6 +5746,35 @@ impl Executor {
             // No pushdown - apply full WHERE clause
             where_for_join
         };
+
+        if let Some(stream) = stream {
+            let where_ = match effective_where {
+                Some(where_expr) => {
+                    let program = self.join_where(
+                        prepared,
+                        WhereSite::AfterJoin,
+                        stmt,
+                        where_expr,
+                        &all_columns,
+                        blocks.as_deref(),
+                    )?;
+                    Some(JoinedWhere::new(program, blocks_run.as_ref(), ctx))
+                }
+                None => None,
+            };
+            let source = JoinedRows {
+                stream,
+                where_,
+                ctx,
+                row: None,
+                read: 0,
+            };
+            let feed = plan.as_deref().map(|plan| plan.feed(&all_columns));
+            let result = self.aggregate_each(stmt, ctx, source, &all_columns, feed.as_deref())?;
+            let layout = Self::result_layout(stmt, &all_columns, None, result.columns());
+            let columns = CompactArc::new(result.columns().to_vec());
+            return Ok((result, columns, false, SelectShape::laid_out(layout)));
+        }
 
         // Apply WHERE clause if present
         let filtered_rows = if let Some(where_expr) = effective_where {

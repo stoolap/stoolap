@@ -2126,6 +2126,38 @@ pub(crate) fn tvf_rows_generated(rows: usize) {
     TVF_ROWS.with(|count| count.set(count.get() + rows));
 }
 
+thread_local! {
+    /// The part size a test sets for a join an aggregation reads as it is
+    /// made on this thread, 0 for the engine's own, and the most joined rows
+    /// it has held at once since the last reset, a row read alone one
+    static JOIN_PART_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static JOIN_PART_LARGEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Parts of at most `rows` rows for each join an aggregation reads as it is
+/// made on this thread; 0 restores the engine's own size
+pub fn set_join_part_rows(rows: usize) {
+    JOIN_PART_ROWS.with(|n| n.set(rows));
+}
+
+pub(crate) fn join_part_rows() -> Option<usize> {
+    Some(JOIN_PART_ROWS.with(std::cell::Cell::get)).filter(|&rows| rows > 0)
+}
+
+/// The most joined rows an aggregation reading them as they are made has
+/// held at once on this thread since the last reset
+pub fn join_part_largest() -> usize {
+    JOIN_PART_LARGEST.with(std::cell::Cell::get)
+}
+
+pub fn reset_join_part_largest() {
+    JOIN_PART_LARGEST.with(|n| n.set(0));
+}
+
+pub(crate) fn join_part_held(rows: usize) {
+    JOIN_PART_LARGEST.with(|n| n.set(n.get().max(rows)));
+}
+
 /// A mechanism of the general SELECT path that the prepared family no
 /// longer reaches
 #[derive(Clone, Copy, Debug)]

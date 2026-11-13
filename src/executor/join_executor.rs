@@ -358,6 +358,81 @@ impl JoinExecutor {
         let mut all_columns = request.left_columns.to_vec();
         all_columns.extend(request.right_columns.iter().cloned());
 
+        let (method, analysis) = self.plan(&request);
+        let rows = self.run(method, request, &analysis)?;
+
+        Ok(JoinResult {
+            rows,
+            columns: all_columns,
+        })
+    }
+
+    /// The rows of `request`'s join, made as they are read when one operator
+    /// makes them all in turn: a hash join on one thread or a nested loop,
+    /// with no LIMIT and a statement asking nothing of a site; else made at once
+    pub(crate) fn execute_each(&self, request: JoinRequest<'_>) -> Result<JoinRows> {
+        let sites = request.blocks.is_some_and(|run| run.blocks.asks_sites());
+        if request.limit.is_some() || sites {
+            return self
+                .execute(request)
+                .map(|result| JoinRows::Held(result.rows));
+        }
+        let (method, analysis) = self.plan(&request);
+        let sides = (
+            request.left_rows,
+            request.right_rows,
+            request.left_columns,
+            request.right_columns,
+        );
+        let (op, residual_filters): (Box<dyn Operator>, _) = match method {
+            PairMethod::Hash { build_left } => {
+                let build_rows = match build_left {
+                    true => sides.0.len(),
+                    false => sides.1.len(),
+                };
+                if Self::uses_parallel(&analysis, build_rows, None) {
+                    let request = JoinRequest {
+                        left_rows: sides.0,
+                        right_rows: sides.1,
+                        ..request
+                    };
+                    return self.run(method, request, &analysis).map(JoinRows::Held);
+                }
+                JoinPath::Hash.taken();
+                let mut all_columns = request.left_columns.to_vec();
+                all_columns.extend(request.right_columns.iter().cloned());
+                let (ctx, prepared, blocks) = (request.ctx, request.prepared, request.blocks);
+                let (op, filters) = self.hash_join_operator(
+                    sides,
+                    &analysis,
+                    &all_columns,
+                    build_left,
+                    ctx,
+                    prepared,
+                    blocks,
+                    None,
+                )?;
+                (Box::new(op), filters)
+            }
+            PairMethod::NestedLoop => {
+                JoinPath::NestedLoop.taken();
+                let op = self.nested_loop_operator(
+                    sides,
+                    request.condition,
+                    &analysis.join_type_str,
+                    request.ctx,
+                    request.prepared,
+                    request.blocks,
+                    None,
+                )?;
+                (Box::new(op), Vec::new())
+            }
+        };
+        JoinStream::new(op, residual_filters, self.room).map(JoinRows::Streamed)
+    }
+
+    /// The method `request`'s join runs by and the keys it runs with
+    fn plan(&self, request: &JoinRequest<'_>) -> (PairMethod, Held<JoinAnalysis>) {
         // Analyze the join (key extraction)
         let mut analysis = self.analysis_of(
             request.prepared,
@@ -415,12 +490,7 @@ impl JoinExecutor {
             !analysis.left_key_indices.is_empty(),
             &analysis.join_type_str,
         );
-        let rows = self.run(method, request, &analysis)?;
-
-        Ok(JoinResult {
-            rows,
-            columns: all_columns,
-        })
+        (method, analysis)
     }
 
     /// Run the join by `method` (takes ownership of rows)
@@ -659,6 +729,18 @@ impl JoinExecutor {
         }
     }
 
+    /// Whether a hash join of `build_rows` builds its matches across threads:
+    /// with a large build side and no LIMIT, which the streaming operator
+    /// stops at, and no OUTER residual, which only the operator asks per pair
+    fn uses_parallel(analysis: &JoinAnalysis, build_rows: usize, limit: Option<u64>) -> bool {
+        let is_outer = analysis.join_type_str.contains("LEFT")
+            || analysis.join_type_str.contains("RIGHT")
+            || analysis.join_type_str.contains("FULL");
+        build_rows >= DEFAULT_PARALLEL_JOIN_THRESHOLD
+            && limit.is_none()
+            && !(is_outer && !analysis.residual_conditions.is_empty())
+    }
+
     /// Execute hash join using streaming HashJoinOperator or parallel execution.
     ///
     /// Chooses between:
@@ -688,25 +770,12 @@ impl JoinExecutor {
         let mut all_columns = left_columns.to_vec();
         all_columns.extend(right_columns.iter().cloned());
 
-        // Decide between parallel and streaming execution
-        // Parallel is beneficial when:
-        // 1. Build side row count exceeds threshold (parallel overhead worthwhile)
-        // 2. No LIMIT: the parallel join builds every match, streaming stops at the LIMIT
         let build_row_count = if build_left {
             left_rows.len()
         } else {
             right_rows.len()
         };
-        // OUTER joins with a non-equality ON condition need the residual applied
-        // per candidate pair, which only the streaming operator does.
-        let is_outer = analysis.join_type_str.contains("LEFT")
-            || analysis.join_type_str.contains("RIGHT")
-            || analysis.join_type_str.contains("FULL");
-        let use_parallel = build_row_count >= DEFAULT_PARALLEL_JOIN_THRESHOLD
-            && limit.is_none()
-            && !(is_outer && !analysis.residual_conditions.is_empty());
-
-        if use_parallel {
+        if Self::uses_parallel(analysis, build_row_count, limit) {
             // Parallel execution path
             self.execute_hash_join_parallel(
                 left_rows,
@@ -837,6 +906,44 @@ impl JoinExecutor {
         blocks: Option<StatementRun<'_>>,
     ) -> Result<RowVec> {
         JoinPath::Hash.taken();
+        let site = blocks.and_then(|blocks| blocks.site(false));
+        let site = site.as_ref().map(|site| site as &dyn SubqueryExecutor);
+        let sides = (left_rows, right_rows, left_columns, right_columns);
+        let (mut join_op, inline_filters) = self.hash_join_operator(
+            sides,
+            analysis,
+            all_columns,
+            build_left,
+            ctx,
+            prepared,
+            blocks,
+            site,
+        )?;
+
+        // Execute with Volcano model
+        self.execute_operator_with_filter(&mut join_op, limit, &inline_filters, site)
+    }
+
+    /// The hash join operator over both sides, an OUTER join asking its
+    /// residual of each pair inside it with `site`, and the residual filters
+    /// an INNER join's rows pass after it
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn hash_join_operator<'s>(
+        &self,
+        (left_rows, right_rows, left_columns, right_columns): (
+            CompactArc<Vec<Row>>,
+            CompactArc<Vec<Row>>,
+            &[String],
+            &[String],
+        ),
+        analysis: &JoinAnalysis,
+        all_columns: &[String],
+        build_left: bool,
+        ctx: &ExecutionContext,
+        prepared: Option<&PreparedJoin>,
+        blocks: Option<StatementRun<'_>>,
+        site: Option<&'s dyn SubqueryExecutor>,
+    ) -> Result<(HashJoinOperator<'s>, Vec<RowFilter>)> {
         // Create input operators from Arc (unwraps if sole owner, clones if shared)
         let left_op = Box::new(MaterializedOperator::from_arc(
             left_rows,
@@ -869,21 +976,15 @@ impl JoinExecutor {
             && !analysis.join_type_str.contains("FULL");
 
         let residual_filters = residual_filters(analysis, all_columns, ctx, prepared, blocks)?;
-        let site = blocks.and_then(|blocks| blocks.site(false));
-        let site = site.as_ref().map(|site| site as &dyn SubqueryExecutor);
 
         // OUTER joins have to reject a pair inside the operator so the row it
         // came from still counts as unmatched; INNER joins can filter the
         // output rows, which avoids materializing a candidate per pair.
-        let inline_filters: &[RowFilter] = if is_inner {
-            &residual_filters
-        } else {
-            join_op = join_op.with_residual(residual_filters).with_blocks(site);
-            &[]
-        };
-
-        // Execute with Volcano model
-        self.execute_operator_with_filter(&mut join_op, limit, inline_filters, site)
+        if is_inner {
+            return Ok((join_op, residual_filters));
+        }
+        join_op = join_op.with_residual(residual_filters).with_blocks(site);
+        Ok((join_op, Vec::new()))
     }
 
     /// Execute nested loop join using NestedLoopJoinOperator.
@@ -902,6 +1003,41 @@ impl JoinExecutor {
         blocks: Option<StatementRun<'_>>,
     ) -> Result<RowVec> {
         JoinPath::NestedLoop.taken();
+        let site = blocks.and_then(|blocks| blocks.site(true));
+        let site = site.as_ref().map(|site| site as &dyn SubqueryExecutor);
+        let sides = (left_rows, right_rows, left_columns, right_columns);
+        let mut nl_op = self.nested_loop_operator(
+            sides,
+            condition,
+            join_type_str,
+            ctx,
+            prepared,
+            blocks,
+            site,
+        )?;
+
+        // Execute with Volcano model
+        self.execute_operator_with_filter(&mut nl_op, limit, &[], None)
+    }
+
+    /// The nested loop operator over both sides, asking `condition` of each
+    /// pair with `site`
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn nested_loop_operator<'s>(
+        &self,
+        (left_rows, right_rows, left_columns, right_columns): (
+            CompactArc<Vec<Row>>,
+            CompactArc<Vec<Row>>,
+            &[String],
+            &[String],
+        ),
+        condition: Option<&Expression>,
+        join_type_str: &str,
+        ctx: &ExecutionContext,
+        prepared: Option<&PreparedJoin>,
+        blocks: Option<StatementRun<'_>>,
+        site: Option<&'s dyn SubqueryExecutor>,
+    ) -> Result<NestedLoopJoinOperator<'s>> {
         // Unwrap CompactArc if sole owner, otherwise clone (MaterializedOperator needs Vec<Row>)
         let left_vec = CompactArc::try_unwrap(left_rows).unwrap_or_else(|arc| (*arc).clone());
         let right_vec = CompactArc::try_unwrap(right_rows).unwrap_or_else(|arc| (*arc).clone());
@@ -923,8 +1059,6 @@ impl JoinExecutor {
             JoinType::Inner
         };
 
-        let site = blocks.and_then(|blocks| blocks.site(true));
-        let site = site.as_ref().map(|site| site as &dyn SubqueryExecutor);
         let mut filter = None;
         if let Some(cond) = condition {
             // With the statement's blocks, the ON they rewrote, over the pair
@@ -959,12 +1093,11 @@ impl JoinExecutor {
         }
 
         // Create nested loop join operator
-        let mut nl_op = NestedLoopJoinOperator::new(left_op, right_op, join_type, filter)
-            .with_blocks(site)
-            .with_room(self.room);
-
-        // Execute with Volcano model
-        self.execute_operator_with_filter(&mut nl_op, limit, &[], None)
+        Ok(
+            NestedLoopJoinOperator::new(left_op, right_op, join_type, filter)
+                .with_blocks(site)
+                .with_room(self.room),
+        )
     }
 
     /// Execute operator with Volcano model and optional residual filter.
@@ -980,46 +1113,8 @@ impl JoinExecutor {
         let max_rows = limit.map(|l| l as usize).unwrap_or(usize::MAX);
         let mut rows = RowVec::with_capacity(max_rows.min(1000));
         let mut row_id = 0i64;
-        let has_filters = !residual_filters.is_empty();
 
-        while let Some(row_ref) = op.next()? {
-            let row = row_ref.into_owned_with_room(self.room);
-
-            // Apply residual filters - specialized unrolling for common cases (1-4 filters)
-            if has_filters {
-                let pass = match residual_filters.len() {
-                    1 => residual_filters[0].matches_checked_with(&row, blocks)?,
-                    2 => {
-                        residual_filters[0].matches_checked_with(&row, blocks)?
-                            && residual_filters[1].matches_checked_with(&row, blocks)?
-                    }
-                    3 => {
-                        residual_filters[0].matches_checked_with(&row, blocks)?
-                            && residual_filters[1].matches_checked_with(&row, blocks)?
-                            && residual_filters[2].matches_checked_with(&row, blocks)?
-                    }
-                    4 => {
-                        residual_filters[0].matches_checked_with(&row, blocks)?
-                            && residual_filters[1].matches_checked_with(&row, blocks)?
-                            && residual_filters[2].matches_checked_with(&row, blocks)?
-                            && residual_filters[3].matches_checked_with(&row, blocks)?
-                    }
-                    _ => {
-                        let mut all_pass = true;
-                        for f in residual_filters {
-                            if !f.matches_checked_with(&row, blocks)? {
-                                all_pass = false;
-                                break;
-                            }
-                        }
-                        all_pass
-                    }
-                };
-                if !pass {
-                    continue;
-                }
-            }
-
+        while let Some(row) = next_passing(op, residual_filters, blocks, self.room)? {
             rows.push((row_id, row));
             row_id += 1;
 
@@ -1032,6 +1127,99 @@ impl JoinExecutor {
         op.close()?;
         Ok(rows)
     }
+}
+
+/// The next row of the opened `op` that every one of `residual_filters`
+/// passes, made with room for `room` values more; None at its end
+#[inline]
+fn next_passing(
+    op: &mut dyn Operator,
+    residual_filters: &[RowFilter],
+    blocks: Option<&dyn SubqueryExecutor>,
+    room: usize,
+) -> Result<Option<Row>> {
+    while let Some(row_ref) = op.next()? {
+        let row = row_ref.into_owned_with_room(room);
+
+        // Apply residual filters - specialized unrolling for common cases (1-4 filters)
+        let pass = match residual_filters.len() {
+            0 => true,
+            1 => residual_filters[0].matches_checked_with(&row, blocks)?,
+            2 => {
+                residual_filters[0].matches_checked_with(&row, blocks)?
+                    && residual_filters[1].matches_checked_with(&row, blocks)?
+            }
+            3 => {
+                residual_filters[0].matches_checked_with(&row, blocks)?
+                    && residual_filters[1].matches_checked_with(&row, blocks)?
+                    && residual_filters[2].matches_checked_with(&row, blocks)?
+            }
+            4 => {
+                residual_filters[0].matches_checked_with(&row, blocks)?
+                    && residual_filters[1].matches_checked_with(&row, blocks)?
+                    && residual_filters[2].matches_checked_with(&row, blocks)?
+                    && residual_filters[3].matches_checked_with(&row, blocks)?
+            }
+            _ => {
+                let mut all_pass = true;
+                for f in residual_filters {
+                    if !f.matches_checked_with(&row, blocks)? {
+                        all_pass = false;
+                        break;
+                    }
+                }
+                all_pass
+            }
+        };
+        if pass {
+            return Ok(Some(row));
+        }
+    }
+    Ok(None)
+}
+
+/// A join's rows as its operator makes them, each passed by the residual
+/// filters, the operator closed at their end
+pub(crate) struct JoinStream {
+    op: Box<dyn Operator>,
+    residual_filters: Vec<RowFilter>,
+    room: usize,
+    open: bool,
+}
+
+impl JoinStream {
+    fn new(
+        mut op: Box<dyn Operator>,
+        residual_filters: Vec<RowFilter>,
+        room: usize,
+    ) -> Result<Self> {
+        op.open()?;
+        Ok(Self {
+            op,
+            residual_filters,
+            room,
+            open: true,
+        })
+    }
+
+    /// The next joined row; None once every row was made
+    pub(crate) fn next_row(&mut self) -> Result<Option<Row>> {
+        if !self.open {
+            return Ok(None);
+        }
+        let row = next_passing(&mut *self.op, &self.residual_filters, None, self.room)?;
+        if row.is_none() {
+            self.open = false;
+            self.op.close()?;
+        }
+        Ok(row)
+    }
+}
+
+/// A join's rows: all of them made at once, or made as they are read
+pub(crate) enum JoinRows {
+    Held(RowVec),
+    Streamed(JoinStream),
 }
 
 impl Default for JoinExecutor {
