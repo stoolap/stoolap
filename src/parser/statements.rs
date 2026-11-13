@@ -1017,6 +1017,9 @@ impl Parser<'_> {
                 self.add_error(format!("expected ')' at {}", self.cur_token.position));
                 return None;
             }
+            if self.written_twice(columns.iter().map(|c| c.value.as_str())) {
+                return None;
+            }
         }
 
         // Check if next is VALUES, SELECT, or WITH (CTE)
@@ -1254,7 +1257,34 @@ impl Parser<'_> {
             self.next_token(); // consume comma
         }
 
+        self.written_twice(update_columns.iter().map(|c| c.value.as_str()));
         (update_columns, update_expressions)
+    }
+
+    /// Adds an error, and returns true, when `names`, the columns a statement
+    /// writes, name one column more than once
+    fn written_twice<'a>(&mut self, mut names: impl Iterator<Item = &'a str> + Clone) -> bool {
+        while let Some(name) = names.next() {
+            if self.written_again(names.clone(), name) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Adds an error, and returns true, when `name` is among `written`, as
+    /// column names resolve, without regard to case
+    fn written_again<'a>(
+        &mut self,
+        mut written: impl Iterator<Item = &'a str>,
+        name: &str,
+    ) -> bool {
+        if !written.any(|other| crate::common::names::eq_names(name, other)) {
+            return false;
+        }
+        let name = name.to_lowercase();
+        self.add_error(format!("column {name} is written more than once"));
+        true
     }
 
     /// Parse DISTINCT ON (expr1, expr2, ...) if present after DISTINCT keyword.
@@ -1570,6 +1600,9 @@ impl Parser<'_> {
             self.next_token();
             let column_name = self.cur_token_as_column_identifier();
             let column_name = column_name.value;
+            if self.written_again(updates.keys().map(SmartString::as_str), &column_name) {
+                return None;
+            }
 
             if !self.expect_peek(TokenType::Operator) || self.cur_token.literal != "=" {
                 self.add_error(format!("expected '=' at {}", self.cur_token.position));
@@ -3212,6 +3245,9 @@ impl Parser<'_> {
             columns = self.parse_identifier_list();
             if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {
                 self.add_error(format!("expected ')' at {}", self.cur_token.position));
+                return None;
+            }
+            if self.written_twice(columns.iter().map(|c| c.value.as_str())) {
                 return None;
             }
         }

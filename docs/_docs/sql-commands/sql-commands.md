@@ -318,6 +318,8 @@ ON CONFLICT (conflict_columns) DO UPDATE SET
   column1 = EXCLUDED.column1;
 ```
 
+A column list, or an upsert's assignment list, that names one column more than once is an error. Column names compare without regard to case, so `(v, V)` names `v` twice.
+
 #### Examples
 
 ```sql
@@ -406,6 +408,8 @@ SET column1 = value1, column2 = value2, ...
 [WHERE condition]
 [RETURNING *|column1, column2, ...];
 ```
+
+A SET list that assigns one column more than once, `SET v = 1, V = 2` included, is an error.
 
 #### Examples
 
@@ -519,6 +523,8 @@ COPY table_name [(column1, column2, ...)]
 FROM 'file_path'
 WITH (FORMAT CSV|JSON [, HEADER true|false] [, DELIMITER 'c'] [, NULL 'string']);
 ```
+
+A column list that names one column more than once is an error.
 
 #### Parameters
 

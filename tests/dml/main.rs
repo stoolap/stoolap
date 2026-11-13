@@ -76,3 +76,4 @@ mod upsert_row_met_twice_test;
 mod upsert_where_test;
 mod values_clause_test;
 mod write_path_rule_test;
+mod written_twice_test;
