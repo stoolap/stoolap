@@ -1887,10 +1887,10 @@ impl MVCCTable {
     }
 
     /// Inserts a row for a statement already admitted
-    fn insert_admitted(&mut self, mut row: Row) -> Result<()> {
+    fn insert_admitted(&mut self, mut row: Row) -> Result<i64> {
         let row_id = self.prepare_insert(&mut row)?;
         self.writes()?.put(row_id, row, false)?;
-        Ok(())
+        Ok(row_id)
     }
 
     /// Prepares a row for insertion: handles auto-increment, validates, and checks constraints.
@@ -2966,10 +2966,6 @@ impl Table for MVCCTable {
         self.txn_id
     }
 
-    fn wrote_after(&self, row_id: i64, cut: i64) -> bool {
-        (self.local().get_latest_local(row_id)).is_some_and(|version| version.create_time > cut)
-    }
-
     fn cold_row_holds(
         &self,
         row_id: i64,
@@ -3124,7 +3120,7 @@ impl Table for MVCCTable {
         Ok((row_id, inserted_row))
     }
 
-    fn insert_discard(&mut self, row: Row) -> Result<()> {
+    fn insert_discard(&mut self, row: Row) -> Result<i64> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         self.insert_admitted(row)
     }

@@ -297,13 +297,6 @@ pub trait Table: Send + Sync {
     /// Used by FK enforcement to participate in the caller's transaction.
     fn txn_id(&self) -> i64;
 
-    /// Whether this handle's transaction wrote `row_id` after write order
-    /// `cut`, as an upsert asks of the row a conflict names
-    fn wrote_after(&self, row_id: i64, cut: i64) -> bool {
-        let _ = (row_id, cut);
-        false
-    }
-
     /// Whether the volume row `row_id` holds the key `values` in `columns`
     /// as this handle's transaction sees it; `deleted` says whether the
     /// transaction deleted the row
@@ -395,16 +388,16 @@ pub trait Table: Send + Sync {
     /// as inserted
     fn insert_with_id(&mut self, row: Row) -> Result<(i64, Row)>;
 
-    /// Inserts a single row without returning it (avoids clone overhead)
+    /// Inserts a single row without returning it (avoids clone overhead),
+    /// returning the row id it was given
     ///
     /// Use this when the RETURNING clause is not needed.
     /// This is ~7ms faster per 1000 rows by avoiding Row::clone().
     ///
     /// # Arguments
     /// * `row` - The row to insert
-    fn insert_discard(&mut self, row: Row) -> Result<()> {
-        self.insert(row)?;
-        Ok(())
+    fn insert_discard(&mut self, row: Row) -> Result<i64> {
+        self.insert_with_id(row).map(|(row_id, _)| row_id)
     }
 
     /// Inserts multiple rows into the table in a single batch operation

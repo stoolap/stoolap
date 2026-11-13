@@ -73,3 +73,31 @@ fn a_later_row_meets_the_row_an_earlier_one_wrote() {
         }
     }
 }
+
+#[test]
+fn a_row_a_cascade_wrote_is_not_met_twice() {
+    let db = Database::open("memory://upsert_cascade_not_twice").unwrap();
+    for sql in [
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, code INTEGER UNIQUE, \
+         parent INTEGER REFERENCES s(code) ON UPDATE CASCADE, n INTEGER)",
+        "INSERT INTO s VALUES (1, 100, NULL, 0), (2, 200, 100, 0)",
+        "INSERT INTO s VALUES (1, 100, NULL, 0), (2, 200, NULL, 0) \
+         ON CONFLICT (id) DO UPDATE SET code = code + 1000, n = n + 1",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let left: Vec<(i64, i64, Option<i64>, i64)> = db
+        .query("SELECT id, code, parent, n FROM s ORDER BY id", ())
+        .unwrap()
+        .map(|row| {
+            let row = row.unwrap();
+            (
+                row.get::<i64>(0).unwrap(),
+                row.get::<i64>(1).unwrap(),
+                row.get::<Option<i64>>(2).unwrap(),
+                row.get::<i64>(3).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(left, [(1, 1100, None, 1), (2, 1200, Some(1100), 1)]);
+}

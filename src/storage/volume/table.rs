@@ -4813,10 +4813,6 @@ impl Table for SegmentedTable {
         self.hot.txn_id()
     }
 
-    fn wrote_after(&self, row_id: i64, cut: i64) -> bool {
-        self.hot.wrote_after(row_id, cut)
-    }
-
     // =========================================================================
     // DDL — delegate to hot buffer
     // =========================================================================
@@ -4878,7 +4874,7 @@ impl Table for SegmentedTable {
         Ok(result)
     }
 
-    fn insert_discard(&mut self, row: Row) -> Result<()> {
+    fn insert_discard(&mut self, row: Row) -> Result<i64> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         let (_read, _seal_guard, _) = Self::fence_after_cold_check(
             &self.segment_mgr,
@@ -4887,9 +4883,9 @@ impl Table for SegmentedTable {
                 self.check_segment_constraints_with_snapshot(snapshot, loads, &row, None)
             },
         )?;
-        self.hot.insert_discard(row)?;
+        let row_id = self.hot.insert_discard(row)?;
         self.segment_mgr.record_txn_seal_generation(self.txn_id());
-        Ok(())
+        Ok(row_id)
     }
 
     fn insert_batch(&mut self, rows: Vec<Row>) -> Result<()> {

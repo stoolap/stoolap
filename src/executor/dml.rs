@@ -566,11 +566,16 @@ fn returns_slot(returning: &[Expression], schema: &Schema) -> bool {
 /// `row` inserted into `table` as a RETURNING reads it: with its row id
 /// past its columns when `widened`
 fn inserted(table: &mut dyn Table, row: Row, widened: bool) -> Result<Row> {
+    inserted_with_id(table, row, widened).map(|(_, row)| row)
+}
+
+/// The row id an insert gave `row`, with the row as [`inserted`] gives it
+fn inserted_with_id(table: &mut dyn Table, row: Row, widened: bool) -> Result<(i64, Row)> {
     match widened {
         true => table
             .insert_with_id(row)
-            .map(|(id, row)| super::prepared_select::widened(row, id)),
-        false => table.insert(row),
+            .map(|(id, row)| (id, super::prepared_select::widened(row, id))),
+        false => table.insert_with_id(row),
     }
 }
 
@@ -878,8 +883,10 @@ impl Executor {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::dml_table_opened();
         // An upsert judges each row's keys against the rows before it, its
-        // own earlier rows included, and refuses a row it already wrote
-        let upsert_cut = crate::storage::mvcc::last_write_order();
+        // own earlier rows included; ON CONFLICT DO UPDATE refuses a row it
+        // inserted or updated
+        let mut affected =
+            (stmt.on_duplicate && !stmt.conflict_target.is_empty()).then(I64Set::default);
         if stmt.on_duplicate || stmt.do_nothing {
             self.engine.track_keys(table.txn_id());
         }
@@ -1206,7 +1213,7 @@ impl Executor {
                     let insert_result: Result<Option<Row>> = if has_returning {
                         inserted(&mut *table, row, widened).map(Some)
                     } else {
-                        table.insert_discard(row).map(|()| None)
+                        table.insert_discard(row).map(|_| None)
                     };
                     match insert_result {
                         Ok(opt_row) => {
@@ -1228,13 +1235,16 @@ impl Executor {
                     let row_values = saved_row_values.as_ref().unwrap();
                     let schema_ref = select_schema.as_ref().unwrap();
                     // ON CONFLICT DO UPDATE / ON DUPLICATE KEY UPDATE
-                    let insert_result: Result<Option<Row>> = if has_returning {
-                        inserted(&mut *table, row, widened).map(Some)
+                    let insert_result: Result<(i64, Option<Row>)> = if has_returning {
+                        inserted_with_id(&mut *table, row, widened).map(|(id, row)| (id, Some(row)))
                     } else {
-                        table.insert_discard(row).map(|()| None)
+                        table.insert_discard(row).map(|id| (id, None))
                     };
                     match insert_result {
-                        Ok(opt_row) => {
+                        Ok((row_id, opt_row)) => {
+                            if let Some(affected) = affected.as_mut() {
+                                affected.insert(row_id);
+                            }
                             if let Some(inserted) = opt_row {
                                 returning_rows.push(inserted);
                             }
@@ -1248,7 +1258,7 @@ impl Executor {
                                 &mut table,
                                 schema_ref,
                                 row_id,
-                                upsert_cut,
+                                affected.as_mut(),
                                 None,
                                 row_values,
                                 stmt,
@@ -1299,7 +1309,7 @@ impl Executor {
                                         &mut table,
                                         schema_ref,
                                         row_id,
-                                        upsert_cut,
+                                        affected.as_mut(),
                                         Some(column),
                                         row_values,
                                         stmt,
@@ -1499,7 +1509,7 @@ impl Executor {
                     let insert_result: Result<Option<Row>> = if has_returning {
                         inserted(&mut *table, row, widened).map(Some)
                     } else {
-                        table.insert_discard(row).map(|()| None)
+                        table.insert_discard(row).map(|_| None)
                     };
                     match insert_result {
                         Ok(opt_row) => {
@@ -1519,13 +1529,16 @@ impl Executor {
                     }
                 } else {
                     // ON CONFLICT DO UPDATE / ON DUPLICATE KEY UPDATE
-                    let insert_result: Result<Option<Row>> = if has_returning {
-                        inserted(&mut *table, row, widened).map(Some)
+                    let insert_result: Result<(i64, Option<Row>)> = if has_returning {
+                        inserted_with_id(&mut *table, row, widened).map(|(id, row)| (id, Some(row)))
                     } else {
-                        table.insert_discard(row).map(|()| None)
+                        table.insert_discard(row).map(|id| (id, None))
                     };
                     match insert_result {
-                        Ok(opt_row) => {
+                        Ok((row_id, opt_row)) => {
+                            if let Some(affected) = affected.as_mut() {
+                                affected.insert(row_id);
+                            }
                             if let Some(inserted) = opt_row {
                                 returning_rows.push(inserted);
                             }
@@ -1539,7 +1552,7 @@ impl Executor {
                                 &mut table,
                                 &schema,
                                 row_id,
-                                upsert_cut,
+                                affected.as_mut(),
                                 None,
                                 &row_values,
                                 stmt,
@@ -1591,7 +1604,7 @@ impl Executor {
                                         &mut table,
                                         &schema,
                                         row_id,
-                                        upsert_cut,
+                                        affected.as_mut(),
                                         Some(column),
                                         &row_values,
                                         stmt,
@@ -3666,7 +3679,7 @@ impl Executor {
         table: &mut Box<dyn Table>,
         schema: &crate::core::Schema,
         row_id: i64,
-        cut: i64,
+        affected: Option<&mut I64Set>,
         conflict_column: Option<&str>,
         insert_values: &[Value],
         stmt: &InsertStatement,
@@ -3679,9 +3692,9 @@ impl Executor {
             &mut super::foreign_key::UpdatePlans,
         ),
     ) -> Result<(bool, Option<Row>)> {
-        // ON CONFLICT names its target; ON DUPLICATE KEY UPDATE, with none,
-        // updates a row an earlier row of the statement wrote again
-        if !stmt.conflict_target.is_empty() && table.wrote_after(row_id, cut) {
+        // ON CONFLICT DO UPDATE keeps the rows its statement inserted or
+        // updated; ON DUPLICATE KEY UPDATE updates such a row again
+        if affected.as_ref().is_some_and(|rows| rows.contains(row_id)) {
             return Err(Error::invalid_argument(
                 "ON CONFLICT DO UPDATE cannot affect a row a second time in one statement",
             ));
@@ -3901,6 +3914,15 @@ impl Executor {
             let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
             table.update(access, where_expr.as_deref(), &mut setter)?
         };
+        if let (Some(rows), true) = (affected, updated > 0) {
+            rows.insert(row_id);
+            let key = schema.pk_column_index();
+            for (_, row) in &moves {
+                if let Some(Value::Integer(moved)) = key.and_then(|at| row.get(at)) {
+                    rows.insert(*moved);
+                }
+            }
+        }
         move_rows(&mut **table, moves)?;
 
         let txn_id = table.txn_id();
