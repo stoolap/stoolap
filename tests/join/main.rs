@@ -23,6 +23,7 @@ mod correlated_join_on_test;
 mod cross_join_limit_test;
 mod cross_type_join_test;
 mod hash_join_test;
+mod join_aggregate_parts_test;
 mod join_algorithm_rule_test;
 mod join_bare_outer_key_test;
 mod join_clause_matrix_test;

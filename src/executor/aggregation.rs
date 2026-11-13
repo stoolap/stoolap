@@ -1140,6 +1140,9 @@ impl GroupKey for Picked<'_> {
     }
 }
 
+/// What runs one part of the rows a source hands over in parts
+pub(super) type PartRun<'a> = dyn FnMut(&[(i64, Row)]) -> Result<()> + 'a;
+
 /// What hands an aggregation its rows one at a time, each borrowed until
 /// the next is asked for
 pub(super) trait RowSource {
@@ -1148,6 +1151,15 @@ pub(super) trait RowSource {
 
     /// Every row left, taken at once; their ids are not read
     fn held(self) -> Result<RowVec>;
+
+    /// Every row left, handed to `run` in parts, each run before the next
+    /// is read; by default all of them as one part
+    fn each_part(self, run: &mut PartRun<'_>) -> Result<()>
+    where
+        Self: Sized,
+    {
+        run(&self.held()?)
+    }
 }
 
 /// The rows an aggregation reads: held at once, which a large input feeds
@@ -1676,7 +1688,7 @@ impl<'a> RowFeed<'a> {
         match input {
             FeedInput::Rows(rows) => self.run_rows(groups, rows, ctx, blocks),
             FeedInput::Each(source, rows) if self.splits(groups, rows) => {
-                self.run_rows(groups, &source.held()?, ctx, blocks)
+                source.each_part(&mut |part| self.run_rows(groups, part, ctx, blocks))
             }
             FeedInput::Each(source, _) => self.run_each(groups, ctx, blocks, source),
         }
@@ -1753,9 +1765,34 @@ impl Executor {
         base_columns: &[String],
         held: Option<&HeldFeed>,
     ) -> Result<Box<dyn QueryResult>> {
+        let input = FeedInput::<ScannedRows<'_>>::Rows(&base_rows);
+        self.select_aggregate(stmt, ctx, input, base_columns, held)
+    }
+
+    /// `execute_select_with_aggregation` over the rows `source` hands over,
+    /// read in its parts whenever the feed splits its rows
+    pub(super) fn aggregate_each(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        source: impl RowSource,
+        base_columns: &[String],
+        held: Option<&HeldFeed>,
+    ) -> Result<Box<dyn QueryResult>> {
+        let input = FeedInput::Each(source, usize::MAX);
+        self.select_aggregate(stmt, ctx, input, base_columns, held)
+    }
+
+    fn select_aggregate(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        input: FeedInput<'_, impl RowSource>,
+        base_columns: &[String],
+        held: Option<&HeldFeed>,
+    ) -> Result<Box<dyn QueryResult>> {
         // Parse aggregations and group by columns
         let (aggregations, _non_agg_columns) = self.parse_aggregations(stmt, Some(ctx))?;
-        let input = FeedInput::<ScannedRows<'_>>::Rows(&base_rows);
         self.aggregate_input(
             AggregatePath::General,
             (stmt, stmt),
