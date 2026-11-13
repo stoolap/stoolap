@@ -289,27 +289,33 @@ fn check_statement_keys(
     crate::test_failpoints::statement_volumes_reading();
     let snapshot = mgr.statement_snapshot();
     let mut sealed: SmallVec<[(usize, i64); 1]> = SmallVec::new();
-    for (position, (at, row_id, values)) in keys.iter().enumerate() {
-        let columns: SmallVec<[usize; 4]> = (indexes[*at].column_ids().iter())
-            .map(|&id| id as usize)
-            .collect();
-        let coerced: SmallVec<[Value; 4]> = (values.iter().zip(&columns))
-            .map(|(value, &at)| value.coerce_to_type(schema.columns[at].data_type))
-            .collect();
-        let defaults: SmallVec<[Value; 4]> = columns
-            .iter()
-            .map(|&at| {
-                let column = &schema.columns[at];
-                (column.default_value.clone()).unwrap_or(Value::null(column.data_type))
-            })
-            .collect();
-        let found: SmallVec<[&Value; 4]> = coerced.iter().collect();
-        let holder = mgr.find_row_id_by_values_in(&snapshot, &columns, &found, &defaults)?;
-        if let Some(holder) = holder.filter(|&holder| holder != *row_id) {
-            sealed.push((position, holder));
+    let mut look_up = || -> Result<()> {
+        for (position, (at, row_id, values)) in keys.iter().enumerate() {
+            let columns: SmallVec<[usize; 4]> = (indexes[*at].column_ids().iter())
+                .map(|&id| id as usize)
+                .collect();
+            let coerced: SmallVec<[Value; 4]> = (values.iter().zip(&columns))
+                .map(|(value, &at)| value.coerce_to_type(schema.columns[at].data_type))
+                .collect();
+            let defaults: SmallVec<[Value; 4]> = columns
+                .iter()
+                .map(|&at| {
+                    let column = &schema.columns[at];
+                    (column.default_value.clone()).unwrap_or(Value::null(column.data_type))
+                })
+                .collect();
+            let found: SmallVec<[&Value; 4]> = coerced.iter().collect();
+            let holder = mgr.find_row_id_by_values_in(&snapshot, &columns, &found, &defaults)?;
+            if let Some(holder) = holder.filter(|&holder| holder != *row_id) {
+                sealed.push((position, holder));
+            }
         }
-    }
+        Ok(())
+    };
+    // The volumes a failed lookup loaded are published all the same
+    let looked_up = look_up();
     mgr.publish_loaded(snapshot.take_loaded());
+    looked_up?;
     if let Some(generation) = generation {
         mgr.check_schema_generation(generation)?;
     }
@@ -11377,22 +11383,21 @@ impl TransactionEngineOperations for EngineOperations {
     fn check_statement_keys(&self, txn_id: i64) -> Result<()> {
         let cache =
             (self.txn_version_stores().read()).unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Only the stores a write changed a key of; the cache, then a store,
+        // the order track_keys takes them in
+        let changed = |store: &Arc<TxnTableStore>| {
+            (store
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner))
+            .has_key_changes()
+        };
         let touched: smallvec::SmallVec<[(crate::common::SmartString, Arc<TxnTableStore>); 4]> =
-            cache
-                .get(txn_id)
-                .map(|tables| {
-                    tables
-                        .iter()
-                        .map(|(name, store)| (name.clone(), Arc::clone(store)))
-                        .collect()
-                })
-                .unwrap_or_default();
+            (cache.get(txn_id).into_iter().flatten())
+                .filter(|(_, store)| changed(store))
+                .map(|(name, store)| (name.clone(), Arc::clone(store)))
+                .collect();
         drop(cache);
         for (name, txn_store) in &touched {
-            let poisoned = |_| Error::internal("transaction store lock poisoned");
-            if !txn_store.read().map_err(poisoned)?.has_key_changes() {
-                continue;
-            }
             let mgr = self
                 .segment_managers
                 .read()

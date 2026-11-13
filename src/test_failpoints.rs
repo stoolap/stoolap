@@ -3741,6 +3741,8 @@ pub fn reset_all() {
     COLD_MAP_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = None);
     UNIQUE_INDEX_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     STATEMENT_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    STATEMENT_INDEXES_HOOK.with(|slot| *slot.borrow_mut() = None);
+    STATEMENT_VOLUMES_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_ROUND_PREPARED_HOOK.with(|slot| *slot.borrow_mut() = None);
     IN_MEMBER_PROBED_HOOK.with(|slot| *slot.borrow_mut() = None);
     HOT_TOP_K_VISIT_HOOK.with(|slot| *slot.borrow_mut() = None);

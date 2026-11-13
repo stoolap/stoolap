@@ -1889,8 +1889,19 @@ impl MVCCTable {
     /// Inserts a row for a statement already admitted
     fn insert_admitted(&mut self, mut row: Row) -> Result<i64> {
         let row_id = self.prepare_insert(&mut row)?;
-        self.writes()?.put(row_id, row, false)?;
+        self.put_inserted(row_id, row)?;
         Ok(row_id)
+    }
+
+    /// Writes the row `prepare_insert` admitted; a write that fails takes
+    /// the keys its check entered back out
+    fn put_inserted(&self, row_id: i64, row: Row) -> Result<()> {
+        let mut store = self.writes()?;
+        let put = store.put(row_id, row, false);
+        if put.is_err() {
+            store.release_keys(row_id);
+        }
+        put
     }
 
     /// Prepares a row for insertion: handles auto-increment, validates, and checks constraints.
@@ -3116,7 +3127,7 @@ impl Table for MVCCTable {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         let row_id = self.prepare_insert(&mut row)?;
         let inserted_row = row.clone();
-        self.writes()?.put(row_id, row, false)?;
+        self.put_inserted(row_id, row)?;
         Ok((row_id, inserted_row))
     }
 

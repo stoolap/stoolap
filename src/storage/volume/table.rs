@@ -2481,7 +2481,7 @@ impl SegmentedTable {
         planned: Result<()>,
     ) -> Result<i32> {
         // A new key, a hot row's or a sealed one's, is checked against the
-        // volumes only at commit, so a statement may swap keys among its rows
+        // volumes when the statement ends, so it may swap keys among its rows
         plan.compare_hot_keys = segment_mgr.has_segments();
         let cold_keys_changed =
             !plan.cold.is_empty() && cold_keys_changed(hot.as_ref(), &plan.cold)?;
