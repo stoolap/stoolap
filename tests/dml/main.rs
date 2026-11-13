@@ -66,6 +66,7 @@ mod table_level_primary_key_test;
 mod unique_update_sealed_test;
 mod update_arithmetic_test;
 mod update_correlated_restrict_test;
+mod update_counts_test;
 mod update_parentheses_test;
 mod update_path_test;
 mod update_set_default_test;

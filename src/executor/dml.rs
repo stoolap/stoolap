@@ -595,6 +595,14 @@ pub(crate) fn written_column(schema: &Schema, name: &str) -> Result<Option<usize
     }
 }
 
+/// Sets column `at` of `row` to `value`, an UPDATE's SET; true when it
+/// changes the value the row held, as a changed foreign key value counts
+pub(crate) fn set_changed(row: &mut Row, at: usize, value: Value) -> bool {
+    let changed = row.get(at) != Some(&value);
+    let _ = row.set(at, value);
+    changed
+}
+
 /// Moves each row of `moves`, (old row id, row), to the id its primary key
 /// now holds: every old id is deleted first, then every row inserted, so a
 /// key collides only with a row the statement leaves or with another new
@@ -2573,6 +2581,8 @@ impl Executor {
         let fk_new_values: RefCell<Vec<Row>> = RefCell::new(Vec::new());
         // (referenced_col_idx, old_value, new_value) for FK cascade enforcement
         let ref_col_changes: RefCell<Vec<(usize, Value, Value)>> = RefCell::new(Vec::new());
+        // The matched rows whose SET changed a value
+        let changed_rows = std::cell::Cell::new(0i64);
 
         // Pre-compute referenced column indices for FK cascade enforcement.
         // Shared by both correlated and non-correlated update paths.
@@ -2763,8 +2773,12 @@ impl Executor {
                     };
 
                 let original = key_set.map(|_| row.clone());
+                let mut values_changed = false;
                 for (idx, new_value) in updates_to_apply {
-                    let _ = row.set(idx, new_value);
+                    values_changed |= set_changed(&mut row, idx, new_value);
+                }
+                if values_changed {
+                    changed_rows.set(changed_rows.get() + 1);
                 }
 
                 // Each CHECK an updated column reads, over the row as it now is
@@ -2939,8 +2953,9 @@ impl Executor {
             }
         }
 
-        statement_rollback.finish(Ok(Box::new(ExecResult::with_rows_affected(
+        statement_rollback.finish(Ok(Box::new(ExecResult::with_rows_changed(
             rows_affected as i64,
+            changed_rows.get(),
         ))))
     }
 

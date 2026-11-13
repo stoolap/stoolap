@@ -160,7 +160,13 @@ stoolap_exec_params(db, "INSERT INTO t VALUES ($1, $2)", params, 2, &affected);
 /* affected == 1 */
 ```
 
-The `rows_affected` pointer may be NULL if you do not need the count.
+The `rows_affected` pointer may be NULL if you do not need the count. For an UPDATE it counts the rows the WHERE clause matched. `stoolap_exec_params_counts`, `stoolap_stmt_exec_counts` and `stoolap_tx_exec_params_counts` take one more pointer, `rows_changed`, which receives the matched rows whose SET changed a value (the rows affected for any other statement):
+
+```c
+int64_t matched = 0, changed = 0;
+stoolap_exec_params_counts(db, "UPDATE t SET name = 'Bob' WHERE id IN (1, 2)", NULL, 0, &matched, &changed);
+/* matched == 2, changed == 1 */
+```
 
 ## Querying Data
 
@@ -317,6 +323,7 @@ The `total_affected` pointer may be NULL if you do not need the count. When `row
 |----------|---------|-------------|
 | `stoolap_prepare(db, sql, &stmt)` | `int32_t` | Prepare a SQL statement |
 | `stoolap_stmt_exec(stmt, params, len, &affected)` | `int32_t` | Execute with parameters |
+| `stoolap_stmt_exec_counts(stmt, params, len, &affected, &changed)` | `int32_t` | Execute with parameters, also reporting the rows an UPDATE changed |
 | `stoolap_stmt_exec_batch(db, stmt, params, params_per_row, row_count, &total)` | `int32_t` | Execute batch in a single transaction |
 | `stoolap_stmt_query(stmt, params, len, &rows)` | `int32_t` | Query with parameters |
 | `stoolap_stmt_exec_named(stmt, params, len, &affected)` | `int32_t` | Execute with named parameters |
@@ -439,6 +446,7 @@ stoolap_stmt_finalize(lookup);
 | `stoolap_begin_with_isolation(db, level, &tx)` | `int32_t` | Begin with specific isolation |
 | `stoolap_tx_exec(tx, sql, &affected)` | `int32_t` | Execute without params |
 | `stoolap_tx_exec_params(tx, sql, params, len, &affected)` | `int32_t` | Execute with params |
+| `stoolap_tx_exec_params_counts(tx, sql, params, len, &affected, &changed)` | `int32_t` | Execute with params, also reporting the rows an UPDATE changed |
 | `stoolap_tx_query(tx, sql, &rows)` | `int32_t` | Query without params |
 | `stoolap_tx_query_params(tx, sql, params, len, &rows)` | `int32_t` | Query with params |
 | `stoolap_tx_stmt_exec(tx, stmt, params, len, &affected)` | `int32_t` | Execute prepared statement in transaction |
@@ -805,6 +813,7 @@ stoolap_tx_commit(tx);
 |----------|---------|-------------|
 | `stoolap_exec(db, sql, &affected)` | `int32_t` | Execute without parameters |
 | `stoolap_exec_params(db, sql, params, len, &affected)` | `int32_t` | Execute with positional parameters |
+| `stoolap_exec_params_counts(db, sql, params, len, &affected, &changed)` | `int32_t` | Execute with positional parameters, also reporting the rows an UPDATE changed |
 | `stoolap_exec_named(db, sql, params, len, &affected)` | `int32_t` | Execute with named parameters |
 
 ### Query
@@ -821,6 +830,7 @@ stoolap_tx_commit(tx);
 |----------|---------|-------------|
 | `stoolap_prepare(db, sql, &stmt)` | `int32_t` | Prepare a SQL statement |
 | `stoolap_stmt_exec(stmt, params, len, &affected)` | `int32_t` | Execute prepared statement |
+| `stoolap_stmt_exec_counts(stmt, params, len, &affected, &changed)` | `int32_t` | Execute prepared statement, also reporting the rows an UPDATE changed |
 | `stoolap_stmt_exec_batch(db, stmt, params, params_per_row, row_count, &total)` | `int32_t` | Execute batch in a single transaction |
 | `stoolap_stmt_query(stmt, params, len, &rows)` | `int32_t` | Query with prepared statement |
 | `stoolap_stmt_exec_named(stmt, params, len, &affected)` | `int32_t` | Execute prepared statement with named parameters |
@@ -837,6 +847,7 @@ stoolap_tx_commit(tx);
 | `stoolap_begin_with_isolation(db, level, &tx)` | `int32_t` | Begin with specific isolation level |
 | `stoolap_tx_exec(tx, sql, &affected)` | `int32_t` | Execute in transaction |
 | `stoolap_tx_exec_params(tx, sql, params, len, &affected)` | `int32_t` | Execute with positional parameters in transaction |
+| `stoolap_tx_exec_params_counts(tx, sql, params, len, &affected, &changed)` | `int32_t` | Execute with positional parameters in transaction, also reporting the rows an UPDATE changed |
 | `stoolap_tx_exec_named(tx, sql, params, len, &affected)` | `int32_t` | Execute with named parameters in transaction |
 | `stoolap_tx_query(tx, sql, &rows)` | `int32_t` | Query in transaction |
 | `stoolap_tx_query_params(tx, sql, params, len, &rows)` | `int32_t` | Query with positional parameters in transaction |

@@ -575,6 +575,61 @@ fn test_rows_affected() {
     }
 }
 
+#[test]
+fn test_rows_changed() {
+    unsafe {
+        let mut db: *mut StoolapDB = std::ptr::null_mut();
+        stoolap_open_in_memory(&mut db);
+        let sql = cstr("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)");
+        stoolap_exec(db, sql.as_ptr(), std::ptr::null_mut());
+        let sql = cstr("INSERT INTO t VALUES (1, 1), (2, 2)");
+        stoolap_exec(db, sql.as_ptr(), std::ptr::null_mut());
+
+        let one = [StoolapValue {
+            value_type: STOOLAP_TYPE_INTEGER,
+            _padding: 0,
+            v: StoolapValueData { integer: 1 },
+        }];
+        let (mut matched, mut changed) = (0i64, 0i64);
+        let sql = cstr("UPDATE t SET v = $1");
+        let rc = stoolap_exec_params_counts(
+            db,
+            sql.as_ptr(),
+            one.as_ptr(),
+            1,
+            &mut matched,
+            &mut changed,
+        );
+        assert_eq!(rc, STOOLAP_OK);
+        assert_eq!((matched, changed), (2, 1), "exec_params_counts");
+
+        let sql = cstr("UPDATE t SET v = $1 WHERE id = 2");
+        let mut stmt: *mut StoolapStmt = std::ptr::null_mut();
+        stoolap_prepare(db, sql.as_ptr(), &mut stmt);
+        let rc = stoolap_stmt_exec_counts(stmt, one.as_ptr(), 1, &mut matched, &mut changed);
+        assert_eq!(rc, STOOLAP_OK);
+        assert_eq!((matched, changed), (1, 0), "stmt_exec_counts");
+        stoolap_stmt_finalize(stmt);
+
+        let mut tx: *mut StoolapTx = std::ptr::null_mut();
+        stoolap_begin(db, &mut tx);
+        let sql = cstr("UPDATE t SET v = v + $1");
+        let rc = stoolap_tx_exec_params_counts(
+            tx,
+            sql.as_ptr(),
+            one.as_ptr(),
+            1,
+            &mut matched,
+            &mut changed,
+        );
+        assert_eq!(rc, STOOLAP_OK);
+        assert_eq!((matched, changed), (2, 2), "tx_exec_params_counts");
+        stoolap_tx_commit(tx);
+
+        stoolap_close(db);
+    }
+}
+
 // =========================================================================
 // Clone for multi-threaded use
 // =========================================================================

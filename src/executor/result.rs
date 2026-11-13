@@ -35,6 +35,8 @@ use super::projection::Projection;
 pub struct ExecResult {
     /// Number of rows affected
     affected: i64,
+    /// Of those, the rows an UPDATE changed
+    changed: i64,
     /// Last insert ID (for auto-increment)
     insert_id: i64,
 }
@@ -56,7 +58,17 @@ impl ExecResult {
     pub fn new(rows_affected: i64, last_insert_id: i64) -> Self {
         Self {
             affected: rows_affected,
+            changed: rows_affected,
             insert_id: last_insert_id,
+        }
+    }
+
+    /// An UPDATE's result: the rows it matched, of which it changed `changed`
+    #[inline]
+    pub fn with_rows_changed(rows_affected: i64, changed: i64) -> Self {
+        Self {
+            changed,
+            ..Self::new(rows_affected, 0)
         }
     }
 
@@ -103,6 +115,10 @@ impl QueryResult for ExecResult {
 
     fn rows_affected(&self) -> i64 {
         self.affected
+    }
+
+    fn rows_changed(&self) -> i64 {
+        self.changed
     }
 
     fn last_insert_id(&self) -> i64 {
@@ -541,6 +557,10 @@ impl QueryResult for FilteredResult {
         self.inner.rows_affected()
     }
 
+    fn rows_changed(&self) -> i64 {
+        self.inner.rows_changed()
+    }
+
     fn last_insert_id(&self) -> i64 {
         self.inner.last_insert_id()
     }
@@ -775,6 +795,10 @@ impl QueryResult for LimitedResult {
 
     fn rows_affected(&self) -> i64 {
         self.inner.rows_affected()
+    }
+
+    fn rows_changed(&self) -> i64 {
+        self.inner.rows_changed()
     }
 
     fn last_insert_id(&self) -> i64 {
@@ -1691,6 +1715,10 @@ impl QueryResult for AliasedResult {
 
     fn rows_affected(&self) -> i64 {
         self.inner.rows_affected()
+    }
+
+    fn rows_changed(&self) -> i64 {
+        self.inner.rows_changed()
     }
 
     fn last_insert_id(&self) -> i64 {

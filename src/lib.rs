@@ -165,8 +165,8 @@ pub use executor::{
 
 // Re-export API types
 pub use api::{
-    Database, FromRow, FromValue, NamedParams, ParamVec, Params, ResultRow, Rows, Statement,
-    ToParam, Transaction as ApiTransaction,
+    Database, ExecCounts, FromRow, FromValue, NamedParams, ParamVec, Params, ResultRow, Rows,
+    Statement, ToParam, Transaction as ApiTransaction,
 };
 
 #[cfg(any(test, feature = "test-failpoints"))]

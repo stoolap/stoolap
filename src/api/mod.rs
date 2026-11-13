@@ -87,7 +87,7 @@ pub mod rows;
 pub mod statement;
 pub mod transaction;
 
-pub use database::{Database, FromValue};
+pub use database::{Database, ExecCounts, FromValue};
 pub use params::{NamedParams, ParamVec, Params, ToParam};
 pub use rows::{FromRow, ResultRow, Rows};
 pub use statement::Statement;
