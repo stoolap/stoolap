@@ -369,11 +369,14 @@ impl Executor {
         // A name the plan does not find is the error of the statement's own
         // run, planned again after it takes its view
         self.with_planned(stmt, compiled, classification, ctx, |planned| {
-            // A snapshot the caller gave that reads at its own point, or may
-            // have written, is the plan's to read
+            // A snapshot the caller gave that may have written, or reads at its
+            // own point without a view the key reads take, is the plan's to read
             if ctx
                 .and_then(ExecutionContext::statement_snapshot)
-                .is_some_and(|snapshot| !(snapshot.reads_latest() && snapshot.writes_nothing()))
+                .is_some_and(|snapshot| {
+                    !snapshot.writes_nothing()
+                        || (snapshot.view().is_none() && !snapshot.reads_latest())
+                })
             {
                 return None;
             }
@@ -549,18 +552,21 @@ impl Executor {
         transaction: Option<u64>,
     ) -> Result<Box<dyn QueryResult>> {
         let mut vm: Option<ExprVM> = None;
-        let mut out = RowVec::with_capacity(match &rows {
+        let count = match &rows {
             KeyRows::One(..) => 1,
             KeyRows::Many(rows) => rows.len(),
-        });
+        };
+        let mut out = RowVec::with_capacity(count);
         let mut passed = 0;
-        // The parameters a program reads as another value are read once a run
+        // The parameters a program reads as another value are read once a
+        // run of several rows; one row reads them once all the same
         let bound_filter = plan
             .filter
             .as_ref()
-            .filter(|filter| filter.binds_params())
+            .filter(|filter| count > 1 && filter.binds_params())
             .map(|filter| Program::bound(filter.clone(), params));
-        let bound_projection = plan.projection_binds.then(|| plan.projection.bound(params));
+        let bound_projection =
+            (count > 1 && plan.projection_binds).then(|| plan.projection.bound(params));
         let filter = bound_filter.as_ref().or(plan.filter.as_ref());
         let projection = bound_projection.as_ref().unwrap_or(&plan.projection);
         for (id, row) in rows {

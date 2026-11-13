@@ -9581,12 +9581,11 @@ impl MVCCEngine {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::before_index_get_manager();
         // Taken by name, none made; a rename after the check below moves this one
-        let mgr = self
-            .segment_managers
-            .read()
-            .unwrap()
-            .get(table_name)
-            .cloned();
+        let Ok(mgrs) = self.segment_managers.read() else {
+            return Ok(None);
+        };
+        let mgr = mgrs.get(table_name).cloned();
+        drop(mgrs);
         if !self
             .get_version_store(table_name)
             .is_ok_and(|named| Arc::ptr_eq(&named, store))

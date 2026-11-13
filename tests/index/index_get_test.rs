@@ -521,20 +521,28 @@ mod windows {
         db.execute("PRAGMA CHECKPOINT", ()).unwrap();
         assert_eq!(ids(&db, 1), vec![1, 5, 9, 13, 17]);
         let writer = db.clone();
+        let fired = Rc::new(std::cell::Cell::new(false));
+        let hook = Rc::clone(&fired);
         before_index_get_manager_taken(move || {
             writer.execute("ALTER TABLE o RENAME TO o_old", ()).unwrap();
+            hook.set(true);
         });
-        let found: Result<Vec<i64>, String> = db
-            .query("SELECT id FROM o WHERE g = $1", (1,))
-            .map_err(|e| e.to_string())
-            .map(|rows| {
-                rows.map(|row| row.unwrap().get::<i64>(0).unwrap())
-                    .collect()
-            });
+        let found = rows_or_error(&db);
+        assert!(fired.get(), "the rename ran before the manager was taken");
         assert!(
-            matches!(found.as_deref(), Ok([1, 5, 9, 13, 17]) | Err(_)),
-            "the sealed rows or a refusal, never no row: {found:?}"
+            matches!(
+                found.as_deref(),
+                Ok([1, 5, 9, 13, 17]) | Err(stoolap::core::Error::TableOrViewNotFound(_))
+            ),
+            "the sealed rows or the name refused, never no row: {found:?}"
         );
+    }
+
+    /// The ids `g = 1` reads, or the statement's error
+    fn rows_or_error(db: &Database) -> stoolap::Result<Vec<i64>> {
+        db.query("SELECT id FROM o WHERE g = $1", (1,))?
+            .map(|row| row.map(|r| r.get::<i64>(0).unwrap()))
+            .collect()
     }
 
     #[test]
@@ -566,6 +574,29 @@ mod windows {
         );
         db.execute("ALTER TABLE o_old RENAME TO o", ())
             .expect("the old name is free to take back");
+    }
+
+    #[test]
+    fn a_single_row_key_read_runs_its_programs_unbound() {
+        let _guard = FailpointGuard::new();
+        let db = Database::open("memory://index_get_single_row_bind").unwrap();
+        for sql in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v VECTOR(3))",
+            "INSERT INTO t VALUES (1, '[1,2,3]')",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        let sql = "SELECT VEC_DISTANCE_L2(v, $2) FROM t WHERE id = $1";
+        let params = || vec![stoolap::Value::Integer(1), stoolap::Value::text("[1,2,4]")];
+        db.query(sql, params()).unwrap().count();
+        let ran = programs_ran(|| {
+            assert_eq!(db.query(sql, params()).unwrap().count(), 1);
+        });
+        assert!(
+            ran.iter()
+                .any(|(listing, times)| *times == 1 && listing.contains("LoadParam")),
+            "one row reads its parameter in place, no copy bound for it: {ran:?}"
+        );
     }
 
     #[test]
@@ -745,20 +776,20 @@ mod windows {
         let db = table("index_get_dropped_table", false, &dir);
         assert_eq!(ids(&db, 1), vec![1, 5, 9, 13, 17]);
         let writer = db.clone();
+        let fired = Rc::new(std::cell::Cell::new(false));
+        let hook = Rc::clone(&fired);
         after_index_get_ids_taken(move || {
             writer.execute("DROP TABLE o", ()).unwrap();
+            hook.set(true);
         });
-        let found: Result<Vec<i64>, String> = db
-            .query("SELECT id FROM o WHERE g = $1", (1,))
-            .map_err(|e| e.to_string())
-            .and_then(|rows| {
-                rows.map(|row| row.map(|r| r.get::<i64>(0).unwrap()))
-                    .collect::<stoolap::Result<Vec<i64>>>()
-                    .map_err(|e| e.to_string())
-            });
+        let found = rows_or_error(&db);
+        assert!(fired.get(), "the drop ran between the ids and the rows");
         assert!(
-            matches!(found.as_deref(), Ok([1, 5, 9, 13, 17]) | Err(_)),
-            "the rows or a refusal, never no row: {found:?}"
+            matches!(
+                found.as_deref(),
+                Ok([1, 5, 9, 13, 17]) | Err(stoolap::core::Error::TableOrViewNotFound(_))
+            ),
+            "the rows or the table refused, never no row: {found:?}"
         );
     }
 

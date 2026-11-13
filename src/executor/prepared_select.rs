@@ -4432,12 +4432,11 @@ impl PreparedSelect {
         )
     }
 
-    /// Reads the statement's row by its primary key equality, else by an
-    /// equality a unique index of its column alone answers, else, for a
-    /// statement that is not `ordered`, the rows a non-unique index of its
-    /// column alone holds; skipping `offset` rows and keeping `limit`, for a
-    /// statement that asks no block, takes no set and computes no sort or
-    /// DISTINCT ON key; a run whose key names no row reads as the plan did
+    /// Reads the statement's rows by its primary key equality, else a unique
+    /// index's, else, unless `ordered`, a non-unique index's of the column
+    /// alone; skipping `offset` rows and keeping `limit`, for a statement
+    /// that asks no block, takes no set and computes no sort or DISTINCT ON
+    /// key; a run whose key names no row reads as the plan did
     pub(crate) fn read_by_key(
         &mut self,
         (table, store): (SmartString, &Arc<VersionStore>),
@@ -4469,7 +4468,16 @@ impl PreparedSelect {
                 let indexed = || {
                     equalities
                         .iter()
-                        .find(|key| store.index_on(key.index).is_some())
+                        .find(|key| {
+                            store.index_on(key.index).is_some_and(|index| {
+                                matches!(
+                                    index.index_type(),
+                                    crate::core::IndexType::BTree
+                                        | crate::core::IndexType::Hash
+                                        | crate::core::IndexType::Bitmap
+                                )
+                            })
+                        })
                         .filter(|_| !ordered)
                         .map(|key| (key, KeyReadBy::Index))
                 };
