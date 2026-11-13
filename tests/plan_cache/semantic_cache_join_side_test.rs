@@ -116,3 +116,54 @@ fn a_sealed_side_read_by_need_leaves_no_partial_rows_in_the_cache() {
         .collect();
     assert_eq!(notes, vec![Some("n".to_string()); 9], "notes of the rows");
 }
+
+#[test]
+fn a_filter_with_an_escape_parameter_is_read_from_its_table() {
+    let mut wrong = Vec::new();
+    for (at, (query, want)) in [
+        (
+            "SELECT p.id, o.id FROM p JOIN o ON o.qty = p.id \
+             WHERE o.id < o.qty AND o.note LIKE o.pattern ESCAPE $1",
+            1,
+        ),
+        (
+            "SELECT * FROM o WHERE id < qty AND note LIKE pattern ESCAPE $1",
+            2,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let db = Database::open(&format!("memory://semantic_join_side_escape_{at}")).unwrap();
+        for sql in [
+            "CREATE TABLE p (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE o (id INTEGER PRIMARY KEY, qty INTEGER, note TEXT, pattern TEXT)",
+            "INSERT INTO p VALUES (2)",
+            "INSERT INTO o VALUES (1, 2, 'a_b', 'a!_b'), (3, 4, 'axb', 'a!_b')",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        // The rows of the filter without the LIKE, cached first
+        db.query("SELECT * FROM o WHERE id < qty", ())
+            .unwrap()
+            .count();
+        db.query("SELECT * FROM o WHERE id < qty", ())
+            .unwrap()
+            .count();
+        let found: Result<Vec<i64>, String> = db
+            .query(query, ("!",))
+            .map_err(|e| e.to_string())
+            .and_then(|rows| {
+                rows.map(|row| {
+                    row.map_err(|e| e.to_string())?
+                        .get::<i64>(1)
+                        .map_err(|e| e.to_string())
+                })
+                .collect()
+            });
+        if found.as_deref() != Ok(&[want][..]) {
+            wrong.push(format!("{query}: {found:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

@@ -11724,6 +11724,12 @@ impl Executor {
             limit,
             offset,
         )?;
+        // A first seal after the check above may have let the scan leave
+        // unread columns out; volumes go away only with a commit the stamp
+        // predates, so a table still without them gave whole rows
+        if where_.needed.is_some() && table.narrows_scans() {
+            return Ok((result, token));
+        }
         let rows = Self::materialize_result(result)?;
         self.semantic_write(name, &columns, rows.rows(), predicate, params, stamp);
         Ok((

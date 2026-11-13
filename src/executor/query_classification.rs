@@ -410,7 +410,7 @@ impl QueryClassification {
 
     /// Analyze WHERE clause for various subquery types
     fn analyze_where_clause(expr: &Expression) -> (bool, bool, bool, bool, bool, bool, bool) {
-        let has_parameters = Self::expression_has_parameters(expr);
+        let has_parameters = super::utils::expression_has_parameters(expr);
         let mut has_exists = false;
         let mut has_in_subquery = false;
         let mut has_scalar_subquery = false;
@@ -758,60 +758,6 @@ impl QueryClassification {
     /// Check if an expression contains window functions
     pub(crate) fn expression_has_window_function(expr: &Expression) -> bool {
         expr.holds_window()
-    }
-
-    /// Check if an expression contains parameter placeholders ($1, $2, etc.)
-    /// Mirrors the implementation in utils.rs to ensure consistent behavior
-    fn expression_has_parameters(expr: &Expression) -> bool {
-        match expr {
-            Expression::Parameter(_) => true,
-            Expression::Prefix(prefix) => Self::expression_has_parameters(&prefix.right),
-            Expression::Infix(infix) => {
-                Self::expression_has_parameters(&infix.left)
-                    || Self::expression_has_parameters(&infix.right)
-            }
-            Expression::In(in_expr) => {
-                Self::expression_has_parameters(&in_expr.left)
-                    || match in_expr.right.as_ref() {
-                        Expression::List(list) => {
-                            list.elements.iter().any(Self::expression_has_parameters)
-                        }
-                        Expression::ExpressionList(list) => {
-                            list.expressions.iter().any(Self::expression_has_parameters)
-                        }
-                        other => Self::expression_has_parameters(other),
-                    }
-            }
-            Expression::Between(between) => {
-                Self::expression_has_parameters(&between.expr)
-                    || Self::expression_has_parameters(&between.lower)
-                    || Self::expression_has_parameters(&between.upper)
-            }
-            Expression::Like(like) => {
-                Self::expression_has_parameters(&like.left)
-                    || Self::expression_has_parameters(&like.pattern)
-            }
-            Expression::Case(case) => {
-                case.value
-                    .as_ref()
-                    .is_some_and(|e| Self::expression_has_parameters(e))
-                    || case.when_clauses.iter().any(|w| {
-                        Self::expression_has_parameters(&w.condition)
-                            || Self::expression_has_parameters(&w.then_result)
-                    })
-                    || case
-                        .else_value
-                        .as_ref()
-                        .is_some_and(|e| Self::expression_has_parameters(e))
-            }
-            Expression::FunctionCall(func) => {
-                func.arguments.iter().any(Self::expression_has_parameters)
-            }
-            Expression::Aliased(aliased) => Self::expression_has_parameters(&aliased.expression),
-            Expression::Cast(cast) => Self::expression_has_parameters(&cast.expr),
-            Expression::QuantifiedSet(set) => Self::expression_has_parameters(&set.left),
-            _ => false,
-        }
     }
 
     /// Whether an expression may answer differently in another statement

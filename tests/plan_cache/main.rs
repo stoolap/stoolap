@@ -35,6 +35,7 @@ mod query_cache_test;
 mod query_optimization_paths_test;
 mod semantic_cache_clear_test;
 mod semantic_cache_cross_handle_test;
+mod semantic_cache_join_seal_test;
 mod semantic_cache_join_side_test;
 mod semantic_cache_stamp_order_test;
 mod semantic_cache_tests;
