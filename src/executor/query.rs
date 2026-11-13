@@ -3116,14 +3116,16 @@ impl Executor {
             .map_or(table_name, |alias| alias.value_lower.as_str());
         let predicate = miss.simplified.as_deref().unwrap_or(where_expr);
         let params = classification.where_has_parameters.then(|| ctx.params());
+        let output_columns = || {
+            CompactArc::new(self.get_output_column_names(&stmt.columns, &all_columns, Some(alias)))
+        };
         match self.semantic_cache_answer(
             table_name,
-            stmt,
             &all_columns,
-            Some(alias),
             predicate,
             params,
             stamp,
+            output_columns,
         )? {
             Some((result, _)) => Ok(EarlySemantic::Hit(result)),
             None => Ok(EarlySemantic::Miss(miss)),
@@ -3174,7 +3176,7 @@ impl Executor {
     pub(crate) fn semantic_write<'r>(
         &self,
         table_name: &str,
-        columns: &[String],
+        columns: &CompactArc<Vec<String>>,
         rows: impl Iterator<Item = &'r Row>,
         predicate: &Expression,
         params: Option<&[Value]>,
@@ -3190,7 +3192,7 @@ impl Executor {
         };
         self.semantic_cache.insert(
             table_name,
-            columns.to_vec(),
+            CompactArc::clone(columns),
             rows.cloned().collect(),
             Some(predicate),
             stamp,
@@ -3213,14 +3215,16 @@ impl Executor {
         let table = self.prepared_table(table_name, ctx, None)?;
         let all_columns = table.schema().column_names_arc();
         let alias = source.alias.as_ref().map_or(table_name, |a| &a.value_lower);
+        let output_columns = || {
+            CompactArc::new(self.get_output_column_names(&stmt.columns, &all_columns, Some(alias)))
+        };
         let Some((result, columns)) = self.semantic_cache_answer(
             table_name,
-            stmt,
             &all_columns,
-            Some(alias),
             where_expr,
             params,
             stamp,
+            output_columns,
         )?
         else {
             return Ok(None);
@@ -3234,19 +3238,18 @@ impl Executor {
         Ok(Some((result, columns, false, shape)))
     }
 
-    /// The cached answer to `stmt` whose WHERE the cache reads as
-    /// `where_expr`; `params` are the values of one holding parameters,
-    /// which the cache reads as the literals they are written as
-    #[allow(clippy::too_many_arguments)]
-    fn semantic_cache_answer(
+    /// The cached rows of `table_name` over `all_columns` whose WHERE the
+    /// cache reads as `where_expr`, shown under `output_columns`; `params`
+    /// are the values of one holding parameters, which the cache reads as
+    /// the literals they are written as
+    pub(super) fn semantic_cache_answer(
         &self,
         table_name: &str,
-        stmt: &SelectStatement,
         all_columns: &[String],
-        table_alias: Option<&str>,
         where_expr: &Expression,
         params: Option<&[Value]>,
         stamp: super::semantic_cache::CacheStamp,
+        output_columns: impl FnOnce() -> CompactArc<Vec<String>>,
     ) -> Result<Option<CachedAnswer>> {
         use super::semantic_cache::{CacheLookupResult, SemanticCache};
         let bound;
@@ -3261,9 +3264,6 @@ impl Executor {
                 }
             }
             None => where_expr,
-        };
-        let output_columns = || {
-            CompactArc::new(self.get_output_column_names(&stmt.columns, all_columns, table_alias))
         };
         match self
             .semantic_cache
@@ -6272,9 +6272,10 @@ impl Executor {
             };
             let alias = ts.alias.as_ref().unwrap_or(&ts.name).value.as_str();
             let table = (ts.name.value_lower.as_str(), alias);
+            let read = (ctx, side.filter);
             let side = (index, where_);
             let (result, token) =
-                self.join_side_rows(run.blocks, run.run, side, table, ctx, extra, limit, offset)?;
+                self.join_side_rows(run.blocks, run.run, side, table, read, extra, limit, offset)?;
             let columns = result
                 .columns()
                 .iter()

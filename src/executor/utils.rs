@@ -628,48 +628,13 @@ pub fn extract_base_column_name(col_name: &str) -> String {
 /// stores results tied to specific parameter values, but the AST only
 /// contains parameter indices, not values.
 pub fn expression_has_parameters(expr: &Expression) -> bool {
-    match expr {
-        Expression::Parameter(_) => true,
-        Expression::Prefix(prefix) => expression_has_parameters(&prefix.right),
-        Expression::Infix(infix) => {
-            expression_has_parameters(&infix.left) || expression_has_parameters(&infix.right)
-        }
-        Expression::In(in_expr) => {
-            expression_has_parameters(&in_expr.left)
-                || match in_expr.right.as_ref() {
-                    Expression::List(list) => list.elements.iter().any(expression_has_parameters),
-                    Expression::ExpressionList(list) => {
-                        list.expressions.iter().any(expression_has_parameters)
-                    }
-                    other => expression_has_parameters(other),
-                }
-        }
-        Expression::Between(between) => {
-            expression_has_parameters(&between.expr)
-                || expression_has_parameters(&between.lower)
-                || expression_has_parameters(&between.upper)
-        }
-        Expression::Like(like) => {
-            expression_has_parameters(&like.left) || expression_has_parameters(&like.pattern)
-        }
-        Expression::Case(case) => {
-            case.value
-                .as_ref()
-                .is_some_and(|e| expression_has_parameters(e))
-                || case.when_clauses.iter().any(|wc| {
-                    expression_has_parameters(&wc.condition)
-                        || expression_has_parameters(&wc.then_result)
-                })
-                || case
-                    .else_value
-                    .as_ref()
-                    .is_some_and(|e| expression_has_parameters(e))
-        }
-        Expression::FunctionCall(func) => func.arguments.iter().any(expression_has_parameters),
-        Expression::Aliased(aliased) => expression_has_parameters(&aliased.expression),
-        Expression::Cast(cast) => expression_has_parameters(&cast.expr),
-        _ => false,
-    }
+    matches!(expr, Expression::Parameter(_))
+        || expr
+            .try_for_each_child(&mut |child| match expression_has_parameters(child) {
+                true => Err(()),
+                false => Ok(()),
+            })
+            .is_err()
 }
 
 /// Check if two expressions are structurally equivalent.

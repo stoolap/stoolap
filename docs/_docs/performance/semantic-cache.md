@@ -87,6 +87,7 @@ Best scenarios for semantic caching:
 - **Dashboard queries**: Similar queries with different filter values
 - **Range queries**: Successive queries on ranges
 - **Exploratory analysis**: Progressively filtering data
+- **Joins with a fixed side filter**: A join reads a table side whose own conditions are literals, such as `o.id < 300` in `SELECT p.id, o.id FROM products p JOIN orders o ON o.qty = p.id WHERE o.id < 300`, through the same cache as `SELECT * FROM orders WHERE id < 300`. A side whose conditions hold a parameter or a subquery is read from the table.
 
 ## When Caching Doesn't Apply
 

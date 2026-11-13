@@ -21,6 +21,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
+use stoolap::common::CompactArc;
 use stoolap::core::{Row, Value};
 use stoolap::executor::semantic_cache::CacheStamp;
 use stoolap::executor::{CacheLookupResult, SemanticCache};
@@ -72,7 +73,7 @@ fn hit(width: usize) -> usize {
     let predicate = predicate();
     cache.insert(
         "t",
-        columns.clone(),
+        CompactArc::new(columns.clone()),
         vec![row],
         Some(predicate.clone()),
         STAMP,
@@ -108,7 +109,13 @@ fn miss(entries: usize) -> usize {
     for i in 0..entries {
         let row = Row::from_values(vec![Value::integer(1); 2]);
         let predicate = where_of(&format!("SELECT * FROM t WHERE b > {i}"));
-        cache.insert("t", columns.clone(), vec![row], Some(predicate), STAMP);
+        cache.insert(
+            "t",
+            CompactArc::new(columns.clone()),
+            vec![row],
+            Some(predicate),
+            STAMP,
+        );
     }
     let predicate = where_of("SELECT * FROM t WHERE b < 0");
     let before = ALLOCATIONS.with(Cell::get);

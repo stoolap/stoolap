@@ -3728,6 +3728,17 @@ struct PreparedBlocks {
 /// passes is still asked the rest
 type ScanFilter = (Option<Box<dyn StorageExpr>>, bool);
 
+/// A whole WHERE as the semantic cache reads a `SELECT *` by it: without
+/// the side's qualifier, and whether the cache may answer it with and
+/// without the statement's parameters being its text's literals
+#[derive(Debug)]
+struct SemanticWhere {
+    predicate: Expression,
+    has_parameters: bool,
+    with_literals: bool,
+    without_literals: bool,
+}
+
 /// A statement's WHERE over its table's row: its program, what of it a scan
 /// takes, and the rows a set test's keys may narrow it to
 #[derive(Debug)]
@@ -3761,6 +3772,9 @@ pub(crate) struct PreparedWhere {
     /// How many conjuncts `pushdown` holds, of the WHERE's `conjuncts`
     pushed: usize,
     conjuncts: usize,
+    /// The conditions the semantic cache keys a join side's rows by, built
+    /// by the first run that asks it
+    semantic: std::sync::OnceLock<SemanticWhere>,
     /// The first conjunct equating the primary key, and the WHERE without
     /// it when it has another conjunct
     point: Option<(PreparedComparison, Option<SharedProgram>)>,
@@ -3829,6 +3843,32 @@ impl PreparedWhere {
             WhereRest::NarrowedScanned => self.narrowed_scanned.as_ref(),
         };
         program.unwrap_or(&self.whole)
+    }
+
+    /// `conditions`, the ones of a side read under `alias` that this WHERE
+    /// prepared, as the semantic cache reads them, with whether they hold
+    /// parameters; None for conditions the cache does not answer
+    fn semantic_where(
+        &self,
+        conditions: &Expression,
+        alias: &str,
+        literal_params: bool,
+    ) -> Option<(&Expression, bool)> {
+        use super::query_classification::QueryClassification;
+        let semantic = self.semantic.get_or_init(|| {
+            let predicate = strip_table_qualifier(conditions, alias);
+            SemanticWhere {
+                has_parameters: super::utils::expression_has_parameters(&predicate),
+                with_literals: QueryClassification::semantic_filter(&predicate, true),
+                without_literals: QueryClassification::semantic_filter(&predicate, false),
+                predicate,
+            }
+        });
+        let answers = match literal_params {
+            true => semantic.with_literals,
+            false => semantic.without_literals,
+        };
+        answers.then_some((&semantic.predicate, semantic.has_parameters))
     }
 }
 
@@ -4196,6 +4236,7 @@ impl WhereParts {
             narrowed_scanned,
             pushed,
             conjuncts: self.conjuncts,
+            semantic: std::sync::OnceLock::new(),
             pushdown,
             narrowing,
             sets,
@@ -11614,10 +11655,114 @@ impl Executor {
     /// The rows of table `name`, side `side` of the join `held` prepared,
     /// that its conditions on that side pass and the `extra` ones too, read
     /// as `run` reads a prepared statement's rows: from the `offset`-th up
-    /// to `limit` of them, with the table's layout, by the scan its
-    /// conditions `where_` plan
+    /// to `limit` of them, with the table's layout. A side read whole is
+    /// answered by the semantic cache as a `SELECT *` by its WHERE is, and
+    /// kept there when the cache misses
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn join_side_rows(
+        &self,
+        held: &JoinBlocks,
+        run: &PreparedRunner<'_>,
+        (side, where_): (usize, &PreparedWhere),
+        (name, alias): (&str, &str),
+        (ctx, conditions): (&ExecutionContext, Option<&Expression>),
+        extra: Option<&Expression>,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<(Box<dyn crate::storage::traits::QueryResult>, LayoutToken)> {
+        let whole = extra.is_none() && limit.is_none() && offset == 0;
+        let semantic = conditions
+            .filter(|_| whole && run.failed_slots.is_none() && Self::reads_cacheable_rows(ctx))
+            .and_then(|conditions| where_.semantic_where(conditions, alias, ctx.literal_params()))
+            .filter(|_| !ctx.has_cte_by_lower(name));
+        let Some((predicate, has_parameters)) = semantic else {
+            return self.join_side_scan(
+                held,
+                run,
+                (side, where_),
+                (name, alias),
+                ctx,
+                extra,
+                limit,
+                offset,
+            );
+        };
+        let table = self.join_side_table(held, side, name, ctx)?;
+        // A row that leaves an unread column out, or carries its row id, is
+        // no row of a `SELECT *`; the stamp is taken before the rows are read
+        let whole_rows = !where_.widen && (where_.needed.is_none() || !table.narrows_scans());
+        let stamp = (whole_rows && Self::semantic_rows_fit(&*table))
+            .then(|| self.semantic_write_stamp(name, ctx))
+            .flatten();
+        let Some(stamp) = stamp else {
+            return self.join_side_scan(
+                held,
+                run,
+                (side, where_),
+                (name, alias),
+                ctx,
+                extra,
+                limit,
+                offset,
+            );
+        };
+        let columns = table.schema().column_names_arc();
+        let params = has_parameters.then(|| ctx.params());
+        let shown = || CompactArc::clone(&columns);
+        if let Some((result, _)) =
+            self.semantic_cache_answer(name, &columns, predicate, params, stamp, shown)?
+        {
+            return Ok((result, table.layout_token()));
+        }
+        let (result, token) = self.join_side_scan(
+            held,
+            run,
+            (side, where_),
+            (name, alias),
+            ctx,
+            extra,
+            limit,
+            offset,
+        )?;
+        // A first seal after the check above may have let the scan leave
+        // unread columns out; volumes go away only with a commit the stamp
+        // predates, so a table still without them gave whole rows
+        if where_.needed.is_some() && table.narrows_scans() {
+            return Ok((result, token));
+        }
+        let rows = Self::materialize_result(result)?;
+        self.semantic_write(name, &columns, rows.rows(), predicate, params, stamp);
+        Ok((
+            Box::new(ExecutorResult::with_arc_columns(columns, rows)),
+            token,
+        ))
+    }
+
+    /// Table `name` of side `side` of the join `held`, refused as changed
+    /// when it is gone or no longer has the columns the side was prepared for
+    fn join_side_table(
+        &self,
+        held: &JoinBlocks,
+        side: usize,
+        name: &str,
+        ctx: &ExecutionContext,
+    ) -> Result<Box<dyn crate::storage::traits::Table>> {
+        let table = self
+            .prepared_table(name, ctx, None)
+            .map_err(|err| match err {
+                Error::TableNotFound(_) | Error::TableOrViewNotFound(_) => Error::SchemaChanged {
+                    table: name.to_string(),
+                },
+                err => err,
+            })?;
+        held.side_fits(side, &table.schema_arc())?;
+        Ok(table)
+    }
+
+    /// The rows of [`Self::join_side_rows`] read by the scan the side's
+    /// conditions `where_` plan
+    #[allow(clippy::too_many_arguments)]
+    fn join_side_scan(
         &self,
         held: &JoinBlocks,
         run: &PreparedRunner<'_>,
@@ -11631,15 +11776,7 @@ impl Executor {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::join_side_opening();
         // A table the side was prepared for and is gone changed under it
-        let table = self
-            .prepared_table(name, ctx, None)
-            .map_err(|err| match err {
-                Error::TableNotFound(_) | Error::TableOrViewNotFound(_) => Error::SchemaChanged {
-                    table: name.to_string(),
-                },
-                err => err,
-            })?;
-        held.side_fits(side, &table.schema_arc())?;
+        let table = self.join_side_table(held, side, name, ctx)?;
         let token = table.layout_token();
         let columns = table.schema().column_names_arc();
         let extra = extra.map(|extra| strip_table_qualifier(extra, alias));

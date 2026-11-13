@@ -133,15 +133,15 @@ pub const DEFAULT_MAX_GLOBAL_CACHED_ROWS: usize = 1_000_000;
 pub struct QueryFingerprint {
     /// Table name (lowercase)
     pub table_name: String,
-    /// Selected columns (sorted for comparison)
-    pub columns: Vec<String>,
+    /// Selected columns, shared with the table's schema
+    pub columns: CompactArc<Vec<String>>,
     /// Hash of the predicate structure (not values)
     pub predicate_structure_hash: u64,
 }
 
 impl QueryFingerprint {
     /// Create a fingerprint for a simple table scan
-    pub fn new(table_name: &str, columns: Vec<String>) -> Self {
+    pub fn new(table_name: &str, columns: CompactArc<Vec<String>>) -> Self {
         Self {
             table_name: table_name.to_lowercase(),
             columns,
@@ -150,7 +150,11 @@ impl QueryFingerprint {
     }
 
     /// Create a fingerprint with predicate structure
-    pub fn with_predicate(table_name: &str, columns: Vec<String>, predicate: &Expression) -> Self {
+    pub fn with_predicate(
+        table_name: &str,
+        columns: CompactArc<Vec<String>>,
+        predicate: &Expression,
+    ) -> Self {
         Self {
             table_name: table_name.to_lowercase(),
             columns,
@@ -176,7 +180,7 @@ pub struct CachedResult {
     /// What the rows were read under
     pub stamp: CacheStamp,
     /// Column names in order
-    pub column_names: Vec<String>,
+    pub column_names: CompactArc<Vec<String>>,
     /// Cached rows (Arc for zero-copy sharing on cache hits)
     pub rows: CompactArc<Vec<Row>>,
     /// The original WHERE predicate (for subsumption checking)
@@ -194,7 +198,7 @@ impl CachedResult {
     pub fn new(
         fingerprint: QueryFingerprint,
         stamp: CacheStamp,
-        column_names: Vec<String>,
+        column_names: CompactArc<Vec<String>>,
         rows: Vec<Row>,
         predicate: Option<Expression>,
     ) -> Self {
@@ -218,7 +222,7 @@ impl CachedResult {
     pub fn new_with_arc(
         fingerprint: QueryFingerprint,
         stamp: CacheStamp,
-        column_names: Vec<String>,
+        column_names: CompactArc<Vec<String>>,
         rows: CompactArc<Vec<Row>>,
         predicate: Option<Expression>,
     ) -> Self {
@@ -341,7 +345,7 @@ pub enum CacheLookupResult {
         /// Filter predicate to apply
         filter: Box<Expression>,
         /// Column names for evaluation context
-        columns: Vec<String>,
+        columns: CompactArc<Vec<String>>,
     },
     /// No match found
     Miss,
@@ -436,7 +440,7 @@ impl SemanticCache {
                 }
 
                 // Check if columns match
-                if entry.column_names != columns {
+                if entry.column_names.as_slice() != columns {
                     continue;
                 }
 
@@ -508,7 +512,7 @@ impl SemanticCache {
     pub fn insert(
         &self,
         table_name: &str,
-        columns: Vec<String>,
+        columns: CompactArc<Vec<String>>,
         rows: Vec<Row>,
         predicate: Option<Expression>,
         stamp: CacheStamp,
@@ -522,8 +526,8 @@ impl SemanticCache {
 
         let (table_key, column_key) = Self::cache_keys(table_name, &columns);
         let fingerprint = match &predicate {
-            Some(p) => QueryFingerprint::with_predicate(table_name, columns.clone(), p),
-            None => QueryFingerprint::new(table_name, columns.clone()),
+            Some(p) => QueryFingerprint::with_predicate(table_name, CompactArc::clone(&columns), p),
+            None => QueryFingerprint::new(table_name, CompactArc::clone(&columns)),
         };
 
         let entry = CachedResult::new(fingerprint, stamp, columns, rows, predicate);
@@ -537,7 +541,7 @@ impl SemanticCache {
     pub fn insert_arc(
         &self,
         table_name: &str,
-        columns: Vec<String>,
+        columns: CompactArc<Vec<String>>,
         rows: CompactArc<Vec<Row>>,
         predicate: Option<Expression>,
         stamp: CacheStamp,
@@ -551,8 +555,8 @@ impl SemanticCache {
 
         let (table_key, column_key) = Self::cache_keys(table_name, &columns);
         let fingerprint = match &predicate {
-            Some(p) => QueryFingerprint::with_predicate(table_name, columns.clone(), p),
-            None => QueryFingerprint::new(table_name, columns.clone()),
+            Some(p) => QueryFingerprint::with_predicate(table_name, CompactArc::clone(&columns), p),
+            None => QueryFingerprint::new(table_name, CompactArc::clone(&columns)),
         };
 
         let entry = CachedResult::new_with_arc(fingerprint, stamp, columns, rows, predicate);
@@ -1518,7 +1522,7 @@ mod tests {
 
         cache.insert(
             "orders",
-            vec!["id".to_string(), "amount".to_string()],
+            CompactArc::new(vec!["id".to_string(), "amount".to_string()]),
             rows.clone(),
             Some(make_gt("amount", 100)),
             STAMP,
@@ -1556,7 +1560,7 @@ mod tests {
 
         cache.insert(
             "orders",
-            vec!["id".to_string(), "amount".to_string()],
+            CompactArc::new(vec!["id".to_string(), "amount".to_string()]),
             rows,
             Some(make_gt("amount", 100)),
             STAMP,
@@ -1585,7 +1589,7 @@ mod tests {
 
         cache.insert(
             "orders",
-            vec!["id".to_string()],
+            CompactArc::new(vec!["id".to_string()]),
             vec![Row::from_values(vec![Value::Integer(1)])],
             None,
             STAMP,
@@ -1607,7 +1611,7 @@ mod tests {
         ])];
         cache.insert(
             "orders",
-            columns.clone(),
+            CompactArc::new(columns.clone()),
             rows,
             Some(make_gt("amount", 100)),
             STAMP,
@@ -1645,7 +1649,7 @@ mod tests {
         let insert = |table: &str| {
             cache.insert(
                 table,
-                columns.clone(),
+                CompactArc::new(columns.clone()),
                 row(),
                 Some(make_gt("amount", 100)),
                 STAMP,
