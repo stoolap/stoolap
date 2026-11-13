@@ -3175,7 +3175,7 @@ impl Executor {
     pub(crate) fn semantic_write<'r>(
         &self,
         table_name: &str,
-        columns: &[String],
+        columns: &CompactArc<Vec<String>>,
         rows: impl Iterator<Item = &'r Row>,
         predicate: &Expression,
         params: Option<&[Value]>,
@@ -3191,7 +3191,7 @@ impl Executor {
         };
         self.semantic_cache.insert(
             table_name,
-            columns.to_vec(),
+            CompactArc::clone(columns),
             rows.cloned().collect(),
             Some(predicate),
             stamp,
