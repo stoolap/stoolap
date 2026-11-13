@@ -1278,20 +1278,34 @@ impl JoinStream {
 
     /// Into `part`, the next joined rows until it holds `rows` of them;
     /// false once every row was made. A slice with no residual to ask moves
-    /// its rows over at once
-    pub(crate) fn fill(&mut self, part: &mut RowVec, rows: usize) -> Result<bool> {
+    /// its rows over at once; the cancel is checked every hundred rows read
+    /// one at a time and before each slice
+    pub(crate) fn fill(
+        &mut self,
+        part: &mut RowVec,
+        rows: usize,
+        ctx: &ExecutionContext,
+    ) -> Result<bool> {
         while part.len() < rows {
             match &mut self.source {
                 StreamSource::Slices(slices, made) if self.residual_filters.is_empty() => {
                     let wanted = rows - part.len();
                     part.extend(made.by_ref().take(wanted).map(|row| (0, row)));
-                    if part.len() < rows && !next_slice(slices, made) {
-                        self.open = false;
-                        return Ok(false);
+                    if part.len() < rows {
+                        ctx.check_cancelled()?;
+                        if !next_slice(slices, made) {
+                            self.open = false;
+                            return Ok(false);
+                        }
                     }
                 }
                 _ => match self.next_row()? {
-                    Some(row) => part.push((0, row)),
+                    Some(row) => {
+                        part.push((0, row));
+                        if part.len().is_multiple_of(100) {
+                            ctx.check_cancelled()?;
+                        }
+                    }
                     None => return Ok(false),
                 },
             }

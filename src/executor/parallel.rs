@@ -811,10 +811,25 @@ impl Probe<'_> {
         let (matched_rows, unmatched_probe_rows) = {
             #[cfg(feature = "parallel")]
             {
+                // Chunks small enough that a slice of few probe rows still
+                // spreads over every thread
+                let threads = num_threads();
+                let chunk_rows = probe_rows
+                    .len()
+                    .div_ceil(threads)
+                    .clamp(1, config.chunk_size.max(1000));
+                #[cfg(feature = "test-failpoints")]
+                if use_parallel {
+                    crate::test_failpoints::join_probe_chunks(
+                        probe_rows.len(),
+                        chunk_rows,
+                        threads,
+                    );
+                }
                 if use_parallel && join_type == JoinType::Inner {
                     // For INNER joins, we can fully parallelize the probe phase
                     let matches: Vec<Row> = probe_rows
-                        .par_chunks(config.chunk_size.max(1000))
+                        .par_chunks(chunk_rows)
                         .flat_map(|chunk| {
                             let mut local_results = Vec::new();
                             for probe_row in chunk {
@@ -851,7 +866,7 @@ impl Probe<'_> {
 
                     // Each chunk returns: (matched_rows, unmatched_probe_rows)
                     let chunk_results: Vec<(Vec<Row>, Vec<Row>)> = probe_rows
-                        .par_chunks(config.chunk_size.max(1000))
+                        .par_chunks(chunk_rows)
                         .map(|chunk| {
                             let mut matched_results = Vec::new();
                             let mut unmatched_results = Vec::new();

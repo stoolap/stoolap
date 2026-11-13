@@ -499,11 +499,7 @@ impl RowSource for JoinedRows<'_, '_> {
             part.clear();
             // With no WHERE to ask, the join fills the part itself
             let more = match self.where_ {
-                None => {
-                    let more = self.stream.fill(&mut part, part_rows)?;
-                    self.ctx.check_cancelled()?;
-                    more
-                }
+                None => self.stream.fill(&mut part, part_rows, self.ctx)?,
                 Some(_) => {
                     while part.len() < part_rows {
                         match self.next_passed()? {

@@ -331,3 +331,134 @@ fn a_residual_and_a_distinct_count_read_a_join_built_across_threads() {
                GROUP BY bl.g ORDER BY bl.g";
     assert_eq!(parted_across_threads(&db, sql), expected);
 }
+
+#[test]
+fn a_slice_of_probe_rows_meeting_many_rows_is_probed_on_every_thread() {
+    let db = Database::open("memory://join_aggregate_parts_fan_out").unwrap();
+    for sql in [
+        "CREATE TABLE fl (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE TABLE fs (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO fl SELECT value, value % 200 FROM generate_series(1, 10000)",
+        "INSERT INTO fs SELECT value, value % 200 FROM generate_series(1, 10000)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let mut per_key: BTreeMap<i64, i64> = BTreeMap::new();
+    for l in 1..=10_000i64 {
+        *per_key.entry(l % 200).or_default() += 1;
+    }
+    let (mut count, mut sum) = (0, 0);
+    for s in 1..=10_000i64 {
+        let met = per_key[&(s % 200)];
+        count += met;
+        sum += met * s;
+    }
+    let sql = "SELECT COUNT(*), SUM(fs.id) FROM fs JOIN fl ON fs.k = fl.k";
+    #[cfg(feature = "test-failpoints")]
+    {
+        stoolap::test_failpoints::set_join_part_rows(2_000);
+        stoolap::test_failpoints::reset_join_probes_narrow();
+        stoolap::test_failpoints::reset_join_paths();
+    }
+    let out = rows(&db, sql);
+    #[cfg(feature = "test-failpoints")]
+    {
+        stoolap::test_failpoints::set_join_part_rows(0);
+        assert_eq!(
+            stoolap::test_failpoints::join_paths_taken(),
+            vec!["parallel_hash"],
+            "{sql}"
+        );
+        let narrow = stoolap::test_failpoints::join_probes_narrow();
+        assert_eq!(
+            narrow, 0,
+            "{sql}: {narrow} slices were probed in fewer chunks than the threads could take"
+        );
+    }
+    assert_eq!(out, vec![[int(count), int(sum)].join("|")]);
+}
+
+mod cancel {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use stoolap::core::{Result, Value};
+    use stoolap::functions::registry::global_registry;
+    use stoolap::functions::{
+        FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
+    };
+    use stoolap::{Error, ExecutionContext, Executor};
+
+    static TO_CANCEL: Mutex<Option<ExecutionContext>> = Mutex::new(None);
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    /// Returns its argument, counts its calls and cancels `TO_CANCEL`
+    #[derive(Default)]
+    struct JoinCancelNow;
+
+    impl ScalarFunction for JoinCancelNow {
+        fn name(&self) -> &str {
+            "JOIN_CANCEL_NOW"
+        }
+        fn info(&self) -> FunctionInfo {
+            FunctionInfo::new(
+                "JOIN_CANCEL_NOW",
+                FunctionType::Scalar,
+                "test cancel",
+                FunctionSignature::new(
+                    FunctionDataType::Integer,
+                    vec![FunctionDataType::Any],
+                    1,
+                    1,
+                ),
+            )
+        }
+        fn evaluate(&self, args: &[Value]) -> Result<Value> {
+            CALLS.fetch_add(1, Ordering::Relaxed);
+            if let Some(ctx) = TO_CANCEL.lock().unwrap().as_ref() {
+                ctx.cancel();
+            }
+            Ok(args[0].clone())
+        }
+        fn clone_box(&self) -> Box<dyn ScalarFunction> {
+            Box::new(JoinCancelNow)
+        }
+    }
+
+    #[test]
+    fn a_cancel_stops_a_join_read_in_parts_within_a_hundred_rows() {
+        global_registry()
+            .register_scalar::<JoinCancelNow>()
+            .unwrap();
+        for (db, sql) in [
+            (
+                super::open("join_aggregate_parts_cancel_one"),
+                "SELECT COUNT(*) FROM l JOIN r ON l.k = r.k \
+                 AND JOIN_CANCEL_NOW(l.id + r.id) = l.id + r.id",
+            ),
+            (
+                super::open_wide("join_aggregate_parts_cancel_wide"),
+                "SELECT COUNT(*) FROM bl JOIN br ON bl.u = br.u \
+                 AND JOIN_CANCEL_NOW(bl.id + br.id) = bl.id + br.id",
+            ),
+        ] {
+            let executor = Executor::new(Arc::clone(db.engine()));
+            let ctx = ExecutionContext::new();
+            *TO_CANCEL.lock().unwrap() = Some(ctx.clone());
+            let before = CALLS.load(Ordering::Relaxed);
+            let read = executor
+                .execute_with_context(sql, &ctx)
+                .and_then(|mut rows| {
+                    while rows.next() {}
+                    rows.last_error().map_or(Ok(()), Err)
+                });
+            *TO_CANCEL.lock().unwrap() = None;
+            let calls = CALLS.load(Ordering::Relaxed) - before;
+            assert!(
+                matches!(read, Err(Error::QueryCancelled)),
+                "{sql}: {read:?}"
+            );
+            assert!(calls <= 100, "{sql}: {calls} rows joined after the cancel");
+        }
+    }
+}
