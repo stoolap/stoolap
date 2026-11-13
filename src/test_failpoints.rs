@@ -120,6 +120,25 @@ pub static WAL_CUT_FAIL: AtomicBool = AtomicBool::new(false);
 /// Fail WAL `sync_locked()` (fsync) with an I/O error
 pub static WAL_SYNC_FAIL: AtomicBool = AtomicBool::new(false);
 
+/// The directory whose databases alone fail their WAL syncs, so tests
+/// beside the one failing them keep theirs
+static WAL_SYNC_FAIL_UNDER: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+/// Fail the WAL syncs of the databases under `dir` from now on; None stops it
+pub fn fail_wal_syncs_under(dir: Option<&std::path::Path>) {
+    *WAL_SYNC_FAIL_UNDER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = dir.map(std::path::Path::to_path_buf);
+}
+
+pub(crate) fn wal_sync_fails_at(wal: &std::path::Path) -> bool {
+    WAL_SYNC_FAIL_UNDER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_deref()
+        .is_some_and(|dir| wal.starts_with(dir))
+}
+
 /// Run every text by its own plan, none shared by its literals
 pub static LITERAL_SHARING_OFF: AtomicBool = AtomicBool::new(false);
 
@@ -3722,6 +3741,7 @@ pub fn reset_all() {
     WAL_WRITE_PARTIAL.store(false, Release);
     WAL_CUT_FAIL.store(false, Release);
     WAL_SYNC_FAIL.store(false, Release);
+    fail_wal_syncs_under(None);
     WAL_SCAN_READ_FAIL.store(false, Release);
     SNAPSHOT_WRITE_FAIL.store(false, Release);
     SNAPSHOT_SYNC_FAIL.store(false, Release);

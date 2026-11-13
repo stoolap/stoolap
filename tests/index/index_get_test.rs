@@ -505,13 +505,12 @@ mod windows {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
-    use std::sync::atomic::Ordering;
     use std::sync::mpsc;
     use std::time::Duration;
     use stoolap::test_failpoints::{
         after_commit_index_removed, after_compiled_epoch_checked, after_index_get_ids_taken,
-        after_indexes_published, before_index_get_manager_taken, programs_ran, take_read_paths,
-        FailpointGuard, WAL_SYNC_FAIL,
+        after_indexes_published, before_index_get_manager_taken, fail_wal_syncs_under,
+        programs_ran, take_read_paths, FailpointGuard,
     };
 
     #[test]
@@ -634,12 +633,14 @@ mod windows {
         let reader = db.clone();
         let seen = Rc::new(RefCell::new(None));
         let slot = Rc::clone(&seen);
+        // Only this database's WAL fails its sync; the tests beside it keep theirs
+        let own = dir.path().to_path_buf();
         after_indexes_published(move || {
             *slot.borrow_mut() = Some(ids(&reader, 2));
-            WAL_SYNC_FAIL.store(true, Ordering::Release);
+            fail_wal_syncs_under(Some(&own));
         });
         let failed = db.execute("DELETE FROM o WHERE id = 6", ()).is_err();
-        WAL_SYNC_FAIL.store(false, Ordering::Release);
+        fail_wal_syncs_under(None);
         assert!(failed, "the commit failed");
         assert_eq!(
             seen.borrow_mut().take(),
