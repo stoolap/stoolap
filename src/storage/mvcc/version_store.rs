@@ -7344,6 +7344,8 @@ struct KeyTracking {
     key_changes: Vec<(i64, u64)>,
     /// The index generation the positions are of, ALL_KEYS once it moved
     changes_read_at: u64,
+    /// How many of `key_changes` a claim has entered under their new keys
+    changes_entered: usize,
     /// The unique indexes beside the key, by the generation of the parent's
     /// indexes they were read at
     unique_indexes: Option<(u64, UniqueIndexes)>,
@@ -7684,8 +7686,8 @@ impl TransactionVersionStore {
 
     /// Notes that a write is giving `row_id` the row `new` in place of the
     /// version it holds now, when a unique key differs, for the statement's
-    /// end to judge, and enters the new key for later rows to meet; a new
-    /// row's insert judged its keys itself
+    /// end to judge and the next claim to enter; a new row's insert judged
+    /// its keys itself
     fn note_key_change(&mut self, row_id: i64, new: &Row) {
         if self.tracking.is_none() || !self.parent_store.may_hold_unique_beside_key() {
             return;
@@ -7713,8 +7715,6 @@ impl TransactionVersionStore {
             let columns = index.column_ids();
             if (columns.iter()).any(|&id| old.get(id as usize) != new.get(id as usize)) {
                 changed |= 1u64.checked_shl(at as u32).unwrap_or(u64::MAX);
-                let hash = row_key_hash(new, columns);
-                key_rows(&mut tracking.local_keys, columns).set(row_id, hash);
             }
         }
         if changed != 0 {
@@ -7737,8 +7737,40 @@ impl TransactionVersionStore {
     pub(crate) fn take_key_changes(&mut self) -> (Vec<(i64, u64)>, u64) {
         (self.tracking.as_deref_mut()).map_or_else(
             || (Vec::new(), ALL_KEYS),
-            |t| (std::mem::take(&mut t.key_changes), t.changes_read_at),
+            |t| {
+                t.changes_entered = 0;
+                (std::mem::take(&mut t.key_changes), t.changes_read_at)
+            },
         )
+    }
+
+    /// Enters the rows of the key changes no claim has entered yet under
+    /// the keys their latest versions hold, so a later row of the statement
+    /// meets them
+    fn enter_noted_keys(&mut self) {
+        let local_versions = self.local_versions.as_ref();
+        let Some(tracking) = self.tracking.as_deref_mut() else {
+            return;
+        };
+        let Some((read_at, indexes)) = tracking.unique_indexes.as_ref() else {
+            return;
+        };
+        let every = tracking.changes_read_at != *read_at;
+        for &(row_id, changed) in &tracking.key_changes[tracking.changes_entered..] {
+            let latest = (local_versions.and_then(|all| all.get(row_id)))
+                .and_then(|versions| versions.last())
+                .filter(|version| !version.is_deleted());
+            for (at, index) in indexes.iter().enumerate() {
+                let bit = 1u64.checked_shl(at as u32).unwrap_or(u64::MAX);
+                if !every && changed & bit == 0 {
+                    continue;
+                }
+                let columns = index.column_ids();
+                let hash = latest.and_then(|version| row_key_hash(&version.data, columns));
+                key_rows(&mut tracking.local_keys, columns).set(row_id, hash);
+            }
+        }
+        tracking.changes_entered = tracking.key_changes.len();
     }
 
     /// Whether a write changed a unique key since the last statement end
@@ -7795,9 +7827,10 @@ impl TransactionVersionStore {
         row_id: i64,
     ) -> Result<Option<i64>, Error> {
         // A claim judges against every key the rows hold, so it tracks them
-        // all, of an index that came since too
+        // all, of an index that came since and of the writes noted since
         self.track_keys();
         self.unique_indexes();
+        self.enter_noted_keys();
         if let Some(holder) = self.committed_holder(index, values, row_id)? {
             return Ok(Some(holder));
         }
@@ -9437,6 +9470,7 @@ impl TransactionVersionStore {
         // among the local keys find no row holding them
         if let Some(tracking) = self.tracking.as_deref_mut() {
             tracking.key_changes.clear();
+            tracking.changes_entered = 0;
         }
         // Rows given back an earlier version or none, whose keys are entered
         // again or taken out
