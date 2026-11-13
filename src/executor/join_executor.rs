@@ -86,6 +86,7 @@ use crate::executor::expression::{JoinFilter, RowFilter, SharedProgram, Subquery
 use crate::executor::hash_table::JoinHashTable;
 use crate::executor::operator::{MaterializedOperator, Operator};
 use crate::executor::operators::hash_join::{HashJoinOperator, JoinSide, JoinType};
+use crate::executor::operators::index_nested_loop::BatchIndexNestedLoopJoinOperator;
 use crate::executor::operators::nested_loop_join::NestedLoopJoinOperator;
 use crate::executor::parallel::{
     parallel_hash_join_with_room, HashJoinSlices, ParallelConfig, DEFAULT_PARALLEL_JOIN_THRESHOLD,
@@ -1216,30 +1217,44 @@ pub(crate) fn join_part_rows() -> usize {
     JOIN_PART_ROWS
 }
 
-/// What makes a stream's joined rows: an operator, or a parallel hash join a
-/// slice at a time with the rows of its slice not yet read
-enum StreamSource {
-    Operator(Box<dyn Operator>),
+/// What makes a stream's joined rows: an operator, a batch index join, or a
+/// parallel hash join a slice at a time with the rows of its slice not yet read
+enum StreamSource<'a> {
+    Operator(Box<dyn Operator + 'a>),
+    IndexBatch(Box<BatchIndexNestedLoopJoinOperator<'a>>),
     Slices(Box<HashJoinSlices>, std::vec::IntoIter<Row>),
 }
 
 /// A join's rows as they are made, each passed by the residual filters, an
 /// operator closed at their end
-pub(crate) struct JoinStream {
-    source: StreamSource,
+pub(crate) struct JoinStream<'a> {
+    source: StreamSource<'a>,
     residual_filters: Vec<RowFilter>,
     room: usize,
     open: bool,
 }
 
-impl JoinStream {
+impl<'a> JoinStream<'a> {
+    /// The rows `op` makes, opened here, as an aggregation reads them
+    pub(crate) fn of_operator(op: Box<dyn Operator + 'a>) -> Result<Self> {
+        Self::new(StreamSource::Operator(op), Vec::new(), 0)
+    }
+
+    /// The rows the batch index join `op` makes, opened here, filled into
+    /// a part without a call per row
+    pub(crate) fn of_index_batch(op: BatchIndexNestedLoopJoinOperator<'a>) -> Result<Self> {
+        Self::new(StreamSource::IndexBatch(Box::new(op)), Vec::new(), 0)
+    }
+
     fn new(
-        mut source: StreamSource,
+        mut source: StreamSource<'a>,
         residual_filters: Vec<RowFilter>,
         room: usize,
     ) -> Result<Self> {
-        if let StreamSource::Operator(op) = &mut source {
-            op.open()?;
+        match &mut source {
+            StreamSource::Operator(op) => op.open()?,
+            StreamSource::IndexBatch(op) => op.open()?,
+            StreamSource::Slices(..) => {}
         }
         Ok(Self {
             source,
@@ -1258,6 +1273,7 @@ impl JoinStream {
             StreamSource::Operator(op) => {
                 next_passing(&mut **op, &self.residual_filters, None, self.room)?
             }
+            StreamSource::IndexBatch(op) => op.next_joined()?,
             StreamSource::Slices(slices, rows) => loop {
                 match rows.next() {
                     Some(row) if passes(&self.residual_filters, &row, None)? => break Some(row),
@@ -1268,18 +1284,25 @@ impl JoinStream {
             },
         };
         if row.is_none() {
-            self.open = false;
-            if let StreamSource::Operator(op) = &mut self.source {
-                op.close()?;
-            }
+            self.close()?;
         }
         Ok(row)
     }
 
+    /// Marks the stream ended, its operator closed
+    fn close(&mut self) -> Result<()> {
+        self.open = false;
+        match &mut self.source {
+            StreamSource::Operator(op) => op.close(),
+            StreamSource::IndexBatch(op) => op.close(),
+            StreamSource::Slices(..) => Ok(()),
+        }
+    }
+
     /// Into `part`, the next joined rows until it holds `rows` of them;
     /// false once every row was made. A slice with no residual to ask moves
-    /// its rows over at once; the cancel is checked every hundred rows read
-    /// one at a time and before each slice
+    /// its rows over at once, a batch index join fills a hundred at a time;
+    /// the cancel is checked every hundred rows and before each slice
     pub(crate) fn fill(
         &mut self,
         part: &mut RowVec,
@@ -1298,6 +1321,14 @@ impl JoinStream {
                             return Ok(false);
                         }
                     }
+                }
+                StreamSource::IndexBatch(op) if self.open => {
+                    let until = (part.len() + 100).min(rows);
+                    if !op.fill_joined(part, until)? {
+                        self.close()?;
+                        return Ok(false);
+                    }
+                    ctx.check_cancelled()?;
                 }
                 _ => match self.next_row()? {
                     Some(row) => {
@@ -1329,7 +1360,7 @@ fn next_slice(slices: &mut HashJoinSlices, rows: &mut std::vec::IntoIter<Row>) -
 /// A join's rows: all of them made at once, or made as they are read
 pub(crate) enum JoinRows {
     Held(RowVec),
-    Streamed(JoinStream),
+    Streamed(JoinStream<'static>),
 }
 
 impl Default for JoinExecutor {

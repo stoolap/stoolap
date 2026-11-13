@@ -451,14 +451,28 @@ impl<'r, 'p> JoinedWhere<'r, 'p> {
 /// A join's rows as the join makes them, those `where_` passes, as an
 /// aggregation reads them, the cancel checked every hundred
 struct JoinedRows<'r, 'p> {
-    stream: JoinStream,
+    stream: JoinStream<'r>,
     where_: Option<JoinedWhere<'r, 'p>>,
     ctx: &'r ExecutionContext,
     row: Option<Row>,
     read: u64,
 }
 
-impl JoinedRows<'_, '_> {
+impl<'r, 'p> JoinedRows<'r, 'p> {
+    fn new(
+        stream: JoinStream<'r>,
+        where_: Option<JoinedWhere<'r, 'p>>,
+        ctx: &'r ExecutionContext,
+    ) -> Self {
+        Self {
+            stream,
+            where_,
+            ctx,
+            row: None,
+            read: 0,
+        }
+    }
+
     fn next_passed(&mut self) -> Result<Option<Row>> {
         while let Some(row) = self.stream.next_row()? {
             self.read += 1;
@@ -4812,6 +4826,13 @@ impl Executor {
                     if let Some(run) = &blocks_run {
                         run.ask_rows(outer_result.estimated_count());
                     }
+                    // An aggregate reads the joined rows in parts as the join
+                    // makes them, under the general path's conditions
+                    let in_parts = classification.has_aggregation
+                        && !classification.has_window_functions
+                        && blocks.as_deref().is_none_or(|held| !held.asks_sites())
+                        && !(side_merged && !apart)
+                        && !Self::grouped_family_reach(stmt, classification);
                     let mut result_rows = RowVec::new();
                     // A primary key join without a limit fetches its rows in one
                     // batch; an index lookup streams, which costs less than the
@@ -4871,6 +4892,23 @@ impl Executor {
                             }
                             if let Some(ref proj) = projection_pushdown {
                                 op = op.with_projection(proj.columns.clone());
+                            }
+                            // With no limit, no probe cap and the inner key known,
+                            // the join never falls back, so no row read is undone
+                            if in_parts
+                                && join_limit.is_none()
+                                && !keeps_outer
+                                && inner_key_idx.is_some()
+                            {
+                                let stream = JoinStream::of_operator(Box::new(op))?;
+                                let source = JoinedRows::new(stream, cross_row_filter, ctx);
+                                return self.aggregate_joined(
+                                    plan.as_deref(),
+                                    stmt,
+                                    ctx,
+                                    source,
+                                    &all_columns,
+                                );
                             }
                             Self::collect_join_rows(
                                 &mut op,
@@ -4997,6 +5035,17 @@ impl Executor {
                         }
                         if let Some(ref proj) = projection_pushdown {
                             op = op.with_projection(proj.columns.clone());
+                        }
+                        if in_parts {
+                            let stream = JoinStream::of_index_batch(op)?;
+                            let source = JoinedRows::new(stream, cross_row_filter, ctx);
+                            return self.aggregate_joined(
+                                plan.as_deref(),
+                                stmt,
+                                ctx,
+                                source,
+                                &all_columns,
+                            );
                         }
                         Self::collect_join_rows(
                             &mut op,
@@ -5793,18 +5842,8 @@ impl Executor {
                 }
                 None => None,
             };
-            let source = JoinedRows {
-                stream,
-                where_,
-                ctx,
-                row: None,
-                read: 0,
-            };
-            let feed = plan.as_deref().map(|plan| plan.feed(&all_columns));
-            let result = self.aggregate_each(stmt, ctx, source, &all_columns, feed.as_deref())?;
-            let layout = Self::result_layout(stmt, &all_columns, None, result.columns());
-            let columns = CompactArc::new(result.columns().to_vec());
-            return Ok((result, columns, false, SelectShape::laid_out(layout)));
+            let source = JoinedRows::new(stream, where_, ctx);
+            return self.aggregate_joined(plan.as_deref(), stmt, ctx, source, &all_columns);
         }
 
         // Apply WHERE clause if present
@@ -6684,6 +6723,23 @@ impl Executor {
             self.group_and_window_rows(stmt, ctx, classification, rows, columns, layout, held)?;
         let columns = CompactArc::new(result.columns().to_vec());
         Ok((result, columns, false, SelectShape::laid_out(layout)))
+    }
+
+    /// A join's aggregate over the rows of `source`, of `columns`, read in
+    /// parts as the join makes them, its calls fed by programs the `plan` holds
+    fn aggregate_joined(
+        &self,
+        plan: Option<&PreparedJoin>,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        source: JoinedRows<'_, '_>,
+        columns: &[String],
+    ) -> SelectResult {
+        let feed = plan.map(|plan| plan.feed(columns));
+        let result = self.aggregate_each(stmt, ctx, source, columns, feed.as_deref())?;
+        let layout = Self::result_layout(stmt, columns, None, result.columns());
+        let names = CompactArc::new(result.columns().to_vec());
+        Ok((result, names, false, SelectShape::laid_out(layout)))
     }
 
     /// A join's grouped output over its joined `rows` of `columns`, each

@@ -965,12 +965,68 @@ impl Operator for IndexNestedLoopJoinOperator<'_> {
     }
 }
 
+/// The rows a batch index join fetched in `open`: each inner row pairs with
+/// the outer rows of its key, then a LEFT join's outer rows none met follow
+struct Fetched {
+    outer_rows: Vec<Row>,
+    outers_of: I64Map<SmallVec<[usize; 2]>>,
+    inner_rows: RowVec,
+    matched: Vec<bool>,
+    /// The inner row next paired, its outer rows taken from `outers_of`,
+    /// and the place among them
+    inner_at: usize,
+    outers: SmallVec<[usize; 2]>,
+    outer_at: usize,
+    /// The next outer row to make alone, after every pair
+    alone_at: usize,
+    /// The inner side's NULLs, for a LEFT join
+    null_inner: Option<Row>,
+    condition_failed: bool,
+}
+
+/// `outer` and `inner` as one joined row, or the `projection`'s columns of
+/// them; the inner side first when the outer side is the right one
+#[inline]
+fn combine_rows(
+    projection: &Option<JoinProjection>,
+    outer_on_right: bool,
+    outer: &Row,
+    inner: &Row,
+) -> Row {
+    match projection {
+        Some(proj) => {
+            // Fused projection: create only the columns we need, in SELECT order
+            let mut values: CompactVec<Value> = CompactVec::with_capacity(proj.columns.len());
+
+            let outer_slice = outer.as_slice();
+            let inner_slice = inner.as_slice();
+
+            for col_source in &proj.columns {
+                match col_source {
+                    ColumnSource::Outer(idx) => {
+                        // SAFETY: indices validated at planning time against outer table schema.
+                        values.push(unsafe { outer_slice.get_unchecked(*idx) }.clone());
+                    }
+                    ColumnSource::Inner(idx) => {
+                        // SAFETY: indices validated at planning time against inner table schema.
+                        values.push(unsafe { inner_slice.get_unchecked(*idx) }.clone());
+                    }
+                }
+            }
+
+            Row::from_compact_vec(values)
+        }
+        None if outer_on_right => Row::from_combined(inner, outer),
+        None => Row::from_combined(outer, inner),
+    }
+}
+
 /// Batch Index Nested Loop Join Operator.
 ///
 /// Optimized for queries without LIMIT. Instead of looking up one row at a time,
 /// this collects all outer rows first, batches all row ID lookups into a single
-/// call, and builds all results at once. This reduces lock overhead from O(N)
-/// to O(1) for the inner table access.
+/// call, and makes the joined rows as they are read. This reduces lock overhead
+/// from O(N) to O(1) for the inner table access.
 pub struct BatchIndexNestedLoopJoinOperator<'a> {
     // Outer input operator
     outer: Box<dyn Operator>,
@@ -1003,9 +1059,8 @@ pub struct BatchIndexNestedLoopJoinOperator<'a> {
     // The statement's subquery blocks, as the residual's site calls them
     blocks: Option<&'a dyn SubqueryExecutor>,
 
-    // Pre-computed results (built in open())
-    results: Vec<Row>,
-    result_idx: usize,
+    // What open() fetched, from which next() makes the joined rows
+    fetched: Option<Fetched>,
 
     // Optimization: Reusable buffer for row IDs to avoid allocation per outer row
     row_id_buffer: Vec<i64>,
@@ -1044,8 +1099,7 @@ impl<'a> BatchIndexNestedLoopJoinOperator<'a> {
             projection: None,
             outer_on_right: false,
             blocks: None,
-            results: Vec::new(),
-            result_idx: 0,
+            fetched: None,
             // Pre-allocate buffer for typical number of matches
             row_id_buffer: Vec::with_capacity(16),
             opened: false,
@@ -1101,48 +1155,115 @@ impl<'a> BatchIndexNestedLoopJoinOperator<'a> {
         self
     }
 
-    /// Combine outer and inner rows into output row.
-    /// When projection is set, creates projected row directly (avoids full combine).
-    ///
-    /// # Safety
-    /// Uses `get_unchecked` for performance - projection indices are validated
-    /// at query planning time against the table schemas.
-    #[inline]
-    fn combine(&self, outer: &Row, inner: &Row) -> Row {
-        match &self.projection {
-            Some(proj) => {
-                // Fused projection: create only the columns we need, in SELECT order
-                let mut values: CompactVec<Value> = CompactVec::with_capacity(proj.columns.len());
-
-                let outer_slice = outer.as_slice();
-                let inner_slice = inner.as_slice();
-
-                for col_source in &proj.columns {
-                    match col_source {
-                        ColumnSource::Outer(idx) => {
-                            // SAFETY: indices validated at planning time against outer table schema.
-                            values.push(unsafe { outer_slice.get_unchecked(*idx) }.clone());
-                        }
-                        ColumnSource::Inner(idx) => {
-                            // SAFETY: indices validated at planning time against inner table schema.
-                            values.push(unsafe { inner_slice.get_unchecked(*idx) }.clone());
-                        }
-                    }
-                }
-
-                Row::from_compact_vec(values)
-            }
-            None if self.outer_on_right => Row::from_combined(inner, outer),
-            None => Row::from_combined(outer, inner),
-        }
-    }
-
     /// Create a NULL row for the inner side.
     /// Always creates full-width row so combine() can use consistent indexing.
     #[inline]
     fn null_inner_row(&self) -> Row {
         let null_values: Vec<Value> = (0..self.inner_col_count).map(|_| NULL_VALUE).collect();
         Row::from_values(null_values)
+    }
+
+    /// The next joined row of the opened join; None once every row was made
+    #[inline]
+    pub(crate) fn next_joined(&mut self) -> Result<Option<Row>> {
+        if !self.opened {
+            return Err(crate::core::Error::internal(
+                "BatchIndexNestedLoopJoinOperator::next called before open",
+            ));
+        }
+        let Self {
+            fetched,
+            lookup_strategy,
+            inner_key_idx,
+            outer_key_idx,
+            residual_filter,
+            projection,
+            outer_on_right,
+            blocks,
+            ..
+        } = self;
+        let Some(f) = fetched.as_mut() else {
+            return Ok(None);
+        };
+        // Row ids are deduplicated, so each fetched inner row is one key's
+        while let Some((row_id, inner_row)) = f.inner_rows.get(f.inner_at) {
+            if f.outer_at == 0 {
+                f.outers = f
+                    .outers_of
+                    .get_mut(*row_id)
+                    .map(std::mem::take)
+                    .unwrap_or_default();
+            }
+            let Some(&outer_idx) = f.outers.get(f.outer_at) else {
+                f.inner_at += 1;
+                f.outer_at = 0;
+                continue;
+            };
+            f.outer_at += 1;
+            let outer_row = &f.outer_rows[outer_idx];
+
+            // An index entry may point at a row whose key has since
+            // changed inside the transaction, so the row's own key decides
+            if let (IndexLookupStrategy::SecondaryIndex(_), Some(idx)) =
+                (&*lookup_strategy, *inner_key_idx)
+            {
+                let equal = inner_row
+                    .get(idx)
+                    .zip(outer_row.get(*outer_key_idx))
+                    .and_then(|(inner, outer)| sql_eq(inner, outer));
+                if equal != Some(true) {
+                    continue;
+                }
+            }
+
+            let passes_filter = match residual_filter {
+                Some(filter) => pair_matches(
+                    filter,
+                    *outer_on_right,
+                    outer_row,
+                    inner_row,
+                    &mut f.condition_failed,
+                    *blocks,
+                ),
+                None => true,
+            };
+            if passes_filter {
+                f.matched[outer_idx] = true;
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::join_part_held(1);
+                return Ok(Some(combine_rows(
+                    projection,
+                    *outer_on_right,
+                    outer_row,
+                    inner_row,
+                )));
+            }
+        }
+        residual_failed(residual_filter, f.condition_failed)?;
+
+        // A LEFT join's outer rows none met, with the inner side's NULLs
+        if let Some(null_inner) = &f.null_inner {
+            while let Some(outer_row) = f.outer_rows.get(f.alone_at) {
+                f.alone_at += 1;
+                if !f.matched[f.alone_at - 1] {
+                    let row = combine_rows(projection, *outer_on_right, outer_row, null_inner);
+                    return Ok(Some(row));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Into `out`, the next joined rows until it holds `until`; false once
+    /// every row was made
+    pub(crate) fn fill_joined(&mut self, out: &mut RowVec, until: usize) -> Result<bool> {
+        while out.len() < until {
+            match self.next_joined()? {
+                Some(row) => out.push((0, row)),
+                None => return Ok(false),
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -1294,89 +1415,30 @@ impl Operator for BatchIndexNestedLoopJoinOperator<'_> {
             Some(filter) => filter.as_ref(),
             None => &true_expr,
         };
-        let inner_rows_batch = self.inner_table.fetch_rows_by_ids(&all_row_ids, filter)?;
-
-        // Step 3: Build results by matching outer rows with inner rows.
-        // Row ids are already deduplicated, so the fetched batch is
-        // iterated directly (the old I64Map was built only to iterate)
-        let mut matched_outers: Vec<bool> = vec![false; outer_rows.len()];
+        let inner_rows = self.inner_table.fetch_rows_by_ids(&all_row_ids, filter)?;
 
         // An error a join on this thread left behind is not this one's
         if let Some(filter) = &self.residual_filter {
             let _ = filter.take_error();
         }
-        let mut condition_failed = false;
-        for (row_id, inner_row) in inner_rows_batch.iter() {
-            if let Some(outer_indices) = key_to_outer_indices.get(*row_id) {
-                for &outer_idx in outer_indices {
-                    let outer_row = &outer_rows[outer_idx];
-
-                    // An index entry may point at a row whose key has since
-                    // changed inside the transaction, so the row's own key decides
-                    if let (IndexLookupStrategy::SecondaryIndex(_), Some(idx)) =
-                        (&self.lookup_strategy, self.inner_key_idx)
-                    {
-                        let equal = inner_row
-                            .get(idx)
-                            .zip(outer_row.get(self.outer_key_idx))
-                            .and_then(|(inner, outer)| sql_eq(inner, outer));
-                        if equal != Some(true) {
-                            continue;
-                        }
-                    }
-
-                    // Apply residual filter if present
-                    let passes_filter = if let Some(ref filter) = self.residual_filter {
-                        pair_matches(
-                            filter,
-                            self.outer_on_right,
-                            outer_row,
-                            inner_row,
-                            &mut condition_failed,
-                            self.blocks,
-                        )
-                    } else {
-                        true
-                    };
-
-                    if passes_filter {
-                        matched_outers[outer_idx] = true;
-                        self.results.push(self.combine(outer_row, inner_row));
-                    }
-                }
-            }
-        }
-        residual_failed(&self.residual_filter, condition_failed)?;
-
-        // Handle LEFT OUTER JOIN - emit unmatched outer rows with NULLs
-        if is_left_join {
-            let null_inner = self.null_inner_row();
-            for (idx, outer_row) in outer_rows.iter().enumerate() {
-                if !matched_outers[idx] {
-                    self.results.push(self.combine(outer_row, &null_inner));
-                }
-            }
-        }
-
+        self.fetched = Some(Fetched {
+            matched: vec![false; outer_rows.len()],
+            outer_rows,
+            outers_of: key_to_outer_indices,
+            inner_rows,
+            inner_at: 0,
+            outers: SmallVec::new(),
+            outer_at: 0,
+            alone_at: 0,
+            null_inner: is_left_join.then(|| self.null_inner_row()),
+            condition_failed: false,
+        });
         self.opened = true;
         Ok(())
     }
 
     fn next(&mut self) -> Result<Option<RowRef>> {
-        if !self.opened {
-            return Err(crate::core::Error::internal(
-                "BatchIndexNestedLoopJoinOperator::next called before open",
-            ));
-        }
-
-        if self.result_idx < self.results.len() {
-            // Use mem::take to avoid cloning - each result is only returned once
-            let row = std::mem::take(&mut self.results[self.result_idx]);
-            self.result_idx += 1;
-            Ok(Some(RowRef::Owned(row)))
-        } else {
-            Ok(None)
-        }
+        Ok(self.next_joined()?.map(RowRef::Owned))
     }
 
     fn close(&mut self) -> Result<()> {
