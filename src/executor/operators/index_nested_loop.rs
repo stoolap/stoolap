@@ -1228,6 +1228,7 @@ impl<'a> BatchIndexNestedLoopJoinOperator<'a> {
                 None => true,
             };
             if passes_filter {
+                residual_failed(residual_filter, f.condition_failed)?;
                 f.matched[outer_idx] = true;
                 #[cfg(feature = "test-failpoints")]
                 crate::test_failpoints::join_part_held(1);

@@ -691,6 +691,28 @@ fn distinct_counts_rollups_and_having_read_an_index_join_in_parts() {
     assert_eq!(parted_by(&db, sql, "batch_index_nested_loop"), want);
 }
 
+#[test]
+fn an_index_join_raises_its_on_error_before_the_where_reads_a_row() {
+    let db = open_keyed("join_aggregate_parts_index_on_error");
+    let sql = "SELECT c.id FROM c JOIN p ON p.id = c.pid \
+               AND CASE WHEN c.id = 1 THEN 9223372036854775807 + c.id ELSE 0 END = 0 \
+               WHERE EXISTS (SELECT 1 FROM p a JOIN c b ON a.id = b.pid AND b.v >= a.g - 9 \
+               WHERE b.id = c.id)";
+    #[cfg(feature = "test-failpoints")]
+    stoolap::test_failpoints::reset_join_paths();
+    let err = match db.query(sql, ()) {
+        Ok(rows) => rows.map(|r| r.map(|_| ())).collect::<Result<Vec<_>, _>>(),
+        Err(e) => Err(e),
+    }
+    .expect_err("c.id = 1 overflows the ON");
+    #[cfg(feature = "test-failpoints")]
+    assert_eq!(
+        stoolap::test_failpoints::join_paths_taken().first(),
+        Some(&"batch_index_nested_loop")
+    );
+    assert!(err.to_string().contains("overflow"), "{err}");
+}
+
 #[cfg(feature = "test-failpoints")]
 mod made_as_read {
     use std::sync::atomic::{AtomicI64, Ordering};
