@@ -1017,6 +1017,9 @@ impl Parser<'_> {
                 self.add_error(format!("expected ')' at {}", self.cur_token.position));
                 return None;
             }
+            if self.written_twice(columns.iter().map(|c| c.value_lower.as_str())) {
+                return None;
+            }
         }
 
         // Check if next is VALUES, SELECT, or WITH (CTE)
@@ -1254,7 +1257,20 @@ impl Parser<'_> {
             self.next_token(); // consume comma
         }
 
+        self.written_twice(update_columns.iter().map(|c| c.value_lower.as_str()));
         (update_columns, update_expressions)
+    }
+
+    /// Adds an error, and returns true, when `names`, the lowercase names of
+    /// the columns a statement writes, name one column more than once
+    fn written_twice<'a>(&mut self, mut names: impl Iterator<Item = &'a str> + Clone) -> bool {
+        while let Some(name) = names.next() {
+            if names.clone().any(|later| later == name) {
+                self.add_error(format!("column {name} is written more than once"));
+                return true;
+            }
+        }
+        false
     }
 
     /// Parse DISTINCT ON (expr1, expr2, ...) if present after DISTINCT keyword.
@@ -1557,6 +1573,7 @@ impl Parser<'_> {
 
         // Parse column-value pairs
         let mut updates = FxHashMap::default();
+        let mut written: Vec<SmartString> = Vec::new();
         loop {
             // Accept both identifiers and keywords as column names (e.g., level, key, order)
             if !self.peek_token_is(TokenType::Identifier) && !self.peek_token_is(TokenType::Keyword)
@@ -1569,6 +1586,7 @@ impl Parser<'_> {
             }
             self.next_token();
             let column_name = self.cur_token_as_column_identifier();
+            written.push(column_name.value_lower);
             let column_name = column_name.value;
 
             if !self.expect_peek(TokenType::Operator) || self.cur_token.literal != "=" {
@@ -1584,6 +1602,9 @@ impl Parser<'_> {
                 break;
             }
             self.next_token(); // consume comma
+        }
+        if self.written_twice(written.iter().map(SmartString::as_str)) {
+            return None;
         }
 
         // Parse WHERE clause
@@ -3212,6 +3233,9 @@ impl Parser<'_> {
             columns = self.parse_identifier_list();
             if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {
                 self.add_error(format!("expected ')' at {}", self.cur_token.position));
+                return None;
+            }
+            if self.written_twice(columns.iter().map(|c| c.value_lower.as_str())) {
                 return None;
             }
         }

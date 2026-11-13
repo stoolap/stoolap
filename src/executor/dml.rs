@@ -595,19 +595,14 @@ pub(crate) fn written_column(schema: &Schema, name: &str) -> Result<Option<usize
     }
 }
 
-/// Whether an UPDATE's SET `updates`, in the order they apply, leave a
-/// column of `row` holding a value different from its own, as a changed
-/// foreign key value counts; a later write to a column replaces an earlier
-pub(crate) fn set_changes<'a, I>(row: &Row, mut updates: I) -> bool
-where
-    I: Iterator<Item = &'a (usize, Value)> + Clone,
-{
-    while let Some((at, value)) = updates.next() {
-        if row.get(*at) != Some(value) && !updates.clone().any(|(later, _)| later == at) {
-            return true;
-        }
-    }
-    false
+/// Whether an UPDATE's SET `updates`, each to a column of its own, give a
+/// column of `row` a value different from its own, as a changed foreign
+/// key value counts
+pub(crate) fn set_changes<'a>(
+    row: &Row,
+    mut updates: impl Iterator<Item = &'a (usize, Value)>,
+) -> bool {
+    updates.any(|(at, value)| row.get(*at) != Some(value))
 }
 
 /// Moves each row of `moves`, (old row id, row), to the id its primary key

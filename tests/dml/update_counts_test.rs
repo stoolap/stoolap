@@ -164,27 +164,6 @@ fn update_counts_other_statements_report_rows_affected_twice() {
 }
 
 #[test]
-fn update_counts_judge_a_column_by_the_value_it_ends_with() {
-    for rows in LAYOUTS {
-        let dir = tempfile::tempdir().unwrap();
-        let db = database(rows, &dir);
-        for (sql, matched) in [
-            ("UPDATE t SET v = 1, V = v + 1 WHERE id = 1", 1),
-            ("UPDATE t SET v = 1, V = v + 1 WHERE v = 1", 1),
-        ] {
-            let got = db.execute_counts(sql, ()).unwrap();
-            let v: i64 = db.query_one("SELECT v FROM t WHERE id = 1", ()).unwrap();
-            assert_eq!(
-                got,
-                counts(matched, i64::from(v != 1)),
-                "{rows:?}: {sql} left v = {v}"
-            );
-            db.execute("UPDATE t SET v = 1 WHERE id = 1", ()).unwrap();
-        }
-    }
-}
-
-#[test]
 fn update_counts_returning_reports_rows_not_counts() {
     let db = Database::open("memory://update_counts_returning").unwrap();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
