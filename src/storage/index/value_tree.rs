@@ -185,22 +185,20 @@ fn search<'a>(
     found
 }
 
-/// The first index whose word is not below `word`, the halving free of
-/// branches on the words
+/// The first index whose word is not below `word`: past eight words at a
+/// time, then within the eight. Its branches predict for keys probed in
+/// order, so a load need not wait on the compare before it
 #[inline]
 fn lower_bound(words: &[u64], word: u64) -> usize {
     let mut base = 0;
-    let mut size = words.len();
-    while size > 1 {
-        let half = size / 2;
-        base = if words[base + half] < word {
-            base + half
-        } else {
-            base
-        };
-        size -= half;
+    while base + 8 <= words.len() && words[base + 7] < word {
+        base += 8;
     }
-    base + usize::from(size == 1 && words[base] < word)
+    let end = (base + 8).min(words.len());
+    base + words[base..end]
+        .iter()
+        .position(|&w| w >= word)
+        .unwrap_or(end - base)
 }
 
 /// Leading bytes of a node's TEXT keys skipped at most, kept in the node
@@ -1076,6 +1074,32 @@ fn walk_down(
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn lower_bound_finds_the_first_word_not_below() {
+        let run: Vec<u64> = (0..64).map(|i| 10 * i).collect();
+        let cases: [(&[u64], u64, usize); 16] = [
+            (&[], 5, 0),
+            (&[7], 6, 0),
+            (&[7], 7, 0),
+            (&[7], 8, 1),
+            (&[1, 2, 3, 4, 5, 6, 7], 4, 3),
+            (&[1, 2, 3, 4, 5, 6, 7], 9, 7),
+            (&[1, 2, 3, 4, 5, 6, 7, 8], 8, 7),
+            (&[1, 2, 3, 4, 5, 6, 7, 8], 9, 8),
+            (&[1, 2, 3, 4, 5, 6, 7, 8, 9], 9, 8),
+            (&[1, 2, 3, 4, 5, 6, 7, 8, 9], 10, 9),
+            (&[3, 3, 3, 3, 3, 3, 3, 3, 3, 3], 3, 0),
+            (&[1, 3, 3, 3, 3, 3, 3, 3, 3, 4], 4, 9),
+            (&run, 0, 0),
+            (&run, 75, 8),
+            (&run, 630, 63),
+            (&run, 631, 64),
+        ];
+        for (words, word, want) in cases {
+            assert_eq!(lower_bound(words, word), want, "{word} in {words:?}");
+        }
+    }
 
     /// A deterministic stream of numbers for the random operations
     struct Lcg(u64);
