@@ -88,6 +88,26 @@ fn written_twice_is_refused_on_every_path() {
 }
 
 #[test]
+fn written_twice_compares_names_beyond_ascii_without_case() {
+    let db = Database::open("memory://written_twice_beyond_ascii").unwrap();
+    db.execute(
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, \"größe\" INTEGER)",
+        (),
+    )
+    .unwrap();
+    for sql in [
+        "UPDATE u SET \"größe\" = 1, \"GRÖßE\" = 2",
+        "INSERT INTO u (id, \"größe\", \"Größe\") VALUES (1, 2, 3)",
+    ] {
+        let error = db.execute(sql, ()).expect_err(sql).to_string();
+        assert!(
+            error.contains("column größe is written more than once"),
+            "{sql}: {error}"
+        );
+    }
+}
+
+#[test]
 fn written_twice_allows_each_column_once() {
     let dir = tempfile::tempdir().unwrap();
     let db = database(false, &dir);

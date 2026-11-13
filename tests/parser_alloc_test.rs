@@ -14,7 +14,8 @@
 
 //! Parsing allocates for the tree it builds, not for operator precedence,
 //! reserved keyword checks, clause names, a copy of the input, a box per
-//! part of a qualified column name or an operator's spelling
+//! part of a qualified column name, an operator's spelling or the check
+//! that a statement writes each column once
 
 // The jemalloc feature, on by default, sets the library's own global allocator
 #![cfg(not(feature = "jemalloc"))]
@@ -75,6 +76,14 @@ fn test_parse_allocates_only_for_the_tree() {
              WHERE o.status = 'open' AND c.region = $1 GROUP BY o.id, c.name \
              ORDER BY total DESC LIMIT 20",
             33,
+        ),
+        ("UPDATE t SET v = 1 WHERE id = 1", 5),
+        ("UPDATE t SET v = v + 1, s = 'x', w = $1 WHERE id = $2", 7),
+        ("INSERT INTO t (id, v, s) VALUES (1, 2, 'x')", 4),
+        (
+            "INSERT INTO t (id, v, s) VALUES (1, 2, 'x') \
+             ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v, s = 'y'",
+            7,
         ),
     ] {
         parse_allocations(sql);

@@ -1017,7 +1017,7 @@ impl Parser<'_> {
                 self.add_error(format!("expected ')' at {}", self.cur_token.position));
                 return None;
             }
-            if self.written_twice(columns.iter().map(|c| c.value_lower.as_str())) {
+            if self.written_twice(columns.iter().map(|c| c.value.as_str())) {
                 return None;
             }
         }
@@ -1257,20 +1257,38 @@ impl Parser<'_> {
             self.next_token(); // consume comma
         }
 
-        self.written_twice(update_columns.iter().map(|c| c.value_lower.as_str()));
+        self.written_twice(update_columns.iter().map(|c| c.value.as_str()));
         (update_columns, update_expressions)
     }
 
-    /// Adds an error, and returns true, when `names`, the lowercase names of
-    /// the columns a statement writes, name one column more than once
+    /// Adds an error, and returns true, when `names`, the columns a statement
+    /// writes, name one column more than once
     fn written_twice<'a>(&mut self, mut names: impl Iterator<Item = &'a str> + Clone) -> bool {
         while let Some(name) = names.next() {
-            if names.clone().any(|later| later == name) {
-                self.add_error(format!("column {name} is written more than once"));
+            if self.written_again(names.clone(), name) {
                 return true;
             }
         }
         false
+    }
+
+    /// Adds an error, and returns true, when `name` is among `written`, as
+    /// column names resolve, without regard to case
+    fn written_again<'a>(
+        &mut self,
+        mut written: impl Iterator<Item = &'a str>,
+        name: &str,
+    ) -> bool {
+        let same = |other: &str| match name.is_ascii() && other.is_ascii() {
+            true => name.eq_ignore_ascii_case(other),
+            false => name.to_lowercase() == other.to_lowercase(),
+        };
+        if !written.any(same) {
+            return false;
+        }
+        let name = name.to_lowercase();
+        self.add_error(format!("column {name} is written more than once"));
+        true
     }
 
     /// Parse DISTINCT ON (expr1, expr2, ...) if present after DISTINCT keyword.
@@ -1573,7 +1591,6 @@ impl Parser<'_> {
 
         // Parse column-value pairs
         let mut updates = FxHashMap::default();
-        let mut written: Vec<SmartString> = Vec::new();
         loop {
             // Accept both identifiers and keywords as column names (e.g., level, key, order)
             if !self.peek_token_is(TokenType::Identifier) && !self.peek_token_is(TokenType::Keyword)
@@ -1586,8 +1603,10 @@ impl Parser<'_> {
             }
             self.next_token();
             let column_name = self.cur_token_as_column_identifier();
-            written.push(column_name.value_lower);
             let column_name = column_name.value;
+            if self.written_again(updates.keys().map(SmartString::as_str), &column_name) {
+                return None;
+            }
 
             if !self.expect_peek(TokenType::Operator) || self.cur_token.literal != "=" {
                 self.add_error(format!("expected '=' at {}", self.cur_token.position));
@@ -1602,9 +1621,6 @@ impl Parser<'_> {
                 break;
             }
             self.next_token(); // consume comma
-        }
-        if self.written_twice(written.iter().map(SmartString::as_str)) {
-            return None;
         }
 
         // Parse WHERE clause
@@ -3235,7 +3251,7 @@ impl Parser<'_> {
                 self.add_error(format!("expected ')' at {}", self.cur_token.position));
                 return None;
             }
-            if self.written_twice(columns.iter().map(|c| c.value_lower.as_str())) {
+            if self.written_twice(columns.iter().map(|c| c.value.as_str())) {
                 return None;
             }
         }
