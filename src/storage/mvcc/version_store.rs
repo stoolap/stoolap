@@ -7336,9 +7336,8 @@ pub struct TransactionVersionStore {
 /// What a transaction that judges its unique keys as it writes them keeps
 #[derive(Default)]
 struct KeyTracking {
-    /// Every unique key a local row was given that differs from its
-    /// committed one, by the index's columns and the key's hash; each a
-    /// candidate its row's latest version confirms
+    /// The unique keys the transaction's rows were given, by the index's
+    /// columns; each a candidate its row's latest version confirms
     local_keys: LocalKeys,
     /// The rows whose unique keys a write changed since the statement began,
     /// judged when it ends
@@ -7351,8 +7350,59 @@ struct KeyTracking {
 /// A table's unique indexes beside its key
 pub(crate) type UniqueIndexes = SmallVec<[Arc<dyn Index>; 4]>;
 
-/// Rows by the columns of a unique index, few, and the hash of a key
-pub(crate) type LocalKeys = Vec<(SmallVec<[i32; 4]>, FxHashMap<u64, SmallVec<[i64; 1]>>)>;
+/// The rows entered under the keys of each unique index, by its columns
+type LocalKeys = Vec<(SmallVec<[i32; 4]>, KeyRows)>;
+
+/// The rows entered under the keys of one unique index: each row once,
+/// under the hash of the key it was last given
+#[derive(Default)]
+struct KeyRows {
+    by_hash: FxHashMap<u64, SmallVec<[i64; 1]>>,
+    /// Each entered row's hash and its place among that hash's rows
+    by_row: I64Map<(u64, u32)>,
+}
+
+impl KeyRows {
+    /// Enters `row_id` under `hash` alone, out of any hash it was under;
+    /// none takes it out
+    fn set(&mut self, row_id: i64, hash: Option<u64>) {
+        let old = self.by_row.get(row_id).copied();
+        if old.map(|(held, _)| held) == hash {
+            return;
+        }
+        if let Some((held, at)) = old {
+            self.take_out(held, at as usize);
+        }
+        match hash {
+            Some(hash) => {
+                let rows = self.by_hash.entry(hash).or_default();
+                rows.push(row_id);
+                let at = (rows.len() - 1) as u32;
+                self.by_row.insert(row_id, (hash, at));
+            }
+            None => {
+                self.by_row.remove(row_id);
+            }
+        }
+    }
+
+    /// Takes the row at `at` among `hash`'s rows out of them, the last row
+    /// moving into its place; the row's own entry is the caller's
+    fn take_out(&mut self, hash: u64, at: usize) {
+        let Some(rows) = self.by_hash.get_mut(&hash) else {
+            return;
+        };
+        rows.swap_remove(at);
+        if let Some(&moved) = rows.get(at) {
+            if let Some(entry) = self.by_row.get_mut(moved) {
+                entry.1 = at as u32;
+            }
+        }
+        if rows.is_empty() {
+            self.by_hash.remove(&hash);
+        }
+    }
+}
 
 /// Whether `row` holds `values` in the columns `columns`
 pub(crate) fn key_held(row: &Row, columns: &[i32], values: &[Value]) -> bool {
@@ -7379,20 +7429,16 @@ pub(crate) fn key_hash<'v>(values: impl IntoIterator<Item = &'v Value>) -> u64 {
     hasher.finish()
 }
 
-/// The rows entered among `keys` for a key of `columns` hashed `hash`
-fn key_bucket<'k>(
-    keys: &'k mut LocalKeys,
-    columns: &[i32],
-    hash: u64,
-) -> &'k mut SmallVec<[i64; 1]> {
+/// The rows entered among `keys` under the keys of `columns`
+fn key_rows<'k>(keys: &'k mut LocalKeys, columns: &[i32]) -> &'k mut KeyRows {
     let at = match keys.iter().position(|(held, _)| held.as_slice() == columns) {
         Some(at) => at,
         None => {
-            keys.push((SmallVec::from_slice(columns), FxHashMap::default()));
+            keys.push((SmallVec::from_slice(columns), KeyRows::default()));
             keys.len() - 1
         }
     };
-    keys[at].1.entry(hash).or_default()
+    &mut keys[at].1
 }
 
 /// The hash of the key `row` holds in `columns`, none when one is NULL
@@ -7554,17 +7600,22 @@ impl TransactionVersionStore {
         }
     }
 
-    /// Enters the keys of `indexes` the latest versions of `rows` hold
+    /// Enters `rows` under the keys of `indexes` their latest versions hold,
+    /// and out of any other
     fn enter_row_keys(&mut self, rows: Vec<i64>, indexes: &[Arc<dyn Index>]) {
-        for row_id in rows {
-            for index in indexes {
-                let columns = index.column_ids();
-                let hash = (self.get_latest_local(row_id))
+        let local_versions = self.local_versions.as_ref();
+        let Some(tracking) = self.tracking.as_deref_mut() else {
+            return;
+        };
+        for index in indexes {
+            let columns = index.column_ids();
+            let keys = key_rows(&mut tracking.local_keys, columns);
+            for &row_id in &rows {
+                let hash = (local_versions.and_then(|all| all.get(row_id)))
+                    .and_then(|versions| versions.last())
                     .filter(|version| !version.is_deleted())
                     .and_then(|version| row_key_hash(&version.data, columns));
-                if let Some(hash) = hash {
-                    self.enter_key(columns, hash, row_id);
-                }
+                keys.set(row_id, hash);
             }
         }
     }
@@ -7654,13 +7705,8 @@ impl TransactionVersionStore {
             let columns = index.column_ids();
             if (columns.iter()).any(|&id| old.get(id as usize) != new.get(id as usize)) {
                 changed = true;
-                // Entered with no scan: the statement end's claim prunes
-                if let Some(hash) = row_key_hash(new, columns) {
-                    let rows = key_bucket(&mut tracking.local_keys, columns, hash);
-                    if rows.last() != Some(&row_id) {
-                        rows.push(row_id);
-                    }
-                }
+                let hash = row_key_hash(new, columns);
+                key_rows(&mut tracking.local_keys, columns).set(row_id, hash);
             }
         }
         if changed {
@@ -7734,61 +7780,38 @@ impl TransactionVersionStore {
         if let Some(holder) = self.committed_holder(index, values, row_id)? {
             return Ok(Some(holder));
         }
-        let hash = key_hash(values);
-        Ok(self.meet_or_enter(index.column_ids(), Some(values), hash, row_id))
-    }
-
-    /// Enters `row_id` among the rows holding a key of `columns` hashed
-    /// `hash`, as a rollback to a savepoint does for the rows it gives back
-    fn enter_key(&mut self, columns: &[i32], hash: u64, row_id: i64) {
-        self.meet_or_enter(columns, None, hash, row_id);
+        Ok(self.meet_or_enter(index.column_ids(), values, row_id))
     }
 
     /// One of the transaction's own rows other than `row_id` holding the
-    /// key `values` of `columns`, hashed `hash`, or none and `row_id`
-    /// entered there once; rows whose latest version holds no key so hashed
-    /// are dropped either way, so each stale row is passed once
-    fn meet_or_enter(
-        &mut self,
-        columns: &[i32],
-        values: Option<&[Value]>,
-        hash: u64,
-        row_id: i64,
-    ) -> Option<i64> {
+    /// key `values` of `columns`, or none and `row_id` entered under it;
+    /// a row met there whose latest version holds no key so hashed is
+    /// taken out, so each is passed once
+    fn meet_or_enter(&mut self, columns: &[i32], values: &[Value], row_id: i64) -> Option<i64> {
+        let hash = key_hash(values);
         let local_versions = self.local_versions.as_ref();
         let tracking = self.tracking.as_deref_mut()?;
-        let latest = |held: i64| {
-            (local_versions.and_then(|all| all.get(held)))
+        let keys = key_rows(&mut tracking.local_keys, columns);
+        let mut at = 0;
+        let mut holder = None;
+        while let Some(&held) = keys.by_hash.get(&hash).and_then(|rows| rows.get(at)) {
+            let version = (local_versions.and_then(|all| all.get(held)))
                 .and_then(|versions| versions.last())
                 .filter(|version| !version.is_deleted())
-        };
-        let rows = key_bucket(&mut tracking.local_keys, columns, hash);
-        // Every copy of `row_id` goes, to come back once, and every copy of
-        // the holder but the first
-        let mut entered = false;
-        let mut holder = None;
-        rows.retain(|held| {
-            let held = *held;
-            let Some(version) = latest(held) else {
-                return false;
+                .filter(|version| row_key_hash(&version.data, columns) == Some(hash));
+            let Some(version) = version else {
+                keys.take_out(hash, at);
+                keys.by_row.remove(held);
+                continue;
             };
-            if row_key_hash(&version.data, columns) != Some(hash) {
-                return false;
-            }
-            if held == row_id {
-                entered = true;
-                return false;
-            }
-            if holder == Some(held) {
-                return false;
-            }
-            if holder.is_none() && values.is_some_and(|v| key_held(&version.data, columns, v)) {
+            if held != row_id && key_held(&version.data, columns, values) {
                 holder = Some(held);
+                break;
             }
-            true
-        });
-        if holder.is_none() || entered {
-            rows.push(row_id);
+            at += 1;
+        }
+        if holder.is_none() {
+            keys.set(row_id, Some(hash));
         }
         holder
     }
@@ -10072,9 +10095,7 @@ mod tests {
             txn.put(row_id, row, true).unwrap();
         }
         let tracking = txn.tracking.as_deref().unwrap();
-        let entered: usize = tracking.local_keys[0]
-            .1
-            .values()
+        let entered: usize = (tracking.local_keys[0].1.by_hash.values())
             .map(|rows| rows.len())
             .sum();
         assert_eq!(entered, 1, "rows entered for the key");
@@ -10109,7 +10130,7 @@ mod tests {
             }
         }
         let tracking = txn.tracking.as_deref().unwrap();
-        let held = tracking.local_keys[0].1[&key_hash(&[Value::from(-1i64)])].len();
+        let held = tracking.local_keys[0].1.by_hash[&key_hash(&[Value::from(-1i64)])].len();
         assert_eq!(held, 1, "rows entered for key -1");
     }
 
@@ -10141,8 +10162,45 @@ mod tests {
             assert_eq!(met.unwrap(), Some(1), "holder of -1");
         }
         let tracking = txn.tracking.as_deref().unwrap();
-        let held = tracking.local_keys[0].1[&key_hash(&[Value::from(-1i64)])].len();
+        let held = tracking.local_keys[0].1.by_hash[&key_hash(&[Value::from(-1i64)])].len();
         assert_eq!(held, 1, "rows entered for key -1");
+    }
+
+    #[test]
+    fn statements_that_fail_on_one_key_leave_each_row_entered_once() {
+        use crate::core::types::DataType;
+        use crate::storage::index::HashIndex;
+        let store = Arc::new(VersionStore::new("t".to_string(), test_schema()));
+        let index = Arc::new(HashIndex::new(
+            "t_u".to_string(),
+            "t".to_string(),
+            vec!["u".to_string()],
+            vec![1],
+            vec![DataType::Integer],
+            true,
+            0,
+        ));
+        store.add_index("t_u".to_string(), index.clone());
+        let mut txn = TransactionVersionStore::new(Arc::clone(&store), 1);
+        txn.track_keys();
+        let row = |id: i64, u: i64| Row::from(vec![Value::from(id), Value::from(u)]);
+        for id in 1..=3 {
+            txn.put(id, row(id, id), false).unwrap();
+        }
+        for _ in 0..50 {
+            let cut = crate::storage::mvcc::timestamp::last_write_order();
+            for id in 1..=3 {
+                txn.put(id, row(id, -1), false).unwrap();
+            }
+            let met = txn.claim_key(&*index, &[Value::from(-1i64)], 1).unwrap();
+            assert!(met.is_some(), "a holder of -1 besides row 1");
+            txn.rollback_to_timestamp(cut);
+        }
+        let tracking = txn.tracking.as_deref().unwrap();
+        let entered: usize = (tracking.local_keys[0].1.by_hash.values())
+            .map(|rows| rows.len())
+            .sum();
+        assert!(entered <= 3, "rows entered: {entered}");
     }
 
     /// The layout admission sees is the one the transaction's rows are held
