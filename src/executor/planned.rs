@@ -29,7 +29,7 @@ use crate::storage::traits::transaction::{StatementTable, TableUse};
 use crate::storage::traits::{Engine, QueryResult};
 
 use super::context::ExecutionContext;
-use super::expression::{ExecuteContext, ExprVM};
+use super::expression::{ExecuteContext, ExprVM, Program};
 use super::prepared_select::{
     first_branch_of, prepared_branch, KeyReadBy, KeyReadPath, PreparedSelect,
 };
@@ -369,6 +369,13 @@ impl Executor {
         // A name the plan does not find is the error of the statement's own
         // run, planned again after it takes its view
         self.with_planned(stmt, compiled, classification, ctx, |planned| {
+            // A snapshot the caller gave that reads at its own point is the plan's to read
+            if ctx
+                .and_then(ExecutionContext::statement_snapshot)
+                .is_some_and(|snapshot| !snapshot.reads_latest())
+            {
+                return None;
+            }
             // The table's count or bound sees no open transaction's writes
             // and no statement's view: those read the plan's rows
             if let Some(quiet) = &planned.quiet {
@@ -546,9 +553,25 @@ impl Executor {
             KeyRows::Many(rows) => rows.len(),
         });
         let mut passed = 0;
+        // The parameters a program reads as another value are read once a run
+        let (bound_filter, bound_projection) = match plan.binds {
+            true => (
+                plan.filter
+                    .as_ref()
+                    .map(|filter| Program::bound(filter.clone(), params)),
+                Some(plan.projection.bound(params)),
+            ),
+            false => (None, None),
+        };
+        let filter = bound_filter.as_ref().or(plan.filter.as_ref());
+        let projection = bound_projection.as_ref().unwrap_or(&plan.projection);
         for (id, row) in rows {
+            // A full LIMIT asks no further row's filter
+            if plan.limit.is_some_and(|limit| out.len() >= limit) {
+                break;
+            }
             let row = normalize_row_to_schema(row, &plan.schema);
-            if let Some(filter) = &plan.filter {
+            if let Some(filter) = filter {
                 let exec = ExecuteContext::new(&row).with_run(params, transaction, None);
                 let vm = vm.get_or_insert_with(ExprVM::new);
                 if !vm.execute_bool_checked(filter, &exec)? {
@@ -559,14 +582,11 @@ impl Executor {
             if passed <= plan.offset {
                 continue;
             }
-            if plan.limit.is_some_and(|limit| out.len() >= limit) {
-                break;
-            }
             if plan.whole_row {
                 out.push((id, row));
                 continue;
             }
-            if let Some(columns) = plan.projection.column_indices() {
+            if let Some(columns) = projection.column_indices() {
                 let values = columns
                     .iter()
                     .map(|&i| row.get(i).cloned().unwrap_or_else(Value::null_unknown));
@@ -574,9 +594,9 @@ impl Executor {
                 continue;
             }
             let exec = ExecuteContext::new(&row).with_run(params, transaction, None);
-            let mut projected = Row::with_capacity(plan.projection.width());
+            let mut projected = Row::with_capacity(projection.width());
             let vm = vm.get_or_insert_with(ExprVM::new);
-            plan.projection.project_into(vm, &exec, &mut projected)?;
+            projection.project_into(vm, &exec, &mut projected)?;
             out.push((id, projected));
         }
         Ok(Box::new(ExecutorResult::with_arc_columns(

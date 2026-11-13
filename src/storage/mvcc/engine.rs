@@ -9574,20 +9574,33 @@ impl MVCCEngine {
             return Err(Error::EngineNotOpen);
         }
         self.check_cold_available(table_name, store)?;
-        // A name renamed or dropped since the plan gets no manager made for it
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::before_index_get_manager();
+        // Taken by name, none made; a rename after the check below moves this one
+        let mgr = self
+            .segment_managers
+            .read()
+            .unwrap()
+            .get(table_name)
+            .cloned();
         if !self
             .get_version_store(table_name)
             .is_ok_and(|named| Arc::ptr_eq(&named, store))
         {
             return Ok(None);
         }
-        // A seal removes its hot rows before it clears their tombstones: the
-        // ids are taken in a settled state, and a seal meanwhile lets them go
-        let mgr = self.get_or_create_segment_manager(table_name);
-        let generation = mgr.settled_seal_generation();
-        if mgr.has_segments() {
-            return Ok(None);
-        }
+        // Ids taken in a settled state; only a persisting database seals
+        let generation = match &mgr {
+            Some(mgr) => {
+                let generation = mgr.settled_seal_generation();
+                if mgr.has_segments() {
+                    return Ok(None);
+                }
+                Some(generation)
+            }
+            None if self.persistence.is_some() => return Ok(None),
+            None => None,
+        };
         let Some(epoch) = store.publish_epoch_if_quiet() else {
             return Ok(None);
         };
@@ -9625,7 +9638,9 @@ impl MVCCEngine {
                 rows
             }
         };
-        if store.publish_epoch_if_quiet() != Some(epoch) || mgr.seal_generation() != generation {
+        if store.publish_epoch_if_quiet() != Some(epoch)
+            || mgr.map(|mgr| mgr.seal_generation()) != generation
+        {
             return Ok(None);
         }
         store.check_token(token)?;

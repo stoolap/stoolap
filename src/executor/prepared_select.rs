@@ -4489,12 +4489,14 @@ impl PreparedSelect {
             steps.push(Step::Filter);
         }
         let otherwise = Box::new(self.plan.take().map_or(Read::Scan(None), |plan| plan.read));
+        let binds = filter.as_ref().is_some_and(|f| f.binds_params()) || projection.binds_params();
         let read = KeyRead {
             key,
             otherwise,
             filter,
             whole_row: projection.is_columns_in_order(schema.columns.len()),
             projection,
+            binds,
             needed: self.where_.needed.clone(),
             names: CompactArc::clone(&self.output_columns),
             offset,

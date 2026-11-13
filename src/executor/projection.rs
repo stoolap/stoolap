@@ -182,6 +182,22 @@ impl Projection {
         Self::of(indices.into_iter().map(Item::Column).collect())
     }
 
+    /// Whether a program of an item reads a parameter a bind folds
+    pub(crate) fn binds_params(&self) -> bool {
+        self.items.iter().any(|item| match item {
+            Item::Program(program) => program.binds_params(),
+            Item::Concat(concat) => concat.source().is_some_and(|p| p.binds_params()),
+            _ => false,
+        })
+    }
+
+    /// A copy whose programs are bound to `params`
+    pub(crate) fn bound(&self, params: &[Value]) -> Self {
+        let mut copy = Self::of(self.items.clone());
+        copy.bind(params);
+        copy
+    }
+
     /// The programs bound to `params`; one that binds to a value is a
     /// constant for the execution
     pub(crate) fn bind(&mut self, params: &[Value]) {

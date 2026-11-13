@@ -277,6 +277,9 @@ pub struct KeyRead {
     /// The WHERE's other conjuncts
     pub(crate) filter: Option<SharedProgram>,
     pub(crate) projection: Projection,
+    /// Whether the filter or the projection reads a parameter a bind folds,
+    /// once per run
+    pub(crate) binds: bool,
     /// The table columns the projection and filter read; a sealed row
     /// decodes only these. None reads every column
     pub(crate) needed: Option<Vec<bool>>,

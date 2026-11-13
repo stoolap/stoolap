@@ -439,6 +439,7 @@ thread_local! {
     static CHECKPOINT_CUT_TAKEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static CHECKPOINT_MANAGERS_TAKEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static INDEX_GET_IDS_TAKEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static INDEX_GET_MANAGER_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static KEY_READS_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static CATALOG_COPIES_TAKEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static RETYPE_OUTPUTS_WRITTEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
@@ -715,6 +716,16 @@ pub fn after_index_get_ids_taken(hook: impl FnOnce() + 'static) {
 
 pub(crate) fn index_get_ids_taken() {
     run_hook(&INDEX_GET_IDS_TAKEN_HOOK);
+}
+
+/// Run once on this thread when its next index key read is about to take
+/// its table's segment manager
+pub fn before_index_get_manager_taken(hook: impl FnOnce() + 'static) {
+    INDEX_GET_MANAGER_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn before_index_get_manager() {
+    run_hook(&INDEX_GET_MANAGER_HOOK);
 }
 
 /// Plan the statements this thread plans from now on without a key read,
@@ -3767,6 +3778,7 @@ pub fn reset_all() {
     CHECKPOINT_CUT_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     CHECKPOINT_MANAGERS_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     INDEX_GET_IDS_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
+    INDEX_GET_MANAGER_HOOK.with(|slot| *slot.borrow_mut() = None);
     KEY_READS_OFF.with(|off| off.set(false));
     CATALOG_COPIES_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     RETYPE_OUTPUTS_WRITTEN_HOOK.with(|slot| *slot.borrow_mut() = None);

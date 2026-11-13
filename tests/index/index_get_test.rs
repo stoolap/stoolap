@@ -355,6 +355,83 @@ fn a_bitmap_index_reads_its_rows() {
 }
 
 #[test]
+fn a_full_limit_asks_no_further_row_of_its_filter() {
+    let db = Database::open("memory://index_get_limit_filter").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, n INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX t_g ON t(g)", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1, 0), (2, 1, 1)", ())
+        .unwrap();
+    // The second row's term overflows
+    let sql = "SELECT id FROM t WHERE g = $1 AND 9223372036854775807 + n > 0 LIMIT 1";
+    for _ in 0..2 {
+        let found: stoolap::Result<Vec<i64>> = db.query(sql, (1,)).and_then(|rows| {
+            rows.map(|row| row.map(|r| r.get::<i64>(0).unwrap()))
+                .collect()
+        });
+        assert_eq!(found.map_err(|e| e.to_string()), Ok(vec![1]));
+    }
+}
+
+#[test]
+fn a_snapshot_the_caller_gives_is_read_at_its_own_point() {
+    use stoolap::core::IsolationLevel;
+    use stoolap::executor::context::StatementSnapshot;
+    use stoolap::storage::traits::Engine;
+    let db = Database::open("memory://index_get_given_snapshot").unwrap();
+    for sql in [
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, g INTEGER, u INTEGER)",
+        "CREATE INDEX s_g ON s(g)",
+        "CREATE UNIQUE INDEX s_u ON s(u)",
+        "INSERT INTO s VALUES (1, 1, 10), (2, 1, 20)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let engine = db.engine();
+    let executor = stoolap::Executor::new(std::sync::Arc::clone(engine));
+    let first = |ctx: &stoolap::ExecutionContext, sql: &str| -> Vec<i64> {
+        let mut result = executor.execute_with_context(sql, ctx).unwrap();
+        let mut out = Vec::new();
+        while result.next() {
+            out.push(result.row().get(0).and_then(|v| v.as_int64()).unwrap());
+        }
+        out.sort_unstable();
+        out
+    };
+    // Every key read and the table's count, each planned before the snapshot
+    let reads: [(&str, &[i64]); 4] = [
+        ("SELECT id FROM s WHERE g = 1", &[1, 2]),
+        ("SELECT id FROM s WHERE u = 30", &[]),
+        ("SELECT id FROM s WHERE id = 3", &[]),
+        ("SELECT COUNT(*) FROM s", &[2]),
+    ];
+    for (sql, _) in reads {
+        first(&stoolap::ExecutionContext::new(), sql);
+        first(&stoolap::ExecutionContext::new(), sql);
+    }
+    let snapshot = StatementSnapshot::new(
+        engine
+            .begin_transaction_with_level(IsolationLevel::SnapshotIsolation)
+            .unwrap(),
+        IsolationLevel::SnapshotIsolation,
+        None,
+    );
+    db.execute("INSERT INTO s VALUES (3, 1, 30)", ()).unwrap();
+    let ctx = stoolap::ExecutionContext::new().with_statement_snapshot(snapshot);
+    let wrong: Vec<String> = reads
+        .iter()
+        .filter_map(|(sql, expected)| {
+            let seen = first(&ctx, sql);
+            (seen != *expected).then(|| format!("{sql}: {seen:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "the rows at the snapshot: {wrong:?}");
+}
+
+#[test]
 fn explain_names_the_index_read() {
     let dir = tempfile::tempdir().unwrap();
     let db = table("index_get_explain", false, &dir);
@@ -380,8 +457,63 @@ mod windows {
     use std::time::Duration;
     use stoolap::test_failpoints::{
         after_commit_index_removed, after_compiled_epoch_checked, after_index_get_ids_taken,
-        after_indexes_published, take_read_paths, FailpointGuard, WAL_SYNC_FAIL,
+        after_indexes_published, before_index_get_manager_taken, programs_ran, take_read_paths,
+        FailpointGuard, WAL_SYNC_FAIL,
     };
+
+    #[test]
+    fn a_sealed_table_renamed_before_its_manager_is_taken_never_reads_as_empty() {
+        let _guard = FailpointGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db = file_table(&dir, "checkpoint_interval=3600&compact_threshold=1000");
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        assert_eq!(ids(&db, 1), vec![1, 5, 9, 13, 17]);
+        let writer = db.clone();
+        before_index_get_manager_taken(move || {
+            writer.execute("ALTER TABLE o RENAME TO o_old", ()).unwrap();
+        });
+        let found: Result<Vec<i64>, String> = db
+            .query("SELECT id FROM o WHERE g = $1", (1,))
+            .map_err(|e| e.to_string())
+            .map(|rows| {
+                rows.map(|row| row.unwrap().get::<i64>(0).unwrap())
+                    .collect()
+            });
+        assert!(
+            matches!(found.as_deref(), Ok([1, 5, 9, 13, 17]) | Err(_)),
+            "the sealed rows or a refusal, never no row: {found:?}"
+        );
+    }
+
+    #[test]
+    fn a_run_binds_its_parameters_once() {
+        let _guard = FailpointGuard::new();
+        let db = Database::open("memory://index_get_binds").unwrap();
+        for sql in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v VECTOR(3))",
+            "CREATE INDEX t_g ON t(g)",
+            "INSERT INTO t SELECT value, 1, '[1,2,3]' FROM generate_series(1, 5)",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        let sql =
+            "SELECT VEC_DISTANCE_L2(v, $2) FROM t WHERE g = $1 AND VEC_DISTANCE_L2(v, $2) >= 0";
+        let params = || vec![stoolap::Value::Integer(1), stoolap::Value::text("[1,2,4]")];
+        db.query(sql, params()).unwrap().count();
+        let mut returned = 0;
+        take_read_paths();
+        let ran = programs_ran(|| {
+            returned = db.query(sql, params()).unwrap().count();
+        });
+        assert!(take_read_paths().contains(&"exec.index_get"));
+        let per_row: Vec<String> = ran
+            .into_iter()
+            .filter(|(listing, times)| *times > 1 && listing.contains("LoadParam"))
+            .map(|(listing, times)| format!("{times} runs of {listing}"))
+            .collect();
+        assert_eq!(returned, 5);
+        assert!(per_row.is_empty(), "{per_row:?}");
+    }
 
     const WAIT: Duration = Duration::from_secs(10);
 
