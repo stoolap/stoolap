@@ -160,7 +160,7 @@ stoolap_exec_params(db, "INSERT INTO t VALUES ($1, $2)", params, 2, &affected);
 /* affected == 1 */
 ```
 
-The `rows_affected` pointer may be NULL if you do not need the count. For an UPDATE it counts the rows the WHERE clause matched. `stoolap_exec_params_counts`, `stoolap_stmt_exec_counts` and `stoolap_tx_exec_params_counts` take one more pointer, `rows_changed`, which receives the matched rows whose SET changed a value (the rows affected for any other statement):
+The `rows_affected` pointer may be NULL if you do not need the count. For an UPDATE it counts the rows the WHERE clause matched. `stoolap_exec_params_counts`, `stoolap_stmt_exec_counts` and `stoolap_tx_exec_params_counts` take one more pointer, `rows_changed`, which receives the matched rows whose SET changed a value (the rows affected for any other statement). A statement with RETURNING answers with its rows through the query functions, and both counts are 0:
 
 ```c
 int64_t matched = 0, changed = 0;

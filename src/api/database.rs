@@ -619,7 +619,8 @@ impl Database {
 
     /// Execute a statement, returning the rows it matched and the rows it
     /// changed: for an UPDATE, those whose SET gave a value different from
-    /// the one they held; for any other statement both are the rows affected
+    /// the one they held; for any other statement both are the rows affected.
+    /// A statement with RETURNING reports its rows through `query`, and 0 here
     ///
     /// ```ignore
     /// let counts = db.execute_counts("UPDATE t SET v = 2 WHERE id > 0", ())?;

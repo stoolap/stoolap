@@ -519,8 +519,8 @@ impl Executor {
                             return Ok((row, false));
                         }
                     }
+                    let mut computed = Vec::with_capacity(programs.len());
                     if !programs.is_empty() {
-                        let mut computed = Vec::with_capacity(programs.len());
                         {
                             let exec_ctx = super::expression::execute_context(&row, ctx, None);
                             for (idx, program, column_type, vector_dims) in programs {
@@ -536,12 +536,13 @@ impl Executor {
                                 computed.push((*idx, coerced));
                             }
                         }
-                        for (idx, value) in computed {
-                            changed |= super::dml::set_changed(&mut row, idx, value);
-                        }
+                    }
+                    changed = super::dml::set_changes(&row, computed.iter().chain(&values));
+                    for (idx, value) in computed {
+                        let _ = row.set(idx, value);
                     }
                     for (idx, value) in &values {
-                        changed |= super::dml::set_changed(&mut row, *idx, value.clone());
+                        let _ = row.set(*idx, value.clone());
                     }
                     Ok((row, true))
                 };

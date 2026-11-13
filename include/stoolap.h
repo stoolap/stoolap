@@ -241,7 +241,8 @@ int32_t stoolap_exec_params(
  * @param rows_affected  If non-NULL, receives the rows the statement matched.
  * @param rows_changed   If non-NULL, receives, for an UPDATE, the matched rows
  *                       whose SET changed a value; for any other statement,
- *                       the rows affected.
+ *                       the rows affected. A statement with RETURNING
+ *                       reports both counts as 0.
  */
 int32_t stoolap_exec_params_counts(
     StoolapDB* db,
@@ -327,7 +328,8 @@ int32_t stoolap_stmt_exec(
 /**
  * Execute a prepared statement with parameters, reporting two counts:
  * the rows matched, and for an UPDATE the matched rows whose SET changed a
- * value (the rows affected for any other statement). Either may be NULL.
+ * value (the rows affected for any other statement, 0 for one with
+ * RETURNING). Either may be NULL.
  */
 int32_t stoolap_stmt_exec_counts(
     StoolapStmt* stmt,
@@ -442,7 +444,8 @@ int32_t stoolap_tx_exec_params(
 /**
  * Execute within a transaction (with parameters), reporting the rows
  * matched and, for an UPDATE, the matched rows whose SET changed a value.
- * Either count pointer may be NULL.
+ * A statement with RETURNING reports both as 0. Either count pointer may
+ * be NULL.
  */
 int32_t stoolap_tx_exec_params_counts(
     StoolapTx* tx,

@@ -82,7 +82,7 @@ For an UPDATE, the rows affected are the rows the WHERE clause matched, whether 
 
 ### execute_counts()
 
-Execute a statement and return two counts: `matched`, the rows affected as `execute()` reports them, and `changed`, the matched rows whose SET gave a column a value different from the one it held. For any statement other than UPDATE, `changed` equals `matched`. `Statement` and `Transaction` have the same method.
+Execute a statement and return two counts: `matched`, the rows affected as `execute()` reports them, and `changed`, the matched rows whose SET gave a column a value different from the one it held. For any statement other than UPDATE, `changed` equals `matched`. A statement with RETURNING answers with its rows instead, and both counts are 0, as `execute()` returns 0 for it. `Statement` and `Transaction` have the same method.
 
 ```rust
 db.execute("INSERT INTO users VALUES ($1, $2, $3)", (3, "Dana", 41))?;

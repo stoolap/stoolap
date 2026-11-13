@@ -595,12 +595,19 @@ pub(crate) fn written_column(schema: &Schema, name: &str) -> Result<Option<usize
     }
 }
 
-/// Sets column `at` of `row` to `value`, an UPDATE's SET; true when it
-/// changes the value the row held, as a changed foreign key value counts
-pub(crate) fn set_changed(row: &mut Row, at: usize, value: Value) -> bool {
-    let changed = row.get(at) != Some(&value);
-    let _ = row.set(at, value);
-    changed
+/// Whether an UPDATE's SET `updates`, in the order they apply, leave a
+/// column of `row` holding a value different from its own, as a changed
+/// foreign key value counts; a later write to a column replaces an earlier
+pub(crate) fn set_changes<'a, I>(row: &Row, mut updates: I) -> bool
+where
+    I: Iterator<Item = &'a (usize, Value)> + Clone,
+{
+    while let Some((at, value)) = updates.next() {
+        if row.get(*at) != Some(value) && !updates.clone().any(|(later, _)| later == at) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Moves each row of `moves`, (old row id, row), to the id its primary key
@@ -2773,9 +2780,9 @@ impl Executor {
                     };
 
                 let original = key_set.map(|_| row.clone());
-                let mut values_changed = false;
+                let values_changed = set_changes(&row, updates_to_apply.iter());
                 for (idx, new_value) in updates_to_apply {
-                    values_changed |= set_changed(&mut row, idx, new_value);
+                    let _ = row.set(idx, new_value);
                 }
                 if values_changed {
                     changed_rows.set(changed_rows.get() + 1);
