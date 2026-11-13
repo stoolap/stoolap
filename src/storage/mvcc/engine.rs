@@ -10495,12 +10495,12 @@ impl TransactionEngineOperations for EngineOperations {
                     (Some(Arc::clone(cached)), None)
                 } else {
                     let layout = version_store.layout();
-                    let mut store =
-                        TransactionVersionStore::new(Arc::clone(&version_store), txn_id);
-                    if self.tracks_keys(txn_id) {
-                        store.track_keys();
-                    }
+                    let store = TransactionVersionStore::new(Arc::clone(&version_store), txn_id);
                     let new_store = Arc::new(TxnTableStore::admitted_at(store, layout));
+                    // Built in place first: a store borrowed before it moves is copied
+                    if self.tracks_keys(txn_id) {
+                        new_store.write_store().track_keys();
+                    }
                     txn_tables.push((
                         table_name_lower.clone().into_owned().into(),
                         Arc::clone(&new_store),
