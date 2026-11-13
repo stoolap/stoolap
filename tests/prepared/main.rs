@@ -21,6 +21,7 @@ mod oracle;
 mod api_prepared_paths_test;
 mod bug_like_param_test;
 mod compiled_positions_test;
+mod grouped_output_rows_test;
 mod held_program_retry_test;
 mod held_programs_rebind_test;
 mod insert_plan_cache_test;

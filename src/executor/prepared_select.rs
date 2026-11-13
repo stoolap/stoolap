@@ -17053,6 +17053,10 @@ impl<'a> PreparedRunner<'a> {
 }
 
 impl SubqueryExecutor for PreparedRunner<'_> {
+    fn rows_asking(&self, rows: usize) {
+        self.ask_rows(Some(rows));
+    }
+
     fn execute_scalar(&self, subquery_index: u16, caller: &ExecuteContext) -> Result<Value> {
         self.scalar_at(subquery_index, caller, self.holes)
     }
@@ -17137,6 +17141,10 @@ impl<'r> SiteRunner<'r> {
 }
 
 impl SubqueryExecutor for SiteRunner<'_> {
+    fn rows_asking(&self, rows: usize) {
+        self.runner.ask_rows(Some(rows));
+    }
+
     fn execute_scalar(&self, subquery_index: u16, caller: &ExecuteContext) -> Result<Value> {
         self.runner.scalar_at(subquery_index, caller, self.holes)
     }
