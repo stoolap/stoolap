@@ -42,7 +42,7 @@ use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::common::CompactVec;
+use crate::common::{CompactArc, CompactVec};
 use crate::core::value::NULL_VALUE;
 use crate::core::{Row, RowVec, Value};
 
@@ -628,7 +628,7 @@ fn sequential_probe(
     probe_col_count: usize,
     build_col_count: usize,
     (swapped, room): (bool, usize),
-    build_matched: &Option<BuildMatchedTracker>,
+    build_matched: Option<&BuildMatchedTracker>,
 ) -> (Vec<Row>, Vec<Row>) {
     let mut matched_rows = Vec::new();
     let needs_unmatched_probe = join_type.needs_unmatched_probe(swapped);
@@ -642,7 +642,7 @@ fn sequential_probe(
                 let build_row = &build_rows[build_idx];
                 if verify_key_match(probe_row, build_row, probe_key_indices, build_key_indices) {
                     matched = true;
-                    if let Some(ref tracker) = build_matched {
+                    if let Some(tracker) = build_matched {
                         tracker.mark_matched(build_idx);
                     }
                     let combined = combine_join_rows(
@@ -721,184 +721,24 @@ pub(crate) fn parallel_hash_join_with_room(
 ) -> ParallelJoinResult {
     let probe_count = probe_rows.len();
     let build_count = build_rows.len();
-
-    // Determine if we should use parallel execution
-    #[cfg(feature = "parallel")]
-    let use_parallel =
-        config.should_parallel_join(build_count) || config.should_parallel_join(probe_count);
-    #[cfg(not(feature = "parallel"))]
-    let use_parallel = false;
+    let use_parallel = probes_in_parallel(config, build_count, probe_count);
 
     // Build phase: Create hash table (parallel if large enough)
     let hash_table = parallel_hash_build(build_rows, build_key_indices, config);
-
-    // For OUTER joins, we need to track which build rows were matched
-    // Uses Vec<AtomicBool> for both sequential and parallel execution (minimal overhead)
-    let build_matched: Option<BuildMatchedTracker> = if join_type.needs_unmatched_build(swapped) {
-        Some(BuildMatchedTracker::new(build_count))
-    } else {
-        None
+    let build_matched = tracker_for(join_type, swapped, build_count);
+    let probe = Probe {
+        build_rows,
+        hash_table: &hash_table,
+        keys: (probe_key_indices, build_key_indices),
+        join_type,
+        counts: (probe_col_count, build_col_count, room),
+        swapped,
+        use_parallel,
+        config,
+        build_matched: build_matched.as_ref(),
     };
-
-    // Probe phase
-    #[allow(unused_variables)]
-    let (matched_rows, unmatched_probe_rows) = {
-        #[cfg(feature = "parallel")]
-        {
-            if use_parallel && join_type == JoinType::Inner {
-                // For INNER joins, we can fully parallelize the probe phase
-                let matches: Vec<Row> = probe_rows
-                    .par_chunks(config.chunk_size.max(1000))
-                    .flat_map(|chunk| {
-                        let mut local_results = Vec::new();
-                        for probe_row in chunk {
-                            let hash = hash_row_by_keys(probe_row, probe_key_indices);
-                            if let Some(build_indices) = hash_table.get(&hash) {
-                                for &build_idx in build_indices {
-                                    let build_row = &build_rows[build_idx];
-                                    if verify_key_match(
-                                        probe_row,
-                                        build_row,
-                                        probe_key_indices,
-                                        build_key_indices,
-                                    ) {
-                                        let combined = combine_join_rows(
-                                            probe_row,
-                                            build_row,
-                                            probe_col_count,
-                                            build_col_count,
-                                            (swapped, room),
-                                        );
-                                        local_results.push(Row::from_compact_vec(combined));
-                                    }
-                                }
-                            }
-                        }
-                        local_results
-                    })
-                    .collect();
-                (matches, Vec::new())
-            } else if use_parallel {
-                // For OUTER joins with parallel execution, use atomic tracking for build side
-                // and collect unmatched probe rows directly in parallel
-                let needs_unmatched_probe = join_type.needs_unmatched_probe(swapped);
-
-                // Each chunk returns: (matched_rows, unmatched_probe_rows)
-                let chunk_results: Vec<(Vec<Row>, Vec<Row>)> = probe_rows
-                    .par_chunks(config.chunk_size.max(1000))
-                    .map(|chunk| {
-                        let mut matched_results = Vec::new();
-                        let mut unmatched_results = Vec::new();
-
-                        for probe_row in chunk.iter() {
-                            let mut matched = false;
-                            let hash = hash_row_by_keys(probe_row, probe_key_indices);
-
-                            if let Some(build_indices) = hash_table.get(&hash) {
-                                for &build_idx in build_indices {
-                                    let build_row = &build_rows[build_idx];
-                                    if verify_key_match(
-                                        probe_row,
-                                        build_row,
-                                        probe_key_indices,
-                                        build_key_indices,
-                                    ) {
-                                        matched = true;
-                                        if let Some(ref tracker) = build_matched {
-                                            tracker.mark_matched(build_idx);
-                                        }
-                                        let combined = combine_join_rows(
-                                            probe_row,
-                                            build_row,
-                                            probe_col_count,
-                                            build_col_count,
-                                            (swapped, room),
-                                        );
-                                        matched_results.push(Row::from_compact_vec(combined));
-                                    }
-                                }
-                            }
-
-                            if !matched && needs_unmatched_probe {
-                                let values = combine_with_nulls(
-                                    probe_row,
-                                    probe_col_count,
-                                    build_col_count,
-                                    (swapped, room),
-                                );
-                                unmatched_results.push(Row::from_compact_vec(values));
-                            }
-                        }
-
-                        (matched_results, unmatched_results)
-                    })
-                    .collect();
-
-                let total_matched: usize = chunk_results.iter().map(|(m, _)| m.len()).sum();
-                let total_unmatched: usize = chunk_results.iter().map(|(_, u)| u.len()).sum();
-
-                let mut matched_rows = Vec::with_capacity(total_matched);
-                let mut unmatched_rows = Vec::with_capacity(total_unmatched);
-
-                for (matched, unmatched) in chunk_results {
-                    matched_rows.extend(matched);
-                    unmatched_rows.extend(unmatched);
-                }
-
-                // CRITICAL: Acquire fence for cross-thread visibility of build_matched[] writes.
-                // Parallel probe stores use Release ordering; this fence ensures all stores
-                // are visible before the sequential scan of unmatched build rows below.
-                std::sync::atomic::fence(Ordering::Acquire);
-
-                (matched_rows, unmatched_rows)
-            } else {
-                // Sequential execution for small datasets
-                sequential_probe(
-                    probe_rows,
-                    build_rows,
-                    &hash_table,
-                    probe_key_indices,
-                    build_key_indices,
-                    &join_type,
-                    probe_col_count,
-                    build_col_count,
-                    (swapped, room),
-                    &build_matched,
-                )
-            }
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            sequential_probe(
-                probe_rows,
-                build_rows,
-                &hash_table,
-                probe_key_indices,
-                build_key_indices,
-                &join_type,
-                probe_col_count,
-                build_col_count,
-                (swapped, room),
-                &build_matched,
-            )
-        }
-    };
-
-    let mut result_rows = matched_rows;
-    result_rows.extend(unmatched_probe_rows);
-
-    // Handle unmatched build rows for OUTER joins
-    // The Acquire fence at line 794 ensures all parallel stores are visible
-    if let Some(ref tracker) = build_matched {
-        for (build_idx, build_row) in build_rows.iter().enumerate() {
-            if !tracker.was_matched(build_idx) {
-                let shape = (swapped, room);
-                let values =
-                    combine_build_with_nulls(build_row, build_col_count, probe_col_count, shape);
-                result_rows.push(Row::from_compact_vec(values));
-            }
-        }
-    }
+    let mut result_rows = probe.slice(probe_rows);
+    probe.unmatched_build(0, usize::MAX, &mut result_rows);
 
     let matches_found = result_rows.len();
 
@@ -908,6 +748,336 @@ pub(crate) fn parallel_hash_join_with_room(
         probe_rows_processed: probe_count,
         build_rows_count: build_count,
         matches_found,
+    }
+}
+
+/// Whether a hash join of `build_count` and `probe_count` rows probes on the
+/// thread pool
+fn probes_in_parallel(config: &ParallelConfig, build_count: usize, probe_count: usize) -> bool {
+    #[cfg(feature = "parallel")]
+    {
+        config.should_parallel_join(build_count) || config.should_parallel_join(probe_count)
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        let _ = (config, build_count, probe_count);
+        false
+    }
+}
+
+/// The flags of the build rows a probe met, kept for a join that makes the
+/// build rows none met
+fn tracker_for(
+    join_type: JoinType,
+    swapped: bool,
+    build_count: usize,
+) -> Option<BuildMatchedTracker> {
+    join_type
+        .needs_unmatched_build(swapped)
+        .then(|| BuildMatchedTracker::new(build_count))
+}
+
+/// The probe rows of a chunk when `rows` probe across threads: small enough
+/// that few rows still spread over every thread, at most the config's chunk
+#[cfg(feature = "parallel")]
+fn probe_chunk_rows(rows: usize, config: &ParallelConfig) -> usize {
+    let threads = num_threads();
+    let chunk_rows = rows.div_ceil(threads).clamp(1, config.chunk_size.max(1000));
+    #[cfg(feature = "test-failpoints")]
+    crate::test_failpoints::join_probe_chunks(rows, chunk_rows, threads);
+    chunk_rows
+}
+
+/// One hash join's probe: its build side and hash table, keys, shape and
+/// the flags of the build rows met
+#[derive(Clone, Copy)]
+struct Probe<'a> {
+    build_rows: &'a [Row],
+    hash_table: &'a ParallelHashTable,
+    keys: (&'a [usize], &'a [usize]),
+    join_type: JoinType,
+    counts: (usize, usize, usize),
+    swapped: bool,
+    use_parallel: bool,
+    config: &'a ParallelConfig,
+    build_matched: Option<&'a BuildMatchedTracker>,
+}
+
+impl Probe<'_> {
+    /// The rows `probe_rows` make: their matches, then the probe rows none
+    /// met when the join keeps them
+    #[allow(unused_variables)]
+    fn slice(&self, probe_rows: &[Row]) -> Vec<Row> {
+        let Probe {
+            build_rows,
+            hash_table,
+            keys: (probe_key_indices, build_key_indices),
+            join_type,
+            counts: (probe_col_count, build_col_count, room),
+            swapped,
+            use_parallel,
+            config,
+            build_matched,
+        } = *self;
+        let (matched_rows, unmatched_probe_rows) = {
+            #[cfg(feature = "parallel")]
+            {
+                if use_parallel && join_type == JoinType::Inner {
+                    // For INNER joins, we can fully parallelize the probe phase
+                    let matches: Vec<Row> = probe_rows
+                        .par_chunks(probe_chunk_rows(probe_rows.len(), config))
+                        .flat_map(|chunk| {
+                            let mut local_results = Vec::new();
+                            for probe_row in chunk {
+                                let hash = hash_row_by_keys(probe_row, probe_key_indices);
+                                if let Some(build_indices) = hash_table.get(&hash) {
+                                    for &build_idx in build_indices {
+                                        let build_row = &build_rows[build_idx];
+                                        if verify_key_match(
+                                            probe_row,
+                                            build_row,
+                                            probe_key_indices,
+                                            build_key_indices,
+                                        ) {
+                                            let combined = combine_join_rows(
+                                                probe_row,
+                                                build_row,
+                                                probe_col_count,
+                                                build_col_count,
+                                                (swapped, room),
+                                            );
+                                            local_results.push(Row::from_compact_vec(combined));
+                                        }
+                                    }
+                                }
+                            }
+                            local_results
+                        })
+                        .collect();
+                    (matches, Vec::new())
+                } else if use_parallel {
+                    // For OUTER joins with parallel execution, use atomic tracking for build side
+                    // and collect unmatched probe rows directly in parallel
+                    let needs_unmatched_probe = join_type.needs_unmatched_probe(swapped);
+
+                    // Each chunk returns: (matched_rows, unmatched_probe_rows)
+                    let chunk_results: Vec<(Vec<Row>, Vec<Row>)> = probe_rows
+                        .par_chunks(probe_chunk_rows(probe_rows.len(), config))
+                        .map(|chunk| {
+                            let mut matched_results = Vec::new();
+                            let mut unmatched_results = Vec::new();
+
+                            for probe_row in chunk.iter() {
+                                let mut matched = false;
+                                let hash = hash_row_by_keys(probe_row, probe_key_indices);
+
+                                if let Some(build_indices) = hash_table.get(&hash) {
+                                    for &build_idx in build_indices {
+                                        let build_row = &build_rows[build_idx];
+                                        if verify_key_match(
+                                            probe_row,
+                                            build_row,
+                                            probe_key_indices,
+                                            build_key_indices,
+                                        ) {
+                                            matched = true;
+                                            if let Some(tracker) = build_matched {
+                                                tracker.mark_matched(build_idx);
+                                            }
+                                            let combined = combine_join_rows(
+                                                probe_row,
+                                                build_row,
+                                                probe_col_count,
+                                                build_col_count,
+                                                (swapped, room),
+                                            );
+                                            matched_results.push(Row::from_compact_vec(combined));
+                                        }
+                                    }
+                                }
+
+                                if !matched && needs_unmatched_probe {
+                                    let values = combine_with_nulls(
+                                        probe_row,
+                                        probe_col_count,
+                                        build_col_count,
+                                        (swapped, room),
+                                    );
+                                    unmatched_results.push(Row::from_compact_vec(values));
+                                }
+                            }
+
+                            (matched_results, unmatched_results)
+                        })
+                        .collect();
+
+                    let total_matched: usize = chunk_results.iter().map(|(m, _)| m.len()).sum();
+                    let total_unmatched: usize = chunk_results.iter().map(|(_, u)| u.len()).sum();
+
+                    let mut matched_rows = Vec::with_capacity(total_matched);
+                    let mut unmatched_rows = Vec::with_capacity(total_unmatched);
+
+                    for (matched, unmatched) in chunk_results {
+                        matched_rows.extend(matched);
+                        unmatched_rows.extend(unmatched);
+                    }
+
+                    // CRITICAL: Acquire fence for cross-thread visibility of build_matched[] writes.
+                    // Parallel probe stores use Release ordering; this fence ensures all stores
+                    // are visible before the sequential scan of unmatched build rows below.
+                    std::sync::atomic::fence(Ordering::Acquire);
+
+                    (matched_rows, unmatched_rows)
+                } else {
+                    // Sequential execution for small datasets
+                    sequential_probe(
+                        probe_rows,
+                        build_rows,
+                        hash_table,
+                        probe_key_indices,
+                        build_key_indices,
+                        &join_type,
+                        probe_col_count,
+                        build_col_count,
+                        (swapped, room),
+                        build_matched,
+                    )
+                }
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                sequential_probe(
+                    probe_rows,
+                    build_rows,
+                    hash_table,
+                    probe_key_indices,
+                    build_key_indices,
+                    &join_type,
+                    probe_col_count,
+                    build_col_count,
+                    (swapped, room),
+                    build_matched,
+                )
+            }
+        };
+
+        let mut result_rows = matched_rows;
+        result_rows.extend(unmatched_probe_rows);
+        result_rows
+    }
+
+    /// Into `out`, the build rows from `from` on that no probe row met, at
+    /// most `limit` of them, when the join keeps them; where the next
+    /// would start
+    fn unmatched_build(&self, from: usize, limit: usize, out: &mut Vec<Row>) -> usize {
+        let Some(tracker) = self.build_matched else {
+            return self.build_rows.len();
+        };
+        let (probe_col_count, build_col_count, room) = self.counts;
+        let shape = (self.swapped, room);
+        let mut made = 0;
+        // The probes' Acquire fence and their join on the pool make every
+        // flag they set visible here
+        for (build_idx, build_row) in self.build_rows.iter().enumerate().skip(from) {
+            if made == limit {
+                return build_idx;
+            }
+            if !tracker.was_matched(build_idx) {
+                let values =
+                    combine_build_with_nulls(build_row, build_col_count, probe_col_count, shape);
+                out.push(Row::from_compact_vec(values));
+                made += 1;
+            }
+        }
+        self.build_rows.len()
+    }
+}
+
+/// A hash join probed a slice of its probe rows at a time against one hash
+/// table, each slice sized by the rows the slices before it made, the build
+/// rows no probe row met made last
+pub(crate) struct HashJoinSlices {
+    probe_rows: CompactArc<Vec<Row>>,
+    build_rows: CompactArc<Vec<Row>>,
+    keys: (Vec<usize>, Vec<usize>),
+    join_type: JoinType,
+    counts: (usize, usize, usize),
+    swapped: bool,
+    use_parallel: bool,
+    config: ParallelConfig,
+    hash_table: ParallelHashTable,
+    build_matched: Option<BuildMatchedTracker>,
+    probed: usize,
+    /// The probe rows the last slice took and the rows it made
+    last: (usize, usize),
+    unmatched_from: usize,
+}
+
+impl HashJoinSlices {
+    /// The join of `probe_rows` and `build_rows` on the probe and build
+    /// `keys`, shaped as `parallel_hash_join_with_room` shapes its rows
+    pub(crate) fn new(
+        (probe_rows, build_rows): (CompactArc<Vec<Row>>, CompactArc<Vec<Row>>),
+        keys: (Vec<usize>, Vec<usize>),
+        join_type: JoinType,
+        counts: (usize, usize, usize),
+        swapped: bool,
+        config: ParallelConfig,
+    ) -> Self {
+        let use_parallel = probes_in_parallel(&config, build_rows.len(), probe_rows.len());
+        let hash_table = parallel_hash_build(&build_rows, &keys.1, &config);
+        let build_matched = tracker_for(join_type, swapped, build_rows.len());
+        Self {
+            probe_rows,
+            build_rows,
+            keys,
+            join_type,
+            counts,
+            swapped,
+            use_parallel,
+            config,
+            hash_table,
+            build_matched,
+            probed: 0,
+            last: (0, 0),
+            unmatched_from: 0,
+        }
+    }
+
+    /// The rows of the next slice, about `rows` of them once the slices
+    /// before it show how many a probe row makes; empty after the last
+    pub(crate) fn next_slice(&mut self, rows: usize) -> Vec<Row> {
+        let probe = Probe {
+            build_rows: &self.build_rows,
+            hash_table: &self.hash_table,
+            keys: (&self.keys.0, &self.keys.1),
+            join_type: self.join_type,
+            counts: self.counts,
+            swapped: self.swapped,
+            use_parallel: self.use_parallel,
+            config: &self.config,
+            build_matched: self.build_matched.as_ref(),
+        };
+        while self.probed < self.probe_rows.len() {
+            let left = self.probe_rows.len() - self.probed;
+            // As many probe rows as made `rows` at the last slice's rate; a
+            // sixty-fourth of `rows` after a slice that made none
+            let (taken, made) = self.last;
+            let take = match made {
+                0 => rows / 64,
+                made => (rows as u128 * taken as u128 / made as u128) as usize,
+            };
+            let take = take.clamp(1, left);
+            let slice = probe.slice(&self.probe_rows[self.probed..self.probed + take]);
+            self.probed += take;
+            self.last = (take, slice.len());
+            if !slice.is_empty() {
+                return slice;
+            }
+        }
+        let mut out = Vec::new();
+        self.unmatched_from = probe.unmatched_build(self.unmatched_from, rows, &mut out);
+        out
     }
 }
 

@@ -2244,6 +2244,29 @@ pub(crate) fn join_part_held(rows: usize) {
     JOIN_PART_LARGEST.with(|n| n.set(n.get().max(rows)));
 }
 
+thread_local! {
+    /// The parallel hash join probes made on this thread in fewer chunks
+    /// than the threads could take, since the last reset
+    static JOIN_PROBES_NARROW: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The parallel hash join probes made on this thread since the last reset
+/// whose probe rows were cut into fewer chunks than the threads could take
+pub fn join_probes_narrow() -> usize {
+    JOIN_PROBES_NARROW.with(std::cell::Cell::get)
+}
+
+pub fn reset_join_probes_narrow() {
+    JOIN_PROBES_NARROW.with(|n| n.set(0));
+}
+
+pub(crate) fn join_probe_chunks(rows: usize, chunk_rows: usize, threads: usize) {
+    let even = rows.div_ceil(threads.max(1)).max(1);
+    if rows.div_ceil(chunk_rows) < rows.div_ceil(even) {
+        JOIN_PROBES_NARROW.with(|n| n.set(n.get() + 1));
+    }
+}
+
 /// A mechanism of the general SELECT path that the prepared family no
 /// longer reaches
 #[derive(Clone, Copy, Debug)]
