@@ -7783,6 +7783,24 @@ impl TransactionVersionStore {
         Ok(self.meet_or_enter(index.column_ids(), values, row_id))
     }
 
+    /// How many rows are entered under a key, across the unique indexes
+    #[cfg(test)]
+    pub(crate) fn entered_keys(&self) -> usize {
+        (self.tracking.as_deref()).map_or(0, |t| {
+            t.local_keys.iter().map(|(_, keys)| keys.by_row.len()).sum()
+        })
+    }
+
+    /// Takes `row_id` out of every key it was entered under, as a row whose
+    /// insert claimed some keys and met a holder of another
+    pub(crate) fn release_keys(&mut self, row_id: i64) {
+        if let Some(tracking) = self.tracking.as_deref_mut() {
+            for (_, keys) in &mut tracking.local_keys {
+                keys.set(row_id, None);
+            }
+        }
+    }
+
     /// One of the transaction's own rows other than `row_id` holding the
     /// key `values` of `columns`, or none and `row_id` entered under it;
     /// a row met there whose latest version holds no key so hashed is
@@ -9379,14 +9397,15 @@ impl TransactionVersionStore {
         if let Some(tracking) = self.tracking.as_deref_mut() {
             tracking.key_changes.clear();
         }
-        // Rows given back an earlier version, whose keys are entered again
+        // Rows given back an earlier version or none, whose keys are entered
+        // again or taken out
         let mut restored: Vec<i64> = Vec::new();
         let tracks = self.tracking.is_some();
         if let Some(local_versions) = self.local_versions.as_mut() {
             local_versions.retain(|row_id, versions| {
                 let before = versions.len();
                 versions.retain(|v| v.create_time <= timestamp);
-                if tracks && versions.len() != before && !versions.is_empty() {
+                if tracks && versions.len() != before {
                     restored.push(row_id);
                 }
                 !versions.is_empty()

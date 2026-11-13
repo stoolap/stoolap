@@ -12212,6 +12212,31 @@ mod tests {
     }
 
     #[test]
+    fn failed_inserts_of_a_transaction_leave_no_keys_entered() {
+        let db = crate::api::Database::open("memory://failed_inserts_leave_no_keys").unwrap();
+        for sql in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER UNIQUE, b INTEGER UNIQUE)",
+            "INSERT INTO t VALUES (0, 0, 0)",
+            "BEGIN",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        for n in 1..=50 {
+            let undone = format!("INSERT INTO t VALUES ({n}, {n}, {n}), (-{n}, 0, -{n})");
+            assert!(db.execute(&undone, ()).is_err(), "{undone}");
+            let half = format!("INSERT INTO t VALUES ({m}, {m}, 0)", m = n + 100);
+            assert!(db.execute(&half, ()).is_err(), "{half}");
+        }
+        let operations = db.engine().operations();
+        let entered: usize = (operations.txn_version_stores().read().unwrap().values())
+            .flatten()
+            .map(|(_, store)| store.read().unwrap().entered_keys())
+            .sum();
+        assert_eq!(entered, 0, "rows entered under a key");
+        db.execute("ROLLBACK", ()).unwrap();
+    }
+
+    #[test]
     fn column_ddl_only_uses_an_existing_memory_segment_manager() {
         let engine = MVCCEngine::in_memory();
         engine.open_engine().unwrap();

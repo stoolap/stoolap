@@ -1786,6 +1786,8 @@ impl MVCCTable {
                     continue;
                 };
                 if let Some(holder) = store.claim_key(&**index, &values, row_id)? {
+                    // The row is not written: its keys of the indexes before go
+                    store.release_keys(row_id);
                     return Err(unique_error(&**index, &values, holder));
                 }
             }
