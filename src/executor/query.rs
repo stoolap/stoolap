@@ -448,11 +448,7 @@ impl<'r, 'p> JoinedWhere<'r, 'p> {
     }
 }
 
-/// The rows a join's aggregation reads in one part, about 30 MB of
-/// joined rows of a few columns
-const JOIN_PART_ROWS: usize = 262_144;
-
-/// A join's rows as its operator makes them, those `where_` passes, as an
+/// A join's rows as the join makes them, those `where_` passes, as an
 /// aggregation reads them, the cancel checked every hundred
 struct JoinedRows<'r, 'p> {
     stream: JoinStream,
@@ -497,25 +493,33 @@ impl RowSource for JoinedRows<'_, '_> {
     }
 
     fn each_part(mut self, run: &mut PartRun<'_>) -> Result<()> {
-        #[cfg(feature = "test-failpoints")]
-        let part_rows = crate::test_failpoints::join_part_rows().unwrap_or(JOIN_PART_ROWS);
-        #[cfg(not(feature = "test-failpoints"))]
-        let part_rows = JOIN_PART_ROWS;
+        let part_rows = join_part_rows();
         let mut part = RowVec::new();
         loop {
             part.clear();
-            while part.len() < part_rows {
-                match self.next_passed()? {
-                    Some(row) => part.push((0, row)),
-                    None => break,
+            // With no WHERE to ask, the join fills the part itself
+            let more = match self.where_ {
+                None => {
+                    let more = self.stream.fill(&mut part, part_rows)?;
+                    self.ctx.check_cancelled()?;
+                    more
                 }
-            }
+                Some(_) => {
+                    while part.len() < part_rows {
+                        match self.next_passed()? {
+                            Some(row) => part.push((0, row)),
+                            None => break,
+                        }
+                    }
+                    part.len() == part_rows
+                }
+            };
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::join_part_held(part.len());
             if !part.is_empty() {
                 run(&part)?;
             }
-            if part.len() < part_rows {
+            if !more {
                 return Ok(());
             }
         }
@@ -544,7 +548,8 @@ use super::expression::{
 };
 use super::hash_table::JoinHashTable;
 use super::join_executor::{
-    JoinExecutor, JoinPath, JoinRows, JoinStream, StatementRun, StreamingJoinRequest,
+    join_part_rows, JoinExecutor, JoinPath, JoinRows, JoinStream, StatementRun,
+    StreamingJoinRequest,
 };
 use super::operator::{Operator, QueryResultOperator};
 use super::operators::hash_join::JoinType as OperatorJoinType;

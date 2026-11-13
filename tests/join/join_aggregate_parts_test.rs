@@ -234,3 +234,100 @@ fn a_join_whose_parts_are_whole_counts_each_once() {
     let sql = "SELECT COUNT(*) FROM l JOIN r ON l.k = r.k WHERE l.id BETWEEN 3 AND 9";
     assert_eq!(parted(&db, sql), vec![int(pairs.len() as i64)]);
 }
+
+/// Rows on each side of the joins built across threads
+const WIDE: i64 = 12_000;
+
+/// bl: id 1..=WIDE, u = id, g = id % 5; br: id 1..=WIDE, u = id + WIDE / 2,
+/// v = id % 7. Row n of br meets row n + WIDE / 2 of bl, so half of each
+/// side meets nothing
+fn open_wide(name: &str) -> Database {
+    let db = Database::open(&format!("memory://{name}")).unwrap();
+    for sql in [
+        "CREATE TABLE bl (id INTEGER PRIMARY KEY, u INTEGER, g INTEGER)".to_string(),
+        "CREATE TABLE br (id INTEGER PRIMARY KEY, u INTEGER, v INTEGER)".to_string(),
+        format!("INSERT INTO bl SELECT value, value, value % 5 FROM generate_series(1, {WIDE})"),
+        format!(
+            "INSERT INTO br SELECT value, value + {}, value % 7 FROM generate_series(1, {WIDE})",
+            WIDE / 2
+        ),
+    ] {
+        db.execute(&sql, ()).unwrap();
+    }
+    db
+}
+
+/// The (bl, br) id pairs with equal u
+fn wide_pairs() -> impl Iterator<Item = (i64, i64)> {
+    (1..=WIDE / 2).map(|r| (r + WIDE / 2, r))
+}
+
+/// `sql`'s rows as `parted` reads them, checked to come from the hash join
+/// built across threads
+fn parted_across_threads(db: &Database, sql: &str) -> Vec<String> {
+    #[cfg(feature = "test-failpoints")]
+    stoolap::test_failpoints::reset_join_paths();
+    let out = parted(db, sql);
+    #[cfg(feature = "test-failpoints")]
+    assert_eq!(
+        stoolap::test_failpoints::join_paths_taken(),
+        vec!["parallel_hash"],
+        "{sql}"
+    );
+    out
+}
+
+#[test]
+fn a_join_built_across_threads_is_grouped_in_parts() {
+    let db = open_wide("join_aggregate_parts_wide_grouped");
+    let mut groups: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
+    for (l, r) in wide_pairs() {
+        let group = groups.entry(l % 5).or_default();
+        group.0 += 1;
+        group.1 += r % 7;
+    }
+    let expected: Vec<String> = groups
+        .iter()
+        .map(|(g, (count, sum))| [int(*g), int(*count), int(*sum)].join("|"))
+        .collect();
+    let sql = "SELECT bl.g, COUNT(*), SUM(br.v) FROM bl JOIN br ON bl.u = br.u \
+               GROUP BY bl.g ORDER BY bl.g";
+    assert_eq!(parted_across_threads(&db, sql), expected);
+}
+
+#[test]
+fn outer_joins_built_across_threads_count_every_unmatched_row() {
+    let db = open_wide("join_aggregate_parts_wide_outer");
+    let (pairs, alone) = (WIDE / 2, WIDE / 2);
+    let cases = [
+        ("LEFT", pairs + alone, pairs + alone, pairs),
+        ("RIGHT", pairs + alone, pairs, pairs + alone),
+        ("FULL", pairs + 2 * alone, pairs + alone, pairs + alone),
+    ];
+    for (kind, all, with_l, with_r) in cases {
+        let sql = format!(
+            "SELECT COUNT(*), COUNT(bl.id), COUNT(br.id) FROM bl {kind} JOIN br ON bl.u = br.u"
+        );
+        let expected = [int(all), int(with_l), int(with_r)].join("|");
+        assert_eq!(parted_across_threads(&db, &sql), vec![expected], "{kind}");
+    }
+}
+
+#[test]
+fn a_residual_and_a_distinct_count_read_a_join_built_across_threads() {
+    let db = open_wide("join_aggregate_parts_wide_residual");
+    let kept = wide_pairs().filter(|(_, r)| r % 7 < 3).count() as i64;
+    let sql = "SELECT COUNT(*) FROM bl JOIN br ON bl.u = br.u AND br.v < 3";
+    assert_eq!(parted_across_threads(&db, sql), vec![int(kept)]);
+    let mut groups: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
+    for (l, r) in wide_pairs() {
+        groups.entry(l % 5).or_default().insert(r % 7);
+    }
+    let expected: Vec<String> = groups
+        .iter()
+        .map(|(g, v)| [int(*g), int(v.len() as i64)].join("|"))
+        .collect();
+    let sql = "SELECT bl.g, COUNT(DISTINCT br.v) FROM bl JOIN br ON bl.u = br.u \
+               GROUP BY bl.g ORDER BY bl.g";
+    assert_eq!(parted_across_threads(&db, sql), expected);
+}
