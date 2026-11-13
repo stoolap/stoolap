@@ -1359,10 +1359,7 @@ impl Executor {
                         table_name
                     )));
                 }
-                // The id set is logged, so replay keeps what this saw
-                let set = self.engine.set_auto_increment(table_name, next)?;
-                self.engine
-                    .record_alter_table_auto_increment(table_name, set)?;
+                self.engine.set_auto_increment(table_name, next)?;
             }
             AlterTableOperation::RenameTable => {
                 if let Some(ref new_name) = stmt.new_table_name {

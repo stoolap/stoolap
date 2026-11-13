@@ -2235,16 +2235,18 @@ impl VersionStore {
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::live_rows_read();
         let open_at = deleted.iter().position(|&(_, txn_id)| open(txn_id));
-        // A deletion seen ended may have been taken back since: its commit
-        // puts the row back before the transaction ends
+        // A deletion seen ended may have been taken back since, its commit
+        // putting the row back before the transaction ends, and the row
+        // deleted again by another transaction
         let versions = self.versions.read();
-        let restored = deleted[..open_at.unwrap_or(deleted.len())]
-            .iter()
-            .find(|&&(row_id, _)| {
-                versions
-                    .get(row_id)
-                    .is_some_and(|entry| !entry.version.is_deleted())
-            });
+        let restored =
+            deleted[..open_at.unwrap_or(deleted.len())]
+                .iter()
+                .find(|&&(row_id, txn_id)| {
+                    versions
+                        .get(row_id)
+                        .is_some_and(|entry| entry.version.deleted_at_txn_id != txn_id)
+                });
         restored
             .or(open_at.map(|at| &deleted[at]))
             .map_or(live, |&(row_id, _)| row_id.max(live))

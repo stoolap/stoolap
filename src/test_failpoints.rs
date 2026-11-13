@@ -1834,6 +1834,20 @@ pub(crate) fn live_rows_read() {
 }
 
 thread_local! {
+    static AUTO_INCREMENT_LOGGING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next ALTER TABLE ... AUTO_INCREMENT has
+/// chosen the counter and is about to log it
+pub fn before_auto_increment_logged(hook: impl FnOnce() + 'static) {
+    AUTO_INCREMENT_LOGGING_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn auto_increment_logging() {
+    run_hook(&AUTO_INCREMENT_LOGGING_HOOK);
+}
+
+thread_local! {
     static PREPARED_SCALAR_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static PREPARED_PLAN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static PREPARED_EXISTS_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
