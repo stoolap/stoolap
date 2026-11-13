@@ -7748,11 +7748,13 @@ impl TransactionVersionStore {
         };
         let mut held = self.local_indexes.lock();
         let indexes = held.get_or_insert_with(Box::default);
-        let dirty = std::mem::take(&mut indexes.dirty);
-        for (held_columns, keys) in &mut indexes.by_columns {
-            for row_id in dirty.iter() {
-                keys.set(row_id, newest_hash(row_id, held_columns));
+        if !indexes.dirty.is_empty() {
+            for (held_columns, keys) in &mut indexes.by_columns {
+                for row_id in indexes.dirty.iter() {
+                    keys.set(row_id, newest_hash(row_id, held_columns));
+                }
             }
+            indexes.dirty = crate::common::I64Set::default();
         }
         if !indexes
             .by_columns
