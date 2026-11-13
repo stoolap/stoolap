@@ -304,6 +304,20 @@ pub trait Table: Send + Sync {
         false
     }
 
+    /// Whether the volume row `row_id` holds the key `values` in `columns`
+    /// as this handle's transaction sees it; `deleted` says whether the
+    /// transaction deleted the row
+    fn cold_row_holds(
+        &self,
+        row_id: i64,
+        columns: &[usize],
+        values: &[&Value],
+        deleted: &dyn Fn() -> bool,
+    ) -> bool {
+        let _ = (row_id, columns, values);
+        !deleted()
+    }
+
     /// The table instance and row layout this handle's schema describes:
     /// positions resolved from `schema()` are valid against this token only
     fn layout_token(&self) -> LayoutToken;

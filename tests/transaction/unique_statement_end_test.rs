@@ -289,6 +289,28 @@ const CASES: &[(&[&str], &str)] = &[
         ],
         "ok ok ok => 1:10,2:20",
     ),
+    (
+        &[
+            "BEGIN",
+            "UPDATE t SET w = 1 WHERE id = 1",
+            "INSERT INTO t VALUES (4, 10, 0)",
+            "COMMIT",
+        ],
+        "ok ok taken ok => 1:10,2:20",
+    ),
+    (
+        &[
+            "BEGIN",
+            "UPDATE t SET w = 1 WHERE id = 1",
+            "INSERT INTO t VALUES (4, 10, 0) ON CONFLICT (u) DO UPDATE SET w = 5",
+            "COMMIT",
+        ],
+        "ok ok ok ok => 1:10,2:20",
+    ),
+    (
+        &["INSERT INTO t VALUES (1, 0, 7), (8, 10, 0) ON DUPLICATE KEY UPDATE w = 9"],
+        "ok => 1:10,2:20",
+    ),
 ];
 
 #[test]

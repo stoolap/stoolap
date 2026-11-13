@@ -307,15 +307,12 @@ fn check_statement_keys(
     let store = txn_store.write_store();
     for (position, holder) in sealed {
         let (at, _, values) = &keys[position];
-        let columns = indexes[*at].column_ids();
-        let holds = match store.get_latest_local(holder) {
-            Some(version) => {
-                !version.is_deleted()
-                    && super::version_store::key_held(&version.data, columns, values)
-            }
-            None => !mgr.is_pending_tombstone(Pending::of(txn_id), holder),
-        };
-        if holds {
+        let columns: SmallVec<[usize; 4]> = (indexes[*at].column_ids().iter())
+            .map(|&id| id as usize)
+            .collect();
+        let found: SmallVec<[&Value; 4]> = values.iter().collect();
+        let deleted = || mgr.is_pending_tombstone(Pending::of(txn_id), holder);
+        if store.cold_row_holds(holder, &columns, &found, deleted) {
             return Err(super::version_store::unique_error(
                 &*indexes[*at],
                 values,

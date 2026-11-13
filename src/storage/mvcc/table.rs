@@ -2970,6 +2970,22 @@ impl Table for MVCCTable {
         (self.local().get_latest_local(row_id)).is_some_and(|version| version.create_time > cut)
     }
 
+    fn cold_row_holds(
+        &self,
+        row_id: i64,
+        columns: &[usize],
+        values: &[&Value],
+        deleted: &dyn Fn() -> bool,
+    ) -> bool {
+        match &self.txn_versions {
+            Some(store) => (store
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner))
+            .cold_row_holds(row_id, columns, values, deleted),
+            None => !deleted(),
+        }
+    }
+
     fn layout_token(&self) -> LayoutToken {
         self.version_store.token_for(self.layout)
     }

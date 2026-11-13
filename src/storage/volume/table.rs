@@ -1971,11 +1971,9 @@ impl SegmentedTable {
             None => return Ok(None),
         };
 
-        if self.segment_mgr.is_pending_tombstone(self.pending(), rid) {
-            return Ok(None);
-        }
-
-        Ok(Some(rid))
+        let pending = self.pending();
+        let deleted = || self.segment_mgr.is_pending_tombstone(pending, rid);
+        Ok((self.hot.cold_row_holds(rid, col_indices, values, &deleted)).then_some(rid))
     }
 
     /// Check PK and UNIQUE constraints against segment data before INSERT.

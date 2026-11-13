@@ -7783,6 +7783,26 @@ impl TransactionVersionStore {
         Ok(self.meet_or_enter(index.column_ids(), values, row_id))
     }
 
+    /// Whether the volume row `row_id` holds the key `values` in `columns`
+    /// as the transaction sees it: by its latest local version when it has
+    /// one, else unless the transaction deleted it
+    pub(crate) fn cold_row_holds(
+        &self,
+        row_id: i64,
+        columns: &[usize],
+        values: &[&Value],
+        deleted: impl FnOnce() -> bool,
+    ) -> bool {
+        match self.get_latest_local(row_id) {
+            Some(version) => {
+                !version.is_deleted()
+                    && (columns.iter().zip(values))
+                        .all(|(&at, &value)| version.data.get(at) == Some(value))
+            }
+            None => !deleted(),
+        }
+    }
+
     /// How many rows are entered under a key, across the unique indexes
     #[cfg(test)]
     pub(crate) fn entered_keys(&self) -> usize {
