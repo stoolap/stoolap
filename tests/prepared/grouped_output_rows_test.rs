@@ -44,6 +44,14 @@ fn a_grouped_output_block_reads_only_its_groups_rows() {
         format!("SELECT u.age, {block} FROM users u GROUP BY u.age ORDER BY u.age"),
         format!("SELECT u.age, 2 FROM users u GROUP BY u.age HAVING {block} = 2 ORDER BY u.age"),
         format!("SELECT u.age, {block} FROM users u GROUP BY u.age ORDER BY {block}, u.age"),
+        format!(
+            "SELECT u.age, {block}, ROW_NUMBER() OVER (ORDER BY u.age) \
+             FROM users u GROUP BY u.age ORDER BY u.age"
+        ),
+        format!(
+            "SELECT u.age, {block}, ROW_NUMBER() OVER (ORDER BY u.age) \
+             FROM users u GROUP BY u.age HAVING COUNT(*) > 0 ORDER BY u.age"
+        ),
     ]
     .into_iter()
     .enumerate()

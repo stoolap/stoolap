@@ -1911,6 +1911,10 @@ impl Executor {
         let groups = (group_by_columns.as_slice(), aggregations);
         let having_rows =
             self.having_groups(stmt, groups, ctx, (&result_columns, result_rows), blocks)?;
+        // The kept groups ask the output's blocks, through windows too
+        if let Some(blocks) = blocks {
+            blocks.rows_asking(having_rows.len());
+        }
         Ok((result_columns, having_rows, group_by_columns))
     }
 
