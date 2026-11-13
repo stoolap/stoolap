@@ -502,3 +502,317 @@ fn a_hash_join_on_one_thread_leaves_the_thread_pool_unbuilt() {
         .build_global()
         .expect("a hash join on one thread built the global thread pool");
 }
+
+/// A row of p: id, g
+type Parent = (i64, i64);
+
+/// A row of c: id, pid, v
+type Child = (i64, i64, i64);
+
+/// Which (p, c) pairs a statement keeps
+type Keep = fn(&Parent, &Child) -> bool;
+
+/// p: id 1..=50, g = id % 3
+fn p_rows() -> impl Iterator<Item = Parent> + Clone {
+    (1..=50).map(|id| (id, id % 3))
+}
+
+/// c: id 1..=300, pid = id % 47, v = id % 7, an index on pid; pid 0 meets
+/// no p, and p 47 to 50 meet no c
+fn c_rows() -> impl Iterator<Item = Child> + Clone {
+    (1..=300).map(|id| (id, id % 47, id % 7))
+}
+
+/// The (p, c) pairs with p.id = c.pid
+fn keyed_pairs() -> Vec<(Parent, Child)> {
+    let mut out = Vec::new();
+    for p in p_rows() {
+        for c in c_rows().filter(|c| c.1 == p.0) {
+            out.push((p, c));
+        }
+    }
+    out
+}
+
+fn open_keyed(name: &str) -> Database {
+    let db = Database::open(&format!("memory://{name}")).unwrap();
+    for sql in [
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, g INTEGER)",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, pid INTEGER, v INTEGER)",
+        "CREATE INDEX c_pid ON c (pid)",
+        "INSERT INTO p SELECT value, value % 3 FROM generate_series(1, 50)",
+        "INSERT INTO c SELECT value, value % 47, value % 7 FROM generate_series(1, 300)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    db
+}
+
+/// The path a join probing c's index takes; a file database hashes it
+const C_INDEX: &str = if cfg!(feature = "test-filedb") {
+    "hash"
+} else {
+    "index_nested_loop"
+};
+
+/// `sql`'s rows as `parted` reads them, checked to come from the index
+/// join `path`
+fn parted_by(db: &Database, sql: &str, path: &str) -> Vec<String> {
+    #[cfg(feature = "test-failpoints")]
+    stoolap::test_failpoints::reset_join_paths();
+    let out = parted(db, sql);
+    #[cfg(feature = "test-failpoints")]
+    assert_eq!(
+        stoolap::test_failpoints::join_paths_taken(),
+        vec![path],
+        "{sql}"
+    );
+    #[cfg(not(feature = "test-failpoints"))]
+    let _ = path;
+    out
+}
+
+/// Per p.g of the pairs `keep` keeps: the count and the sum of c.v
+fn keyed_groups(keep: impl Fn(&Parent, &Child) -> bool) -> Vec<String> {
+    let mut groups: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
+    for (p, c) in keyed_pairs().iter().filter(|(p, c)| keep(p, c)) {
+        let group = groups.entry(p.1).or_default();
+        group.0 += 1;
+        group.1 += c.2;
+    }
+    groups
+        .iter()
+        .map(|(g, (count, sum))| [int(*g), int(*count), int(*sum)].join("|"))
+        .collect()
+}
+
+#[test]
+fn an_index_join_is_grouped_in_parts() {
+    let db = open_keyed("join_aggregate_parts_index_grouped");
+    let all = keyed_groups(|_, _| true);
+    for (sql, path) in [
+        (
+            "SELECT p.g, COUNT(*), SUM(c.v) FROM p JOIN c ON c.pid = p.id \
+             GROUP BY p.g ORDER BY p.g",
+            C_INDEX,
+        ),
+        (
+            "SELECT p.g, COUNT(*), SUM(c.v) FROM c JOIN p ON p.id = c.pid \
+             GROUP BY p.g ORDER BY p.g",
+            "batch_index_nested_loop",
+        ),
+    ] {
+        assert_eq!(parted_by(&db, sql, path), all, "{sql}");
+    }
+}
+
+#[test]
+fn left_index_joins_count_their_unmatched_rows_in_parts() {
+    let db = open_keyed("join_aggregate_parts_index_left");
+    let pairs = keyed_pairs();
+    let lone_p = p_rows().filter(|p| !c_rows().any(|c| c.1 == p.0)).count() as i64;
+    let lone_c = c_rows().filter(|c| !p_rows().any(|p| p.0 == c.1)).count() as i64;
+    let sum: i64 = pairs.iter().map(|(_, c)| c.2).sum();
+    let n = pairs.len() as i64;
+    let sql = "SELECT COUNT(*), COUNT(c.id), SUM(c.v) FROM p LEFT JOIN c ON c.pid = p.id";
+    let want = vec![[int(n + lone_p), int(n), int(sum)].join("|")];
+    assert_eq!(parted_by(&db, sql, C_INDEX), want);
+    let sql = "SELECT COUNT(*), COUNT(p.id) FROM c LEFT JOIN p ON p.id = c.pid";
+    let want = vec![[int(n + lone_c), int(n)].join("|")];
+    assert_eq!(parted_by(&db, sql, "batch_index_nested_loop"), want);
+}
+
+#[test]
+fn filters_on_an_index_join_pass_rows_in_parts() {
+    let db = open_keyed("join_aggregate_parts_index_filters");
+    let cases: [(&str, &str, Keep); 4] = [
+        (
+            "SELECT p.g, COUNT(*), SUM(c.v) FROM p JOIN c ON c.pid = p.id AND c.v < 3 \
+             GROUP BY p.g ORDER BY p.g",
+            C_INDEX,
+            |_, c| c.2 < 3,
+        ),
+        (
+            "SELECT p.g, COUNT(*), SUM(c.v) FROM p JOIN c ON c.pid = p.id WHERE c.v = 2 \
+             GROUP BY p.g ORDER BY p.g",
+            "batch_index_nested_loop",
+            |_, c| c.2 == 2,
+        ),
+        (
+            "SELECT p.g, COUNT(*), SUM(c.v) FROM p JOIN c ON c.pid = p.id \
+             WHERE p.g + c.v > 3 GROUP BY p.g ORDER BY p.g",
+            C_INDEX,
+            |p, c| p.1 + c.2 > 3,
+        ),
+        (
+            "SELECT p.g, COUNT(*), SUM(c.v) FROM c JOIN p ON p.id = c.pid \
+             WHERE p.g + c.v > 3 GROUP BY p.g ORDER BY p.g",
+            "batch_index_nested_loop",
+            |p, c| p.1 + c.2 > 3,
+        ),
+    ];
+    for (sql, path, keep) in cases {
+        assert_eq!(parted_by(&db, sql, path), keyed_groups(keep), "{sql}");
+    }
+}
+
+#[test]
+fn distinct_counts_rollups_and_having_read_an_index_join_in_parts() {
+    let db = open_keyed("join_aggregate_parts_index_shapes");
+    let pairs = keyed_pairs();
+    let mut distinct: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
+    for (p, c) in &pairs {
+        distinct.entry(p.1).or_default().insert(c.2);
+    }
+    let want: Vec<String> = distinct
+        .iter()
+        .map(|(g, v)| [int(*g), int(v.len() as i64)].join("|"))
+        .collect();
+    let sql = "SELECT p.g, COUNT(DISTINCT c.v) FROM p JOIN c ON c.pid = p.id \
+               GROUP BY p.g ORDER BY p.g";
+    assert_eq!(parted_by(&db, sql, C_INDEX), want);
+
+    let mut groups: BTreeMap<i64, i64> = BTreeMap::new();
+    for (p, _) in &pairs {
+        *groups.entry(p.1).or_default() += 1;
+    }
+    let want: Vec<String> = std::iter::once((-1, pairs.len() as i64))
+        .chain(groups)
+        .map(|(g, count)| [int(g), int(count)].join("|"))
+        .collect();
+    let sql = "SELECT COALESCE(p.g, -1), COUNT(*) FROM p JOIN c ON c.pid = p.id \
+               GROUP BY ROLLUP(p.g) ORDER BY 1";
+    assert_eq!(parted_by(&db, sql, C_INDEX), want);
+
+    let mut counts: BTreeMap<i64, i64> = BTreeMap::new();
+    for (p, _) in &pairs {
+        *counts.entry(p.0).or_default() += 1;
+    }
+    let want: Vec<String> = counts
+        .iter()
+        .filter(|(_, n)| **n > 6)
+        .map(|(id, n)| [int(*id), int(*n)].join("|"))
+        .collect();
+    let sql = "SELECT p.id, COUNT(*) FROM c JOIN p ON p.id = c.pid \
+               GROUP BY p.id HAVING COUNT(*) > 6 ORDER BY p.id";
+    assert_eq!(parted_by(&db, sql, "batch_index_nested_loop"), want);
+}
+
+#[test]
+fn an_index_join_raises_its_on_error_before_the_where_reads_a_row() {
+    let db = open_keyed("join_aggregate_parts_index_on_error");
+    let sql = "SELECT c.id FROM c JOIN p ON p.id = c.pid \
+               AND CASE WHEN c.id = 1 THEN 9223372036854775807 + c.id ELSE 0 END = 0 \
+               WHERE EXISTS (SELECT 1 FROM p a JOIN c b ON a.id = b.pid AND b.v >= a.g - 9 \
+               WHERE b.id = c.id)";
+    #[cfg(feature = "test-failpoints")]
+    stoolap::test_failpoints::reset_join_paths();
+    let err = match db.query(sql, ()) {
+        Ok(rows) => rows.map(|r| r.map(|_| ())).collect::<Result<Vec<_>, _>>(),
+        Err(e) => Err(e),
+    }
+    .expect_err("c.id = 1 overflows the ON");
+    #[cfg(feature = "test-failpoints")]
+    assert_eq!(
+        stoolap::test_failpoints::join_paths_taken().first(),
+        Some(&"batch_index_nested_loop")
+    );
+    assert!(err.to_string().contains("overflow"), "{err}");
+}
+
+#[cfg(feature = "test-failpoints")]
+mod made_as_read {
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    use stoolap::core::{Result, Value};
+    use stoolap::functions::registry::global_registry;
+    use stoolap::functions::{
+        FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
+    };
+
+    static TICKS: AtomicI64 = AtomicI64::new(0);
+
+    fn info(name: &str) -> FunctionInfo {
+        FunctionInfo::new(
+            name,
+            FunctionType::Scalar,
+            "test counter",
+            FunctionSignature::new(FunctionDataType::Integer, vec![FunctionDataType::Any], 1, 1),
+        )
+        .non_deterministic()
+    }
+
+    /// Returns its argument and counts the pairs the join asked
+    #[derive(Default)]
+    struct JoinPartTick;
+
+    impl ScalarFunction for JoinPartTick {
+        fn name(&self) -> &str {
+            "JOIN_PART_TICK"
+        }
+        fn info(&self) -> FunctionInfo {
+            info("JOIN_PART_TICK")
+        }
+        fn evaluate(&self, args: &[Value]) -> Result<Value> {
+            TICKS.fetch_add(1, Ordering::Relaxed);
+            Ok(args[0].clone())
+        }
+        fn clone_box(&self) -> Box<dyn ScalarFunction> {
+            Box::new(JoinPartTick)
+        }
+    }
+
+    /// The pairs the join had asked when the aggregate read a row
+    #[derive(Default)]
+    struct JoinPartSeen;
+
+    impl ScalarFunction for JoinPartSeen {
+        fn name(&self) -> &str {
+            "JOIN_PART_SEEN"
+        }
+        fn info(&self) -> FunctionInfo {
+            info("JOIN_PART_SEEN")
+        }
+        fn evaluate(&self, _args: &[Value]) -> Result<Value> {
+            Ok(Value::Integer(TICKS.load(Ordering::Relaxed)))
+        }
+        fn clone_box(&self) -> Box<dyn ScalarFunction> {
+            Box::new(JoinPartSeen)
+        }
+    }
+
+    #[test]
+    fn an_index_join_makes_its_rows_as_the_aggregate_reads_them() {
+        global_registry().register_scalar::<JoinPartTick>().unwrap();
+        global_registry().register_scalar::<JoinPartSeen>().unwrap();
+        let db = super::open_keyed("join_aggregate_parts_index_made_as_read");
+        let pairs = super::keyed_pairs().len() as i64;
+        for (sql, path) in [
+            (
+                "SELECT MIN(JOIN_PART_SEEN(c.id)), COUNT(*) FROM p JOIN c ON c.pid = p.id \
+                 AND JOIN_PART_TICK(p.id + c.id) = p.id + c.id",
+                super::C_INDEX,
+            ),
+            (
+                "SELECT MIN(JOIN_PART_SEEN(c.id)), COUNT(*) FROM c JOIN p ON p.id = c.pid \
+                 AND JOIN_PART_TICK(p.id + c.id) = p.id + c.id",
+                "batch_index_nested_loop",
+            ),
+        ] {
+            let before = TICKS.load(Ordering::Relaxed);
+            let out = super::parted_by(&db, sql, path);
+            let row: Vec<&str> = out[0].split('|').collect();
+            assert_eq!(row[1], super::int(pairs), "{sql}");
+            let first_seen: i64 = row[0]
+                .trim_start_matches("Integer(")
+                .trim_end_matches(')')
+                .parse()
+                .unwrap();
+            let asked = first_seen - before;
+            assert!(
+                asked <= 2 * super::PART_ROWS as i64,
+                "{sql}: the join had asked {asked} of {pairs} pairs when the aggregate read its first row"
+            );
+        }
+    }
+}
