@@ -98,8 +98,8 @@ const CASES: &[Case] = &[
         ],
     },
     Case {
-        sql: "INSERT INTO p VALUES (3, 70, 0), (3, 700, 0) ON CONFLICT (id) DO UPDATE \
-              SET code = excluded.code",
+        sql: "INSERT INTO p VALUES (3, 70, 0), (3, 700, 0) ON DUPLICATE KEY UPDATE \
+              code = excluded.code",
         params: &[],
         returned: &[],
         after: &[
@@ -109,7 +109,7 @@ const CASES: &[Case] = &[
     },
     Case {
         sql: "INSERT INTO p VALUES (3, 8, 0), (4, 7, 0), (4, 9, 0), (3, 7, 0) \
-              ON CONFLICT (id) DO UPDATE SET code = excluded.code",
+              ON DUPLICATE KEY UPDATE code = excluded.code",
         params: &[],
         returned: &[],
         after: &[
@@ -118,15 +118,15 @@ const CASES: &[Case] = &[
         ],
     },
     Case {
-        sql: "INSERT INTO p VALUES (1, 50, 0), (1, 5, 0) ON CONFLICT (id) DO UPDATE \
-              SET code = excluded.code",
+        sql: "INSERT INTO p VALUES (1, 50, 0), (1, 5, 0) ON DUPLICATE KEY UPDATE \
+              code = excluded.code",
         params: &[],
         returned: &[],
         after: &[("SELECT COUNT(*) FROM cn WHERE pc IS NULL", 1)],
     },
     Case {
-        sql: "INSERT INTO p VALUES (3, 70, 0), (4, 700, 0) ON CONFLICT (id) DO UPDATE \
-              SET id = excluded.id + 1, code = excluded.code",
+        sql: "INSERT INTO p VALUES (3, 70, 0), (4, 700, 0) ON DUPLICATE KEY UPDATE \
+              id = excluded.id + 1, code = excluded.code",
         params: &[],
         returned: &[],
         after: &[
@@ -135,8 +135,8 @@ const CASES: &[Case] = &[
         ],
     },
     Case {
-        sql: "INSERT INTO p VALUES (3, 70, 0), (3, 700, 0) ON CONFLICT (id) DO UPDATE \
-              SET code = excluded.code RETURNING (SELECT COUNT(*) FROM cu WHERE pc = p.id + 4)",
+        sql: "INSERT INTO p VALUES (3, 70, 0), (3, 700, 0) ON DUPLICATE KEY UPDATE \
+              code = excluded.code RETURNING (SELECT COUNT(*) FROM cu WHERE pc = p.id + 4)",
         params: &[],
         returned: &[&[2], &[2]],
         after: &[("SELECT COUNT(*) FROM cu WHERE pc = 700", 2)],

@@ -297,6 +297,20 @@ pub trait Table: Send + Sync {
     /// Used by FK enforcement to participate in the caller's transaction.
     fn txn_id(&self) -> i64;
 
+    /// Whether the volume row `row_id` holds the key `values` in `columns`
+    /// as this handle's transaction sees it; `deleted` says whether the
+    /// transaction deleted the row
+    fn cold_row_holds(
+        &self,
+        row_id: i64,
+        columns: &[usize],
+        values: &[&Value],
+        deleted: &dyn Fn() -> bool,
+    ) -> bool {
+        let _ = (row_id, columns, values);
+        !deleted()
+    }
+
     /// The table instance and row layout this handle's schema describes:
     /// positions resolved from `schema()` are valid against this token only
     fn layout_token(&self) -> LayoutToken;
@@ -374,16 +388,16 @@ pub trait Table: Send + Sync {
     /// as inserted
     fn insert_with_id(&mut self, row: Row) -> Result<(i64, Row)>;
 
-    /// Inserts a single row without returning it (avoids clone overhead)
+    /// Inserts a single row without returning it (avoids clone overhead),
+    /// returning the row id it was given
     ///
     /// Use this when the RETURNING clause is not needed.
     /// This is ~7ms faster per 1000 rows by avoiding Row::clone().
     ///
     /// # Arguments
     /// * `row` - The row to insert
-    fn insert_discard(&mut self, row: Row) -> Result<()> {
-        self.insert(row)?;
-        Ok(())
+    fn insert_discard(&mut self, row: Row) -> Result<i64> {
+        self.insert_with_id(row).map(|(row_id, _)| row_id)
     }
 
     /// Inserts multiple rows into the table in a single batch operation

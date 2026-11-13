@@ -58,6 +58,8 @@ mod tx_pk_fast_path_layout_test;
 mod tx_pk_fast_path_test;
 mod txn_gate_test;
 mod txn_status_table_test;
+mod unique_statement_end_schema_test;
+mod unique_statement_end_test;
 mod view_overtaken_test;
 mod view_removal_history_test;
 mod visible_row_race_test;

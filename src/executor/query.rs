@@ -8741,6 +8741,8 @@ impl Executor {
         } else {
             self.begin_transaction()?
         };
+        // Each statement's unique keys are judged when it ends
+        self.engine.track_keys(transaction.id());
 
         *active_tx = Some(ActiveTransaction {
             transaction,

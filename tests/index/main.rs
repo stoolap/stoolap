@@ -63,5 +63,4 @@ mod unique_check_lock_order_test;
 mod unique_conflict_message_test;
 mod unique_get_test;
 mod unique_index_test;
-mod unique_plan_check_test;
 mod view_index_candidates_test;

@@ -789,13 +789,20 @@ fn a_keyless_cold_update_meets_a_hot_unique_key_when_it_runs() {
             Ok((row, false))
         },
     );
+    drop(table);
+    let committed = updated.and_then(|_| txn.commit());
+    assert!(
+        matches!(
+            committed,
+            Err(stoolap::core::Error::UniqueConstraint { .. })
+        ),
+        "the hot row's key was taken by the update: {committed:?}"
+    );
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let table = txn.get_table("k").unwrap();
     let rows = rows_of(table.as_ref());
     drop(table);
     txn.rollback().unwrap();
-    assert!(
-        updated.is_err(),
-        "the hot row's key was taken by the update: {updated:?}"
-    );
     assert_eq!(rows, vec![(1, 0), (2, 0)], "a refused update left a change");
 }
 
@@ -946,29 +953,30 @@ fn rows_of_one_statement_cannot_take_one_unique_key() {
         .unwrap();
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     db.execute("INSERT INTO t VALUES (3, 3)", ()).unwrap();
-    let mut txn = db.engine().begin_transaction().unwrap();
-    let mut table = txn.get_table("t").unwrap();
-    let mut to_five = |_: i64, mut row: stoolap::core::Row| {
+    let to_five = |_: i64, mut row: stoolap::core::Row| {
         row.set(1, stoolap::core::Value::Integer(5)).unwrap();
         Ok((row, true))
     };
-    // Two sealed rows, then a sealed and a hot row
-    let cold_cold = table.update_by_row_ids(&[1, 2], &mut to_five);
-    let cold_hot = table.update_by_row_ids(&[1, 3], &mut to_five);
+    // Two sealed rows, then a sealed and a hot row, each refused by its commit
+    for ids in [[1, 2], [1, 3]] {
+        let mut txn = db.engine().begin_transaction().unwrap();
+        let mut table = txn.get_table("t").unwrap();
+        let updated = table.update_by_row_ids(&ids, &mut to_five.clone());
+        drop(table);
+        let committed = updated.and_then(|_| txn.commit());
+        assert!(
+            matches!(
+                committed,
+                Err(stoolap::core::Error::UniqueConstraint { .. })
+            ),
+            "rows {ids:?} took one key: {committed:?}"
+        );
+    }
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let table = txn.get_table("t").unwrap();
     let rows = rows_of(table.as_ref());
     drop(table);
     txn.rollback().unwrap();
-    assert!(
-        matches!(
-            cold_cold,
-            Err(stoolap::core::Error::UniqueConstraint { .. })
-        ),
-        "two sealed rows took one key: {cold_cold:?}"
-    );
-    assert!(
-        matches!(cold_hot, Err(stoolap::core::Error::UniqueConstraint { .. })),
-        "a sealed and a hot row took one key: {cold_hot:?}"
-    );
     assert_eq!(
         rows,
         vec![(1, 1), (2, 2), (3, 3)],

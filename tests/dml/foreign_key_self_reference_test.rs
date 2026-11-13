@@ -549,7 +549,8 @@ fn an_upsert_checks_its_keys_into_its_own_table_as_the_statement_leaves_them() {
         "REFERENCES s(id)",
         &["INSERT INTO s VALUES (1, NULL, 0)"],
         |db| {
-            let upsert = "ON CONFLICT (id) DO UPDATE SET up = EXCLUDED.up";
+            // A later row may update a row an earlier one wrote
+            let upsert = "ON DUPLICATE KEY UPDATE up = EXCLUDED.up";
             for values in ["(1, 2, 0), (2, NULL, 0)", "(3, 99, 0), (3, NULL, 0)"] {
                 db.execute(&format!("INSERT INTO s VALUES {values} {upsert}"), ())
                     .unwrap();

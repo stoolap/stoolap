@@ -65,7 +65,15 @@ impl<'a> StatementRollback<'a> {
         }
     }
 
+    /// The statement's result once its new unique keys are judged as it
+    /// leaves the rows; a statement that fails is undone when this drops
     pub(super) fn finish<T>(mut self, result: Result<T>) -> Result<T> {
+        let result = match (result, self.checkpoint) {
+            (Ok(value), Some((txn_id, _))) => {
+                (self.engine.check_statement_keys(txn_id)).map(|()| value)
+            }
+            (result, _) => result,
+        };
         if result.is_ok() {
             self.checkpoint = None;
         }
@@ -558,11 +566,16 @@ fn returns_slot(returning: &[Expression], schema: &Schema) -> bool {
 /// `row` inserted into `table` as a RETURNING reads it: with its row id
 /// past its columns when `widened`
 fn inserted(table: &mut dyn Table, row: Row, widened: bool) -> Result<Row> {
+    inserted_with_id(table, row, widened).map(|(_, row)| row)
+}
+
+/// The row id an insert gave `row`, with the row as [`inserted`] gives it
+fn inserted_with_id(table: &mut dyn Table, row: Row, widened: bool) -> Result<(i64, Row)> {
     match widened {
         true => table
             .insert_with_id(row)
-            .map(|(id, row)| super::prepared_select::widened(row, id)),
-        false => table.insert(row),
+            .map(|(id, row)| (id, super::prepared_select::widened(row, id))),
+        false => table.insert_with_id(row),
     }
 }
 
@@ -869,6 +882,14 @@ impl Executor {
         drop(active_tx);
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::dml_table_opened();
+        // An upsert judges each row's keys against the rows before it, its
+        // own earlier rows included; ON CONFLICT DO UPDATE refuses a row it
+        // inserted or updated
+        let mut affected =
+            (stmt.on_duplicate && !stmt.conflict_target.is_empty()).then(I64Set::default);
+        if stmt.on_duplicate || stmt.do_nothing {
+            self.engine.track_keys(table.txn_id());
+        }
 
         // Prepared subqueries are read before the first write, through this
         // statement's transaction; a commit-time retry runs the statement again
@@ -1192,7 +1213,7 @@ impl Executor {
                     let insert_result: Result<Option<Row>> = if has_returning {
                         inserted(&mut *table, row, widened).map(Some)
                     } else {
-                        table.insert_discard(row).map(|()| None)
+                        table.insert_discard(row).map(|_| None)
                     };
                     match insert_result {
                         Ok(opt_row) => {
@@ -1214,13 +1235,16 @@ impl Executor {
                     let row_values = saved_row_values.as_ref().unwrap();
                     let schema_ref = select_schema.as_ref().unwrap();
                     // ON CONFLICT DO UPDATE / ON DUPLICATE KEY UPDATE
-                    let insert_result: Result<Option<Row>> = if has_returning {
-                        inserted(&mut *table, row, widened).map(Some)
+                    let insert_result: Result<(i64, Option<Row>)> = if has_returning {
+                        inserted_with_id(&mut *table, row, widened).map(|(id, row)| (id, Some(row)))
                     } else {
-                        table.insert_discard(row).map(|()| None)
+                        table.insert_discard(row).map(|id| (id, None))
                     };
                     match insert_result {
-                        Ok(opt_row) => {
+                        Ok((row_id, opt_row)) => {
+                            if let Some(affected) = affected.as_mut() {
+                                affected.insert(row_id);
+                            }
                             if let Some(inserted) = opt_row {
                                 returning_rows.push(inserted);
                             }
@@ -1234,6 +1258,7 @@ impl Executor {
                                 &mut table,
                                 schema_ref,
                                 row_id,
+                                affected.as_mut(),
                                 None,
                                 row_values,
                                 stmt,
@@ -1269,9 +1294,9 @@ impl Executor {
                             };
                             let conflict_rid = *conflict_rid;
                             // Use row_id from the error if available (cold segment check
-                            // already found it). Only fall back to re-search if row_id < 0
-                            // (hot index path sets row_id = -1 when unknown).
-                            let found_row_id = if conflict_rid >= 0 {
+                            // already found it). Only fall back to re-search if row_id is
+                            // i64::MIN (hot index path sets it when unknown).
+                            let found_row_id = if conflict_rid != i64::MIN {
                                 Ok(Some(conflict_rid))
                             } else {
                                 self.find_row_by_unique_index(
@@ -1284,6 +1309,7 @@ impl Executor {
                                         &mut table,
                                         schema_ref,
                                         row_id,
+                                        affected.as_mut(),
                                         Some(column),
                                         row_values,
                                         stmt,
@@ -1306,7 +1332,7 @@ impl Executor {
                                 }
                                 Ok(None) => {
                                     if let Error::UniqueConstraint { row_id, .. } = &mut e {
-                                        *row_id = -1;
+                                        *row_id = i64::MIN;
                                     }
                                     return Err(e);
                                 }
@@ -1483,7 +1509,7 @@ impl Executor {
                     let insert_result: Result<Option<Row>> = if has_returning {
                         inserted(&mut *table, row, widened).map(Some)
                     } else {
-                        table.insert_discard(row).map(|()| None)
+                        table.insert_discard(row).map(|_| None)
                     };
                     match insert_result {
                         Ok(opt_row) => {
@@ -1503,13 +1529,16 @@ impl Executor {
                     }
                 } else {
                     // ON CONFLICT DO UPDATE / ON DUPLICATE KEY UPDATE
-                    let insert_result: Result<Option<Row>> = if has_returning {
-                        inserted(&mut *table, row, widened).map(Some)
+                    let insert_result: Result<(i64, Option<Row>)> = if has_returning {
+                        inserted_with_id(&mut *table, row, widened).map(|(id, row)| (id, Some(row)))
                     } else {
-                        table.insert_discard(row).map(|()| None)
+                        table.insert_discard(row).map(|id| (id, None))
                     };
                     match insert_result {
-                        Ok(opt_row) => {
+                        Ok((row_id, opt_row)) => {
+                            if let Some(affected) = affected.as_mut() {
+                                affected.insert(row_id);
+                            }
                             if let Some(inserted) = opt_row {
                                 returning_rows.push(inserted);
                             }
@@ -1523,6 +1552,7 @@ impl Executor {
                                 &mut table,
                                 &schema,
                                 row_id,
+                                affected.as_mut(),
                                 None,
                                 &row_values,
                                 stmt,
@@ -1557,7 +1587,7 @@ impl Executor {
                                 return Err(e);
                             };
                             let conflict_rid = *conflict_rid;
-                            let found_row_id = if conflict_rid >= 0 {
+                            let found_row_id = if conflict_rid != i64::MIN {
                                 Ok(Some(conflict_rid))
                             } else {
                                 self.find_row_by_unique_index(
@@ -1574,6 +1604,7 @@ impl Executor {
                                         &mut table,
                                         &schema,
                                         row_id,
+                                        affected.as_mut(),
                                         Some(column),
                                         &row_values,
                                         stmt,
@@ -1596,7 +1627,7 @@ impl Executor {
                                 }
                                 Ok(None) => {
                                     if let Error::UniqueConstraint { row_id, .. } = &mut e {
-                                        *row_id = -1;
+                                        *row_id = i64::MIN;
                                     }
                                     return Err(e);
                                 }
@@ -3648,6 +3679,7 @@ impl Executor {
         table: &mut Box<dyn Table>,
         schema: &crate::core::Schema,
         row_id: i64,
+        affected: Option<&mut I64Set>,
         conflict_column: Option<&str>,
         insert_values: &[Value],
         stmt: &InsertStatement,
@@ -3660,6 +3692,13 @@ impl Executor {
             &mut super::foreign_key::UpdatePlans,
         ),
     ) -> Result<(bool, Option<Row>)> {
+        // ON CONFLICT DO UPDATE keeps the rows its statement inserted or
+        // updated; ON DUPLICATE KEY UPDATE updates such a row again
+        if affected.as_ref().is_some_and(|rows| rows.contains(row_id)) {
+            return Err(Error::invalid_argument(
+                "ON CONFLICT DO UPDATE cannot affect a row a second time in one statement",
+            ));
+        }
         // Build a WHERE clause to find the specific row
         // Use schema's cached pk_column_index for O(1) lookup
         let pk_col = schema
@@ -3866,15 +3905,24 @@ impl Executor {
 
         // Prefer direct row_id lookup when we have a concrete conflicting row_id.
         // This avoids a second scan on non-PK upserts after conflict resolution.
-        // row_id < 0 means "unknown" (sentinel from UniqueConstraint error).
+        // row_id i64::MIN means "unknown" (sentinel from UniqueConstraint error).
         // A row DO UPDATE ... WHERE left alone is not an updated row
-        let updated = if row_id >= 0 {
+        let updated = if row_id != i64::MIN {
             table.update_by_row_ids(&[row_id], &mut setter)?
         } else {
             let plan = where_expr.as_deref().and_then(|e| table.index_plan(e));
             let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
             table.update(access, where_expr.as_deref(), &mut setter)?
         };
+        if let (Some(rows), true) = (affected, updated > 0) {
+            rows.insert(row_id);
+            let key = schema.pk_column_index();
+            for (_, row) in &moves {
+                if let Some(Value::Integer(moved)) = key.and_then(|at| row.get(at)) {
+                    rows.insert(*moved);
+                }
+            }
+        }
         move_rows(&mut **table, moves)?;
 
         let txn_id = table.txn_id();

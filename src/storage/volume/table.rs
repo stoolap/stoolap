@@ -1971,11 +1971,9 @@ impl SegmentedTable {
             None => return Ok(None),
         };
 
-        if self.segment_mgr.is_pending_tombstone(self.pending(), rid) {
-            return Ok(None);
-        }
-
-        Ok(Some(rid))
+        let pending = self.pending();
+        let deleted = || self.segment_mgr.is_pending_tombstone(pending, rid);
+        Ok((self.hot.cold_row_holds(rid, col_indices, values, &deleted)).then_some(rid))
     }
 
     /// Check PK and UNIQUE constraints against segment data before INSERT.
@@ -2483,7 +2481,7 @@ impl SegmentedTable {
         planned: Result<()>,
     ) -> Result<i32> {
         // A new key, a hot row's or a sealed one's, is checked against the
-        // volumes only at commit, so a statement may swap keys among its rows
+        // volumes when the statement ends, so it may swap keys among its rows
         plan.compare_hot_keys = segment_mgr.has_segments();
         let cold_keys_changed =
             !plan.cold.is_empty() && cold_keys_changed(hot.as_ref(), &plan.cold)?;
@@ -4876,7 +4874,7 @@ impl Table for SegmentedTable {
         Ok(result)
     }
 
-    fn insert_discard(&mut self, row: Row) -> Result<()> {
+    fn insert_discard(&mut self, row: Row) -> Result<i64> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         let (_read, _seal_guard, _) = Self::fence_after_cold_check(
             &self.segment_mgr,
@@ -4885,9 +4883,9 @@ impl Table for SegmentedTable {
                 self.check_segment_constraints_with_snapshot(snapshot, loads, &row, None)
             },
         )?;
-        self.hot.insert_discard(row)?;
+        let row_id = self.hot.insert_discard(row)?;
         self.segment_mgr.record_txn_seal_generation(self.txn_id());
-        Ok(())
+        Ok(row_id)
     }
 
     fn insert_batch(&mut self, rows: Vec<Row>) -> Result<()> {

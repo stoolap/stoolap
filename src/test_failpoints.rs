@@ -298,6 +298,40 @@ pub(crate) fn transaction_begun() {
 }
 
 thread_local! {
+    static STATEMENT_INDEXES_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when a statement's end next has read a table's
+/// unique indexes, before it checks they are of the layout it read.
+pub fn after_statement_indexes(hook: impl FnOnce() + 'static) {
+    STATEMENT_INDEXES_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn statement_indexes_read() {
+    let hook = STATEMENT_INDEXES_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static STATEMENT_VOLUMES_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when a statement's end next reads a table's
+/// volumes for its unique keys, before it takes their snapshot.
+pub fn before_statement_volumes(hook: impl FnOnce() + 'static) {
+    STATEMENT_VOLUMES_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn statement_volumes_reading() {
+    let hook = STATEMENT_VOLUMES_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static COMMIT_VISIBLE_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
@@ -3284,19 +3318,6 @@ pub(crate) fn cold_only_rows_claimed() {
 }
 
 thread_local! {
-    static UNIQUE_PAIRS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// Pairs of an UPDATE's planned rows this thread compared for one unique key
-pub fn unique_pairs_compared() -> usize {
-    UNIQUE_PAIRS.with(std::cell::Cell::get)
-}
-
-pub(crate) fn unique_pair_compared() {
-    UNIQUE_PAIRS.with(|n| n.set(n.get() + 1));
-}
-
-thread_local! {
     static COLD_RECHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -3805,6 +3826,8 @@ pub fn reset_all() {
     COLD_MAP_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = None);
     UNIQUE_INDEX_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     STATEMENT_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    STATEMENT_INDEXES_HOOK.with(|slot| *slot.borrow_mut() = None);
+    STATEMENT_VOLUMES_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_ROUND_PREPARED_HOOK.with(|slot| *slot.borrow_mut() = None);
     IN_MEMBER_PROBED_HOOK.with(|slot| *slot.borrow_mut() = None);
     HOT_TOP_K_VISIT_HOOK.with(|slot| *slot.borrow_mut() = None);
@@ -3872,7 +3895,6 @@ pub fn reset_all() {
     DROP_HOT_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_CLAIM_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_ONLY_CLAIMED_HOOK.with(|slot| *slot.borrow_mut() = None);
-    UNIQUE_PAIRS.with(|n| n.set(0));
     COLD_RECHECKS.with(|n| n.set(0));
     TXN_GATE_LOOKUPS.with(|n| n.set(0));
     TXN_GATE_ADMISSIONS.with(|n| n.set(0));

@@ -267,7 +267,7 @@ fn publication_keeps_a_view_another_reader_published_meanwhile() {
 }
 
 #[test]
-fn unique_candidates_in_seven_volumes_load_at_commit_with_one_map_copy() {
+fn unique_candidates_in_seven_volumes_load_at_the_statement_end_with_one_map_copy() {
     let _guard = FailpointGuard::new();
     let dir = tempfile::tempdir().unwrap();
     let db = cold_table(dir.path(), 8);
@@ -295,13 +295,14 @@ fn unique_candidates_in_seven_volumes_load_at_commit_with_one_map_copy() {
     let commit_clones = stoolap::test_failpoints::segment_map_clones() - clones - update_clones;
     assert_eq!(
         (updated.0 - before.0, updated.1 - before.1, update_clones),
-        (1, 1, 1),
-        "the statement loads the source volume, with one map copy"
+        (8, 8, 2),
+        "the statement loads the source volume, then its end the seven unique \
+         candidates, with one map copy each"
     );
     assert_eq!(
         (after.0 - updated.0, after.1 - updated.1, commit_clones),
-        (7, 7, 1),
-        "the commit loads the seven unique candidates, with one map copy"
+        (0, 0, 0),
+        "the commit finds them loaded"
     );
     let moved: i64 = db
         .query_one(
