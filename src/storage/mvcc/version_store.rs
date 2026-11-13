@@ -7340,12 +7340,17 @@ struct KeyTracking {
     /// columns; each a candidate its row's latest version confirms
     local_keys: LocalKeys,
     /// The rows whose unique keys a write changed since the statement began,
-    /// judged when it ends
-    key_changes: Vec<i64>,
+    /// judged when it ends, each with a bit per changed index position
+    key_changes: Vec<(i64, u64)>,
+    /// The index generation the positions are of, ALL_KEYS once it moved
+    changes_read_at: u64,
     /// The unique indexes beside the key, by the generation of the parent's
     /// indexes they were read at
     unique_indexes: Option<(u64, UniqueIndexes)>,
 }
+
+/// An index generation no read has: every key of a changed row is judged
+pub(crate) const ALL_KEYS: u64 = u64::MAX;
 
 /// A table's unique indexes beside its key
 pub(crate) type UniqueIndexes = SmallVec<[Arc<dyn Index>; 4]>;
@@ -7625,14 +7630,17 @@ impl TransactionVersionStore {
         self.tracking.is_some()
     }
 
-    /// The unique indexes beside the key and the schema, read in one layout
-    /// of the parent, refused as SchemaChanged unless the transaction's rows
-    /// are held in it
+    /// The unique indexes beside the key with the generation they were read
+    /// at, and the schema, read in one layout of the parent, refused as
+    /// SchemaChanged unless the transaction's rows are held in it
     pub(crate) fn unique_indexes_in_layout(
         &mut self,
-    ) -> Result<(UniqueIndexes, CompactArc<Schema>), Error> {
+    ) -> Result<(u64, UniqueIndexes, CompactArc<Schema>), Error> {
         let (schema, layout) = self.parent_store.schema_and_layout();
         let indexes: UniqueIndexes = self.unique_indexes().iter().cloned().collect();
+        let read_at = (self.tracking.as_deref())
+            .and_then(|tracking| tracking.unique_indexes.as_ref())
+            .map_or(ALL_KEYS, |(read, _)| *read);
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::statement_indexes_read();
         let moved = is_closed(layout) || self.parent_store.layout() != layout;
@@ -7641,7 +7649,7 @@ impl TransactionVersionStore {
                 table: self.parent_store.table_name.to_string(),
             });
         }
-        Ok((indexes, schema))
+        Ok((read_at, indexes, schema))
     }
 
     /// The unique indexes beside the key a tracking transaction judges,
@@ -7700,24 +7708,37 @@ impl TransactionVersionStore {
             .unique_indexes
             .as_ref()
             .map_or(&[][..], |(_, all)| all);
-        let mut changed = false;
-        for index in indexes {
+        let mut changed = 0u64;
+        for (at, index) in indexes.iter().enumerate() {
             let columns = index.column_ids();
             if (columns.iter()).any(|&id| old.get(id as usize) != new.get(id as usize)) {
-                changed = true;
+                changed |= 1u64.checked_shl(at as u32).unwrap_or(u64::MAX);
                 let hash = row_key_hash(new, columns);
                 key_rows(&mut tracking.local_keys, columns).set(row_id, hash);
             }
         }
-        if changed {
-            tracking.key_changes.push(row_id);
+        if changed != 0 {
+            let read_at = tracking
+                .unique_indexes
+                .as_ref()
+                .map_or(0, |(read, _)| *read);
+            if tracking.key_changes.is_empty() {
+                tracking.changes_read_at = read_at;
+            } else if tracking.changes_read_at != read_at {
+                tracking.changes_read_at = ALL_KEYS;
+            }
+            tracking.key_changes.push((row_id, changed));
         }
     }
 
     /// The rows whose unique keys a write changed since the last statement
-    /// end, handed over
-    pub(crate) fn take_key_changes(&mut self) -> Vec<i64> {
-        (self.tracking.as_deref_mut()).map_or_else(Vec::new, |t| std::mem::take(&mut t.key_changes))
+    /// end, each with the positions of the indexes it changed, handed over
+    /// with the index generation those positions are of
+    pub(crate) fn take_key_changes(&mut self) -> (Vec<(i64, u64)>, u64) {
+        (self.tracking.as_deref_mut()).map_or_else(
+            || (Vec::new(), ALL_KEYS),
+            |t| (std::mem::take(&mut t.key_changes), t.changes_read_at),
+        )
     }
 
     /// Whether a write changed a unique key since the last statement end

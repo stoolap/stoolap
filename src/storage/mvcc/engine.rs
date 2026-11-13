@@ -233,17 +233,29 @@ fn check_statement_keys(
     // Read before the layout: a column change after it fails the volume read
     let generation = mgr.map(|mgr| mgr.schema_generation());
     let mut store = txn_store.write_store();
-    let mut rows = store.take_key_changes();
-    rows.sort_unstable();
-    rows.dedup();
-    let (indexes, schema) = store.unique_indexes_in_layout()?;
+    let (mut rows, changes_read_at) = store.take_key_changes();
+    rows.sort_unstable_by_key(|(row_id, _)| *row_id);
+    rows.dedup_by(|later, kept| {
+        let same = later.0 == kept.0;
+        if same {
+            kept.1 |= later.1;
+        }
+        same
+    });
+    let (read_at, indexes, schema) = store.unique_indexes_in_layout()?;
+    // Positions of another index set leave every key of the row to judge
+    let every = changes_read_at != read_at;
     // Each key by its index's position and its row
     let mut keys: SmallVec<[StatementKey; 1]> = SmallVec::new();
-    for &row_id in &rows {
+    for &(row_id, changed) in &rows {
         let Some(latest) = store.get_latest_local(row_id).filter(|v| !v.is_deleted()) else {
             continue;
         };
         for (at, index) in indexes.iter().enumerate() {
+            let bit = 1u64.checked_shl(at as u32).unwrap_or(u64::MAX);
+            if !every && changed & bit == 0 {
+                continue;
+            }
             let values: Option<SmallVec<[Value; 4]>> = (index.column_ids().iter())
                 .map(|&id| {
                     latest
