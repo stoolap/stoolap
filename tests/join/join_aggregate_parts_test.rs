@@ -548,6 +548,13 @@ fn open_keyed(name: &str) -> Database {
     db
 }
 
+/// The path a join probing c's index takes; a file database hashes it
+const C_INDEX: &str = if cfg!(feature = "test-filedb") {
+    "hash"
+} else {
+    "index_nested_loop"
+};
+
 /// `sql`'s rows as `parted` reads them, checked to come from the index
 /// join `path`
 fn parted_by(db: &Database, sql: &str, path: &str) -> Vec<String> {
@@ -587,7 +594,7 @@ fn an_index_join_is_grouped_in_parts() {
         (
             "SELECT p.g, COUNT(*), SUM(c.v) FROM p JOIN c ON c.pid = p.id \
              GROUP BY p.g ORDER BY p.g",
-            "index_nested_loop",
+            C_INDEX,
         ),
         (
             "SELECT p.g, COUNT(*), SUM(c.v) FROM c JOIN p ON p.id = c.pid \
@@ -609,7 +616,7 @@ fn left_index_joins_count_their_unmatched_rows_in_parts() {
     let n = pairs.len() as i64;
     let sql = "SELECT COUNT(*), COUNT(c.id), SUM(c.v) FROM p LEFT JOIN c ON c.pid = p.id";
     let want = vec![[int(n + lone_p), int(n), int(sum)].join("|")];
-    assert_eq!(parted_by(&db, sql, "index_nested_loop"), want);
+    assert_eq!(parted_by(&db, sql, C_INDEX), want);
     let sql = "SELECT COUNT(*), COUNT(p.id) FROM c LEFT JOIN p ON p.id = c.pid";
     let want = vec![[int(n + lone_c), int(n)].join("|")];
     assert_eq!(parted_by(&db, sql, "batch_index_nested_loop"), want);
@@ -622,7 +629,7 @@ fn filters_on_an_index_join_pass_rows_in_parts() {
         (
             "SELECT p.g, COUNT(*), SUM(c.v) FROM p JOIN c ON c.pid = p.id AND c.v < 3 \
              GROUP BY p.g ORDER BY p.g",
-            "index_nested_loop",
+            C_INDEX,
             |_, c| c.2 < 3,
         ),
         (
@@ -634,7 +641,7 @@ fn filters_on_an_index_join_pass_rows_in_parts() {
         (
             "SELECT p.g, COUNT(*), SUM(c.v) FROM p JOIN c ON c.pid = p.id \
              WHERE p.g + c.v > 3 GROUP BY p.g ORDER BY p.g",
-            "index_nested_loop",
+            C_INDEX,
             |p, c| p.1 + c.2 > 3,
         ),
         (
@@ -663,7 +670,7 @@ fn distinct_counts_rollups_and_having_read_an_index_join_in_parts() {
         .collect();
     let sql = "SELECT p.g, COUNT(DISTINCT c.v) FROM p JOIN c ON c.pid = p.id \
                GROUP BY p.g ORDER BY p.g";
-    assert_eq!(parted_by(&db, sql, "index_nested_loop"), want);
+    assert_eq!(parted_by(&db, sql, C_INDEX), want);
 
     let mut groups: BTreeMap<i64, i64> = BTreeMap::new();
     for (p, _) in &pairs {
@@ -675,7 +682,7 @@ fn distinct_counts_rollups_and_having_read_an_index_join_in_parts() {
         .collect();
     let sql = "SELECT COALESCE(p.g, -1), COUNT(*) FROM p JOIN c ON c.pid = p.id \
                GROUP BY ROLLUP(p.g) ORDER BY 1";
-    assert_eq!(parted_by(&db, sql, "index_nested_loop"), want);
+    assert_eq!(parted_by(&db, sql, C_INDEX), want);
 
     let mut counts: BTreeMap<i64, i64> = BTreeMap::new();
     for (p, _) in &pairs {
@@ -784,7 +791,7 @@ mod made_as_read {
             (
                 "SELECT MIN(JOIN_PART_SEEN(c.id)), COUNT(*) FROM p JOIN c ON c.pid = p.id \
                  AND JOIN_PART_TICK(p.id + c.id) = p.id + c.id",
-                "index_nested_loop",
+                super::C_INDEX,
             ),
             (
                 "SELECT MIN(JOIN_PART_SEEN(c.id)), COUNT(*) FROM c JOIN p ON p.id = c.pid \
