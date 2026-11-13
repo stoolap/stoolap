@@ -165,6 +165,36 @@ pub unsafe extern "C" fn stoolap_tx_exec_params(
     params_len: i32,
     rows_affected: *mut i64,
 ) -> i32 {
+    stoolap_tx_exec_params_counts(
+        tx,
+        sql,
+        params,
+        params_len,
+        rows_affected,
+        std::ptr::null_mut(),
+    )
+}
+
+/// Execute a SQL statement within a transaction (with parameters), writing
+/// the rows it matched to `rows_affected` and, for an UPDATE, the matched
+/// rows whose SET changed a value to `rows_changed`; for any other
+/// statement both receive the rows affected.
+///
+/// # Safety
+///
+/// - `tx` must be a valid `StoolapTx` pointer.
+/// - `sql` must be a valid null-terminated UTF-8 string.
+/// - `params` must point to `params_len` valid `StoolapValue` structs (or be NULL).
+/// - `rows_affected` and `rows_changed` may be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_tx_exec_params_counts(
+    tx: *mut StoolapTx,
+    sql: *const c_char,
+    params: *const StoolapValue,
+    params_len: i32,
+    rows_affected: *mut i64,
+    rows_changed: *mut i64,
+) -> i32 {
     let handle = match tx.as_mut() {
         Some(h) => h,
         None => return STOOLAP_ERROR,
@@ -193,10 +223,15 @@ pub unsafe extern "C" fn stoolap_tx_exec_params(
             }
         };
 
-        match value::params_to_vec(params, params_len).and_then(|p| inner_tx.execute(sql_str, p)) {
-            Ok(affected) => {
+        let executed = value::params_to_vec(params, params_len)
+            .and_then(|p| inner_tx.execute_counts(sql_str, p));
+        match executed {
+            Ok(counts) => {
                 if !rows_affected.is_null() {
-                    *rows_affected = affected;
+                    *rows_affected = counts.matched;
+                }
+                if !rows_changed.is_null() {
+                    *rows_changed = counts.changed;
                 }
                 STOOLAP_OK
             }

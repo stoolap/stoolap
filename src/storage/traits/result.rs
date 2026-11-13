@@ -91,6 +91,13 @@ pub trait QueryResult: Send {
         0
     }
 
+    /// The rows an UPDATE changed, those its SET gave a value different
+    /// from the one they held; the rows affected for any other statement,
+    /// 0 for one with RETURNING
+    fn rows_changed(&self) -> i64 {
+        self.rows_affected()
+    }
+
     /// Returns the last inserted ID for an INSERT operation
     ///
     /// Default implementation returns 0. Override for INSERT results.

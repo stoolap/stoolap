@@ -236,6 +236,24 @@ int32_t stoolap_exec_params(
 );
 
 /**
+ * Execute a SQL statement with positional parameters, reporting two counts.
+ *
+ * @param rows_affected  If non-NULL, receives the rows the statement matched.
+ * @param rows_changed   If non-NULL, receives, for an UPDATE, the matched rows
+ *                       whose SET changed a value; for any other statement,
+ *                       the rows affected. A statement with RETURNING
+ *                       reports both counts as 0.
+ */
+int32_t stoolap_exec_params_counts(
+    StoolapDB* db,
+    const char* sql,
+    const StoolapValue* params,
+    int32_t params_len,
+    int64_t* rows_affected,
+    int64_t* rows_changed
+);
+
+/**
  * Execute a SQL statement with named parameters (:name).
  *
  * @param params      Array of named parameters. May be NULL if params_len is 0.
@@ -305,6 +323,20 @@ int32_t stoolap_stmt_exec(
     const StoolapValue* params,
     int32_t params_len,
     int64_t* rows_affected
+);
+
+/**
+ * Execute a prepared statement with parameters, reporting two counts:
+ * the rows matched, and for an UPDATE the matched rows whose SET changed a
+ * value (the rows affected for any other statement, 0 for one with
+ * RETURNING). Either may be NULL.
+ */
+int32_t stoolap_stmt_exec_counts(
+    StoolapStmt* stmt,
+    const StoolapValue* params,
+    int32_t params_len,
+    int64_t* rows_affected,
+    int64_t* rows_changed
 );
 
 /**
@@ -407,6 +439,21 @@ int32_t stoolap_tx_exec_params(
     const StoolapValue* params,
     int32_t params_len,
     int64_t* rows_affected
+);
+
+/**
+ * Execute within a transaction (with parameters), reporting the rows
+ * matched and, for an UPDATE, the matched rows whose SET changed a value.
+ * A statement with RETURNING reports both as 0. Either count pointer may
+ * be NULL.
+ */
+int32_t stoolap_tx_exec_params_counts(
+    StoolapTx* tx,
+    const char* sql,
+    const StoolapValue* params,
+    int32_t params_len,
+    int64_t* rows_affected,
+    int64_t* rows_changed
 );
 
 /** Execute within a transaction (with named parameters). */

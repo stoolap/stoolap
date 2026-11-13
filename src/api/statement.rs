@@ -133,11 +133,24 @@ impl Statement {
     /// stmt.execute((2, "Bob"))?;
     /// ```
     pub fn execute<P: Params>(&self, params: P) -> Result<i64> {
+        Ok(self.executed(params)?.rows_affected())
+    }
+
+    /// Execute the prepared statement, returning the rows it matched and,
+    /// for an UPDATE, the rows whose SET changed a value
+    pub fn execute_counts<P: Params>(&self, params: P) -> Result<crate::api::ExecCounts> {
+        Ok(crate::api::ExecCounts::of(&*self.executed(params)?))
+    }
+
+    /// The result of running the statement with `params`
+    fn executed<P: Params>(
+        &self,
+        params: P,
+    ) -> Result<Box<dyn crate::storage::traits::QueryResult>> {
         let db = self.get_db()?;
-        if let Some(plan) = &self.plan {
-            Ok(db.run_plan(plan, params.into_params())?.rows_affected())
-        } else {
-            db.execute(&self.sql, params)
+        match &self.plan {
+            Some(plan) => db.run_plan(plan, params.into_params()),
+            None => db.executed(&self.sql, params),
         }
     }
 

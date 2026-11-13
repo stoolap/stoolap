@@ -129,11 +129,21 @@ impl Transaction {
     /// tx.commit()?;
     /// ```
     pub fn execute<P: Params>(&mut self, sql: &str, params: P) -> Result<i64> {
+        Ok(self.execute_counts(sql, params)?.matched)
+    }
+
+    /// Execute a statement within the transaction, returning the rows it
+    /// matched and, for an UPDATE, the rows whose SET changed a value
+    pub fn execute_counts<P: Params>(
+        &mut self,
+        sql: &str,
+        params: P,
+    ) -> Result<crate::api::ExecCounts> {
         self.check_active()?;
 
         let param_values = params.into_params();
         let result = self.execute_sql(sql, param_values)?;
-        Ok(result.rows_affected())
+        Ok(crate::api::ExecCounts::of(&*result))
     }
 
     /// Execute a pre-parsed statement with parameters.

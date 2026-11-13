@@ -506,6 +506,8 @@ impl Executor {
         );
         pk_expr.prepare_for_schema(&plan.schema);
         let access = ScanAccess::Index(&IndexPlan::Key);
+        // Whether the row an UPDATE set got a value it did not hold
+        let mut changed = false;
         let written = match plan.write {
             DmlWrite::Delete => table.delete(access, Some(&pk_expr)),
             DmlWrite::Update(_) => {
@@ -517,8 +519,8 @@ impl Executor {
                             return Ok((row, false));
                         }
                     }
+                    let mut computed = Vec::with_capacity(programs.len());
                     if !programs.is_empty() {
-                        let mut computed = Vec::with_capacity(programs.len());
                         {
                             let exec_ctx = super::expression::execute_context(&row, ctx, None);
                             for (idx, program, column_type, vector_dims) in programs {
@@ -534,9 +536,10 @@ impl Executor {
                                 computed.push((*idx, coerced));
                             }
                         }
-                        for (idx, value) in computed {
-                            let _ = row.set(idx, value);
-                        }
+                    }
+                    changed = super::dml::set_changes(&row, computed.iter().chain(&values));
+                    for (idx, value) in computed {
+                        let _ = row.set(idx, value);
                     }
                     for (idx, value) in &values {
                         let _ = row.set(*idx, value.clone());
@@ -554,9 +557,13 @@ impl Executor {
         if let Some(mut tx) = autocommit {
             tx.commit()?;
         }
-        Ok(Box::new(ExecResult::with_rows_affected(
-            rows_affected as i64,
-        )))
+        let result = match plan.write {
+            DmlWrite::Delete => ExecResult::with_rows_affected(rows_affected as i64),
+            DmlWrite::Update(_) => {
+                ExecResult::with_rows_changed(rows_affected as i64, i64::from(changed))
+            }
+        };
+        Ok(Box::new(result))
     }
 
     /// The plan of `stmt` as EXPLAIN shows it when it reads the row its

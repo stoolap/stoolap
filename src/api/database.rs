@@ -614,17 +614,37 @@ impl Database {
     /// )?;
     /// ```
     pub fn execute<P: Params>(&self, sql: &str, params: P) -> Result<i64> {
-        let executor = &self.inner.executor;
+        Ok(self.executed(sql, params)?.rows_affected())
+    }
 
+    /// Execute a statement, returning the rows it matched and the rows it
+    /// changed: for an UPDATE, those whose SET gave a value different from
+    /// the one they held; for any other statement both are the rows affected.
+    /// A statement with RETURNING reports its rows through `query`, and 0 here
+    ///
+    /// ```ignore
+    /// let counts = db.execute_counts("UPDATE t SET v = 2 WHERE id > 0", ())?;
+    /// assert_eq!((counts.matched, counts.changed), (2, 1));
+    /// ```
+    pub fn execute_counts<P: Params>(&self, sql: &str, params: P) -> Result<ExecCounts> {
+        Ok(ExecCounts::of(&*self.executed(sql, params)?))
+    }
+
+    /// The result of running `sql` with `params`
+    pub(crate) fn executed<P: Params>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> Result<Box<dyn crate::storage::traits::QueryResult>> {
+        let executor = &self.inner.executor;
         let param_values = params.into_params();
-        let result = if param_values.is_empty() {
-            executor.execute(sql)?
+        if param_values.is_empty() {
+            executor.execute(sql)
         } else if let Some(fast_result) = executor.try_fast_path_with_params(sql, &param_values) {
-            fast_result?
+            fast_result
         } else {
-            executor.execute_with_params(sql, param_values)?
-        };
-        Ok(result.rows_affected())
+            executor.execute_with_params(sql, param_values)
+        }
     }
 
     /// Execute a query that returns rows
@@ -1140,6 +1160,26 @@ impl Database {
     /// Returns None if no snapshots were loaded.
     pub fn oldest_loaded_snapshot_timestamp(&self) -> Option<String> {
         self.inner.shared.engine.oldest_loaded_snapshot_timestamp()
+    }
+}
+
+/// The rows a statement matched and, of those, the rows it changed
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecCounts {
+    /// The rows affected, for an UPDATE the rows its WHERE matched
+    pub matched: i64,
+    /// For an UPDATE, the matched rows whose SET changed a value; else
+    /// the rows affected
+    pub changed: i64,
+}
+
+impl ExecCounts {
+    /// The counts `result` reports
+    pub(crate) fn of(result: &dyn crate::storage::traits::QueryResult) -> Self {
+        Self {
+            matched: result.rows_affected(),
+            changed: result.rows_changed(),
+        }
     }
 }
 
