@@ -15,7 +15,7 @@
 //! A scan by the access a plan chose reads the rows a scan that chooses its
 //! own access reads: hot and sealed, with the transaction's own changes
 
-use stoolap::core::{RowVec, Value};
+use stoolap::core::{Error, RowVec, Value};
 use stoolap::executor::Deadline;
 use stoolap::storage::expression::{
     AndExpr, BetweenExpr, ComparisonExpr, Expression, InListExpr, LikeExpr, OrExpr,
@@ -419,5 +419,38 @@ fn a_range_after_a_multi_column_prefix_keeps_the_rows_at_its_bounds() {
                 "{sql}"
             );
         }
+    }
+}
+
+#[test]
+fn an_index_read_that_finds_no_candidate_still_refuses_a_changed_table() {
+    let db = Database::open("memory://scan_access_no_candidate_changed").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",
+        "CREATE INDEX t_a ON t (a)",
+        "INSERT INTO t VALUES (1, 1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let tx = db.engine().begin_transaction().unwrap();
+    let older = tx.get_table("t").unwrap();
+    let mut condition = ComparisonExpr::eq("a", Value::Integer(999));
+    condition.prepare_for_schema(older.schema());
+    let store = db.engine().get_version_store("t").unwrap();
+    let plan = decide(&store, older.schema(), &condition as &dyn Expression, false).unwrap();
+    db.execute("ALTER TABLE t ADD COLUMN b INTEGER", ())
+        .unwrap();
+    let access = || ScanAccess::Index(&plan);
+    let scanned = older
+        .scan_access(access(), &[0, 1], None, Some(&condition), Deadline::NONE)
+        .map(drop);
+    let collected = older
+        .collect_access_rows(access(), Some(&condition), Deadline::NONE)
+        .map(drop);
+    for (read, got) in [("scan_access", scanned), ("collect_access_rows", collected)] {
+        assert!(
+            matches!(got, Err(Error::SchemaChanged { .. })),
+            "{read} gave {got:?}"
+        );
     }
 }

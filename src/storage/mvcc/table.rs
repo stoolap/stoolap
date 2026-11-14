@@ -3090,11 +3090,113 @@ impl MVCCTable {
             row_ids.extend(self.local_ids_missing_from(plan, filter, &row_ids));
         }
         let mut rows = RowVec::with_capacity(row_ids.len());
-        for ids in row_ids.chunks(CHARGE_BEAT) {
-            deadline.charge(DeadlineSite::StorageRead, ids.len())?;
-            self.fetch_rows_by_ids_into(ids, filter, &mut rows)?;
-        }
+        self.fetch_rows_charged(&row_ids, filter, &mut rows, deadline)?;
         Ok(Some(rows))
+    }
+
+    /// The rows of `row_ids` that `filter` keeps, the transaction's own
+    /// versions first, added to `rows`; `deadline` is charged a run of ids
+    /// at a time. The global rows are read in one batch, under one lock
+    fn fetch_rows_charged(
+        &self,
+        row_ids: &[i64],
+        filter: &dyn Expression,
+        rows: &mut RowVec,
+        deadline: Deadline,
+    ) -> Result<()> {
+        let txn_versions = self.local();
+        let schema = &self.cached_schema;
+        let fallible = filter.can_fail();
+
+        // Without local changes every id reads the global store, as given
+        let mut global_row_ids = Vec::new();
+        let global_ids: &[i64] = if txn_versions.has_local_changes() {
+            // Don't pre-allocate based on row_ids.len() — for volume-backed tables,
+            // indexes may contain row_ids that exist in frozen volumes but not in
+            // the version store. Most lookups will be misses, so pre-allocating
+            // for all of them wastes memory.
+            global_row_ids.reserve(row_ids.len().min(4096));
+
+            // Step 1: Check local versions first (uncommitted changes in this transaction)
+            let start = rows.len();
+            for ids in row_ids.chunks(CHARGE_BEAT) {
+                deadline.charge(DeadlineSite::StorageRead, ids.len())?;
+                for &row_id in ids {
+                    if let Some(version) = txn_versions.get_local_version(row_id) {
+                        if !version.is_deleted() {
+                            // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
+                            let row = self.normalize_row_to_schema(version.data.clone(), schema);
+                            rows.push((row_id, row));
+                        }
+                        // Skip global lookup - local version takes precedence
+                    } else {
+                        // Need to fetch from global store
+                        global_row_ids.push(row_id);
+                    }
+                }
+            }
+            drop(txn_versions);
+            let kept = keep_passing(
+                rows.as_mut_slice(),
+                start,
+                |(_, row)| row,
+                filter,
+                fallible,
+                deadline,
+                DeadlineSite::StorageRead,
+            )?;
+            rows.truncate(kept);
+            &global_row_ids
+        } else {
+            drop(txn_versions);
+            row_ids
+        };
+
+        // Step 2: Batch fetch from global store (single lock acquisition)
+        if !global_ids.is_empty() {
+            let global_rows = self
+                .version_store
+                .get_visible_versions_batch(global_ids, self.reader());
+            self.check_read()?;
+            if !deadline.is_none() {
+                return self.keep_global_timed(global_rows, filter, rows, deadline);
+            }
+
+            // Apply filter to fetched rows
+            for (row_id, row) in global_rows {
+                // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
+                let row = self.normalize_row_to_schema(row, schema);
+                if passes(filter, fallible, &row)? {
+                    rows.push((row_id, row));
+                }
+            }
+            return Ok(());
+        }
+        self.check_read()
+    }
+
+    /// The filter loop of [`Self::fetch_rows_charged`] charging `deadline`
+    /// a run of rows at a time, compiled apart so the untimed loop holds no
+    /// charge, which costs a row loop its registers
+    #[inline(never)]
+    fn keep_global_timed(
+        &self,
+        mut global_rows: RowVec,
+        filter: &dyn Expression,
+        rows: &mut RowVec,
+        deadline: Deadline,
+    ) -> Result<()> {
+        let fallible = filter.can_fail();
+        for batch in global_rows.chunks_mut(CHARGE_BEAT) {
+            deadline.charge(DeadlineSite::StorageRead, batch.len())?;
+            for (row_id, row) in batch.iter_mut() {
+                let row = self.normalize_row_to_schema(std::mem::take(row), &self.cached_schema);
+                if passes(filter, fallible, &row)? {
+                    rows.push((*row_id, row));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The row an `IndexPlan::Key` names in `filter`, the transaction's own
@@ -3217,69 +3319,7 @@ impl Table for MVCCTable {
         filter: &dyn Expression,
         rows: &mut RowVec,
     ) -> Result<()> {
-        let txn_versions = self.local();
-        let schema = &self.cached_schema;
-        let fallible = filter.can_fail();
-
-        // Without local changes every id reads the global store, as given
-        let mut global_row_ids = Vec::new();
-        let global_ids: &[i64] = if txn_versions.has_local_changes() {
-            // Don't pre-allocate based on row_ids.len() — for volume-backed tables,
-            // indexes may contain row_ids that exist in frozen volumes but not in
-            // the version store. Most lookups will be misses, so pre-allocating
-            // for all of them wastes memory.
-            global_row_ids.reserve(row_ids.len().min(4096));
-
-            // Step 1: Check local versions first (uncommitted changes in this transaction)
-            let start = rows.len();
-            for &row_id in row_ids {
-                if let Some(version) = txn_versions.get_local_version(row_id) {
-                    if !version.is_deleted() {
-                        // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
-                        let row = self.normalize_row_to_schema(version.data.clone(), schema);
-                        rows.push((row_id, row));
-                    }
-                    // Skip global lookup - local version takes precedence
-                } else {
-                    // Need to fetch from global store
-                    global_row_ids.push(row_id);
-                }
-            }
-            drop(txn_versions);
-            let kept = keep_passing(
-                rows.as_mut_slice(),
-                start,
-                |(_, row)| row,
-                filter,
-                fallible,
-                Deadline::NONE,
-                DeadlineSite::StorageRead,
-            )?;
-            rows.truncate(kept);
-            &global_row_ids
-        } else {
-            drop(txn_versions);
-            row_ids
-        };
-
-        // Step 2: Batch fetch from global store (single lock acquisition)
-        if !global_ids.is_empty() {
-            let global_rows = self
-                .version_store
-                .get_visible_versions_batch(global_ids, self.reader());
-            self.check_read()?;
-
-            // Apply filter to fetched rows
-            for (row_id, row) in global_rows {
-                // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
-                let row = self.normalize_row_to_schema(row, schema);
-                if passes(filter, fallible, &row)? {
-                    rows.push((row_id, row));
-                }
-            }
-            return Ok(());
-        }
-        self.check_read()
+        self.fetch_rows_charged(row_ids, filter, rows, Deadline::NONE)
     }
 
     fn create_column(&mut self, name: &str, column_type: DataType, nullable: bool) -> Result<()> {
