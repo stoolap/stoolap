@@ -448,12 +448,43 @@ impl<'r, 'p> JoinedWhere<'r, 'p> {
     }
 }
 
-/// A join's rows as the join makes them, those `where_` passes, as an
-/// aggregation reads them, the cancel checked every hundred
+/// The values a NATURAL or USING join adds to each joined row: per full join
+/// pair (left, right) its left value unless NULL, else its right one, then
+/// the value at each place in `appended`
+#[derive(Clone, Copy, Default)]
+struct MergedValues<'a> {
+    coalesced: &'a [(usize, usize)],
+    appended: &'a [usize],
+}
+
+impl MergedValues<'_> {
+    fn push_onto(&self, row: &mut Row) {
+        for &(left, right) in self.coalesced {
+            let value = match row.get(left) {
+                Some(value) if !value.is_null() => value.clone(),
+                _ => row.get(right).cloned().unwrap_or_else(Value::null_unknown),
+            };
+            row.push(value);
+        }
+        for &read in self.appended {
+            let value = row.get(read).cloned().unwrap_or_else(Value::null_unknown);
+            row.push(value);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.coalesced.is_empty() && self.appended.is_empty()
+    }
+}
+
+/// A join's rows as the join makes them, with the values `merged` adds,
+/// those `where_` passes, as an aggregation reads them, the cancel checked
+/// every hundred
 struct JoinedRows<'r, 'p> {
     stream: JoinStream<'r>,
     where_: Option<JoinedWhere<'r, 'p>>,
     ctx: &'r ExecutionContext,
+    merged: MergedValues<'r>,
     row: Option<Row>,
     read: u64,
 }
@@ -468,17 +499,24 @@ impl<'r, 'p> JoinedRows<'r, 'p> {
             stream,
             where_,
             ctx,
+            merged: MergedValues::default(),
             row: None,
             read: 0,
         }
     }
 
+    fn merging(mut self, merged: MergedValues<'r>) -> Self {
+        self.merged = merged;
+        self
+    }
+
     fn next_passed(&mut self) -> Result<Option<Row>> {
-        while let Some(row) = self.stream.next_row()? {
+        while let Some(mut row) = self.stream.next_row()? {
             self.read += 1;
             if self.read.is_multiple_of(100) {
                 self.ctx.check_cancelled()?;
             }
+            self.merged.push_onto(&mut row);
             if let Some(where_) = self.where_.as_mut() {
                 if !where_.matches(&row, None)? {
                     continue;
@@ -513,7 +551,15 @@ impl RowSource for JoinedRows<'_, '_> {
             part.clear();
             // With no WHERE to ask, the join fills the part itself
             let more = match self.where_ {
-                None => self.stream.fill(&mut part, part_rows, self.ctx)?,
+                None => {
+                    let more = self.stream.fill(&mut part, part_rows, self.ctx)?;
+                    if !self.merged.is_empty() {
+                        for (_, row) in part.iter_mut() {
+                            self.merged.push_onto(row);
+                        }
+                    }
+                    more
+                }
                 Some(_) => {
                     while part.len() < part_rows {
                         match self.next_passed()? {
@@ -727,19 +773,30 @@ fn merged_columns(
     } else {
         let mut columns = all_columns.to_vec();
         let mut rows = filtered_rows;
-        // A full join's merged column is its own, named bare already
-        let appended = join_col_renames
-            .iter()
-            .filter(|(_, read, name)| all_columns[*read] != *name);
-        for (_, read, base_name) in appended {
-            columns.push(base_name.clone());
-            for (_, row) in rows.iter_mut() {
-                let value = row.get(*read).cloned().unwrap_or_else(Value::null_unknown);
-                row.push(value);
-            }
+        let appended = appended_merges(all_columns, join_col_renames);
+        columns.extend(appended.clone().map(|(_, _, name)| name.clone()));
+        let reads: Vec<usize> = appended.map(|(_, read, _)| *read).collect();
+        let merged = MergedValues {
+            coalesced: &[],
+            appended: &reads,
+        };
+        for (_, row) in rows.iter_mut() {
+            merged.push_onto(row);
         }
         (columns, rows)
     }
+}
+
+/// The merges of `join_col_renames` a select list without a star reads as
+/// a column of its own, at the end; a full join's merged column is its own,
+/// named bare already
+fn appended_merges<'a>(
+    all_columns: &'a [String],
+    join_col_renames: &'a [(usize, usize, String)],
+) -> impl Iterator<Item = &'a (usize, usize, String)> + Clone {
+    join_col_renames
+        .iter()
+        .filter(|(_, read, name)| all_columns[*read] != *name)
 }
 
 /// `named`, the names of joined rows holding each of the pairs `merges`
@@ -5765,9 +5822,26 @@ impl Executor {
             None
         };
 
+        // A grouped statement without windows that reads the joined rows as
+        // the join makes them, through no subquery and no star over merged
+        // columns, aggregates them in parts as they are made
+        let shows_star = (stmt.columns.iter()).any(|c| matches!(c, Expression::Star(_)));
+        let in_parts = classification.has_aggregation
+            && !classification.has_window_functions
+            && blocks.as_deref().is_none_or(|held| !held.asks_sites())
+            && !(shows_star
+                && !(excluded_column_indices.is_empty() && join_col_renames.is_empty()))
+            && !Self::grouped_family_reach(stmt, classification);
+        let appended: Vec<usize> = match in_parts {
+            true => (appended_merges(&all_columns, &join_col_renames))
+                .map(|(_, read, _)| *read)
+                .collect(),
+            false => Vec::new(),
+        };
+
         // Execute join using JoinExecutor (takes ownership of rows), each row
-        // made with room for a full join's merged columns
-        let join_executor = JoinExecutor::with_room(coalesced.len());
+        // made with room for the merged columns it adds
+        let join_executor = JoinExecutor::with_room(coalesced.len() + appended.len());
         let join_request = super::join_executor::JoinRequest {
             left_rows,
             right_rows,
@@ -5783,17 +5857,6 @@ impl Executor {
             blocks: statement_run,
         };
 
-        // A grouped statement without windows that reads the joined rows as
-        // the join makes them, through no subquery and no merged column,
-        // aggregates them in parts as they are made
-        let in_parts = classification.has_aggregation
-            && !classification.has_window_functions
-            && blocks.as_deref().is_none_or(|held| !held.asks_sites())
-            && coalesced.is_empty()
-            && excluded_column_indices.is_empty()
-            && join_col_renames.is_empty()
-            && side_names.is_empty()
-            && !Self::grouped_family_reach(stmt, classification);
         let (mut result_rows, stream) = match in_parts {
             true => match join_executor.execute_each(join_request)? {
                 JoinRows::Held(rows) => (rows, None),
@@ -5802,14 +5865,12 @@ impl Executor {
             false => (join_executor.execute(join_request)?.rows, None),
         };
         if !coalesced.is_empty() {
+            let merged = MergedValues {
+                coalesced: &coalesced,
+                appended: &[],
+            };
             for (_, row) in result_rows.iter_mut() {
-                for &(left, right) in &coalesced {
-                    let value = match row.get(left) {
-                        Some(value) if !value.is_null() => value.clone(),
-                        _ => row.get(right).cloned().unwrap_or_else(Value::null_unknown),
-                    };
-                    row.push(value);
-                }
+                merged.push_onto(row);
             }
         }
 
@@ -5842,8 +5903,20 @@ impl Executor {
                 }
                 None => None,
             };
-            let source = JoinedRows::new(stream, where_, ctx);
-            return self.aggregate_joined(plan.as_deref(), stmt, ctx, source, &all_columns);
+            let merged = MergedValues {
+                coalesced: &coalesced,
+                appended: &appended,
+            };
+            let source = JoinedRows::new(stream, where_, ctx).merging(merged);
+            let bare: Vec<String> = appended_merges(&all_columns, &join_col_renames)
+                .map(|(_, _, name)| name.clone())
+                .collect();
+            let mut columns = all_columns;
+            columns.extend(bare);
+            for (at, name) in side_names {
+                columns[at] = name;
+            }
+            return self.aggregate_joined(plan.as_deref(), stmt, ctx, source, &columns);
         }
 
         // Apply WHERE clause if present

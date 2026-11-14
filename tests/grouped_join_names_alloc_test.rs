@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A grouped join whose output holds a subquery names its joined columns
-//! without copying them for each run: what one run allocates does not grow
-//! with the columns its sides hold
+//! A grouped join, gathered for a subquery in its output or aggregated in
+//! parts, names its joined columns without copying them for each run: what
+//! one run allocates does not grow with the columns its sides hold
 
 // The jemalloc feature, on by default, sets the library's own global allocator
 #![cfg(all(not(feature = "jemalloc"), not(feature = "test-filedb")))]
@@ -50,9 +50,9 @@ unsafe impl GlobalAlloc for ThreadCounting {
 static COUNTING: ThreadCounting = ThreadCounting;
 
 /// The allocations of one run of `sql`, prepared, over sides of `width`
-/// columns each
-fn allocations(width: usize, sql: &str) -> usize {
-    let db = Database::open(&format!("memory://grouped_join_names_alloc_{width}")).unwrap();
+/// columns each, in a database named after `name`
+fn allocations(name: &str, width: usize, sql: &str) -> usize {
+    let db = Database::open(&format!("memory://grouped_join_names_alloc_{name}_{width}")).unwrap();
     let extra: String = (0..width).map(|i| format!(", c{i} INTEGER")).collect();
     for table in ["l", "r"] {
         db.execute(
@@ -80,10 +80,24 @@ fn a_grouped_join_copies_no_column_name_for_each_run() {
     // allocation for each of them on top of what the run reads per column
     let added = 2 * (100 - 2);
     let sql = "SELECT l.k, COUNT(*), (SELECT 1) FROM l JOIN r ON r.id = l.id GROUP BY l.k";
-    let narrow = allocations(2, sql);
-    let wide = allocations(100, sql);
+    let narrow = allocations("gathered", 2, sql);
+    let wide = allocations("gathered", 100, sql);
     assert!(
         wide - narrow < 5 * added,
+        "{narrow} allocations over narrow sides, {wide} over wide ones"
+    );
+}
+
+#[test]
+fn a_join_aggregated_in_parts_copies_no_column_name_for_each_run() {
+    // The run reads about five allocations per column; a copy of the names
+    // costs one more for each
+    let added = 2 * (100 - 2);
+    let sql = "SELECT l.k, COUNT(*) FROM l JOIN r ON r.k = l.k GROUP BY l.k";
+    let narrow = allocations("parts", 2, sql);
+    let wide = allocations("parts", 100, sql);
+    assert!(
+        wide - narrow < 11 * added / 2,
         "{narrow} allocations over narrow sides, {wide} over wide ones"
     );
 }
