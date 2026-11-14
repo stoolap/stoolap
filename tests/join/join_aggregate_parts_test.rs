@@ -1481,3 +1481,236 @@ fn a_where_beside_a_subquery_running_a_join_raises_its_error_in_parts() {
         assert!(err.to_string().contains("overflow"), "{sql}: {err}");
     }
 }
+
+/// The rows of q with `a`
+fn q_with(a: i64) -> i64 {
+    q_rows().filter(|q| q.1 == a).count() as i64
+}
+
+/// Per l.g of the pairs of l and r that `meet` and `keep` keeps, its count
+fn lr_counts(
+    meet: impl Fn(&Fixture, &Fixture) -> bool,
+    keep: impl Fn(&Fixture, &Fixture) -> bool,
+) -> BTreeMap<i64, i64> {
+    let mut counts = BTreeMap::new();
+    for l in l_rows() {
+        let met = r_rows().filter(|r| meet(&l, r) && keep(&l, r)).count() as i64;
+        if met > 0 {
+            *counts.entry(l.2).or_default() += met;
+        }
+    }
+    counts
+}
+
+#[test]
+fn subqueries_in_a_grouped_joins_output_and_having_run_over_its_parts() {
+    let db = with_q(open("join_aggregate_parts_family_hash"));
+    let counts = lr_counts(equal_keys, |_, _| true);
+    let max_a = q_rows().map(|q| q.1).max().unwrap();
+    let row = |g: &i64, values: &[i64]| {
+        std::iter::once(int(*g))
+            .chain(values.iter().map(|v| int(*v)))
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+    let cases: Vec<(&str, Vec<String>)> = vec![
+        (
+            "SELECT l.g, COUNT(*), (SELECT MAX(q.a) FROM q) FROM l JOIN r ON l.k = r.k \
+             GROUP BY l.g ORDER BY l.g",
+            counts.iter().map(|(g, n)| row(g, &[*n, max_a])).collect(),
+        ),
+        (
+            "SELECT l.g, COUNT(*) FROM l JOIN r ON l.k = r.k GROUP BY l.g \
+             HAVING COUNT(*) > (SELECT COUNT(*) FROM q WHERE q.a < 3) ORDER BY l.g",
+            counts
+                .iter()
+                .filter(|(_, n)| **n > (0..3).map(q_with).sum::<i64>())
+                .map(|(g, n)| row(g, &[*n]))
+                .collect(),
+        ),
+        (
+            "SELECT l.g, COUNT(*), (SELECT COUNT(*) FROM q WHERE q.a = l.g) FROM l \
+             JOIN r ON l.k = r.k GROUP BY l.g ORDER BY l.g",
+            counts
+                .iter()
+                .map(|(g, n)| row(g, &[*n, q_with(*g)]))
+                .collect(),
+        ),
+        (
+            "SELECT l.g, COUNT(*) FROM l JOIN r ON l.k = r.k GROUP BY l.g \
+             ORDER BY (SELECT MAX(q.id) FROM q WHERE q.a = l.g) DESC",
+            {
+                let top = |g: i64| q_rows().filter(|q| q.1 == g).map(|q| q.0).max();
+                let mut groups: Vec<_> = counts.iter().collect();
+                groups.sort_by_key(|(g, _)| std::cmp::Reverse(top(**g)));
+                groups.into_iter().map(|(g, n)| row(g, &[*n])).collect()
+            },
+        ),
+        (
+            "SELECT DISTINCT ON ((SELECT COUNT(*) FROM q WHERE q.a = l.g)) l.g, COUNT(*) \
+             FROM l JOIN r ON l.k = r.k GROUP BY l.g \
+             ORDER BY (SELECT COUNT(*) FROM q WHERE q.a = l.g), l.g",
+            {
+                let mut seen = BTreeSet::new();
+                let mut groups: Vec<_> = counts.iter().collect();
+                groups.sort_by_key(|(g, _)| (q_with(**g), **g));
+                groups
+                    .into_iter()
+                    .filter(|(g, _)| seen.insert(q_with(**g)))
+                    .map(|(g, n)| row(g, &[*n]))
+                    .collect()
+            },
+        ),
+        (
+            "SELECT l.g, COUNT(*), (SELECT MAX(q.a) FROM q) FROM l JOIN r ON l.k = r.k \
+             WHERE EXISTS (SELECT 1 FROM q WHERE q.a = r.w AND q.id < l.id) \
+             GROUP BY l.g ORDER BY l.g",
+            lr_counts(equal_keys, |l, r| q_below(r.2, l.0))
+                .iter()
+                .map(|(g, n)| row(g, &[*n, max_a]))
+                .collect(),
+        ),
+        (
+            "SELECT l.g, COUNT(DISTINCT r.w), (SELECT MAX(q.a) FROM q) FROM l \
+             JOIN r ON l.k = r.k GROUP BY l.g ORDER BY l.g",
+            {
+                let mut ws: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
+                for (l, r) in pairs() {
+                    ws.entry(l.2).or_default().insert(r.2);
+                }
+                ws.iter()
+                    .map(|(g, w)| row(g, &[w.len() as i64, max_a]))
+                    .collect()
+            },
+        ),
+        (
+            "SELECT COALESCE(l.g, -1), COUNT(*) FROM l JOIN r ON l.k = r.k \
+             GROUP BY ROLLUP(l.g) HAVING COUNT(*) > (SELECT MIN(q.id) FROM q) ORDER BY 1",
+            std::iter::once((-1, counts.values().sum::<i64>()))
+                .chain(counts.iter().map(|(g, n)| (*g, *n)))
+                .filter(|(_, n)| *n > 1)
+                .map(|(g, n)| row(&g, &[n]))
+                .collect(),
+        ),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(parted_by(&db, sql, "hash"), want, "{sql}");
+    }
+}
+
+#[test]
+fn grouped_joins_of_every_kind_run_their_subqueries_over_their_parts() {
+    let db = with_q(open("join_aggregate_parts_family_kinds"));
+    let max_a = q_rows().map(|q| q.1).max().unwrap();
+    let lone_l = l_rows().filter(|l| !r_rows().any(|r| r.1 == l.1)).count() as i64;
+    let matched = pairs().len() as i64;
+    let sql = "SELECT COUNT(*), COUNT(r.id), (SELECT MAX(q.a) FROM q) FROM l \
+               LEFT JOIN r ON l.k = r.k";
+    assert_eq!(
+        parted_by(&db, sql, "hash"),
+        vec![[matched + lone_l, matched, max_a].map(int).join("|")],
+        "{sql}"
+    );
+    let sql = "SELECT l.g, COUNT(*), (SELECT MAX(q.a) FROM q) FROM l JOIN r ON l.k < r.k \
+               GROUP BY l.g ORDER BY l.g";
+    let want: Vec<String> = lr_counts(|l, r| l.1 < r.1, |_, _| true)
+        .iter()
+        .map(|(g, n)| [*g, *n, max_a].map(int).join("|"))
+        .collect();
+    assert_eq!(parted_by(&db, sql, "nested_loop"), want, "{sql}");
+
+    let db = with_q(open_wide("join_aggregate_parts_family_wide"));
+    let mut groups: BTreeMap<i64, i64> = BTreeMap::new();
+    for (l, _) in wide_pairs() {
+        *groups.entry(l % 5).or_default() += 1;
+    }
+    let want: Vec<String> = groups
+        .iter()
+        .map(|(g, n)| [*g, *n, q_with(*g)].map(int).join("|"))
+        .collect();
+    let sql = "SELECT bl.g, COUNT(*), (SELECT COUNT(*) FROM q WHERE q.a = bl.g) FROM bl \
+               JOIN br ON bl.u = br.u GROUP BY bl.g ORDER BY bl.g";
+    assert_eq!(parted_across_threads(&db, sql), want, "{sql}");
+}
+
+#[test]
+fn a_grouped_index_join_runs_its_subqueries_over_its_parts() {
+    let db = with_q(open_keyed("join_aggregate_parts_family_index"));
+    let mut groups: BTreeMap<i64, i64> = BTreeMap::new();
+    for (p, _) in keyed_pairs() {
+        *groups.entry(p.1).or_default() += 1;
+    }
+    let want: Vec<String> = groups
+        .iter()
+        .map(|(g, n)| [*g, *n, q_with(*g)].map(int).join("|"))
+        .collect();
+    for (sql, path) in [
+        (
+            "SELECT p.g, COUNT(*), (SELECT COUNT(*) FROM q WHERE q.a = p.g) FROM c \
+             JOIN p ON p.id = c.pid GROUP BY p.g ORDER BY p.g",
+            "batch_index_nested_loop",
+        ),
+        (
+            "SELECT p.g, COUNT(*), (SELECT COUNT(*) FROM q WHERE q.a = p.g) FROM p \
+             JOIN c ON c.pid = p.id GROUP BY p.g ORDER BY p.g",
+            C_INDEX,
+        ),
+    ] {
+        assert_eq!(parted_by(&db, sql, path), want, "{sql}");
+    }
+}
+
+#[test]
+fn a_prepared_grouped_join_and_a_union_branch_run_their_subqueries_over_parts() {
+    let db = with_q(open("join_aggregate_parts_family_prepared"));
+    let counts = lr_counts(equal_keys, |_, _| true);
+    let query = db
+        .prepare(
+            "SELECT l.g, COUNT(*), (SELECT COUNT(*) FROM q WHERE q.a = l.g AND q.id < $1) \
+             FROM l JOIN r ON l.k = r.k GROUP BY l.g ORDER BY l.g",
+        )
+        .unwrap();
+    for below in [5, 15] {
+        #[cfg(feature = "test-failpoints")]
+        {
+            stoolap::test_failpoints::set_join_part_rows(PART_ROWS);
+            stoolap::test_failpoints::reset_join_part_largest();
+        }
+        let got: Vec<String> = query
+            .query((below,))
+            .unwrap()
+            .map(|row| {
+                let row = row.unwrap();
+                (0..row.len())
+                    .map(|i| format!("{:?}", row.get_value(i).unwrap()))
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect();
+        #[cfg(feature = "test-failpoints")]
+        {
+            stoolap::test_failpoints::set_join_part_rows(0);
+            let largest = stoolap::test_failpoints::join_part_largest();
+            assert!(
+                (1..=PART_ROWS).contains(&largest),
+                "$1 = {below}: the aggregation held {largest} joined rows at once"
+            );
+        }
+        let below_in = |g: i64| q_rows().filter(|q| q.1 == g && q.0 < below).count() as i64;
+        let want: Vec<String> = counts
+            .iter()
+            .map(|(g, n)| [*g, *n, below_in(*g)].map(int).join("|"))
+            .collect();
+        assert_eq!(got, want, "$1 = {below}");
+    }
+
+    let sql = "SELECT l.g, (SELECT MAX(q.a) FROM q) FROM l JOIN r ON l.k = r.k GROUP BY l.g \
+               UNION ALL SELECT 9, 9 ORDER BY 1";
+    let max_a = q_rows().map(|q| q.1).max().unwrap();
+    let want: Vec<String> = counts
+        .keys()
+        .map(|g| [*g, max_a].map(int).join("|"))
+        .chain(std::iter::once([9, 9].map(int).join("|")))
+        .collect();
+    assert_eq!(parted_by(&db, sql, "hash"), want, "{sql}");
+}
