@@ -549,6 +549,11 @@ impl Executor {
                 table.update(access, Some(&pk_expr), &mut setter)
             }
         };
+        // A write that outlasted its deadline is undone
+        let written = written.and_then(|rows| match ctx {
+            Some(ctx) => ctx.check_deadline().map(|()| rows),
+            None => Ok(rows),
+        });
         let rows_affected = rollback.finish(written)?;
         if rows_affected > 0 {
             self.semantic_cache.invalidate_table(&plan.table);

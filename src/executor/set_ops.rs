@@ -166,12 +166,12 @@ impl Executor {
                     let result_rows = running.into_rows();
                     // INTERSECT ALL: keep matching rows with multiplicity with proper collision handling
                     let right_rows = Self::materialize_result(right_result, deadline)?;
-                    deadline.charge(DeadlineSite::SetOp, right_rows.len() + result_rows.len())?;
 
                     // Build hash map: hash -> list of (row_index, remaining_count)
                     // Each unique row in right side gets its own counter
                     let mut right_hash_map: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
                     for (idx, (_, row)) in right_rows.iter().enumerate() {
+                        deadline.charge(DeadlineSite::SetOp, 1)?;
                         let hash = hash_row(row);
                         right_hash_map.entry(hash).or_default().push(idx);
                     }
@@ -182,6 +182,7 @@ impl Executor {
                     for (hash, indices) in right_hash_map {
                         let mut unique_rows_in_bucket: Vec<(usize, usize)> = Vec::new();
                         for &idx in &indices {
+                            deadline.charge(DeadlineSite::SetOp, 1)?;
                             // Find if this row already exists in unique_rows_in_bucket
                             if let Some(entry) =
                                 unique_rows_in_bucket.iter_mut().find(|(rep_idx, _)| {
@@ -199,6 +200,7 @@ impl Executor {
                     let mut intersected_rows = RowVec::new();
                     let mut row_id = 0i64;
                     for (_, left_row) in result_rows {
+                        deadline.charge(DeadlineSite::SetOp, 1)?;
                         let hash = hash_row(&left_row);
 
                         // Find matching right row and decrement its count
@@ -220,11 +222,11 @@ impl Executor {
                     let result_rows = running.into_rows();
                     // EXCEPT ALL: remove matching rows with multiplicity with proper collision handling
                     let right_rows = Self::materialize_result(right_result, deadline)?;
-                    deadline.charge(DeadlineSite::SetOp, right_rows.len() + result_rows.len())?;
 
                     // Build hash map: hash -> list of row indices
                     let mut right_hash_map: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
                     for (idx, (_, row)) in right_rows.iter().enumerate() {
+                        deadline.charge(DeadlineSite::SetOp, 1)?;
                         let hash = hash_row(row);
                         right_hash_map.entry(hash).or_default().push(idx);
                     }
@@ -235,6 +237,7 @@ impl Executor {
                     for (hash, indices) in right_hash_map {
                         let mut unique_rows_in_bucket: Vec<(usize, usize)> = Vec::new();
                         for &idx in &indices {
+                            deadline.charge(DeadlineSite::SetOp, 1)?;
                             // Find if this row already exists in unique_rows_in_bucket
                             if let Some(entry) =
                                 unique_rows_in_bucket.iter_mut().find(|(rep_idx, _)| {
@@ -252,6 +255,7 @@ impl Executor {
                     let mut excepted_rows = RowVec::new();
                     let mut row_id = 0i64;
                     for (_, left_row) in result_rows {
+                        deadline.charge(DeadlineSite::SetOp, 1)?;
                         let hash = hash_row(&left_row);
 
                         // Check if this row should be removed (exists in right with count > 0)
@@ -340,8 +344,18 @@ impl Running {
             }
             distinct => {
                 let mut rows = distinct.into_rows();
-                deadline.charge(DeadlineSite::SetOp, rows.len())?;
-                rows.retain(|(_, row)| keep(row));
+                // A charge that fails keeps no row past it and is raised after
+                let mut failed = None;
+                rows.retain(|(_, row)| match deadline.charge(DeadlineSite::SetOp, 1) {
+                    Ok(()) => failed.is_none() && keep(row),
+                    Err(e) => {
+                        failed.get_or_insert(e);
+                        false
+                    }
+                });
+                if let Some(e) = failed {
+                    return Err(e);
+                }
                 for (id, (row_id, _)) in (0i64..).zip(rows.iter_mut()) {
                     *row_id = id;
                 }

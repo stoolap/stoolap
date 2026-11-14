@@ -2336,6 +2336,8 @@ impl Executor {
                         num_order_cols,
                     )
                 });
+                // A sort runs to its end; a deadline it outlasted fails it after
+                ctx.check_deadline()?;
 
                 // Reorder rows using sorted indices
                 // OPTIMIZATION: For LIMIT queries without DISTINCT ON, only collect needed rows
@@ -5235,6 +5237,8 @@ impl Executor {
                             ),
                             None => compile().map(|programs| order_of(&programs)),
                         };
+                        // A sort runs to its end; a deadline it outlasted fails it after
+                        ctx.check_deadline()?;
                         if let Ok(Some(indices)) = ordered {
                             // Sorted here, and LIMIT/OFFSET applied below, so
                             // the standard path must not apply OFFSET again

@@ -1603,7 +1603,6 @@ impl<'a> RowFeed<'a> {
             let parts: Vec<GroupedAggregates> = rows
                 .par_chunks(chunk_size)
                 .map(|chunk| {
-                    deadline.charge(DeadlineSite::Aggregate, chunk.len())?;
                     let mut part = groups.empty_like();
                     let mut state = FeedState::default();
                     let reads = RowReads {
@@ -1612,6 +1611,7 @@ impl<'a> RowFeed<'a> {
                         blocks: None,
                     };
                     for (_, row) in chunk {
+                        deadline.charge(DeadlineSite::Aggregate, 1)?;
                         self.run_one(&mut part, row, &reads, &mut state)?;
                     }
                     Ok(part)

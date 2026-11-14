@@ -199,6 +199,8 @@ impl Executor {
             self.semantic_cache.invalidate_table(table_name);
         }
 
+        // A copy that outlasted its deadline commits nothing
+        ctx.check_deadline()?;
         tx.commit()?;
 
         Ok(Box::new(ExecResult::with_rows_affected(rows_affected)))

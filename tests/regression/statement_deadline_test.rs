@@ -18,7 +18,10 @@
 #![cfg(feature = "test-failpoints")]
 
 use stoolap::executor::DeadlineSite;
-use stoolap::test_failpoints::{keep_deadlines, pass_deadline_at, FailpointGuard};
+use stoolap::test_failpoints::{
+    count_deadline_charges, deadline_charges, keep_deadlines, pass_deadline_after,
+    pass_deadline_at, FailpointGuard,
+};
 use stoolap::{Database, Error, ExecutionContext, Executor};
 
 /// The tables every site's statements read or write
@@ -203,26 +206,144 @@ fn a_write_stopped_at_its_deadline_leaves_no_row_in_or_out_of_a_transaction() {
     let mut wrong = Vec::new();
     for in_txn in [false, true] {
         for (site, sql) in writes {
-            if in_txn {
-                read(&executor, "BEGIN", &ctx).unwrap();
+            read(&executor, "BEGIN", &ctx).unwrap();
+            let charges = charges_of(&executor, &ctx, site, sql);
+            read(&executor, "ROLLBACK", &ctx).unwrap();
+            if charges == 0 {
+                wrong.push(format!("{sql} (in a transaction: {in_txn}) found no rows"));
+                continue;
             }
-            let held = holding(&executor, &ctx);
-            pass_deadline_at(site);
-            let stopped = read(&executor, sql, &ctx);
-            keep_deadlines();
-            if !matches!(stopped, Err(Error::QueryCancelled)) {
-                wrong.push(format!(
-                    "{site:?} (in a transaction: {in_txn}): {sql} gave {stopped:?}"
-                ));
+            // Past its first write, and past its last with every row written
+            for passed in [1, charges] {
+                if in_txn {
+                    read(&executor, "BEGIN", &ctx).unwrap();
+                }
+                let held = holding(&executor, &ctx);
+                pass_deadline_after(site, passed);
+                let stopped = read(&executor, sql, &ctx);
+                keep_deadlines();
+                let at = format!("{sql} (in a transaction: {in_txn}, {passed} of {charges})");
+                if !matches!(stopped, Err(Error::QueryCancelled)) {
+                    wrong.push(format!("{at} gave {stopped:?}"));
+                }
+                if holding(&executor, &ctx) != held {
+                    wrong.push(format!("{at} left a change"));
+                }
+                if in_txn {
+                    read(&executor, "SELECT 1", &ctx).unwrap();
+                    read(&executor, "COMMIT", &ctx).unwrap();
+                }
             }
-            if holding(&executor, &ctx) != held {
-                wrong.push(format!(
-                    "{site:?} (in a transaction: {in_txn}): {sql} left a change"
-                ));
-            }
-            if in_txn {
-                read(&executor, "COMMIT", &ctx).unwrap();
-            }
+        }
+    }
+    // A COPY past its last row, and a write by key, which charges nothing
+    let csv = csv_of(50);
+    let copy = statement(DeadlineSite::Copy, &csv.path().display().to_string());
+    let late = [
+        (DeadlineSite::Copy, copy.as_str(), 50, false),
+        (
+            DeadlineSite::Update,
+            "UPDATE w SET k = 5 WHERE id = 1",
+            0,
+            false,
+        ),
+        (
+            DeadlineSite::Update,
+            "UPDATE w SET k = 5 WHERE id = 1",
+            0,
+            true,
+        ),
+    ];
+    for (site, sql, passed, in_txn) in late {
+        if in_txn {
+            read(&executor, "BEGIN", &ctx).unwrap();
+        }
+        let held = holding(&executor, &ctx);
+        pass_deadline_after(site, passed);
+        let stopped = read(&executor, sql, &ctx);
+        keep_deadlines();
+        if !matches!(stopped, Err(Error::QueryCancelled)) {
+            wrong.push(format!(
+                "{sql} (in a transaction: {in_txn}) past its end gave {stopped:?}"
+            ));
+        }
+        if holding(&executor, &ctx) != held {
+            wrong.push(format!(
+                "{sql} (in a transaction: {in_txn}) past its end left a change"
+            ));
+        }
+        if in_txn {
+            read(&executor, "COMMIT", &ctx).unwrap();
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The charges `sql` makes at `site`, run once
+fn charges_of(executor: &Executor, ctx: &ExecutionContext, site: DeadlineSite, sql: &str) -> usize {
+    count_deadline_charges(site);
+    let ran = read(executor, sql, ctx);
+    let charges = deadline_charges();
+    keep_deadlines();
+    assert!(ran.is_ok(), "{sql} gave {ran:?}");
+    charges
+}
+
+#[test]
+fn a_deadline_passed_late_in_a_statement_still_stops_it() {
+    let _guard = FailpointGuard::new();
+    let db = Database::open("memory://statement_deadline_late").unwrap();
+    for sql in TABLES.iter().chain(&FILLED) {
+        db.execute(sql, ()).unwrap();
+    }
+    let executor = Executor::new(std::sync::Arc::clone(db.engine()));
+    let mut ctx = ExecutionContext::new();
+    ctx.set_timeout_ms(3_600_000);
+    let join = statement(DeadlineSite::ParallelJoin, "");
+    // The charges each passes, None for all it makes: a sort's after its
+    // last, a set operation's in its loops past the rows it read, a join's
+    // past every row built and probed, where only its pairs are left
+    let late = [
+        (
+            DeadlineSite::Sort,
+            "SELECT id FROM big ORDER BY v * 1 DESC",
+            None,
+        ),
+        (
+            DeadlineSite::Sort,
+            "SELECT id, k FROM big ORDER BY k, id",
+            None,
+        ),
+        (
+            DeadlineSite::Sort,
+            "SELECT id FROM big ORDER BY v * 1 DESC LIMIT 10",
+            None,
+        ),
+        (
+            DeadlineSite::SetOp,
+            "SELECT k FROM big INTERSECT ALL SELECT k FROM u",
+            Some(1),
+        ),
+        (
+            DeadlineSite::SetOp,
+            "SELECT k FROM big EXCEPT ALL SELECT k FROM u",
+            Some(1),
+        ),
+        (
+            DeadlineSite::SetOp,
+            "SELECT k FROM big INTERSECT SELECT k FROM u",
+            Some(251),
+        ),
+        (DeadlineSite::ParallelJoin, join.as_str(), Some(24_000)),
+    ];
+    let mut wrong = Vec::new();
+    for (site, sql, passed) in late {
+        let passed = passed.unwrap_or_else(|| charges_of(&executor, &ctx, site, sql));
+        pass_deadline_after(site, passed);
+        let stopped = read(&executor, sql, &ctx);
+        keep_deadlines();
+        if !matches!(stopped, Err(Error::QueryCancelled)) {
+            wrong.push(format!("{sql} past {passed} charges gave {stopped:?}"));
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
@@ -246,7 +367,8 @@ fn an_aggregation_split_over_the_thread_pool_stops_at_its_deadline() {
     let mut ctx = ExecutionContext::new();
     ctx.set_timeout_ms(3_600_000);
     let sql = "SELECT k, SUM(v) FROM t WHERE v * 1 > 0 GROUP BY k";
-    pass_deadline_at(DeadlineSite::Aggregate);
+    // Past all but one row, so only a worker's charge for a row can stop it
+    pass_deadline_after(DeadlineSite::Aggregate, 100_000);
     let stopped = read(&executor, sql, &ctx);
     keep_deadlines();
     assert!(

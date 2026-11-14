@@ -1392,6 +1392,8 @@ impl Executor {
 
             // A statement whose reads a truncate or drop overtook commits nothing
             ctx.view_held()?;
+            // Nor one that outlasted its deadline
+            ctx.check_deadline()?;
             // Commit if this is a standalone (auto-commit) transaction
             if should_auto_commit {
                 if let Some(mut tx) = standalone_tx {
@@ -1765,6 +1767,8 @@ impl Executor {
 
         // A statement whose reads a truncate or drop overtook commits nothing
         ctx.view_held()?;
+        // Nor one that outlasted its deadline
+        ctx.check_deadline()?;
         // Commit if this is a standalone (auto-commit) transaction
         if should_auto_commit {
             if let Some(mut tx) = standalone_tx {
@@ -2298,6 +2302,8 @@ impl Executor {
 
         // A statement whose reads a truncate or drop overtook commits nothing
         ctx.view_held()?;
+        // Nor one that outlasted its deadline
+        ctx.check_deadline()?;
         // Commit if this is a standalone (auto-commit) transaction
         if should_auto_commit {
             if let Some(mut tx) = standalone_tx {
@@ -2957,6 +2963,8 @@ impl Executor {
 
         // A statement whose reads a truncate or drop overtook commits nothing
         ctx.view_held()?;
+        // Nor one that outlasted its deadline
+        ctx.check_deadline()?;
         // Commit if this is a standalone (auto-commit) transaction
         if should_auto_commit {
             // Commit the transaction - it will commit all tables via commit_all_tables()
@@ -3454,6 +3462,8 @@ impl Executor {
 
         // A statement whose reads a truncate or drop overtook commits nothing
         ctx.view_held()?;
+        // Nor one that outlasted its deadline
+        ctx.check_deadline()?;
         // Commit if this is a standalone (auto-commit) transaction
         if should_auto_commit {
             // Commit the transaction - it will commit all tables via commit_all_tables()
@@ -4129,6 +4139,8 @@ impl Executor {
             self.build_returning_result(returning, source_rows, column_names, ctx, prepared, held)?;
         // A statement whose reads a truncate or drop overtook commits nothing
         ctx.view_held()?;
+        // Nor one that outlasted its deadline
+        ctx.check_deadline()?;
         if let Some(mut tx) = standalone_tx {
             tx.commit()?;
         }

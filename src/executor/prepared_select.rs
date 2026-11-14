@@ -8744,11 +8744,13 @@ impl PreparedProjection {
             }
             Ok(())
         })?;
+        let sorted = top.into_rows();
+        run.ctx.check_deadline()?;
         if whole {
-            return Ok(top.into_row_vec());
+            return Ok((0i64..).zip(sorted).collect());
         }
         let mut kept = RowVec::new();
-        for mut out in top.into_rows() {
+        for mut out in sorted {
             let Some(Value::Integer(i)) = out.get(width).cloned() else {
                 return Err(Error::internal("a sorted row lost its source"));
             };
@@ -14621,7 +14623,9 @@ fn top_rows(
         }
         Ok(())
     })?;
-    Ok((0i64..).zip(top.into_rows()).collect())
+    let rows = top.into_rows();
+    runner.ctx.check_deadline()?;
+    Ok((0i64..).zip(rows).collect())
 }
 
 /// The rows of `result` as it reads them, then its error, if it failed
@@ -17536,6 +17540,7 @@ impl PreparedRunner<'_> {
             // A stable sort: a tie stays in the order read
             self.ctx.charge(DeadlineSite::Sort, all.len())?;
             all.sort_by(|a, b| order.compare(&a.0, &b.0));
+            self.ctx.check_deadline()?;
             let mut first = super::result::DistinctRows::new(order.distinct.len());
             let rows = all.into_iter().filter(|(_, seen, _)| first.is_new(seen));
             let rows = rows.skip(offset).take(keep - offset);

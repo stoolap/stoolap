@@ -461,12 +461,12 @@ pub fn parallel_hash_build(
             .par_chunks(chunk_size)
             .enumerate()
             .map(|(chunk_idx, chunk)| {
-                deadline.charge(DeadlineSite::ParallelJoin, chunk.len())?;
                 let base_idx = chunk_idx * chunk_size;
                 let mut parts: Vec<Vec<(u64, usize)>> = (0..partitions)
                     .map(|_| Vec::with_capacity(chunk.len() / partitions + 1))
                     .collect();
                 for (local_idx, row) in chunk.iter().enumerate() {
+                    deadline.charge(DeadlineSite::ParallelJoin, 1)?;
                     let hash = hash_composite_key(row, key_indices);
                     parts[partition_of(hash, shift)].push((hash, base_idx + local_idx));
                 }
@@ -547,16 +547,17 @@ where
             .par_chunks(chunk_size)
             .enumerate()
             .map(|(chunk_idx, chunk)| {
-                deadline.charge(DeadlineSite::ParallelJoin, chunk.len())?;
                 let base_idx = chunk_idx * chunk_size;
                 let mut local_matches = Vec::new();
 
                 for (local_idx, probe_row) in chunk.iter().enumerate() {
+                    deadline.charge(DeadlineSite::ParallelJoin, 1)?;
                     let probe_idx = base_idx + local_idx;
                     let hash = hash_composite_key(probe_row, probe_key_indices);
 
                     if let Some(build_indices) = hash_table.get(&hash) {
                         for &build_idx in build_indices {
+                            deadline.charge(DeadlineSite::ParallelJoin, 1)?;
                             if verify_match(probe_row, &build_rows[build_idx]) {
                                 local_matches.push((probe_idx, build_idx));
                             }
@@ -578,6 +579,7 @@ where
         let hash = hash_composite_key(probe_row, probe_key_indices);
         if let Some(build_indices) = hash_table.get(&hash) {
             for &build_idx in build_indices {
+                deadline.charge(DeadlineSite::ParallelJoin, 1)?;
                 if verify_match(probe_row, &build_rows[build_idx]) {
                     matches.push((probe_idx, build_idx));
                 }
@@ -647,6 +649,7 @@ fn sequential_probe(
 
         if let Some(build_indices) = hash_table.get(&hash) {
             for &build_idx in build_indices {
+                deadline.charge(DeadlineSite::ParallelJoin, 1)?;
                 let build_row = &build_rows[build_idx];
                 if verify_key_match(probe_row, build_row, probe_key_indices, build_key_indices) {
                     matched = true;
@@ -839,12 +842,13 @@ impl Probe<'_> {
                     let chunks: Vec<Vec<Row>> = probe_rows
                         .par_chunks(probe_chunk_rows(probe_rows.len(), config))
                         .map(|chunk| {
-                            deadline.charge(DeadlineSite::ParallelJoin, chunk.len())?;
                             let mut local_results = Vec::new();
                             for probe_row in chunk {
+                                deadline.charge(DeadlineSite::ParallelJoin, 1)?;
                                 let hash = hash_row_by_keys(probe_row, probe_key_indices);
                                 if let Some(build_indices) = hash_table.get(&hash) {
                                     for &build_idx in build_indices {
+                                        deadline.charge(DeadlineSite::ParallelJoin, 1)?;
                                         let build_row = &build_rows[build_idx];
                                         if verify_key_match(
                                             probe_row,
@@ -881,16 +885,17 @@ impl Probe<'_> {
                     let chunk_results: Vec<(Vec<Row>, Vec<Row>)> = probe_rows
                         .par_chunks(probe_chunk_rows(probe_rows.len(), config))
                         .map(|chunk| {
-                            deadline.charge(DeadlineSite::ParallelJoin, chunk.len())?;
                             let mut matched_results = Vec::new();
                             let mut unmatched_results = Vec::new();
 
                             for probe_row in chunk.iter() {
+                                deadline.charge(DeadlineSite::ParallelJoin, 1)?;
                                 let mut matched = false;
                                 let hash = hash_row_by_keys(probe_row, probe_key_indices);
 
                                 if let Some(build_indices) = hash_table.get(&hash) {
                                     for &build_idx in build_indices {
+                                        deadline.charge(DeadlineSite::ParallelJoin, 1)?;
                                         let build_row = &build_rows[build_idx];
                                         if verify_key_match(
                                             probe_row,

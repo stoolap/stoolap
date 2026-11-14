@@ -857,6 +857,8 @@ impl OrderedResult {
         // Sort rows (comparing only the Row part, ignoring IDs)
         deadline.charge(DeadlineSite::Sort, rows.len())?;
         rows.sort_unstable_by(|(_, a), (_, b)| compare(a, b));
+        // A sort runs to its end; a deadline it outlasted fails it after
+        deadline.check()?;
 
         // Create memory result
         let memory_result = ExecutorResult::new(columns, rows);
@@ -905,6 +907,7 @@ impl OrderedResult {
             let nulls_first = crate::core::value::nulls_first(spec.ascending, spec.nulls_first);
             if Self::try_radix_sort_single_int(&mut rows, spec.col_idx, spec.ascending, nulls_first)
             {
+                deadline.check()?;
                 return Ok(Self {
                     inner: ExecutorResult::new(columns, rows),
                 });
@@ -913,6 +916,7 @@ impl OrderedResult {
 
         // Try radix sort for multiple integer columns
         if order_specs.len() <= 4 && Self::try_radix_sort_multi_int(&mut rows, order_specs) {
+            deadline.check()?;
             return Ok(Self {
                 inner: ExecutorResult::new(columns, rows),
             });
@@ -920,6 +924,7 @@ impl OrderedResult {
 
         // Fallback to comparison sort (use sort_unstable_by for better performance)
         rows.sort_unstable_by(|(_, a), (_, b)| fallback_compare(a, b));
+        deadline.check()?;
 
         Ok(Self {
             inner: ExecutorResult::new(columns, rows),
@@ -1280,9 +1285,11 @@ impl TopNResult {
         if let Some(err) = inner.last_error() {
             return Err(err);
         }
+        let rows = top.into_row_vec();
+        deadline.check()?;
 
         Ok(Self {
-            inner: ExecutorResult::new(columns, top.into_row_vec()),
+            inner: ExecutorResult::new(columns, rows),
         })
     }
 }
