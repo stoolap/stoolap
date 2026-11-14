@@ -1146,7 +1146,7 @@ impl Executor {
                 // A late runtime error (e.g., invalid REGEXP) will fail here
                 // before any inserts, preventing partial writes in the transaction.
                 let columns = select_result.columns().to_vec();
-                let rows = Self::materialize_result(select_result)?;
+                let rows = Self::materialize_result(select_result, ctx.deadline_of_call())?;
                 select_result = Box::new(super::result::ExecutorResult::new(columns, rows));
             }
 
@@ -2113,7 +2113,7 @@ impl Executor {
             if !should_auto_commit {
                 // Explicit tx: fully materialize before writes for atomicity
                 let columns = select_result.columns().to_vec();
-                let rows = Self::materialize_result(select_result)?;
+                let rows = Self::materialize_result(select_result, ctx.deadline_of_call())?;
                 select_result = Box::new(super::result::ExecutorResult::new(columns, rows));
             }
 

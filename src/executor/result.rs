@@ -836,7 +836,7 @@ pub struct RadixOrderSpec {
 
 impl OrderedResult {
     /// Create a new ordered result by materializing and sorting the inner result
-    pub fn new<F>(mut inner: Box<dyn QueryResult>, compare: F) -> Result<Self>
+    pub fn new<F>(mut inner: Box<dyn QueryResult>, compare: F, deadline: Deadline) -> Result<Self>
     where
         F: Fn(&Row, &Row) -> std::cmp::Ordering,
     {
@@ -846,6 +846,7 @@ impl OrderedResult {
         let mut rows = RowVec::new();
         let mut idx = 0i64;
         while inner.next() {
+            deadline.charge(DeadlineSite::Sort, 1)?;
             rows.push((idx, inner.take_row()));
             idx += 1;
         }
@@ -854,6 +855,7 @@ impl OrderedResult {
         }
 
         // Sort rows (comparing only the Row part, ignoring IDs)
+        deadline.charge(DeadlineSite::Sort, rows.len())?;
         rows.sort_unstable_by(|(_, a), (_, b)| compare(a, b));
 
         // Create memory result
@@ -877,6 +879,7 @@ impl OrderedResult {
         mut inner: Box<dyn QueryResult>,
         order_specs: &[RadixOrderSpec],
         fallback_compare: F,
+        deadline: Deadline,
     ) -> Result<Self>
     where
         F: Fn(&Row, &Row) -> std::cmp::Ordering,
@@ -887,12 +890,14 @@ impl OrderedResult {
         let mut rows = RowVec::new();
         let mut idx = 0i64;
         while inner.next() {
+            deadline.charge(DeadlineSite::Sort, 1)?;
             rows.push((idx, inner.take_row()));
             idx += 1;
         }
         if let Some(err) = inner.last_error() {
             return Err(err);
         }
+        deadline.charge(DeadlineSite::Sort, rows.len())?;
 
         // Try radix sort for single integer column (most common case)
         if order_specs.len() == 1 {
@@ -1253,6 +1258,7 @@ impl TopNResult {
         compare: F,
         limit: usize,
         offset: usize,
+        deadline: Deadline,
     ) -> Result<Self>
     where
         F: Fn(&Row, &Row) -> std::cmp::Ordering + Clone,
@@ -1268,6 +1274,7 @@ impl TopNResult {
 
         let mut top = TopN::new(compare, limit, offset);
         while inner.next() {
+            deadline.charge(DeadlineSite::Sort, 1)?;
             top.push(inner.take_row());
         }
         if let Some(err) = inner.last_error() {
@@ -2306,11 +2313,15 @@ mod tests {
         let inner = Box::new(ExecutorResult::new(columns, rows));
 
         // Sort by id ascending
-        let mut result = OrderedResult::new(inner, |a, b| {
-            let a_id = a.get(0).and_then(|v| v.as_int64()).unwrap_or(0);
-            let b_id = b.get(0).and_then(|v| v.as_int64()).unwrap_or(0);
-            a_id.cmp(&b_id)
-        })
+        let mut result = OrderedResult::new(
+            inner,
+            |a, b| {
+                let a_id = a.get(0).and_then(|v| v.as_int64()).unwrap_or(0);
+                let b_id = b.get(0).and_then(|v| v.as_int64()).unwrap_or(0);
+                a_id.cmp(&b_id)
+            },
+            Deadline::NONE,
+        )
         .unwrap();
 
         assert!(result.next());

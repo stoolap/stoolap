@@ -36,6 +36,7 @@ use smallvec::SmallVec;
 use std::cmp::Ordering;
 use std::sync::{Arc, OnceLock};
 
+use crate::common::deadline::DeadlineSite;
 use crate::common::{CompactVec, SmartString, StringMap};
 use crate::core::row_vec::RowVec;
 use crate::core::value::NULL_VALUE;
@@ -1673,6 +1674,7 @@ impl Executor {
         // OVER clause (K functions pay one map build and one sort)
         let mut partition_cache: Vec<(OverClauseKey, SharedSortedPartitions)> = Vec::new();
         for wf in window_functions {
+            ctx.charge(DeadlineSite::Window, base_rows.len())?;
             let window_values = self.compute_window_function(
                 wf,
                 base_rows,
@@ -1830,6 +1832,7 @@ impl Executor {
         let has_expressions = !base_expr_items.is_empty() || !ext_expr_items.is_empty();
         if has_expressions {
             for (row_idx, (_, base_row)) in base_rows.iter().enumerate() {
+                ctx.charge(DeadlineSite::Window, 1)?;
                 // Evaluate base expressions and update their column values
                 if let Some(ref mut eval) = base_eval {
                     eval.eval_into(base_row, &mut base_results)?;
@@ -2030,6 +2033,7 @@ impl Executor {
             if result_rows.len() >= limit {
                 break;
             }
+            ctx.charge(DeadlineSite::Window, row_indices.len())?;
 
             // Compute window functions for this partition.
             let mut window_value_map: StringMap<Vec<Value>> = StringMap::new();
@@ -2141,6 +2145,7 @@ impl Executor {
                 if result_rows.len() >= limit {
                     break;
                 }
+                ctx.charge(DeadlineSite::Window, 1)?;
 
                 let base_row = &base_rows[orig_idx].1;
                 let mut values: CompactVec<Value> = CompactVec::with_capacity(num_items);
@@ -2247,6 +2252,7 @@ impl Executor {
             if partition_rows.is_empty() {
                 continue;
             }
+            ctx.charge(DeadlineSite::Window, partition_rows.len())?;
 
             // Precompute ORDER BY values for each unique ORDER BY clause
             let mut order_by_cache: Vec<(OrderByKey, ColumnarOrderByValues)> = Vec::new();
@@ -2386,6 +2392,7 @@ impl Executor {
                 if result_rows.len() >= limit {
                     break;
                 }
+                ctx.charge(DeadlineSite::Window, 1)?;
 
                 let (_, base_row) = &partition_rows[row_idx];
                 let mut values: CompactVec<Value> = CompactVec::with_capacity(num_items);
@@ -3016,6 +3023,7 @@ impl Executor {
 
         if let Some(order_by) = order_by_values.filter(|v| !v.is_empty()) {
             for indices in partition_vec.iter_mut() {
+                ctx.charge(DeadlineSite::Window, indices.len())?;
                 Self::sort_by_order_values(indices, order_by);
             }
         }
@@ -3111,6 +3119,7 @@ impl Executor {
 
         if let Some(partition_indices) = partition_indices {
             for (i, (_, row)) in rows.iter().enumerate() {
+                ctx.charge(DeadlineSite::Window, 1)?;
                 let key: PartitionKey = partition_indices
                     .iter()
                     .map(|&idx| row.get(idx).cloned().unwrap_or_else(Value::null_unknown))
@@ -3129,6 +3138,7 @@ impl Executor {
             )?;
             let mut values = Vec::with_capacity(wf_info.partition_by_exprs.len());
             for (i, (_, row)) in rows.iter().enumerate() {
+                ctx.charge(DeadlineSite::Window, 1)?;
                 eval.eval_into(row, &mut values).map_err(|e| {
                     Error::internal(format!("Failed to evaluate PARTITION BY expression: {}", e))
                 })?;
@@ -3404,6 +3414,7 @@ impl Executor {
 
         // Sort partition by ORDER BY if specified (skip if already pre-sorted by index)
         if !skip_sorting && !wf_info.order_by.is_empty() && !order_by_values.is_empty() {
+            ctx.charge(DeadlineSite::Window, row_indices.len())?;
             Self::sort_by_order_values(&mut row_indices, order_by_values);
         }
 
@@ -3498,6 +3509,7 @@ impl Executor {
         let mut nth_once: Option<Option<usize>> = None;
 
         for (i, &row_idx) in row_indices.iter().enumerate() {
+            ctx.charge(DeadlineSite::Window, 1)?;
             // Handle special functions
             let value = match wf_info.name.as_str() {
                 // MEMORY OPTIMIZATION: Access values directly from all_rows via indices
@@ -3619,6 +3631,7 @@ impl Executor {
         // Sort partition by ORDER BY if specified (the shared-partition
         // cache hands in pre-sorted indices)
         if !already_sorted && !wf_info.order_by.is_empty() && !order_by_values.is_empty() {
+            ctx.charge(DeadlineSite::Window, row_indices.len())?;
             Self::sort_by_order_values(&mut row_indices, order_by_values);
         }
 
@@ -3676,6 +3689,7 @@ impl Executor {
         // Sort partition by ORDER BY if specified (the shared-partition
         // cache hands in pre-sorted indices)
         if !already_sorted && !wf_info.order_by.is_empty() && !order_by_values.is_empty() {
+            ctx.charge(DeadlineSite::Window, row_indices.len())?;
             Self::sort_by_order_values(&mut row_indices, order_by_values);
         }
 
@@ -4016,6 +4030,7 @@ impl Executor {
             )?;
             let mut values = Vec::with_capacity(num_cols);
             for (_, row) in rows {
+                ctx.charge(DeadlineSite::Window, 1)?;
                 eval.eval_into(row, &mut values)?;
                 for (col_idx, value) in values.drain(..).enumerate() {
                     if col_idx < result_columns.len() {
@@ -4437,6 +4452,7 @@ impl Executor {
         let mut values = Vec::with_capacity(rows.len());
         let mut kept = Vec::with_capacity(rows.len());
         for (idx, (_, row)) in rows.iter().enumerate() {
+            ctx.charge(DeadlineSite::Window, 1)?;
             let keeps = matches!(eval.eval(row)?, Value::Boolean(true));
             values.push(if keeps {
                 window_argument_value(rows, idx, arg_col_idx, expression_values).clone()
@@ -4494,6 +4510,7 @@ impl Executor {
         )?;
         let mut sort_keys = Vec::with_capacity(rows.len());
         for (_, row) in rows {
+            ctx.charge(DeadlineSite::Window, 1)?;
             let mut key = Vec::with_capacity(wf_info.call_order_by.len());
             evals.eval_into(row, &mut key)?;
             sort_keys.push(key);
@@ -4548,7 +4565,10 @@ impl Executor {
                 held,
             )?;
             rows.iter()
-                .map(|(_, row)| eval.eval(row))
+                .map(|(_, row)| {
+                    ctx.charge(DeadlineSite::Window, 1)?;
+                    eval.eval(row)
+                })
                 .collect::<Result<_>>()?
         } else {
             vec![]
@@ -4588,6 +4608,7 @@ impl Executor {
                 RowPrograms::compile(later, columns, Some(group_slots), ctx, blocks, held)?;
             let mut read = Vec::with_capacity(later.len());
             for (idx, (_, row)) in rows.iter().enumerate() {
+                ctx.charge(DeadlineSite::Window, 1)?;
                 match kept.get(idx) {
                     Some(false) => read.resize(later.len(), Value::null_unknown()),
                     _ => evals.eval_into(row, &mut read)?,
@@ -4676,6 +4697,7 @@ impl Executor {
 
         for row_indices in partitions.iter() {
             let row_indices = row_indices.as_slice();
+            ctx.charge(DeadlineSite::Window, row_indices.len())?;
             // Partitions from the shared cache arrive pre-sorted
             if !wf_info.order_by.is_empty() || wf_info.frame.is_some() {
                 let frames = PartitionFrames::new(&frame, row_indices, order_by_values);
@@ -4704,6 +4726,10 @@ impl Executor {
                         // Reset aggregate state for new frame computation
                         agg_func.reset();
                         let (frame_start, frame_end) = frames.bounds(&frame, i);
+                        ctx.charge(
+                            DeadlineSite::Window,
+                            frame_end.saturating_sub(frame_start) + 1,
+                        )?;
 
                         // Accumulate values within the frame
                         accumulate_frame(

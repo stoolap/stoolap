@@ -11720,7 +11720,7 @@ impl Executor {
         if where_.needed.is_some() && table.narrows_scans() {
             return Ok((result, token));
         }
-        let rows = Self::materialize_result(result)?;
+        let rows = Self::materialize_result(result, ctx.deadline_of_call())?;
         self.semantic_write(name, &columns, rows.rows(), predicate, params, stamp);
         Ok((
             Box::new(ExecutorResult::with_arc_columns(columns, rows)),
@@ -12990,7 +12990,10 @@ impl Executor {
             Some(&run.compiled),
         )?;
         let columns = result.columns().to_vec();
-        Ok((columns, Self::materialize_result(result)?))
+        Ok((
+            columns,
+            Self::materialize_result(result, ctx.deadline_of_call())?,
+        ))
     }
 
     /// Whether a source read when a call first needs it is the one the plan
@@ -13027,7 +13030,10 @@ impl Executor {
                 };
                 let result = self.execute_view_body(&view, ctx)?;
                 let columns = result.columns().to_vec();
-                (columns, Self::materialize_result(result)?)
+                (
+                    columns,
+                    Self::materialize_result(result, ctx.deadline_of_call())?,
+                )
             }
             BlockSource::Derived(run, ..) => self.statement_rows(run, ctx)?,
             BlockSource::AsOf(name, as_of) => self.as_of_rows(name, as_of, ctx)?,
@@ -15640,7 +15646,12 @@ impl<'a> PreparedRunner<'a> {
         each: &mut dyn FnMut(&Row) -> Result<()>,
     ) -> Result<()> {
         let scan = match rows {
-            SortInput::Rows(rows) => return rows.iter().try_for_each(|(_, row)| each(row)),
+            SortInput::Rows(rows) => {
+                return rows.iter().try_for_each(|(_, row)| {
+                    self.ctx.charge(DeadlineSite::Sort, 1)?;
+                    each(row)
+                })
+            }
             SortInput::Scan(scan) => scan,
         };
         while scan.next() {
@@ -17523,6 +17534,7 @@ impl PreparedRunner<'_> {
         }
         if !order.distinct.is_empty() {
             // A stable sort: a tie stays in the order read
+            self.ctx.charge(DeadlineSite::Sort, all.len())?;
             all.sort_by(|a, b| order.compare(&a.0, &b.0));
             let mut first = super::result::DistinctRows::new(order.distinct.len());
             let rows = all.into_iter().filter(|(_, seen, _)| first.is_new(seen));

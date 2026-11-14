@@ -260,7 +260,7 @@ impl Executor {
                 return Ok(result);
             };
             let columns = result.columns().to_vec();
-            let rows = Self::materialize_result(result)?;
+            let rows = Self::materialize_result(result, ctx.deadline_of_call())?;
             if rows.len() as u64 >= wanted {
                 return Ok(Box::new(ExecutorResult::new(columns, rows)));
             }
@@ -359,7 +359,7 @@ impl Executor {
         let ctx_with_ctes = ctx.with_cte_data(cte_registry.data());
         let result = self.execute_source_statement(stmt, &ctx_with_ctes, None, plan)?;
         let columns = result.columns().to_vec();
-        let rows = Self::materialize_result(result)?;
+        let rows = Self::materialize_result(result, ctx.deadline_of_call())?;
 
         Ok((columns, rows))
     }
@@ -442,7 +442,7 @@ impl Executor {
             anchor_columns
         };
 
-        let mut all_rows = Self::materialize_result(result)?;
+        let mut all_rows = Self::materialize_result(result, ctx.deadline_of_call())?;
 
         // A branch that does not read the CTE belongs to the first: it runs
         // once, and its rows start the recursion with the first's

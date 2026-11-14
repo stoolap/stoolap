@@ -644,7 +644,7 @@ use super::utils::{
 use super::volatility::{expression_volatility, statement_constant};
 use super::window::WindowOutput;
 use super::Executor;
-use crate::common::deadline::DeadlineSite;
+use crate::common::deadline::{Deadline, DeadlineSite};
 use crate::functions::{global_registry, FunctionRegistry, Volatility};
 use crate::optimizer::bloom::BloomFilterBuilder;
 use crate::planner::join::{IndexProbe, LimitHash};
@@ -2051,7 +2051,7 @@ impl Executor {
                 self.execute_prepared_select(stmt, ctx, compiled, limit, offset)?;
             let result = match (semantic_stamp, stmt.where_clause.as_deref()) {
                 (Some((source, stamp)), Some(where_expr)) => {
-                    let rows = Self::materialize_result(result)?;
+                    let rows = Self::materialize_result(result, ctx.deadline_of_call())?;
                     let predicate = match ctx.semantic_miss(stmt) {
                         Some(miss) => miss.simplified.as_deref().unwrap_or(where_expr),
                         None => simplified.as_ref().unwrap_or(where_expr),
@@ -2283,6 +2283,7 @@ impl Executor {
                         .collect::<Result<_>>()?;
                     rows.iter()
                         .map(|(_, row)| {
+                            ctx.charge(DeadlineSite::Sort, 1)?;
                             key_sources
                                 .iter()
                                 .map(|source| match source {
@@ -2302,6 +2303,7 @@ impl Executor {
 
                 // Create indices and sort them based on sort_keys
                 let mut indices: Vec<usize> = (0..rows.len()).collect();
+                ctx.charge(DeadlineSite::Sort, indices.len())?;
 
                 // Top-K: with LIMIT (and no DISTINCT ON, which dedups after
                 // the sort), select the needed prefix in O(n) and sort only
@@ -2438,6 +2440,7 @@ impl Executor {
                         move |a, b| Self::compare_rows_with_indices(a, b, &order_specs),
                         lim,
                         offset,
+                        ctx.deadline_of_call(),
                     )?);
 
                     OrderLimitPath::TopN.taken();
@@ -2474,12 +2477,15 @@ impl Executor {
                         result,
                         &radix_specs,
                         move |a, b| Self::compare_rows_with_indices(a, b, &order_specs),
+                        ctx.deadline_of_call(),
                     )?);
                 } else {
                     // Some columns missing - use comparison sort
-                    result = Box::new(OrderedResult::new(result, move |a, b| {
-                        Self::compare_rows_with_indices(a, b, &order_specs)
-                    })?);
+                    result = Box::new(OrderedResult::new(
+                        result,
+                        move |a, b| Self::compare_rows_with_indices(a, b, &order_specs),
+                        ctx.deadline_of_call(),
+                    )?);
                 }
             }
         }
@@ -3436,12 +3442,12 @@ impl Executor {
                 }
                 None => (
                     (columns, flag, shape),
-                    Self::materialize_result(result)?,
+                    Self::materialize_result(result, ctx.deadline_of_call())?,
                     pass.token,
                 ),
                 Some((head, mut rows, token)) => {
                     same_outer_source(&join_source.left, token, pass.token, true)?;
-                    for (_, row) in Self::materialize_result(result)? {
+                    for (_, row) in Self::materialize_result(result, ctx.deadline_of_call())? {
                         rows.push((rows.len() as i64, row));
                     }
                     (head, rows, token)
@@ -4214,7 +4220,7 @@ impl Executor {
                                         self.read_join_side(entry, ctx, side, None, limit, 0)?;
                                     run.blocks.rows_fit(i, &name, rows.columns())?;
                                     if let Expression::SubquerySource(_) = &**entry {
-                                        Self::materialize_result(rows)?;
+                                        Self::materialize_result(rows, ctx.deadline_of_call())?;
                                     }
                                 }
                             }
@@ -4292,7 +4298,7 @@ impl Executor {
             let left_rows = match window.offset {
                 0 => Self::materialize_result_arc(left_result)?,
                 _ => CompactArc::new(
-                    Self::materialize_result(left_result)?
+                    Self::materialize_result(left_result, ctx.deadline_of_call())?
                         .into_iter()
                         .map(|(_, row)| row)
                         .collect(),
@@ -5213,6 +5219,7 @@ impl Executor {
                             });
                             Some(indices)
                         };
+                        ctx.charge(DeadlineSite::Sort, final_rows.len())?;
                         let ordered = match &prepared {
                             Some(prepared) => prepared.programs(
                                 |held| {
@@ -6591,7 +6598,7 @@ impl Executor {
         let mut vm = ExprVM::new();
         let mut kept = RowVec::new();
         let mut skipped = 0;
-        for (id, row) in Self::materialize_result(result)? {
+        for (id, row) in Self::materialize_result(result, ctx.deadline_of_call())? {
             if let Some(program) = &program {
                 let exec = super::aggregation::slot_context(&row, ctx);
                 if !vm.execute_bool_checked(program, &exec)? {
@@ -6639,7 +6646,7 @@ impl Executor {
             // has qualified names like "ds.avg_salary" not just "avg_salary"
             let row_filter = Self::side_filter(filter_expr, &qualified_columns, ctx)?;
             // Materialize and filter - materialized is RowVec = Vec<(i64, Row)>
-            let mut materialized = Self::materialize_result(result)?;
+            let mut materialized = Self::materialize_result(result, ctx.deadline_of_call())?;
             row_filter.retain_checked(&mut materialized)?;
             let filtered_result: Box<dyn QueryResult> =
                 Box::new(super::result::ExecutorResult::new(columns, materialized));
@@ -6650,7 +6657,10 @@ impl Executor {
     }
 
     /// Materialize a result into a RowVec
-    pub(crate) fn materialize_result(mut result: Box<dyn QueryResult>) -> Result<RowVec> {
+    pub(crate) fn materialize_result(
+        mut result: Box<dyn QueryResult>,
+        deadline: Deadline,
+    ) -> Result<RowVec> {
         // Pre-allocate based on estimate to avoid reallocations
         let mut rows = if let Some(estimate) = result.estimated_count() {
             RowVec::with_capacity(estimate)
@@ -6659,6 +6669,7 @@ impl Executor {
         };
         let mut row_id = 0i64;
         while result.next() {
+            deadline.charge(DeadlineSite::Result, 1)?;
             rows.push((row_id, result.take_row()));
             row_id += 1;
         }
@@ -7001,7 +7012,7 @@ impl Executor {
             return Ok(output);
         };
         let (result, columns, applied, shape) = output;
-        let mut rows = Self::materialize_result(result)?;
+        let mut rows = Self::materialize_result(result, ctx.deadline_of_call())?;
         late.fill(run, &mut rows, ctx)?;
         let result = ExecutorResult::with_arc_columns(CompactArc::clone(&columns), rows);
         Ok((Box::new(result), columns, applied, shape))

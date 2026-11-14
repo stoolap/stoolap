@@ -66,11 +66,17 @@ pub enum DeadlineSite {
     IndexProbe,
     /// A hash join's rows built and probed on worker threads
     ParallelJoin,
+    /// The rows an ORDER BY reads, and their count before each sort
+    Sort,
+    /// A window function's rows and partitions
+    Window,
+    /// The rows a UNION, INTERSECT or EXCEPT reads
+    SetOp,
 }
 
 impl DeadlineSite {
     /// Every site, which a test stops a statement at in turn
-    pub const ALL: [DeadlineSite; 16] = [
+    pub const ALL: [DeadlineSite; 19] = [
         DeadlineSite::Scan,
         DeadlineSite::LateKeys,
         DeadlineSite::Block,
@@ -87,6 +93,9 @@ impl DeadlineSite {
         DeadlineSite::NestedLoop,
         DeadlineSite::IndexProbe,
         DeadlineSite::ParallelJoin,
+        DeadlineSite::Sort,
+        DeadlineSite::Window,
+        DeadlineSite::SetOp,
     ];
 }
 

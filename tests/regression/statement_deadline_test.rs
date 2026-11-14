@@ -108,6 +108,11 @@ fn statement(site: DeadlineSite, csv: &str) -> String {
         DeadlineSite::NestedLoop => "SELECT a.id, b.id FROM u a JOIN u b ON a.k < b.k",
         DeadlineSite::IndexProbe => "SELECT big.id, u.k FROM big JOIN u ON u.id = big.v",
         DeadlineSite::ParallelJoin => "SELECT x.id, y.id FROM wide x JOIN wide y ON x.k = y.k",
+        DeadlineSite::Sort => "SELECT id FROM big ORDER BY v * 1 DESC",
+        DeadlineSite::Window => {
+            "SELECT id, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v) AS n FROM big"
+        }
+        DeadlineSite::SetOp => "SELECT k FROM big UNION SELECT k FROM u",
     };
     sql.to_string()
 }
