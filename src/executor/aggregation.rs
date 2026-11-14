@@ -25,6 +25,7 @@ use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 // SmallVec removed - Vec is faster due to spilled() check overhead in hot loops
 
+use crate::common::deadline::DeadlineSite;
 use crate::common::{CompactArc, CompactVec, StringMap};
 use crate::core::{Result, Row, RowVec, Value};
 use crate::functions::aggregate::{
@@ -1598,9 +1599,11 @@ impl<'a> RowFeed<'a> {
         if self.splits(groups, rows.len()) {
             let chunk_size = (rows.len() / rayon::current_num_threads()).max(1000);
             let (params, transaction_id) = (ctx.params(), ctx.transaction_id());
+            let deadline = ctx.deadline_of_call();
             let parts: Vec<GroupedAggregates> = rows
                 .par_chunks(chunk_size)
                 .map(|chunk| {
+                    deadline.charge(DeadlineSite::Aggregate, chunk.len())?;
                     let mut part = groups.empty_like();
                     let mut state = FeedState::default();
                     let reads = RowReads {
@@ -1624,12 +1627,14 @@ impl<'a> RowFeed<'a> {
                 if let Some(group) = groups.group(&[] as &[Value]) {
                     let runs = groups.aggregates(group);
                     for (_, row) in rows {
+                        ctx.charge(DeadlineSite::Aggregate, 1)?;
                         self.feed_columns(runs, row);
                     }
                 }
                 return Ok(());
             }
             for (_, row) in rows {
+                ctx.charge(DeadlineSite::Aggregate, 1)?;
                 self.run_columns(groups, row, columns);
             }
             return Ok(());
@@ -1637,6 +1642,7 @@ impl<'a> RowFeed<'a> {
         let mut state = FeedState::default();
         let reads = RowReads::of(ctx, blocks);
         for (_, row) in rows {
+            ctx.charge(DeadlineSite::Aggregate, 1)?;
             self.run_one(groups, row, &reads, &mut state)?;
         }
         Ok(())
@@ -1658,11 +1664,13 @@ impl<'a> RowFeed<'a> {
                 };
                 let runs = groups.aggregates(group);
                 while let Some(row) = source.next_row()? {
+                    ctx.charge(DeadlineSite::Aggregate, 1)?;
                     self.feed_columns(runs, row);
                 }
                 return Ok(());
             }
             while let Some(row) = source.next_row()? {
+                ctx.charge(DeadlineSite::Aggregate, 1)?;
                 self.run_columns(groups, row, columns);
             }
             return Ok(());
@@ -1670,6 +1678,7 @@ impl<'a> RowFeed<'a> {
         let mut state = FeedState::default();
         let reads = RowReads::of(ctx, blocks);
         while let Some(row) = source.next_row()? {
+            ctx.charge(DeadlineSite::Aggregate, 1)?;
             self.run_one(groups, row, &reads, &mut state)?;
         }
         Ok(())
@@ -1709,11 +1718,13 @@ impl<'a> RowFeed<'a> {
         match input {
             FeedInput::Rows(rows) => {
                 for (_, row) in rows {
+                    ctx.charge(DeadlineSite::Aggregate, 1)?;
                     self.run_set_row(sets, picks, row, &reads, &mut state)?;
                 }
             }
             FeedInput::Each(mut source, _) => {
                 while let Some(row) = source.next_row()? {
+                    ctx.charge(DeadlineSite::Aggregate, 1)?;
                     self.run_set_row(sets, picks, row, &reads, &mut state)?;
                 }
             }
@@ -2442,6 +2453,7 @@ impl Executor {
             .collect::<Result<_>>()?;
 
         for (id, row) in agg_rows {
+            ctx.charge(DeadlineSite::Aggregate, 1)?;
             // Use CompactVec directly to avoid Vec→CompactVec conversion
             let mut new_values: CompactVec<Value> = CompactVec::with_capacity(column_sources.len());
 
@@ -3586,6 +3598,7 @@ impl Executor {
         let mut new_id = 0i64;
         let mut vm = ExprVM::new();
         for (_, row) in rows {
+            ctx.charge(DeadlineSite::Aggregate, 1)?;
             if vm.execute_bool_checked(&having_filter, &run_context(&row, ctx, blocks))? {
                 filtered_rows.push((new_id, row));
                 new_id += 1;

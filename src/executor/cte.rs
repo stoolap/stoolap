@@ -32,6 +32,7 @@ use crate::common::SmartString;
 use ahash::AHashSet;
 use std::sync::Arc;
 
+use crate::common::deadline::DeadlineSite;
 use crate::common::names::eq_names;
 use crate::common::{CompactArc, StringMap};
 use crate::core::{Error, Result, Row, RowVec, Value};
@@ -480,6 +481,7 @@ impl Executor {
             if working_rows.is_empty() {
                 break;
             }
+            ctx.charge(DeadlineSite::RecursiveCte, working_rows.len())?;
 
             // Create a temporary CTE registry with current working set
             let mut temp_registry = CteRegistry::new();

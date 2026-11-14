@@ -113,6 +113,12 @@ fn statement(site: DeadlineSite, csv: &str) -> String {
             "SELECT id, ROW_NUMBER() OVER (PARTITION BY k ORDER BY v) AS n FROM big"
         }
         DeadlineSite::SetOp => "SELECT k FROM big UNION SELECT k FROM u",
+        DeadlineSite::RecursiveCte => {
+            "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 5000) \
+             SELECT n FROM r"
+        }
+        DeadlineSite::Tvf => "SELECT value FROM generate_series(1, 5000)",
+        DeadlineSite::Aggregate => "SELECT k, SUM(v * 2) FROM big GROUP BY k",
     };
     sql.to_string()
 }
@@ -220,6 +226,34 @@ fn a_write_stopped_at_its_deadline_leaves_no_row_in_or_out_of_a_transaction() {
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn an_aggregation_split_over_the_thread_pool_stops_at_its_deadline() {
+    let _guard = FailpointGuard::new();
+    let db = Database::open("memory://statement_deadline_split_aggregate").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO t SELECT value, value % 50, value FROM generate_series(1, 100001)",
+        (),
+    )
+    .unwrap();
+    let executor = Executor::new(std::sync::Arc::clone(db.engine()));
+    let mut ctx = ExecutionContext::new();
+    ctx.set_timeout_ms(3_600_000);
+    let sql = "SELECT k, SUM(v) FROM t WHERE v * 1 > 0 GROUP BY k";
+    pass_deadline_at(DeadlineSite::Aggregate);
+    let stopped = read(&executor, sql, &ctx);
+    keep_deadlines();
+    assert!(
+        matches!(stopped, Err(Error::QueryCancelled)),
+        "{sql} gave {stopped:?}"
+    );
+    assert_eq!(read(&executor, sql, &ctx).unwrap(), 50);
 }
 
 #[test]

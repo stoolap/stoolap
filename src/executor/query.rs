@@ -2961,6 +2961,7 @@ impl Executor {
         let result_rows = tvf.generate(&arg_values, limit)?;
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::tvf_rows_generated(result_rows.len());
+        ctx.charge(DeadlineSite::Tvf, result_rows.len())?;
 
         Ok((result_rows, Self::tvf_source_columns(tvf_source, &*tvf)))
     }

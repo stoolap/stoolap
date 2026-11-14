@@ -15,6 +15,7 @@
 //! A statement that groups one table by one column without WHERE: the one
 //! rule that says where its groups come from, and the run of that source
 
+use crate::common::deadline::DeadlineSite;
 use crate::common::names::eq_names;
 use crate::core::{Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::{Expression, GroupByModifier, SelectStatement};
@@ -378,6 +379,7 @@ impl Executor {
         let count_star = Value::Integer(1);
 
         let mut aggregate = |group_value: &Value, row_ids: GroupIds<'_>| -> Result<bool> {
+            ctx.charge(DeadlineSite::Aggregate, 1)?;
             for run in runs.iter_mut() {
                 run.reset();
             }
@@ -386,6 +388,7 @@ impl Executor {
                 // A page of ids at a time through the one row buffer; the
                 // aggregate state carries across the group's pages
                 for page in row_ids.pages() {
+                    ctx.charge(DeadlineSite::Aggregate, page.len())?;
                     row_buffer.clear();
                     table.fetch_rows_by_ids_into(page, &true_expr, &mut row_buffer)?;
                     for (_row_id, row) in &row_buffer {

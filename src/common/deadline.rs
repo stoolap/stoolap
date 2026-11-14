@@ -72,11 +72,17 @@ pub enum DeadlineSite {
     Window,
     /// The rows a UNION, INTERSECT or EXCEPT reads
     SetOp,
+    /// A recursive CTE's working rows, at each iteration
+    RecursiveCte,
+    /// The rows a table-valued function made, once it returns them
+    Tvf,
+    /// The rows an aggregation folds into groups and the groups it reads
+    Aggregate,
 }
 
 impl DeadlineSite {
     /// Every site, which a test stops a statement at in turn
-    pub const ALL: [DeadlineSite; 19] = [
+    pub const ALL: [DeadlineSite; 22] = [
         DeadlineSite::Scan,
         DeadlineSite::LateKeys,
         DeadlineSite::Block,
@@ -96,6 +102,9 @@ impl DeadlineSite {
         DeadlineSite::Sort,
         DeadlineSite::Window,
         DeadlineSite::SetOp,
+        DeadlineSite::RecursiveCte,
+        DeadlineSite::Tvf,
+        DeadlineSite::Aggregate,
     ];
 }
 
