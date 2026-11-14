@@ -446,6 +446,11 @@ impl<'r, 'p> JoinedWhere<'r, 'p> {
         }
         Ok(passed)
     }
+
+    /// The run whose blocks the WHERE asks, when it holds a subquery
+    fn asking(&self) -> Option<&'r super::prepared_select::PreparedRunner<'p>> {
+        self.bound.as_ref().map(|(_, run)| *run)
+    }
 }
 
 /// The values a NATURAL or USING join adds to each joined row: per full join
@@ -478,8 +483,8 @@ impl MergedValues<'_> {
 }
 
 /// A join's rows as the join makes them, with the values `merged` adds,
-/// those `where_` passes, asking its subqueries through `site`, as an
-/// aggregation reads them, each charged against the deadline
+/// those `where_` passes, asking its subqueries through `site`, read a part
+/// at a time as an aggregation reads them, each charged against the deadline
 struct JoinedRows<'r, 'p> {
     stream: JoinStream<'r>,
     where_: Option<JoinedWhere<'r, 'p>>,
@@ -487,6 +492,11 @@ struct JoinedRows<'r, 'p> {
     ctx: &'r ExecutionContext,
     merged: MergedValues<'r>,
     row: Option<Row>,
+    /// The run told the joined rows its WHERE asks, before its first ask
+    counted: Option<&'r super::prepared_select::PreparedRunner<'p>>,
+    /// The passed rows of the part read last, as `next_row` hands them out
+    pending: Option<crate::core::row_vec::RowVecIter>,
+    more: bool,
 }
 
 impl<'r, 'p> JoinedRows<'r, 'p> {
@@ -505,6 +515,9 @@ impl<'r, 'p> JoinedRows<'r, 'p> {
             ctx,
             merged: MergedValues::default(),
             row: None,
+            counted: None,
+            pending: None,
+            more: true,
         }
     }
 
@@ -513,65 +526,88 @@ impl<'r, 'p> JoinedRows<'r, 'p> {
         self
     }
 
-    fn next_passed(&mut self) -> Result<Option<Row>> {
-        while let Some(mut row) = self.stream.next_row(self.ctx)? {
-            self.ctx.charge(DeadlineSite::JoinedRows, 1)?;
-            self.merged.push_onto(&mut row);
-            if let Some(where_) = self.where_.as_mut() {
-                if !where_.matches(&row, self.site)? {
-                    continue;
-                }
-            }
-            return Ok(Some(row));
+    /// Tells the blocks its WHERE asks the joined rows before the first ask,
+    /// as the gathered path does: their number when the join ends within a
+    /// part, else none, which builds a keyed set rather than probing per row
+    fn counting(mut self) -> Self {
+        self.counted = self.where_.as_ref().and_then(JoinedWhere::asking);
+        self
+    }
+
+    /// Into the empty `part`, the next part of joined rows the join fills,
+    /// with the values `merged` adds, those the WHERE passes, each asked
+    /// charged against the deadline; false once every row was made. The
+    /// first part tells the counted run how many rows its WHERE asks
+    fn fill_passed(&mut self, part: &mut RowVec) -> Result<bool> {
+        let more = self.stream.fill(part, join_part_rows(), self.ctx)?;
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::join_part_held(part.len());
+        if let Some(run) = self.counted.take() {
+            run.ask_rows((!more).then_some(part.len()));
         }
-        Ok(None)
+        if !self.merged.is_empty() {
+            for (_, row) in part.iter_mut() {
+                self.merged.push_onto(row);
+            }
+        }
+        if let Some(where_) = self.where_.as_mut() {
+            let (ctx, site) = (self.ctx, self.site);
+            let mut failed = None;
+            part.retain(|(_, row)| {
+                if failed.is_some() {
+                    return false;
+                }
+                let asked = ctx.charge(DeadlineSite::JoinedRows, 1);
+                asked
+                    .and_then(|()| where_.matches(row, site))
+                    .unwrap_or_else(|e| {
+                        failed = Some(e);
+                        false
+                    })
+            });
+            if let Some(e) = failed {
+                return Err(e);
+            }
+        }
+        Ok(more)
     }
 }
 
 impl RowSource for JoinedRows<'_, '_> {
     fn next_row(&mut self) -> Result<Option<&Row>> {
-        self.row = self.next_passed()?;
-        #[cfg(feature = "test-failpoints")]
-        crate::test_failpoints::join_part_held(usize::from(self.row.is_some()));
-        Ok(self.row.as_ref())
+        loop {
+            if let Some((_, row)) = self.pending.as_mut().and_then(Iterator::next) {
+                self.row = Some(row);
+                return Ok(self.row.as_ref());
+            }
+            if !self.more {
+                self.pending = None;
+                return Ok(None);
+            }
+            let mut part = RowVec::new();
+            self.more = self.fill_passed(&mut part)?;
+            self.pending = Some(part.into_iter());
+        }
     }
 
     fn held(mut self) -> Result<RowVec> {
         let mut rows = RowVec::new();
-        while let Some(row) = self.next_passed()? {
-            rows.push((0, row));
-        }
-        Ok(rows)
-    }
-
-    fn each_part(mut self, run: &mut PartRun<'_>) -> Result<()> {
-        let part_rows = join_part_rows();
         let mut part = RowVec::new();
         loop {
             part.clear();
-            // With no WHERE to ask, the join fills the part itself
-            let more = match self.where_ {
-                None => {
-                    let more = self.stream.fill(&mut part, part_rows, self.ctx)?;
-                    if !self.merged.is_empty() {
-                        for (_, row) in part.iter_mut() {
-                            self.merged.push_onto(row);
-                        }
-                    }
-                    more
-                }
-                Some(_) => {
-                    while part.len() < part_rows {
-                        match self.next_passed()? {
-                            Some(row) => part.push((0, row)),
-                            None => break,
-                        }
-                    }
-                    part.len() == part_rows
-                }
-            };
-            #[cfg(feature = "test-failpoints")]
-            crate::test_failpoints::join_part_held(part.len());
+            let more = self.fill_passed(&mut part)?;
+            rows.append(&mut part);
+            if !more {
+                return Ok(rows);
+            }
+        }
+    }
+
+    fn each_part(mut self, run: &mut PartRun<'_>) -> Result<()> {
+        let mut part = RowVec::new();
+        loop {
+            part.clear();
+            let more = self.fill_passed(&mut part)?;
             if !part.is_empty() {
                 run(&part)?;
             }
@@ -5827,13 +5863,11 @@ impl Executor {
         };
 
         // A grouped statement without windows that reads the joined rows as
-        // the join makes them, with no subquery in the WHERE after the join
-        // and no star over merged columns, aggregates them in parts as they
-        // are made
+        // the join makes them, with no star over merged columns, aggregates
+        // them in parts as they are made
         let shows_star = (stmt.columns.iter()).any(|c| matches!(c, Expression::Star(_)));
         let in_parts = classification.has_aggregation
             && !classification.has_window_functions
-            && !effective_where.is_some_and(Self::has_subqueries)
             && !(shows_star
                 && !(excluded_column_indices.is_empty() && join_col_renames.is_empty()))
             && !Self::grouped_family_reach(stmt, classification);
@@ -5898,7 +5932,9 @@ impl Executor {
                 coalesced: &coalesced,
                 appended: &appended,
             };
-            let source = JoinedRows::new(stream, (where_, where_blocks), ctx).merging(merged);
+            let source = JoinedRows::new(stream, (where_, where_blocks), ctx)
+                .merging(merged)
+                .counting();
             let bare: Vec<String> = appended_merges(&all_columns, &join_col_renames)
                 .map(|(_, _, name)| name.clone())
                 .collect();
