@@ -13613,25 +13613,34 @@ impl Executor {
         Ok(Some((output, columns)))
     }
 
-    /// The rows of the grouped statement `held` over a join's `rows` of
-    /// `columns`, which its WHERE has passed, the run `run` answering its
-    /// blocks: its groups, as many as `bound` when it is a set operation's
-    /// branch, and their windows, or its windows over the rows
-    pub(crate) fn grouped_rows(
+    /// The rows of the grouped statement `held` over a join's rows of
+    /// `columns`, which its WHERE has passed, held or read as they come in
+    /// `input`, the run `run` answering its blocks: its groups, as many as
+    /// `bound` when it is a set operation's branch, and their windows, or its
+    /// windows over the rows, which holds them
+    pub(super) fn grouped_rows(
         &self,
         (held, bound): (&PreparedGrouped, BranchBound),
         run: &PreparedRunner<'_>,
-        rows: &[(i64, Row)],
+        input: FeedInput<'_, impl RowSource>,
         columns: &[String],
         ctx: &ExecutionContext,
     ) -> Result<WindowOutput> {
         if held.windows_alone() {
-            return self.grouped_windows((held, bound), run, (rows, columns), (None, None), ctx);
+            let order = (None, None);
+            return match input {
+                FeedInput::Rows(rows) => {
+                    self.grouped_windows((held, bound), run, (rows, columns), order, ctx)
+                }
+                FeedInput::Each(source, _) => {
+                    let rows = source.held()?;
+                    self.grouped_windows((held, bound), run, (&rows, columns), order, ctx)
+                }
+            };
         }
         let stmt = &*bounded_branch(&held.stmt, bound);
         let aggregations = &*self.prepared_calls(held.calls.as_ref(), (ctx, run))?;
         let windows = held.classification.has_window_functions;
-        let input = FeedInput::<StreamedRows<'_>>::Rows(rows);
         let calls = (
             aggregations,
             Some(run as &dyn SubqueryExecutor),

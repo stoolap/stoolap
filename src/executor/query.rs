@@ -634,7 +634,7 @@ pub(crate) enum EarlySemantic {
     NotTried,
 }
 
-use super::aggregation::{PartRun, RowSource};
+use super::aggregation::{FeedInput, PartRun, RowSource};
 use super::context::{ExecutionContext, SemanticMiss, StatementSnapshot};
 use super::expr_key::ExprKey;
 use super::expression::SubqueryExecutor;
@@ -4922,10 +4922,21 @@ impl Executor {
                     // An aggregate reads the joined rows in parts as the join
                     // makes them, under the general path's conditions; the
                     // blocks were told the rows they ask before the join
-                    let in_parts = classification.has_aggregation
+                    let parts_shape = classification.has_aggregation
                         && !classification.has_window_functions
-                        && !(side_merged && !apart)
-                        && !Self::grouped_family_reach(stmt, classification);
+                        && !(side_merged && !apart);
+                    let family = match parts_shape {
+                        true => self.parts_family(
+                            plan.as_deref(),
+                            (stmt, classification),
+                            ctx,
+                            &all_columns,
+                            (left_cols.len(), blocks.as_deref(), side_merged),
+                        )?,
+                        false => None,
+                    };
+                    let in_parts = parts_shape && family.as_deref().is_none_or(Option::is_some);
+                    let family = family.as_deref().and_then(Option::as_ref);
                     let mut result_rows = RowVec::new();
                     // A primary key join without a limit fetches its rows in one
                     // batch; an index lookup streams, which costs less than the
@@ -5003,6 +5014,7 @@ impl Executor {
                                     ctx,
                                     source,
                                     &all_columns,
+                                    family,
                                 );
                             }
                             Self::collect_join_rows(
@@ -5142,6 +5154,7 @@ impl Executor {
                                 ctx,
                                 source,
                                 &all_columns,
+                                family,
                             );
                         }
                         Self::collect_join_rows(
@@ -5885,11 +5898,25 @@ impl Executor {
         // the join makes them, with no star over merged columns, aggregates
         // them in parts as they are made
         let shows_star = (stmt.columns.iter()).any(|c| matches!(c, Expression::Star(_)));
-        let in_parts = classification.has_aggregation
+        let parts_shape = classification.has_aggregation
             && !classification.has_window_functions
             && !(shows_star
-                && !(excluded_column_indices.is_empty() && join_col_renames.is_empty()))
-            && !Self::grouped_family_reach(stmt, classification);
+                && !(excluded_column_indices.is_empty() && join_col_renames.is_empty()));
+        let merged = !(coalesced.is_empty()
+            && excluded_column_indices.is_empty()
+            && join_col_renames.is_empty()
+            && side_names.is_empty());
+        let family = match parts_shape {
+            true => self.parts_family(
+                plan.as_deref(),
+                (stmt, classification),
+                ctx,
+                &all_columns,
+                (left_columns.len(), blocks.as_deref(), merged),
+            )?,
+            false => None,
+        };
+        let in_parts = parts_shape && family.as_deref().is_none_or(Option::is_some);
         let appended: Vec<usize> = match in_parts {
             true => (appended_merges(&all_columns, &join_col_renames))
                 .map(|(_, read, _)| *read)
@@ -5962,7 +5989,8 @@ impl Executor {
             for (at, name) in side_names {
                 columns[at] = name;
             }
-            return self.aggregate_joined(plan.as_deref(), stmt, ctx, source, &columns);
+            let family = family.as_deref().and_then(Option::as_ref);
+            return self.aggregate_joined(plan.as_deref(), stmt, ctx, source, &columns, family);
         }
 
         // Apply WHERE clause if present
@@ -6848,7 +6876,8 @@ impl Executor {
     }
 
     /// A join's aggregate over the rows of `source`, of `columns`, read in
-    /// parts as the join makes them, its calls fed by programs the `plan` holds
+    /// parts as the join makes them: through the grouped blocks `family` of
+    /// the statement's family, else its calls fed by programs the `plan` holds
     fn aggregate_joined(
         &self,
         plan: Option<&PreparedJoin>,
@@ -6856,7 +6885,12 @@ impl Executor {
         ctx: &ExecutionContext,
         source: JoinedRows<'_, '_>,
         columns: &[String],
+        family: Option<&super::prepared_select::PreparedGrouped>,
     ) -> SelectResult {
+        if let Some(held) = family {
+            let input = FeedInput::Each(source, usize::MAX);
+            return self.grouped_family_output(held, stmt, ctx, input, columns);
+        }
         let feed = plan.map(|plan| plan.feed(columns));
         let result = self.aggregate_each(stmt, ctx, source, columns, feed.as_deref())?;
         let layout = Self::result_layout(stmt, columns, None, result.columns());
@@ -6881,10 +6915,7 @@ impl Executor {
         merge: impl FnOnce(Vec<String>, RowVec) -> (Vec<String>, RowVec),
         (left_width, blocks): (usize, Option<&JoinBlocks>),
     ) -> SelectResult {
-        let in_family = Self::grouped_family_reach(stmt, classification) && {
-            let decide = || self.grouped_family(stmt).is_ok();
-            plan.map_or_else(decide, |plan| plan.grouped(decide))
-        };
+        let in_family = self.in_grouped_family(plan, stmt, classification);
         let apart = blocks.filter(|_| in_family);
         let mut merge = Some(merge);
         // Apart, a bare name reads each pair's left column, as the blocks do
@@ -6896,37 +6927,11 @@ impl Executor {
             },
         };
         if in_family {
-            let columns = &columns[..];
-            let build = || {
-                let mut leaves = Vec::new();
-                let mut left_leaves = 0;
-                if let Some(Expression::JoinSource(join)) = stmt.table_expr.as_deref() {
-                    self.join_leaves(&join.left, ctx, &mut leaves);
-                    left_leaves = leaves.len();
-                    self.join_leaves(&join.right, ctx, &mut leaves);
-                }
-                let sides = (left_leaves, left_width);
-                self.prepare_grouped_join(stmt, columns, (&leaves, sides), blocks, ctx)
-            };
-            let held = match plan {
-                Some(plan) => plan.grouped_blocks(columns, ctx.params().len(), build)?,
-                None => std::sync::Arc::new(build()?),
-            };
+            let held =
+                self.grouped_family_blocks(plan, stmt, ctx, &columns, (left_width, blocks))?;
             if let Some(held) = held.as_ref() {
-                let run = self.grouped_runner(held, ctx)?.ok_or_else(|| {
-                    Error::internal("a table's columns changed while the statement prepared")
-                })?;
-                let held_run = (held, Self::branch_bound(stmt, ctx));
-                let (result, names, applied, mut shape) =
-                    self.group_held_rows(held_run, &run, ctx, rows, columns, |out| {
-                        Self::result_layout(&held.stmt, columns, None, out)
-                    })?;
-                // The rows were laid out by the items the stars were written
-                // out in, each of which stands for the item it comes from
-                if let (Some(items), Some(shape)) = (held.star_items(), shape.as_mut()) {
-                    shape.written_from(items, stmt.columns.len());
-                }
-                return Self::with_late_keys(held, &run, (result, names, applied, shape), ctx);
+                let input = FeedInput::<JoinedRows<'_, '_>>::Rows(&rows);
+                return self.grouped_family_output(held, stmt, ctx, input, &columns);
             }
         }
         let (columns, rows) = match merge {
@@ -6936,6 +6941,97 @@ impl Executor {
         let feed = plan.map(|plan| plan.feed(&columns));
         let held = feed.as_deref();
         self.grouped_select(stmt, ctx, classification, rows, &columns, None, held)
+    }
+
+    /// For a joined `stmt` of the grouped family, the grouped blocks it runs
+    /// over the joined rows of `columns` read in parts: none when they cannot
+    /// run or a `merged` column, or one its `blocks` merge, names the joined
+    /// row its own way; None for a statement outside the family's reach
+    fn parts_family(
+        &self,
+        plan: Option<&PreparedJoin>,
+        (stmt, classification): (&SelectStatement, &QueryClassification),
+        ctx: &ExecutionContext,
+        columns: &[String],
+        (left_width, blocks, merged): (usize, Option<&JoinBlocks>, bool),
+    ) -> Result<Option<Arc<Option<super::prepared_select::PreparedGrouped>>>> {
+        if !Self::grouped_family_reach(stmt, classification) {
+            return Ok(None);
+        }
+        let merged = merged || blocks.is_some_and(|held| !held.merges().is_empty());
+        if merged || !self.in_grouped_family(plan, stmt, classification) {
+            return Ok(Some(Arc::new(None)));
+        }
+        let held = self.grouped_family_blocks(plan, stmt, ctx, columns, (left_width, blocks))?;
+        Ok(Some(held))
+    }
+
+    /// Whether the joined `stmt`, as `classification` says, runs through the
+    /// grouped blocks of its family, decided once with the `plan`
+    fn in_grouped_family(
+        &self,
+        plan: Option<&PreparedJoin>,
+        stmt: &SelectStatement,
+        classification: &QueryClassification,
+    ) -> bool {
+        Self::grouped_family_reach(stmt, classification) && {
+            let decide = || self.grouped_family(stmt).is_ok();
+            plan.map_or_else(decide, |plan| plan.grouped(decide))
+        }
+    }
+
+    /// The grouped blocks of the joined `stmt` over its joined `columns`, the
+    /// first `left_width` its left side's, held with the `plan`, over the
+    /// scope its `blocks` laid out when it has them; none when they cannot run
+    fn grouped_family_blocks(
+        &self,
+        plan: Option<&PreparedJoin>,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        columns: &[String],
+        (left_width, blocks): (usize, Option<&JoinBlocks>),
+    ) -> Result<Arc<Option<super::prepared_select::PreparedGrouped>>> {
+        let build = || {
+            let mut leaves = Vec::new();
+            let mut left_leaves = 0;
+            if let Some(Expression::JoinSource(join)) = stmt.table_expr.as_deref() {
+                self.join_leaves(&join.left, ctx, &mut leaves);
+                left_leaves = leaves.len();
+                self.join_leaves(&join.right, ctx, &mut leaves);
+            }
+            let sides = (left_leaves, left_width);
+            self.prepare_grouped_join(stmt, columns, (&leaves, sides), blocks, ctx)
+        };
+        match plan {
+            Some(plan) => plan.grouped_blocks(columns, ctx.params().len(), build),
+            None => Ok(Arc::new(build()?)),
+        }
+    }
+
+    /// The output of the joined `stmt` through its grouped blocks `held`,
+    /// over the joined rows of `columns` held or read as they come in `input`
+    fn grouped_family_output(
+        &self,
+        held: &super::prepared_select::PreparedGrouped,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        input: FeedInput<'_, impl RowSource>,
+        columns: &[String],
+    ) -> SelectResult {
+        let run = self.grouped_runner(held, ctx)?.ok_or_else(|| {
+            Error::internal("a table's columns changed while the statement prepared")
+        })?;
+        let held_run = (held, Self::branch_bound(stmt, ctx));
+        let (result, names, applied, mut shape) =
+            self.group_held_rows(held_run, &run, ctx, input, columns, |out| {
+                Self::result_layout(&held.stmt, columns, None, out)
+            })?;
+        // The rows were laid out by the items the stars were written out in,
+        // each of which stands for the item it comes from
+        if let (Some(items), Some(shape)) = (held.star_items(), shape.as_mut()) {
+            shape.written_from(items, stmt.columns.len());
+        }
+        Self::with_late_keys(held, &run, (result, names, applied, shape), ctx)
     }
 
     /// Each source the join `expr` reads, left to right, with its column
@@ -6981,8 +7077,8 @@ impl Executor {
         });
     }
 
-    /// `rows` of `columns` grouped as `held` prepared them, asking the
-    /// `run`'s blocks, as many groups as `bound` when it is a set
+    /// The rows of `columns` in `input` grouped as `held` prepared them,
+    /// asking the `run`'s blocks, as many groups as `bound` when it is a set
     /// operation's branch
     fn group_held_rows(
         &self,
@@ -6992,7 +7088,7 @@ impl Executor {
         ),
         run: &super::prepared_select::PreparedRunner<'_>,
         ctx: &ExecutionContext,
-        rows: RowVec,
+        input: FeedInput<'_, impl RowSource>,
         columns: &[String],
         layout: impl FnOnce(&[String]) -> Option<OutputLayout>,
     ) -> SelectResult {
@@ -7005,7 +7101,7 @@ impl Executor {
             }
             false => ctx,
         };
-        let (result, windows) = self.grouped_rows((held, bound), run, &rows, columns, ctx)?;
+        let (result, windows) = self.grouped_rows((held, bound), run, input, columns, ctx)?;
         // The windows lay out their own rows
         let layout = match held.classification.has_window_functions {
             true => windows,
