@@ -17,17 +17,18 @@
 //! This module provides the execution context for SQL queries, including
 //! parameter handling, transaction state, and query options.
 
+use crate::common::deadline::Deadline;
+pub use crate::common::deadline::DeadlineSite;
 use crate::common::time_compat::Instant;
 use crate::storage::mvcc::commit_log::HistoricalCut;
 use crate::storage::mvcc::registry::StatementView;
 use crate::storage::traits::transaction::{StatementTable, TableUse};
 use lru::LruCache;
 use rustc_hash::FxHashMap;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::num::NonZeroUsize;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, LazyLock};
-use std::time::Duration;
 
 use crate::api::params::ParamVec;
 use crate::common::{CompactArc, StringMap};
@@ -927,12 +928,12 @@ impl ExecutionContext {
 
     /// The instant past which the call's statements stop, if any
     pub fn deadline(&self) -> Option<Instant> {
-        self.deadline.0
+        self.deadline.instant()
     }
 
     /// Stop the call's statements past `at`; None runs them to their end
     pub fn set_deadline(&mut self, at: Option<Instant>) {
-        self.deadline = Deadline(at);
+        self.deadline = Deadline::at(at);
     }
 
     /// Stop the call's statements `timeout_ms` from now; 0 sets no deadline
@@ -1258,113 +1259,6 @@ impl ExecutionContext {
     }
 }
 
-/// Units of work a thread does between two reads of the clock
-const CHARGE_BEAT: usize = 4096;
-
-thread_local! {
-    /// Units this thread charges against one deadline before it reads the
-    /// clock again; nested loops of that deadline draw from it as one, and
-    /// a charge against another deadline reads the clock first
-    static BEAT: Cell<(usize, Option<Instant>)> = const { Cell::new((0, None)) };
-}
-
-/// A loop that charges its work against the call's deadline, by name, so
-/// a test can stop a statement at each one
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum DeadlineSite {
-    /// A prepared statement's scan of its rows
-    Scan,
-    /// A grouped statement's keys computed over each row its run returns
-    LateKeys,
-    /// A subquery block's run and its scan
-    Block,
-    /// A join's rows the general path judges as it streams them
-    JoinedRows,
-    /// A join read in parts
-    JoinParts,
-    /// A streamed result's rows as the caller reads them
-    Result,
-    /// An ordered walk of an index
-    IndexWalk,
-}
-
-impl DeadlineSite {
-    /// Every site, which a test stops a statement at in turn
-    pub const ALL: [DeadlineSite; 7] = [
-        DeadlineSite::Scan,
-        DeadlineSite::LateKeys,
-        DeadlineSite::Block,
-        DeadlineSite::JoinedRows,
-        DeadlineSite::JoinParts,
-        DeadlineSite::Result,
-        DeadlineSite::IndexWalk,
-    ];
-}
-
-/// The instant past which a call's statements stop, copied into every
-/// context and result of the call; None runs them to their end
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Deadline(Option<Instant>);
-
-impl Deadline {
-    pub(crate) const NONE: Self = Self(None);
-
-    /// `timeout_ms` from now; 0 sets none
-    fn after_ms(timeout_ms: u64) -> Self {
-        Self((timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(timeout_ms)))
-    }
-
-    /// Count `units` of work at `site`; the clock is read when the thread's
-    /// beat runs out, and at every charge once the deadline has passed
-    #[inline]
-    pub(crate) fn charge(self, site: DeadlineSite, units: usize) -> Result<()> {
-        match self.0 {
-            None => Ok(()),
-            Some(at) => charge_until(at, site, units),
-        }
-    }
-
-    /// Fail when the deadline has passed, reading the clock now
-    pub(crate) fn check(self) -> Result<()> {
-        match self.0 {
-            None => Ok(()),
-            Some(at) => passed(at, None),
-        }
-    }
-}
-
-#[inline(never)]
-fn charge_until(at: Instant, site: DeadlineSite, units: usize) -> Result<()> {
-    let (left, owner) = BEAT.with(Cell::get);
-    #[cfg(feature = "test-failpoints")]
-    let left = match crate::test_failpoints::deadline_forced() {
-        true => 0,
-        false => left,
-    };
-    if left > units && owner == Some(at) {
-        BEAT.with(|cell| cell.set((left - units, owner)));
-        return Ok(());
-    }
-    BEAT.with(|cell| cell.set((0, None)));
-    passed(at, Some(site))?;
-    BEAT.with(|cell| cell.set((CHARGE_BEAT, Some(at))));
-    Ok(())
-}
-
-/// QueryCancelled once `at` is past, read at `site` or at a statement's step
-fn passed(at: Instant, site: Option<DeadlineSite>) -> Result<()> {
-    #[cfg(feature = "test-failpoints")]
-    if crate::test_failpoints::deadline_passed_at(site) {
-        return Err(crate::core::Error::QueryCancelled);
-    }
-    #[cfg(not(feature = "test-failpoints"))]
-    let _ = site;
-    match Instant::now() >= at {
-        true => Err(crate::core::Error::QueryCancelled),
-        false => Ok(()),
-    }
-}
-
 /// Builder for ExecutionContext
 pub struct ExecutionContextBuilder {
     ctx: ExecutionContext,
@@ -1443,6 +1337,7 @@ impl Default for ExecutionContextBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::deadline::CHARGE_BEAT;
 
     #[test]
     fn test_context_new() {

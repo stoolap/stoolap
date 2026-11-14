@@ -57,8 +57,8 @@ use super::aggregation::{
 };
 use super::context::{
     cache_block_answer, get_cached_block_answer, subquery_cache_tables, BlockAnswer, BlockOrigin,
-    CteScope, DeadlineSite, ExecutionContext, ExistsKeys, ExistsOutcome, KeptMembers, MemberKeys,
-    MemberSet, SubqueryStamp,
+    CteScope, ExecutionContext, ExistsKeys, ExistsOutcome, KeptMembers, MemberKeys, MemberSet,
+    SubqueryStamp,
 };
 use super::expr_key::ExprKey;
 use super::expression::{
@@ -94,6 +94,7 @@ use super::window::{
     HeldWindow, WindowOutput, WindowPreGroupedState, WindowPreSortedState, WindowRows,
 };
 use super::Executor;
+use crate::common::deadline::DeadlineSite;
 use crate::planner::block::{self as block_plan, BlockRuns, CallRead};
 use crate::planner::{
     distinct_values_column, keys_ordered_read, nearest_read, ordered_read, scan_choice, KeyRead,
@@ -11508,12 +11509,18 @@ impl Executor {
 
     /// A context holding each CTE of `with` under the columns a FROM names
     /// it with, and no rows: a recursive one named by its first branch; a
-    /// view only its run names runs when the caller `runs`
-    pub(crate) fn named_ctes(&self, with: &WithClause, runs: bool) -> Result<ExecutionContext> {
+    /// view only its run names runs under the call that `runs` it
+    pub(crate) fn named_ctes(
+        &self,
+        with: &WithClause,
+        runs: Option<&ExecutionContext>,
+    ) -> Result<ExecutionContext> {
         let mut registry = super::cte::CteRegistry::new();
         let mut on = |_: Reach<'_>| Ok(None);
+        let mut call = ExecutionContext::new();
+        call.set_deadline(runs.and_then(ExecutionContext::deadline));
         for cte in &with.ctes {
-            let ctx = ExecutionContext::new().with_cte_data(registry.data());
+            let ctx = call.with_cte_data(registry.data());
             let columns = match cte.column_names.is_empty() {
                 false => cte
                     .column_names
@@ -11536,7 +11543,7 @@ impl Executor {
                         executor: self,
                         ctx: &ctx,
                         on: &mut on,
-                        runs,
+                        runs: runs.is_some(),
                         visible: Vec::new(),
                         ctes: Vec::new(),
                     };
@@ -11545,7 +11552,7 @@ impl Executor {
             };
             registry.store(&cte.name.value, columns, RowVec::new());
         }
-        Ok(ExecutionContext::new().with_cte_data(registry.data()))
+        Ok(call.with_cte_data(registry.data()))
     }
 
     /// A join statement's `on`, `cross` and `output`, over the joined rows of

@@ -103,9 +103,10 @@ use crate::storage::traits::transaction::TableUse;
 use crate::storage::traits::{Engine, QueryResult, Table, Transaction};
 use planned_dml::DmlStatement;
 
+pub use crate::common::deadline::DeadlineSite;
 #[cfg(any(test, feature = "test-failpoints"))]
 pub(crate) use aggregation::AggregatePath;
-pub use context::{clear_all_thread_local_caches, DeadlineSite, ExecutionContext};
+pub use context::{clear_all_thread_local_caches, ExecutionContext};
 pub use expression::{
     CompileContext, CompileError, ExecuteContext, ExprCompiler, ExprVM, Program as ExprProgram,
 };

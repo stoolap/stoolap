@@ -21,9 +21,9 @@ use crate::core::{Result, Row, RowVec, Value};
 use crate::storage::traits::QueryResult;
 use rustc_hash::{FxHashMap, FxHasher};
 
-use super::context::{Deadline, DeadlineSite};
 use super::expression::RowFilter;
 use super::projection::Projection;
+use crate::common::deadline::{Deadline, DeadlineSite};
 
 /// Execution result for DML operations (INSERT, UPDATE, DELETE)
 ///

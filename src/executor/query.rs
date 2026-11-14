@@ -591,7 +591,7 @@ pub(crate) enum EarlySemantic {
 }
 
 use super::aggregation::{PartRun, RowSource};
-use super::context::{DeadlineSite, ExecutionContext, SemanticMiss, StatementSnapshot};
+use super::context::{ExecutionContext, SemanticMiss, StatementSnapshot};
 use super::expr_key::ExprKey;
 use super::expression::SubqueryExecutor;
 use super::expression::{
@@ -639,6 +639,7 @@ use super::utils::{
 use super::volatility::{expression_volatility, statement_constant};
 use super::window::WindowOutput;
 use super::Executor;
+use crate::common::deadline::DeadlineSite;
 use crate::functions::{global_registry, FunctionRegistry, Volatility};
 use crate::optimizer::bloom::BloomFilterBuilder;
 use crate::planner::join::{IndexProbe, LimitHash};
@@ -3552,12 +3553,12 @@ impl Executor {
 
     /// Whether a join keeps its plan, its CTEs bound or inlined, so its
     /// blocks may run; a join with a CTE not named before it runs stays
-    /// there; a view only its run names runs when the caller `runs`
+    /// there; a view only its run names runs under the call that `runs` it
     pub(crate) fn join_keeps_plan(
         &self,
         stmt: &SelectStatement,
         with: &WithClause,
-        runs: bool,
+        runs: Option<&ExecutionContext>,
     ) -> bool {
         matches!(stmt.table_expr.as_deref(), Some(Expression::JoinSource(_)))
             && self.named_ctes(with, runs).is_ok()
@@ -3584,8 +3585,8 @@ impl Executor {
                 _ => None,
             });
         match held {
-            Some(held) => held.ctes_named(|| self.join_keeps_plan(stmt, with, true)),
-            None => self.join_keeps_plan(stmt, with, true),
+            Some(held) => held.ctes_named(|| self.join_keeps_plan(stmt, with, Some(ctx))),
+            None => self.join_keeps_plan(stmt, with, Some(ctx)),
         }
     }
 
@@ -3597,7 +3598,7 @@ impl Executor {
         with: Option<&WithClause>,
     ) -> Option<JoinSides> {
         let ctx = match with {
-            Some(with) => self.named_ctes(with, false).ok()?,
+            Some(with) => self.named_ctes(with, None).ok()?,
             None => ExecutionContext::new(),
         };
         self.join_side_schemas(join, &ctx, false)
@@ -10499,5 +10500,34 @@ mod tests {
             vec![Value::Integer(0)],
             "the statement snapshot saw a commit made after its sequence"
         );
+    }
+
+    #[test]
+    fn a_view_named_for_a_run_runs_under_the_call_deadline() {
+        let engine = Arc::new(MVCCEngine::in_memory());
+        engine.open_engine().unwrap();
+        let executor = Executor::new(Arc::clone(&engine));
+        executor
+            .execute("CREATE TABLE big (id INTEGER PRIMARY KEY, k INTEGER)")
+            .unwrap();
+        let view = "SELECT k, COUNT(*) AS c FROM big GROUP BY k".to_string();
+        engine.create_view("v", view, None, false).unwrap();
+        let Statement::Select(select) = crate::parser::parse_sql(
+            "WITH w AS (SELECT * FROM v) SELECT * FROM w JOIN w AS x ON w.k = x.k",
+        )
+        .unwrap()
+        .remove(0) else {
+            panic!("not a SELECT");
+        };
+        let with = select.with.as_ref().unwrap();
+        let mut passed = ExecutionContext::new();
+        passed.set_deadline(Some(crate::common::time_compat::Instant::now()));
+        let run = executor.named_ctes(with, Some(&passed));
+        assert!(
+            matches!(run, Err(Error::QueryCancelled)),
+            "a view run to name its columns outlived the deadline: {:?}",
+            run.map(|_| ())
+        );
+        assert!(executor.named_ctes(with, None).is_ok());
     }
 }

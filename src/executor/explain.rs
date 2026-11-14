@@ -655,8 +655,8 @@ impl Executor {
         // A join with CTEs keeps its plan as execution keeps it, its CTE
         // sides named by their bodies
         let ctx = match with {
-            Some(with) if self.join_keeps_plan(select, with, false) => {
-                self.named_ctes(with, false).map_err(|_| "a WITH clause")?
+            Some(with) if self.join_keeps_plan(select, with, None) => {
+                self.named_ctes(with, None).map_err(|_| "a WITH clause")?
             }
             Some(_) => return Err("a WITH clause"),
             None => ExecutionContext::new(),
