@@ -4922,7 +4922,8 @@ impl Executor {
                                 build_residual_filter()?,
                             )
                             .with_inner_key(inner_key_idx)
-                            .with_blocks(pair_blocks);
+                            .with_blocks(pair_blocks)
+                            .with_deadline(ctx.deadline_of_call());
                             if let Some(Some(filter)) = &inner_taken {
                                 op = op.with_inner_filter(filter.clone_box());
                             }
@@ -5072,7 +5073,8 @@ impl Executor {
                             build_residual_filter()?,
                         )
                         .with_inner_key(inner_key_idx)
-                        .with_blocks(pair_blocks);
+                        .with_blocks(pair_blocks)
+                        .with_deadline(ctx.deadline_of_call());
                         if let Some(Some(filter)) = inner_taken {
                             op = op.with_inner_filter(filter);
                         }
@@ -5482,6 +5484,7 @@ impl Executor {
                 // need a few results. With streaming + early termination, we don't
                 // probe many rows anyway.
                 let skip_bloom_for_small_limit = limit <= 500;
+                ctx.charge(DeadlineSite::HashJoin, build_rows.len())?;
                 let wants_bloom = build_rows.len() >= 100
                     && !build_key_indices.is_empty()
                     && !skip_bloom_for_small_limit;
@@ -5585,7 +5588,8 @@ impl Executor {
                 // Wrap probe with bloom filter if available
                 let probe_source: Box<dyn Operator> = match bloom_filter {
                     Some(bf) if !probe_key_indices.is_empty() => Box::new(
-                        BloomFilterOperator::new(probe_source, bf, probe_key_indices),
+                        BloomFilterOperator::new(probe_source, bf, probe_key_indices)
+                            .with_deadline(ctx.deadline_of_call()),
                     ),
                     _ => probe_source,
                 };
@@ -7509,7 +7513,8 @@ impl Executor {
                 build_residual_filter()?,
             )
             .with_inner_key(inner_key_idx)
-            .with_blocks(pair_blocks);
+            .with_blocks(pair_blocks)
+            .with_deadline(ctx.deadline_of_call());
             if let Some(filter) = &inner_filter {
                 op = op.with_inner_filter(filter.clone());
             }

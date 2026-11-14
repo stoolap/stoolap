@@ -18,7 +18,7 @@
 #![cfg(not(any(feature = "jemalloc", feature = "dhat-heap")))]
 
 use stoolap::core::{Row, Value};
-use stoolap::executor::{parallel_hash_build, parallel_hash_probe, ParallelConfig};
+use stoolap::executor::{parallel_hash_build, parallel_hash_probe, Deadline, ParallelConfig};
 
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
@@ -35,7 +35,7 @@ fn rows() -> Vec<Row> {
 fn probe_allocations(build_config: &ParallelConfig) -> u64 {
     let build = rows();
     let probe = rows();
-    let table = parallel_hash_build(&build, &[0], build_config);
+    let table = parallel_hash_build(&build, &[0], build_config, Deadline::NONE).unwrap();
     let profiler = dhat::Profiler::builder().testing().build();
     let before = dhat::HeapStats::get().total_blocks;
     let matches = parallel_hash_probe(
@@ -45,7 +45,9 @@ fn probe_allocations(build_config: &ParallelConfig) -> u64 {
         &build,
         |p, b| p.get(0) == b.get(0),
         &ParallelConfig::disabled(),
-    );
+        Deadline::NONE,
+    )
+    .unwrap();
     let allocated = dhat::HeapStats::get().total_blocks - before;
     drop(profiler);
     assert_eq!(matches.len(), ROWS as usize);

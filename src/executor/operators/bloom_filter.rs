@@ -40,6 +40,7 @@
 //! The hash is computed once and reused for both bloom filter check and
 //! hash table probe.
 
+use crate::common::deadline::{Deadline, DeadlineSite};
 use crate::core::Result;
 use crate::executor::hash_table::hash_keys_with;
 use crate::executor::operator::{Operator, RowRef};
@@ -62,6 +63,8 @@ pub struct BloomFilterOperator {
     rows_checked: u64,
     /// Statistics: rows that passed the filter
     rows_passed: u64,
+    /// The call's deadline, charged per row checked
+    deadline: Deadline,
 }
 
 impl BloomFilterOperator {
@@ -84,7 +87,14 @@ impl BloomFilterOperator {
             opened: false,
             rows_checked: 0,
             rows_passed: 0,
+            deadline: Deadline::NONE,
         }
+    }
+
+    /// The call's deadline, which the filter charges per row it checks
+    pub(crate) fn with_deadline(mut self, deadline: Deadline) -> Self {
+        self.deadline = deadline;
+        self
     }
 
     /// Get the number of rows checked by the filter.
@@ -123,6 +133,7 @@ impl Operator for BloomFilterOperator {
 
         // Stream through child, filtering rows that definitely don't match
         while let Some(row_ref) = self.child.next()? {
+            self.deadline.charge(DeadlineSite::HashJoin, 1)?;
             self.rows_checked += 1;
 
             // Check for NULL keys - pass through to let hash join handle NULL semantics

@@ -22,7 +22,7 @@ use stoolap::test_failpoints::{keep_deadlines, pass_deadline_at, FailpointGuard}
 use stoolap::{Database, Error, ExecutionContext, Executor};
 
 /// The tables every site's statements read or write
-const TABLES: [&str; 11] = [
+const TABLES: [&str; 12] = [
     "CREATE TABLE big (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER, a INTEGER, b INTEGER)",
     "INSERT INTO big SELECT value, value % 50, value, value % 10, value FROM generate_series(1, 5000)",
     "CREATE INDEX big_ab ON big (a, b)",
@@ -34,10 +34,12 @@ const TABLES: [&str; 11] = [
     "CREATE TABLE n (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE SET NULL)",
     "CREATE TABLE q (id INTEGER PRIMARY KEY, code INTEGER UNIQUE)",
     "CREATE TABLE r (id INTEGER PRIMARY KEY, code INTEGER REFERENCES q(code) ON UPDATE CASCADE)",
+    "CREATE TABLE wide (id INTEGER PRIMARY KEY, k INTEGER)",
 ];
 
 /// Rows of the tables a write fills, beside `TABLES`
-const FILLED: [&str; 6] = [
+const FILLED: [&str; 7] = [
+    "INSERT INTO wide SELECT value, value FROM generate_series(1, 12000)",
     "INSERT INTO w SELECT value, value % 50 FROM generate_series(1, 3000)",
     "INSERT INTO p SELECT value FROM generate_series(1, 100)",
     "INSERT INTO c SELECT value, value % 100 + 1 FROM generate_series(1, 3000)",
@@ -102,6 +104,10 @@ fn statement(site: DeadlineSite, csv: &str) -> String {
         DeadlineSite::Copy => {
             return format!("COPY w FROM '{csv}' WITH (FORMAT CSV, HEADER false)")
         }
+        DeadlineSite::HashJoin => "SELECT big.id, u.id FROM big JOIN u ON big.k = u.k",
+        DeadlineSite::NestedLoop => "SELECT a.id, b.id FROM u a JOIN u b ON a.k < b.k",
+        DeadlineSite::IndexProbe => "SELECT big.id, u.k FROM big JOIN u ON u.id = big.v",
+        DeadlineSite::ParallelJoin => "SELECT x.id, y.id FROM wide x JOIN wide y ON x.k = y.k",
     };
     sql.to_string()
 }

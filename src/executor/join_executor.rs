@@ -427,8 +427,8 @@ impl JoinExecutor {
                         analysis.join_type,
                         (counts.0, counts.1, self.room),
                         swapped,
-                        ParallelConfig::default(),
-                    );
+                        (ParallelConfig::default(), ctx.deadline_of_call()),
+                    )?;
                     let filters = residual_filters(&analysis, &all_columns, ctx, prepared, blocks)?;
                     let source = StreamSource::Slices(Box::new(slices), Vec::new().into_iter());
                     return JoinStream::new(source, (filters, site), self.room)
@@ -657,6 +657,7 @@ impl JoinExecutor {
                 build_side,
             )
         };
+        join_op = join_op.with_deadline(request.ctx.deadline_of_call());
         if let Some(build) = request.cross_key {
             join_op = join_op.with_cross_key(build);
         }
@@ -873,8 +874,8 @@ impl JoinExecutor {
             analysis.join_type,
             (probe_col_count, build_col_count, self.room),
             swapped,
-            &config,
-        );
+            (&config, ctx.deadline_of_call()),
+        )?;
 
         // Wrap with synthetic row IDs for join results
         let mut rows: RowVec = result
@@ -1007,7 +1008,8 @@ impl JoinExecutor {
             analysis.left_key_indices.clone(),
             analysis.right_key_indices.clone(),
             build_side,
-        );
+        )
+        .with_deadline(ctx.deadline_of_call());
 
         // Compile the non-equality part of the ON clause
         let is_inner = !analysis.join_type_str.contains("LEFT")
@@ -1134,7 +1136,8 @@ impl JoinExecutor {
         Ok(
             NestedLoopJoinOperator::new(left_op, right_op, join_type, filter)
                 .with_blocks(site)
-                .with_room(self.room),
+                .with_room(self.room)
+                .with_deadline(ctx.deadline_of_call()),
         )
     }
 
@@ -1380,7 +1383,7 @@ fn next_slice(
     (residual_filters, site): (&[RowFilter], Option<&dyn SubqueryExecutor>),
     ctx: &ExecutionContext,
 ) -> Result<bool> {
-    let mut slice = slices.next_slice(join_part_rows());
+    let mut slice = slices.next_slice(join_part_rows())?;
     #[cfg(feature = "test-failpoints")]
     crate::test_failpoints::join_part_held(slice.len());
     if slice.is_empty() {

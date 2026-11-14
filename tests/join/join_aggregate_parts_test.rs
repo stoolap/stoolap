@@ -475,7 +475,7 @@ mod cancel {
 #[test]
 fn a_hash_join_on_one_thread_leaves_the_thread_pool_unbuilt() {
     use stoolap::core::{Row, Value};
-    use stoolap::executor::{parallel_hash_join, ParallelConfig, ParallelJoinType};
+    use stoolap::executor::{parallel_hash_join, Deadline, ParallelConfig, ParallelJoinType};
 
     const NAME: &str =
         "join_aggregate_parts_test::a_hash_join_on_one_thread_leaves_the_thread_pool_unbuilt";
@@ -499,7 +499,20 @@ fn a_hash_join_on_one_thread_leaves_the_thread_pool_unbuilt() {
     for config in [ParallelConfig::disabled(), ParallelConfig::default()] {
         for (probe, build) in [(&rows[..], &rows[..]), (&[][..], &[][..])] {
             for join_type in [ParallelJoinType::Inner, ParallelJoinType::Full] {
-                parallel_hash_join(probe, build, &[0], &[0], join_type, 1, 1, false, &config);
+                let none = Deadline::NONE;
+                parallel_hash_join(
+                    probe,
+                    build,
+                    &[0],
+                    &[0],
+                    join_type,
+                    1,
+                    1,
+                    false,
+                    &config,
+                    none,
+                )
+                .unwrap();
             }
         }
     }

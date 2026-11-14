@@ -58,11 +58,19 @@ pub enum DeadlineSite {
     ForeignKey,
     /// A COPY's rows, as it reads each from its file
     Copy,
+    /// A hash join's build rows, probe rows and candidate pairs
+    HashJoin,
+    /// A nested loop join's rows and the pairs it judges
+    NestedLoop,
+    /// An index join's outer rows and the inner rows each probe finds
+    IndexProbe,
+    /// A hash join's rows built and probed on worker threads
+    ParallelJoin,
 }
 
 impl DeadlineSite {
     /// Every site, which a test stops a statement at in turn
-    pub const ALL: [DeadlineSite; 12] = [
+    pub const ALL: [DeadlineSite; 16] = [
         DeadlineSite::Scan,
         DeadlineSite::LateKeys,
         DeadlineSite::Block,
@@ -75,16 +83,21 @@ impl DeadlineSite {
         DeadlineSite::Delete,
         DeadlineSite::ForeignKey,
         DeadlineSite::Copy,
+        DeadlineSite::HashJoin,
+        DeadlineSite::NestedLoop,
+        DeadlineSite::IndexProbe,
+        DeadlineSite::ParallelJoin,
     ];
 }
 
 /// The instant past which a call's statements stop, copied into every
 /// context and result of the call; None runs them to their end
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Deadline(Option<Instant>);
+pub struct Deadline(Option<Instant>);
 
 impl Deadline {
-    pub(crate) const NONE: Self = Self(None);
+    /// No deadline: the work runs to its end
+    pub const NONE: Self = Self(None);
 
     /// Stop past `at`; None never stops
     pub(crate) fn at(at: Option<Instant>) -> Self {

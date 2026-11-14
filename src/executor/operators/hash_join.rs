@@ -34,6 +34,7 @@
 
 use smallvec::SmallVec;
 
+use crate::common::deadline::{Deadline, DeadlineSite};
 use crate::common::CompactArc;
 use crate::core::predicate::{sql_eq, KeySide, TextReading};
 use crate::core::value::NULL_VALUE;
@@ -246,6 +247,8 @@ pub struct HashJoinOperator<'a> {
     cross: Option<CrossKey>,
     // The current probe key as that comparison reads it, for such a key
     current_cross_key: Option<Value>,
+    // The call's deadline, charged per build row, probe row and pair
+    deadline: Deadline,
 }
 
 /// A build key column on one side of a cross, and for a TEXT one, its rows
@@ -314,6 +317,7 @@ impl<'a> HashJoinOperator<'a> {
             probe_exhausted: false,
             cross: None,
             current_cross_key: None,
+            deadline: Deadline::NONE,
         }
     }
 
@@ -417,6 +421,7 @@ impl<'a> HashJoinOperator<'a> {
             probe_exhausted: false,
             cross: None,
             current_cross_key: None,
+            deadline: Deadline::NONE,
         }
     }
 
@@ -464,7 +469,14 @@ impl<'a> HashJoinOperator<'a> {
             probe_exhausted: false,
             cross: None,
             current_cross_key: None,
+            deadline: Deadline::NONE,
         }
+    }
+
+    /// The call's deadline, which the join charges as it builds and probes
+    pub(crate) fn with_deadline(mut self, deadline: Deadline) -> Self {
+        self.deadline = deadline;
+        self
     }
 
     /// Attach the non-equality part of the ON clause.
@@ -694,6 +706,7 @@ impl Operator for HashJoinOperator<'_> {
         // to avoid doubling reallocation on materialized inputs
         let mut build_rows = Vec::with_capacity(build_op.estimated_rows().unwrap_or(0));
         while let Some(row_ref) = build_op.next()? {
+            self.deadline.charge(DeadlineSite::HashJoin, 1)?;
             build_rows.push(row_ref.into_owned());
         }
 
@@ -731,6 +744,7 @@ impl Operator for HashJoinOperator<'_> {
         // If we're returning unmatched build rows (for FULL/RIGHT OUTER)
         if self.returning_unmatched_build {
             while self.unmatched_build_idx < self.build_rows.len() {
+                self.deadline.charge(DeadlineSite::HashJoin, 1)?;
                 let idx = self.unmatched_build_idx;
                 self.unmatched_build_idx += 1;
 
@@ -746,6 +760,7 @@ impl Operator for HashJoinOperator<'_> {
         loop {
             // Try to return next match for current probe row
             while self.current_match_idx < self.current_matches.len() {
+                self.deadline.charge(DeadlineSite::HashJoin, 1)?;
                 let build_idx = self.current_matches[self.current_match_idx];
                 self.current_match_idx += 1;
 
@@ -837,6 +852,7 @@ impl Operator for HashJoinOperator<'_> {
             let next_probe = self.next_probe_row()?;
             match next_probe {
                 Some(probe_row) => {
+                    self.deadline.charge(DeadlineSite::HashJoin, 1)?;
                     // Compute hash for probe row (no allocation - use slice directly)
                     let probe_key_indices = self.probe_key_indices();
                     let hash = hash_row_keys(&probe_row, probe_key_indices);
