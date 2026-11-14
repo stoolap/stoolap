@@ -19,25 +19,22 @@
 
 #![cfg(feature = "test-failpoints")]
 
-use std::sync::{Mutex, MutexGuard};
-
-use stoolap::test_failpoints::{force_exists_strategy, keep_deadlines, pass_deadlines};
+use stoolap::test_failpoints::{
+    force_exists_strategy, keep_deadlines, pass_deadlines, FailpointGuard,
+};
 use stoolap::Database;
 
-static SERIAL: Mutex<()> = Mutex::new(());
-
-/// Holds the lock and restores the rule's choice when dropped
-struct Serial(#[allow(dead_code)] MutexGuard<'static, ()>);
+/// Holds the failpoint lock and restores the rule's choice when dropped
+struct Serial(#[allow(dead_code)] FailpointGuard);
 
 impl Drop for Serial {
     fn drop(&mut self) {
         force_exists_strategy(None);
-        keep_deadlines();
     }
 }
 
 fn serial() -> Serial {
-    Serial(SERIAL.lock().unwrap_or_else(|e| e.into_inner()))
+    Serial(FailpointGuard::new())
 }
 
 /// `t` and its copy `w` are the tested rows; `u` the members. Key 1 holds

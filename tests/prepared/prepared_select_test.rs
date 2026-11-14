@@ -16,12 +16,11 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::{Mutex, MutexGuard};
 
 use stoolap::test_failpoints::{
     after_prepared_plan_taken, before_prepared_scalar, general_path_hits, keep_deadlines,
     pass_deadlines, prepared_ordered_reads, prepared_projection_runs, prepared_scalar_runs,
-    prepared_selects_built, random_draws, tvf_rows, GeneralPath,
+    prepared_selects_built, random_draws, tvf_rows, FailpointGuard, GeneralPath,
 };
 use stoolap::{Database, Params};
 
@@ -31,11 +30,9 @@ use crate::oracle;
 /// same; a new recording is reviewed by its diff
 const RECORDED_IN_FAMILY: oracle::Answers = answers!("prepared_select_in_family");
 
-// The counters are process-wide
-static SERIAL: Mutex<()> = Mutex::new(());
-
-fn serial() -> MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+// The counters and the passed deadlines are process-wide
+fn serial() -> FailpointGuard {
+    FailpointGuard::new()
 }
 
 const S1: &str =

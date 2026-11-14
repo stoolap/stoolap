@@ -388,7 +388,7 @@ mod cancel {
     use stoolap::functions::{
         FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
     };
-    use stoolap::test_failpoints::{keep_deadlines, pass_deadlines};
+    use stoolap::test_failpoints::{keep_deadlines, pass_deadlines, FailpointGuard};
     use stoolap::{Error, ExecutionContext, Executor};
 
     static ARMED: AtomicBool = AtomicBool::new(false);
@@ -430,6 +430,7 @@ mod cancel {
 
     #[test]
     fn a_cancel_stops_a_join_read_in_parts_within_a_hundred_rows() {
+        let _guard = FailpointGuard::new();
         global_registry()
             .register_scalar::<JoinCancelNow>()
             .unwrap();

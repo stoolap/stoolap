@@ -83,3 +83,55 @@ fn every_site_stops_its_statement_once_the_deadline_passes_there() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+#[test]
+fn a_derived_source_streamed_to_the_caller_keeps_the_deadline() {
+    let _guard = FailpointGuard::new();
+    let db = Database::open("memory://statement_deadline_source").unwrap();
+    for sql in [
+        "CREATE TABLE big (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO big SELECT value, value % 50 FROM generate_series(1, 5000)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let executor = Executor::new(std::sync::Arc::clone(db.engine()));
+    let mut ctx = ExecutionContext::new();
+    ctx.set_timeout_ms(3_600_000);
+    let mut wrong = Vec::new();
+    for sql in [
+        "SELECT d.k FROM (SELECT k, COUNT(*) AS c FROM big GROUP BY k) d WHERE d.k * 1 >= 0",
+        "SELECT d.k FROM (SELECT k, COUNT(*) AS c FROM big GROUP BY k) d",
+    ] {
+        pass_deadline_at(DeadlineSite::Result);
+        let stopped = read(&executor, sql, &ctx);
+        keep_deadlines();
+        if !matches!(stopped, Err(Error::QueryCancelled)) {
+            wrong.push(format!("{sql} gave {stopped:?}"));
+        }
+        if let Err(err) = read(&executor, sql, &ctx) {
+            wrong.push(format!("{sql} failed ahead of its deadline: {err}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_key_read_in_a_transaction_that_outlasts_its_deadline_fails() {
+    let _guard = FailpointGuard::new();
+    let db = Database::open("memory://statement_deadline_key_read").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10)", ()).unwrap();
+    db.execute("BEGIN", ()).unwrap();
+    stoolap::test_failpoints::after_pk_lookup_resolved(stoolap::test_failpoints::pass_deadlines);
+    let read = db
+        .query_with_timeout("SELECT v FROM t WHERE id = $1", (1,), 3_600_000)
+        .and_then(|rows| rows.collect::<stoolap::Result<Vec<_>>>());
+    keep_deadlines();
+    assert!(
+        matches!(read, Err(Error::QueryCancelled)),
+        "a key read past its deadline gave {:?}",
+        read.map(|rows| rows.len())
+    );
+    db.execute("ROLLBACK", ()).unwrap();
+}

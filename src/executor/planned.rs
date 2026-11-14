@@ -414,7 +414,13 @@ impl Executor {
                 None if in_txn => self.active_txn_id().map(|id| id as u64),
                 None => None,
             };
-            self.run_planned(planned, params, (in_txn, transaction), view)
+            let read = self.run_planned(planned, params, (in_txn, transaction), view);
+            // A residual term that outlasted the deadline fails the read
+            if let (Some(Ok(_)), Some(Err(e))) = (&read, ctx.map(ExecutionContext::check_deadline))
+            {
+                return Some(Err(e));
+            }
+            read
         })
         .flatten()
     }

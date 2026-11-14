@@ -1262,9 +1262,10 @@ impl ExecutionContext {
 const CHARGE_BEAT: usize = 4096;
 
 thread_local! {
-    /// Units this thread charges before it reads the clock again; every loop
-    /// on the thread draws from it, so nested loops count as one
-    static LEFT: Cell<usize> = const { Cell::new(0) };
+    /// Units this thread charges against one deadline before it reads the
+    /// clock again; nested loops of that deadline draw from it as one, and
+    /// a charge against another deadline reads the clock first
+    static BEAT: Cell<(usize, Option<Instant>)> = const { Cell::new((0, None)) };
 }
 
 /// A loop that charges its work against the call's deadline, by name, so
@@ -1334,19 +1335,19 @@ impl Deadline {
 
 #[inline(never)]
 fn charge_until(at: Instant, site: DeadlineSite, units: usize) -> Result<()> {
-    let left = LEFT.with(Cell::get);
+    let (left, owner) = BEAT.with(Cell::get);
     #[cfg(feature = "test-failpoints")]
     let left = match crate::test_failpoints::deadline_forced() {
         true => 0,
         false => left,
     };
-    if left > units {
-        LEFT.with(|cell| cell.set(left - units));
+    if left > units && owner == Some(at) {
+        BEAT.with(|cell| cell.set((left - units, owner)));
         return Ok(());
     }
-    LEFT.with(|cell| cell.set(0));
+    BEAT.with(|cell| cell.set((0, None)));
     passed(at, Some(site))?;
-    LEFT.with(|cell| cell.set(CHARGE_BEAT));
+    BEAT.with(|cell| cell.set((CHARGE_BEAT, Some(at))));
     Ok(())
 }
 
@@ -1559,6 +1560,21 @@ mod tests {
         assert!(ctx.check_deadline().is_ok());
         for _ in 0..3 * CHARGE_BEAT {
             assert!(ctx.charge(DeadlineSite::Scan, 1).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_deadline_ahead_never_spares_a_passed_one_on_its_thread() {
+        let mut ahead = ExecutionContext::new();
+        ahead.set_timeout_ms(60_000);
+        let mut passed = ExecutionContext::new();
+        passed.set_deadline(Some(Instant::now()));
+        for _ in 0..3 {
+            assert!(ahead.charge(DeadlineSite::Scan, 1).is_ok());
+            assert!(
+                passed.charge(DeadlineSite::Scan, 1).is_err(),
+                "a passed deadline charged against another's beat"
+            );
         }
     }
 

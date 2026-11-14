@@ -250,8 +250,9 @@ fn an_order_of_two_keys_walks_only_the_rows_it_keeps() {
 #[test]
 fn a_cancel_stops_the_walk_while_it_reads() {
     use stoolap::test_failpoints::{
-        hot_top_k_visits, keep_deadlines, on_hot_top_k_visit, pass_deadlines,
+        hot_top_k_visits, keep_deadlines, on_hot_top_k_visit, pass_deadlines, FailpointGuard,
     };
+    let _guard = FailpointGuard::new();
     let db = Database::open("memory://index_keys_order_cancel").unwrap();
     for sql in [
         "CREATE TABLE big (a INTEGER, b INTEGER)",

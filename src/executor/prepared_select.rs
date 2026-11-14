@@ -14414,6 +14414,17 @@ impl Executor {
                                 .with_deadline(ctx.deadline_of_call()),
                         )
                     }
+                    // A source's rows keep the call's deadline as the scan's do
+                    Flow::Source(rows) if ctx.deadline().is_some() => {
+                        let names = match projection.whole_row {
+                            true => CompactArc::clone(&output_columns),
+                            false => CompactArc::new(rows.columns().to_vec()),
+                        };
+                        Box::new(
+                            ScannerResult::new(Box::new(SourceScanner::new(rows)), names)
+                                .with_deadline(ctx.deadline_of_call()),
+                        )
+                    }
                     Flow::Source(rows)
                         if projection.whole_row && rows.columns() != output_columns.as_slice() =>
                     {
