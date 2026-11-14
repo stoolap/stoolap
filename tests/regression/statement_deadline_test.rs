@@ -21,9 +21,66 @@ use stoolap::executor::DeadlineSite;
 use stoolap::test_failpoints::{keep_deadlines, pass_deadline_at, FailpointGuard};
 use stoolap::{Database, Error, ExecutionContext, Executor};
 
-/// A statement whose run reaches `site`
-fn statement(site: DeadlineSite) -> &'static str {
-    match site {
+/// The tables every site's statements read or write
+const TABLES: [&str; 11] = [
+    "CREATE TABLE big (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER, a INTEGER, b INTEGER)",
+    "INSERT INTO big SELECT value, value % 50, value, value % 10, value FROM generate_series(1, 5000)",
+    "CREATE INDEX big_ab ON big (a, b)",
+    "CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER)",
+    "INSERT INTO u SELECT value, value % 50 FROM generate_series(1, 200)",
+    "CREATE TABLE w (id INTEGER PRIMARY KEY, k INTEGER)",
+    "CREATE TABLE p (id INTEGER PRIMARY KEY)",
+    "CREATE TABLE c (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE CASCADE)",
+    "CREATE TABLE n (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE SET NULL)",
+    "CREATE TABLE q (id INTEGER PRIMARY KEY, code INTEGER UNIQUE)",
+    "CREATE TABLE r (id INTEGER PRIMARY KEY, code INTEGER REFERENCES q(code) ON UPDATE CASCADE)",
+];
+
+/// Rows of the tables a write fills, beside `TABLES`
+const FILLED: [&str; 6] = [
+    "INSERT INTO w SELECT value, value % 50 FROM generate_series(1, 3000)",
+    "INSERT INTO p SELECT value FROM generate_series(1, 100)",
+    "INSERT INTO c SELECT value, value % 100 + 1 FROM generate_series(1, 3000)",
+    "INSERT INTO n SELECT value, value % 100 + 1 FROM generate_series(1, 3000)",
+    "INSERT INTO q SELECT value, value FROM generate_series(1, 100)",
+    "INSERT INTO r SELECT value, value % 100 + 1 FROM generate_series(1, 3000)",
+];
+
+/// What the tables hold, which a statement stopped part way leaves as it was
+fn holding(executor: &Executor, ctx: &ExecutionContext) -> Vec<String> {
+    [
+        "SELECT COUNT(*), SUM(v) FROM big",
+        "SELECT COUNT(*), SUM(k) FROM w",
+        "SELECT COUNT(*) FROM p",
+        "SELECT COUNT(*), SUM(pid) FROM c",
+        "SELECT COUNT(*), COUNT(pid) FROM n",
+        "SELECT COUNT(*), SUM(code) FROM q",
+        "SELECT COUNT(*), SUM(code) FROM r",
+    ]
+    .iter()
+    .map(|sql| {
+        let mut rows = executor.execute_with_context(sql, ctx).unwrap();
+        assert!(rows.next());
+        format!("{sql}: {:?}", rows.row())
+    })
+    .collect()
+}
+
+/// A file of `n` rows of `w` for COPY to read
+fn csv_of(n: i64) -> tempfile::NamedTempFile {
+    use std::io::Write;
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let mut out = std::io::BufWriter::new(file.as_file());
+    for id in 1..=n {
+        writeln!(out, "{},{}", 10_000 + id, id % 50).unwrap();
+    }
+    drop(out);
+    file
+}
+
+/// A statement whose run reaches `site`; `csv` is the file COPY reads
+fn statement(site: DeadlineSite, csv: &str) -> String {
+    let sql = match site {
         DeadlineSite::Scan => "SELECT id FROM big WHERE v * 1 > 0 ORDER BY v DESC",
         DeadlineSite::LateKeys => {
             "SELECT k, (SELECT COUNT(*) FROM u WHERE u.k = big.k) AS m FROM big \
@@ -38,7 +95,15 @@ fn statement(site: DeadlineSite) -> &'static str {
         DeadlineSite::JoinParts => "SELECT COUNT(*) FROM big JOIN u ON big.k = u.k",
         DeadlineSite::Result => "SELECT id, v FROM big",
         DeadlineSite::IndexWalk => "SELECT a, b FROM big ORDER BY a, b LIMIT 10 OFFSET 1000",
-    }
+        DeadlineSite::Insert => "INSERT INTO w SELECT id + 20000, k FROM big",
+        DeadlineSite::Update => "UPDATE big SET v = v + 1 WHERE k >= 0",
+        DeadlineSite::Delete => "DELETE FROM w RETURNING id",
+        DeadlineSite::ForeignKey => "DELETE FROM p WHERE id > 0",
+        DeadlineSite::Copy => {
+            return format!("COPY w FROM '{csv}' WITH (FORMAT CSV, HEADER false)")
+        }
+    };
+    sql.to_string()
 }
 
 fn read(executor: &Executor, sql: &str, ctx: &ExecutionContext) -> stoolap::Result<usize> {
@@ -54,31 +119,93 @@ fn read(executor: &Executor, sql: &str, ctx: &ExecutionContext) -> stoolap::Resu
 fn every_site_stops_its_statement_once_the_deadline_passes_there() {
     let _guard = FailpointGuard::new();
     let db = Database::open("memory://statement_deadline_sites").unwrap();
-    for sql in [
-        "CREATE TABLE big (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER, a INTEGER, b INTEGER)",
-        "INSERT INTO big SELECT value, value % 50, value, value % 10, value FROM generate_series(1, 5000)",
-        "CREATE INDEX big_ab ON big (a, b)",
-        "CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER)",
-        "INSERT INTO u SELECT value, value % 50 FROM generate_series(1, 200)",
-    ] {
+    for sql in TABLES.iter().chain(&FILLED) {
         db.execute(sql, ()).unwrap();
     }
+    let csv = csv_of(3000);
     let executor = Executor::new(std::sync::Arc::clone(db.engine()));
     let mut ctx = ExecutionContext::new();
     ctx.set_timeout_ms(3_600_000);
     let mut wrong = Vec::new();
     for site in DeadlineSite::ALL {
-        let sql = statement(site);
+        let sql = &statement(site, &csv.path().display().to_string());
+        let held = holding(&executor, &ctx);
         pass_deadline_at(site);
         let stopped = read(&executor, sql, &ctx);
         keep_deadlines();
         if !matches!(stopped, Err(Error::QueryCancelled)) {
             wrong.push(format!("{site:?}: {sql} gave {stopped:?}"));
         }
+        if holding(&executor, &ctx) != held {
+            wrong.push(format!("{site:?}: {sql} stopped and left a change"));
+        }
         if let Err(err) = read(&executor, sql, &ctx) {
             wrong.push(format!(
                 "{site:?}: {sql} failed ahead of its deadline: {err}"
             ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_write_stopped_at_its_deadline_leaves_no_row_in_or_out_of_a_transaction() {
+    let _guard = FailpointGuard::new();
+    let db = Database::open("memory://statement_deadline_writes").unwrap();
+    for sql in TABLES.iter().chain(&FILLED) {
+        db.execute(sql, ()).unwrap();
+    }
+    let executor = Executor::new(std::sync::Arc::clone(db.engine()));
+    let mut ctx = ExecutionContext::new();
+    ctx.set_timeout_ms(3_600_000);
+    let writes = [
+        (
+            DeadlineSite::Insert,
+            "INSERT INTO w VALUES (90001, 1), (90002, 2)",
+        ),
+        (
+            DeadlineSite::Insert,
+            "INSERT INTO w VALUES (1, 7), (90003, 3) ON DUPLICATE KEY UPDATE k = 7",
+        ),
+        (
+            DeadlineSite::Insert,
+            "INSERT INTO w SELECT id + 20000, k FROM big",
+        ),
+        (
+            DeadlineSite::Update,
+            "UPDATE w SET k = k + 1 WHERE k * 1 >= 0",
+        ),
+        (DeadlineSite::Delete, "DELETE FROM w RETURNING id"),
+        (DeadlineSite::ForeignKey, "DELETE FROM p WHERE id > 50"),
+        (DeadlineSite::ForeignKey, "UPDATE q SET code = code + 1000"),
+        (
+            DeadlineSite::ForeignKey,
+            "UPDATE c SET pid = 1 WHERE id <= 10",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for in_txn in [false, true] {
+        for (site, sql) in writes {
+            if in_txn {
+                read(&executor, "BEGIN", &ctx).unwrap();
+            }
+            let held = holding(&executor, &ctx);
+            pass_deadline_at(site);
+            let stopped = read(&executor, sql, &ctx);
+            keep_deadlines();
+            if !matches!(stopped, Err(Error::QueryCancelled)) {
+                wrong.push(format!(
+                    "{site:?} (in a transaction: {in_txn}): {sql} gave {stopped:?}"
+                ));
+            }
+            if holding(&executor, &ctx) != held {
+                wrong.push(format!(
+                    "{site:?} (in a transaction: {in_txn}): {sql} left a change"
+                ));
+            }
+            if in_txn {
+                read(&executor, "COMMIT", &ctx).unwrap();
+            }
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));

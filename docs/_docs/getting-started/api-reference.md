@@ -179,6 +179,7 @@ Cancel queries that exceed a time limit. Timeout is in milliseconds; use 0 for n
 
 - A call has one deadline, fixed when the call starts. Its subqueries and views, and a query run again because a `TRUNCATE` or `DROP` overtook it, share that deadline.
 - The rows a query returns keep the deadline while you read them, and the time between two reads counts toward it.
+- An `INSERT`, `UPDATE`, `DELETE` or `COPY` that the deadline stops changes no row, the rows its foreign key actions reach included. Inside a transaction the statement is undone and the transaction stays open.
 - Cancellation is cooperative. A query stops at its next check, which its loops make every few thousand rows they read, and returns `Error::QueryCancelled`. A wait for a lock, file I/O and a user function are not interrupted.
 
 ```rust

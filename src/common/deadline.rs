@@ -48,11 +48,21 @@ pub enum DeadlineSite {
     Result,
     /// An ordered walk of an index
     IndexWalk,
+    /// An INSERT's rows, as it writes each
+    Insert,
+    /// An UPDATE's rows, as it computes each new row
+    Update,
+    /// A DELETE's rows, as it judges each
+    Delete,
+    /// The child rows a foreign key action reads or writes
+    ForeignKey,
+    /// A COPY's rows, as it reads each from its file
+    Copy,
 }
 
 impl DeadlineSite {
     /// Every site, which a test stops a statement at in turn
-    pub const ALL: [DeadlineSite; 7] = [
+    pub const ALL: [DeadlineSite; 12] = [
         DeadlineSite::Scan,
         DeadlineSite::LateKeys,
         DeadlineSite::Block,
@@ -60,6 +70,11 @@ impl DeadlineSite {
         DeadlineSite::JoinParts,
         DeadlineSite::Result,
         DeadlineSite::IndexWalk,
+        DeadlineSite::Insert,
+        DeadlineSite::Update,
+        DeadlineSite::Delete,
+        DeadlineSite::ForeignKey,
+        DeadlineSite::Copy,
     ];
 }
 

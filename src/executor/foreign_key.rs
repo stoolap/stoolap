@@ -35,6 +35,7 @@ use std::sync::Arc;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
+use crate::common::deadline::{Deadline, DeadlineSite};
 use crate::common::{I64Map, I64Set};
 use crate::core::{Error, ForeignKeyAction, ForeignKeyConstraint, Result, Schema, Value};
 use crate::storage::expression::{Expression as StorageExpression, InListExpr, OrExpr};
@@ -318,6 +319,8 @@ pub(crate) fn find_referencing_fks(
 /// the rows that stay
 pub(crate) struct DeletePlan {
     tables: Vec<Reached>,
+    /// The statement's deadline, charged a unit per child row or key value
+    deadline: Deadline,
 }
 
 /// A table the keys of a delete reach
@@ -373,12 +376,16 @@ pub(crate) fn plan_delete_actions(
     ids: &[i64],
     keys: Arc<Vec<(String, ForeignKeyConstraint)>>,
     values: Vec<Vec<Value>>,
+    deadline: Deadline,
 ) -> Result<DeletePlan> {
     let mut root = Reached::new(table);
     for &id in ids {
         root.gone.insert(id);
     }
-    let mut plan = DeletePlan { tables: vec![root] };
+    let mut plan = DeletePlan {
+        tables: vec![root],
+        deadline,
+    };
     let mut work = vec![Going {
         table: table.to_string(),
         keys,
@@ -430,6 +437,7 @@ impl DeletePlan {
         fk: &ForeignKeyConstraint,
         values: Vec<Value>,
     ) -> Result<Option<Going>> {
+        let deadline = self.deadline;
         let reached = &mut self.tables[at];
         let child = engine.get_table_to_check(txn_id, &reached.table)?;
         let schema = child.schema_arc();
@@ -438,6 +446,7 @@ impl DeletePlan {
         let keys = cascade.then(|| find_referencing_fks(engine, &reached.table));
         if keys.as_ref().is_some_and(|keys| keys.is_empty()) {
             for value in &values {
+                deadline.charge(DeadlineSite::ForeignKey, 1)?;
                 check_children_seen(engine, txn_id, &reached.table, fk, value)?;
             }
             reached.unread = true;
@@ -459,6 +468,7 @@ impl DeletePlan {
             let plan = child.index_plan(&expr);
             let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
             let rows = child.collect_access_rows(access, Some(&expr))?;
+            deadline.charge(DeadlineSite::ForeignKey, rows.len() + 1)?;
             if rows.is_empty() {
                 continue;
             }
@@ -499,13 +509,15 @@ impl DeletePlan {
     /// Refuses a restricting key that a row staying names, and a SET NULL
     /// into a column that cannot be NULL of a row that stays
     fn check(&mut self, engine: &MVCCEngine, txn_id: i64) -> Result<()> {
+        let deadline = self.deadline;
         for reached in &mut self.tables {
             if reached.unread && !(reached.nulled.is_empty() && reached.restricted.is_empty()) {
-                reached.read_cascaded(engine, txn_id)?;
+                reached.read_cascaded(engine, txn_id, deadline)?;
             }
             let reached = &*reached;
             for (fk, values) in &reached.restricted {
                 for value in values {
+                    deadline.charge(DeadlineSite::ForeignKey, 1)?;
                     if reached.names_a_staying_row(engine, txn_id, fk, value)? {
                         return Err(Error::foreign_key_violation(
                             &reached.table,
@@ -552,9 +564,11 @@ impl DeletePlan {
         crate::test_failpoints::cascade_targets_read();
         for reached in &self.tables {
             if !reached.cascades.is_empty() {
+                self.deadline
+                    .charge(DeadlineSite::ForeignKey, reached.cascaded.len() + 1)?;
                 reached.delete_cascaded(engine, txn_id)?;
             }
-            reached.clear_nulled(engine, txn_id)?;
+            reached.clear_nulled(engine, txn_id, self.deadline)?;
         }
         Ok(())
     }
@@ -562,7 +576,12 @@ impl DeletePlan {
 
 impl Reached {
     /// Reads the rows the cascades into the table left unread
-    fn read_cascaded(&mut self, engine: &MVCCEngine, txn_id: i64) -> Result<()> {
+    fn read_cascaded(
+        &mut self,
+        engine: &MVCCEngine,
+        txn_id: i64,
+        deadline: Deadline,
+    ) -> Result<()> {
         let child = engine.get_table_to_check(txn_id, &self.table)?;
         let schema = child.schema();
         for (fk, values) in &self.cascades {
@@ -571,7 +590,9 @@ impl Reached {
                 let expr = key_filter(schema, column, value);
                 let plan = child.index_plan(&expr);
                 let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-                for (id, _) in child.collect_access_rows(access, Some(&expr))?.iter() {
+                let rows = child.collect_access_rows(access, Some(&expr))?;
+                deadline.charge(DeadlineSite::ForeignKey, rows.len() + 1)?;
+                for (id, _) in rows.iter() {
                     if self.gone.insert(*id) {
                         self.cascaded.push(*id);
                     }
@@ -647,7 +668,7 @@ impl Reached {
 
     /// Clears each column a SET NULL key reached in the rows that stay. A
     /// row that no longer holds the value the key found keeps its column
-    fn clear_nulled(&self, engine: &MVCCEngine, txn_id: i64) -> Result<()> {
+    fn clear_nulled(&self, engine: &MVCCEngine, txn_id: i64, deadline: Deadline) -> Result<()> {
         let mut rows: Vec<(i64, usize, usize)> = self
             .nulled
             .iter()
@@ -673,6 +694,7 @@ impl Reached {
             });
         let mut vm = super::expression::ExprVM::new();
         child.update_by_row_ids(&ids, &mut |id, mut row| {
+            deadline.charge(DeadlineSite::ForeignKey, 1)?;
             let from = rows.partition_point(|r| r.0 < id);
             let mut changed = false;
             for &(_, key, value) in rows[from..].iter().take_while(|r| r.0 == id) {
@@ -952,6 +974,7 @@ pub(crate) fn enforce_update_actions(
     mut changes: Vec<(usize, Vec<(Value, Value)>)>,
     pending: Option<&mut PendingParents<'_>>,
     plans: &mut UpdatePlans,
+    deadline: Deadline,
 ) -> Result<()> {
     changes.sort_unstable_by_key(|(column, _)| *column);
     let roots = changes.len();
@@ -982,7 +1005,7 @@ pub(crate) fn enforce_update_actions(
             columns[at].finish()?;
         }
         for action in actions.iter().filter(|a| a.from == at) {
-            run_update_action(engine, txn_id, &mut columns, action, at < roots)?;
+            run_update_action(engine, txn_id, &mut columns, action, at < roots, deadline)?;
             if let Some(to) = action.to.filter(|_| action.counted) {
                 let into = &mut columns[to];
                 into.waiting -= 1;
@@ -998,8 +1021,8 @@ pub(crate) fn enforce_update_actions(
     }
     #[cfg(feature = "test-failpoints")]
     crate::test_failpoints::cascade_targets_read();
-    write_changed(engine, txn_id, &columns[roots..])?;
-    check_changed(engine, txn_id, &columns[roots..], pending)
+    write_changed(engine, txn_id, &columns[roots..], deadline)?;
+    check_changed(engine, txn_id, &columns[roots..], pending, deadline)
 }
 
 /// The ON UPDATE keys beneath the columns a statement changes in a table,
@@ -1342,6 +1365,7 @@ fn run_update_action(
     columns: &mut [Changed],
     action: &UpdateAction,
     from_root: bool,
+    deadline: Deadline,
 ) -> Result<()> {
     let fk = &action.fk;
     let child_table = action.child_table.as_str();
@@ -1369,6 +1393,7 @@ fn run_update_action(
             return Ok(());
         }
         for (old_value, _) in &changes {
+            deadline.charge(DeadlineSite::ForeignKey, 1)?;
             if child_rows_exist(engine, txn_id, child_table, fk, old_value)? {
                 return Err(Error::foreign_key_violation(
                     child_table,
@@ -1402,6 +1427,7 @@ fn run_update_action(
     let set_null = fk.on_update == ForeignKeyAction::SetNull;
     let mut reached = false;
     for (old_value, new_value) in &changes {
+        deadline.charge(DeadlineSite::ForeignKey, 1)?;
         // A row holding a value the statement wrote into the column is that write
         let written = columns[to].shape.shadows.is_some_and(|root| {
             match columns[root].values.len() > WRITTEN_INLINE {
@@ -1457,7 +1483,9 @@ fn run_update_action(
         let expr = key_filter(child_schema, col_idx, old_value);
         let plan = child.index_plan(&expr);
         let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-        for (id, row) in child.collect_access_rows(access, Some(&expr))?.iter() {
+        let rows = child.collect_access_rows(access, Some(&expr))?;
+        deadline.charge(DeadlineSite::ForeignKey, rows.len())?;
+        for (id, row) in rows.iter() {
             if let Some(start) = row.get(col_idx) {
                 columns[to].take(*id, start, &new_val, action);
                 reached = true;
@@ -1478,7 +1506,12 @@ fn run_update_action(
 /// Writes every child row of `columns` once, with all the values its
 /// columns take. A row that no longer holds a column's start value keeps
 /// that column; a row whose primary key changes moves to its new id
-fn write_changed(engine: &MVCCEngine, txn_id: i64, columns: &[Changed]) -> Result<()> {
+fn write_changed(
+    engine: &MVCCEngine,
+    txn_id: i64,
+    columns: &[Changed],
+    deadline: Deadline,
+) -> Result<()> {
     let mut tables: Vec<&str> = Vec::new();
     for column in columns {
         let table = column.shape.table.as_str();
@@ -1515,6 +1548,7 @@ fn write_changed(engine: &MVCCEngine, txn_id: i64, columns: &[Changed]) -> Resul
         let mut moves = Vec::new();
         let mut apply: Vec<(usize, &Taken)> = Vec::new();
         child.update_by_row_ids(&ids, &mut |id, mut row| {
+            deadline.charge(DeadlineSite::ForeignKey, 1)?;
             apply.clear();
             for column in &of_table {
                 let Some(&at) = column.rows.get(id) else {
@@ -1563,6 +1597,7 @@ fn check_changed(
     txn_id: i64,
     columns: &[Changed],
     mut pending: Option<&mut PendingParents<'_>>,
+    deadline: Deadline,
 ) -> Result<()> {
     let checked = |t: &Taken| t.changed && t.written.get() && !t.new.is_null();
     for column in columns {
@@ -1581,6 +1616,7 @@ fn check_changed(
                 if bit.is_some_and(|b| b < 64 && taken.from & (1 << b) != 0) {
                     continue;
                 }
+                deadline.charge(DeadlineSite::ForeignKey, 1)?;
                 match pending.as_deref_mut() {
                     Some(pending) => pending.ask(engine, txn_id, table, fk, &taken.new)?,
                     None => validate_fk_value(engine, txn_id, fk, &taken.new, table)?,

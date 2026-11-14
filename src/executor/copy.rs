@@ -17,6 +17,7 @@
 //! Bulk imports data from CSV or JSON files, bypassing per-row SQL parsing
 //! for significantly faster loading compared to individual INSERT statements.
 
+use crate::common::deadline::{Deadline, DeadlineSite};
 use crate::common::{CompactArc, SmartString};
 use crate::core::integer::integer_from_text;
 use crate::core::{DataType, Error, Result, Row, Schema, Value};
@@ -98,7 +99,7 @@ impl Executor {
     pub(crate) fn execute_copy(
         &self,
         stmt: &CopyStatement,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
         let table_name = &stmt.table_name.value_lower;
 
@@ -175,6 +176,7 @@ impl Executor {
                 &defaults,
                 &check_programs,
                 (&fk_schema, &mut pending),
+                ctx.deadline_of_call(),
             )?,
             CopyFormat::Json => self.copy_from_json(
                 stmt,
@@ -187,6 +189,7 @@ impl Executor {
                 &defaults,
                 &check_programs,
                 (&fk_schema, &mut pending),
+                ctx.deadline_of_call(),
             )?,
         };
         pending.check(&self.engine, table.txn_id())?;
@@ -214,6 +217,7 @@ impl Executor {
         defaults: &CopyDefaults,
         check_programs: &[super::dml::CompiledCheck],
         (fk_schema, pending): ParentChecks<'_, '_>,
+        deadline: Deadline,
     ) -> Result<i64> {
         let file = std::fs::File::open(&stmt.file_path).map_err(|e| {
             Error::InvalidArgument(format!("cannot open file '{}': {}", stmt.file_path, e))
@@ -261,6 +265,7 @@ impl Executor {
         let mut check_vm = super::expression::ExprVM::new();
         let mut check_row = None;
         for result in reader.records() {
+            deadline.charge(DeadlineSite::Copy, 1)?;
             let record = result.map_err(|e| {
                 Error::InvalidArgument(format!(
                     "CSV parse error at row {}: {}",
@@ -337,6 +342,7 @@ impl Executor {
         defaults: &CopyDefaults,
         check_programs: &[super::dml::CompiledCheck],
         (fk_schema, pending): ParentChecks<'_, '_>,
+        deadline: Deadline,
     ) -> Result<i64> {
         let null_str = stmt.null_string.as_deref();
         let use_columns = !stmt.columns.is_empty();
@@ -376,6 +382,7 @@ impl Executor {
         };
 
         for (idx, result) in stream.enumerate() {
+            deadline.charge(DeadlineSite::Copy, 1)?;
             let item = result.map_err(|e| {
                 Error::InvalidArgument(format!("JSON parse error at object {}: {}", idx + 1, e))
             })?;
