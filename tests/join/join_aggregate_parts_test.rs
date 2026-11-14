@@ -1899,3 +1899,118 @@ fn windows_over_a_using_join_and_a_prepared_join_run_after_their_parts() {
         assert_eq!(got, group_rows(&counts, |_, _| vec![total]), "$1 = {below}");
     }
 }
+
+/// Per k of the pairs of l and r, its count
+fn key_counts() -> BTreeMap<i64, i64> {
+    let mut keys = BTreeMap::new();
+    for (l, _) in pairs() {
+        *keys.entry(l.1).or_default() += 1;
+    }
+    keys
+}
+
+#[test]
+fn grouped_using_and_natural_joins_run_their_subqueries_over_their_parts() {
+    let db = with_q(open_merged("join_aggregate_parts_family_using"));
+    let keys = key_counts();
+    let by_g = lr_counts(equal_keys, |_, _| true);
+    let max_a = q_rows().map(|q| q.1).max().unwrap();
+    let rank = |n: i64| 1 + keys.values().filter(|m| **m < n).count() as i64;
+    let cases: Vec<(&str, Vec<String>)> = vec![
+        (
+            "SELECT l.g, COUNT(*), (SELECT MAX(q.a) FROM q) FROM l JOIN r USING (k) \
+             GROUP BY l.g ORDER BY l.g",
+            group_rows(&by_g, |_, _| vec![max_a]),
+        ),
+        (
+            "SELECT k, COUNT(*) FROM l JOIN r USING (k) GROUP BY k \
+             HAVING COUNT(*) > (SELECT MAX(q.a) FROM q) ORDER BY k",
+            group_rows(
+                &keys
+                    .iter()
+                    .filter(|(_, n)| **n > max_a)
+                    .map(|(k, n)| (*k, *n))
+                    .collect(),
+                |_, _| vec![],
+            ),
+        ),
+        (
+            "SELECT k, COUNT(*), (SELECT COUNT(*) FROM q WHERE q.a = k) FROM l \
+             NATURAL JOIN s GROUP BY k ORDER BY k",
+            group_rows(&keys, |k, _| vec![q_with(k)]),
+        ),
+        (
+            "SELECT k, COUNT(*), RANK() OVER (ORDER BY COUNT(*)), (SELECT MAX(q.a) FROM q) \
+             FROM l JOIN r USING (k) GROUP BY k ORDER BY k",
+            group_rows(&keys, |_, n| vec![rank(n), max_a]),
+        ),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(parted_by(&db, sql, "hash"), want, "{sql}");
+    }
+
+    for kind in ["LEFT", "RIGHT", "FULL"] {
+        let sql = format!(
+            "SELECT k, COUNT(*), COUNT(l.id), COUNT(r.id), COALESCE(SUM(r.w), 0) \
+             FROM l {kind} JOIN r USING (k) GROUP BY k \
+             HAVING COUNT(*) > (SELECT MIN(q.id) - 1 FROM q) ORDER BY k"
+        );
+        assert_eq!(parted(&db, &sql), merged_groups(kind), "{kind}");
+    }
+
+    let mut groups: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
+    for (l, r) in pairs() {
+        let ts = r_rows().filter(|t| t.2 == r.2).count() as i64;
+        let group = groups.entry(l.1).or_default();
+        *group = (group.0 + ts, group.1 + ts * r.2);
+    }
+    let want: Vec<String> = groups
+        .iter()
+        .map(|(k, (n, sum))| [*k, *n, *sum, max_a].map(int).join("|"))
+        .collect();
+    let sql = "SELECT k, COUNT(*), SUM(t.x), (SELECT MAX(q.a) FROM q) FROM l \
+               JOIN r USING (k) JOIN t ON t.x = r.w GROUP BY k ORDER BY k";
+    assert_eq!(parted(&db, sql), want, "{sql}");
+}
+
+#[test]
+fn a_prepared_grouped_using_join_runs_its_subqueries_over_its_parts() {
+    let db = with_q(open_merged("join_aggregate_parts_family_using_prepared"));
+    let keys = key_counts();
+    let query = db
+        .prepare(
+            "SELECT k, COUNT(*), (SELECT COUNT(*) FROM q WHERE q.a = k AND q.id < $1) \
+             FROM l JOIN r USING (k) GROUP BY k ORDER BY k",
+        )
+        .unwrap();
+    for below in [5, 15] {
+        #[cfg(feature = "test-failpoints")]
+        {
+            stoolap::test_failpoints::set_join_part_rows(PART_ROWS);
+            stoolap::test_failpoints::reset_join_part_largest();
+        }
+        let got: Vec<String> = query
+            .query((below,))
+            .unwrap()
+            .map(|row| {
+                let row = row.unwrap();
+                (0..row.len())
+                    .map(|i| format!("{:?}", row.get_value(i).unwrap()))
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect();
+        #[cfg(feature = "test-failpoints")]
+        {
+            stoolap::test_failpoints::set_join_part_rows(0);
+            let largest = stoolap::test_failpoints::join_part_largest();
+            assert!(
+                (1..=PART_ROWS).contains(&largest),
+                "$1 = {below}: the aggregation held {largest} joined rows at once"
+            );
+        }
+        let below_in = |k: i64| q_rows().filter(|q| q.1 == k && q.0 < below).count() as i64;
+        let want = group_rows(&keys, |k, _| vec![below_in(k)]);
+        assert_eq!(got, want, "$1 = {below}");
+    }
+}
