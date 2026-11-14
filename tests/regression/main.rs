@@ -35,3 +35,4 @@ mod runtime_error_test;
 mod select_test;
 mod sqllogictest_test;
 mod statement_deadline_test;
+mod statement_timeout_test;
