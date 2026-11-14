@@ -94,7 +94,7 @@ use super::window::{
     HeldWindow, WindowOutput, WindowPreGroupedState, WindowPreSortedState, WindowRows,
 };
 use super::Executor;
-use crate::common::deadline::DeadlineSite;
+use crate::common::deadline::{Deadline, DeadlineSite};
 use crate::planner::block::{self as block_plan, BlockRuns, CallRead};
 use crate::planner::{
     distinct_values_column, keys_ordered_read, nearest_read, ordered_read, scan_choice, KeyRead,
@@ -5646,6 +5646,7 @@ fn member_rows(
     filter: Option<&dyn StorageExpr>,
     limited: bool,
     target: Option<usize>,
+    deadline: Deadline,
 ) -> Result<Option<RowVec>> {
     let Some(filter) = filter else {
         return Ok(None);
@@ -5668,6 +5669,7 @@ fn member_rows(
                 list.get_values().iter(),
                 target.is_some(),
                 target.filter(|_| scope.len() == 1),
+                deadline,
             )?;
             if rows.is_some() {
                 KeyReadPath::KeyMembers.taken();
@@ -5681,6 +5683,7 @@ fn member_rows(
                 list.get_values().to_vec(),
                 || Ok(None),
                 false,
+                deadline,
             )
         }
         None => Ok(None),
@@ -15382,7 +15385,7 @@ impl<'a> PreparedRunner<'a> {
                     None => ScanAccess::Seq,
                 };
                 let columns = &self.prepared.subqueries[index].column_indices;
-                table.scan_access(access, columns, None, expr)
+                table.scan_access(access, columns, None, expr, self.ctx.deadline_of_call())
             }
             Some(BlockInput::Rows(rows)) => Ok(Box::new(PointRows {
                 rows: CompactArc::clone(rows),
@@ -16242,7 +16245,9 @@ impl<'a> PreparedRunner<'a> {
                     // where the table can, an index or not
                     if scan.is_some() {
                         let enough = target.filter(|_| scanned_whole);
-                        if let Some(rows) = member_rows(table, filter, target.is_some(), enough)? {
+                        let deadline = ctx.deadline_of_call();
+                        let read = member_rows(table, filter, target.is_some(), enough, deadline)?;
+                        if let Some(rows) = read {
                             break 'read (Some(rows.into_iter()), None, true, scanned_whole);
                         }
                     }
@@ -16270,6 +16275,8 @@ impl<'a> PreparedRunner<'a> {
                                 0,
                                 ctx.deadline_of_call(),
                             )?;
+                            // A read whose last charge read no clock is checked once more
+                            ctx.check_deadline()?;
                             return Ok(Passing::Answers(answers));
                         }
                         None => {
@@ -16285,10 +16292,13 @@ impl<'a> PreparedRunner<'a> {
                             {
                                 let deadline = ctx.deadline_of_call();
                                 let rows = table.collect_access_rows(access, filter, deadline)?;
+                                // A read whose last charge read no clock is checked once more
+                                ctx.check_deadline()?;
                                 return Ok(Passing::Answers(rows));
                             }
                             let all: Vec<usize> = (0..table.schema().columns.len()).collect();
-                            let scan = table.scan_access(access, &all, needed, filter)?;
+                            let deadline = ctx.deadline_of_call();
+                            let scan = table.scan_access(access, &all, needed, filter, deadline)?;
                             let stream = stream && !where_.widen;
                             if stream && scanned_whole && extra_whole {
                                 return Ok(Passing::Scan(scan));
@@ -16509,7 +16519,8 @@ impl<'a> PreparedRunner<'a> {
             Executor::rows_without_members(table, column, &set.left_out, passing, enough)?
         } else {
             let members = set.outcomes.keys().filter_map(|key| key.first());
-            Executor::rows_of_members(table, column, members, target.is_some(), enough)?
+            let deadline = self.ctx.deadline_of_call();
+            Executor::rows_of_members(table, column, members, target.is_some(), enough, deadline)?
         };
         #[cfg(feature = "test-failpoints")]
         if rows.is_some() {
@@ -18518,6 +18529,7 @@ impl PreparedRunner<'_> {
             values,
             target.is_some(),
             target.filter(|_| whole),
+            self.ctx.deadline_of_call(),
         )?;
         Ok(rows.map(|rows| (rows, true)))
     }

@@ -639,7 +639,8 @@ mod written_by_the_filter {
     #[test]
     fn a_scan_filter_may_write_through_another_handle_of_its_transaction() {
         read_writing("memory://filter_writes_scan", false, |table, filter| {
-            let mut scanner = table.scan(&[0, 1, 2], Some(filter))?;
+            let mut scanner =
+                table.scan(&[0, 1, 2], Some(filter), stoolap::executor::Deadline::NONE)?;
             let mut rows = 0;
             while scanner.next() {
                 rows += 1;

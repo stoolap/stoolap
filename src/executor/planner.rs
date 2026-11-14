@@ -27,6 +27,7 @@
 
 use std::sync::Arc;
 
+use crate::common::deadline::Deadline;
 use crate::common::names::eq_names;
 use crate::common::StringMap;
 use crate::storage::traits::transaction::{StatementTable, TableUse};
@@ -314,7 +315,7 @@ impl QueryPlanner {
         };
 
         // Scan for this table's stats (all columns, no filter)
-        let mut result = stats_table.scan(&[], None)?;
+        let mut result = stats_table.scan(&[], None, Deadline::NONE)?;
         while result.next() {
             let row = result.row();
             // Check if this row is for our table (table_name is column 1)
@@ -352,7 +353,7 @@ impl QueryPlanner {
         };
 
         // Scan for this table's column stats (all columns, no filter)
-        let mut result = stats_table.scan(&[], None)?;
+        let mut result = stats_table.scan(&[], None, Deadline::NONE)?;
         while result.next() {
             let row = result.row();
             // Check if this row is for our table (table_name is column 1)

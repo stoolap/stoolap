@@ -3658,11 +3658,12 @@ impl SegmentedTable {
         needed: Option<&[bool]>,
         where_expr: Option<&dyn Expression>,
         access: ScanAccess<'_>,
+        deadline: Deadline,
     ) -> Result<Box<dyn Scanner>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.scan_cold_and_hot");
-        let unsealed =
-            self.unsealed(|hot| hot.scan_access(access, column_indices, None, where_expr));
+        let unsealed = self
+            .unsealed(|hot| hot.scan_access(access, column_indices, None, where_expr, deadline));
         if let Some(result) = unsealed {
             return result;
         }
@@ -3675,7 +3676,7 @@ impl SegmentedTable {
             // preventing the race where remove_moved_rows runs between building
             // the skip set and hot scanner execution (which would lose rows).
             let cut = self.read_cut();
-            let hot_rows = self.hot_rows(where_expr, access, Deadline::NONE)?;
+            let hot_rows = self.hot_rows(where_expr, access, deadline)?;
 
             let mut skip: FxHashSet<i64> =
                 FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
@@ -3695,6 +3696,7 @@ impl SegmentedTable {
                 skip,
                 generation,
                 cut,
+                deadline,
             )?
             else {
                 return Ok(None);
@@ -3711,6 +3713,7 @@ impl SegmentedTable {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_segment_scanners_filtered(
         &self,
         column_indices: &[usize],
@@ -3719,6 +3722,7 @@ impl SegmentedTable {
         hot_skip: FxHashSet<i64>,
         generation: u64,
         cut: CommitCut,
+        deadline: Deadline,
     ) -> Result<Option<Vec<Box<dyn Scanner>>>> {
         let comparisons = where_expr
             .map(|e| e.collect_comparisons())
@@ -3838,6 +3842,7 @@ impl SegmentedTable {
             scanner.set_visibility_bitmap(cs.visible.clone());
             scanner.view = self.view.clone();
             scanner.cut = cut.clone();
+            scanner.deadline = deadline;
             let current_schema = self.hot.schema();
             // From the captured segment: a retired volume's mapping is no
             // longer in the live map, which answers with an identity one
@@ -5220,8 +5225,9 @@ impl Table for SegmentedTable {
         &self,
         column_indices: &[usize],
         where_expr: Option<&dyn Expression>,
+        deadline: Deadline,
     ) -> Result<Box<dyn Scanner>> {
-        self.scan_cold_and_hot(column_indices, None, where_expr, ScanAccess::Seq)
+        self.scan_cold_and_hot(column_indices, None, where_expr, ScanAccess::Seq, deadline)
     }
 
     fn index_plan(&self, where_expr: &dyn Expression) -> Option<IndexPlan> {
@@ -5242,8 +5248,9 @@ impl Table for SegmentedTable {
         column_indices: &[usize],
         needed: Option<&[bool]>,
         where_expr: Option<&dyn Expression>,
+        deadline: Deadline,
     ) -> Result<Box<dyn Scanner>> {
-        self.scan_cold_and_hot(column_indices, needed, where_expr, access)
+        self.scan_cold_and_hot(column_indices, needed, where_expr, access, deadline)
     }
 
     fn narrows_scans(&self) -> bool {
@@ -5255,8 +5262,15 @@ impl Table for SegmentedTable {
         column_indices: &[usize],
         needed: &[bool],
         where_expr: Option<&dyn Expression>,
+        deadline: Deadline,
     ) -> Result<Box<dyn Scanner>> {
-        self.scan_cold_and_hot(column_indices, Some(needed), where_expr, ScanAccess::Seq)
+        self.scan_cold_and_hot(
+            column_indices,
+            Some(needed),
+            where_expr,
+            ScanAccess::Seq,
+            deadline,
+        )
     }
 
     fn collect_all_rows(&self, where_expr: Option<&dyn Expression>) -> Result<RowVec> {
@@ -8847,6 +8861,8 @@ impl Table for SegmentedTable {
             };
 
             self.check_cold()?;
+            // A run whose last charge read no clock is checked once more
+            deadline.check()?;
             Ok(Some(Some(results)))
         })
     }
@@ -8923,9 +8939,9 @@ impl Table for SegmentedTable {
             let hot_skip_ref = &hot_skip;
             let tombstones_ref = &tombstones_arc;
 
-            // Runs one volume's visible rows into `groups`; false when the
-            // volume's layout cannot answer. A key's group is looked up once
-            // per volume, at the key's first row
+            // Runs the visible rows of one volume into `groups`, the deadline
+            // charged a row group at a time; false when the volume's layout
+            // cannot answer. A key's group is looked up once per volume
             let process_volume = |(_, cs): &(u64, super::manifest::ColdSegment),
                                   groups: &mut GroupedAggregates|
              -> Result<bool> {
@@ -8941,7 +8957,8 @@ impl Table for SegmentedTable {
                         && !self.is_row_tombstoned(tombstones_ref, row_ids[i], &cut)
                         && !hot_skip_ref.contains(&row_ids[i])
                 };
-                let Some(start) = (0..vol.meta.row_count).find(|&i| visible(i)) else {
+                let end = vol.meta.row_count;
+                let Some(start) = (0..end).find(|&i| visible(i)) else {
                     return Ok(true);
                 };
 
@@ -8963,76 +8980,87 @@ impl Table for SegmentedTable {
                             };
                             // Each entry's group, NULL's last
                             let mut known = vec![u32::MAX; dictionary.len() + 1];
-                            for i in start..vol.meta.row_count {
-                                if !visible(i) {
-                                    continue;
-                                }
-                                let slot = if nulls[i] {
-                                    dictionary.len()
-                                } else {
-                                    ids[i] as usize
-                                };
-                                if known[slot] == u32::MAX {
-                                    let key = match dictionary.get(slot) {
-                                        Some(text) => Value::Text(text.clone()),
-                                        None => Value::Null(DataType::Text),
-                                    };
-                                    match groups.group(std::slice::from_ref(&key)) {
-                                        Some(group) => known[slot] = group as u32,
-                                        None => continue,
+                            for rows in row_groups(start..end) {
+                                deadline.charge(DeadlineSite::StorageAggregate, rows.len())?;
+                                for i in rows {
+                                    if !visible(i) {
+                                        continue;
                                     }
+                                    let slot = if nulls[i] {
+                                        dictionary.len()
+                                    } else {
+                                        ids[i] as usize
+                                    };
+                                    if known[slot] == u32::MAX {
+                                        let key = match dictionary.get(slot) {
+                                            Some(text) => Value::Text(text.clone()),
+                                            None => Value::Null(DataType::Text),
+                                        };
+                                        match groups.group(std::slice::from_ref(&key)) {
+                                            Some(group) => known[slot] = group as u32,
+                                            None => continue,
+                                        }
+                                    }
+                                    accumulate_columnar(
+                                        groups.aggregates(known[slot] as usize),
+                                        &inputs,
+                                        i,
+                                    );
                                 }
-                                accumulate_columnar(
-                                    groups.aggregates(known[slot] as usize),
-                                    &inputs,
-                                    i,
-                                );
                             }
                         } else {
                             let mut known: FxHashMap<i64, u32> = FxHashMap::default();
                             let mut null_group: Option<u32> = None;
-                            for i in start..vol.meta.row_count {
-                                if !visible(i) {
-                                    continue;
-                                }
-                                let is_null = gb_col.is_null(i);
-                                let found = match is_null {
-                                    true => null_group,
-                                    false => known.get(&gb_col.get_i64(i)).copied(),
-                                };
-                                let group = match found {
-                                    Some(group) => group,
-                                    None => {
-                                        let key = gb_col.get_value(i);
-                                        let Some(group) = groups.group(std::slice::from_ref(&key))
-                                        else {
-                                            continue;
-                                        };
-                                        let group = group as u32;
-                                        match is_null {
-                                            true => null_group = Some(group),
-                                            false => {
-                                                known.insert(gb_col.get_i64(i), group);
-                                            }
-                                        }
-                                        group
+                            for rows in row_groups(start..end) {
+                                deadline.charge(DeadlineSite::StorageAggregate, rows.len())?;
+                                for i in rows {
+                                    if !visible(i) {
+                                        continue;
                                     }
-                                };
-                                accumulate_columnar(groups.aggregates(group as usize), &inputs, i);
+                                    let is_null = gb_col.is_null(i);
+                                    let found = match is_null {
+                                        true => null_group,
+                                        false => known.get(&gb_col.get_i64(i)).copied(),
+                                    };
+                                    let group = match found {
+                                        Some(group) => group,
+                                        None => {
+                                            let key = gb_col.get_value(i);
+                                            let Some(group) =
+                                                groups.group(std::slice::from_ref(&key))
+                                            else {
+                                                continue;
+                                            };
+                                            let group = group as u32;
+                                            match is_null {
+                                                true => null_group = Some(group),
+                                                false => {
+                                                    known.insert(gb_col.get_i64(i), group);
+                                                }
+                                            }
+                                            group
+                                        }
+                                    };
+                                    let aggregates = groups.aggregates(group as usize);
+                                    accumulate_columnar(aggregates, &inputs, i);
+                                }
                             }
                         }
                     }
                     super::writer::ColSource::Default(default_val) => {
                         let mut group = None;
-                        for i in start..vol.meta.row_count {
-                            if !visible(i) {
-                                continue;
-                            }
-                            if group.is_none() {
-                                group = groups.group(std::slice::from_ref(default_val));
-                            }
-                            if let Some(group) = group {
-                                accumulate_columnar(groups.aggregates(group), &inputs, i);
+                        for rows in row_groups(start..end) {
+                            deadline.charge(DeadlineSite::StorageAggregate, rows.len())?;
+                            for i in rows {
+                                if !visible(i) {
+                                    continue;
+                                }
+                                if group.is_none() {
+                                    group = groups.group(std::slice::from_ref(default_val));
+                                }
+                                if let Some(group) = group {
+                                    accumulate_columnar(groups.aggregates(group), &inputs, i);
+                                }
                             }
                         }
                     }
@@ -9059,8 +9087,6 @@ impl Table for SegmentedTable {
                     let parts: Vec<Option<GroupedAggregates>> = volumes
                         .par_iter()
                         .map(|volume| {
-                            let rows = volume.1.volume.meta.row_count;
-                            deadline.charge(DeadlineSite::StorageAggregate, rows)?;
                             let mut part = groups.empty_like();
                             Ok(process_volume(volume, &mut part)?.then_some(part))
                         })
@@ -9074,10 +9100,6 @@ impl Table for SegmentedTable {
                 }
             } else {
                 for volume in volumes.iter() {
-                    deadline.charge(
-                        DeadlineSite::StorageAggregate,
-                        volume.1.volume.meta.row_count,
-                    )?;
                     if !process_volume(volume, &mut groups)? {
                         return Ok(Some(None));
                     }
@@ -9085,6 +9107,8 @@ impl Table for SegmentedTable {
             }
 
             self.check_cold()?;
+            // A run whose last charge read no clock is checked once more
+            deadline.check()?;
             Ok(Some(Some(groups)))
         })
     }
@@ -9141,6 +9165,13 @@ impl<'a> ColdInput<'a> {
         }
         Ok(Some(inputs))
     }
+}
+
+/// `rows` cut into runs of at most a row group each
+fn row_groups(rows: std::ops::Range<usize>) -> impl Iterator<Item = std::ops::Range<usize>> {
+    let end = rows.end;
+    rows.step_by(super::column::ROW_GROUP_SIZE)
+        .map(move |from| from..(from + super::column::ROW_GROUP_SIZE).min(end))
 }
 
 /// Feeds row `i` of a volume to the runs of every call
@@ -9497,7 +9528,12 @@ mod tests {
         ) -> Result<i32> {
             Ok(0)
         }
-        fn scan(&self, _: &[usize], _: Option<&dyn Expression>) -> Result<Box<dyn Scanner>> {
+        fn scan(
+            &self,
+            _: &[usize],
+            _: Option<&dyn Expression>,
+            _: Deadline,
+        ) -> Result<Box<dyn Scanner>> {
             Ok(Box::new(crate::storage::traits::VecScanner::new(
                 self.rows.iter().map(|(_, r)| r.clone()).collect(),
             )))
@@ -9768,7 +9804,7 @@ mod tests {
         let table = SegmentedTable::new(Box::new(hot), mgr);
 
         let all_col_indices: Vec<usize> = (0..schema.columns.len()).collect();
-        let mut scanner = table.scan(&all_col_indices, None).unwrap();
+        let mut scanner = table.scan(&all_col_indices, None, Deadline::NONE).unwrap();
 
         let mut count = 0;
         let mut ids = Vec::new();

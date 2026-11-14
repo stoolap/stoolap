@@ -26,7 +26,7 @@ use crate::core::{Result, Row};
 /// # Example
 ///
 /// ```ignore
-/// let scanner = table.scan(&[0, 1], None)?;
+/// let scanner = table.scan(&[0, 1], None, Deadline::NONE)?;
 /// while scanner.next() {
 ///     let row = scanner.row();
 ///     // Process row...

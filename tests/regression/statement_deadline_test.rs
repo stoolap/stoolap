@@ -422,23 +422,31 @@ fn a_storage_write_over_sealed_rows_stops_and_leaves_no_row_or_claim() {
             }
         }
     }
-    // Reads of the sealed rows, each stopped inside them
+    // Reads of the sealed rows, each stopped inside them: a read charges its
+    // hot rows once before them, which the deadline lets pass; an aggregate
+    // charges only its sealed rows
     let reads = [
         (
             DeadlineSite::StorageRead,
             "SELECT id, ROW_NUMBER() OVER (ORDER BY v) AS n FROM s",
+            Some(1),
         ),
         (
             DeadlineSite::StorageAggregate,
             "SELECT k, SUM(v) FROM s GROUP BY k",
+            None,
         ),
         (
             DeadlineSite::StorageAggregate,
             "SELECT SUM(v) FROM s WHERE k >= 0",
+            None,
         ),
     ];
-    for (site, sql) in reads {
-        pass_deadline_at(site);
+    for (site, sql, passed) in reads {
+        match passed {
+            Some(passed) => pass_deadline_after(site, passed),
+            None => pass_deadline_at(site),
+        }
         let stopped = read(&executor, sql, &ctx);
         keep_deadlines();
         if !matches!(stopped, Err(Error::QueryCancelled)) {
@@ -446,6 +454,130 @@ fn a_storage_write_over_sealed_rows_stops_and_leaves_no_row_or_claim() {
         }
         if let Err(err) = read(&executor, sql, &ctx) {
             wrong.push(format!("{sql} failed ahead of its deadline: {err}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_storage_read_or_write_past_its_first_charges_still_stops() {
+    let _guard = FailpointGuard::new();
+    let db = Database::open("memory://statement_deadline_storage_late").unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        "INSERT INTO t SELECT value, value % 3, value FROM generate_series(1, 3000)",
+        "CREATE INDEX t_k ON t (k)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let executor = Executor::new(std::sync::Arc::clone(db.engine()));
+    let mut ctx = ExecutionContext::new();
+    ctx.set_timeout_ms(3_600_000);
+    // The charges each passes, None for every one it makes: a write by
+    // index past its first candidates, a read past its last row
+    let late = [
+        (
+            DeadlineSite::StorageDelete,
+            "DELETE FROM t WHERE k = 1",
+            Some(2),
+        ),
+        (
+            DeadlineSite::StorageUpdate,
+            "UPDATE t SET v = v + 1 WHERE k = 1",
+            Some(2),
+        ),
+        (
+            DeadlineSite::StorageRead,
+            "SELECT * FROM t WHERE v >= (SELECT 0) AND ABS(v) < 0 LIMIT 1",
+            None,
+        ),
+        (
+            DeadlineSite::StorageRead,
+            "SELECT COUNT(*) FROM t WHERE v >= (SELECT 0) AND ABS(v) < 0",
+            None,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (site, sql, passed) in late {
+        read(&executor, "BEGIN", &ctx).unwrap();
+        let passed = passed.unwrap_or_else(|| charges_of(&executor, &ctx, site, sql));
+        pass_deadline_after(site, passed);
+        let stopped = read(&executor, sql, &ctx);
+        keep_deadlines();
+        read(&executor, "ROLLBACK", &ctx).unwrap();
+        if !matches!(stopped, Err(Error::QueryCancelled)) {
+            wrong.push(format!("{sql} past {passed} charges gave {stopped:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_scan_charges_the_rows_its_pushed_filter_rejects() {
+    let _guard = FailpointGuard::new();
+    let db = Database::open("memory://statement_deadline_pushed_filter").unwrap();
+    for sql in [
+        "CREATE TABLE h (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        "INSERT INTO h SELECT value, value % 3, value FROM generate_series(1, 20000)",
+        "CREATE INDEX h_k ON h (k)",
+        "CREATE TABLE e (id INTEGER PRIMARY KEY, v INTEGER)",
+        "INSERT INTO e SELECT value, value FROM generate_series(1, 300)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!(
+        "file://{}?checkpoint_interval=3600&compact_threshold=1000",
+        dir.path().display()
+    );
+    let sealed = Database::open(&dsn).unwrap();
+    sealed
+        .execute(
+            "CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER, t TEXT)",
+            (),
+        )
+        .unwrap();
+    sealed
+        .execute(
+            "INSERT INTO s SELECT value, (value * 7919) % 140000, 'x' || (value % 10) \
+             FROM generate_series(1, 140000)",
+            (),
+        )
+        .unwrap();
+    sealed.engine().seal_for_test().unwrap();
+    let hot = Executor::new(std::sync::Arc::clone(db.engine()));
+    let cold = Executor::new(std::sync::Arc::clone(sealed.engine()));
+    let mut ctx = ExecutionContext::new();
+    ctx.set_timeout_ms(3_600_000);
+    // Each passes one charge more than the read makes without the scan's own
+    let shapes = [
+        (&hot, false, "SELECT id FROM h WHERE v = -1", 1),
+        (&hot, true, "SELECT id FROM h WHERE v = -1", 2),
+        (&hot, false, "SELECT * FROM h WHERE v = -1 ORDER BY v", 2),
+        (&hot, false, "SELECT id FROM h WHERE k = 1 AND v < 0", 1),
+        (
+            &hot,
+            false,
+            "SELECT COUNT(*) FROM e a WHERE EXISTS (SELECT 1 FROM e b WHERE b.v = a.v + 1000)",
+            1,
+        ),
+        (&cold, false, "SELECT id FROM s WHERE v = 70000", 2),
+        (&cold, false, "SELECT id FROM s WHERE t = 'x7'", 5),
+    ];
+    let mut wrong = Vec::new();
+    for (executor, own_rows, sql, passed) in shapes {
+        if own_rows {
+            read(executor, "BEGIN", &ctx).unwrap();
+            read(executor, "INSERT INTO h VALUES (900000, 1, 5)", &ctx).unwrap();
+        }
+        pass_deadline_after(DeadlineSite::StorageRead, passed);
+        let stopped = read(executor, sql, &ctx);
+        keep_deadlines();
+        if own_rows {
+            read(executor, "ROLLBACK", &ctx).unwrap();
+        }
+        if !matches!(stopped, Err(Error::QueryCancelled)) {
+            wrong.push(format!("{sql} past {passed} charges gave {stopped:?}"));
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));

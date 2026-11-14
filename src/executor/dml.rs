@@ -42,7 +42,7 @@ use super::query_cache::{
 use super::result::{ExecResult, ExecutorResult};
 use super::utils::qualified;
 use super::Executor;
-use crate::common::deadline::DeadlineSite;
+use crate::common::deadline::{Deadline, DeadlineSite};
 use std::sync::RwLock;
 
 pub(super) struct StatementRollback<'a> {
@@ -3262,7 +3262,13 @@ impl Executor {
             } else {
                 let plan = where_expr.as_deref().and_then(|e| table.index_plan(e));
                 let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-                Some(table.scan_access(access, &column_indices, None, where_expr.as_deref())?)
+                Some(table.scan_access(
+                    access,
+                    &column_indices,
+                    None,
+                    where_expr.as_deref(),
+                    ctx.deadline_of_call(),
+                )?)
             };
 
             while let Some(scanner) = scanner.as_mut() {
@@ -4096,7 +4102,13 @@ impl Executor {
         };
         let plan = table.index_plan(&*scan_expr);
         let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-        let mut scanner = table.scan_access(access, &column_indices, None, Some(&*scan_expr))?;
+        let mut scanner = table.scan_access(
+            access,
+            &column_indices,
+            None,
+            Some(&*scan_expr),
+            Deadline::NONE,
+        )?;
 
         let result = if scanner.next() {
             let row_id = scanner.current_row_id();

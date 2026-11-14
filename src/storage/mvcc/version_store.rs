@@ -753,6 +753,42 @@ fn visit_visible<'v, C: VisibilityChecker + ?Sized>(
     Ok(())
 }
 
+/// [`visit_visible`] charging `deadline` each leaf, compiled apart so the
+/// untimed loop holds no charge, which costs a row loop its registers
+#[inline(never)]
+fn visit_timed<'v, C: VisibilityChecker + ?Sized>(
+    chunks: impl Iterator<Item = (&'v [i64], &'v [VersionChainEntry])>,
+    checker: &ReaderChecker<'_, '_, C>,
+    txn_id: i64,
+    deadline: Deadline,
+    mut each: impl FnMut(i64, &'v Row) -> crate::core::Result<()>,
+) -> crate::core::Result<()> {
+    let mut last = (0i64, false);
+    for (ids, chains) in chunks {
+        deadline.charge(DeadlineSite::StorageRead, ids.len())?;
+        visit_leaf(ids, chains, checker, txn_id, &mut last, &mut each)?;
+    }
+    Ok(())
+}
+
+/// The rows `seen_row` gives of one leaf's chains, passed to `each`
+#[inline(always)]
+fn visit_leaf<'v, C: VisibilityChecker + ?Sized>(
+    ids: &'v [i64],
+    chains: &'v [VersionChainEntry],
+    checker: &ReaderChecker<'_, '_, C>,
+    txn_id: i64,
+    last: &mut (i64, bool),
+    each: &mut impl FnMut(i64, &'v Row) -> crate::core::Result<()>,
+) -> crate::core::Result<()> {
+    for (&row_id, chain) in ids.iter().zip(chains) {
+        if let Some(row) = seen_row(chain, checker, txn_id, last) {
+            each(row_id, row)?;
+        }
+    }
+    Ok(())
+}
+
 /// The store's rows as they were when a scan took them, whatever commits,
 /// seals or truncates after, read a leaf at a time
 pub(crate) struct HotRows {
@@ -776,23 +812,33 @@ impl HotRows {
         reader: Reader<'_>,
         out: &mut RowVec,
         rows: usize,
+        deadline: Deadline,
         mut keep: impl FnMut(&Row) -> crate::core::Result<bool>,
     ) -> crate::core::Result<bool> {
         let Some(checker) = self.store.visibility_checker.as_ref() else {
             return Ok(false);
         };
         let checker = reader.over(&**checker);
+        let txn_id = reader.txn_id;
+        let mut take = |id: i64, row: &Row, out: &mut RowVec| {
+            if keep(row)? {
+                out.push((id, row.clone()));
+            }
+            Ok(())
+        };
+        // An untimed scan skips the charge, which costs the row loop its registers
+        let timed = !deadline.is_none();
         while out.len() < rows {
             let Some((ids, chains)) = self.leaves.leaf() else {
                 return Ok(false);
             };
-            for (&id, chain) in ids.iter().zip(chains) {
-                if let Some(row) = seen_row(chain, &checker, reader.txn_id, &mut self.last) {
-                    if keep(row)? {
-                        out.push((id, row.clone()));
-                    }
-                }
+            if timed {
+                deadline.charge(DeadlineSite::StorageRead, ids.len())?;
             }
+            let last = &mut self.last;
+            visit_leaf(ids, chains, &checker, txn_id, last, &mut |id, row| {
+                take(id, row, out)
+            })?;
             self.leaves.advance();
         }
         Ok(self.leaves.leaf().is_some())
@@ -5179,6 +5225,7 @@ impl VersionStore {
         &self,
         reader: Reader<'_>,
         filter: &dyn crate::storage::expression::Expression,
+        deadline: Deadline,
     ) -> crate::core::Result<RowVec> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.get_all_visible_rows_filtered");
@@ -5207,12 +5254,16 @@ impl VersionStore {
 
         // Single-pass: read, filter, and collect in one loop
         let mut result = RowVec::with_capacity(versions.len() / 4);
-        visit_visible(versions.iter_chunks(), &checker, txn_id, |row_id, row| {
+        let keep = |row_id, row: &Row| {
             if matches_row(row)? {
                 result.push((row_id, row.clone()));
             }
             Ok(())
-        })?;
+        };
+        match deadline.is_none() {
+            true => visit_visible(versions.iter_chunks(), &checker, txn_id, keep)?,
+            false => visit_timed(versions.iter_chunks(), &checker, txn_id, deadline, keep)?,
+        }
         Ok(result)
     }
 

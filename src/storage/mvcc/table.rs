@@ -21,7 +21,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::sync::Arc;
 
-use crate::common::deadline::{Deadline, DeadlineSite};
+use crate::common::deadline::{Deadline, DeadlineSite, CHARGE_BEAT};
 use crate::common::names::eq_names;
 use crate::common::{CompactArc, I64Set};
 use crate::core::{
@@ -2273,7 +2273,11 @@ impl MVCCTable {
     /// then merge the results.
     /// Returns RowVec for zero-allocation reuse across queries.
     #[inline]
-    fn collect_visible_rows(&self, filter: Option<&dyn Expression>) -> Result<RowVec> {
+    fn collect_visible_rows(
+        &self,
+        filter: Option<&dyn Expression>,
+        deadline: Deadline,
+    ) -> Result<RowVec> {
         let txn_versions = self.local();
         let schema = &self.cached_schema;
 
@@ -2286,9 +2290,11 @@ impl MVCCTable {
             // Arena storage provides 50x+ faster scans via contiguous memory access
             if let Some(expr) = filter {
                 // Use filtered version - returns RowVec directly
-                return self
-                    .version_store
-                    .get_all_visible_rows_filtered(self.reader(), expr);
+                return self.version_store.get_all_visible_rows_filtered(
+                    self.reader(),
+                    expr,
+                    deadline,
+                );
             }
 
             // Use cached version for unfiltered scans (main optimization)
@@ -2332,6 +2338,7 @@ impl MVCCTable {
 
         // Step 4: Add global rows that don't have local overrides
         for (row_id, row) in global_rows {
+            deadline.charge(DeadlineSite::StorageRead, 1)?;
             if local_ids.hides(row_id) {
                 continue; // Local version takes precedence
             }
@@ -2347,6 +2354,7 @@ impl MVCCTable {
 
         // Step 5: Add local versions (both updates and inserts)
         for (row_id, row) in local_rows {
+            deadline.charge(DeadlineSite::StorageRead, 1)?;
             if let Some(expr) = filter {
                 if !passes(expr, fallible, &row)? {
                     continue;
@@ -2365,7 +2373,7 @@ impl MVCCTable {
     #[inline]
     fn collect_visible_rows_unsorted(&self) -> Result<RowVec> {
         // For GROUP BY, order doesn't matter - use same cached path
-        self.collect_visible_rows(None)
+        self.collect_visible_rows(None, Deadline::NONE)
     }
 
     /// Collect visible rows with early termination when limit is reached
@@ -2692,13 +2700,13 @@ impl MVCCTable {
             // Every key of the range: a row's id is its key
             if let WriteAccess::KeyRange(low, high) = access {
                 let keys = usize::try_from(high.saturating_sub(low).saturating_add(1)).unwrap_or(0);
-                deadline.charge(DeadlineSite::StorageUpdate, keys)?;
                 plan.hot.reserve_exact(keys);
                 let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(keys);
                 {
                     let txn_versions = self.local();
                     self.check_read()?;
                     for row_id in low..=high {
+                        deadline.charge(DeadlineSite::StorageUpdate, 1)?;
                         if skipped(row_id) {
                             continue;
                         }
@@ -2720,6 +2728,7 @@ impl MVCCTable {
                     self.check_read()?;
                     let stored = plan.hot.len();
                     for (row_id, row, version) in batch_rows {
+                        deadline.charge(DeadlineSite::StorageUpdate, 1)?;
                         let row = self.normalize_row_to_schema(row, schema);
                         plan.hot.push((row_id, row, version));
                     }
@@ -2741,12 +2750,12 @@ impl MVCCTable {
                     expr,
                     &filtered_row_ids,
                 ));
-                deadline.charge(DeadlineSite::StorageUpdate, filtered_row_ids.len())?;
                 plan.hot.reserve_exact(filtered_row_ids.len());
                 let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(filtered_row_ids.len());
                 {
                     let txn_versions = self.local();
                     for &row_id in &filtered_row_ids {
+                        deadline.charge(DeadlineSite::StorageUpdate, 1)?;
                         if skipped(row_id) {
                             continue;
                         }
@@ -2768,6 +2777,7 @@ impl MVCCTable {
                         .version_store
                         .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
                     for (row_id, row, original) in batch_rows {
+                        deadline.charge(DeadlineSite::StorageUpdate, 1)?;
                         let row = self.normalize_row_to_schema(row, schema);
                         if passes(expr, fallible, &row)? {
                             plan.hot.push((row_id, row, original));
@@ -2847,6 +2857,7 @@ impl MVCCTable {
             }
             joined = plan.hot.len();
             for (row_id, version) in txn_versions.iter_local() {
+                deadline.charge(DeadlineSite::StorageUpdate, 1)?;
                 if skipped(row_id)
                     || version.is_deleted()
                     || (where_expr.is_none()
@@ -3037,6 +3048,7 @@ impl MVCCTable {
         &self,
         access: ScanAccess<'_>,
         filter: Option<&dyn Expression>,
+        deadline: Deadline,
     ) -> Result<Option<RowVec>> {
         let (ScanAccess::Index(plan), Some(filter)) = (access, filter) else {
             return Ok(None);
@@ -3052,6 +3064,7 @@ impl MVCCTable {
         if !plan.names_keys() {
             row_ids.extend(self.local_ids_missing_from(plan, filter, &row_ids));
         }
+        deadline.charge(DeadlineSite::StorageRead, row_ids.len())?;
         self.fetch_rows_by_ids(&row_ids, filter).map(Some)
     }
 
@@ -3095,6 +3108,7 @@ impl MVCCTable {
         schema: CompactArc<Schema>,
         column_indices: &[usize],
         where_expr: Option<&dyn Expression>,
+        deadline: Deadline,
     ) -> Result<Box<dyn Scanner>> {
         // Fall back to full scan - use MVCCScanner with RowVec for cache reuse
         #[cfg(test)]
@@ -3116,9 +3130,10 @@ impl MVCCTable {
                 where_expr,
                 schema,
                 column_indices,
+                deadline,
             )));
         }
-        let rows = self.collect_visible_rows(where_expr)?;
+        let rows = self.collect_visible_rows(where_expr, deadline)?;
         self.check_read()?;
         let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
         Ok(Box::new(scanner))
@@ -3559,7 +3574,6 @@ impl Table for MVCCTable {
             // Every key of the range: PK IS the row_id
             if let WriteAccess::KeyRange(low, high) = access {
                 let keys = usize::try_from(high.saturating_sub(low).saturating_add(1)).unwrap_or(0);
-                deadline.charge(DeadlineSite::StorageDelete, keys)?;
                 // OPTIMIZATION: Track original versions to avoid redundant lookups
                 let mut local_rows = RowVec::with_capacity(keys / 4);
                 let mut rows_with_originals: Vec<(i64, Row, crate::storage::mvcc::RowVersion)> =
@@ -3571,6 +3585,7 @@ impl Table for MVCCTable {
                 {
                     let txn_versions = self.local();
                     for row_id in low..=high {
+                        deadline.charge(DeadlineSite::StorageDelete, 1)?;
                         if let Some(local) = txn_versions.get_local_version(row_id) {
                             if !local.is_deleted() {
                                 local_rows.push((row_id, local.data.clone()));
@@ -3588,6 +3603,7 @@ impl Table for MVCCTable {
                         .version_store
                         .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
                     for (row_id, row, version) in batch_rows {
+                        deadline.charge(DeadlineSite::StorageDelete, 1)?;
                         rows_with_originals.push((row_id, row, version));
                     }
                 }
@@ -3619,7 +3635,6 @@ impl Table for MVCCTable {
                     expr,
                     &filtered_row_ids,
                 ));
-                deadline.charge(DeadlineSite::StorageDelete, filtered_row_ids.len())?;
                 // OPTIMIZATION: Batch collect rows to delete, then batch put
                 // This reduces lock contention from 2N locks to 2 locks for N rows
                 let mut rows_to_delete = RowVec::with_capacity(filtered_row_ids.len());
@@ -3629,14 +3644,17 @@ impl Table for MVCCTable {
                 let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(filtered_row_ids.len());
                 {
                     let txn_versions = self.local();
-                    for row_id in filtered_row_ids {
-                        if let Some(local) = txn_versions.get_local_version(row_id) {
-                            if !local.is_deleted() {
-                                rows_to_delete.push((row_id, local.data.clone()));
+                    for ids in filtered_row_ids.chunks(CHARGE_BEAT) {
+                        deadline.charge(DeadlineSite::StorageDelete, ids.len())?;
+                        for &row_id in ids {
+                            if let Some(local) = txn_versions.get_local_version(row_id) {
+                                if !local.is_deleted() {
+                                    rows_to_delete.push((row_id, local.data.clone()));
+                                }
+                                // Already locally deleted — skip, don't fall through
+                            } else {
+                                remaining_row_ids.push(row_id);
                             }
-                            // Already locally deleted — skip, don't fall through
-                        } else {
-                            remaining_row_ids.push(row_id);
                         }
                     }
                 }
@@ -3655,10 +3673,14 @@ impl Table for MVCCTable {
                     let batch_rows = self
                         .version_store
                         .get_visible_versions_batch(&remaining_row_ids, self.reader());
-                    for (row_id, row) in batch_rows {
-                        // Re-apply filter (index may be partial match)
-                        if passes(expr, fallible, &row)? {
-                            rows_to_delete.push((row_id, row));
+                    let mut batch_rows = batch_rows;
+                    for batch in batch_rows.chunks_mut(CHARGE_BEAT) {
+                        deadline.charge(DeadlineSite::StorageDelete, batch.len())?;
+                        for (row_id, row) in batch.iter_mut() {
+                            // Re-apply filter (index may be partial match)
+                            if passes(expr, fallible, row)? {
+                                rows_to_delete.push((*row_id, std::mem::take(row)));
+                            }
                         }
                     }
                 }
@@ -3734,6 +3756,7 @@ impl Table for MVCCTable {
             txn_versions.iter_local().map(|(id, _)| id).collect()
         };
         for row_id in local_ids {
+            deadline.charge(DeadlineSite::StorageDelete, 1)?;
             // Skip if already processed
             if self.version_store.quick_check_row_existence(row_id) {
                 continue;
@@ -3777,10 +3800,11 @@ impl Table for MVCCTable {
         &self,
         column_indices: &[usize],
         where_expr: Option<&dyn Expression>,
+        deadline: Deadline,
     ) -> Result<Box<dyn Scanner>> {
         // CompactArc clone - O(1) reference count increment instead of full Schema clone
         let schema = self.cached_schema.clone();
-        self.scan_every(schema, column_indices, where_expr)
+        self.scan_every(schema, column_indices, where_expr, deadline)
     }
 
     fn index_plan(&self, where_expr: &dyn Expression) -> Option<IndexPlan> {
@@ -3801,13 +3825,14 @@ impl Table for MVCCTable {
         column_indices: &[usize],
         _needed: Option<&[bool]>,
         where_expr: Option<&dyn Expression>,
+        deadline: Deadline,
     ) -> Result<Box<dyn Scanner>> {
         let schema = self.cached_schema.clone();
-        if let Some(rows) = self.access_rows(access, where_expr)? {
+        if let Some(rows) = self.access_rows(access, where_expr, deadline)? {
             let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
             return Ok(Box::new(scanner));
         }
-        self.scan_every(schema, column_indices, where_expr)
+        self.scan_every(schema, column_indices, where_expr, deadline)
     }
 
     fn collect_access_rows(
@@ -3816,11 +3841,15 @@ impl Table for MVCCTable {
         where_expr: Option<&dyn Expression>,
         deadline: Deadline,
     ) -> Result<RowVec> {
-        let rows = match self.access_rows(access, where_expr)? {
+        let rows = match self.access_rows(access, where_expr, deadline)? {
             Some(rows) => rows,
-            None => self.collect_all_rows(where_expr)?,
+            None => {
+                let rows = self.collect_visible_rows(where_expr, deadline)?;
+                self.check_read()?;
+                rows
+            }
         };
-        // The hot rows are read at once, under the store's guards
+        // An unfiltered read takes the hot rows at once, under the store's guards
         deadline.charge(DeadlineSite::StorageRead, rows.len())?;
         Ok(rows)
     }
@@ -3966,7 +3995,7 @@ impl Table for MVCCTable {
 
     fn collect_all_rows(&self, where_expr: Option<&dyn Expression>) -> Result<RowVec> {
         // Return cached row vector directly - caller iterates (i64, Row) tuples
-        let rows = self.collect_visible_rows(where_expr)?;
+        let rows = self.collect_visible_rows(where_expr, Deadline::NONE)?;
         self.check_read()?;
         Ok(rows)
     }
@@ -5422,7 +5451,7 @@ impl Table for MVCCTable {
         // Scan and collect results
         let plan = expr.and_then(|expr| self.index_plan(expr));
         let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-        let mut scanner = self.scan_access(access, &column_indices, None, expr)?;
+        let mut scanner = self.scan_access(access, &column_indices, None, expr, Deadline::NONE)?;
         let mut rows = Vec::new();
 
         while scanner.next() {
@@ -5544,6 +5573,8 @@ impl Table for MVCCTable {
             deadline,
         )?;
         self.check_read()?;
+        // A pass whose last charge read no clock is checked once more
+        deadline.check()?;
         Ok(groups)
     }
 }
@@ -5617,7 +5648,7 @@ mod tests {
         table.insert(row).unwrap();
 
         // Scan to verify
-        let mut scanner = table.scan(&[0, 1], None).unwrap();
+        let mut scanner = table.scan(&[0, 1], None, Deadline::NONE).unwrap();
 
         assert!(scanner.next());
         let row = scanner.row();
@@ -5694,7 +5725,7 @@ mod tests {
         let plan = table.index_plan(expr);
         let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
         table
-            .scan_access(access, &[0, 1], None, Some(expr))
+            .scan_access(access, &[0, 1], None, Some(expr), Deadline::NONE)
             .unwrap()
     }
 
@@ -5900,7 +5931,7 @@ mod tests {
         assert_eq!(deleted, 3);
 
         // Verify no rows remain
-        let mut scanner = table.scan(&[0], None).unwrap();
+        let mut scanner = table.scan(&[0], None, Deadline::NONE).unwrap();
         assert!(!scanner.next());
         scanner.close().unwrap();
     }
@@ -5944,7 +5975,7 @@ mod tests {
         assert_eq!(updated, 1);
 
         // Verify update
-        let mut scanner = table.scan(&[0, 1], None).unwrap();
+        let mut scanner = table.scan(&[0, 1], None, Deadline::NONE).unwrap();
         assert!(scanner.next());
         let row = scanner.row();
         assert_eq!(row.get(1), Some(&Value::Integer(20)));
@@ -6011,7 +6042,7 @@ mod tests {
         let row = Row::from_values(vec![Value::Integer(1), Value::Integer(42)]);
         table.insert(row).unwrap();
 
-        let mut scanner = table.scan(&[0, 1], None).unwrap();
+        let mut scanner = table.scan(&[0, 1], None, Deadline::NONE).unwrap();
         assert!(scanner.next());
         assert_eq!(scanner.row().get(1), Some(&Value::Float(42.0)));
         scanner.close().unwrap();
@@ -6033,7 +6064,7 @@ mod tests {
         let row = Row::from_values(vec![Value::Integer(1), Value::Float(9.7)]);
         table.insert(row).unwrap();
 
-        let mut scanner = table.scan(&[0, 1], None).unwrap();
+        let mut scanner = table.scan(&[0, 1], None, Deadline::NONE).unwrap();
         assert!(scanner.next());
         assert_eq!(scanner.row().get(1), Some(&Value::Integer(9)));
         scanner.close().unwrap();
@@ -6063,7 +6094,7 @@ mod tests {
         table.insert(row).unwrap();
 
         let mut results: Vec<(i64, bool)> = Vec::new();
-        let mut scanner = table.scan(&[0, 1], None).unwrap();
+        let mut scanner = table.scan(&[0, 1], None, Deadline::NONE).unwrap();
         while scanner.next() {
             let id = match scanner.row().get(0) {
                 Some(Value::Integer(v)) => *v,

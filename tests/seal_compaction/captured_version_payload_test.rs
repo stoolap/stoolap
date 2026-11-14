@@ -152,7 +152,11 @@ captured_rows_test!(captured_keyset, |store, id| store.collect_rows_keyset(
     1
 ));
 captured_rows_test!(captured_filtered_rows, |store, id| store
-    .get_all_visible_rows_filtered(id.into(), &balance_filter())
+    .get_all_visible_rows_filtered(
+        id.into(),
+        &balance_filter(),
+        stoolap::executor::Deadline::NONE
+    )
     .unwrap());
 captured_rows_test!(captured_filtered_callback, |store, id| {
     let mut rows = RowVec::new();

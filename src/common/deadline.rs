@@ -144,10 +144,16 @@ impl Deadline {
         self.0
     }
 
+    /// Whether the work runs to its end, so a loop can leave out its charges
+    #[inline(always)]
+    pub(crate) fn is_none(self) -> bool {
+        self.0.is_none()
+    }
+
     /// Count `units` of work at `site`; the clock is read when the thread's
     /// beat runs out, and at every charge once the deadline has passed
     #[inline]
-    pub(crate) fn charge(self, site: DeadlineSite, units: usize) -> Result<()> {
+    pub fn charge(self, site: DeadlineSite, units: usize) -> Result<()> {
         match self.0 {
             None => Ok(()),
             Some(at) => charge_until(at, site, units),
@@ -155,7 +161,7 @@ impl Deadline {
     }
 
     /// Fail when the deadline has passed, reading the clock now
-    pub(crate) fn check(self) -> Result<()> {
+    pub fn check(self) -> Result<()> {
         match self.0 {
             None => Ok(()),
             Some(at) => passed(at, None),

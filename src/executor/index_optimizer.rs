@@ -21,6 +21,7 @@
 //! - IN list/subquery/hashset using index probe
 //! - Window function pre-sorting detection
 
+use crate::common::deadline::Deadline;
 use crate::common::names::eq_names;
 use crate::common::{CompactArc, I64Set};
 use crate::core::predicate::{kind, PredicateSet};
@@ -292,6 +293,7 @@ impl Executor {
         members: Vec<Value>,
         remaining: impl FnOnce() -> Result<Option<RowFilter>>,
         scan: bool,
+        deadline: Deadline,
     ) -> Result<Option<RowVec>> {
         use crate::storage::expression::{Expression as _, InListExpr};
         use crate::storage::traits::{CappedEqual, ProbeScratch};
@@ -336,7 +338,7 @@ impl Executor {
         crate::test_failpoints::in_members_read(true);
         let plan = table.index_plan(&membership);
         let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-        let mut scanner = table.scan_access(access, &columns, None, Some(&membership))?;
+        let mut scanner = table.scan_access(access, &columns, None, Some(&membership), deadline)?;
         let mut rows = RowVec::new();
         while scanner.next() {
             let row_id = scanner.current_row_id();
@@ -447,6 +449,7 @@ impl Executor {
         members: impl Iterator<Item = &'v Value> + 'v,
         limited: bool,
         target: Option<usize>,
+        deadline: Deadline,
     ) -> Result<Option<RowVec>> {
         use crate::storage::expression::logical::ConstBoolExpr;
         let known = members.size_hint().0;
@@ -469,7 +472,7 @@ impl Executor {
             if members.iter().any(|v| Some(v.data_type()) != column_type) {
                 return Ok(None);
             }
-            return Self::in_member_rows(table, column, members, || Ok(None), true);
+            return Self::in_member_rows(table, column, members, || Ok(None), true, deadline);
         } else {
             return Ok(None);
         }

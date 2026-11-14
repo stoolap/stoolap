@@ -16,6 +16,7 @@
 //! own access reads: hot and sealed, with the transaction's own changes
 
 use stoolap::core::{RowVec, Value};
+use stoolap::executor::Deadline;
 use stoolap::storage::expression::{
     AndExpr, BetweenExpr, ComparisonExpr, Expression, InListExpr, LikeExpr, OrExpr,
 };
@@ -161,7 +162,11 @@ fn assert_alike_in(db: &Database, what: &str, local: bool) {
         filter.prepare_for_schema(table.schema());
         let plan = decide(&store, table.schema(), condition.as_ref(), true)
             .unwrap_or_else(|| panic!("{what}: no index reads {condition:?}"));
-        let expected = scanned(table.scan(&columns, Some(filter.as_ref())).unwrap());
+        let expected = scanned(
+            table
+                .scan(&columns, Some(filter.as_ref()), Deadline::NONE)
+                .unwrap(),
+        );
         assert!(!expected.is_empty(), "{what}: {filter:?} keeps no row");
         let by_index = table
             .scan_access(
@@ -169,6 +174,7 @@ fn assert_alike_in(db: &Database, what: &str, local: bool) {
                 &columns,
                 None,
                 Some(filter.as_ref()),
+                Deadline::NONE,
             )
             .unwrap();
         assert_eq!(
@@ -177,7 +183,13 @@ fn assert_alike_in(db: &Database, what: &str, local: bool) {
             "{what}: index {condition:?} for {filter:?}"
         );
         let every = table
-            .scan_access(ScanAccess::Seq, &columns, None, Some(filter.as_ref()))
+            .scan_access(
+                ScanAccess::Seq,
+                &columns,
+                None,
+                Some(filter.as_ref()),
+                Deadline::NONE,
+            )
             .unwrap();
         assert_eq!(scanned(every), expected, "{what}: every row for {filter:?}");
         let rows = table
@@ -238,7 +250,13 @@ fn assert_alike_in(db: &Database, what: &str, local: bool) {
         let before = read();
         drop(
             table
-                .scan_access(ScanAccess::Seq, &columns, None, Some(&condition))
+                .scan_access(
+                    ScanAccess::Seq,
+                    &columns,
+                    None,
+                    Some(&condition),
+                    Deadline::NONE,
+                )
                 .unwrap(),
         );
         assert_eq!(read(), before, "{what}: a scan of every row read an index");
@@ -260,7 +278,13 @@ fn assert_alike_in(db: &Database, what: &str, local: bool) {
         );
         drop(
             table
-                .scan_access(ScanAccess::Index(&plan), &columns, None, Some(&condition))
+                .scan_access(
+                    ScanAccess::Index(&plan),
+                    &columns,
+                    None,
+                    Some(&condition),
+                    Deadline::NONE,
+                )
                 .unwrap(),
         );
         assert!(read() > before, "{what}: the index access read no index");

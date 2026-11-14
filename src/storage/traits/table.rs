@@ -154,7 +154,7 @@ pub(crate) fn count_equal_by_reading<T: Table + ?Sized>(
 /// table.insert(row)?;
 ///
 /// // Scan all rows
-/// let scanner = table.scan(&[0, 1], None)?;
+/// let scanner = table.scan(&[0, 1], None, Deadline::NONE)?;
 /// while scanner.next() {
 ///     println!("{:?}", scanner.row());
 /// }
@@ -599,6 +599,7 @@ pub trait Table: Send + Sync {
     /// # Arguments
     /// * `column_indices` - Indices of columns to include in the scan
     /// * `where_expr` - Expression to filter rows (None means all rows)
+    /// * `deadline` - Charged with the rows the filter reads, kept or not
     ///
     /// # Returns
     /// A scanner that iterates over the matching rows
@@ -606,6 +607,7 @@ pub trait Table: Send + Sync {
         &self,
         column_indices: &[usize],
         where_expr: Option<&dyn Expression>,
+        deadline: Deadline,
     ) -> Result<Box<dyn Scanner>>;
 
     /// The index plan the one access rule, `index_plan::decide`, picks for
@@ -636,11 +638,12 @@ pub trait Table: Send + Sync {
         column_indices: &[usize],
         needed: Option<&[bool]>,
         where_expr: Option<&dyn Expression>,
+        deadline: Deadline,
     ) -> Result<Box<dyn Scanner>> {
         let _ = access;
         match needed {
-            Some(needed) => self.scan_needed(column_indices, needed, where_expr),
-            None => self.scan(column_indices, where_expr),
+            Some(needed) => self.scan_needed(column_indices, needed, where_expr, deadline),
+            None => self.scan(column_indices, where_expr, deadline),
         }
     }
 
@@ -658,9 +661,10 @@ pub trait Table: Send + Sync {
         column_indices: &[usize],
         needed: &[bool],
         where_expr: Option<&dyn Expression>,
+        deadline: Deadline,
     ) -> Result<Box<dyn Scanner>> {
         let _ = needed;
-        self.scan(column_indices, where_expr)
+        self.scan(column_indices, where_expr, deadline)
     }
 
     /// Collects all rows matching the expression without intermediate cloning

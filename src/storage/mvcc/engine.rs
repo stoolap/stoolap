@@ -12618,7 +12618,9 @@ mod tests {
             .unwrap();
 
         // Scan to verify
-        let mut scanner = table.scan(&[0, 1], None).unwrap();
+        let mut scanner = table
+            .scan(&[0, 1], None, crate::common::deadline::Deadline::NONE)
+            .unwrap();
         let mut count = 0;
         while scanner.next() {
             count += 1;
@@ -12729,7 +12731,9 @@ mod tests {
         fn count_rows(engine: &MVCCEngine, table_name: &str) -> i64 {
             let tx = engine.begin_transaction().unwrap();
             let table = tx.get_table(table_name).unwrap();
-            let mut scanner = table.scan(&[0], None).unwrap();
+            let mut scanner = table
+                .scan(&[0], None, crate::common::deadline::Deadline::NONE)
+                .unwrap();
             let mut count = 0i64;
             while scanner.next() {
                 count += 1;
@@ -13029,7 +13033,9 @@ mod tests {
         {
             let tx2 = engine.begin_transaction().unwrap();
             let table = tx2.get_table("test_xact").unwrap();
-            let mut scanner = table.scan(&[0, 1], None).unwrap();
+            let mut scanner = table
+                .scan(&[0, 1], None, crate::common::deadline::Deadline::NONE)
+                .unwrap();
 
             let mut count = 0;
             while scanner.next() {
@@ -13236,7 +13242,9 @@ mod tests {
         {
             let tx = engine.begin_transaction().unwrap();
             let table = tx.get_table("cleanup_test").unwrap();
-            let mut scanner = table.scan(&[0], None).unwrap();
+            let mut scanner = table
+                .scan(&[0], None, crate::common::deadline::Deadline::NONE)
+                .unwrap();
             let mut count = 0;
             while scanner.next() {
                 count += 1;

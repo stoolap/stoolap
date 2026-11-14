@@ -379,7 +379,7 @@ fn range_scan_setup_propagates_boundary_failure() {
     use stoolap::storage::traits::Table;
     let table = malformed_warm_table();
     let filter = ComparisonExpr::gte("b", Value::Integer(1));
-    match table.scan(&[0], Some(&filter)) {
+    match table.scan(&[0], Some(&filter), stoolap::executor::Deadline::NONE) {
         Err(Error::Io { message }) => assert_eq!(message, "invalid column block length"),
         Err(error) => panic!("unexpected error: {error:?}"),
         Ok(_) => panic!("boundary failure became a successful scan"),
@@ -408,7 +408,9 @@ fn range_scan_without_group_metadata_preserves_matching_rows() {
     Arc::get_mut(&mut volume.meta).unwrap().row_groups.clear();
     let table = warm_table(volume);
     let filter = ComparisonExpr::gte("b", Value::Integer(ROW_GROUP_SIZE as i64 + 1));
-    let mut scanner = table.scan(&[0], Some(&filter)).unwrap();
+    let mut scanner = table
+        .scan(&[0], Some(&filter), stoolap::executor::Deadline::NONE)
+        .unwrap();
     let mut ids = Vec::new();
     while scanner.next() {
         ids.push(scanner.current_row_id());
