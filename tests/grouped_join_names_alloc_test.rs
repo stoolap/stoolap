@@ -101,3 +101,33 @@ fn a_join_aggregated_in_parts_copies_no_column_name_for_each_run() {
         "{narrow} allocations over narrow sides, {wide} over wide ones"
     );
 }
+
+/// The most allocations a run of the merged grouped join below makes once
+/// its plan is held: 568 when its family's turn from the parts path was
+/// first carried without one. Lower it when a change saves one
+const MERGED_FAMILY_RUN: usize = 568;
+
+#[test]
+fn a_merged_grouped_join_turned_from_parts_allocates_nothing_to_say_so() {
+    let db = Database::open("memory://grouped_join_names_alloc_merged_family").unwrap();
+    for sql in [
+        "CREATE TABLE l (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, a INTEGER)",
+        "INSERT INTO l SELECT g.value, g.value % 4 FROM generate_series(1, 40) g",
+        "INSERT INTO r SELECT g.value, g.value % 4 FROM generate_series(1, 40) g",
+        "INSERT INTO s SELECT g.value, g.value FROM generate_series(1, 5) g",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let sql = "SELECT k, COUNT(*), (SELECT MAX(s.a) FROM s) FROM l JOIN r USING (k) GROUP BY k";
+    let query = db.prepare(sql).unwrap();
+    assert_eq!(query.query(()).unwrap().count(), 4, "{sql}");
+    let before = ALLOCATIONS.with(Cell::get);
+    query.query(()).unwrap().count();
+    let run = ALLOCATIONS.with(Cell::get) - before;
+    assert!(
+        run <= MERGED_FAMILY_RUN,
+        "{sql}: a held run allocated {run} times, at most {MERGED_FAMILY_RUN} before"
+    );
+}

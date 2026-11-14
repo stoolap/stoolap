@@ -621,6 +621,33 @@ impl RowSource for JoinedRows<'_, '_> {
     }
 }
 
+/// How a joined statement reaching the grouped family reads its joined rows
+enum FamilyParts {
+    /// Outside the family's reach, in parts as any aggregate
+    Outside,
+    /// Gathered, as the family runs over held rows
+    Gathered,
+    /// In parts when its grouped blocks, held with the plan, can run
+    Blocks(Arc<Option<super::prepared_select::PreparedGrouped>>),
+}
+
+impl FamilyParts {
+    fn in_parts(&self) -> bool {
+        match self {
+            Self::Outside => true,
+            Self::Gathered => false,
+            Self::Blocks(held) => held.is_some(),
+        }
+    }
+
+    fn blocks(&self) -> Option<&super::prepared_select::PreparedGrouped> {
+        match self {
+            Self::Blocks(held) => held.as_ref().as_ref(),
+            _ => None,
+        }
+    }
+}
+
 /// A semantic cache answer and its output columns
 type CachedAnswer = (Box<dyn QueryResult>, CompactArc<Vec<String>>);
 
@@ -4933,10 +4960,10 @@ impl Executor {
                             &all_columns,
                             (left_cols.len(), blocks.as_deref(), side_merged),
                         )?,
-                        false => None,
+                        false => FamilyParts::Gathered,
                     };
-                    let in_parts = parts_shape && family.as_deref().is_none_or(Option::is_some);
-                    let family = family.as_deref().and_then(Option::as_ref);
+                    let in_parts = parts_shape && family.in_parts();
+                    let family = family.blocks();
                     let mut result_rows = RowVec::new();
                     // A primary key join without a limit fetches its rows in one
                     // batch; an index lookup streams, which costs less than the
@@ -5914,9 +5941,9 @@ impl Executor {
                 &all_columns,
                 (left_columns.len(), blocks.as_deref(), merged),
             )?,
-            false => None,
+            false => FamilyParts::Gathered,
         };
-        let in_parts = parts_shape && family.as_deref().is_none_or(Option::is_some);
+        let in_parts = parts_shape && family.in_parts();
         let appended: Vec<usize> = match in_parts {
             true => (appended_merges(&all_columns, &join_col_renames))
                 .map(|(_, read, _)| *read)
@@ -5989,7 +6016,7 @@ impl Executor {
             for (at, name) in side_names {
                 columns[at] = name;
             }
-            let family = family.as_deref().and_then(Option::as_ref);
+            let family = family.blocks();
             return self.aggregate_joined(plan.as_deref(), stmt, ctx, source, &columns, family);
         }
 
@@ -6943,10 +6970,10 @@ impl Executor {
         self.grouped_select(stmt, ctx, classification, rows, &columns, None, held)
     }
 
-    /// For a joined `stmt` of the grouped family, the grouped blocks it runs
-    /// over the joined rows of `columns` read in parts: none when they cannot
-    /// run or a `merged` column, or one its `blocks` merge, names the joined
-    /// row its own way; None for a statement outside the family's reach
+    /// How a joined `stmt` of the grouped family reads the joined rows of
+    /// `columns`: in parts through its grouped blocks, or gathered when it
+    /// is out of the family or a `merged` column, or one its `blocks` merge,
+    /// names the joined row its own way
     fn parts_family(
         &self,
         plan: Option<&PreparedJoin>,
@@ -6954,16 +6981,16 @@ impl Executor {
         ctx: &ExecutionContext,
         columns: &[String],
         (left_width, blocks, merged): (usize, Option<&JoinBlocks>, bool),
-    ) -> Result<Option<Arc<Option<super::prepared_select::PreparedGrouped>>>> {
+    ) -> Result<FamilyParts> {
         if !Self::grouped_family_reach(stmt, classification) {
-            return Ok(None);
+            return Ok(FamilyParts::Outside);
         }
         let merged = merged || blocks.is_some_and(|held| !held.merges().is_empty());
         if merged || !self.in_grouped_family(plan, stmt, classification) {
-            return Ok(Some(Arc::new(None)));
+            return Ok(FamilyParts::Gathered);
         }
         let held = self.grouped_family_blocks(plan, stmt, ctx, columns, (left_width, blocks))?;
-        Ok(Some(held))
+        Ok(FamilyParts::Blocks(held))
     }
 
     /// Whether the joined `stmt`, as `classification` says, runs through the
