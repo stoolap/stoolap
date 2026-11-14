@@ -1714,3 +1714,188 @@ fn a_prepared_grouped_join_and_a_union_branch_run_their_subqueries_over_parts() 
         .collect();
     assert_eq!(parted_by(&db, sql, "hash"), want, "{sql}");
 }
+
+/// Each group of `counts` with its count and `extra` values, as rows
+fn group_rows(counts: &BTreeMap<i64, i64>, extra: impl Fn(i64, i64) -> Vec<i64>) -> Vec<String> {
+    counts
+        .iter()
+        .map(|(g, n)| {
+            [*g, *n]
+                .into_iter()
+                .chain(extra(*g, *n))
+                .map(int)
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect()
+}
+
+#[test]
+fn windows_over_a_joins_groups_run_after_its_parts() {
+    let db = with_q(open("join_aggregate_parts_windows"));
+    let counts = lr_counts(equal_keys, |_, _| true);
+    let total: i64 = counts.values().sum();
+    let rank = |n: i64| 1 + counts.values().filter(|m| **m < n).count() as i64;
+    let least = *counts.values().min().unwrap();
+    let kept_max = *counts.values().filter(|n| **n > least).max().unwrap();
+    let kept = lr_counts(equal_keys, |l, r| q_below(r.2, l.0));
+    let kept_total: i64 = kept.values().sum();
+    let max_a = q_rows().map(|q| q.1).max().unwrap();
+    let cases: Vec<(String, Vec<String>)> = vec![
+        (
+            "SELECT l.g, COUNT(*), RANK() OVER (ORDER BY COUNT(*)) FROM l JOIN r ON l.k = r.k \
+             GROUP BY l.g ORDER BY l.g"
+                .to_string(),
+            group_rows(&counts, |_, n| vec![rank(n)]),
+        ),
+        (
+            "SELECT l.g, COUNT(*), SUM(COUNT(*)) OVER () FROM l JOIN r ON l.k = r.k \
+             GROUP BY l.g ORDER BY l.g"
+                .to_string(),
+            group_rows(&counts, |_, _| vec![total]),
+        ),
+        (
+            "SELECT COALESCE(l.g, -1), COUNT(*), GROUPING(l.g), SUM(COUNT(*)) OVER () \
+             FROM l JOIN r ON l.k = r.k GROUP BY ROLLUP(l.g) ORDER BY 1"
+                .to_string(),
+            std::iter::once([-1, total, 1, 2 * total].map(int).join("|"))
+                .chain(group_rows(&counts, |_, _| vec![0, 2 * total]))
+                .collect(),
+        ),
+        (
+            format!(
+                "SELECT l.g, COUNT(*), MAX(COUNT(*)) OVER () FROM l JOIN r ON l.k = r.k \
+                 GROUP BY l.g HAVING COUNT(*) > {least} ORDER BY l.g"
+            ),
+            group_rows(
+                &counts
+                    .iter()
+                    .filter(|(_, n)| **n > least)
+                    .map(|(g, n)| (*g, *n))
+                    .collect(),
+                |_, _| vec![kept_max],
+            ),
+        ),
+        (
+            "SELECT l.g, COUNT(*), SUM(COUNT(*)) OVER () FROM l JOIN r ON l.k = r.k \
+             WHERE EXISTS (SELECT 1 FROM q WHERE q.a = r.w AND q.id < l.id) \
+             GROUP BY l.g ORDER BY l.g"
+                .to_string(),
+            group_rows(&kept, |_, _| vec![kept_total]),
+        ),
+        (
+            "SELECT l.g, COUNT(*), (SELECT MAX(q.a) FROM q), SUM(COUNT(*)) OVER () \
+             FROM l JOIN r ON l.k = r.k GROUP BY l.g ORDER BY l.g"
+                .to_string(),
+            group_rows(&counts, |_, _| vec![max_a, total]),
+        ),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(parted_by(&db, &sql, "hash"), want, "{sql}");
+    }
+}
+
+#[test]
+fn windows_over_grouped_joins_of_every_kind_run_after_their_parts() {
+    let db = open("join_aggregate_parts_windows_kinds");
+    let matched = lr_counts(equal_keys, |_, _| true);
+    let mut left = matched.clone();
+    for l in l_rows().filter(|l| !r_rows().any(|r| r.1 == l.1)) {
+        left.entry(l.2).or_insert(0);
+    }
+    let left_total: i64 = left.values().sum();
+    let sql = "SELECT l.g, COUNT(r.id), SUM(COUNT(r.id)) OVER () FROM l LEFT JOIN r \
+               ON l.k = r.k GROUP BY l.g ORDER BY l.g";
+    let want = group_rows(&left, |_, _| vec![left_total]);
+    assert_eq!(parted_by(&db, sql, "hash"), want, "{sql}");
+    let below = lr_counts(|l, r| l.1 < r.1, |_, _| true);
+    let below_total: i64 = below.values().sum();
+    let sql = "SELECT l.g, COUNT(*), SUM(COUNT(*)) OVER () FROM l JOIN r ON l.k < r.k \
+               GROUP BY l.g ORDER BY l.g";
+    let want = group_rows(&below, |_, _| vec![below_total]);
+    assert_eq!(parted_by(&db, sql, "nested_loop"), want, "{sql}");
+
+    let db = open_wide("join_aggregate_parts_windows_wide");
+    let mut groups: BTreeMap<i64, i64> = BTreeMap::new();
+    for (l, _) in wide_pairs() {
+        *groups.entry(l % 5).or_default() += 1;
+    }
+    let total: i64 = groups.values().sum();
+    let sql = "SELECT bl.g, COUNT(*), SUM(COUNT(*)) OVER () FROM bl JOIN br ON bl.u = br.u \
+               GROUP BY bl.g ORDER BY bl.g";
+    let want = group_rows(&groups, |_, _| vec![total]);
+    assert_eq!(parted_across_threads(&db, sql), want, "{sql}");
+
+    let db = open_keyed("join_aggregate_parts_windows_index");
+    let mut groups: BTreeMap<i64, i64> = BTreeMap::new();
+    for (p, _) in keyed_pairs() {
+        *groups.entry(p.1).or_default() += 1;
+    }
+    let total: i64 = groups.values().sum();
+    let want = group_rows(&groups, |_, _| vec![total]);
+    for (sql, path) in [
+        (
+            "SELECT p.g, COUNT(*), SUM(COUNT(*)) OVER () FROM c JOIN p ON p.id = c.pid \
+             GROUP BY p.g ORDER BY p.g",
+            "batch_index_nested_loop",
+        ),
+        (
+            "SELECT p.g, COUNT(*), SUM(COUNT(*)) OVER () FROM p JOIN c ON c.pid = p.id \
+             GROUP BY p.g ORDER BY p.g",
+            C_INDEX,
+        ),
+    ] {
+        assert_eq!(parted_by(&db, sql, path), want, "{sql}");
+    }
+}
+
+#[test]
+fn windows_over_a_using_join_and_a_prepared_join_run_after_their_parts() {
+    let db = open_merged("join_aggregate_parts_windows_using");
+    let mut keys: BTreeMap<i64, i64> = BTreeMap::new();
+    for (l, _) in pairs() {
+        *keys.entry(l.1).or_default() += 1;
+    }
+    let total: i64 = keys.values().sum();
+    let sql = "SELECT k, COUNT(*), SUM(COUNT(*)) OVER () FROM l JOIN s USING (k) \
+               GROUP BY k ORDER BY k";
+    let want = group_rows(&keys, |_, _| vec![total]);
+    assert_eq!(parted_by(&db, sql, "hash"), want, "{sql}");
+
+    let query = db
+        .prepare(
+            "SELECT l.g, COUNT(*), SUM(COUNT(*)) OVER () FROM l JOIN r ON l.k = r.k \
+             WHERE l.id + r.id < $1 GROUP BY l.g ORDER BY l.g",
+        )
+        .unwrap();
+    for below in [40, 70] {
+        #[cfg(feature = "test-failpoints")]
+        {
+            stoolap::test_failpoints::set_join_part_rows(PART_ROWS);
+            stoolap::test_failpoints::reset_join_part_largest();
+        }
+        let got: Vec<String> = query
+            .query((below,))
+            .unwrap()
+            .map(|row| {
+                let row = row.unwrap();
+                (0..row.len())
+                    .map(|i| format!("{:?}", row.get_value(i).unwrap()))
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect();
+        #[cfg(feature = "test-failpoints")]
+        {
+            stoolap::test_failpoints::set_join_part_rows(0);
+            let largest = stoolap::test_failpoints::join_part_largest();
+            assert!(
+                (1..=PART_ROWS).contains(&largest),
+                "$1 = {below}: the aggregation held {largest} joined rows at once"
+            );
+        }
+        let counts = lr_counts(equal_keys, |l, r| l.0 + r.0 < below);
+        let total: i64 = counts.values().sum();
+        assert_eq!(got, group_rows(&counts, |_, _| vec![total]), "$1 = {below}");
+    }
+}
