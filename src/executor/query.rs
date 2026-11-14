@@ -4949,9 +4949,7 @@ impl Executor {
                     // An aggregate reads the joined rows in parts as the join
                     // makes them, under the general path's conditions; the
                     // blocks were told the rows they ask before the join
-                    let parts_shape = classification.has_aggregation
-                        && !classification.has_window_functions
-                        && !(side_merged && !apart);
+                    let parts_shape = classification.has_aggregation && !(side_merged && !apart);
                     let family = match parts_shape {
                         true => self.parts_family(
                             plan.as_deref(),
@@ -5041,7 +5039,7 @@ impl Executor {
                                     ctx,
                                     source,
                                     &all_columns,
-                                    family,
+                                    (classification, family),
                                 );
                             }
                             Self::collect_join_rows(
@@ -5181,7 +5179,7 @@ impl Executor {
                                 ctx,
                                 source,
                                 &all_columns,
-                                family,
+                                (classification, family),
                             );
                         }
                         Self::collect_join_rows(
@@ -5921,12 +5919,11 @@ impl Executor {
             where_for_join
         };
 
-        // A grouped statement without windows that reads the joined rows as
-        // the join makes them, with no star over merged columns, aggregates
-        // them in parts as they are made
+        // A grouped statement that reads the joined rows as the join makes
+        // them, with no star over merged columns, aggregates them in parts as
+        // they are made, its windows run over its groups
         let shows_star = (stmt.columns.iter()).any(|c| matches!(c, Expression::Star(_)));
         let parts_shape = classification.has_aggregation
-            && !classification.has_window_functions
             && !(shows_star
                 && !(excluded_column_indices.is_empty() && join_col_renames.is_empty()));
         let merged = !(coalesced.is_empty()
@@ -6017,7 +6014,8 @@ impl Executor {
                 columns[at] = name;
             }
             let family = family.blocks();
-            return self.aggregate_joined(plan.as_deref(), stmt, ctx, source, &columns, family);
+            let run = (&**classification, family);
+            return self.aggregate_joined(plan.as_deref(), stmt, ctx, source, &columns, run);
         }
 
         // Apply WHERE clause if present
@@ -6871,7 +6869,10 @@ impl Executor {
             classification.has_aggregation,
             classification.has_window_functions,
         ) {
-            (true, true) => self.execute_aggregation_then_windows(stmt, ctx, &rows, columns, held),
+            (true, true) => {
+                let input = FeedInput::<JoinedRows<'_, '_>>::Rows(&rows);
+                self.execute_aggregation_then_windows(stmt, ctx, input, columns, held)
+            }
             (false, true) => self.execute_select_with_window_functions(stmt, ctx, &rows, columns),
             _ => {
                 let result =
@@ -6904,7 +6905,8 @@ impl Executor {
 
     /// A join's aggregate over the rows of `source`, of `columns`, read in
     /// parts as the join makes them: through the grouped blocks `family` of
-    /// the statement's family, else its calls fed by programs the `plan` holds
+    /// the statement's family, else its calls fed by programs the `plan`
+    /// holds, its windows, as `classification` says, run over its groups
     fn aggregate_joined(
         &self,
         plan: Option<&PreparedJoin>,
@@ -6912,13 +6914,23 @@ impl Executor {
         ctx: &ExecutionContext,
         source: JoinedRows<'_, '_>,
         columns: &[String],
-        family: Option<&super::prepared_select::PreparedGrouped>,
+        (classification, family): (
+            &QueryClassification,
+            Option<&super::prepared_select::PreparedGrouped>,
+        ),
     ) -> SelectResult {
         if let Some(held) = family {
             let input = FeedInput::Each(source, usize::MAX);
             return self.grouped_family_output(held, stmt, ctx, input, columns);
         }
         let feed = plan.map(|plan| plan.feed(columns));
+        if classification.has_window_functions {
+            let input = FeedInput::Each(source, usize::MAX);
+            let (result, layout) =
+                self.execute_aggregation_then_windows(stmt, ctx, input, columns, feed.as_deref())?;
+            let names = CompactArc::new(result.columns().to_vec());
+            return Ok((result, names, false, SelectShape::laid_out(layout)));
+        }
         let result = self.aggregate_each(stmt, ctx, source, columns, feed.as_deref())?;
         let layout = Self::result_layout(stmt, columns, None, result.columns());
         let names = CompactArc::new(result.columns().to_vec());

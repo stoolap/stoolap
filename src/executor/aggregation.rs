@@ -2668,18 +2668,18 @@ impl Executor {
         })
     }
 
-    /// Aggregate, then run the window functions over the aggregate's output,
-    /// the calls fed by the `held` feed when a plan holds one
-    pub(crate) fn execute_aggregation_then_windows(
+    /// Aggregate the rows of `input`, held or read as they come, then run the
+    /// window functions over the aggregate's output, the calls fed by the
+    /// `held` feed when a plan holds one
+    pub(super) fn execute_aggregation_then_windows(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
-        base_rows: &[(i64, Row)],
+        input: FeedInput<'_, impl RowSource>,
         base_columns: &[String],
         held: Option<&HeldFeed>,
     ) -> Result<WindowOutput> {
         let (aggregations, _) = self.parse_aggregations(stmt, Some(ctx))?;
-        let input = FeedInput::<ScannedRows<'_>>::Rows(base_rows);
         let path = AggregatePath::General;
         let run = (None, held, None);
         self.windows_over_groups(path, stmt, &aggregations, ctx, input, base_columns, run)
