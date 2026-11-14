@@ -672,6 +672,37 @@ fn a_storage_loop_over_filtered_candidates_or_unseen_rows_still_stops() {
     if !matches!(stopped, Err(Error::QueryCancelled)) {
         wrong.push(format!("{sql} over deleted sealed rows gave {stopped:?}"));
     }
+
+    // Index candidates committed after the snapshot: the store reads them
+    // and sees none, so only the charge before each run of ids can stop it
+    db.execute(
+        "CREATE TABLE q (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX q_k ON q (k)", ()).unwrap();
+    read(
+        &executor,
+        "BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT",
+        &ctx,
+    )
+    .unwrap();
+    read(&executor, "SELECT COUNT(*) FROM q", &ctx).unwrap();
+    db.execute(
+        "INSERT INTO q SELECT value, 1, value FROM generate_series(1, 10000)",
+        (),
+    )
+    .unwrap();
+    let sql = "SELECT * FROM q WHERE k = 1 AND ABS(v) < 0";
+    pass_deadline_after(DeadlineSite::StorageRead, 1);
+    let stopped = read(&executor, sql, &ctx);
+    keep_deadlines();
+    read(&executor, "ROLLBACK", &ctx).unwrap();
+    if !matches!(stopped, Err(Error::QueryCancelled)) {
+        wrong.push(format!(
+            "{sql} over rows the snapshot misses gave {stopped:?}"
+        ));
+    }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 

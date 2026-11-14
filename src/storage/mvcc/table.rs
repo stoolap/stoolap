@@ -3096,7 +3096,7 @@ impl MVCCTable {
 
     /// The rows of `row_ids` that `filter` keeps, the transaction's own
     /// versions first, added to `rows`; `deadline` is charged a run of ids
-    /// at a time. The global rows are read in one batch, under one lock
+    /// at a time. Untimed, the store's rows are read in one batch
     fn fetch_rows_charged(
         &self,
         row_ids: &[i64],
@@ -3154,13 +3154,13 @@ impl MVCCTable {
 
         // Step 2: Batch fetch from global store (single lock acquisition)
         if !global_ids.is_empty() {
+            if !deadline.is_none() {
+                return self.fetch_global_timed(global_ids, filter, rows, deadline);
+            }
             let global_rows = self
                 .version_store
                 .get_visible_versions_batch(global_ids, self.reader());
             self.check_read()?;
-            if !deadline.is_none() {
-                return self.keep_global_timed(global_rows, filter, rows, deadline);
-            }
 
             // Apply filter to fetched rows
             for (row_id, row) in global_rows {
@@ -3175,20 +3175,24 @@ impl MVCCTable {
         self.check_read()
     }
 
-    /// The filter loop of [`Self::fetch_rows_charged`] charging `deadline`
-    /// a run of rows at a time, compiled apart so the untimed loop holds no
-    /// charge, which costs a row loop its registers
+    /// The store's rows of [`Self::fetch_rows_charged`], read and filtered
+    /// a run of ids at a time, each charged before it is read; compiled
+    /// apart so the untimed loop holds no charge, which costs it registers
     #[inline(never)]
-    fn keep_global_timed(
+    fn fetch_global_timed(
         &self,
-        mut global_rows: RowVec,
+        global_ids: &[i64],
         filter: &dyn Expression,
         rows: &mut RowVec,
         deadline: Deadline,
     ) -> Result<()> {
         let fallible = filter.can_fail();
-        for batch in global_rows.chunks_mut(CHARGE_BEAT) {
-            deadline.charge(DeadlineSite::StorageRead, batch.len())?;
+        for ids in global_ids.chunks(CHARGE_BEAT) {
+            deadline.charge(DeadlineSite::StorageRead, ids.len())?;
+            let mut batch = self
+                .version_store
+                .get_visible_versions_batch(ids, self.reader());
+            self.check_read()?;
             for (row_id, row) in batch.iter_mut() {
                 let row = self.normalize_row_to_schema(std::mem::take(row), &self.cached_schema);
                 if passes(filter, fallible, &row)? {
