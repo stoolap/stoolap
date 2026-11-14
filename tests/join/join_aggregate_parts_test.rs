@@ -720,6 +720,146 @@ fn an_index_join_raises_its_on_error_before_the_where_reads_a_row() {
     assert!(err.to_string().contains("overflow"), "{err}");
 }
 
+/// `open`'s l and r, s: r's rows under sid, k, w, so l and s share k alone,
+/// and t: r's id and w under tid, x
+fn open_merged(name: &str) -> Database {
+    let db = open(name);
+    for sql in [
+        "CREATE TABLE s (sid INTEGER PRIMARY KEY, k INTEGER, w INTEGER)",
+        "INSERT INTO s SELECT id, k, w FROM r",
+        "CREATE TABLE t (tid INTEGER PRIMARY KEY, x INTEGER)",
+        "INSERT INTO t SELECT id, w FROM r",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    db
+}
+
+/// Per merged k of the rows a `kind` join of l and r on k makes: the count,
+/// the l rows, the r rows and the sum of r.w; an unmatched row's merged k is
+/// its own side's
+fn merged_groups(kind: &str) -> Vec<String> {
+    let mut groups: BTreeMap<i64, (i64, i64, i64, i64)> = BTreeMap::new();
+    for (l, r) in pairs() {
+        let group = groups.entry(l.1).or_default();
+        *group = (group.0 + 1, group.1 + 1, group.2 + 1, group.3 + r.2);
+    }
+    if kind == "LEFT" || kind == "FULL" {
+        for l in l_rows().filter(|l| !r_rows().any(|r| r.1 == l.1)) {
+            let group = groups.entry(l.1).or_default();
+            *group = (group.0 + 1, group.1 + 1, group.2, group.3);
+        }
+    }
+    if kind == "RIGHT" || kind == "FULL" {
+        for r in r_rows().filter(|r| !l_rows().any(|l| l.1 == r.1)) {
+            let group = groups.entry(r.1).or_default();
+            *group = (group.0 + 1, group.1, group.2 + 1, group.3 + r.2);
+        }
+    }
+    groups
+        .iter()
+        .map(|(k, (n, ls, rs, sum))| [int(*k), int(*n), int(*ls), int(*rs), int(*sum)].join("|"))
+        .collect()
+}
+
+#[test]
+fn using_and_natural_joins_are_grouped_by_their_merged_column_in_parts() {
+    let db = open_merged("join_aggregate_parts_using");
+    let want = merged_groups("INNER");
+    for sql in [
+        "SELECT k, COUNT(*), COUNT(l.id), COUNT(r.id), SUM(r.w) FROM l JOIN r USING (k) \
+         GROUP BY k ORDER BY k",
+        "SELECT k, COUNT(*), COUNT(l.id), COUNT(s.sid), SUM(s.w) FROM l NATURAL JOIN s \
+         GROUP BY k ORDER BY k",
+    ] {
+        assert_eq!(parted(&db, sql), want, "{sql}");
+    }
+    let mut by_g: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
+    for (l, r) in pairs() {
+        let group = by_g.entry(l.2).or_default();
+        *group = (group.0 + 1, group.1 + r.2);
+    }
+    let want: Vec<String> = by_g
+        .iter()
+        .map(|(g, (n, sum))| [int(*g), int(*n), int(*sum)].join("|"))
+        .collect();
+    let sql = "SELECT l.g, COUNT(*), SUM(r.w) FROM l JOIN r USING (k) GROUP BY l.g ORDER BY l.g";
+    assert_eq!(parted(&db, sql), want);
+}
+
+#[test]
+fn outer_using_joins_group_unmatched_rows_under_their_merged_column_in_parts() {
+    let db = open_merged("join_aggregate_parts_using_outer");
+    for kind in ["LEFT", "RIGHT", "FULL"] {
+        let sql = format!(
+            "SELECT k, COUNT(*), COUNT(l.id), COUNT(r.id), COALESCE(SUM(r.w), 0) \
+             FROM l {kind} JOIN r USING (k) GROUP BY k ORDER BY k"
+        );
+        assert_eq!(parted(&db, &sql), merged_groups(kind), "{kind}");
+    }
+}
+
+#[test]
+fn a_where_having_distinct_count_and_rollup_read_a_merged_column_in_parts() {
+    let db = open_merged("join_aggregate_parts_using_shapes");
+    let pairs = pairs();
+    let mut below: BTreeMap<i64, i64> = BTreeMap::new();
+    for (l, _) in pairs.iter().filter(|(l, r)| l.1 > 4 && l.0 < r.0) {
+        *below.entry(l.1).or_default() += 1;
+    }
+    let want: Vec<String> = (below.iter())
+        .filter(|(_, n)| **n > 5)
+        .map(|(k, n)| [int(*k), int(*n)].join("|"))
+        .collect();
+    let sql = "SELECT k, COUNT(*) FROM l JOIN r USING (k) WHERE k > 4 AND l.id < r.id \
+               GROUP BY k HAVING COUNT(*) > 5 ORDER BY k";
+    assert_eq!(parted(&db, sql), want);
+
+    let mut distinct: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
+    for (l, r) in &pairs {
+        distinct.entry(l.1).or_default().insert(r.2);
+    }
+    let want: Vec<String> = (distinct.iter())
+        .map(|(k, w)| [int(*k), int(w.len() as i64)].join("|"))
+        .collect();
+    let sql = "SELECT k, COUNT(DISTINCT w) FROM l NATURAL JOIN s GROUP BY k ORDER BY k";
+    assert_eq!(parted(&db, sql), want);
+
+    let mut counts: BTreeMap<i64, i64> = BTreeMap::new();
+    for (l, _) in &pairs {
+        *counts.entry(l.1).or_default() += 1;
+    }
+    let want: Vec<String> = std::iter::once((-1, pairs.len() as i64))
+        .chain(counts)
+        .map(|(k, n)| [int(k), int(n)].join("|"))
+        .collect();
+    let sql = "SELECT COALESCE(k, -1), COUNT(*) FROM l JOIN r USING (k) \
+               GROUP BY ROLLUP(k) ORDER BY 1";
+    assert_eq!(parted(&db, sql), want);
+}
+
+#[test]
+fn a_join_over_a_using_join_is_grouped_by_its_merged_column_in_parts() {
+    let db = open_merged("join_aggregate_parts_using_side");
+    let mut groups: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
+    for (l, r) in pairs() {
+        let ts = r_rows().filter(|t| t.2 == r.2).count() as i64;
+        let group = groups.entry(l.1).or_default();
+        *group = (group.0 + ts, group.1 + ts * r.2);
+    }
+    let want: Vec<String> = groups
+        .iter()
+        .map(|(k, (n, sum))| [int(*k), int(*n), int(*sum)].join("|"))
+        .collect();
+    let sql = "SELECT k, COUNT(*), SUM(t.x) FROM l JOIN r USING (k) \
+               JOIN t ON t.x = r.w GROUP BY k ORDER BY k";
+    #[cfg(feature = "test-failpoints")]
+    stoolap::test_failpoints::reset_join_paths();
+    assert_eq!(parted(&db, sql), want);
+    #[cfg(feature = "test-failpoints")]
+    assert_eq!(stoolap::test_failpoints::join_paths_taken(), vec!["hash"]);
+}
+
 #[cfg(feature = "test-failpoints")]
 mod made_as_read {
     use std::sync::atomic::{AtomicI64, Ordering};
