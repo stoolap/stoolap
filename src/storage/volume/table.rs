@@ -8958,7 +8958,15 @@ impl Table for SegmentedTable {
                         && !hot_skip_ref.contains(&row_ids[i])
                 };
                 let end = vol.meta.row_count;
-                let Some(start) = (0..end).find(|&i| visible(i)) else {
+                let mut first = None;
+                for rows in row_groups(0..end) {
+                    deadline.charge(DeadlineSite::StorageAggregate, rows.len())?;
+                    first = rows.into_iter().find(|&i| visible(i));
+                    if first.is_some() {
+                        break;
+                    }
+                }
+                let Some(start) = first else {
                     return Ok(true);
                 };
 

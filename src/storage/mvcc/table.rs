@@ -148,21 +148,30 @@ impl LocalIds {
 }
 
 /// Keeps, in order, the entries of `entries` from `start` on whose row
-/// `filter` keeps, and returns how many entries are left. Run with no guard
-/// on the transaction's rows held: a filter may write through another handle
+/// `filter` keeps, and returns how many entries are left, charging `site` a
+/// run of entries at a time. Run with no guard on the transaction's rows
+/// held: a filter may write through another handle
 fn keep_passing<T>(
     entries: &mut [T],
     start: usize,
     row: impl Fn(&T) -> &Row,
     filter: &dyn Expression,
     fallible: bool,
+    deadline: Deadline,
+    site: DeadlineSite,
 ) -> Result<usize> {
     let mut kept = start;
-    for i in start..entries.len() {
-        if passes(filter, fallible, row(&entries[i]))? {
-            entries.swap(kept, i);
-            kept += 1;
+    let mut from = start;
+    while from < entries.len() {
+        let to = (from + CHARGE_BEAT).min(entries.len());
+        deadline.charge(site, to - from)?;
+        for i in from..to {
+            if passes(filter, fallible, row(&entries[i]))? {
+                entries.swap(kept, i);
+                kept += 1;
+            }
         }
+        from = to;
     }
     Ok(kept)
 }
@@ -2770,7 +2779,15 @@ impl MVCCTable {
                     }
                 }
                 // The index may match in part
-                let kept = keep_passing(&mut plan.hot, start, |(_, row, _)| row, expr, fallible)?;
+                let kept = keep_passing(
+                    &mut plan.hot,
+                    start,
+                    |(_, row, _)| row,
+                    expr,
+                    fallible,
+                    deadline,
+                    DeadlineSite::StorageUpdate,
+                )?;
                 plan.hot.truncate(kept);
                 if !remaining_row_ids.is_empty() {
                     let batch_rows = self
@@ -2870,7 +2887,15 @@ impl MVCCTable {
             }
         }
         if let Some(expr) = where_expr {
-            let kept = keep_passing(&mut plan.hot, joined, |(_, row, _)| row, expr, fallible)?;
+            let kept = keep_passing(
+                &mut plan.hot,
+                joined,
+                |(_, row, _)| row,
+                expr,
+                fallible,
+                deadline,
+                DeadlineSite::StorageUpdate,
+            )?;
             plan.hot.truncate(kept);
         }
         self.set_planned(plan, start, setter)
@@ -3064,8 +3089,12 @@ impl MVCCTable {
         if !plan.names_keys() {
             row_ids.extend(self.local_ids_missing_from(plan, filter, &row_ids));
         }
-        deadline.charge(DeadlineSite::StorageRead, row_ids.len())?;
-        self.fetch_rows_by_ids(&row_ids, filter).map(Some)
+        let mut rows = RowVec::with_capacity(row_ids.len());
+        for ids in row_ids.chunks(CHARGE_BEAT) {
+            deadline.charge(DeadlineSite::StorageRead, ids.len())?;
+            self.fetch_rows_by_ids_into(ids, filter, &mut rows)?;
+        }
+        Ok(Some(rows))
     }
 
     /// The row an `IndexPlan::Key` names in `filter`, the transaction's own
@@ -3217,7 +3246,15 @@ impl Table for MVCCTable {
                 }
             }
             drop(txn_versions);
-            let kept = keep_passing(rows.as_mut_slice(), start, |(_, row)| row, filter, fallible)?;
+            let kept = keep_passing(
+                rows.as_mut_slice(),
+                start,
+                |(_, row)| row,
+                filter,
+                fallible,
+                Deadline::NONE,
+                DeadlineSite::StorageRead,
+            )?;
             rows.truncate(kept);
             &global_row_ids
         } else {
@@ -3665,6 +3702,8 @@ impl Table for MVCCTable {
                     |(_, row)| row,
                     expr,
                     fallible,
+                    deadline,
+                    DeadlineSite::StorageDelete,
                 )?;
                 rows_to_delete.truncate(kept);
 

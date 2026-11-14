@@ -584,6 +584,98 @@ fn a_scan_charges_the_rows_its_pushed_filter_rejects() {
 }
 
 #[test]
+fn a_storage_loop_over_filtered_candidates_or_unseen_rows_still_stops() {
+    let _guard = FailpointGuard::new();
+    let db = Database::open("memory://statement_deadline_filtered_candidates").unwrap();
+    for sql in [
+        "CREATE TABLE w (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        "CREATE INDEX w_k ON w (k)",
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        "INSERT INTO r SELECT value, value % 2, value FROM generate_series(1, 20000)",
+        "CREATE INDEX r_k ON r (k)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let executor = Executor::new(std::sync::Arc::clone(db.engine()));
+    let mut ctx = ExecutionContext::new();
+    ctx.set_timeout_ms(3_600_000);
+    // Each passes one charge more than the statement makes without the
+    // charges of its filter's loop
+    let shapes = [
+        (
+            DeadlineSite::StorageUpdate,
+            true,
+            "UPDATE w SET v = v + 1 WHERE ABS(v) < 0",
+            10_001,
+        ),
+        (
+            DeadlineSite::StorageUpdate,
+            true,
+            "UPDATE w SET v = v + 1 WHERE k = 1 AND ABS(v) < 0",
+            5_001,
+        ),
+        (
+            DeadlineSite::StorageDelete,
+            true,
+            "DELETE FROM w WHERE k = 1 AND ABS(v) < 0",
+            3,
+        ),
+        (
+            DeadlineSite::StorageRead,
+            false,
+            "SELECT * FROM r WHERE k = 1 AND ABS(v) < 0",
+            2,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (site, own_rows, sql, passed) in shapes {
+        read(&executor, "BEGIN", &ctx).unwrap();
+        if own_rows {
+            let insert =
+                "INSERT INTO w SELECT value, value % 2, value FROM generate_series(1, 10000)";
+            read(&executor, insert, &ctx).unwrap();
+        }
+        pass_deadline_after(site, passed);
+        let stopped = read(&executor, sql, &ctx);
+        keep_deadlines();
+        read(&executor, "ROLLBACK", &ctx).unwrap();
+        if !matches!(stopped, Err(Error::QueryCancelled)) {
+            wrong.push(format!("{sql} past {passed} charges gave {stopped:?}"));
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!(
+        "file://{}?checkpoint_interval=3600&compact_threshold=1000",
+        dir.path().display()
+    );
+    let sealed = Database::open(&dsn).unwrap();
+    sealed
+        .execute(
+            "CREATE TABLE s (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+            (),
+        )
+        .unwrap();
+    sealed
+        .execute(
+            "INSERT INTO s SELECT value, value % 50, value FROM generate_series(1, 140000)",
+            (),
+        )
+        .unwrap();
+    sealed.engine().seal_for_test().unwrap();
+    sealed.execute("DELETE FROM s WHERE id >= 0", ()).unwrap();
+    let cold = Executor::new(std::sync::Arc::clone(sealed.engine()));
+    let sql = "SELECT k, SUM(v) FROM s GROUP BY k";
+    pass_deadline_after(DeadlineSite::StorageAggregate, 1);
+    let stopped = read(&cold, sql, &ctx);
+    keep_deadlines();
+    if !matches!(stopped, Err(Error::QueryCancelled)) {
+        wrong.push(format!("{sql} over deleted sealed rows gave {stopped:?}"));
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
 fn an_aggregation_split_over_the_thread_pool_stops_at_its_deadline() {
     let _guard = FailpointGuard::new();
     let db = Database::open("memory://statement_deadline_split_aggregate").unwrap();
