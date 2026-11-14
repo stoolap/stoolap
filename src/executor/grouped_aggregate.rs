@@ -15,7 +15,7 @@
 //! A statement that groups one table by one column without WHERE: the one
 //! rule that says where its groups come from, and the run of that source
 
-use crate::common::deadline::DeadlineSite;
+use crate::common::deadline::{Deadline, DeadlineSite};
 use crate::common::names::eq_names;
 use crate::core::{Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::{Expression, GroupByModifier, SelectStatement};
@@ -199,7 +199,8 @@ impl Executor {
         let columns = Self::call_columns(aggregations, all_columns);
         let stored = match source {
             GroupedSource::Storage => {
-                Self::stored_groups(table, group_index, aggregations, &columns)?
+                let deadline = ctx.deadline_of_call();
+                Self::stored_groups(table, group_index, aggregations, &columns, deadline)?
             }
             GroupedSource::SortedStream | GroupedSource::Hash => None,
         };
@@ -255,6 +256,7 @@ impl Executor {
         group_index: usize,
         aggregations: &[SqlAggregateFunction],
         columns: &[Option<usize>],
+        deadline: Deadline,
     ) -> Result<Option<RowVec>> {
         use crate::storage::mvcc::version_store::AggregateOp;
         if aggregations.is_empty() {
@@ -280,7 +282,7 @@ impl Executor {
             };
             ops.push(op);
         }
-        match table.compute_grouped_aggregates(&[group_index], &ops)? {
+        match table.compute_grouped_aggregates(&[group_index], &ops, deadline)? {
             Some(groups) => groups.into_rows().map(Some),
             None => Ok(None),
         }

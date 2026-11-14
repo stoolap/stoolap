@@ -212,7 +212,8 @@ fn three_rounds_a_seal_moved_end_in_a_write_conflict_with_no_read_under_the_fenc
     filter.prepare_for_schema(table.schema());
     let plan = table.index_plan(&filter);
     let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-    let result = table.update(access, Some(&filter), &mut set_v(&mut calls));
+    let none = stoolap::executor::Deadline::NONE;
+    let result = table.update(access, Some(&filter), &mut set_v(&mut calls), none);
     let (outside, under) = delta(block_file_reads(), before);
     let other_under = delta(other_reads_under_fence(), other_before);
     let seen = rows_through(table.as_ref());
@@ -253,7 +254,12 @@ fn the_rows_read_back_through_the_transaction_show_its_own_writes() {
     let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
     assert_eq!(
         table
-            .update(access, Some(&filter), &mut set_v(&mut calls))
+            .update(
+                access,
+                Some(&filter),
+                &mut set_v(&mut calls),
+                stoolap::executor::Deadline::NONE,
+            )
             .unwrap(),
         2
     );

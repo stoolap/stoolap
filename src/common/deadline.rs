@@ -78,11 +78,19 @@ pub enum DeadlineSite {
     Tvf,
     /// The rows an aggregation folds into groups and the groups it reads
     Aggregate,
+    /// The rows a storage DELETE judges, hot and sealed
+    StorageDelete,
+    /// The rows a storage UPDATE judges, hot and sealed
+    StorageUpdate,
+    /// The rows a storage read hands a statement, hot and sealed
+    StorageRead,
+    /// The rows a storage aggregate folds, hot and sealed
+    StorageAggregate,
 }
 
 impl DeadlineSite {
     /// Every site, which a test stops a statement at in turn
-    pub const ALL: [DeadlineSite; 22] = [
+    pub const ALL: [DeadlineSite; 26] = [
         DeadlineSite::Scan,
         DeadlineSite::LateKeys,
         DeadlineSite::Block,
@@ -105,6 +113,10 @@ impl DeadlineSite {
         DeadlineSite::RecursiveCte,
         DeadlineSite::Tvf,
         DeadlineSite::Aggregate,
+        DeadlineSite::StorageDelete,
+        DeadlineSite::StorageUpdate,
+        DeadlineSite::StorageRead,
+        DeadlineSite::StorageAggregate,
     ];
 }
 
@@ -132,10 +144,16 @@ impl Deadline {
         self.0
     }
 
+    /// Whether the work runs to its end, so a loop can leave out its charges
+    #[inline(always)]
+    pub(crate) fn is_none(self) -> bool {
+        self.0.is_none()
+    }
+
     /// Count `units` of work at `site`; the clock is read when the thread's
     /// beat runs out, and at every charge once the deadline has passed
     #[inline]
-    pub(crate) fn charge(self, site: DeadlineSite, units: usize) -> Result<()> {
+    pub fn charge(self, site: DeadlineSite, units: usize) -> Result<()> {
         match self.0 {
             None => Ok(()),
             Some(at) => charge_until(at, site, units),
@@ -143,7 +161,7 @@ impl Deadline {
     }
 
     /// Fail when the deadline has passed, reading the clock now
-    pub(crate) fn check(self) -> Result<()> {
+    pub fn check(self) -> Result<()> {
         match self.0 {
             None => Ok(()),
             Some(at) => passed(at, None),

@@ -42,7 +42,7 @@ use super::query_cache::{
 use super::result::{ExecResult, ExecutorResult};
 use super::utils::qualified;
 use super::Executor;
-use crate::common::deadline::DeadlineSite;
+use crate::common::deadline::{Deadline, DeadlineSite};
 use std::sync::RwLock;
 
 pub(super) struct StatementRollback<'a> {
@@ -2871,7 +2871,12 @@ impl Executor {
                                 plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index)
                             }
                         };
-                        table.update(access, expr.as_deref(), &mut setter)?
+                        table.update(
+                            access,
+                            expr.as_deref(),
+                            &mut setter,
+                            ctx.deadline_of_call(),
+                        )?
                     }
                 }
             } else {
@@ -2879,7 +2884,12 @@ impl Executor {
                 // asks each the part it does not take
                 let plan = where_expr.as_deref().and_then(|e| table.index_plan(e));
                 let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-                table.update(access, where_expr.as_deref(), &mut setter)?
+                table.update(
+                    access,
+                    where_expr.as_deref(),
+                    &mut setter,
+                    ctx.deadline_of_call(),
+                )?
             };
             rows
         };
@@ -3252,7 +3262,13 @@ impl Executor {
             } else {
                 let plan = where_expr.as_deref().and_then(|e| table.index_plan(e));
                 let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-                Some(table.scan_access(access, &column_indices, None, where_expr.as_deref())?)
+                Some(table.scan_access(
+                    access,
+                    &column_indices,
+                    None,
+                    where_expr.as_deref(),
+                    ctx.deadline_of_call(),
+                )?)
             };
 
             while let Some(scanner) = scanner.as_mut() {
@@ -3439,7 +3455,7 @@ impl Executor {
                     plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index)
                 }
             };
-            table.delete(access, where_expr.as_deref())?
+            table.delete(access, where_expr.as_deref(), ctx.deadline_of_call())?
         };
 
         // Invalidate semantic cache for this table BEFORE commit
@@ -3951,7 +3967,12 @@ impl Executor {
         } else {
             let plan = where_expr.as_deref().and_then(|e| table.index_plan(e));
             let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-            table.update(access, where_expr.as_deref(), &mut setter)?
+            table.update(
+                access,
+                where_expr.as_deref(),
+                &mut setter,
+                ctx.deadline_of_call(),
+            )?
         };
         if let (Some(rows), true) = (affected, updated > 0) {
             rows.insert(row_id);
@@ -4081,7 +4102,13 @@ impl Executor {
         };
         let plan = table.index_plan(&*scan_expr);
         let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-        let mut scanner = table.scan_access(access, &column_indices, None, Some(&*scan_expr))?;
+        let mut scanner = table.scan_access(
+            access,
+            &column_indices,
+            None,
+            Some(&*scan_expr),
+            Deadline::NONE,
+        )?;
 
         let result = if scanner.next() {
             let row_id = scanner.current_row_id();

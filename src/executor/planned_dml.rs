@@ -17,6 +17,7 @@
 
 use std::sync::{Arc, RwLock};
 
+use crate::common::deadline::Deadline;
 use crate::common::names::eq_names;
 use crate::common::{CompactArc, SmartString};
 use crate::core::{DataType, Result, Row, Schema, Value};
@@ -501,8 +502,9 @@ impl Executor {
         let access = ScanAccess::Index(&IndexPlan::Key);
         // Whether the row an UPDATE set got a value it did not hold
         let mut changed = false;
+        let deadline = ctx.map_or(Deadline::NONE, ExecutionContext::deadline_of_call);
         let written = match plan.write {
-            DmlWrite::Delete => table.delete(access, Some(&pk_expr)),
+            DmlWrite::Delete => table.delete(access, Some(&pk_expr), deadline),
             DmlWrite::Update(_) => {
                 let mut vm = super::expression::ExprVM::new();
                 let mut setter = |_: i64, mut row: Row| -> Result<(Row, bool)> {
@@ -539,7 +541,7 @@ impl Executor {
                     }
                     Ok((row, true))
                 };
-                table.update(access, Some(&pk_expr), &mut setter)
+                table.update(access, Some(&pk_expr), &mut setter, deadline)
             }
         };
         // A write that outlasted its deadline is undone

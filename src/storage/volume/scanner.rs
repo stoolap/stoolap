@@ -25,6 +25,7 @@
 
 use std::sync::Arc;
 
+use crate::common::deadline::{Deadline, DeadlineSite};
 use crate::common::smart_string::cmp_bytes;
 use crate::common::SmartString;
 use crate::core::value::float_word;
@@ -187,6 +188,8 @@ pub struct VolumeScanner {
     /// The commits a tombstone counts for: those complete before the read's
     /// hot rows were read, or a snapshot's
     pub cut: CommitCut,
+    /// Charged with the rows the scan reads, kept or not, a group at a time
+    pub deadline: Deadline,
     /// Typed pre-filter predicates extracted from the WHERE clause.
     /// Evaluated directly on column data without Value construction.
     typed_predicates: Vec<ColumnPredicate>,
@@ -531,6 +534,7 @@ impl VolumeScanner {
             committed_tombstones: None,
             view: None,
             cut: CommitCut::every(),
+            deadline: Deadline::NONE,
             typed_predicates: Vec::new(),
             needed_cols: None,
             wanted: false,
@@ -599,6 +603,7 @@ impl VolumeScanner {
             committed_tombstones: None,
             view: None,
             cut: CommitCut::every(),
+            deadline: Deadline::NONE,
             typed_predicates: Vec::new(),
             needed_cols: None,
             wanted: false,
@@ -703,6 +708,7 @@ impl VolumeScanner {
             committed_tombstones: None,
             view: None,
             cut: CommitCut::every(),
+            deadline: Deadline::NONE,
             typed_predicates: Vec::new(),
             needed_cols: None,
             wanted: false,
@@ -839,6 +845,8 @@ impl VolumeScanner {
                     if gs >= self.end_idx || ge <= self.current_idx || self.group_pruned(gi) {
                         continue;
                     }
+                    let rows = ge - gs.max(self.current_idx);
+                    self.deadline.charge(DeadlineSite::StorageRead, rows)?;
                     let mut group_cols = Vec::with_capacity(self.dict_filters.len());
                     let mut failed = None;
                     for &(ci, _) in &self.dict_filters {
@@ -917,6 +925,7 @@ impl VolumeScanner {
                         lo = hi;
                         continue;
                     }
+                    self.deadline.charge(DeadlineSite::StorageRead, hi - lo)?;
                     let filters: smallvec::SmallVec<[super::column::DictFilter<'_>; 4]> =
                         dict_columns
                             .iter()
@@ -937,6 +946,8 @@ impl VolumeScanner {
                 }
                 if !vectorized {
                     m.clear();
+                    let rows = self.end_idx - self.current_idx;
+                    self.deadline.charge(DeadlineSite::StorageRead, rows)?;
                     for i in self.current_idx..self.end_idx {
                         let ok = dict_columns
                             .iter()
@@ -1644,6 +1655,7 @@ impl VolumeScanner {
                     }
                 };
 
+                self.deadline.charge(DeadlineSite::StorageRead, 1)?;
                 if self.should_skip_row(idx) {
                     continue;
                 }
@@ -1696,6 +1708,8 @@ impl VolumeScanner {
                         continue;
                     }
                 }
+                let rows = self.next_group_boundary - self.current_idx;
+                self.deadline.charge(DeadlineSite::StorageRead, rows)?;
 
                 // Load per-group cache (V4 only)
                 if use_group_cache {

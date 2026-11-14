@@ -18,6 +18,7 @@
 //!
 
 use crate::common::cow_btree::MAX_KEYS;
+use crate::common::deadline::Deadline;
 use crate::common::CompactArc;
 use crate::core::{Result, Row, RowVec, Schema};
 use crate::storage::expression::Expression;
@@ -212,6 +213,7 @@ pub(crate) struct HotScanner {
     source: Option<(HotRows, StatementView)>,
     txn_id: i64,
     filter: Option<ScanFilter>,
+    deadline: Deadline,
     schema: CompactArc<Schema>,
     /// The columns each row is cut to, empty for the whole row
     projection: Vec<usize>,
@@ -237,6 +239,7 @@ impl HotScanner {
         filter: Option<&dyn Expression>,
         schema: CompactArc<Schema>,
         column_indices: &[usize],
+        deadline: Deadline,
     ) -> Self {
         // A step stops at the end of a leaf, so it may read a leaf more
         let rows = RowVec::with_capacity((MAX_STEP_ROWS + MAX_KEYS).min(source.held()));
@@ -244,6 +247,7 @@ impl HotScanner {
             source: Some((source, view)),
             txn_id: reader.txn_id,
             filter: filter.map(|filter| ScanFilter::new(&schema, filter)),
+            deadline,
             projection: projection(&schema, column_indices),
             schema,
             normalize: None,
@@ -268,12 +272,13 @@ impl HotScanner {
             txn_id: self.txn_id,
             view: Some(view),
         };
+        let deadline = self.deadline;
         let more = match &self.filter {
-            None => source.fill(reader, &mut self.rows, self.step, |_| {
+            None => source.fill(reader, &mut self.rows, self.step, deadline, |_| {
                 stepped();
                 Ok(true)
             })?,
-            Some(filter) => source.fill(reader, &mut self.rows, self.step, |row| {
+            Some(filter) => source.fill(reader, &mut self.rows, self.step, deadline, |row| {
                 stepped();
                 filter.passes(row)
             })?,

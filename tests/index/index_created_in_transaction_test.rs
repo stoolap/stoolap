@@ -54,10 +54,15 @@ fn a_row_rekeyed_after_the_index_was_created_in_its_transaction_frees_the_old_ke
         t.insert(row(1, 10)).unwrap();
         t.create_index_with_type("ix", columns, true, index_type)
             .unwrap();
-        t.update(ScanAccess::Seq, None, &mut |_, mut r| {
-            r.set(1, Value::Integer(20)).unwrap();
-            Ok((r, true))
-        })
+        t.update(
+            ScanAccess::Seq,
+            None,
+            &mut |_, mut r| {
+                r.set(1, Value::Integer(20)).unwrap();
+                Ok((r, true))
+            },
+            stoolap::executor::Deadline::NONE,
+        )
         .unwrap();
         drop(t);
         tx.commit().unwrap();

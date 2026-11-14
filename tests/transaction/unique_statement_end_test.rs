@@ -506,10 +506,15 @@ fn a_unique_index_a_transaction_creates_is_judged_by_its_own_rows() {
         let mut table = txn.get_table("t").unwrap();
         // Rows committed with distinct values the transaction gives one value
         table
-            .update(ScanAccess::Seq, None, &mut |_, mut row| {
-                row.set(2, Value::Integer(7)).unwrap();
-                Ok((row, true))
-            })
+            .update(
+                ScanAccess::Seq,
+                None,
+                &mut |_, mut row| {
+                    row.set(2, Value::Integer(7)).unwrap();
+                    Ok((row, true))
+                },
+                stoolap::executor::Deadline::NONE,
+            )
             .unwrap();
         let created = table.create_index("t_w", &["w"], true);
         drop(table);

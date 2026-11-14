@@ -29,7 +29,13 @@ fn scan(db: &Database, list: &[Value]) -> Vec<String> {
     let plan = table.index_plan(&expr);
     let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
     let mut scanner = table
-        .scan_access(access, &[0, 1], None, Some(&expr))
+        .scan_access(
+            access,
+            &[0, 1],
+            None,
+            Some(&expr),
+            stoolap::executor::Deadline::NONE,
+        )
         .unwrap();
     let mut out = Vec::new();
     while scanner.next() {

@@ -108,7 +108,9 @@ fn pair(id: i64, row: &stoolap::core::Row) -> (i64, i64) {
 fn state(table: &dyn Table) -> Vec<(i64, i64)> {
     let seen = rows(table, None);
     let mut scanned = Vec::new();
-    let mut scanner = table.scan(&[0, 1], None).unwrap();
+    let mut scanner = table
+        .scan(&[0, 1], None, stoolap::executor::Deadline::NONE)
+        .unwrap();
     while scanner.next() {
         scanned.push(pair(0, scanner.row()));
     }
@@ -139,7 +141,13 @@ fn state(table: &dyn Table) -> Vec<(i64, i64)> {
         let plan = table.index_plan(&key);
         let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
         let mut scanner = table
-            .scan_access(access, &[0, 1], None, Some(&key))
+            .scan_access(
+                access,
+                &[0, 1],
+                None,
+                Some(&key),
+                stoolap::executor::Deadline::NONE,
+            )
             .unwrap();
         while scanner.next() {
             looked_up.push(pair(id, scanner.row()));

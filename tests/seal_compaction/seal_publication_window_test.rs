@@ -257,7 +257,14 @@ fn ordered_pk_rows_inside_a_seal_keep_a_cold_row_updated_before_it() {
     let table = tx.get_table("t").unwrap();
     let rows = inside_seal(&db, Hold::IndexesCleaned, None, || {
         let rows = table
-            .collect_rows_ordered_by_index("id", true, false, 100, 0)
+            .collect_rows_ordered_by_index(
+                "id",
+                true,
+                false,
+                100,
+                0,
+                stoolap::executor::Deadline::NONE,
+            )
             .unwrap()
             .expect("the ordered primary key path answers");
         row_pairs(&rows)

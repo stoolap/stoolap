@@ -240,7 +240,7 @@ fn a_delete_finds_the_rows_its_transaction_changed_with_no_allocation_under_the_
         slot.set(other.update_by_row_ids(&[1, 2, 3, 4, 5, 6], &mut set).ok());
     });
     let before = UNDER_PENDING_LOCK.with(Cell::get);
-    let deleted = deleter.delete(ScanAccess::Seq, None);
+    let deleted = deleter.delete(ScanAccess::Seq, None, stoolap::executor::Deadline::NONE);
     let under = UNDER_PENDING_LOCK.with(Cell::get) - before;
     drop(deleter);
     txn.commit().unwrap();

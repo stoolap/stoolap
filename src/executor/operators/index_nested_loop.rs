@@ -145,7 +145,7 @@ impl TextReads {
         let columns: Vec<usize> = (0..width).collect();
         let mut needed = vec![false; width];
         needed[column] = true;
-        let mut scanner = table.scan_needed(&columns, &needed, None)?;
+        let mut scanner = table.scan_needed(&columns, &needed, None, deadline)?;
         let mut by_read: ValueMap<SmallVec<[i64; 2]>> = ValueMap::default();
         while scanner.next() {
             deadline.charge(DeadlineSite::IndexProbe, 1)?;
@@ -197,7 +197,7 @@ impl ViewKeys {
         let columns: Vec<usize> = (0..width).collect();
         let mut needed = vec![false; width];
         needed[column] = true;
-        let mut scanner = table.scan_needed(&columns, &needed, None)?;
+        let mut scanner = table.scan_needed(&columns, &needed, None, deadline)?;
         let mut by_key: ValueMap<SmallVec<[i64; 2]>> = ValueMap::default();
         while scanner.next() {
             deadline.charge(DeadlineSite::IndexProbe, 1)?;

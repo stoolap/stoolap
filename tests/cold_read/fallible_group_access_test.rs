@@ -379,7 +379,7 @@ fn range_scan_setup_propagates_boundary_failure() {
     use stoolap::storage::traits::Table;
     let table = malformed_warm_table();
     let filter = ComparisonExpr::gte("b", Value::Integer(1));
-    match table.scan(&[0], Some(&filter)) {
+    match table.scan(&[0], Some(&filter), stoolap::executor::Deadline::NONE) {
         Err(Error::Io { message }) => assert_eq!(message, "invalid column block length"),
         Err(error) => panic!("unexpected error: {error:?}"),
         Ok(_) => panic!("boundary failure became a successful scan"),
@@ -408,7 +408,9 @@ fn range_scan_without_group_metadata_preserves_matching_rows() {
     Arc::get_mut(&mut volume.meta).unwrap().row_groups.clear();
     let table = warm_table(volume);
     let filter = ComparisonExpr::gte("b", Value::Integer(ROW_GROUP_SIZE as i64 + 1));
-    let mut scanner = table.scan(&[0], Some(&filter)).unwrap();
+    let mut scanner = table
+        .scan(&[0], Some(&filter), stoolap::executor::Deadline::NONE)
+        .unwrap();
     let mut ids = Vec::new();
     while scanner.next() {
         ids.push(scanner.current_row_id());
@@ -1186,6 +1188,7 @@ fn warm_filtered_aggregation_propagates_column_failure() {
             .compute_filtered_aggregates(
                 &[(AggregateOp::Sum, 1)],
                 &ComparisonExpr::gte("a", Value::Integer(0)),
+                stoolap::executor::Deadline::NONE,
             )
             .map(drop)
     });
@@ -1197,7 +1200,11 @@ fn warm_grouped_aggregation_propagates_column_failure() {
     use stoolap::storage::traits::Table;
     assert_warm_read_failure(|table| {
         table
-            .compute_grouped_aggregates(&[0], &[(AggregateOp::Sum, 1)])
+            .compute_grouped_aggregates(
+                &[0],
+                &[(AggregateOp::Sum, 1)],
+                stoolap::executor::Deadline::NONE,
+            )
             .map(drop)
     });
 }
@@ -1213,7 +1220,7 @@ fn fully_hidden_warm_columns_are_not_decoded() {
     assert_eq!(table.get_partition_count("b").unwrap(), Some(0));
     assert!(table.get_partition_values("b").unwrap().unwrap().is_empty());
     assert!(table
-        .collect_rows_grouped_by_partition("b")
+        .collect_rows_grouped_by_partition("b", stoolap::executor::Deadline::NONE)
         .unwrap()
         .unwrap()
         .is_empty());
@@ -1223,7 +1230,11 @@ fn fully_hidden_warm_columns_are_not_decoded() {
         .unwrap()
         .is_empty());
     assert!(table
-        .compute_grouped_aggregates(&[0], &[(AggregateOp::Sum, 1)])
+        .compute_grouped_aggregates(
+            &[0],
+            &[(AggregateOp::Sum, 1)],
+            stoolap::executor::Deadline::NONE,
+        )
         .unwrap()
         .unwrap()
         .is_empty());

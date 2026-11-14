@@ -116,11 +116,19 @@ captured_rows_test!(captured_update_versions, |store, id| update_rows(
     store.get_visible_versions_for_update(&[1], id)
 ));
 captured_rows_test!(captured_update_rows, |store, id| update_rows(
-    store.get_all_visible_rows_for_update(id)
+    store
+        .get_all_visible_rows_for_update(id, stoolap::executor::Deadline::NONE)
+        .unwrap()
 ));
 captured_rows_test!(captured_filtered_update, |store, id| update_rows(
     store
-        .get_all_visible_rows_for_update_filtered(id, &balance_filter(), |_| false, |_| false)
+        .get_all_visible_rows_for_update_filtered(
+            id,
+            &balance_filter(),
+            |_| false,
+            |_| false,
+            stoolap::executor::Deadline::NONE
+        )
         .unwrap()
 ));
 captured_rows_test!(captured_limited_rows, |store, id| store
@@ -144,7 +152,11 @@ captured_rows_test!(captured_keyset, |store, id| store.collect_rows_keyset(
     1
 ));
 captured_rows_test!(captured_filtered_rows, |store, id| store
-    .get_all_visible_rows_filtered(id.into(), &balance_filter())
+    .get_all_visible_rows_filtered(
+        id.into(),
+        &balance_filter(),
+        stoolap::executor::Deadline::NONE
+    )
     .unwrap());
 captured_rows_test!(captured_filtered_callback, |store, id| {
     let mut rows = RowVec::new();

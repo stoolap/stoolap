@@ -712,7 +712,7 @@ fn every_row_with_one_its_transaction_changed_since_the_round_is_deleted_once() 
     let mut txn = db.engine().begin_transaction().unwrap();
     let mut deleter = txn.get_table("t").unwrap();
     let done = update_through_another_handle(txn.get_table("t").unwrap(), &[1]);
-    let deleted = deleter.delete(ScanAccess::Seq, None);
+    let deleted = deleter.delete(ScanAccess::Seq, None, stoolap::executor::Deadline::NONE);
     drop(deleter);
     txn.commit().unwrap();
     assert_eq!(
@@ -739,7 +739,7 @@ fn a_row_its_transaction_changed_since_the_round_meets_the_filter_again() {
     filter.prepare_for_schema(deleter.schema());
     let plan = deleter.index_plan(&filter);
     let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-    let deleted = deleter.delete(access, Some(&filter));
+    let deleted = deleter.delete(access, Some(&filter), stoolap::executor::Deadline::NONE);
     drop(deleter);
     txn.commit().unwrap();
     assert_eq!(
@@ -767,7 +767,7 @@ fn a_key_its_transaction_changed_since_the_round_is_deleted_once() {
     key.prepare_for_schema(deleter.schema());
     let plan = deleter.index_plan(&key);
     let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-    let deleted = deleter.delete(access, Some(&key));
+    let deleted = deleter.delete(access, Some(&key), stoolap::executor::Deadline::NONE);
     drop(deleter);
     txn.commit().unwrap();
     assert_eq!(
@@ -800,7 +800,7 @@ fn more_rows_than_fit_inline_its_transaction_changed_since_the_round_are_deleted
     let mut txn = db.engine().begin_transaction().unwrap();
     let mut deleter = txn.get_table("t").unwrap();
     let done = update_through_another_handle(txn.get_table("t").unwrap(), &[6, 1, 5, 2, 4, 3]);
-    let deleted = deleter.delete(ScanAccess::Seq, None);
+    let deleted = deleter.delete(ScanAccess::Seq, None, stoolap::executor::Deadline::NONE);
     drop(deleter);
     txn.commit().unwrap();
     assert_eq!(

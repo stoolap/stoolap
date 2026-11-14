@@ -420,11 +420,16 @@ fn an_update_written_before_a_column_change_cannot_commit() {
             .unwrap();
         let plan = older.index_plan(&by_key);
         let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-        let updated = older.update(access, Some(&by_key), &mut |_, row| {
-            let mut values: Vec<Value> = row.iter().cloned().collect();
-            values[2] = Value::text("new-b");
-            Ok((Row::from_values(values), true))
-        });
+        let updated = older.update(
+            access,
+            Some(&by_key),
+            &mut |_, row| {
+                let mut values: Vec<Value> = row.iter().cloned().collect();
+                values[2] = Value::text("new-b");
+                Ok((Row::from_values(values), true))
+            },
+            stoolap::executor::Deadline::NONE,
+        );
         assert!(
             matches!(updated, Err(stoolap::Error::SchemaChanged { .. })),
             "the key-equality update read its row under the old columns"
@@ -620,7 +625,9 @@ fn every_write_through_an_older_handle_carries_its_layout() {
             predicate.prepare_for_schema(older.schema());
             let plan = older.index_plan(&predicate);
             let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-            older.delete(access, Some(&predicate)).map(|_| ())
+            older
+                .delete(access, Some(&predicate), stoolap::executor::Deadline::NONE)
+                .map(|_| ())
         };
         drop(older);
         let refused = |result: &stoolap::Result<()>| {
