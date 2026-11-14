@@ -5908,10 +5908,11 @@ impl Executor {
                 appended: &appended,
             };
             let source = JoinedRows::new(stream, where_, ctx).merging(merged);
-            let mut columns = all_columns.clone();
-            columns.extend(
-                appended_merges(&all_columns, &join_col_renames).map(|(_, _, name)| name.clone()),
-            );
+            let bare: Vec<String> = appended_merges(&all_columns, &join_col_renames)
+                .map(|(_, _, name)| name.clone())
+                .collect();
+            let mut columns = all_columns;
+            columns.extend(bare);
             for (at, name) in side_names {
                 columns[at] = name;
             }
