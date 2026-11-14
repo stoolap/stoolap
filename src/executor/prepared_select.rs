@@ -13765,7 +13765,8 @@ impl Executor {
         }
         // Without a WHERE the table hands over every row at once
         if prepared.where_.conjuncts == 0 && !widen {
-            return Ok(WindowRows::Rows(table.collect_all_rows(None)?, None, None));
+            let rows = table.collect_access_rows(ScanAccess::Seq, None, ctx.deadline_of_call())?;
+            return Ok(WindowRows::Rows(rows, None, None));
         }
         let mut rows = RowVec::new();
         if !keeps_none {
@@ -15950,6 +15951,7 @@ impl<'a> PreparedRunner<'a> {
                     nulls_first,
                     limit,
                     offset,
+                    ctx.deadline_of_call(),
                 )?
             }
             OrderedRead::Keyset => match keyset_start(table.schema(), storage_expr.as_deref()) {
@@ -16015,13 +16017,11 @@ impl<'a> PreparedRunner<'a> {
             .iter()
             .map(|&(column, nulls)| (column, crate::core::value::nulls_first(ascending, nulls)))
             .collect();
-        // The walk asks every hundred rows it visits
-        let cancelled = || ctx.charge(DeadlineSite::IndexWalk, 100).is_err();
         let rows = table.collect_rows_ordered_by_index_keys(
             &keys,
             ascending,
             (limit, offset),
-            &cancelled,
+            ctx.deadline_of_call(),
         )?;
         ctx.check_deadline()?;
         if rows.is_some() {
@@ -16264,10 +16264,12 @@ impl<'a> PreparedRunner<'a> {
                     match limited {
                         Some(target) => {
                             let answers = table.collect_access_rows_with_limit_unordered(
-                                access, filter, target, 0,
+                                access,
+                                filter,
+                                target,
+                                0,
+                                ctx.deadline_of_call(),
                             )?;
-                            // A read that checks for no deadline is the statement's all the same
-                            ctx.check_deadline()?;
                             return Ok(Passing::Answers(answers));
                         }
                         None => {
@@ -16281,9 +16283,8 @@ impl<'a> PreparedRunner<'a> {
                                 && needed.is_none()
                                 && !where_.widen
                             {
-                                let rows = table.collect_access_rows(access, filter)?;
-                                // A read that checks for no deadline is the statement's all the same
-                                ctx.check_deadline()?;
+                                let deadline = ctx.deadline_of_call();
+                                let rows = table.collect_access_rows(access, filter, deadline)?;
                                 return Ok(Passing::Answers(rows));
                             }
                             let all: Vec<usize> = (0..table.schema().columns.len()).collect();

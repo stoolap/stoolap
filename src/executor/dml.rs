@@ -2871,7 +2871,12 @@ impl Executor {
                                 plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index)
                             }
                         };
-                        table.update(access, expr.as_deref(), &mut setter)?
+                        table.update(
+                            access,
+                            expr.as_deref(),
+                            &mut setter,
+                            ctx.deadline_of_call(),
+                        )?
                     }
                 }
             } else {
@@ -2879,7 +2884,12 @@ impl Executor {
                 // asks each the part it does not take
                 let plan = where_expr.as_deref().and_then(|e| table.index_plan(e));
                 let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-                table.update(access, where_expr.as_deref(), &mut setter)?
+                table.update(
+                    access,
+                    where_expr.as_deref(),
+                    &mut setter,
+                    ctx.deadline_of_call(),
+                )?
             };
             rows
         };
@@ -3439,7 +3449,7 @@ impl Executor {
                     plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index)
                 }
             };
-            table.delete(access, where_expr.as_deref())?
+            table.delete(access, where_expr.as_deref(), ctx.deadline_of_call())?
         };
 
         // Invalidate semantic cache for this table BEFORE commit
@@ -3951,7 +3961,12 @@ impl Executor {
         } else {
             let plan = where_expr.as_deref().and_then(|e| table.index_plan(e));
             let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-            table.update(access, where_expr.as_deref(), &mut setter)?
+            table.update(
+                access,
+                where_expr.as_deref(),
+                &mut setter,
+                ctx.deadline_of_call(),
+            )?
         };
         if let (Some(rows), true) = (affected, updated > 0) {
             rows.insert(row_id);

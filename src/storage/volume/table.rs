@@ -28,6 +28,7 @@
 
 use std::sync::Arc;
 
+use crate::common::deadline::{Deadline, DeadlineSite};
 use crate::common::names::eq_names;
 use crate::common::{CompactArc, I64Set};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -722,11 +723,14 @@ impl SegmentedTable {
         limit: usize,
         offset: usize,
         access: ScanAccess<'_>,
+        deadline: Deadline,
     ) -> Result<RowVec> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.collect_rows_with_limit_unordered");
         let hot_rows = |hot: &dyn Table, target: usize, offset: usize| {
-            hot.collect_access_rows_with_limit_unordered(access, where_expr, target, offset)
+            hot.collect_access_rows_with_limit_unordered(
+                access, where_expr, target, offset, deadline,
+            )
         };
         if let Some(result) = self.unsealed(|hot| hot_rows(hot, limit, offset)) {
             return result;
@@ -860,6 +864,7 @@ impl SegmentedTable {
                 };
 
                 while let Some(i) = next_position()? {
+                    deadline.charge(DeadlineSite::StorageRead, 1)?;
                     let row_id = row_ids[i];
                     if !self.shows_cold_row(cs, i, row_id, tombstones_arc, &hot_skip, &cut) {
                         continue;
@@ -909,18 +914,21 @@ impl SegmentedTable {
         &self,
         where_expr: Option<&dyn Expression>,
         access: ScanAccess<'_>,
+        deadline: Deadline,
     ) -> Result<RowVec> {
-        self.hot.collect_access_rows(access, where_expr)
+        self.hot.collect_access_rows(access, where_expr, deadline)
     }
 
     /// Every visible row `where_expr` keeps, the cold ones and the hot ones,
-    /// the hot ones read by `access`
+    /// the hot ones read by `access`, charging `deadline` per row read
     fn collect_cold_and_hot(
         &self,
         where_expr: Option<&dyn Expression>,
         access: ScanAccess<'_>,
+        deadline: Deadline,
     ) -> Result<RowVec> {
-        if let Some(result) = self.unsealed(|hot| hot.collect_access_rows(access, where_expr)) {
+        let hot_only = |hot: &dyn Table| hot.collect_access_rows(access, where_expr, deadline);
+        if let Some(result) = self.unsealed(hot_only) {
             return result;
         }
 
@@ -932,7 +940,7 @@ impl SegmentedTable {
             // This prevents the race where remove_moved_rows runs between
             // building the skip set and scanning hot.
             let cut = self.read_cut();
-            let hot_rows = self.hot_rows(where_expr, access)?;
+            let hot_rows = self.hot_rows(where_expr, access, deadline)?;
 
             let mut skip: FxHashSet<i64> =
                 FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
@@ -943,7 +951,7 @@ impl SegmentedTable {
                 .insert_pending_tombstones_into(self.pending(), &mut skip);
 
             let Some(mut all_rows) =
-                self.collect_cold_rows(where_expr, skip, generation, None, &cut)?
+                self.collect_cold_rows(where_expr, skip, generation, None, &cut, deadline)?
             else {
                 return Ok(None);
             };
@@ -965,7 +973,7 @@ impl SegmentedTable {
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::merged_read_began();
             let cut = self.read_cut();
-            let hot_rows = self.hot_rows(None, ScanAccess::Seq)?;
+            let hot_rows = self.hot_rows(None, ScanAccess::Seq, Deadline::NONE)?;
 
             let mut skip: FxHashSet<i64> =
                 FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
@@ -2060,6 +2068,7 @@ impl SegmentedTable {
         ids: Option<&[i64]>,
         where_expr: Option<&dyn Expression>,
         setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
+        deadline: Deadline,
     ) -> Result<PreparedCold<'m>> {
         if !mgr.has_segments() {
             let guard = mgr.acquire_seal_read();
@@ -2101,6 +2110,7 @@ impl SegmentedTable {
                     &bloom_hashes,
                     setter,
                     &mut prep,
+                    deadline,
                 )?,
             }
             // A volume registered at a settled generation is walked whole;
@@ -2288,6 +2298,7 @@ impl SegmentedTable {
         bloom_hashes: &[Option<u64>],
         setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
         prep: &mut ColdPrepare,
+        deadline: Deadline,
     ) -> Result<()> {
         let tombstones_arc = Arc::clone(&snap.tombstones);
         let mut hot_skip: FxHashSet<i64> =
@@ -2312,6 +2323,7 @@ impl SegmentedTable {
             let mapping = cs.mapping.clone();
             let mut reader = super::writer::RowReader::new(Arc::clone(vol));
             for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
+                deadline.charge(DeadlineSite::StorageUpdate, 1)?;
                 if !self.shows_cold_row(cs, i, row_id, &tombstones_arc, &hot_skip, cut)
                     || prep.visited.contains_key(&row_id)
                 {
@@ -2443,7 +2455,13 @@ impl SegmentedTable {
         let txn_id = self.txn_id();
         // The cold rows named are read, set and checked outside the fence;
         // the ids no cold volume holds are the hot store's
-        let prepared = self.prepare_cold_updates(&self.segment_mgr, Some(row_ids), None, setter)?;
+        let prepared = self.prepare_cold_updates(
+            &self.segment_mgr,
+            Some(row_ids),
+            None,
+            setter,
+            Deadline::NONE,
+        )?;
         let mut plan = PlannedUpdate {
             cold: prepared.changes,
             ..PlannedUpdate::default()
@@ -3657,7 +3675,7 @@ impl SegmentedTable {
             // preventing the race where remove_moved_rows runs between building
             // the skip set and hot scanner execution (which would lose rows).
             let cut = self.read_cut();
-            let hot_rows = self.hot_rows(where_expr, access)?;
+            let hot_rows = self.hot_rows(where_expr, access, Deadline::NONE)?;
 
             let mut skip: FxHashSet<i64> =
                 FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
@@ -3869,6 +3887,7 @@ impl SegmentedTable {
         generation: u64,
         at: Option<&ReadPoint>,
         cut: &CommitCut,
+        deadline: Deadline,
     ) -> Result<Option<RowVec>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.collect_cold_rows");
@@ -4097,6 +4116,7 @@ impl SegmentedTable {
                 let row_ids = vol.row_ids()?;
                 let mut vol_rows = RowVec::new();
                 while let Some(i) = next_row()? {
+                    deadline.charge(DeadlineSite::StorageRead, 1)?;
                     let row_id = row_ids[i];
                     let shown = match at {
                         // At a historical point a tombstone counts once the point sees it
@@ -4225,6 +4245,7 @@ impl SegmentedTable {
         ids: Option<&[i64]>,
         where_expr: Option<&dyn Expression>,
         hot_ids: bool,
+        deadline: Deadline,
     ) -> Result<PreparedDeletes<'m>> {
         if !mgr.has_segments() {
             let guard = mgr.acquire_seal_read();
@@ -4273,6 +4294,7 @@ impl SegmentedTable {
                         &comparisons,
                         &bloom_hashes,
                         &mut prep,
+                        deadline,
                     )?;
                     // A volume registered at a settled generation is walked whole
                     prep.seen_segments.extend(settled);
@@ -4393,6 +4415,7 @@ impl SegmentedTable {
     /// One round over the rows the filter selects, in the volumes not
     /// walked whole yet: the predicate reads only its own columns, and only
     /// a match reads the whole old row
+    #[allow(clippy::too_many_arguments)]
     fn prepare_cold_deletes_where(
         &self,
         snap: &super::manifest::StatementSnapshot,
@@ -4401,6 +4424,7 @@ impl SegmentedTable {
         comparisons: &[(&str, crate::core::Operator, &Value)],
         bloom_hashes: &[Option<u64>],
         prep: &mut ColdDeletes,
+        deadline: Deadline,
     ) -> Result<()> {
         let volumes = snap.volumes_newest_first();
         // Only the volumes read it: without one, gathering every hot row id is waste
@@ -4449,6 +4473,7 @@ impl SegmentedTable {
             // groups decoded across the rows
             let mut old_rows: Option<super::writer::RowReader> = None;
             for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
+                deadline.charge(DeadlineSite::StorageDelete, 1)?;
                 if !self.shows_cold_row(cs, i, row_id, &snap.tombstones, &hot_skip, cut)
                     || (!prep.prepared.is_empty() && prep.prepared.contains(&row_id))
                 {
@@ -4923,6 +4948,7 @@ impl Table for SegmentedTable {
         access: ScanAccess<'_>,
         where_expr: Option<&dyn Expression>,
         setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
+        deadline: Deadline,
     ) -> Result<i32> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         #[cfg(feature = "test-failpoints")]
@@ -4949,6 +4975,7 @@ impl Table for SegmentedTable {
             named.as_ref().map(std::slice::from_ref),
             where_expr,
             setter,
+            deadline,
         )?;
         let mut plan = PlannedUpdate {
             cold: prepared.changes,
@@ -4970,7 +4997,7 @@ impl Table for SegmentedTable {
         let skip = (!prepared.visited.is_empty()).then_some(&prepared.visited);
         let planned = self
             .hot
-            .plan_update(access, where_expr, setter, skip, &mut plan);
+            .plan_update(access, where_expr, setter, skip, &mut plan, deadline);
         Self::publish_prepared(&mut self.hot, &self.segment_mgr, txn_id, plan, planned)
     }
 
@@ -4989,7 +5016,8 @@ impl Table for SegmentedTable {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         let mgr = Arc::clone(&self.segment_mgr);
         // The sealed rows the ids name are read outside the fence
-        let prepared = self.prepare_cold_deletes(&mgr, Some(row_ids), None, true)?;
+        let prepared =
+            self.prepare_cold_deletes(&mgr, Some(row_ids), None, true, Deadline::NONE)?;
         let hot_ids = prepared.hot_ids.as_deref().unwrap_or(row_ids);
         self.apply_cold_deletes(prepared.deletes, prepared.seen, |hot, changed| {
             if !changed.is_empty() {
@@ -5014,7 +5042,8 @@ impl Table for SegmentedTable {
         let handed = changed.len();
         // A sealed row the snapshot still holds is there to delete; a row
         // it does not is the hot store's, deleted if still visible
-        let mut prepared = self.prepare_cold_deletes(&mgr, Some(row_ids), None, true)?;
+        let mut prepared =
+            self.prepare_cold_deletes(&mgr, Some(row_ids), None, true, Deadline::NONE)?;
         let Some(mut hot_ids) = prepared.hot_ids else {
             let count =
                 self.apply_cold_deletes_unless_held(prepared.deletes, prepared.seen, |hot, _| {
@@ -5136,6 +5165,7 @@ impl Table for SegmentedTable {
         &mut self,
         access: ScanAccess<'_>,
         where_expr: Option<&dyn Expression>,
+        deadline: Deadline,
     ) -> Result<i32> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         // A bare `pk = k` names one row: the hot half keeps the predicate and
@@ -5145,19 +5175,19 @@ impl Table for SegmentedTable {
             .and_then(|e| crate::storage::mvcc::table::pk_equality_id(e, self.hot.schema()))
         {
             let mgr = Arc::clone(&self.segment_mgr);
-            let prepared =
-                self.prepare_cold_deletes(&mgr, Some(std::slice::from_ref(&pk)), None, false)?;
+            let named = Some(std::slice::from_ref(&pk));
+            let prepared = self.prepare_cold_deletes(&mgr, named, None, false, Deadline::NONE)?;
             return self.apply_cold_deletes(prepared.deletes, prepared.seen, |hot, _| {
-                hot.delete(access, where_expr)
+                hot.delete(access, where_expr, deadline)
             });
         }
         // The sealed rows the filter selects are read and evaluated outside
         // the fence; under it they are claimed, then the hot rows deleted
         let mgr = Arc::clone(&self.segment_mgr);
-        let prepared = self.prepare_cold_deletes(&mgr, None, where_expr, false)?;
+        let prepared = self.prepare_cold_deletes(&mgr, None, where_expr, false, deadline)?;
         // A row changed since the round meets the filter again in the hot half
         self.apply_cold_deletes(prepared.deletes, prepared.seen, |hot, _| {
-            hot.delete(access, where_expr)
+            hot.delete(access, where_expr, deadline)
         })
     }
 
@@ -5230,15 +5260,16 @@ impl Table for SegmentedTable {
     }
 
     fn collect_all_rows(&self, where_expr: Option<&dyn Expression>) -> Result<RowVec> {
-        self.collect_cold_and_hot(where_expr, ScanAccess::Seq)
+        self.collect_cold_and_hot(where_expr, ScanAccess::Seq, Deadline::NONE)
     }
 
     fn collect_access_rows(
         &self,
         access: ScanAccess<'_>,
         where_expr: Option<&dyn Expression>,
+        deadline: Deadline,
     ) -> Result<RowVec> {
-        self.collect_cold_and_hot(where_expr, access)
+        self.collect_cold_and_hot(where_expr, access, deadline)
     }
 
     fn collect_all_rows_unsorted(&self) -> Result<RowVec> {
@@ -5260,7 +5291,9 @@ impl Table for SegmentedTable {
             self.segment_mgr
                 .insert_pending_tombstones_into(self.pending(), &mut skip);
 
-            let Some(mut all_rows) = self.collect_cold_rows(None, skip, generation, None, &cut)?
+            let none = Deadline::NONE;
+            let Some(mut all_rows) =
+                self.collect_cold_rows(None, skip, generation, None, &cut, none)?
             else {
                 return Ok(None);
             };
@@ -5424,8 +5457,10 @@ impl Table for SegmentedTable {
             // commit publishing here in between could show a row in both;
             // such a read takes the path that reads the hot rows first
             let quiet = (!self.reads_back_in_time()).then(|| self.hot.publish_epoch_if_quiet());
+            let none = Deadline::NONE;
             if quiet == Some(None) {
-                return self.limited_cold_and_hot_unordered(where_expr, limit, offset, access);
+                return self
+                    .limited_cold_and_hot_unordered(where_expr, limit, offset, access, none);
             }
             let cut = self.read_cut();
             // Lazy: no ensure_columns. Phase 1 uses metadata only; Phase 2
@@ -5613,7 +5648,8 @@ impl Table for SegmentedTable {
                 cold_rows.extend(hot_rows);
             }
             if quiet.is_some_and(|quiet| quiet != self.hot.publish_epoch_if_quiet()) {
-                return self.limited_cold_and_hot_unordered(where_expr, limit, offset, access);
+                return self
+                    .limited_cold_and_hot_unordered(where_expr, limit, offset, access, none);
             }
 
             Ok(cold_rows.into_iter().skip(offset).take(limit).collect())
@@ -5626,7 +5662,8 @@ impl Table for SegmentedTable {
         limit: usize,
         offset: usize,
     ) -> Result<RowVec> {
-        self.limited_cold_and_hot_unordered(where_expr, limit, offset, ScanAccess::Seq)
+        let none = Deadline::NONE;
+        self.limited_cold_and_hot_unordered(where_expr, limit, offset, ScanAccess::Seq, none)
     }
 
     fn collect_access_rows_with_limit_unordered(
@@ -5635,8 +5672,9 @@ impl Table for SegmentedTable {
         where_expr: Option<&dyn Expression>,
         limit: usize,
         offset: usize,
+        deadline: Deadline,
     ) -> Result<RowVec> {
-        self.limited_cold_and_hot_unordered(where_expr, limit, offset, access)
+        self.limited_cold_and_hot_unordered(where_expr, limit, offset, access, deadline)
     }
 
     fn has_row_id(&self, row_id: i64) -> Result<bool> {
@@ -6599,11 +6637,14 @@ impl Table for SegmentedTable {
     fn collect_rows_grouped_by_partition(
         &self,
         column_name: &str,
+        deadline: Deadline,
     ) -> Result<Option<Vec<(Value, RowVec)>>> {
         self.newest_across_seals(|generation| {
             let cut = self.read_cut();
             if !self.segment_mgr.has_segments() {
-                let hot = self.hot.collect_rows_grouped_by_partition(column_name)?;
+                let hot = self
+                    .hot
+                    .collect_rows_grouped_by_partition(column_name, deadline)?;
                 return Ok((!self.seal_moved(generation)).then_some(hot));
             }
 
@@ -6619,7 +6660,10 @@ impl Table for SegmentedTable {
             // Start from hot grouped data; a hot side that cannot answer,
             // with local writes among others, leaves the whole to the scan
             let mut groups: ValueMap<RowVec> = ValueMap::default();
-            let Some(hot_groups) = self.hot.collect_rows_grouped_by_partition(column_name)? else {
+            let Some(hot_groups) = self
+                .hot
+                .collect_rows_grouped_by_partition(column_name, deadline)?
+            else {
                 return Ok(Some(None));
             };
             for (val, rows) in hot_groups {
@@ -6659,6 +6703,7 @@ impl Table for SegmentedTable {
                 let column = phys_col.map(|pc| vol.columns.get(pc)).transpose()?;
                 let mut reader = super::writer::RowReader::new(Arc::clone(vol));
                 for (i, &rid) in row_ids.iter().enumerate().skip(start) {
+                    deadline.charge(DeadlineSite::StorageRead, 1)?;
                     if !cs.is_visible(i) {
                         continue;
                     }
@@ -6816,9 +6861,17 @@ impl Table for SegmentedTable {
         nulls_first: bool,
         limit: usize,
         offset: usize,
+        deadline: Deadline,
     ) -> Result<Option<RowVec>> {
         if let Some(result) = self.unsealed(|hot| {
-            hot.collect_rows_ordered_by_index(column_name, ascending, nulls_first, limit, offset)
+            hot.collect_rows_ordered_by_index(
+                column_name,
+                ascending,
+                nulls_first,
+                limit,
+                offset,
+                deadline,
+            )
         }) {
             return result;
         }
@@ -6857,11 +6910,14 @@ impl Table for SegmentedTable {
                 nulls_first,
                 needed,
                 0,
+                deadline,
             )? {
                 Some(rows) => rows,
                 None => {
                     // Local changes prevent ordered iteration — fall back to collect + sort.
-                    let mut rows = self.hot.collect_all_rows(None)?;
+                    let mut rows = self
+                        .hot
+                        .collect_access_rows(ScanAccess::Seq, None, deadline)?;
                     if ascending {
                         rows.sort_unstable_by_key(|&(id, _)| id);
                     } else {
@@ -6940,6 +6996,7 @@ impl Table for SegmentedTable {
                 if result.len() >= limit {
                     break;
                 }
+                deadline.charge(DeadlineSite::StorageRead, 1)?;
 
                 // Find the source with the next row_id to emit.
                 // For ASC: smallest row_id. For DESC: largest row_id.
@@ -7050,10 +7107,10 @@ impl Table for SegmentedTable {
         keys: &[(&str, bool)],
         ascending: bool,
         cut: (usize, usize),
-        cancelled: &dyn Fn() -> bool,
+        deadline: Deadline,
     ) -> Result<Option<RowVec>> {
         if let Some(result) = self
-            .unsealed(|hot| hot.collect_rows_ordered_by_index_keys(keys, ascending, cut, cancelled))
+            .unsealed(|hot| hot.collect_rows_ordered_by_index_keys(keys, ascending, cut, deadline))
         {
             return result;
         }
@@ -8114,6 +8171,7 @@ impl Table for SegmentedTable {
                 generation,
                 Some(point),
                 &CommitCut::every(),
+                Deadline::NONE,
             )?
             else {
                 return Ok(None);
@@ -8157,6 +8215,7 @@ impl Table for SegmentedTable {
         &self,
         aggregates: &[(AggregateOp, usize)],
         where_expr: &dyn Expression,
+        deadline: Deadline,
     ) -> Result<Option<Vec<Value>>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.compute_filtered_aggregates");
@@ -8247,7 +8306,9 @@ impl Table for SegmentedTable {
             let mut groups = GroupedAggregates::global(
                 aggregates.iter().map(|&(op, _)| op.template()).collect(),
             );
-            let hot_rows = self.hot.collect_all_rows(Some(where_expr))?;
+            let hot_rows =
+                self.hot
+                    .collect_access_rows(ScanAccess::Seq, Some(where_expr), deadline)?;
             let mut hot_skip: FxHashSet<i64> =
                 FxHashSet::with_capacity_and_hasher(hot_rows.len().max(1024), Default::default());
             for (row_id, row) in &hot_rows {
@@ -8549,7 +8610,12 @@ impl Table for SegmentedTable {
                         cs: &'v super::manifest::ColdSegment,
                         preds: &[PhysPred],
                         walk: &mut super::secondary::SideWalk,
-                        (tombstones, hot_skip, cut): (&FxHashMap<i64, u64>, &FxHashSet<i64>, &CommitCut),
+                        (tombstones, hot_skip, cut, deadline): (
+                            &FxHashMap<i64, u64>,
+                            &FxHashSet<i64>,
+                            &CommitCut,
+                            Deadline,
+                        ),
                         (mapping, aggregates, bail): (
                             &super::writer::ColumnMapping,
                             &[(AggregateOp, usize)],
@@ -8592,6 +8658,7 @@ impl Table for SegmentedTable {
                         let mut held: Vec<Held> = vec![None; preds.len()];
                         let mut calls: Option<(usize, Vec<Call<'v>>)> = None;
                         while let Some(i) = walk.next_position().map_err(side_error)? {
+                            deadline.charge(DeadlineSite::StorageAggregate, 1)?;
                             if !table.shows_cold_row(cs, i, row_ids[i], tombstones, hot_skip, cut) {
                                 continue;
                             }
@@ -8657,7 +8724,7 @@ impl Table for SegmentedTable {
                         Ok(true)
                     }
                     if let Some(mut walk) = walk {
-                        let view = (&**tombstones_ref, hot_skip_ref, &cut);
+                        let view = (&**tombstones_ref, hot_skip_ref, &cut, deadline);
                         let calls = (mapping, aggregates, &bail);
                         let walked = walk_candidates(
                             self,
@@ -8677,6 +8744,7 @@ impl Table for SegmentedTable {
                         }
                         let g_start = gi * rg_size;
                         let g_end = ((gi + 1) * rg_size).min(row_count);
+                        deadline.charge(DeadlineSite::StorageAggregate, g_end - g_start)?;
 
                         // Dictionary equalities are answered for the whole group in
                         // one pass over the raw ids; the other predicates run per
@@ -8787,6 +8855,7 @@ impl Table for SegmentedTable {
         &self,
         group_by_indices: &[usize],
         aggregates: &[(AggregateOp, usize)],
+        deadline: Deadline,
     ) -> Result<Option<GroupedAggregates>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.compute_grouped_aggregates");
@@ -8797,9 +8866,9 @@ impl Table for SegmentedTable {
         self.newest_across_seals(|generation| {
             let cut = self.read_cut();
             if !self.segment_mgr.has_segments() {
-                let hot = self
-                    .hot
-                    .compute_grouped_aggregates(group_by_indices, aggregates)?;
+                let hot =
+                    self.hot
+                        .compute_grouped_aggregates(group_by_indices, aggregates, deadline)?;
                 return Ok((!self.seal_moved(generation)).then_some(hot));
             }
 
@@ -8834,7 +8903,9 @@ impl Table for SegmentedTable {
             let mut groups = grouped_aggregates(group_by_indices, aggregates);
 
             // ---- Process hot rows (small, use Value-based path) ----
-            let hot_rows = self.hot.collect_all_rows(None)?;
+            let hot_rows = self
+                .hot
+                .collect_access_rows(ScanAccess::Seq, None, deadline)?;
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::hot_and_cold_reads_split();
             for (_, row) in &hot_rows {
@@ -8988,6 +9059,8 @@ impl Table for SegmentedTable {
                     let parts: Vec<Option<GroupedAggregates>> = volumes
                         .par_iter()
                         .map(|volume| {
+                            let rows = volume.1.volume.meta.row_count;
+                            deadline.charge(DeadlineSite::StorageAggregate, rows)?;
                             let mut part = groups.empty_like();
                             Ok(process_volume(volume, &mut part)?.then_some(part))
                         })
@@ -9001,6 +9074,10 @@ impl Table for SegmentedTable {
                 }
             } else {
                 for volume in volumes.iter() {
+                    deadline.charge(
+                        DeadlineSite::StorageAggregate,
+                        volume.1.volume.meta.row_count,
+                    )?;
                     if !process_volume(volume, &mut groups)? {
                         return Ok(Some(None));
                     }
@@ -9379,6 +9456,7 @@ mod tests {
             _: ScanAccess<'_>,
             _: Option<&dyn Expression>,
             _: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
+            _: Deadline,
         ) -> Result<i32> {
             Ok(0)
         }
@@ -9411,7 +9489,12 @@ mod tests {
         fn has_visible_row(&self, row_id: i64) -> Result<bool> {
             Ok(self.rows.iter().any(|(id, _)| *id == row_id))
         }
-        fn delete(&mut self, _: ScanAccess<'_>, _: Option<&dyn Expression>) -> Result<i32> {
+        fn delete(
+            &mut self,
+            _: ScanAccess<'_>,
+            _: Option<&dyn Expression>,
+            _: Deadline,
+        ) -> Result<i32> {
             Ok(0)
         }
         fn scan(&self, _: &[usize], _: Option<&dyn Expression>) -> Result<Box<dyn Scanner>> {
@@ -9807,7 +9890,7 @@ mod tests {
         // not in the order the rows were added
         let first = |ascending: bool| -> Vec<i64> {
             table
-                .collect_rows_ordered_by_index("id", ascending, !ascending, 3, 0)
+                .collect_rows_ordered_by_index("id", ascending, !ascending, 3, 0, Deadline::NONE)
                 .unwrap()
                 .expect("the merge path answers a primary key order")
                 .iter()

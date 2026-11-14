@@ -99,11 +99,16 @@ fn a_prepared_row_another_handle_wrote_is_not_set_again() {
         writer.update_by_row_ids(&[1], &mut set).unwrap();
     });
     let mut calls = Vec::new();
-    let updated = updater.update(ScanAccess::Seq, None, &mut |_, mut row| {
-        calls.push(row.get(0).and_then(|v| v.as_int64()).unwrap());
-        row.set(1, stoolap::core::Value::Integer(7)).unwrap();
-        Ok((row, true))
-    });
+    let updated = updater.update(
+        ScanAccess::Seq,
+        None,
+        &mut |_, mut row| {
+            calls.push(row.get(0).and_then(|v| v.as_int64()).unwrap());
+            row.set(1, stoolap::core::Value::Integer(7)).unwrap();
+            Ok((row, true))
+        },
+        stoolap::executor::Deadline::NONE,
+    );
     let mut rows: Vec<(i64, i64)> = reader
         .collect_all_rows(None)
         .unwrap()
@@ -154,11 +159,16 @@ fn a_late_conflict_on_the_second_row_leaves_no_part_of_the_statement() {
         writer.update_by_row_ids(&[2], &mut set).unwrap();
     });
     let mut calls = Vec::new();
-    let updated = updater.update(ScanAccess::Seq, None, &mut |_, mut row| {
-        calls.push(row.get(0).and_then(|v| v.as_int64()).unwrap());
-        row.set(1, stoolap::core::Value::Integer(7)).unwrap();
-        Ok((row, true))
-    });
+    let updated = updater.update(
+        ScanAccess::Seq,
+        None,
+        &mut |_, mut row| {
+            calls.push(row.get(0).and_then(|v| v.as_int64()).unwrap());
+            row.set(1, stoolap::core::Value::Integer(7)).unwrap();
+            Ok((row, true))
+        },
+        stoolap::executor::Deadline::NONE,
+    );
     let rows = rows_of(reader.as_ref());
     drop(updater);
     drop(reader);

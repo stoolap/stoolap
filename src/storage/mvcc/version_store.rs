@@ -33,6 +33,7 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
+use crate::common::deadline::{Deadline, DeadlineSite};
 use crate::common::names::eq_names;
 use crate::common::SmartString;
 
@@ -831,6 +832,8 @@ enum HeadsPass {
     Empty,
     /// The heads cannot answer for the reader, or a commit published
     Unheld,
+    /// The statement's deadline passed between two strides of heads
+    Stopped,
 }
 
 /// A checker answering for one reader: through its view when it has one
@@ -4428,16 +4431,20 @@ impl VersionStore {
     /// Returns: Vec of (row_id, row_data, original_version) tuples.
     /// Note: read_version_seq is obtained from visibility_checker, not from create_time.
     #[inline]
-    pub fn get_all_visible_rows_for_update(&self, txn_id: i64) -> Vec<(i64, Row, RowVersion)> {
+    pub fn get_all_visible_rows_for_update(
+        &self,
+        txn_id: i64,
+        deadline: Deadline,
+    ) -> crate::core::Result<Vec<(i64, Row, RowVersion)>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.get_all_visible_rows_for_update");
         if self.closed.load(Ordering::Acquire) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => c,
-            None => return Vec::new(),
+            None => return Ok(Vec::new()),
         };
 
         let current_seq = checker.get_current_sequence();
@@ -4448,6 +4455,7 @@ impl VersionStore {
         let mut result: Vec<(i64, Row, RowVersion)> = Vec::with_capacity(versions.len());
 
         for (&row_id, chain) in versions.iter() {
+            deadline.charge(DeadlineSite::StorageUpdate, 1)?;
             // FAST PATH: Check HEAD version first - O(1) for common case
             let head_txn_id = chain.version.txn_id;
             let head_deleted_at = chain.version.deleted_at_txn_id;
@@ -4480,7 +4488,7 @@ impl VersionStore {
             }
         }
 
-        result
+        Ok(result)
     }
 
     /// Get all visible rows for UPDATE with filter applied BEFORE cloning.
@@ -4499,6 +4507,7 @@ impl VersionStore {
         filter: &dyn crate::storage::expression::Expression,
         hidden: impl Fn(i64) -> bool,
         forgives: impl Fn(i64) -> bool,
+        deadline: Deadline,
     ) -> crate::core::Result<Vec<(i64, Row, RowVersion)>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.get_all_visible_rows_for_update_filtered");
@@ -4529,6 +4538,7 @@ impl VersionStore {
         let mut result: Vec<(i64, Row, RowVersion)> = Vec::with_capacity(versions.len() / 4);
 
         for (&row_id, chain) in versions.iter() {
+            deadline.charge(DeadlineSite::StorageUpdate, 1)?;
             // Before a filter that can fail, after one that cannot
             if fallible && hidden(row_id) {
                 continue;
@@ -7242,6 +7252,7 @@ impl VersionStore {
         reader: Reader<'_>,
         group_by_indices: &[usize],
         aggregates: &[(AggregateOp, usize)],
+        deadline: Deadline,
     ) -> crate::core::Result<Option<GroupedAggregates>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.compute_grouped_aggregates");
@@ -7253,14 +7264,12 @@ impl VersionStore {
             return Ok(Some(groups));
         };
         // None lets the caller fall back to regular GROUP BY aggregation
-        Ok(
-            match self.visit_live_heads(&checker, reader, |row| {
-                aggregate_row(&mut groups, group_by_indices, aggregates, row)
-            }) {
-                HeadsPass::Answered | HeadsPass::Empty => Some(groups),
-                HeadsPass::Unheld => None,
-            },
-        )
+        let visit = |row: &[Value]| aggregate_row(&mut groups, group_by_indices, aggregates, row);
+        match self.visit_live_heads(&checker, reader, visit, deadline) {
+            HeadsPass::Answered | HeadsPass::Empty => Ok(Some(groups)),
+            HeadsPass::Unheld => Ok(None),
+            HeadsPass::Stopped => Err(crate::core::Error::QueryCancelled),
+        }
     }
 
     /// Runs `visit` over every arena head `reader` sees. A head may hide an
@@ -7271,6 +7280,7 @@ impl VersionStore {
         checker: &ReaderChecker<'_, '_, C>,
         reader: Reader<'_>,
         mut visit: impl FnMut(&[Value]),
+        deadline: Deadline,
     ) -> HeadsPass {
         // Slots between checks that no commit began publishing: its answer
         // would be dropped, so the pass stops and lets the commit take the arena
@@ -7291,6 +7301,12 @@ impl VersionStore {
         for (stride, metas) in arena_meta.chunks(EPOCH_STRIDE).enumerate() {
             if self.publish_epoch_if_quiet() != Some(epoch) {
                 return HeadsPass::Unheld;
+            }
+            if deadline
+                .charge(DeadlineSite::StorageAggregate, metas.len())
+                .is_err()
+            {
+                return HeadsPass::Stopped;
             }
             for (offset, meta) in metas.iter().enumerate() {
                 let idx = stride * EPOCH_STRIDE + offset;
@@ -7360,11 +7376,16 @@ impl VersionStore {
         mut run: CompiledAggregate,
     ) -> Option<Value> {
         let checker = reader.over(&**self.visibility_checker.as_ref()?);
-        let pass = self.visit_live_heads(&checker, reader, |row| {
-            if let Some(value) = row.get(col_idx) {
-                run.accumulate(value);
-            }
-        });
+        let pass = self.visit_live_heads(
+            &checker,
+            reader,
+            |row| {
+                if let Some(value) = row.get(col_idx) {
+                    run.accumulate(value);
+                }
+            },
+            Deadline::NONE,
+        );
         if !matches!(pass, HeadsPass::Answered) {
             run.reset();
             self.visit_visible_chains(&checker, reader.txn_id, |row| {
@@ -10291,7 +10312,7 @@ mod tests {
         txn.commit().unwrap();
 
         let results = store
-            .compute_grouped_aggregates(2.into(), &[1], &[])
+            .compute_grouped_aggregates(2.into(), &[1], &[], Deadline::NONE)
             .unwrap()
             .expect("arena path should handle an empty aggregate list")
             .into_rows()
@@ -10342,7 +10363,12 @@ mod tests {
             *handle.borrow_mut() = Some(publisher.begin_publish(0));
         });
         let results = store
-            .compute_grouped_aggregates(2.into(), &[1, 2], &[(AggregateOp::CountStar, 0)])
+            .compute_grouped_aggregates(
+                2.into(),
+                &[1, 2],
+                &[(AggregateOp::CountStar, 0)],
+                Deadline::NONE,
+            )
             .unwrap();
         let after = crate::test_failpoints::grouped_slots_after_hook();
         drop(hold.borrow_mut().take().expect("the pass reached the slot"));
@@ -11236,7 +11262,7 @@ mod tests {
         ];
 
         let rows = store
-            .compute_grouped_aggregates(2.into(), &[], &ops)
+            .compute_grouped_aggregates(2.into(), &[], &ops, Deadline::NONE)
             .unwrap()
             .expect("the arena answers")
             .into_rows()

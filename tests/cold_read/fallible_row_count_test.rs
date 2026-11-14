@@ -272,7 +272,10 @@ fn surviving_rows() -> RowVec {
 #[test]
 fn grouped_partition_rows_propagate_cold_reload_failure() {
     assert_optional_reload_failure(
-        |table| format!("{:?}", table.collect_rows_grouped_by_partition("v")),
+        |table| {
+            let none = stoolap::executor::Deadline::NONE;
+            format!("{:?}", table.collect_rows_grouped_by_partition("v", none))
+        },
         vec![(Value::Integer(20), surviving_rows())],
     );
 }
@@ -283,7 +286,14 @@ fn ordered_rows_propagate_cold_reload_failure() {
         |table| {
             format!(
                 "{:?}",
-                table.collect_rows_ordered_by_index("id", true, false, 2, 0)
+                table.collect_rows_ordered_by_index(
+                    "id",
+                    true,
+                    false,
+                    2,
+                    0,
+                    stoolap::executor::Deadline::NONE
+                )
             )
         },
         surviving_rows(),
@@ -299,6 +309,7 @@ fn filtered_aggregates_propagate_cold_reload_failure() {
                 table.compute_filtered_aggregates(
                     &[(AggregateOp::Sum, 1)],
                     &ComparisonExpr::gte("v", Value::Integer(0)),
+                    stoolap::executor::Deadline::NONE,
                 )
             )
         },
@@ -310,7 +321,8 @@ fn filtered_aggregates_propagate_cold_reload_failure() {
 fn grouped_aggregates_propagate_cold_reload_failure() {
     assert_optional_reload_failure(
         |table| {
-            let groups = table.compute_grouped_aggregates(&[1], &[(AggregateOp::Sum, 1)]);
+            let none = stoolap::executor::Deadline::NONE;
+            let groups = table.compute_grouped_aggregates(&[1], &[(AggregateOp::Sum, 1)], none);
             let rows = groups.map(|groups| {
                 groups.map(|groups| {
                     let rows = groups.into_rows().unwrap();

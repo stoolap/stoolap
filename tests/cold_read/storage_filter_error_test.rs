@@ -371,8 +371,12 @@ mod written_by_the_filter {
             filter.prepare_for_schema(first.schema());
             let plan = first.index_plan(filter.as_ref());
             let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-            let updated =
-                first.update(access, Some(filter.as_ref()), &mut |_, row| Ok((row, true)));
+            let updated = first.update(
+                access,
+                Some(filter.as_ref()),
+                &mut |_, row| Ok((row, true)),
+                stoolap::executor::Deadline::NONE,
+            );
             let _ = done.send(updated.map_err(|e| e.to_string()));
         });
         finished
@@ -587,10 +591,15 @@ mod written_by_the_filter {
             Box::new(|table: &mut dyn Table| {
                 let mut id3 = ComparisonExpr::eq("id", Value::Integer(3));
                 id3.prepare_for_schema(table.schema());
-                table.update(ScanAccess::Seq, Some(&id3), &mut |id, _| {
-                    let row = vec![Value::Integer(id), Value::Integer(5), Value::Integer(0)];
-                    Ok((Row::from_values(row), true))
-                })?;
+                table.update(
+                    ScanAccess::Seq,
+                    Some(&id3),
+                    &mut |id, _| {
+                        let row = vec![Value::Integer(id), Value::Integer(5), Value::Integer(0)];
+                        Ok((Row::from_values(row), true))
+                    },
+                    stoolap::executor::Deadline::NONE,
+                )?;
                 Ok(())
             })
         };
@@ -674,7 +683,11 @@ mod written_by_the_filter {
         read_writing("memory://filter_writes_indexed", true, |table, filter| {
             let plan = indexed(table, filter);
             Ok(table
-                .collect_access_rows(ScanAccess::Index(&plan), Some(filter))?
+                .collect_access_rows(
+                    ScanAccess::Index(&plan),
+                    Some(filter),
+                    stoolap::executor::Deadline::NONE,
+                )?
                 .len())
         });
     }
@@ -703,7 +716,8 @@ mod written_by_the_filter {
     #[test]
     fn a_delete_filter_may_write_through_another_handle_of_its_transaction() {
         read_writing("memory://filter_writes_delete", false, |table, filter| {
-            Ok(table.delete(ScanAccess::Seq, Some(filter))? as usize)
+            let none = stoolap::executor::Deadline::NONE;
+            Ok(table.delete(ScanAccess::Seq, Some(filter), none)? as usize)
         });
     }
 
@@ -714,7 +728,8 @@ mod written_by_the_filter {
             true,
             |table, filter| {
                 let plan = indexed(table, filter);
-                Ok(table.delete(ScanAccess::Index(&plan), Some(filter))? as usize)
+                let none = stoolap::executor::Deadline::NONE;
+                Ok(table.delete(ScanAccess::Index(&plan), Some(filter), none)? as usize)
             },
         );
     }
@@ -722,10 +737,12 @@ mod written_by_the_filter {
     #[test]
     fn an_update_filter_over_its_own_rows_may_write_through_another_handle() {
         read_writing("memory://filter_writes_update", false, |table, filter| {
-            Ok(
-                table.update(ScanAccess::Seq, Some(filter), &mut |_, row| Ok((row, true)))?
-                    as usize,
-            )
+            Ok(table.update(
+                ScanAccess::Seq,
+                Some(filter),
+                &mut |_, row| Ok((row, true)),
+                stoolap::executor::Deadline::NONE,
+            )? as usize)
         });
     }
 
@@ -736,11 +753,12 @@ mod written_by_the_filter {
             true,
             |table, filter| {
                 let plan = indexed(table, filter);
-                Ok(
-                    table.update(ScanAccess::Index(&plan), Some(filter), &mut |_, row| {
-                        Ok((row, true))
-                    })? as usize,
-                )
+                Ok(table.update(
+                    ScanAccess::Index(&plan),
+                    Some(filter),
+                    &mut |_, row| Ok((row, true)),
+                    stoolap::executor::Deadline::NONE,
+                )? as usize)
             },
         );
     }

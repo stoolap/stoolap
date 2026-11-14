@@ -262,7 +262,8 @@ fn parent_row_exists(
 
     let plan = parent.index_plan(&expr);
     let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-    let rows = parent.collect_access_rows_with_limit_unordered(access, Some(&expr), 1, 0)?;
+    let none = Deadline::NONE;
+    let rows = parent.collect_access_rows_with_limit_unordered(access, Some(&expr), 1, 0, none)?;
     Ok(!rows.is_empty())
 }
 
@@ -447,7 +448,7 @@ impl DeletePlan {
         if keys.as_ref().is_some_and(|keys| keys.is_empty()) {
             for value in &values {
                 deadline.charge(DeadlineSite::ForeignKey, 1)?;
-                check_children_seen(engine, txn_id, &reached.table, fk, value)?;
+                check_children_seen(engine, txn_id, &reached.table, fk, value, deadline)?;
             }
             reached.unread = true;
             reached.cascades.push((fk.clone(), values));
@@ -463,11 +464,11 @@ impl DeletePlan {
         let mut next: Vec<Vec<Value>> = vec![Vec::new(); positions.len()];
         let mut reaching = Vec::new();
         for value in values {
-            check_children_seen(engine, txn_id, &reached.table, fk, &value)?;
+            check_children_seen(engine, txn_id, &reached.table, fk, &value, deadline)?;
             let expr = key_filter(&schema, column, &value);
             let plan = child.index_plan(&expr);
             let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-            let rows = child.collect_access_rows(access, Some(&expr))?;
+            let rows = child.collect_access_rows(access, Some(&expr), deadline)?;
             deadline.charge(DeadlineSite::ForeignKey, rows.len() + 1)?;
             if rows.is_empty() {
                 continue;
@@ -566,7 +567,7 @@ impl DeletePlan {
             if !reached.cascades.is_empty() {
                 self.deadline
                     .charge(DeadlineSite::ForeignKey, reached.cascaded.len() + 1)?;
-                reached.delete_cascaded(engine, txn_id)?;
+                reached.delete_cascaded(engine, txn_id, self.deadline)?;
             }
             reached.clear_nulled(engine, txn_id, self.deadline)?;
         }
@@ -590,7 +591,7 @@ impl Reached {
                 let expr = key_filter(schema, column, value);
                 let plan = child.index_plan(&expr);
                 let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-                let rows = child.collect_access_rows(access, Some(&expr))?;
+                let rows = child.collect_access_rows(access, Some(&expr), deadline)?;
                 deadline.charge(DeadlineSite::ForeignKey, rows.len() + 1)?;
                 for (id, _) in rows.iter() {
                     if self.gone.insert(*id) {
@@ -621,14 +622,16 @@ impl Reached {
         let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
         // One row past the ones that go is one that stays
         let limit = self.gone.len() + 1;
-        let rows = child.collect_access_rows_with_limit_unordered(access, Some(&expr), limit, 0)?;
+        let none = Deadline::NONE;
+        let rows =
+            child.collect_access_rows_with_limit_unordered(access, Some(&expr), limit, 0, none)?;
         let stays = rows.iter().any(|(id, _)| !self.gone.contains(*id));
         Ok(stays)
     }
 
     /// Deletes the rows every cascade into the table reaches in one call. A
     /// planned row that changed since it was read and stays refuses
-    fn delete_cascaded(&self, engine: &MVCCEngine, txn_id: i64) -> Result<()> {
+    fn delete_cascaded(&self, engine: &MVCCEngine, txn_id: i64, deadline: Deadline) -> Result<()> {
         let mut child = engine.get_table_for_txn(txn_id, &self.table)?;
         let schema = child.schema_arc();
         let mut filters: Vec<Box<dyn StorageExpression>> = Vec::with_capacity(self.cascades.len());
@@ -651,7 +654,7 @@ impl Reached {
         };
         let plan = child.index_plan(&*expr);
         let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-        let deleted = child.delete(access, Some(&*expr))?;
+        let deleted = child.delete(access, Some(&*expr), deadline)?;
         // A table no key references has no rows beneath its own to protect
         if self.unread || deleted as usize == self.cascaded.len() {
             return Ok(());
@@ -861,7 +864,8 @@ fn child_rows_exist(
 
     let plan = child.index_plan(&expr);
     let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-    let rows = child.collect_access_rows_with_limit_unordered(access, Some(&expr), 1, 0)?;
+    let none = Deadline::NONE;
+    let rows = child.collect_access_rows_with_limit_unordered(access, Some(&expr), 1, 0, none)?;
     Ok(!rows.is_empty())
 }
 
@@ -874,6 +878,7 @@ fn check_children_seen(
     child_table: &str,
     fk: &ForeignKeyConstraint,
     parent_value: &Value,
+    deadline: Deadline,
 ) -> Result<()> {
     if !engine.reads_snapshot(txn_id) {
         return Ok(());
@@ -882,7 +887,7 @@ fn check_children_seen(
         let schema = child.schema();
         let expr = key_filter(schema, key_position(schema, fk)?, parent_value);
         Ok(child
-            .collect_all_rows(Some(&expr))?
+            .collect_access_rows(ScanAccess::Seq, Some(&expr), deadline)?
             .iter()
             .map(|(id, _)| *id)
             .collect())
@@ -1440,7 +1445,7 @@ fn run_update_action(
         if written || !child_rows_exist(engine, txn_id, child_table, fk, old_value)? {
             continue;
         }
-        check_children_seen(engine, txn_id, child_table, fk, old_value)?;
+        check_children_seen(engine, txn_id, child_table, fk, old_value, deadline)?;
         let new_val = if set_null {
             if !child_schema.columns[col_idx].nullable {
                 return Err(Error::foreign_key_violation(
@@ -1483,7 +1488,7 @@ fn run_update_action(
         let expr = key_filter(child_schema, col_idx, old_value);
         let plan = child.index_plan(&expr);
         let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-        let rows = child.collect_access_rows(access, Some(&expr))?;
+        let rows = child.collect_access_rows(access, Some(&expr), deadline)?;
         deadline.charge(DeadlineSite::ForeignKey, rows.len())?;
         for (id, row) in rows.iter() {
             if let Some(start) = row.get(col_idx) {

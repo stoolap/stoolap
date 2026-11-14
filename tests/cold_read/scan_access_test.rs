@@ -181,7 +181,11 @@ fn assert_alike_in(db: &Database, what: &str, local: bool) {
             .unwrap();
         assert_eq!(scanned(every), expected, "{what}: every row for {filter:?}");
         let rows = table
-            .collect_access_rows(ScanAccess::Index(&plan), Some(filter.as_ref()))
+            .collect_access_rows(
+                ScanAccess::Index(&plan),
+                Some(filter.as_ref()),
+                stoolap::executor::Deadline::NONE,
+            )
             .unwrap();
         assert_eq!(
             collected(rows),
@@ -196,6 +200,7 @@ fn assert_alike_in(db: &Database, what: &str, local: bool) {
                         Some(filter.as_ref()),
                         limit,
                         0,
+                        stoolap::executor::Deadline::NONE,
                     )
                     .unwrap();
                 let rows = collected(rows);
@@ -239,7 +244,13 @@ fn assert_alike_in(db: &Database, what: &str, local: bool) {
         assert_eq!(read(), before, "{what}: a scan of every row read an index");
         drop(
             table
-                .collect_access_rows_with_limit_unordered(ScanAccess::Seq, Some(&condition), 3, 0)
+                .collect_access_rows_with_limit_unordered(
+                    ScanAccess::Seq,
+                    Some(&condition),
+                    3,
+                    0,
+                    stoolap::executor::Deadline::NONE,
+                )
                 .unwrap(),
         );
         assert_eq!(
@@ -304,6 +315,7 @@ fn the_rule_reads_key_bounds_by_the_key_index_and_a_mixed_or_only_under_a_limit(
                 Some(condition.as_ref()),
                 5,
                 0,
+                stoolap::executor::Deadline::NONE,
             )
             .unwrap();
         assert_eq!(rows.len(), 5);

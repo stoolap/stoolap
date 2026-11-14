@@ -1202,10 +1202,15 @@ fn an_older_handle_meets_its_transactions_rows_written_after_a_drop() {
             let plan = table.index_plan(&range);
             let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
             table
-                .update(access, Some(&range), &mut |_, row| {
-                    called.store(true, Ordering::SeqCst);
-                    Ok((row, true))
-                })
+                .update(
+                    access,
+                    Some(&range),
+                    &mut |_, row| {
+                        called.store(true, Ordering::SeqCst);
+                        Ok((row, true))
+                    },
+                    stoolap::executor::Deadline::NONE,
+                )
                 .map(drop)
         }),
         ("update by key", |table, called| {
@@ -1214,10 +1219,15 @@ fn an_older_handle_meets_its_transactions_rows_written_after_a_drop() {
             let plan = table.index_plan(&key);
             let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
             table
-                .update(access, Some(&key), &mut |_, row| {
-                    called.store(true, Ordering::SeqCst);
-                    Ok((row, true))
-                })
+                .update(
+                    access,
+                    Some(&key),
+                    &mut |_, row| {
+                        called.store(true, Ordering::SeqCst);
+                        Ok((row, true))
+                    },
+                    stoolap::executor::Deadline::NONE,
+                )
                 .map(drop)
         }),
     ];
