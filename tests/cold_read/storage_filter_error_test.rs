@@ -683,7 +683,11 @@ mod written_by_the_filter {
         read_writing("memory://filter_writes_indexed", true, |table, filter| {
             let plan = indexed(table, filter);
             Ok(table
-                .collect_access_rows(ScanAccess::Index(&plan), Some(filter))?
+                .collect_access_rows(
+                    ScanAccess::Index(&plan),
+                    Some(filter),
+                    stoolap::executor::Deadline::NONE,
+                )?
                 .len())
         });
     }

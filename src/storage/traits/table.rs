@@ -18,7 +18,7 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::fmt;
 
-use crate::common::deadline::Deadline;
+use crate::common::deadline::{Deadline, DeadlineSite};
 use crate::common::CompactArc;
 use crate::core::{DataType, Error, IndexType, Result, Row, RowVec, Schema, Value};
 use crate::functions::aggregate::GroupedAggregates;
@@ -675,14 +675,18 @@ pub trait Table: Send + Sync {
     /// Cached row vector - returns to cache on drop for reuse
     fn collect_all_rows(&self, where_expr: Option<&dyn Expression>) -> Result<RowVec>;
 
-    /// `collect_all_rows` reading the rows `access` finds
+    /// `collect_all_rows` reading the rows `access` finds, charging the
+    /// statement's `deadline` per row read
     fn collect_access_rows(
         &self,
         access: ScanAccess<'_>,
         where_expr: Option<&dyn Expression>,
+        deadline: Deadline,
     ) -> Result<RowVec> {
         let _ = access;
-        self.collect_all_rows(where_expr)
+        let rows = self.collect_all_rows(where_expr)?;
+        deadline.charge(DeadlineSite::StorageRead, rows.len())?;
+        Ok(rows)
     }
 
     /// Collects rows with an optional limit (LIMIT pushdown optimization)
@@ -744,16 +748,20 @@ pub trait Table: Send + Sync {
         self.collect_rows_with_limit(where_expr, limit, offset)
     }
 
-    /// `collect_rows_with_limit_unordered` reading the rows `access` finds
+    /// `collect_rows_with_limit_unordered` reading the rows `access` finds,
+    /// charging the statement's `deadline` per row read
     fn collect_access_rows_with_limit_unordered(
         &self,
         access: ScanAccess<'_>,
         where_expr: Option<&dyn Expression>,
         limit: usize,
         offset: usize,
+        deadline: Deadline,
     ) -> Result<RowVec> {
         let _ = access;
-        self.collect_rows_with_limit_unordered(where_expr, limit, offset)
+        let rows = self.collect_rows_with_limit_unordered(where_expr, limit, offset)?;
+        deadline.charge(DeadlineSite::StorageRead, rows.len())?;
+        Ok(rows)
     }
 
     /// Collects all rows WITHOUT guaranteeing deterministic order.
@@ -1341,8 +1349,9 @@ pub trait Table: Send + Sync {
         nulls_first: bool,
         limit: usize,
         offset: usize,
+        deadline: Deadline,
     ) -> Result<Option<RowVec>> {
-        let _ = (column_name, ascending, nulls_first, limit, offset);
+        let _ = (column_name, ascending, nulls_first, limit, offset, deadline);
         Ok(None) // Default implementation - override in concrete tables
     }
 
@@ -1350,16 +1359,16 @@ pub trait Table: Send + Sync {
     /// and whether its NULLs come before its values, all ascending or all
     /// descending, read by walking the index whose leading columns they are.
     /// None when the table cannot read them so, which leaves them to a sort.
-    /// The walk asks `cancelled` as it goes and, once it is true, stops and
-    /// fails with `QueryCancelled` after letting the index go
+    /// The walk charges `deadline` as it goes and, once it has passed, stops
+    /// and fails with `QueryCancelled` after letting the index go
     fn collect_rows_ordered_by_index_keys(
         &self,
         keys: &[(&str, bool)],
         ascending: bool,
         (limit, offset): (usize, usize),
-        cancelled: &dyn Fn() -> bool,
+        deadline: Deadline,
     ) -> Result<Option<RowVec>> {
-        let _ = (keys, ascending, limit, offset, cancelled);
+        let _ = (keys, ascending, limit, offset, deadline);
         Ok(None)
     }
 
@@ -1442,8 +1451,9 @@ pub trait Table: Send + Sync {
     fn collect_rows_grouped_by_partition(
         &self,
         column_name: &str,
+        deadline: Deadline,
     ) -> Result<Option<Vec<(Value, RowVec)>>> {
-        let _ = column_name;
+        let _ = (column_name, deadline);
         Ok(None) // Default implementation - override in concrete tables
     }
 
@@ -1685,6 +1695,7 @@ pub trait Table: Send + Sync {
         &self,
         _aggregates: &[(AggregateOp, usize)],
         _where_expr: &dyn Expression,
+        _deadline: Deadline,
     ) -> Result<Option<Vec<crate::core::Value>>> {
         Ok(None) // Default: not supported
     }
@@ -1704,6 +1715,7 @@ pub trait Table: Send + Sync {
         &self,
         _group_by_indices: &[usize],
         _aggregates: &[(AggregateOp, usize)],
+        _deadline: Deadline,
     ) -> Result<Option<GroupedAggregates>> {
         Ok(None) // Default: not supported
     }

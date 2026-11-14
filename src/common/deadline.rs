@@ -82,11 +82,15 @@ pub enum DeadlineSite {
     StorageDelete,
     /// The rows a storage UPDATE judges, hot and sealed
     StorageUpdate,
+    /// The rows a storage read hands a statement, hot and sealed
+    StorageRead,
+    /// The rows a storage aggregate folds, hot and sealed
+    StorageAggregate,
 }
 
 impl DeadlineSite {
     /// Every site, which a test stops a statement at in turn
-    pub const ALL: [DeadlineSite; 24] = [
+    pub const ALL: [DeadlineSite; 26] = [
         DeadlineSite::Scan,
         DeadlineSite::LateKeys,
         DeadlineSite::Block,
@@ -111,6 +115,8 @@ impl DeadlineSite {
         DeadlineSite::Aggregate,
         DeadlineSite::StorageDelete,
         DeadlineSite::StorageUpdate,
+        DeadlineSite::StorageRead,
+        DeadlineSite::StorageAggregate,
     ];
 }
 

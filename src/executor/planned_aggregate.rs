@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use crate::common::deadline::Deadline;
 use crate::common::names::eq_names;
 use crate::common::{CompactArc, CompactVec, SmartString};
 use crate::core::{IndexType, Result, Row, RowVec, Schema, Value};
@@ -221,6 +222,7 @@ impl Executor {
         columns: &[Option<usize>],
         quiet: bool,
         pushed: Option<&dyn StorageExpr>,
+        deadline: Deadline,
     ) -> Result<Option<(GlobalSource, CompactVec<Value>)>> {
         match source {
             GlobalSource::IndexBound => {
@@ -239,8 +241,12 @@ impl Executor {
             GlobalSource::Stats => Ok(Self::stats_values(table, aggregations, columns, quiet)?
                 .map(|values| (source, values))),
             GlobalSource::StorageFiltered => match pushed {
-                Some(pushed) => Ok(Self::filtered_values(table, pushed, aggregations, columns)?
-                    .map(|values| (source, values))),
+                Some(pushed) => {
+                    Ok(
+                        Self::filtered_values(table, pushed, aggregations, columns, deadline)?
+                            .map(|values| (source, values)),
+                    )
+                }
                 None => Ok(None),
             },
             GlobalSource::Scan => Ok(None),
@@ -315,6 +321,7 @@ impl Executor {
         pushed: &dyn StorageExpr,
         aggregations: &[SqlAggregateFunction],
         columns: &[Option<usize>],
+        deadline: Deadline,
     ) -> Result<Option<CompactVec<Value>>> {
         use crate::storage::mvcc::version_store::AggregateOp;
         let mut ops = Vec::with_capacity(aggregations.len());
@@ -331,7 +338,7 @@ impl Executor {
             ops.push(op);
         }
         Ok(table
-            .compute_filtered_aggregates(&ops, pushed)?
+            .compute_filtered_aggregates(&ops, pushed, deadline)?
             .map(|values| values.into_iter().collect()))
     }
 
@@ -403,7 +410,16 @@ impl Executor {
     ) -> Result<Option<Box<dyn QueryResult>>> {
         let source_columns = table.schema().column_names_arc();
         let columns = Self::call_columns(aggregations, &source_columns);
-        let row = Self::global_values(source, table, aggregations, &columns, false, pushed)?;
+        let deadline = ctx.deadline_of_call();
+        let row = Self::global_values(
+            source,
+            table,
+            aggregations,
+            &columns,
+            false,
+            pushed,
+            deadline,
+        )?;
         let (path, rows) = match row {
             Some((answered, values)) => {
                 let mut rows = RowVec::with_capacity(1);
@@ -456,6 +472,7 @@ impl Executor {
                 &[None],
                 quiet,
                 None,
+                ctx.deadline_of_call(),
             )?;
             let Some((answered, values)) = row else {
                 return Ok(None);

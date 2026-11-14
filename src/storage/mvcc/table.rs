@@ -3814,11 +3814,15 @@ impl Table for MVCCTable {
         &self,
         access: ScanAccess<'_>,
         where_expr: Option<&dyn Expression>,
+        deadline: Deadline,
     ) -> Result<RowVec> {
-        if let Some(rows) = self.access_rows(access, where_expr)? {
-            return Ok(rows);
-        }
-        self.collect_all_rows(where_expr)
+        let rows = match self.access_rows(access, where_expr)? {
+            Some(rows) => rows,
+            None => self.collect_all_rows(where_expr)?,
+        };
+        // The hot rows are read at once, under the store's guards
+        deadline.charge(DeadlineSite::StorageRead, rows.len())?;
+        Ok(rows)
     }
 
     /// Answered by walking a multi-column index whose leading columns the
@@ -4016,7 +4020,14 @@ impl Table for MVCCTable {
         limit: usize,
         offset: usize,
     ) -> Result<RowVec> {
-        self.collect_access_rows_with_limit_unordered(ScanAccess::Seq, where_expr, limit, offset)
+        let none = Deadline::NONE;
+        self.collect_access_rows_with_limit_unordered(
+            ScanAccess::Seq,
+            where_expr,
+            limit,
+            offset,
+            none,
+        )
     }
 
     fn collect_access_rows_with_limit_unordered(
@@ -4025,10 +4036,12 @@ impl Table for MVCCTable {
         where_expr: Option<&dyn Expression>,
         limit: usize,
         offset: usize,
+        deadline: Deadline,
     ) -> Result<RowVec> {
         let rows =
             self.collect_visible_rows_with_limit_unordered(access, where_expr, limit, offset)?;
         self.check_read()?;
+        deadline.charge(DeadlineSite::StorageRead, rows.len())?;
         Ok(rows)
     }
 
@@ -4956,6 +4969,7 @@ impl Table for MVCCTable {
         nulls_first: bool,
         limit: usize,
         offset: usize,
+        deadline: Deadline,
     ) -> Result<Option<RowVec>> {
         // If transaction has local changes (inserts/updates/deletes), fall back to
         // the regular path which correctly merges local changes via collect_visible_rows.
@@ -4984,6 +4998,8 @@ impl Table for MVCCTable {
                     offset,
                 );
                 self.check_read()?;
+                let read = rows.as_ref().map_or(0, |rows| rows.len() + offset);
+                deadline.charge(DeadlineSite::StorageRead, read)?;
                 return Ok(rows);
             }
         }
@@ -5017,6 +5033,7 @@ impl Table for MVCCTable {
             let mut skipped = 0;
 
             for row_id in ordered_row_ids {
+                deadline.charge(DeadlineSite::StorageRead, 1)?;
                 // Check visibility and get row
                 if let Some(version) = self
                     .version_store
@@ -5096,6 +5113,7 @@ impl Table for MVCCTable {
             index.get_row_ids_equal_into(&[value], &mut row_ids);
 
             for row_id in &row_ids {
+                deadline.charge(DeadlineSite::StorageRead, 1)?;
                 let row_id = *row_id;
                 // Check visibility and get row
                 if let Some(version) = self
@@ -5137,7 +5155,7 @@ impl Table for MVCCTable {
         keys: &[(&str, bool)],
         ascending: bool,
         (limit, offset): (usize, usize),
-        cancelled: &dyn Fn() -> bool,
+        deadline: Deadline,
     ) -> Result<Option<RowVec>> {
         let needed = limit.saturating_add(offset);
         if needed == 0 {
@@ -5182,7 +5200,7 @@ impl Table for MVCCTable {
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::hot_top_k_visited();
             visits += 1;
-            if visits % 100 == 0 && cancelled() {
+            if visits % 100 == 0 && deadline.charge(DeadlineSite::IndexWalk, 100).is_err() {
                 cancel = true;
                 return false;
             }
@@ -5249,6 +5267,7 @@ impl Table for MVCCTable {
     fn collect_rows_grouped_by_partition(
         &self,
         column_name: &str,
+        deadline: Deadline,
     ) -> Result<Option<Vec<(Value, RowVec)>>> {
         // The index keys group the rows only while it holds what this
         // statement sees
@@ -5281,6 +5300,7 @@ impl Table for MVCCTable {
             // Collect visible rows for this partition
             let mut partition_rows = RowVec::with_capacity(row_ids.len());
             for &row_id in &row_ids {
+                deadline.charge(DeadlineSite::StorageRead, 1)?;
                 if let Some(version) = self
                     .version_store
                     .get_visible_version(row_id, self.reader())
@@ -5508,6 +5528,7 @@ impl Table for MVCCTable {
         &self,
         group_by_indices: &[usize],
         aggregates: &[(crate::storage::mvcc::version_store::AggregateOp, usize)],
+        deadline: Deadline,
     ) -> Result<Option<crate::functions::aggregate::GroupedAggregates>> {
         // Only use storage-level aggregation if no uncommitted local changes
         let txn_versions = self.local();
@@ -5520,6 +5541,7 @@ impl Table for MVCCTable {
             self.reader(),
             group_by_indices,
             aggregates,
+            deadline,
         )?;
         self.check_read()?;
         Ok(groups)
@@ -5813,6 +5835,7 @@ mod tests {
                     Some(expr),
                     5,
                     0,
+                    Deadline::NONE,
                 )
                 .unwrap();
             let mut ids: Vec<i64> = rows.into_iter().map(|(id, _)| id).collect();

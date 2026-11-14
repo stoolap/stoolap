@@ -1256,7 +1256,9 @@ impl Executor {
                         return Ok(Some(WindowRows::Answer(answer)));
                     }
                 }
-                let Some(grouped) = table.collect_rows_grouped_by_partition(column)? else {
+                let deadline = ctx.deadline_of_call();
+                let Some(grouped) = table.collect_rows_grouped_by_partition(column, deadline)?
+                else {
                     return Ok(None);
                 };
                 let mut rows = RowVec::new();
@@ -1288,6 +1290,7 @@ impl Executor {
                     !*ascending,
                     limit,
                     0,
+                    ctx.deadline_of_call(),
                 )?;
                 Ok(sorted.map(|rows| {
                     let sorted = WindowPreSortedState {

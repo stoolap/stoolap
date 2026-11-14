@@ -1552,11 +1552,12 @@ impl PreparedRows {
         }
     }
 
-    fn into_rows(self) -> Result<CompactArc<Vec<Row>>> {
+    fn into_rows(self, deadline: Deadline) -> Result<CompactArc<Vec<Row>>> {
         match self {
-            PreparedRows::Unread(result) => Executor::materialize_result_arc(result),
+            PreparedRows::Unread(result) => Executor::materialize_result_arc(result, deadline),
             PreparedRows::Partial(mut rows, mut rest) => {
                 while rest.next() {
+                    deadline.charge(DeadlineSite::Result, 1)?;
                     rows.push(rest.take_row());
                 }
                 if let Some(error) = rest.last_error() {
@@ -4338,7 +4339,7 @@ impl Executor {
             };
             // A read after its boundary row goes on from where it stands
             let left_rows = match window.offset {
-                0 => Self::materialize_result_arc(left_result)?,
+                0 => Self::materialize_result_arc(left_result, ctx.deadline_of_call())?,
                 _ => CompactArc::new(
                     Self::materialize_result(left_result, ctx.deadline_of_call())?
                         .into_iter()
@@ -4370,7 +4371,7 @@ impl Executor {
                 None,
                 0,
             )?;
-            let right_rows = Self::materialize_result_arc(right_result)?;
+            let right_rows = Self::materialize_result_arc(right_result, ctx.deadline_of_call())?;
             reduction.set(Some(ReductionPass {
                 cap: window.cap,
                 read: left_rows.len(),
@@ -5496,7 +5497,7 @@ impl Executor {
                 // as it is collected
                 let build = |result, bounded: bool| match build_limit {
                     Some(cap) if !bounded => Self::first_rows(result, cap),
-                    _ => Self::materialize_result_arc(result),
+                    _ => Self::materialize_result_arc(result, ctx.deadline_of_call()),
                 };
                 let (build_rows, build_cols, probe_result, probe_cols, build_is_left) =
                     if build_left {
@@ -5594,7 +5595,8 @@ impl Executor {
                     }
                 }
                 if unverified {
-                    let probe_rows = Self::materialize_result_arc(probe_result)?;
+                    let probe_rows =
+                        Self::materialize_result_arc(probe_result, ctx.deadline_of_call())?;
                     break 'streaming Some(if build_is_left {
                         (build_rows, build_cols, probe_rows, probe_cols)
                     } else {
@@ -5698,13 +5700,14 @@ impl Executor {
                 // Execute both sides; a side the index join already ran is taken
                 // as it left it, and the other side is read in the same context
                 let side_ctx = prepared_ctx.as_ref().unwrap_or(ctx);
+                let deadline = ctx.deadline_of_call();
                 let run_side =
                     |expr: &Expression, read: SideRead<'_>, keys: Option<&Expression>| {
                         #[cfg(any(test, feature = "test-failpoints"))]
                         crate::test_failpoints::join_side_ran();
                         let (result, columns, _, _) =
                             self.read_join_side(expr, side_ctx, read, keys, None, 0)?;
-                        Ok::<_, Error>((Self::materialize_result_arc(result)?, columns))
+                        Ok::<_, Error>((Self::materialize_result_arc(result, deadline)?, columns))
                     };
                 match prepared_side.take() {
                     Some(PreparedSide {
@@ -5714,7 +5717,7 @@ impl Executor {
                     }) => {
                         let (left_rows, left_cols) =
                             run_side(&join_source.left, left_read, inner_keys.as_ref())?;
-                        (left_rows, left_cols, rows.into_rows()?, columns)
+                        (left_rows, left_cols, rows.into_rows(deadline)?, columns)
                     }
                     Some(PreparedSide {
                         rows,
@@ -5723,7 +5726,7 @@ impl Executor {
                     }) => {
                         let (right_rows, right_cols) =
                             run_side(&join_source.right, right_read, inner_keys.as_ref())?;
-                        (rows.into_rows()?, columns, right_rows, right_cols)
+                        (rows.into_rows(deadline)?, columns, right_rows, right_cols)
                     }
                     None => {
                         let (left_rows, left_cols) = run_side(&join_source.left, left_read, None)?;
@@ -7732,6 +7735,7 @@ impl Executor {
     /// falling back to iterating and collecting rows if not possible.
     pub(crate) fn materialize_result_arc(
         mut result: Box<dyn QueryResult>,
+        deadline: Deadline,
     ) -> Result<CompactArc<Vec<Row>>> {
         // Try to extract Arc directly (zero-copy path for CTEs)
         if let Some(arc_rows) = result.try_into_arc_rows() {
@@ -7745,6 +7749,7 @@ impl Executor {
             Vec::new()
         };
         while result.next() {
+            deadline.charge(DeadlineSite::Result, 1)?;
             rows.push(result.take_row());
         }
         // Surface runtime filter errors (e.g., invalid parameterized REGEXP)

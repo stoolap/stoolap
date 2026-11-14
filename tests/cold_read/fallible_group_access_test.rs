@@ -1186,6 +1186,7 @@ fn warm_filtered_aggregation_propagates_column_failure() {
             .compute_filtered_aggregates(
                 &[(AggregateOp::Sum, 1)],
                 &ComparisonExpr::gte("a", Value::Integer(0)),
+                stoolap::executor::Deadline::NONE,
             )
             .map(drop)
     });
@@ -1197,7 +1198,11 @@ fn warm_grouped_aggregation_propagates_column_failure() {
     use stoolap::storage::traits::Table;
     assert_warm_read_failure(|table| {
         table
-            .compute_grouped_aggregates(&[0], &[(AggregateOp::Sum, 1)])
+            .compute_grouped_aggregates(
+                &[0],
+                &[(AggregateOp::Sum, 1)],
+                stoolap::executor::Deadline::NONE,
+            )
             .map(drop)
     });
 }
@@ -1213,7 +1218,7 @@ fn fully_hidden_warm_columns_are_not_decoded() {
     assert_eq!(table.get_partition_count("b").unwrap(), Some(0));
     assert!(table.get_partition_values("b").unwrap().unwrap().is_empty());
     assert!(table
-        .collect_rows_grouped_by_partition("b")
+        .collect_rows_grouped_by_partition("b", stoolap::executor::Deadline::NONE)
         .unwrap()
         .unwrap()
         .is_empty());
@@ -1223,7 +1228,11 @@ fn fully_hidden_warm_columns_are_not_decoded() {
         .unwrap()
         .is_empty());
     assert!(table
-        .compute_grouped_aggregates(&[0], &[(AggregateOp::Sum, 1)])
+        .compute_grouped_aggregates(
+            &[0],
+            &[(AggregateOp::Sum, 1)],
+            stoolap::executor::Deadline::NONE,
+        )
         .unwrap()
         .unwrap()
         .is_empty());

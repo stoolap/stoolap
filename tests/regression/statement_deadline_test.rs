@@ -124,6 +124,8 @@ fn statement(site: DeadlineSite, csv: &str) -> String {
         DeadlineSite::Aggregate => "SELECT k, SUM(v * 2) FROM big GROUP BY k",
         DeadlineSite::StorageDelete => "DELETE FROM w WHERE k >= 0",
         DeadlineSite::StorageUpdate => "UPDATE u SET k = k + 0 WHERE k >= 0",
+        DeadlineSite::StorageRead => "SELECT id, ROW_NUMBER() OVER (ORDER BY v) AS n FROM big",
+        DeadlineSite::StorageAggregate => "SELECT k, SUM(v) FROM big GROUP BY k",
     };
     sql.to_string()
 }
@@ -418,6 +420,32 @@ fn a_storage_write_over_sealed_rows_stops_and_leaves_no_row_or_claim() {
                     read(&executor, "ROLLBACK", &ctx).unwrap();
                 }
             }
+        }
+    }
+    // Reads of the sealed rows, each stopped inside them
+    let reads = [
+        (
+            DeadlineSite::StorageRead,
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY v) AS n FROM s",
+        ),
+        (
+            DeadlineSite::StorageAggregate,
+            "SELECT k, SUM(v) FROM s GROUP BY k",
+        ),
+        (
+            DeadlineSite::StorageAggregate,
+            "SELECT SUM(v) FROM s WHERE k >= 0",
+        ),
+    ];
+    for (site, sql) in reads {
+        pass_deadline_at(site);
+        let stopped = read(&executor, sql, &ctx);
+        keep_deadlines();
+        if !matches!(stopped, Err(Error::QueryCancelled)) {
+            wrong.push(format!("{sql} gave {stopped:?}"));
+        }
+        if let Err(err) = read(&executor, sql, &ctx) {
+            wrong.push(format!("{sql} failed ahead of its deadline: {err}"));
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
