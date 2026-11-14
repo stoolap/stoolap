@@ -77,11 +77,12 @@
 //! The optimizer has bloom filter propagation logic, but runtime bloom filter
 //! checks are not yet integrated into the streaming operators.
 
+use crate::common::deadline::DeadlineSite;
 use crate::common::CompactArc;
 use crate::core::predicate::{kind, KeySide};
 use crate::core::{Result, Row, RowVec, Schema};
 use crate::executor::aggregation::{compile_over_pair, compile_over_slots};
-use crate::executor::context::{DeadlineSite, ExecutionContext};
+use crate::executor::context::ExecutionContext;
 use crate::executor::expression::{JoinFilter, RowFilter, SharedProgram, SubqueryExecutor};
 use crate::executor::hash_table::JoinHashTable;
 use crate::executor::operator::{MaterializedOperator, Operator};

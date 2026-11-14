@@ -24,6 +24,7 @@
 pub mod compact_arc;
 pub mod compact_vec;
 pub mod cow_btree;
+pub(crate) mod deadline;
 pub mod i64_map;
 pub mod maps;
 pub(crate) mod names;
