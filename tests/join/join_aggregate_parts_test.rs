@@ -445,6 +445,14 @@ mod cancel {
                 "SELECT COUNT(*) FROM bl JOIN br ON bl.u = br.u \
                  AND JOIN_CANCEL_NOW(bl.id + br.id) = bl.id + br.id",
             ),
+            (
+                super::open("join_aggregate_parts_cancel_argument"),
+                "SELECT SUM(JOIN_CANCEL_NOW(l.id + r.id)) FROM l JOIN r ON l.k = r.k",
+            ),
+            (
+                super::open_wide("join_aggregate_parts_cancel_wide_argument"),
+                "SELECT SUM(JOIN_CANCEL_NOW(bl.id + br.id)) FROM bl JOIN br ON bl.u = br.u",
+            ),
         ] {
             let executor = Executor::new(Arc::clone(db.engine()));
             let mut ctx = ExecutionContext::new();
@@ -1197,13 +1205,7 @@ fn an_index_join_asks_its_where_and_on_subqueries_in_parts() {
     ];
     for (from, path, keep) in cases {
         let sql = format!("SELECT p.g, COUNT(*), SUM(c.v) {from} GROUP BY p.g ORDER BY p.g");
-        // A file database hashes the join, whose WHERE subqueries the
-        // general path asks of held rows
-        let got = match path == "hash" && from.contains(" WHERE ") {
-            true => rows(&db, &sql),
-            false => parted_by(&db, &sql, path),
-        };
-        assert_eq!(got, keyed_groups(keep), "{sql}");
+        assert_eq!(parted_by(&db, &sql, path), keyed_groups(keep), "{sql}");
     }
 }
 
@@ -1229,6 +1231,13 @@ fn a_prepared_join_asks_its_subqueries_again_for_each_parameter_in_parts() {
         .prepare(
             "SELECT l.g, COUNT(*), SUM(r.w) FROM l JOIN r ON l.k = r.k \
              AND EXISTS (SELECT 1 FROM q WHERE q.a = r.w AND q.id < $1) \
+             GROUP BY l.g ORDER BY l.g",
+        )
+        .unwrap();
+    let hash_where = db
+        .prepare(
+            "SELECT l.g, COUNT(*), SUM(r.w) FROM l JOIN r ON l.k = r.k \
+             WHERE EXISTS (SELECT 1 FROM q WHERE q.a = r.w AND q.id < l.id + $1) \
              GROUP BY l.g ORDER BY l.g",
         )
         .unwrap();
@@ -1264,5 +1273,198 @@ fn a_prepared_join_asks_its_subqueries_again_for_each_parameter_in_parts() {
         assert_eq!(read(&index, below), want, "index join, $1 = {below}");
         let want = lr_groups(equal_keys, |_, r| q_below(r.2, below));
         assert_eq!(read(&hash, below), want, "hash join, $1 = {below}");
+        let want = lr_groups(equal_keys, |l, r| q_below(r.2, l.0 + below));
+        assert_eq!(
+            read(&hash_where, below),
+            want,
+            "hash join WHERE, $1 = {below}"
+        );
+    }
+}
+
+/// z: id 1..=10000, k = id % 100 + 5, an index on k, which an EXISTS on
+/// l.k probes or builds a keyed set of
+fn with_z(db: Database) -> Database {
+    for sql in [
+        "CREATE TABLE z (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE INDEX z_k ON z (k)",
+        "INSERT INTO z SELECT value, value % 100 + 5 FROM generate_series(1, 10000)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    db
+}
+
+/// The probes and the keyed sets the blocks ran on this thread for `sql`,
+/// read with parts of `part_rows` rows (0 for the default), its rows checked
+/// against `want`
+#[cfg(feature = "test-failpoints")]
+fn strategies(db: &Database, sql: &str, part_rows: usize, want: &[String]) -> (usize, usize) {
+    use stoolap::test_failpoints::{prepared_strategy_runs_here, PreparedStrategy};
+    stoolap::test_failpoints::set_join_part_rows(part_rows);
+    stoolap::test_failpoints::reset_join_part_largest();
+    let probes = prepared_strategy_runs_here(PreparedStrategy::Probe);
+    let keyed = prepared_strategy_runs_here(PreparedStrategy::KeyedSet);
+    assert_eq!(rows(db, sql), want, "{sql}");
+    let ran = (
+        prepared_strategy_runs_here(PreparedStrategy::Probe) - probes,
+        prepared_strategy_runs_here(PreparedStrategy::KeyedSet) - keyed,
+    );
+    stoolap::test_failpoints::set_join_part_rows(0);
+    assert!(
+        stoolap::test_failpoints::join_part_largest() > 0,
+        "{sql}: the aggregation read no part"
+    );
+    ran
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_where_subquery_after_a_join_read_in_parts_chooses_its_strategy_by_the_first_part() {
+    let db = with_z(open("join_aggregate_parts_where_strategy"));
+    let sql = "SELECT l.g, COUNT(*), SUM(r.w) FROM l JOIN r ON l.k = r.k \
+               WHERE EXISTS (SELECT 1 FROM z WHERE z.k = l.k) \
+               GROUP BY l.g ORDER BY l.g";
+    let want = lr_groups(equal_keys, |l, _| l.1 >= 5);
+    let joined = pairs().len();
+    let (probes, keyed) = strategies(&db, sql, 0, &want);
+    assert!(
+        probes > 0 && keyed == 0,
+        "{joined} joined rows in one part over 10000 rows of z probe per row: \
+         {probes} probes, {keyed} keyed sets"
+    );
+    let (probes, keyed) = strategies(&db, sql, PART_ROWS, &want);
+    assert_eq!(
+        (probes, keyed),
+        (0, 1),
+        "{joined} joined rows past a part of {PART_ROWS} build the keyed set once"
+    );
+}
+
+#[test]
+fn a_hash_join_asks_its_where_subqueries_in_parts() {
+    let db = with_q(open("join_aggregate_parts_where_blocks_hash"));
+    let cases: [(&str, Keep3); 4] = [
+        ("WHERE l.id + r.id IN (SELECT q.id * 4 FROM q)", |l, r| {
+            (l.0 + r.0) % 4 == 0 && (1..=20).contains(&((l.0 + r.0) / 4))
+        }),
+        (
+            "WHERE NOT EXISTS (SELECT 1 FROM q WHERE q.a = r.w AND q.id < l.id)",
+            |l, r| !q_below(r.2, l.0),
+        ),
+        (
+            "WHERE l.id < ALL (SELECT q.id FROM q WHERE q.a = r.w)",
+            |l, r| q_rows().filter(|q| q.1 == r.2).all(|q| l.0 < q.0),
+        ),
+        (
+            "WHERE l.id + r.id > (SELECT MIN(q.id) * 10 FROM q WHERE q.a = 5)",
+            |l, r| l.0 + r.0 > 50,
+        ),
+    ];
+    for (where_, keep) in cases {
+        let sql = format!(
+            "SELECT l.g, COUNT(*), SUM(r.w) FROM l JOIN r ON l.k = r.k {where_} \
+             GROUP BY l.g ORDER BY l.g"
+        );
+        assert_eq!(
+            parted_by(&db, &sql, "hash"),
+            lr_groups(equal_keys, keep),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn outer_joins_ask_their_where_subqueries_of_unmatched_rows_in_parts() {
+    let db = with_q(open("join_aggregate_parts_where_blocks_outer"));
+    let pairs = pairs();
+    let kept = pairs.iter().filter(|(l, r)| q_below(r.2, l.0)).count() as i64;
+    let lone_l = l_rows().filter(|l| !r_rows().any(|r| r.1 == l.1)).count() as i64;
+    let lone_r = r_rows().filter(|r| !l_rows().any(|l| l.1 == r.1)).count() as i64;
+    for (kind, want) in [
+        ("LEFT", [kept + lone_l, kept]),
+        ("RIGHT", [kept + lone_r, kept + lone_r]),
+        ("FULL", [kept + lone_l + lone_r, kept + lone_r]),
+    ] {
+        let sql = format!(
+            "SELECT COUNT(*), COUNT(r.id) FROM l {kind} JOIN r ON l.k = r.k \
+             WHERE l.id IS NULL OR r.id IS NULL \
+             OR EXISTS (SELECT 1 FROM q WHERE q.a = r.w AND q.id < l.id)"
+        );
+        let want = vec![want.map(int).join("|")];
+        assert_eq!(parted_by(&db, &sql, "hash"), want, "{sql}");
+    }
+}
+
+#[test]
+fn a_nested_loop_and_a_join_across_threads_ask_their_where_subqueries_in_parts() {
+    let db = with_q(open("join_aggregate_parts_where_blocks_nested"));
+    let sql = "SELECT l.g, COUNT(*), SUM(r.w) FROM l JOIN r ON l.k < r.k \
+               WHERE EXISTS (SELECT 1 FROM q WHERE q.a = r.w AND q.id < l.id) \
+               GROUP BY l.g ORDER BY l.g";
+    assert_eq!(
+        parted_by(&db, sql, "nested_loop"),
+        lr_groups(|l, r| l.1 < r.1, |l, r| q_below(r.2, l.0))
+    );
+
+    let db = with_q(open_wide("join_aggregate_parts_where_blocks_wide"));
+    let mut groups: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
+    for (l, r) in wide_pairs().filter(|(l, r)| q_below(l % 5, r % 7 + 2)) {
+        let group = groups.entry(l % 5).or_default();
+        group.0 += 1;
+        group.1 += r % 7;
+    }
+    let want: Vec<String> = groups
+        .iter()
+        .map(|(g, (count, sum))| [int(*g), int(*count), int(*sum)].join("|"))
+        .collect();
+    let sql = "SELECT bl.g, COUNT(*), SUM(br.v) FROM bl JOIN br ON bl.u = br.u \
+               WHERE EXISTS (SELECT 1 FROM q WHERE q.a = bl.g AND q.id < br.v + 2) \
+               GROUP BY bl.g ORDER BY bl.g";
+    assert_eq!(parted_across_threads(&db, sql), want);
+}
+
+#[test]
+fn a_using_join_asks_its_where_subqueries_after_its_merged_column_in_parts() {
+    let db = with_q(open_merged("join_aggregate_parts_where_blocks_using"));
+    let mut groups: BTreeMap<i64, i64> = BTreeMap::new();
+    for (_, r) in pairs().iter().filter(|(l, r)| q_below(r.2, l.0)) {
+        *groups.entry(r.1).or_default() += 1;
+    }
+    let want: Vec<String> = groups
+        .iter()
+        .map(|(k, count)| [int(*k), int(*count)].join("|"))
+        .collect();
+    let sql = "SELECT k, COUNT(*) FROM l JOIN s USING (k) \
+               WHERE EXISTS (SELECT 1 FROM q WHERE q.a = s.w AND q.id < l.id) \
+               GROUP BY k ORDER BY k";
+    assert_eq!(parted_by(&db, sql, "hash"), want);
+}
+
+#[test]
+fn a_where_beside_a_subquery_running_a_join_raises_its_error_in_parts() {
+    let db = with_q(open("join_aggregate_parts_where_blocks_error"));
+    for (on, path) in [("l.k = r.k", "hash"), ("l.k < r.k", "nested_loop")] {
+        let sql = format!(
+            "SELECT COUNT(*) FROM l JOIN r ON {on} \
+             WHERE CASE WHEN l.id = 3 THEN 9223372036854775807 + r.id ELSE 0 END = 0 \
+             AND EXISTS (SELECT 1 FROM l a JOIN r b ON a.k = b.k \
+             WHERE b.id = r.id AND a.id <> l.id)"
+        );
+        #[cfg(feature = "test-failpoints")]
+        stoolap::test_failpoints::reset_join_paths();
+        let err = match db.query(&sql, ()) {
+            Ok(rows) => rows.map(|r| r.map(|_| ())).collect::<Result<Vec<_>, _>>(),
+            Err(e) => Err(e),
+        }
+        .expect_err("l.id = 3 overflows the WHERE");
+        #[cfg(feature = "test-failpoints")]
+        assert!(
+            stoolap::test_failpoints::join_paths_taken().contains(&path),
+            "{sql}"
+        );
+        #[cfg(not(feature = "test-failpoints"))]
+        let _ = path;
+        assert!(err.to_string().contains("overflow"), "{sql}: {err}");
     }
 }
