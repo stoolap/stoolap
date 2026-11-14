@@ -2102,8 +2102,23 @@ pub fn prepared_strategy_runs(strategy: PreparedStrategy) -> usize {
     PREPARED_STRATEGY_RUNS[strategy as usize].load(std::sync::atomic::Ordering::Relaxed)
 }
 
+thread_local! {
+    static PREPARED_STRATEGY_RUNS_HERE: [std::cell::Cell<usize>; 13] =
+        const { [const { std::cell::Cell::new(0) }; 13] };
+}
+
+/// How often `strategy` answered on this thread, so far: a statement's
+/// blocks answer on the thread running it, which no other test counts on
+pub fn prepared_strategy_runs_here(strategy: PreparedStrategy) -> usize {
+    PREPARED_STRATEGY_RUNS_HERE.with(|runs| runs[strategy as usize].get())
+}
+
 pub(crate) fn prepared_strategy_ran(strategy: PreparedStrategy) {
     PREPARED_STRATEGY_RUNS[strategy as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    PREPARED_STRATEGY_RUNS_HERE.with(|runs| {
+        let run = &runs[strategy as usize];
+        run.set(run.get() + 1);
+    });
 }
 
 /// Every place a literal of a text is read as a hidden parameter of the

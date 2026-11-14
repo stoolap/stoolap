@@ -577,6 +577,9 @@ impl RowSource for JoinedRows<'_, '_> {
     fn next_row(&mut self) -> Result<Option<&Row>> {
         loop {
             if let Some((_, row)) = self.pending.as_mut().and_then(Iterator::next) {
+                // The aggregation asks each row as it is handed out, so a
+                // deadline passed while asking one stops the next
+                self.ctx.charge(DeadlineSite::JoinedRows, 1)?;
                 self.row = Some(row);
                 return Ok(self.row.as_ref());
             }

@@ -445,6 +445,14 @@ mod cancel {
                 "SELECT COUNT(*) FROM bl JOIN br ON bl.u = br.u \
                  AND JOIN_CANCEL_NOW(bl.id + br.id) = bl.id + br.id",
             ),
+            (
+                super::open("join_aggregate_parts_cancel_argument"),
+                "SELECT SUM(JOIN_CANCEL_NOW(l.id + r.id)) FROM l JOIN r ON l.k = r.k",
+            ),
+            (
+                super::open_wide("join_aggregate_parts_cancel_wide_argument"),
+                "SELECT SUM(JOIN_CANCEL_NOW(bl.id + br.id)) FROM bl JOIN br ON bl.u = br.u",
+            ),
         ] {
             let executor = Executor::new(Arc::clone(db.engine()));
             let mut ctx = ExecutionContext::new();
@@ -1287,19 +1295,20 @@ fn with_z(db: Database) -> Database {
     db
 }
 
-/// The probes and the keyed sets the blocks ran for `sql`, read with parts
-/// of `part_rows` rows (0 for the default), its rows checked against `want`
+/// The probes and the keyed sets the blocks ran on this thread for `sql`,
+/// read with parts of `part_rows` rows (0 for the default), its rows checked
+/// against `want`
 #[cfg(feature = "test-failpoints")]
 fn strategies(db: &Database, sql: &str, part_rows: usize, want: &[String]) -> (usize, usize) {
-    use stoolap::test_failpoints::{prepared_strategy_runs, PreparedStrategy};
+    use stoolap::test_failpoints::{prepared_strategy_runs_here, PreparedStrategy};
     stoolap::test_failpoints::set_join_part_rows(part_rows);
     stoolap::test_failpoints::reset_join_part_largest();
-    let probes = prepared_strategy_runs(PreparedStrategy::Probe);
-    let keyed = prepared_strategy_runs(PreparedStrategy::KeyedSet);
+    let probes = prepared_strategy_runs_here(PreparedStrategy::Probe);
+    let keyed = prepared_strategy_runs_here(PreparedStrategy::KeyedSet);
     assert_eq!(rows(db, sql), want, "{sql}");
     let ran = (
-        prepared_strategy_runs(PreparedStrategy::Probe) - probes,
-        prepared_strategy_runs(PreparedStrategy::KeyedSet) - keyed,
+        prepared_strategy_runs_here(PreparedStrategy::Probe) - probes,
+        prepared_strategy_runs_here(PreparedStrategy::KeyedSet) - keyed,
     );
     stoolap::test_failpoints::set_join_part_rows(0);
     assert!(
