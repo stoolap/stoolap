@@ -188,8 +188,8 @@ fn executor_in_transaction(name: &str) -> (Database, stoolap::Executor) {
 }
 
 fn cancelled() -> stoolap::ExecutionContext {
-    let ctx = stoolap::ExecutionContext::new();
-    ctx.cancel();
+    let mut ctx = stoolap::ExecutionContext::new();
+    ctx.set_deadline(Some(std::time::Instant::now()));
     ctx
 }
 
@@ -219,7 +219,7 @@ fn test_cancelled_lookup_of_a_parsed_statement_fails() {
 }
 
 #[test]
-fn test_lookup_with_a_timeout_in_begin_takes_the_normal_path() {
+fn test_lookup_with_a_timeout_in_begin_takes_the_key_read() {
     let db = table("tx_pk_timeout");
     db.execute("BEGIN", ()).unwrap();
     assert_eq!(begin_v(&db, 1), Some(10));
@@ -236,8 +236,8 @@ fn test_lookup_with_a_timeout_in_begin_takes_the_normal_path() {
     assert_eq!(v, 10);
     #[cfg(feature = "test-failpoints")]
     assert!(
-        !stoolap::test_failpoints::take_read_paths().contains(&"exec.pk_lookup_in_transaction"),
-        "a timeout is armed by the normal path"
+        stoolap::test_failpoints::take_read_paths().contains(&"exec.pk_lookup_in_transaction"),
+        "a timed lookup left the key read"
     );
     db.execute("COMMIT", ()).unwrap();
 }

@@ -478,15 +478,14 @@ impl MergedValues<'_> {
 }
 
 /// A join's rows as the join makes them, with the values `merged` adds,
-/// those `where_` passes, as an aggregation reads them, the cancel checked
-/// every hundred
+/// those `where_` passes, as an aggregation reads them, each charged
+/// against the deadline
 struct JoinedRows<'r, 'p> {
     stream: JoinStream<'r>,
     where_: Option<JoinedWhere<'r, 'p>>,
     ctx: &'r ExecutionContext,
     merged: MergedValues<'r>,
     row: Option<Row>,
-    read: u64,
 }
 
 impl<'r, 'p> JoinedRows<'r, 'p> {
@@ -501,7 +500,6 @@ impl<'r, 'p> JoinedRows<'r, 'p> {
             ctx,
             merged: MergedValues::default(),
             row: None,
-            read: 0,
         }
     }
 
@@ -512,10 +510,7 @@ impl<'r, 'p> JoinedRows<'r, 'p> {
 
     fn next_passed(&mut self) -> Result<Option<Row>> {
         while let Some(mut row) = self.stream.next_row()? {
-            self.read += 1;
-            if self.read.is_multiple_of(100) {
-                self.ctx.check_cancelled()?;
-            }
+            self.ctx.charge(DeadlineSite::JoinedRows, 1)?;
             self.merged.push_onto(&mut row);
             if let Some(where_) = self.where_.as_mut() {
                 if !where_.matches(&row, None)? {
@@ -596,7 +591,7 @@ pub(crate) enum EarlySemantic {
 }
 
 use super::aggregation::{PartRun, RowSource};
-use super::context::{ExecutionContext, SemanticMiss, StatementSnapshot, TimeoutGuard};
+use super::context::{DeadlineSite, ExecutionContext, SemanticMiss, StatementSnapshot};
 use super::expr_key::ExprKey;
 use super::expression::SubqueryExecutor;
 use super::expression::{
@@ -1754,17 +1749,7 @@ impl Executor {
         plan_classification: Option<&std::sync::OnceLock<Arc<QueryClassification>>>,
         compiled: Option<&NestedPlan>,
     ) -> Result<Box<dyn QueryResult>> {
-        // Start timeout guard ONLY at the top level (query_depth == 0).
-        // For nested queries (subqueries, views), the parent's TimeoutGuard handles timeout.
-        // This ensures the timeout applies to the entire query, not each nested call.
-        let _timeout_guard = if ctx.query_depth == 0 {
-            TimeoutGuard::new(ctx)
-        } else {
-            None
-        };
-
-        // Check for cancellation at entry point
-        ctx.check_cancelled()?;
+        ctx.check_deadline()?;
 
         where_without_aggregates(stmt.where_clause.as_deref())?;
 
@@ -3154,7 +3139,6 @@ impl Executor {
             || classification.has_distinct_on
             || ctx.statement_view().is_some()
             || ctx.statement_snapshot().is_some()
-            || ctx.timeout_ms() > 0
             || ctx.query_depth > 0
             || expression_contains_aggregate(where_expr)
             || self.isolation_level() != crate::core::IsolationLevel::ReadCommitted
@@ -3166,7 +3150,7 @@ impl Executor {
         {
             return Ok(EarlySemantic::NotTried);
         }
-        ctx.check_cancelled()?;
+        ctx.check_deadline()?;
         let Some(statement) = std::num::NonZeroUsize::new(stmt as *const _ as usize) else {
             return Ok(EarlySemantic::NotTried);
         };
@@ -6622,7 +6606,6 @@ impl Executor {
         filter: Option<&Expression>,
         plan: Option<&NestedPlan>,
     ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
-        // Execute subquery with incremented depth to avoid creating new TimeoutGuard
         let subquery_ctx = ctx.with_incremented_query_depth();
         let result = self.execute_source_statement(&ss.subquery, &subquery_ctx, None, plan)?;
         let columns = result.columns().to_vec();

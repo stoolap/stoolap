@@ -19,15 +19,13 @@
 
 #![cfg(feature = "test-failpoints")]
 
-use std::sync::{Mutex, MutexGuard};
-
-use stoolap::test_failpoints::force_exists_strategy;
+use stoolap::test_failpoints::{
+    force_exists_strategy, keep_deadlines, pass_deadlines, FailpointGuard,
+};
 use stoolap::Database;
 
-static SERIAL: Mutex<()> = Mutex::new(());
-
-/// Holds the lock and restores the rule's choice when dropped
-struct Serial(#[allow(dead_code)] MutexGuard<'static, ()>);
+/// Holds the failpoint lock and restores the rule's choice when dropped
+struct Serial(#[allow(dead_code)] FailpointGuard);
 
 impl Drop for Serial {
     fn drop(&mut self) {
@@ -36,7 +34,7 @@ impl Drop for Serial {
 }
 
 fn serial() -> Serial {
-    Serial(SERIAL.lock().unwrap_or_else(|e| e.into_inner()))
+    Serial(FailpointGuard::new())
 }
 
 /// `t` and its copy `w` are the tested rows; `u` the members. Key 1 holds
@@ -547,12 +545,13 @@ fn test_a_long_probe_sees_its_statement_cancelled() {
         ("SELECT id FROM t WHERE t.id = 1 AND EXISTS (SELECT 1 FROM big WHERE big.k = t.k AND big.v * 1 < 0)", false),
         ("SELECT id FROM t WHERE t.id = 1 AND 0 = (SELECT v FROM big WHERE big.k = t.k AND big.v * 1 < 0)", true),
     ] {
-        let ctx = stoolap::ExecutionContext::new();
-        let handle = ctx.clone();
+        keep_deadlines();
+        let mut ctx = stoolap::ExecutionContext::new();
+        ctx.set_timeout_ms(3_600_000);
         if scalar {
-            before_prepared_scalar(move || handle.cancel());
+            before_prepared_scalar(pass_deadlines);
         } else {
-            before_prepared_exists(move || handle.cancel());
+            before_prepared_exists(pass_deadlines);
         }
         let result = executor.execute_with_context(sql, &ctx);
         assert!(
@@ -580,9 +579,9 @@ fn test_a_cancel_inside_a_block_is_raised_and_never_kept() {
     }
     let executor = stoolap::Executor::new(std::sync::Arc::clone(db.engine()));
     let sql = "SELECT id FROM t WHERE id IN (SELECT (SELECT v FROM big WHERE big.k = u.k AND big.v * 1 < 0) FROM u)";
-    let ctx = stoolap::ExecutionContext::new();
-    let handle = ctx.clone();
-    before_prepared_scalar(move || handle.cancel());
+    let mut ctx = stoolap::ExecutionContext::new();
+    ctx.set_timeout_ms(3_600_000);
+    before_prepared_scalar(pass_deadlines);
     let result = executor.execute_with_context(sql, &ctx);
     assert!(
         matches!(result, Err(stoolap::Error::QueryCancelled)),
@@ -641,9 +640,9 @@ fn test_a_cancel_before_the_scan_stops_at_its_limit_is_raised() {
     }
     let executor = stoolap::Executor::new(std::sync::Arc::clone(db.engine()));
     let sql = "SELECT id FROM big WHERE id >= (SELECT k FROM u WHERE u.id = 1) LIMIT 1000000";
-    let ctx = stoolap::ExecutionContext::new();
-    let handle = ctx.clone();
-    before_prepared_scalar(move || handle.cancel());
+    let mut ctx = stoolap::ExecutionContext::new();
+    ctx.set_timeout_ms(3_600_000);
+    before_prepared_scalar(pass_deadlines);
     let result = executor.execute_with_context(sql, &ctx);
     assert!(
         matches!(result, Err(stoolap::Error::QueryCancelled)),

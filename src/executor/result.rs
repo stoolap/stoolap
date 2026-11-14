@@ -21,7 +21,7 @@ use crate::core::{Result, Row, RowVec, Value};
 use crate::storage::traits::QueryResult;
 use rustc_hash::{FxHashMap, FxHasher};
 
-use super::context::CancellationHandle;
+use super::context::{Deadline, DeadlineSite};
 use super::expression::RowFilter;
 use super::projection::Projection;
 
@@ -1859,11 +1859,9 @@ pub struct ScannerResult {
     current_row: Row,
     /// Whether we have a valid current row
     has_current: bool,
-    /// The statement's cancel, checked every 100 rows and at the end
-    cancel: Option<CancellationHandle>,
-    /// Rows left before the next check of `cancel`
-    left: u32,
-    /// `cancel` was set when last checked
+    /// The call's deadline, charged each row and checked at the end
+    deadline: Deadline,
+    /// The read stopped at its deadline
     cancelled: bool,
 }
 
@@ -1878,30 +1876,15 @@ impl ScannerResult {
             columns,
             current_row: Row::new(),
             has_current: false,
-            cancel: None,
-            left: 100,
+            deadline: Deadline::NONE,
             cancelled: false,
         }
     }
 
-    /// Stop the read with a cancel error once `cancel` is cancelled
-    pub(crate) fn with_cancel(mut self, cancel: CancellationHandle) -> Self {
-        self.cancel = Some(cancel);
+    /// Stop the read with a cancel error once `deadline` has passed
+    pub(crate) fn with_deadline(mut self, deadline: Deadline) -> Self {
+        self.deadline = deadline;
         self
-    }
-
-    /// Whether the read stops for its cancel, which it checks every 100 rows
-    #[inline]
-    fn stops(&mut self) -> bool {
-        let Some(cancel) = &self.cancel else {
-            return false;
-        };
-        self.left -= 1;
-        if self.left == 0 {
-            self.left = 100;
-            self.cancelled = cancel.is_cancelled();
-        }
-        self.cancelled
     }
 }
 
@@ -1911,16 +1894,21 @@ impl QueryResult for ScannerResult {
     }
 
     fn next(&mut self) -> bool {
-        if self.scanner.next() && !self.stops() {
-            self.current_row = self.scanner.take_row();
-            self.has_current = true;
-            return true;
-        }
-        if let Some(cancel) = &self.cancel {
-            self.cancelled = cancel.is_cancelled();
-        }
         self.has_current = false;
-        false
+        if self.cancelled {
+            return false;
+        }
+        if !self.scanner.next() {
+            self.cancelled = self.deadline.check().is_err();
+            return false;
+        }
+        if self.deadline.charge(DeadlineSite::Result, 1).is_err() {
+            self.cancelled = true;
+            return false;
+        }
+        self.current_row = self.scanner.take_row();
+        self.has_current = true;
+        true
     }
 
     fn scan(&self, dest: &mut [Value]) -> Result<()> {

@@ -105,7 +105,7 @@ use planned_dml::DmlStatement;
 
 #[cfg(any(test, feature = "test-failpoints"))]
 pub(crate) use aggregation::AggregatePath;
-pub use context::{clear_all_thread_local_caches, ExecutionContext, TimeoutGuard};
+pub use context::{clear_all_thread_local_caches, DeadlineSite, ExecutionContext};
 pub use expression::{
     CompileContext, CompileError, ExecuteContext, ExprCompiler, ExprVM, Program as ExprProgram,
 };
@@ -854,7 +854,7 @@ impl Executor {
         let registry = self.engine.registry_ref();
         let mut noted = false;
         while registry.destruction_running() {
-            ctx.check_cancelled()?;
+            ctx.check_deadline()?;
             if !noted {
                 #[cfg(feature = "test-failpoints")]
                 crate::test_failpoints::destruction_waited();
@@ -862,7 +862,7 @@ impl Executor {
             }
             std::thread::yield_now();
         }
-        ctx.check_cancelled()
+        ctx.check_deadline()
     }
 
     #[inline]
@@ -1092,9 +1092,6 @@ impl Executor {
         // and the statement's view goes into the same context: one the caller
         // owns takes both in place, a borrowed one is copied once
         let select = matches!(statement, Statement::Select(_));
-        // A timed SELECT's deadline counts from before its first view
-        let started =
-            (select && ctx.timeout_ms() > 0).then(crate::common::time_compat::Instant::now);
         // A whole answer the semantic cache holds needs no view
         let mut semantic_miss = None;
         if let (Statement::Select(stmt), None, Some(slot)) =
@@ -1132,12 +1129,10 @@ impl Executor {
             }
         };
         if select {
-            let started = started.filter(|_| took_view);
             return self.select_until_held(
                 statement,
                 ctx,
                 took_view,
-                started,
                 plan_classification,
                 compiled,
             );
@@ -1150,19 +1145,16 @@ impl Executor {
     /// deadline of the first. A view the caller gave, or one a function
     /// registered after the built-ins may not survive running twice, ends
     /// it with the error instead
-    #[allow(clippy::too_many_arguments)]
     fn select_until_held(
         &self,
         statement: &Statement,
         mut ctx: std::borrow::Cow<'_, ExecutionContext>,
         took_view: bool,
-        started: Option<crate::common::time_compat::Instant>,
         plan_classification: Option<
             &std::sync::OnceLock<Arc<query_classification::QueryClassification>>,
         >,
         compiled: Option<&NestedPlan>,
     ) -> Result<Box<dyn QueryResult>> {
-        let mut _deadline = None;
         for attempt in 1..=STATEMENT_RUNS {
             let result = self.dispatch_statement(statement, &ctx, plan_classification, compiled);
             // A result read whole through an overtaken view may hold what went
@@ -1180,13 +1172,6 @@ impl Executor {
                 || crate::functions::global_registry().has_registered_functions()
             {
                 return Err(Error::ViewOvertaken);
-            }
-            if let (Some(started), None) = (started, &_deadline) {
-                let spent = started.elapsed().as_millis() as u64;
-                let Some(left) = ctx.timeout_ms().checked_sub(spent).filter(|&ms| ms > 0) else {
-                    return Err(Error::QueryCancelled);
-                };
-                _deadline = TimeoutGuard::for_ms(&ctx, left);
             }
             self.wait_out_destruction(&ctx)?;
             let statement_ctx = ctx.to_mut();

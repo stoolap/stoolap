@@ -437,7 +437,7 @@ impl Executor {
         planned: &PlannedAggregate,
         ctx: &ExecutionContext,
     ) -> Option<Result<Box<dyn QueryResult>>> {
-        if let Err(error) = ctx.check_cancelled() {
+        if let Err(error) = ctx.check_deadline() {
             return Some(Err(error));
         }
         let run = || -> Result<Option<Box<dyn QueryResult>>> {

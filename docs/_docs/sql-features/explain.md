@@ -59,7 +59,7 @@ Project id, name, email
     PkKey
 ```
 
-A run whose key is not an integer, or one in a transaction with a timeout, takes the read after `else`.
+A run whose key is not an integer takes the read after `else`.
 
 An equality on a column with a unique index of its own reads the one row that index names. The row is still judged by the whole WHERE:
 

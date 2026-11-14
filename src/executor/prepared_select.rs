@@ -57,8 +57,8 @@ use super::aggregation::{
 };
 use super::context::{
     cache_block_answer, get_cached_block_answer, subquery_cache_tables, BlockAnswer, BlockOrigin,
-    CteScope, ExecutionContext, ExistsKeys, ExistsOutcome, KeptMembers, MemberKeys, MemberSet,
-    SubqueryStamp,
+    CteScope, DeadlineSite, ExecutionContext, ExistsKeys, ExistsOutcome, KeptMembers, MemberKeys,
+    MemberSet, SubqueryStamp,
 };
 use super::expr_key::ExprKey;
 use super::expression::{
@@ -3937,14 +3937,13 @@ enum SourceRead {
 
 /// The rows of a scan a statement's WHERE passes, as an aggregation reads
 /// them one at a time: each judged by the bound WHERE when the scan did not
-/// take it whole, the cancel checked every hundred rows read
+/// take it whole, each row read charged against the deadline
 struct PassedRows<'r, 'a> {
     scan: Box<dyn Scanner>,
     bound: Option<SharedProgram>,
     runner: &'r PreparedRunner<'a>,
     ctx: &'r ExecutionContext,
     vm: ExprVM,
-    read: u64,
 }
 
 impl<'r, 'a> PassedRows<'r, 'a> {
@@ -3960,7 +3959,6 @@ impl<'r, 'a> PassedRows<'r, 'a> {
             runner,
             ctx,
             vm: ExprVM::new(),
-            read: 0,
         }
     }
 }
@@ -3974,10 +3972,7 @@ impl RowSource for PassedRows<'_, '_> {
         }
         let mut rows = RowVec::with_capacity(self.scan.estimated_count().unwrap_or(64));
         while self.scan.next() {
-            self.read += 1;
-            if self.read.is_multiple_of(100) {
-                self.ctx.check_cancelled()?;
-            }
+            self.ctx.charge(DeadlineSite::Scan, 1)?;
             rows.push((0, self.scan.take_row()));
         }
         match self.scan.err() {
@@ -3994,10 +3989,7 @@ impl RowSource for PassedRows<'_, '_> {
                     None => Ok(None),
                 };
             }
-            self.read += 1;
-            if self.read.is_multiple_of(100) {
-                self.ctx.check_cancelled()?;
-            }
+            self.ctx.charge(DeadlineSite::Scan, 1)?;
             if let Some(bound) = &self.bound {
                 if !self.runner.matches(&mut self.vm, bound, self.scan.row())? {
                     continue;
@@ -4009,21 +4001,17 @@ impl RowSource for PassedRows<'_, '_> {
 }
 
 /// A view's or a derived table's rows with no WHERE to pass, as an
-/// aggregation reads them one at a time, the cancel checked every hundred
+/// aggregation reads them one at a time, each charged against the deadline
 struct StreamedRows<'c> {
     result: Box<dyn QueryResult>,
     ctx: &'c ExecutionContext,
-    read: u64,
 }
 
 impl RowSource for StreamedRows<'_> {
     fn held(mut self) -> Result<RowVec> {
         let mut rows = RowVec::with_capacity(self.result.estimated_count().unwrap_or(64));
         while self.result.next() {
-            self.read += 1;
-            if self.read.is_multiple_of(100) {
-                self.ctx.check_cancelled()?;
-            }
+            self.ctx.charge(DeadlineSite::Scan, 1)?;
             rows.push((0, self.result.take_row()));
         }
         match self.result.last_error() {
@@ -4039,10 +4027,7 @@ impl RowSource for StreamedRows<'_> {
                 None => Ok(None),
             };
         }
-        self.read += 1;
-        if self.read.is_multiple_of(100) {
-            self.ctx.check_cancelled()?;
-        }
+        self.ctx.charge(DeadlineSite::Scan, 1)?;
         Ok(Some(self.result.row()))
     }
 }
@@ -9482,10 +9467,8 @@ impl LateKeys {
     ) -> Result<()> {
         let site = SiteRunner::new(run, &self.holes);
         let mut vm = ExprVM::new();
-        for (n, (_, row)) in rows.iter_mut().enumerate() {
-            if n % 100 == 0 {
-                ctx.check_cancelled()?;
-            }
+        for (_, row) in rows.iter_mut() {
+            ctx.charge(DeadlineSite::LateKeys, 1)?;
             for (at, program) in &self.keys {
                 let exec = run.exec_over(row, &run.base).with_subquery_executor(&site);
                 let value = vm.execute(program, &exec)?;
@@ -13471,12 +13454,8 @@ impl Executor {
         let (mut vm, mut filter_vm) = (ExprVM::new(), ExprVM::new());
         let (mut values, mut kept) = (Vec::new(), RowVec::new());
         let mut outputs = projection.unbound();
-        let mut scanned = 0u64;
         while scan.next() {
-            scanned += 1;
-            if scanned.is_multiple_of(100) {
-                ctx.check_cancelled()?;
-            }
+            ctx.charge(DeadlineSite::Scan, 1)?;
             let row = scan.row();
             if let Some(bound) = &bound {
                 if !runner.matches(&mut filter_vm, bound, row)? {
@@ -13515,7 +13494,7 @@ impl Executor {
         if let Some(err) = scan.err() {
             return Err(err.clone());
         }
-        ctx.check_cancelled()?;
+        ctx.check_deadline()?;
         Ok(kept)
     }
 
@@ -13846,11 +13825,7 @@ impl Executor {
                 return aggregate(FeedInput::<StreamedRows<'_>>::Rows(rows))
             }
             StatementSource::Stream(_, result) if unfiltered => {
-                let rows = StreamedRows {
-                    result,
-                    ctx,
-                    read: 0,
-                };
+                let rows = StreamedRows { result, ctx };
                 return aggregate(FeedInput::Each(rows, 0));
             }
             source => source,
@@ -14369,13 +14344,12 @@ impl Executor {
                 .any(mentions_subquery))
         .then(|| DistinctRows::new(prepared.visible));
         // Rows nothing sorts, counts or merges, whose output is the row or
-        // columns of it, reach the caller as the scan reads them, which checks
-        // the cancel; a timed read is collected, so its deadline holds while it
-        // reads, and so is a run whose failed slot only the runner raises
+        // columns of it, reach the caller as the scan reads them, which keeps
+        // the call's deadline; a run whose failed slot only the runner raises
+        // is collected
         let projection = &prepared.projection;
         // A DISTINCT over such an output flows too, each row checked as it passes
-        let flowing = !ctx.has_timeout()
-            && runner.failed_slots.is_none()
+        let flowing = runner.failed_slots.is_none()
             && (distinct.is_some() || stmt.order_by.is_empty() && limit.is_none() && offset == 0);
         // Computed items that ask no block flow through the shared projection
         let items = (flowing && !projection.whole_row && projection.columns.is_none())
@@ -14437,7 +14411,18 @@ impl Executor {
                         };
                         Box::new(
                             ScannerResult::new(scan, CompactArc::clone(names))
-                                .with_cancel(ctx.cancellation_handle()),
+                                .with_deadline(ctx.deadline_of_call()),
+                        )
+                    }
+                    // A source's rows keep the call's deadline as the scan's do
+                    Flow::Source(rows) if ctx.deadline().is_some() => {
+                        let names = match projection.whole_row {
+                            true => CompactArc::clone(&output_columns),
+                            false => CompactArc::new(rows.columns().to_vec()),
+                        };
+                        Box::new(
+                            ScannerResult::new(Box::new(SourceScanner::new(rows)), names)
+                                .with_deadline(ctx.deadline_of_call()),
                         )
                     }
                     Flow::Source(rows)
@@ -15594,17 +15579,13 @@ impl<'a> PreparedRunner<'a> {
     }
 
     /// Whether `row` passes `condition`, a program over the statement's row
-    /// The rows of `scan` that `bound` passes, the cancel checked every
-    /// hundred rows read; as many rows as the parallel filter takes are
-    /// judged on the thread pool, as the general path judges them
+    /// The rows of `scan` that `bound` passes, each row read charged against
+    /// the deadline; as many rows as the parallel filter takes are judged on
+    /// the thread pool, as the general path judges them
     fn drain(&self, mut scan: Box<dyn Scanner>, bound: Option<SharedProgram>) -> Result<RowVec> {
         let mut rows = RowVec::with_capacity(scan.estimated_count().unwrap_or(64));
-        let mut read = 0u64;
         while scan.next() {
-            read += 1;
-            if read.is_multiple_of(100) {
-                self.ctx.check_cancelled()?;
-            }
+            self.ctx.charge(DeadlineSite::Scan, 1)?;
             rows.push((scan.current_row_id(), scan.take_row()));
         }
         if let Some(err) = scan.err() {
@@ -15644,8 +15625,8 @@ impl<'a> PreparedRunner<'a> {
         }
     }
 
-    /// Hand `each` every row of `rows`, a scan's checking the cancel every
-    /// hundred rows read
+    /// Hand `each` every row of `rows`, a scan's each charged against the
+    /// deadline
     fn each_row(
         &self,
         rows: &mut SortInput<'_>,
@@ -15655,12 +15636,8 @@ impl<'a> PreparedRunner<'a> {
             SortInput::Rows(rows) => return rows.iter().try_for_each(|(_, row)| each(row)),
             SortInput::Scan(scan) => scan,
         };
-        let mut read = 0u64;
         while scan.next() {
-            read += 1;
-            if read.is_multiple_of(100) {
-                self.ctx.check_cancelled()?;
-            }
+            self.ctx.charge(DeadlineSite::Scan, 1)?;
             each(scan.row())?;
         }
         match scan.err() {
@@ -15980,8 +15957,8 @@ impl<'a> PreparedRunner<'a> {
             offset,
             where_.needed.as_deref(),
         )?;
-        // A read that checks for no cancel is the statement's all the same
-        ctx.check_cancelled()?;
+        // A read that checks for no deadline is the statement's all the same
+        ctx.check_deadline()?;
         if rows.is_some() {
             super::result::OrderLimitPath::PreparedTopK.taken();
         }
@@ -16016,14 +15993,15 @@ impl<'a> PreparedRunner<'a> {
             .iter()
             .map(|&(column, nulls)| (column, crate::core::value::nulls_first(ascending, nulls)))
             .collect();
-        let cancelled = || ctx.is_cancelled();
+        // The walk asks every hundred rows it visits
+        let cancelled = || ctx.charge(DeadlineSite::IndexWalk, 100).is_err();
         let rows = table.collect_rows_ordered_by_index_keys(
             &keys,
             ascending,
             (limit, offset),
             &cancelled,
         )?;
-        ctx.check_cancelled()?;
+        ctx.check_deadline()?;
         if rows.is_some() {
             super::result::OrderLimitPath::PreparedIndexKeys.taken();
         }
@@ -16160,8 +16138,8 @@ impl<'a> PreparedRunner<'a> {
                 .collect()
             }
         };
-        // A read that checks for no cancel is the statement's all the same
-        ctx.check_cancelled()?;
+        // A read that checks for no deadline is the statement's all the same
+        ctx.check_deadline()?;
         super::result::OrderLimitPath::VectorSearch.taken();
         Ok(Some(nearest))
     }
@@ -16266,8 +16244,8 @@ impl<'a> PreparedRunner<'a> {
                             let answers = table.collect_access_rows_with_limit_unordered(
                                 access, filter, target, 0,
                             )?;
-                            // A read that checks for no cancel is the statement's all the same
-                            ctx.check_cancelled()?;
+                            // A read that checks for no deadline is the statement's all the same
+                            ctx.check_deadline()?;
                             return Ok(Passing::Answers(answers));
                         }
                         None => {
@@ -16282,8 +16260,8 @@ impl<'a> PreparedRunner<'a> {
                                 && !where_.widen
                             {
                                 let rows = table.collect_access_rows(access, filter)?;
-                                // A read that checks for no cancel is the statement's all the same
-                                ctx.check_cancelled()?;
+                                // A read that checks for no deadline is the statement's all the same
+                                ctx.check_deadline()?;
                                 return Ok(Passing::Answers(rows));
                             }
                             let all: Vec<usize> = (0..table.schema().columns.len()).collect();
@@ -16321,9 +16299,7 @@ impl<'a> PreparedRunner<'a> {
                 false => row,
             };
             scanned += 1;
-            if scanned.is_multiple_of(100) {
-                ctx.check_cancelled()?;
-            }
+            ctx.charge(DeadlineSite::Scan, 1)?;
             // One that fails to evaluate leaves the answer to the WHERE
             let taken = match storage_expr
                 .as_ref()
@@ -16344,8 +16320,8 @@ impl<'a> PreparedRunner<'a> {
         if let Some(err) = scanner.as_ref().and_then(|scanner| scanner.err()) {
             return Err(err.clone());
         }
-        // A read that checks for no cancel is the statement's all the same
-        ctx.check_cancelled()?;
+        // A read that checks for no deadline is the statement's all the same
+        ctx.check_deadline()?;
         Ok(Passing::Read)
     }
 
@@ -16409,9 +16385,7 @@ impl<'a> PreparedRunner<'a> {
         let mut vm = ExprVM::new();
         let mut program = None;
         for (scanned, read) in (1u64..).zip(rows) {
-            if scanned.is_multiple_of(100) {
-                ctx.check_cancelled()?;
-            }
+            ctx.charge(DeadlineSite::Scan, 1)?;
             let (id, row) = read?;
             // Rows read in no table are narrowed by no key: the narrowing's
             // set is a set conjunct like the others
@@ -16430,7 +16404,7 @@ impl<'a> PreparedRunner<'a> {
                 break;
             }
         }
-        ctx.check_cancelled()?;
+        ctx.check_deadline()?;
         Ok(Passing::Read)
     }
 
@@ -16643,7 +16617,7 @@ impl<'a> PreparedRunner<'a> {
     /// TRUE at the first that does; else the first error a candidate
     /// raised; else FALSE
     fn probe(&self, index: usize) -> Result<bool> {
-        self.ctx.check_cancelled()?;
+        self.ctx.charge(DeadlineSite::Block, 1)?;
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::prepared_exists_probed();
         let sq = &self.prepared.subqueries[index];
@@ -16663,12 +16637,8 @@ impl<'a> PreparedRunner<'a> {
         };
         let decided = pushed && sq.pushed_whole;
         let mut failed = None;
-        let mut scanned = 0u64;
         while scanner.next() {
-            scanned += 1;
-            if scanned.is_multiple_of(100) {
-                self.ctx.check_cancelled()?;
-            }
+            self.ctx.charge(DeadlineSite::Block, 1)?;
             if !decided {
                 let exec = self
                     .exec_over(scanner.row(), &params)
@@ -16950,12 +16920,8 @@ impl<'a> PreparedRunner<'a> {
         let mut scanner = self.scan(index, bound.as_ref().map(BoundPushdown::expr))?;
         let decided = sq.filter.is_none() || (bound.is_some() && plan.pushed_whole);
         let mut set = ExistsKeys::default();
-        let mut scanned = 0u64;
         'rows: while scanner.next() {
-            scanned += 1;
-            if scanned.is_multiple_of(100) {
-                self.ctx.check_cancelled()?;
-            }
+            self.ctx.charge(DeadlineSite::Block, 1)?;
             let row = scanner.row();
             let mut key: SmallVec<[Value; 1]> = SmallVec::with_capacity(plan.keys.len());
             for (column, _, _) in &plan.keys {
@@ -17232,7 +17198,7 @@ impl PreparedRunner<'_> {
         if let Some(BlockAnswer::Value(value)) = self.answered(index, call) {
             return Ok(value);
         }
-        self.ctx.check_cancelled()?;
+        self.ctx.charge(DeadlineSite::Block, 1)?;
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::prepared_scalar_next();
         if let Answer::Statement(kept, block) = &sq.answer {
@@ -17348,12 +17314,8 @@ impl PreparedRunner<'_> {
             self.scan(index, None)?
         };
         let filter = sq.filter.as_ref().filter(|_| !(pushed && sq.pushed_whole));
-        let mut scanned = 0u64;
         while scanner.next() {
-            scanned += 1;
-            if scanned.is_multiple_of(100) {
-                self.ctx.check_cancelled()?;
-            }
+            self.ctx.charge(DeadlineSite::Block, 1)?;
             if let Some(filter) = filter {
                 let exec = self
                     .exec_over(scanner.row(), &params)
@@ -17443,7 +17405,7 @@ impl PreparedRunner<'_> {
         item: Option<&SharedProgram>,
         exists: bool,
     ) -> Result<Vec<(SmallVec<[Value; 2]>, Row)>> {
-        self.ctx.check_cancelled()?;
+        self.ctx.charge(DeadlineSite::Block, 1)?;
         let sq = &self.prepared.subqueries[index];
         let mut vm = self.blocks[index].vm.borrow_mut();
         let params = self.blocks[index].buffer.borrow();
@@ -17479,12 +17441,9 @@ impl PreparedRunner<'_> {
         let (mut kept, mut all) = (Vec::new(), Vec::new());
         // The worst row held on top, which a better one replaces
         let mut held = std::collections::BinaryHeap::new();
-        let (mut passed, mut scanned) = (0usize, 0u64);
+        let mut passed = 0usize;
         while scanner.next() {
-            scanned += 1;
-            if scanned.is_multiple_of(100) {
-                self.ctx.check_cancelled()?;
-            }
+            self.ctx.charge(DeadlineSite::Block, 1)?;
             let row = scanner.row();
             let exec = self.exec_over(row, &params).with_subquery_executor(self);
             if !decided {
@@ -18263,7 +18222,7 @@ impl PreparedRunner<'_> {
         members: &Members,
         tested: &[Value],
     ) -> Result<Option<bool>> {
-        self.ctx.check_cancelled()?;
+        self.ctx.charge(DeadlineSite::Block, 1)?;
         #[cfg(feature = "test-failpoints")]
         {
             crate::test_failpoints::prepared_exists_probed();
@@ -18295,12 +18254,8 @@ impl PreparedRunner<'_> {
         };
         let decided = pushed && sq.pushed_whole;
         let mut fold = MemberFold::new(members.test);
-        let mut scanned = 0u64;
         while scanner.next() {
-            scanned += 1;
-            if scanned.is_multiple_of(100) {
-                self.ctx.check_cancelled()?;
-            }
+            self.ctx.charge(DeadlineSite::Block, 1)?;
             let exec = self
                 .exec_over(scanner.row(), &params)
                 .with_subquery_executor(self);
@@ -18430,12 +18385,8 @@ impl PreparedRunner<'_> {
         let decided =
             (sq.filter.is_none() && candidates.is_none()) || (bound.is_some() && pushed_whole);
         let mut groups: FxHashMap<SmallVec<[Value; 1]>, MemberGroup> = FxHashMap::default();
-        let mut scanned = 0u64;
         'rows: while scanner.next() {
-            scanned += 1;
-            if scanned.is_multiple_of(100) {
-                self.ctx.check_cancelled()?;
-            }
+            self.ctx.charge(DeadlineSite::Block, 1)?;
             let row = scanner.row();
             let mut key: SmallVec<[Value; 1]> = SmallVec::new();
             for (column, _, _) in plan.map_or(&[][..], |plan| &plan.keys) {
@@ -18892,7 +18843,7 @@ impl PreparedRunner<'_> {
     /// The block's slot rows for the buffer filled: every candidate its
     /// WHERE passes, fed to its group
     fn group_rows(&self, index: usize, grouping: &Grouping) -> Result<Vec<Row>> {
-        self.ctx.check_cancelled()?;
+        self.ctx.charge(DeadlineSite::Block, 1)?;
         if let Some(rows) = self.index_count(index, grouping)? {
             return Ok(rows);
         }
@@ -18919,12 +18870,8 @@ impl PreparedRunner<'_> {
         let mut groups =
             grouping.groups(0, call.as_ref().map(|exec| (&mut *vm, exec, registry)))?;
         let mut key = KeyReader::new(grouping, Vec::new());
-        let mut scanned = 0u64;
         'rows: while scanner.next() {
-            scanned += 1;
-            if scanned.is_multiple_of(100) {
-                self.ctx.check_cancelled()?;
-            }
+            self.ctx.charge(DeadlineSite::Block, 1)?;
             let row = scanner.row();
             let exec = self.exec_over(row, &params).with_subquery_executor(self);
             if !decided {
@@ -19060,12 +19007,8 @@ impl PreparedRunner<'_> {
         let mut groups = grouping.groups(prefix.len(), None)?;
         let mut key = KeyReader::new(grouping, prefix.clone());
         let mut failed: FxHashMap<SmallVec<[Value; 1]>, Error> = FxHashMap::default();
-        let mut scanned = 0u64;
         'rows: while scanner.next() {
-            scanned += 1;
-            if scanned.is_multiple_of(100) {
-                self.ctx.check_cancelled()?;
-            }
+            self.ctx.charge(DeadlineSite::Block, 1)?;
             let row = scanner.row();
             for column in &prefix {
                 if row.get(*column).is_none_or(Value::is_null) {

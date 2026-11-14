@@ -16,12 +16,11 @@
 
 use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::{Mutex, MutexGuard};
 
 use stoolap::test_failpoints::{
-    after_prepared_plan_taken, before_prepared_scalar, general_path_hits, prepared_ordered_reads,
-    prepared_projection_runs, prepared_scalar_runs, prepared_selects_built, random_draws, tvf_rows,
-    GeneralPath,
+    after_prepared_plan_taken, before_prepared_scalar, general_path_hits, keep_deadlines,
+    pass_deadlines, prepared_ordered_reads, prepared_projection_runs, prepared_scalar_runs,
+    prepared_selects_built, random_draws, tvf_rows, FailpointGuard, GeneralPath,
 };
 use stoolap::{Database, Params};
 
@@ -31,11 +30,9 @@ use crate::oracle;
 /// same; a new recording is reviewed by its diff
 const RECORDED_IN_FAMILY: oracle::Answers = answers!("prepared_select_in_family");
 
-// The counters are process-wide
-static SERIAL: Mutex<()> = Mutex::new(());
-
-fn serial() -> MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+// The counters and the passed deadlines are process-wide
+fn serial() -> FailpointGuard {
+    FailpointGuard::new()
 }
 
 const S1: &str =
@@ -3464,15 +3461,16 @@ fn test_a_collected_index_read_cancelled_before_its_rows_fails() {
         "SELECT * FROM t WHERE a > 0 ORDER BY b",
         "SELECT id, ROW_NUMBER() OVER (ORDER BY b) FROM t WHERE a > 0",
     ] {
-        let ctx = stoolap::ExecutionContext::new();
-        let handle = ctx.clone();
-        after_prepared_plan_taken(move || handle.cancel());
+        let mut ctx = stoolap::ExecutionContext::new();
+        ctx.set_timeout_ms(3_600_000);
+        after_prepared_plan_taken(pass_deadlines);
         let read = executor
             .execute_with_context(sql, &ctx)
             .and_then(|mut rows| {
                 while rows.next() {}
                 rows.last_error().map_or(Ok(()), Err)
             });
+        keep_deadlines();
         assert!(
             matches!(read, Err(stoolap::Error::QueryCancelled)),
             "{sql}: {:?}",
@@ -3491,15 +3489,16 @@ fn test_a_read_cancelled_before_its_rows_fails() {
         "SELECT id FROM t WHERE a + 0 IN (SELECT v FROM u)",
     ] {
         assert_eq!(prepared_line(&db, sql), "Prepared: yes", "{sql}");
-        let ctx = stoolap::ExecutionContext::new();
-        let handle = ctx.clone();
-        after_prepared_plan_taken(move || handle.cancel());
+        let mut ctx = stoolap::ExecutionContext::new();
+        ctx.set_timeout_ms(3_600_000);
+        after_prepared_plan_taken(pass_deadlines);
         let read = executor
             .execute_with_context(sql, &ctx)
             .and_then(|mut rows| {
                 while rows.next() {}
                 rows.last_error().map_or(Ok(()), Err)
             });
+        keep_deadlines();
         assert!(
             matches!(read, Err(stoolap::Error::QueryCancelled)),
             "{sql}: {:?}",

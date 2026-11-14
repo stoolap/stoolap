@@ -691,11 +691,14 @@ fn a_cached_scan_keeps_what_its_statement_adds_after_it() {
         }
     }
     let taken = stoolap::test_failpoints::statement_views_taken();
+    rows("SELECT * FROM t WHERE v > 15");
+    let untimed = stoolap::test_failpoints::statement_views_taken() - taken;
+    let taken = stoolap::test_failpoints::statement_views_taken();
     db.query_with_timeout("SELECT * FROM t WHERE v > 15", (), 60_000)
         .unwrap()
         .count();
-    if stoolap::test_failpoints::statement_views_taken() - taken != 1 {
-        wrong.push("a timed call left the regular path".to_string());
+    if stoolap::test_failpoints::statement_views_taken() - taken != untimed {
+        wrong.push("a timed call left the path an untimed one takes".to_string());
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
