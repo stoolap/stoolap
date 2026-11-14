@@ -10503,25 +10503,31 @@ mod tests {
     }
 
     #[test]
-    fn ctes_named_for_a_run_keep_the_call_deadline() {
-        let executor = create_test_executor();
+    fn a_view_named_for_a_run_runs_under_the_call_deadline() {
+        let engine = Arc::new(MVCCEngine::in_memory());
+        engine.open_engine().unwrap();
+        let executor = Executor::new(Arc::clone(&engine));
+        executor
+            .execute("CREATE TABLE big (id INTEGER PRIMARY KEY, k INTEGER)")
+            .unwrap();
+        let view = "SELECT k, COUNT(*) AS c FROM big GROUP BY k".to_string();
+        engine.create_view("v", view, None, false).unwrap();
         let Statement::Select(select) = crate::parser::parse_sql(
-            "WITH c AS (SELECT 1 AS a) SELECT * FROM c JOIN c AS d ON c.a = d.a",
+            "WITH w AS (SELECT * FROM v) SELECT * FROM w JOIN w AS x ON w.k = x.k",
         )
         .unwrap()
         .remove(0) else {
             panic!("not a SELECT");
         };
         let with = select.with.as_ref().unwrap();
-        let mut call = ExecutionContext::new();
-        call.set_timeout_ms(60_000);
-        let named = executor.named_ctes(with, Some(&call)).unwrap();
-        assert_eq!(
-            named.deadline(),
-            call.deadline(),
-            "a run's CTEs lost the deadline"
+        let mut passed = ExecutionContext::new();
+        passed.set_deadline(Some(crate::common::time_compat::Instant::now()));
+        let run = executor.named_ctes(with, Some(&passed));
+        assert!(
+            matches!(run, Err(Error::QueryCancelled)),
+            "a view run to name its columns outlived the deadline: {:?}",
+            run.map(|_| ())
         );
-        let unrun = executor.named_ctes(with, None).unwrap();
-        assert_eq!(unrun.deadline(), None);
+        assert!(executor.named_ctes(with, None).is_ok());
     }
 }

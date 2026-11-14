@@ -17,7 +17,8 @@
 //! This module provides the execution context for SQL queries, including
 //! parameter handling, transaction state, and query options.
 
-use crate::common::deadline::{Deadline, DeadlineSite};
+use crate::common::deadline::Deadline;
+pub use crate::common::deadline::DeadlineSite;
 use crate::common::time_compat::Instant;
 use crate::storage::mvcc::commit_log::HistoricalCut;
 use crate::storage::mvcc::registry::StatementView;
