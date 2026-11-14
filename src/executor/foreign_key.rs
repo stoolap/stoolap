@@ -566,7 +566,7 @@ impl DeletePlan {
             if !reached.cascades.is_empty() {
                 self.deadline
                     .charge(DeadlineSite::ForeignKey, reached.cascaded.len() + 1)?;
-                reached.delete_cascaded(engine, txn_id)?;
+                reached.delete_cascaded(engine, txn_id, self.deadline)?;
             }
             reached.clear_nulled(engine, txn_id, self.deadline)?;
         }
@@ -628,7 +628,7 @@ impl Reached {
 
     /// Deletes the rows every cascade into the table reaches in one call. A
     /// planned row that changed since it was read and stays refuses
-    fn delete_cascaded(&self, engine: &MVCCEngine, txn_id: i64) -> Result<()> {
+    fn delete_cascaded(&self, engine: &MVCCEngine, txn_id: i64, deadline: Deadline) -> Result<()> {
         let mut child = engine.get_table_for_txn(txn_id, &self.table)?;
         let schema = child.schema_arc();
         let mut filters: Vec<Box<dyn StorageExpression>> = Vec::with_capacity(self.cascades.len());
@@ -651,7 +651,7 @@ impl Reached {
         };
         let plan = child.index_plan(&*expr);
         let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-        let deleted = child.delete(access, Some(&*expr))?;
+        let deleted = child.delete(access, Some(&*expr), deadline)?;
         // A table no key references has no rows beneath its own to protect
         if self.unread || deleted as usize == self.cascaded.len() {
             return Ok(());

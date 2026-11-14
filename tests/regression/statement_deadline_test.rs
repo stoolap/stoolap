@@ -122,6 +122,8 @@ fn statement(site: DeadlineSite, csv: &str) -> String {
         }
         DeadlineSite::Tvf => "SELECT value FROM generate_series(1, 5000)",
         DeadlineSite::Aggregate => "SELECT k, SUM(v * 2) FROM big GROUP BY k",
+        DeadlineSite::StorageDelete => "DELETE FROM w WHERE k >= 0",
+        DeadlineSite::StorageUpdate => "UPDATE u SET k = k + 0 WHERE k >= 0",
     };
     sql.to_string()
 }
@@ -343,6 +345,79 @@ fn a_deadline_passed_late_in_a_statement_still_stops_it() {
         keep_deadlines();
         if !matches!(stopped, Err(Error::QueryCancelled)) {
             wrong.push(format!("{sql} past {passed} charges gave {stopped:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_storage_write_over_sealed_rows_stops_and_leaves_no_row_or_claim() {
+    let _guard = FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!(
+        "file://{}?checkpoint_interval=3600&compact_threshold=1000",
+        dir.path().display()
+    );
+    let db = Database::open(&dsn).unwrap();
+    db.execute(
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO s SELECT value, value % 50, value FROM generate_series(1, 3000)",
+        (),
+    )
+    .unwrap();
+    db.engine().seal_for_test().unwrap();
+    db.execute(
+        "INSERT INTO s SELECT value, value % 50, value FROM generate_series(3001, 3200)",
+        (),
+    )
+    .unwrap();
+    let executor = Executor::new(std::sync::Arc::clone(db.engine()));
+    let mut ctx = ExecutionContext::new();
+    ctx.set_timeout_ms(3_600_000);
+    let held = |executor: &Executor| {
+        let mut rows = executor
+            .execute_with_context("SELECT COUNT(*), SUM(v) FROM s", &ctx)
+            .unwrap();
+        assert!(rows.next());
+        format!("{:?}", rows.row())
+    };
+    let writes = [
+        (DeadlineSite::StorageDelete, "DELETE FROM s WHERE k >= 0"),
+        (
+            DeadlineSite::StorageUpdate,
+            "UPDATE s SET v = v + 1 WHERE k >= 0",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for in_txn in [false, true] {
+        for (site, sql) in writes {
+            // Inside the sealed rows, and inside the hot rows, its claims taken
+            for passed in [1, 3001] {
+                if in_txn {
+                    read(&executor, "BEGIN", &ctx).unwrap();
+                }
+                let before = held(&executor);
+                pass_deadline_after(site, passed);
+                let stopped = read(&executor, sql, &ctx);
+                keep_deadlines();
+                let at = format!("{sql} (in a transaction: {in_txn}, past {passed})");
+                if !matches!(stopped, Err(Error::QueryCancelled)) {
+                    wrong.push(format!("{at} gave {stopped:?}"));
+                }
+                if held(&executor) != before {
+                    wrong.push(format!("{at} left a change"));
+                }
+                if in_txn {
+                    if let Err(err) = read(&executor, sql, &ctx) {
+                        wrong.push(format!("{at} could not run again: {err}"));
+                    }
+                    read(&executor, "ROLLBACK", &ctx).unwrap();
+                }
+            }
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));

@@ -13214,7 +13214,11 @@ mod tests {
             let mut tx = engine.begin_transaction().unwrap();
             let mut table = tx.get_table("cleanup_test").unwrap();
             table
-                .delete(crate::storage::traits::ScanAccess::Seq, None)
+                .delete(
+                    crate::storage::traits::ScanAccess::Seq,
+                    None,
+                    crate::common::deadline::Deadline::NONE,
+                )
                 .unwrap();
             tx.commit().unwrap();
         }

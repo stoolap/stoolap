@@ -21,6 +21,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::sync::Arc;
 
+use crate::common::deadline::{Deadline, DeadlineSite};
 use crate::common::names::eq_names;
 use crate::common::{CompactArc, I64Set};
 use crate::core::{
@@ -2650,6 +2651,7 @@ impl MVCCTable {
         setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
         skip: Option<&FxHashMap<i64, u64>>,
         plan: &mut PlannedUpdate,
+        deadline: Deadline,
     ) -> Result<()> {
         let schema = &self.cached_schema;
         let skipped = |row_id: i64| skip.is_some_and(|skip| skip.contains_key(&row_id));
@@ -2690,6 +2692,7 @@ impl MVCCTable {
             // Every key of the range: a row's id is its key
             if let WriteAccess::KeyRange(low, high) = access {
                 let keys = usize::try_from(high.saturating_sub(low).saturating_add(1)).unwrap_or(0);
+                deadline.charge(DeadlineSite::StorageUpdate, keys)?;
                 plan.hot.reserve_exact(keys);
                 let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(keys);
                 {
@@ -2738,6 +2741,7 @@ impl MVCCTable {
                     expr,
                     &filtered_row_ids,
                 ));
+                deadline.charge(DeadlineSite::StorageUpdate, filtered_row_ids.len())?;
                 plan.hot.reserve_exact(filtered_row_ids.len());
                 let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(filtered_row_ids.len());
                 {
@@ -2783,7 +2787,13 @@ impl MVCCTable {
         let committed = match where_expr {
             Some(expr) if fallible => self
                 .version_store
-                .get_all_visible_rows_for_update_filtered(self.txn_id, expr, skipped, written)?,
+                .get_all_visible_rows_for_update_filtered(
+                    self.txn_id,
+                    expr,
+                    skipped,
+                    written,
+                    deadline,
+                )?,
             Some(expr) => self
                 .version_store
                 .get_all_visible_rows_for_update_filtered(
@@ -2791,10 +2801,11 @@ impl MVCCTable {
                     expr,
                     |_| false,
                     |_| false,
+                    deadline,
                 )?,
             None => self
                 .version_store
-                .get_all_visible_rows_for_update(self.txn_id),
+                .get_all_visible_rows_for_update(self.txn_id, deadline)?,
         };
         // Collected in place, in the buffer the store returned
         let committed: Vec<_> = committed
@@ -3307,10 +3318,11 @@ impl Table for MVCCTable {
         access: ScanAccess<'_>,
         where_expr: Option<&dyn Expression>,
         setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
+        deadline: Deadline,
     ) -> Result<i32> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         let mut plan = PlannedUpdate::default();
-        self.plan_rows(access, where_expr, setter, None, &mut plan)?;
+        self.plan_rows(access, where_expr, setter, None, &mut plan, deadline)?;
         self.publish(&mut plan)
     }
 
@@ -3332,9 +3344,10 @@ impl Table for MVCCTable {
         setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
         skip: Option<&FxHashMap<i64, u64>>,
         plan: &mut PlannedUpdate,
+        deadline: Deadline,
     ) -> Result<()> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
-        self.plan_rows(access, where_expr, setter, skip, plan)
+        self.plan_rows(access, where_expr, setter, skip, plan, deadline)
     }
 
     fn plan_update_by_row_ids(
@@ -3487,6 +3500,7 @@ impl Table for MVCCTable {
         &mut self,
         access: ScanAccess<'_>,
         where_expr: Option<&dyn Expression>,
+        deadline: Deadline,
     ) -> Result<i32> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         // OPTIMIZATION: Borrow schema instead of cloning - saves allocation per delete
@@ -3545,6 +3559,7 @@ impl Table for MVCCTable {
             // Every key of the range: PK IS the row_id
             if let WriteAccess::KeyRange(low, high) = access {
                 let keys = usize::try_from(high.saturating_sub(low).saturating_add(1)).unwrap_or(0);
+                deadline.charge(DeadlineSite::StorageDelete, keys)?;
                 // OPTIMIZATION: Track original versions to avoid redundant lookups
                 let mut local_rows = RowVec::with_capacity(keys / 4);
                 let mut rows_with_originals: Vec<(i64, Row, crate::storage::mvcc::RowVersion)> =
@@ -3604,6 +3619,7 @@ impl Table for MVCCTable {
                     expr,
                     &filtered_row_ids,
                 ));
+                deadline.charge(DeadlineSite::StorageDelete, filtered_row_ids.len())?;
                 // OPTIMIZATION: Batch collect rows to delete, then batch put
                 // This reduces lock contention from 2N locks to 2 locks for N rows
                 let mut rows_to_delete = RowVec::with_capacity(filtered_row_ids.len());
@@ -3664,6 +3680,7 @@ impl Table for MVCCTable {
         let row_ids = self.version_store.get_all_row_ids();
 
         for row_id in row_ids {
+            deadline.charge(DeadlineSite::StorageDelete, 1)?;
             // OPTIMIZATION: Check filter BEFORE cloning to avoid wasted allocations
             // For DELETE with selective WHERE, this can save 90%+ of clones
 
@@ -5856,7 +5873,7 @@ mod tests {
             .unwrap();
 
         // Delete all rows (no filter)
-        let deleted = table.delete(ScanAccess::Seq, None).unwrap();
+        let deleted = table.delete(ScanAccess::Seq, None, Deadline::NONE).unwrap();
         assert_eq!(deleted, 3);
 
         // Verify no rows remain
@@ -5889,11 +5906,16 @@ mod tests {
 
         // Update the row
         let updated = table
-            .update(ScanAccess::Seq, None, &mut |_, row| {
-                let mut new_row = row.clone();
-                let _ = new_row.set(1, Value::Integer(20));
-                Ok((new_row, true))
-            })
+            .update(
+                ScanAccess::Seq,
+                None,
+                &mut |_, row| {
+                    let mut new_row = row.clone();
+                    let _ = new_row.set(1, Value::Integer(20));
+                    Ok((new_row, true))
+                },
+                Deadline::NONE,
+            )
             .unwrap();
 
         assert_eq!(updated, 1);

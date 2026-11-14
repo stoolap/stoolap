@@ -225,7 +225,12 @@ fn a_row_another_transaction_changed_while_prepared_is_a_write_conflict() {
         Ok((row, true))
     };
     let err = table
-        .update(stoolap::storage::traits::ScanAccess::Seq, None, &mut setter)
+        .update(
+            stoolap::storage::traits::ScanAccess::Seq,
+            None,
+            &mut setter,
+            stoolap::executor::Deadline::NONE,
+        )
         .unwrap_err()
         .to_string();
     assert!(err.contains("write conflict"), "{err}");
@@ -300,7 +305,12 @@ fn a_prepared_row_sealed_again_outside_the_filter_is_a_write_conflict() {
         stoolap::storage::traits::ScanAccess::Index,
     );
     let err = table
-        .update(access, Some(&filter), &mut setter)
+        .update(
+            access,
+            Some(&filter),
+            &mut setter,
+            stoolap::executor::Deadline::NONE,
+        )
         .unwrap_err()
         .to_string();
     assert!(err.contains("write conflict"), "{err}");
@@ -370,7 +380,12 @@ fn a_prepared_row_another_transaction_holds_fails_before_any_hot_write() {
         Ok((row, true))
     };
     let err = table
-        .update(stoolap::storage::traits::ScanAccess::Seq, None, &mut setter)
+        .update(
+            stoolap::storage::traits::ScanAccess::Seq,
+            None,
+            &mut setter,
+            stoolap::executor::Deadline::NONE,
+        )
         .unwrap_err()
         .to_string();
     assert!(err.contains("uncommitted changes"), "{err}");
@@ -446,7 +461,12 @@ fn a_row_the_setter_left_unchanged_is_not_set_again_hot() {
         }
         Ok((row, false))
     };
-    let updated = table.update(stoolap::storage::traits::ScanAccess::Seq, None, &mut setter);
+    let updated = table.update(
+        stoolap::storage::traits::ScanAccess::Seq,
+        None,
+        &mut setter,
+        stoolap::executor::Deadline::NONE,
+    );
     drop(table);
     txn.rollback().unwrap();
     assert_eq!(calls, 1, "the setter ran again: {updated:?}");
@@ -485,7 +505,12 @@ fn a_changed_row_lands_while_an_unchanged_one_went_hot() {
             _ => Ok((row, false)),
         }
     };
-    let updated = table.update(stoolap::storage::traits::ScanAccess::Seq, None, &mut setter);
+    let updated = table.update(
+        stoolap::storage::traits::ScanAccess::Seq,
+        None,
+        &mut setter,
+        stoolap::executor::Deadline::NONE,
+    );
     drop(table);
     txn.commit().unwrap();
     seen.sort_unstable();
@@ -608,7 +633,12 @@ fn a_keyless_row_left_unchanged_that_went_hot_is_not_set_again() {
         seen.push(a);
         Ok((row, false))
     };
-    let updated = table.update(stoolap::storage::traits::ScanAccess::Seq, None, &mut setter);
+    let updated = table.update(
+        stoolap::storage::traits::ScanAccess::Seq,
+        None,
+        &mut setter,
+        stoolap::executor::Deadline::NONE,
+    );
     drop(table);
     txn.rollback().unwrap();
     seen.sort_unstable();
@@ -639,7 +669,12 @@ fn a_refused_statement_keeps_an_earlier_hot_claim_and_takes_no_new_one() {
         Ok((row, true))
     };
     assert_eq!(table.update_by_row_ids(&[2], &mut set).unwrap(), 1);
-    let refused = table.update(stoolap::storage::traits::ScanAccess::Seq, None, &mut set);
+    let refused = table.update(
+        stoolap::storage::traits::ScanAccess::Seq,
+        None,
+        &mut set,
+        stoolap::executor::Deadline::NONE,
+    );
     let rows = rows_of(table.as_ref());
     let earlier = db.execute("UPDATE t SET v = 5 WHERE id = 2", ());
     let new = db.execute("UPDATE t SET v = 5 WHERE id = 3", ());
@@ -707,6 +742,7 @@ fn a_cold_row_another_handle_wrote_from_the_setter_leaves_no_part_of_the_stateme
             row.set(1, stoolap::core::Value::Integer(7)).unwrap();
             Ok((row, true))
         },
+        stoolap::executor::Deadline::NONE,
     );
     let rows = rows_of(reader.as_ref());
     drop(updater);
@@ -744,6 +780,7 @@ fn a_keyless_cold_update_refuses_a_null_or_a_wrong_type_when_it_runs() {
             row.set(0, stoolap::core::Value::null_unknown()).unwrap();
             Ok((row, true))
         },
+        stoolap::executor::Deadline::NONE,
     );
     let text = table.update(
         stoolap::storage::traits::ScanAccess::Seq,
@@ -753,6 +790,7 @@ fn a_keyless_cold_update_refuses_a_null_or_a_wrong_type_when_it_runs() {
                 .unwrap();
             Ok((row, true))
         },
+        stoolap::executor::Deadline::NONE,
     );
     let rows = rows_of(table.as_ref());
     drop(table);
@@ -788,6 +826,7 @@ fn a_keyless_cold_update_meets_a_hot_unique_key_when_it_runs() {
             }
             Ok((row, false))
         },
+        stoolap::executor::Deadline::NONE,
     );
     drop(table);
     let committed = updated.and_then(|_| txn.commit());
@@ -845,6 +884,7 @@ fn a_hot_row_another_transaction_holds_leaves_no_part_of_the_statement() {
             bump(&mut row);
             Ok((row, true))
         },
+        stoolap::executor::Deadline::NONE,
     );
     let rows = rows_of(table.as_ref());
     let free_cold = db.execute("UPDATE t SET v = 4 WHERE id = 1", ());
@@ -880,6 +920,7 @@ fn a_hot_setter_error_lets_go_of_the_cold_claims() {
             bump(&mut row);
             Ok((row, true))
         },
+        stoolap::executor::Deadline::NONE,
     );
     let rows = rows_of(table.as_ref());
     let free = db.execute("UPDATE t SET v = 4 WHERE id = 1", ());
@@ -922,6 +963,7 @@ fn a_hot_row_another_handle_wrote_from_the_setter_leaves_no_part_of_the_statemen
             row.set(1, stoolap::core::Value::Integer(7)).unwrap();
             Ok((row, true))
         },
+        stoolap::executor::Deadline::NONE,
     );
     let rows = rows_of(reader.as_ref());
     drop(updater);

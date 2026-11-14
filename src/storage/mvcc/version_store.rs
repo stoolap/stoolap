@@ -33,6 +33,7 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
+use crate::common::deadline::{Deadline, DeadlineSite};
 use crate::common::names::eq_names;
 use crate::common::SmartString;
 
@@ -4428,16 +4429,20 @@ impl VersionStore {
     /// Returns: Vec of (row_id, row_data, original_version) tuples.
     /// Note: read_version_seq is obtained from visibility_checker, not from create_time.
     #[inline]
-    pub fn get_all_visible_rows_for_update(&self, txn_id: i64) -> Vec<(i64, Row, RowVersion)> {
+    pub fn get_all_visible_rows_for_update(
+        &self,
+        txn_id: i64,
+        deadline: Deadline,
+    ) -> crate::core::Result<Vec<(i64, Row, RowVersion)>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.get_all_visible_rows_for_update");
         if self.closed.load(Ordering::Acquire) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => c,
-            None => return Vec::new(),
+            None => return Ok(Vec::new()),
         };
 
         let current_seq = checker.get_current_sequence();
@@ -4448,6 +4453,7 @@ impl VersionStore {
         let mut result: Vec<(i64, Row, RowVersion)> = Vec::with_capacity(versions.len());
 
         for (&row_id, chain) in versions.iter() {
+            deadline.charge(DeadlineSite::StorageUpdate, 1)?;
             // FAST PATH: Check HEAD version first - O(1) for common case
             let head_txn_id = chain.version.txn_id;
             let head_deleted_at = chain.version.deleted_at_txn_id;
@@ -4480,7 +4486,7 @@ impl VersionStore {
             }
         }
 
-        result
+        Ok(result)
     }
 
     /// Get all visible rows for UPDATE with filter applied BEFORE cloning.
@@ -4499,6 +4505,7 @@ impl VersionStore {
         filter: &dyn crate::storage::expression::Expression,
         hidden: impl Fn(i64) -> bool,
         forgives: impl Fn(i64) -> bool,
+        deadline: Deadline,
     ) -> crate::core::Result<Vec<(i64, Row, RowVersion)>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.get_all_visible_rows_for_update_filtered");
@@ -4529,6 +4536,7 @@ impl VersionStore {
         let mut result: Vec<(i64, Row, RowVersion)> = Vec::with_capacity(versions.len() / 4);
 
         for (&row_id, chain) in versions.iter() {
+            deadline.charge(DeadlineSite::StorageUpdate, 1)?;
             // Before a filter that can fail, after one that cannot
             if fallible && hidden(row_id) {
                 continue;

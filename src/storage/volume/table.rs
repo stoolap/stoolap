@@ -28,6 +28,7 @@
 
 use std::sync::Arc;
 
+use crate::common::deadline::{Deadline, DeadlineSite};
 use crate::common::names::eq_names;
 use crate::common::{CompactArc, I64Set};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -2060,6 +2061,7 @@ impl SegmentedTable {
         ids: Option<&[i64]>,
         where_expr: Option<&dyn Expression>,
         setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
+        deadline: Deadline,
     ) -> Result<PreparedCold<'m>> {
         if !mgr.has_segments() {
             let guard = mgr.acquire_seal_read();
@@ -2101,6 +2103,7 @@ impl SegmentedTable {
                     &bloom_hashes,
                     setter,
                     &mut prep,
+                    deadline,
                 )?,
             }
             // A volume registered at a settled generation is walked whole;
@@ -2288,6 +2291,7 @@ impl SegmentedTable {
         bloom_hashes: &[Option<u64>],
         setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
         prep: &mut ColdPrepare,
+        deadline: Deadline,
     ) -> Result<()> {
         let tombstones_arc = Arc::clone(&snap.tombstones);
         let mut hot_skip: FxHashSet<i64> =
@@ -2312,6 +2316,7 @@ impl SegmentedTable {
             let mapping = cs.mapping.clone();
             let mut reader = super::writer::RowReader::new(Arc::clone(vol));
             for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
+                deadline.charge(DeadlineSite::StorageUpdate, 1)?;
                 if !self.shows_cold_row(cs, i, row_id, &tombstones_arc, &hot_skip, cut)
                     || prep.visited.contains_key(&row_id)
                 {
@@ -2443,7 +2448,13 @@ impl SegmentedTable {
         let txn_id = self.txn_id();
         // The cold rows named are read, set and checked outside the fence;
         // the ids no cold volume holds are the hot store's
-        let prepared = self.prepare_cold_updates(&self.segment_mgr, Some(row_ids), None, setter)?;
+        let prepared = self.prepare_cold_updates(
+            &self.segment_mgr,
+            Some(row_ids),
+            None,
+            setter,
+            Deadline::NONE,
+        )?;
         let mut plan = PlannedUpdate {
             cold: prepared.changes,
             ..PlannedUpdate::default()
@@ -4225,6 +4236,7 @@ impl SegmentedTable {
         ids: Option<&[i64]>,
         where_expr: Option<&dyn Expression>,
         hot_ids: bool,
+        deadline: Deadline,
     ) -> Result<PreparedDeletes<'m>> {
         if !mgr.has_segments() {
             let guard = mgr.acquire_seal_read();
@@ -4273,6 +4285,7 @@ impl SegmentedTable {
                         &comparisons,
                         &bloom_hashes,
                         &mut prep,
+                        deadline,
                     )?;
                     // A volume registered at a settled generation is walked whole
                     prep.seen_segments.extend(settled);
@@ -4393,6 +4406,7 @@ impl SegmentedTable {
     /// One round over the rows the filter selects, in the volumes not
     /// walked whole yet: the predicate reads only its own columns, and only
     /// a match reads the whole old row
+    #[allow(clippy::too_many_arguments)]
     fn prepare_cold_deletes_where(
         &self,
         snap: &super::manifest::StatementSnapshot,
@@ -4401,6 +4415,7 @@ impl SegmentedTable {
         comparisons: &[(&str, crate::core::Operator, &Value)],
         bloom_hashes: &[Option<u64>],
         prep: &mut ColdDeletes,
+        deadline: Deadline,
     ) -> Result<()> {
         let volumes = snap.volumes_newest_first();
         // Only the volumes read it: without one, gathering every hot row id is waste
@@ -4449,6 +4464,7 @@ impl SegmentedTable {
             // groups decoded across the rows
             let mut old_rows: Option<super::writer::RowReader> = None;
             for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
+                deadline.charge(DeadlineSite::StorageDelete, 1)?;
                 if !self.shows_cold_row(cs, i, row_id, &snap.tombstones, &hot_skip, cut)
                     || (!prep.prepared.is_empty() && prep.prepared.contains(&row_id))
                 {
@@ -4923,6 +4939,7 @@ impl Table for SegmentedTable {
         access: ScanAccess<'_>,
         where_expr: Option<&dyn Expression>,
         setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
+        deadline: Deadline,
     ) -> Result<i32> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         #[cfg(feature = "test-failpoints")]
@@ -4949,6 +4966,7 @@ impl Table for SegmentedTable {
             named.as_ref().map(std::slice::from_ref),
             where_expr,
             setter,
+            deadline,
         )?;
         let mut plan = PlannedUpdate {
             cold: prepared.changes,
@@ -4970,7 +4988,7 @@ impl Table for SegmentedTable {
         let skip = (!prepared.visited.is_empty()).then_some(&prepared.visited);
         let planned = self
             .hot
-            .plan_update(access, where_expr, setter, skip, &mut plan);
+            .plan_update(access, where_expr, setter, skip, &mut plan, deadline);
         Self::publish_prepared(&mut self.hot, &self.segment_mgr, txn_id, plan, planned)
     }
 
@@ -4989,7 +5007,8 @@ impl Table for SegmentedTable {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         let mgr = Arc::clone(&self.segment_mgr);
         // The sealed rows the ids name are read outside the fence
-        let prepared = self.prepare_cold_deletes(&mgr, Some(row_ids), None, true)?;
+        let prepared =
+            self.prepare_cold_deletes(&mgr, Some(row_ids), None, true, Deadline::NONE)?;
         let hot_ids = prepared.hot_ids.as_deref().unwrap_or(row_ids);
         self.apply_cold_deletes(prepared.deletes, prepared.seen, |hot, changed| {
             if !changed.is_empty() {
@@ -5014,7 +5033,8 @@ impl Table for SegmentedTable {
         let handed = changed.len();
         // A sealed row the snapshot still holds is there to delete; a row
         // it does not is the hot store's, deleted if still visible
-        let mut prepared = self.prepare_cold_deletes(&mgr, Some(row_ids), None, true)?;
+        let mut prepared =
+            self.prepare_cold_deletes(&mgr, Some(row_ids), None, true, Deadline::NONE)?;
         let Some(mut hot_ids) = prepared.hot_ids else {
             let count =
                 self.apply_cold_deletes_unless_held(prepared.deletes, prepared.seen, |hot, _| {
@@ -5136,6 +5156,7 @@ impl Table for SegmentedTable {
         &mut self,
         access: ScanAccess<'_>,
         where_expr: Option<&dyn Expression>,
+        deadline: Deadline,
     ) -> Result<i32> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         // A bare `pk = k` names one row: the hot half keeps the predicate and
@@ -5145,19 +5166,19 @@ impl Table for SegmentedTable {
             .and_then(|e| crate::storage::mvcc::table::pk_equality_id(e, self.hot.schema()))
         {
             let mgr = Arc::clone(&self.segment_mgr);
-            let prepared =
-                self.prepare_cold_deletes(&mgr, Some(std::slice::from_ref(&pk)), None, false)?;
+            let named = Some(std::slice::from_ref(&pk));
+            let prepared = self.prepare_cold_deletes(&mgr, named, None, false, Deadline::NONE)?;
             return self.apply_cold_deletes(prepared.deletes, prepared.seen, |hot, _| {
-                hot.delete(access, where_expr)
+                hot.delete(access, where_expr, deadline)
             });
         }
         // The sealed rows the filter selects are read and evaluated outside
         // the fence; under it they are claimed, then the hot rows deleted
         let mgr = Arc::clone(&self.segment_mgr);
-        let prepared = self.prepare_cold_deletes(&mgr, None, where_expr, false)?;
+        let prepared = self.prepare_cold_deletes(&mgr, None, where_expr, false, deadline)?;
         // A row changed since the round meets the filter again in the hot half
         self.apply_cold_deletes(prepared.deletes, prepared.seen, |hot, _| {
-            hot.delete(access, where_expr)
+            hot.delete(access, where_expr, deadline)
         })
     }
 
@@ -9379,6 +9400,7 @@ mod tests {
             _: ScanAccess<'_>,
             _: Option<&dyn Expression>,
             _: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
+            _: Deadline,
         ) -> Result<i32> {
             Ok(0)
         }
@@ -9411,7 +9433,12 @@ mod tests {
         fn has_visible_row(&self, row_id: i64) -> Result<bool> {
             Ok(self.rows.iter().any(|(id, _)| *id == row_id))
         }
-        fn delete(&mut self, _: ScanAccess<'_>, _: Option<&dyn Expression>) -> Result<i32> {
+        fn delete(
+            &mut self,
+            _: ScanAccess<'_>,
+            _: Option<&dyn Expression>,
+            _: Deadline,
+        ) -> Result<i32> {
             Ok(0)
         }
         fn scan(&self, _: &[usize], _: Option<&dyn Expression>) -> Result<Box<dyn Scanner>> {

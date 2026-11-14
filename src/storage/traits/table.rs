@@ -18,6 +18,7 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::fmt;
 
+use crate::common::deadline::Deadline;
 use crate::common::CompactArc;
 use crate::core::{DataType, Error, IndexType, Result, Row, RowVec, Schema, Value};
 use crate::functions::aggregate::GroupedAggregates;
@@ -415,6 +416,7 @@ pub trait Table: Send + Sync {
     /// * `where_expr` - Expression to filter rows to update (None means all rows)
     /// * `setter` - Function that transforms a row, given with its row id,
     ///   returns true if changed
+    /// * `deadline` - The statement's deadline, charged per row judged
     ///
     /// # Returns
     /// The number of rows updated
@@ -423,6 +425,7 @@ pub trait Table: Send + Sync {
         access: ScanAccess<'_>,
         where_expr: Option<&dyn Expression>,
         setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
+        deadline: Deadline,
     ) -> Result<i32>;
 
     /// Updates rows by their row IDs directly (O(k) lookup instead of O(n) scan).
@@ -452,6 +455,7 @@ pub trait Table: Send + Sync {
         _setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
         _skip: Option<&FxHashMap<i64, u64>>,
         _plan: &mut PlannedUpdate,
+        _deadline: Deadline,
     ) -> Result<()> {
         Err(Error::NotSupported("plan_update".to_string()))
     }
@@ -566,6 +570,7 @@ pub trait Table: Send + Sync {
     /// # Arguments
     /// * `access` - How the rows are found, decided by the caller
     /// * `where_expr` - Expression to filter rows to delete (None means all rows)
+    /// * `deadline` - The statement's deadline, charged per row judged
     ///
     /// # Returns
     /// The number of rows deleted
@@ -573,13 +578,14 @@ pub trait Table: Send + Sync {
         &mut self,
         access: ScanAccess<'_>,
         where_expr: Option<&dyn Expression>,
+        deadline: Deadline,
     ) -> Result<i32>;
 
     /// Truncates the table, removing all rows efficiently.
     /// Unlike DELETE, this drops storage directly instead of creating delete versions.
     /// Default implementation falls back to delete(None).
     fn truncate(&mut self) -> Result<i32> {
-        self.delete(ScanAccess::Seq, None)
+        self.delete(ScanAccess::Seq, None, Deadline::NONE)
     }
 
     /// `truncate`, running `after_check` once nothing refuses it and before

@@ -63,7 +63,8 @@ fn delete_row_1(table: &mut dyn Table) {
     filter.prepare_for_schema(table.schema());
     let plan = table.index_plan(&filter);
     let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
-    assert_eq!(table.delete(access, Some(&filter)).unwrap(), 1);
+    let none = stoolap::executor::Deadline::NONE;
+    assert_eq!(table.delete(access, Some(&filter), none).unwrap(), 1);
 }
 
 fn recovered(dir: &Path) -> Vec<i64> {
