@@ -81,7 +81,7 @@ use crate::common::CompactArc;
 use crate::core::predicate::{kind, KeySide};
 use crate::core::{Result, Row, RowVec, Schema};
 use crate::executor::aggregation::{compile_over_pair, compile_over_slots};
-use crate::executor::context::ExecutionContext;
+use crate::executor::context::{DeadlineSite, ExecutionContext};
 use crate::executor::expression::{JoinFilter, RowFilter, SharedProgram, SubqueryExecutor};
 use crate::executor::hash_table::JoinHashTable;
 use crate::executor::operator::{MaterializedOperator, Operator};
@@ -1302,7 +1302,7 @@ impl<'a> JoinStream<'a> {
     /// Into `part`, the next joined rows until it holds `rows` of them;
     /// false once every row was made. A slice with no residual to ask moves
     /// its rows over at once, a batch index join fills a hundred at a time;
-    /// the cancel is checked every hundred rows and before each slice
+    /// every row moved is charged against the deadline
     pub(crate) fn fill(
         &mut self,
         part: &mut RowVec,
@@ -1310,16 +1310,15 @@ impl<'a> JoinStream<'a> {
         ctx: &ExecutionContext,
     ) -> Result<bool> {
         while part.len() < rows {
+            let held = part.len();
             match &mut self.source {
                 StreamSource::Slices(slices, made) if self.residual_filters.is_empty() => {
                     let wanted = rows - part.len();
                     part.extend(made.by_ref().take(wanted).map(|row| (0, row)));
-                    if part.len() < rows {
-                        ctx.check_cancelled()?;
-                        if !next_slice(slices, made) {
-                            self.open = false;
-                            return Ok(false);
-                        }
+                    ctx.charge(DeadlineSite::JoinParts, part.len() - held)?;
+                    if part.len() < rows && !next_slice(slices, made) {
+                        self.open = false;
+                        return Ok(false);
                     }
                 }
                 StreamSource::IndexBatch(op) if self.open => {
@@ -1328,14 +1327,12 @@ impl<'a> JoinStream<'a> {
                         self.close()?;
                         return Ok(false);
                     }
-                    ctx.check_cancelled()?;
+                    ctx.charge(DeadlineSite::JoinParts, part.len() - held)?;
                 }
                 _ => match self.next_row()? {
                     Some(row) => {
                         part.push((0, row));
-                        if part.len().is_multiple_of(100) {
-                            ctx.check_cancelled()?;
-                        }
+                        ctx.charge(DeadlineSite::JoinParts, 1)?;
                     }
                     None => return Ok(false),
                 },

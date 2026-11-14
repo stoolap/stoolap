@@ -378,21 +378,24 @@ fn a_slice_of_probe_rows_meeting_many_rows_is_probed_on_every_thread() {
     assert_eq!(out, vec![[int(count), int(sum)].join("|")]);
 }
 
+#[cfg(feature = "test-failpoints")]
 mod cancel {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     use stoolap::core::{Result, Value};
     use stoolap::functions::registry::global_registry;
     use stoolap::functions::{
         FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
     };
+    use stoolap::test_failpoints::{keep_deadlines, pass_deadlines};
     use stoolap::{Error, ExecutionContext, Executor};
 
-    static TO_CANCEL: Mutex<Option<ExecutionContext>> = Mutex::new(None);
+    static ARMED: AtomicBool = AtomicBool::new(false);
     static CALLS: AtomicUsize = AtomicUsize::new(0);
 
-    /// Returns its argument, counts its calls and cancels `TO_CANCEL`
+    /// Returns its argument, counts its calls and passes every deadline
+    /// while `ARMED`
     #[derive(Default)]
     struct JoinCancelNow;
 
@@ -415,8 +418,8 @@ mod cancel {
         }
         fn evaluate(&self, args: &[Value]) -> Result<Value> {
             CALLS.fetch_add(1, Ordering::Relaxed);
-            if let Some(ctx) = TO_CANCEL.lock().unwrap().as_ref() {
-                ctx.cancel();
+            if ARMED.load(Ordering::Relaxed) {
+                pass_deadlines();
             }
             Ok(args[0].clone())
         }
@@ -443,8 +446,9 @@ mod cancel {
             ),
         ] {
             let executor = Executor::new(Arc::clone(db.engine()));
-            let ctx = ExecutionContext::new();
-            *TO_CANCEL.lock().unwrap() = Some(ctx.clone());
+            let mut ctx = ExecutionContext::new();
+            ctx.set_timeout_ms(3_600_000);
+            ARMED.store(true, Ordering::Relaxed);
             let before = CALLS.load(Ordering::Relaxed);
             let read = executor
                 .execute_with_context(sql, &ctx)
@@ -452,7 +456,8 @@ mod cancel {
                     while rows.next() {}
                     rows.last_error().map_or(Ok(()), Err)
                 });
-            *TO_CANCEL.lock().unwrap() = None;
+            ARMED.store(false, Ordering::Relaxed);
+            keep_deadlines();
             let calls = CALLS.load(Ordering::Relaxed) - before;
             assert!(
                 matches!(read, Err(Error::QueryCancelled)),

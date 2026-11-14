@@ -3875,6 +3875,7 @@ pub(crate) fn volume_file_opened() {
 /// Reset all failpoints to disabled state
 pub fn reset_all() {
     use std::sync::atomic::Ordering::Release;
+    keep_deadlines();
     COMMIT_CLOCK_SHIFT.store(0, Release);
     COMMIT_LOG_CAPACITY.store(0, Release);
     WAL_WRITE_FAIL.store(false, Release);
@@ -3985,6 +3986,42 @@ pub fn reset_all() {
     COLD_RECHECKS.with(|n| n.set(0));
     TXN_GATE_LOOKUPS.with(|n| n.set(0));
     TXN_GATE_ADMISSIONS.with(|n| n.set(0));
+}
+
+/// Deadlines a test has passed: 0 none, 1 every one, 2 plus a site's
+/// number those charged at that site alone
+static DEADLINES_PASSED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Every statement with a deadline finds it passed at its next check or
+/// charge, on any thread, until [`keep_deadlines`]
+pub fn pass_deadlines() {
+    DEADLINES_PASSED.store(1, std::sync::atomic::Ordering::Release);
+}
+
+/// Every statement with a deadline finds it passed at its next charge at
+/// `site` alone, until [`keep_deadlines`]
+pub fn pass_deadline_at(site: crate::executor::DeadlineSite) {
+    DEADLINES_PASSED.store(2 + site as usize, std::sync::atomic::Ordering::Release);
+}
+
+/// Deadlines are read from the clock alone again
+pub fn keep_deadlines() {
+    DEADLINES_PASSED.store(0, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether a test passes some deadlines, so a charge reads them at once
+pub(crate) fn deadline_forced() -> bool {
+    DEADLINES_PASSED.load(std::sync::atomic::Ordering::Acquire) != 0
+}
+
+/// Whether a test has passed the deadline read at `site`, or at a
+/// statement's step for None
+pub(crate) fn deadline_passed_at(site: Option<crate::executor::DeadlineSite>) -> bool {
+    match DEADLINES_PASSED.load(std::sync::atomic::Ordering::Acquire) {
+        0 => false,
+        1 => true,
+        passed => site.is_some_and(|site| site as usize + 2 == passed),
+    }
 }
 
 /// RAII guard that serializes failpoint tests and resets all failpoints on drop.

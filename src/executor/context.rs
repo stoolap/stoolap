@@ -23,11 +23,10 @@ use crate::storage::mvcc::registry::StatementView;
 use crate::storage::traits::transaction::{StatementTable, TableUse};
 use lru::LruCache;
 use rustc_hash::FxHashMap;
-use std::cell::RefCell;
-use std::collections::BinaryHeap;
+use std::cell::{Cell, RefCell};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use crate::api::params::ParamVec;
@@ -37,7 +36,6 @@ use crate::core::{Result, Row, Value};
 
 // Static defaults for ExecutionContext to avoid allocations for empty values.
 // These are shared across all contexts and only require Arc refcount bump on clone.
-// Note: cancelled is NOT shared - each context needs its own cancellation flag.
 static EMPTY_PARAMS: LazyLock<CompactArc<ParamVec>> =
     LazyLock::new(|| CompactArc::new(ParamVec::new()));
 static EMPTY_DATABASE: LazyLock<Arc<Option<String>>> = LazyLock::new(|| Arc::new(None));
@@ -541,7 +539,7 @@ pub fn clear_all_thread_local_caches() {
 /// Execution context for SQL queries
 ///
 /// The execution context carries state and configuration for query execution,
-/// including parameters, transaction state, and cancellation support.
+/// including parameters, transaction state, and the call's deadline.
 ///
 /// Note: This struct uses Arc for immutable shared data to make cloning cheap
 /// during correlated subquery processing where context is cloned per row.
@@ -708,18 +706,15 @@ pub struct ExecutionContext {
     params: CompactArc<ParamVec>,
     /// Whether to use auto-commit for DML statements
     auto_commit: bool,
-    /// Cancellation flag
-    cancelled: Arc<AtomicBool>,
     /// Current database/schema name - wrapped in Arc for cheap cloning
     current_database: Arc<Option<String>>,
     /// Session variables (SET key = value) - wrapped in Arc for cheap cloning
     session_vars: Arc<AHashMap<String, Value>>,
-    /// Query timeout in milliseconds (0 = no timeout)
-    timeout_ms: u64,
+    /// When the call stops, shared by every statement it runs
+    deadline: Deadline,
     /// Current view nesting depth (for detecting infinite recursion)
     view_depth: usize,
     /// Query execution depth (0 = top-level query, >0 = subquery/nested)
-    /// Used to ensure TimeoutGuard is only created once at the top level
     pub(crate) query_depth: usize,
     /// CTE data for subqueries to reference CTEs from outer query
     /// Maps CTE name (lowercase) to (columns, rows)
@@ -825,10 +820,9 @@ impl ExecutionContext {
         Self {
             params: EMPTY_PARAMS.clone(),
             auto_commit: true,
-            cancelled: Arc::new(AtomicBool::new(false)), // Each context needs own flag
             current_database: EMPTY_DATABASE.clone(),
             session_vars: EMPTY_SESSION_VARS.clone(),
-            timeout_ms: 0,
+            deadline: Deadline::NONE,
             view_depth: 0,
             query_depth: 0,
             cte_data: None,
@@ -911,27 +905,6 @@ impl ExecutionContext {
         self.auto_commit = auto_commit;
     }
 
-    /// Check if the query has been cancelled
-    pub fn is_cancelled(&self) -> bool {
-        #[cfg(target_arch = "wasm32")]
-        if let Some(manager) = TIMEOUT_MANAGER.get() {
-            manager.poll();
-        }
-        self.cancelled.load(Ordering::Relaxed)
-    }
-
-    /// Cancel the query
-    pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Relaxed);
-    }
-
-    /// Get a cancellation handle that can be used from another thread
-    pub fn cancellation_handle(&self) -> CancellationHandle {
-        CancellationHandle {
-            cancelled: self.cancelled.clone(),
-        }
-    }
-
     /// Get the current database/schema name
     pub fn current_database(&self) -> Option<&str> {
         self.current_database.as_ref().as_deref()
@@ -952,19 +925,37 @@ impl ExecutionContext {
         Arc::make_mut(&mut self.session_vars).insert(name.into(), value);
     }
 
-    /// Get the query timeout in milliseconds
-    pub fn timeout_ms(&self) -> u64 {
-        self.timeout_ms
+    /// The instant past which the call's statements stop, if any
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline.0
     }
 
-    /// Set the query timeout in milliseconds
+    /// Stop the call's statements past `at`; None runs them to their end
+    pub fn set_deadline(&mut self, at: Option<Instant>) {
+        self.deadline = Deadline(at);
+    }
+
+    /// Stop the call's statements `timeout_ms` from now; 0 sets no deadline
     pub fn set_timeout_ms(&mut self, timeout_ms: u64) {
-        self.timeout_ms = timeout_ms;
+        self.deadline = Deadline::after_ms(timeout_ms);
     }
 
-    /// Check if a timeout has been set
-    pub fn has_timeout(&self) -> bool {
-        self.timeout_ms > 0
+    /// The call's deadline, which a result read after the call keeps
+    #[inline]
+    pub(crate) fn deadline_of_call(&self) -> Deadline {
+        self.deadline
+    }
+
+    /// Count `units` of work at `site` against the deadline
+    #[inline]
+    pub(crate) fn charge(&self, site: DeadlineSite, units: usize) -> Result<()> {
+        self.deadline.charge(site, units)
+    }
+
+    /// Fail when the deadline has passed, reading the clock now
+    #[inline]
+    pub(crate) fn check_deadline(&self) -> Result<()> {
+        self.deadline.check()
     }
 
     /// Get the current view nesting depth
@@ -981,10 +972,9 @@ impl ExecutionContext {
         Self {
             params: EMPTY_PARAMS.clone(),
             auto_commit: self.auto_commit,
-            cancelled: self.cancelled.clone(),
             current_database: self.current_database.clone(),
             session_vars: self.session_vars.clone(),
-            timeout_ms: self.timeout_ms,
+            deadline: self.deadline,
             view_depth: self.view_depth + 1,
             query_depth: self.query_depth + 1, // Views are nested queries
             cte_data: None,
@@ -1000,15 +990,14 @@ impl ExecutionContext {
     }
 
     /// Create a new context with incremented query depth.
-    /// Used when executing subqueries to ensure TimeoutGuard is only created at the top level.
+    /// Used when executing subqueries.
     pub fn with_incremented_query_depth(&self) -> Self {
         Self {
             params: self.params.clone(),
             auto_commit: self.auto_commit,
-            cancelled: self.cancelled.clone(),
             current_database: self.current_database.clone(),
             session_vars: self.session_vars.clone(),
-            timeout_ms: self.timeout_ms,
+            deadline: self.deadline,
             view_depth: self.view_depth,
             query_depth: self.query_depth + 1,
             cte_data: self.cte_data.clone(),
@@ -1080,10 +1069,9 @@ impl ExecutionContext {
         Self {
             params: self.params.clone(),
             auto_commit: self.auto_commit,
-            cancelled: self.cancelled.clone(),
             current_database: self.current_database.clone(),
             session_vars: self.session_vars.clone(),
-            timeout_ms: self.timeout_ms,
+            deadline: self.deadline,
             view_depth: self.view_depth,
             query_depth: self.query_depth,
             cte_data: Some(cte_data),
@@ -1246,10 +1234,9 @@ impl ExecutionContext {
         Self {
             params: self.params.clone(),
             auto_commit: self.auto_commit,
-            cancelled: self.cancelled.clone(),
             current_database: self.current_database.clone(),
             session_vars: self.session_vars.clone(),
-            timeout_ms: self.timeout_ms,
+            deadline: self.deadline,
             view_depth: self.view_depth,
             query_depth: self.query_depth,
             cte_data: self.cte_data.clone(),
@@ -1269,266 +1256,111 @@ impl ExecutionContext {
         self.transaction_id = Some(txn_id);
         self
     }
+}
 
-    /// Check for cancellation and return an error if cancelled
-    pub fn check_cancelled(&self) -> Result<()> {
-        if self.is_cancelled() {
-            Err(crate::core::Error::QueryCancelled)
-        } else {
-            Ok(())
+/// Units of work a thread does between two reads of the clock
+const CHARGE_BEAT: usize = 4096;
+
+thread_local! {
+    /// Units this thread charges before it reads the clock again; every loop
+    /// on the thread draws from it, so nested loops count as one
+    static LEFT: Cell<usize> = const { Cell::new(0) };
+}
+
+/// A loop that charges its work against the call's deadline, by name, so
+/// a test can stop a statement at each one
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DeadlineSite {
+    /// A prepared statement's scan of its rows
+    Scan,
+    /// A grouped statement's keys computed over each row its run returns
+    LateKeys,
+    /// A subquery block's run and its scan
+    Block,
+    /// A join's rows the general path judges as it streams them
+    JoinedRows,
+    /// A join read in parts
+    JoinParts,
+    /// A streamed result's rows as the caller reads them
+    Result,
+    /// An ordered walk of an index
+    IndexWalk,
+}
+
+impl DeadlineSite {
+    /// Every site, which a test stops a statement at in turn
+    pub const ALL: [DeadlineSite; 7] = [
+        DeadlineSite::Scan,
+        DeadlineSite::LateKeys,
+        DeadlineSite::Block,
+        DeadlineSite::JoinedRows,
+        DeadlineSite::JoinParts,
+        DeadlineSite::Result,
+        DeadlineSite::IndexWalk,
+    ];
+}
+
+/// The instant past which a call's statements stop, copied into every
+/// context and result of the call; None runs them to their end
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Deadline(Option<Instant>);
+
+impl Deadline {
+    pub(crate) const NONE: Self = Self(None);
+
+    /// `timeout_ms` from now; 0 sets none
+    fn after_ms(timeout_ms: u64) -> Self {
+        Self((timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(timeout_ms)))
+    }
+
+    /// Count `units` of work at `site`; the clock is read when the thread's
+    /// beat runs out, and at every charge once the deadline has passed
+    #[inline]
+    pub(crate) fn charge(self, site: DeadlineSite, units: usize) -> Result<()> {
+        match self.0 {
+            None => Ok(()),
+            Some(at) => charge_until(at, site, units),
+        }
+    }
+
+    /// Fail when the deadline has passed, reading the clock now
+    pub(crate) fn check(self) -> Result<()> {
+        match self.0 {
+            None => Ok(()),
+            Some(at) => passed(at, None),
         }
     }
 }
 
-/// Handle for cancelling a query from another thread
-#[derive(Debug, Clone)]
-pub struct CancellationHandle {
-    cancelled: Arc<AtomicBool>,
+#[inline(never)]
+fn charge_until(at: Instant, site: DeadlineSite, units: usize) -> Result<()> {
+    let left = LEFT.with(Cell::get);
+    #[cfg(feature = "test-failpoints")]
+    let left = match crate::test_failpoints::deadline_forced() {
+        true => 0,
+        false => left,
+    };
+    if left > units {
+        LEFT.with(|cell| cell.set(left - units));
+        return Ok(());
+    }
+    LEFT.with(|cell| cell.set(0));
+    passed(at, Some(site))?;
+    LEFT.with(|cell| cell.set(CHARGE_BEAT));
+    Ok(())
 }
 
-impl CancellationHandle {
-    /// Cancel the query
-    pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Relaxed);
+/// QueryCancelled once `at` is past, read at `site` or at a statement's step
+fn passed(at: Instant, site: Option<DeadlineSite>) -> Result<()> {
+    #[cfg(feature = "test-failpoints")]
+    if crate::test_failpoints::deadline_passed_at(site) {
+        return Err(crate::core::Error::QueryCancelled);
     }
-
-    /// Check if the query has been cancelled
-    pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Relaxed)
-    }
-}
-
-// ============================================================================
-// Global Timeout Manager
-// ============================================================================
-//
-// Uses a single background thread to manage all query timeouts efficiently.
-// This avoids spawning a new thread for each query with a timeout.
-
-/// Entry in the timeout priority queue
-struct TimeoutEntry {
-    /// When the timeout expires
-    deadline: Instant,
-    /// Unique ID for this timeout (for cancellation)
-    id: u64,
-    /// Handle to cancel the query
-    cancel_handle: CancellationHandle,
-    /// Whether this timeout has been cancelled (query completed)
-    cancelled: Arc<AtomicBool>,
-}
-
-impl PartialEq for TimeoutEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.deadline == other.deadline && self.id == other.id
-    }
-}
-
-impl Eq for TimeoutEntry {}
-
-impl PartialOrd for TimeoutEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for TimeoutEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Reverse ordering so BinaryHeap becomes a min-heap (earliest deadline first)
-        other.deadline.cmp(&self.deadline)
-    }
-}
-
-/// Global timeout manager state
-struct TimeoutManagerState {
-    /// Priority queue of pending timeouts (min-heap by deadline)
-    timeouts: BinaryHeap<TimeoutEntry>,
-    /// Whether the manager is shutting down
-    #[cfg(not(target_arch = "wasm32"))]
-    shutdown: bool,
-}
-
-/// Global timeout manager that handles all query timeouts in a single thread
-struct TimeoutManager {
-    /// Shared state protected by mutex
-    state: Mutex<TimeoutManagerState>,
-    /// Condition variable to wake the timer thread
-    condvar: Condvar,
-    /// Counter for generating unique timeout IDs
-    next_id: AtomicU64,
-}
-
-impl TimeoutManager {
-    /// Create a new timeout manager and spawn its background thread
-    fn new() -> Arc<Self> {
-        let manager = Arc::new(Self {
-            state: Mutex::new(TimeoutManagerState {
-                timeouts: BinaryHeap::new(),
-                #[cfg(not(target_arch = "wasm32"))]
-                shutdown: false,
-            }),
-            condvar: Condvar::new(),
-            next_id: AtomicU64::new(1),
-        });
-
-        // Spawn the background timer thread
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let manager_clone = Arc::clone(&manager);
-            std::thread::Builder::new()
-                .name("stoolap-timeout-manager".to_string())
-                .spawn(move || {
-                    manager_clone.run();
-                })
-                .expect("Failed to spawn timeout manager thread");
-        }
-
-        manager
-    }
-
-    /// Cancels every query whose deadline is at or before `now`
-    fn expire_due(state: &mut TimeoutManagerState, now: Instant) {
-        while let Some(entry) = state.timeouts.peek() {
-            if entry.deadline <= now {
-                let entry = state.timeouts.pop().unwrap();
-                // Only cancel if the timeout wasn't already cancelled
-                if !entry.cancelled.load(Ordering::Relaxed) {
-                    entry.cancel_handle.cancel();
-                }
-            } else {
-                break;
-            }
-        }
-    }
-
-    /// Without a timer thread: drops finished timeouts, then expires due ones
-    #[cfg(target_arch = "wasm32")]
-    fn poll(&self) {
-        let Ok(mut state) = self.state.lock() else {
-            return;
-        };
-        while state
-            .timeouts
-            .peek()
-            .is_some_and(|e| e.cancelled.load(Ordering::Relaxed))
-        {
-            state.timeouts.pop();
-        }
-        if !state.timeouts.is_empty() {
-            Self::expire_due(&mut state, Instant::now());
-        }
-    }
-
-    /// Background thread loop
-    #[cfg(not(target_arch = "wasm32"))]
-    fn run(&self) {
-        loop {
-            let mut state = self.state.lock().unwrap();
-
-            // Check for shutdown
-            if state.shutdown && state.timeouts.is_empty() {
-                return;
-            }
-
-            // Process expired timeouts
-            let now = Instant::now();
-            Self::expire_due(&mut state, now);
-
-            // Calculate wait time until next timeout
-            let wait_duration = if let Some(entry) = state.timeouts.peek() {
-                entry.deadline.saturating_duration_since(now)
-            } else {
-                // No timeouts pending, wait indefinitely for new work
-                Duration::from_secs(3600) // 1 hour max wait
-            };
-
-            // Wait for new work or timeout
-            if wait_duration.is_zero() {
-                continue; // Immediately process
-            }
-            let (new_state, _timeout_result) =
-                self.condvar.wait_timeout(state, wait_duration).unwrap();
-            state = new_state;
-
-            // Re-check shutdown after waking
-            if state.shutdown && state.timeouts.is_empty() {
-                return;
-            }
-        }
-    }
-
-    /// Register a new timeout, returns the timeout ID
-    fn register(
-        &self,
-        timeout_ms: u64,
-        cancel_handle: CancellationHandle,
-        cancelled: Arc<AtomicBool>,
-    ) -> u64 {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-
-        let entry = TimeoutEntry {
-            deadline,
-            id,
-            cancel_handle,
-            cancelled,
-        };
-
-        let mut state = self.state.lock().unwrap();
-        let was_empty = state.timeouts.is_empty();
-        let is_earliest = state.timeouts.peek().is_none_or(|e| deadline < e.deadline);
-
-        state.timeouts.push(entry);
-
-        // Wake the timer thread if this is the new earliest deadline
-        if was_empty || is_earliest {
-            self.condvar.notify_one();
-        }
-
-        id
-    }
-}
-
-/// Get or create the global timeout manager
-fn global_timeout_manager() -> &'static Arc<TimeoutManager> {
-    TIMEOUT_MANAGER.get_or_init(TimeoutManager::new)
-}
-
-static TIMEOUT_MANAGER: std::sync::OnceLock<Arc<TimeoutManager>> = std::sync::OnceLock::new();
-
-/// Guard that automatically cancels a query after a timeout.
-/// Uses a global timeout manager for efficient handling of many concurrent timeouts.
-pub struct TimeoutGuard {
-    /// Flag to signal that the query completed (timeout should be ignored)
-    cancelled: Arc<AtomicBool>,
-}
-
-impl TimeoutGuard {
-    /// Create a new timeout guard that will cancel the query after timeout_ms.
-    /// Returns None if timeout_ms is 0 (no timeout).
-    pub fn new(ctx: &ExecutionContext) -> Option<Self> {
-        Self::for_ms(ctx, ctx.timeout_ms())
-    }
-
-    /// A guard cancelling `ctx`'s query `timeout_ms` from now; None for 0
-    pub(crate) fn for_ms(ctx: &ExecutionContext, timeout_ms: u64) -> Option<Self> {
-        if timeout_ms == 0 {
-            return None;
-        }
-
-        let cancel_handle = ctx.cancellation_handle();
-        let cancelled = Arc::new(AtomicBool::new(false));
-
-        // Register with the global timeout manager
-        global_timeout_manager().register(timeout_ms, cancel_handle, Arc::clone(&cancelled));
-
-        Some(Self { cancelled })
-    }
-}
-
-impl Drop for TimeoutGuard {
-    fn drop(&mut self) {
-        // Mark this timeout as cancelled so the manager ignores it
-        self.cancelled.store(true, Ordering::Relaxed);
+    #[cfg(not(feature = "test-failpoints"))]
+    let _ = site;
+    match Instant::now() >= at {
+        true => Err(crate::core::Error::QueryCancelled),
+        false => Ok(()),
     }
 }
 
@@ -1591,7 +1423,7 @@ impl ExecutionContextBuilder {
 
     /// Set the query timeout
     pub fn timeout_ms(mut self, timeout_ms: u64) -> Self {
-        self.ctx.timeout_ms = timeout_ms;
+        self.ctx.set_timeout_ms(timeout_ms);
         self
     }
 
@@ -1616,7 +1448,7 @@ mod tests {
         let ctx = ExecutionContext::new();
         assert_eq!(ctx.param_count(), 0);
         assert!(ctx.auto_commit());
-        assert!(!ctx.is_cancelled());
+        assert!(ctx.deadline().is_none());
     }
 
     fn ids(table: &dyn crate::storage::traits::Table) -> Vec<i64> {
@@ -1702,25 +1534,32 @@ mod tests {
     }
 
     #[test]
-    fn test_context_cancellation() {
-        let ctx = ExecutionContext::new();
-        assert!(!ctx.is_cancelled());
-
-        let handle = ctx.cancellation_handle();
-        assert!(!handle.is_cancelled());
-
-        handle.cancel();
-        assert!(ctx.is_cancelled());
-        assert!(handle.is_cancelled());
+    fn a_passed_deadline_fails_its_check_and_every_charge() {
+        let mut ctx = ExecutionContext::new();
+        ctx.set_deadline(Some(Instant::now()));
+        assert!(ctx.check_deadline().is_err());
+        for _ in 0..3 {
+            assert!(ctx.charge(DeadlineSite::Scan, 1).is_err());
+        }
     }
 
     #[test]
-    fn test_context_check_cancelled() {
+    fn a_context_without_a_deadline_never_stops() {
         let ctx = ExecutionContext::new();
-        assert!(ctx.check_cancelled().is_ok());
+        assert!(ctx.check_deadline().is_ok());
+        for _ in 0..3 * CHARGE_BEAT {
+            assert!(ctx.charge(DeadlineSite::Scan, 1).is_ok());
+        }
+    }
 
-        ctx.cancel();
-        assert!(ctx.check_cancelled().is_err());
+    #[test]
+    fn a_deadline_ahead_is_read_once_a_beat() {
+        let mut ctx = ExecutionContext::new();
+        ctx.set_timeout_ms(60_000);
+        assert!(ctx.check_deadline().is_ok());
+        for _ in 0..3 * CHARGE_BEAT {
+            assert!(ctx.charge(DeadlineSite::Scan, 1).is_ok());
+        }
     }
 
     #[test]
@@ -1747,6 +1586,6 @@ mod tests {
         assert_eq!(ctx.get_param(2), Some(&Value::Integer(2)));
         assert!(!ctx.auto_commit());
         assert_eq!(ctx.current_database(), Some("mydb"));
-        assert_eq!(ctx.timeout_ms(), 5000);
+        assert!(ctx.deadline().is_some());
     }
 }

@@ -759,6 +759,7 @@ impl Database {
     ///
     /// Like `query`, but cancels the query if it exceeds the timeout.
     /// Timeout is specified in milliseconds. Use 0 for no timeout.
+    /// The rows returned keep the deadline while they are read.
     ///
     /// # Examples
     ///

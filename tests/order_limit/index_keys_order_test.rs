@@ -249,7 +249,9 @@ fn an_order_of_two_keys_walks_only_the_rows_it_keeps() {
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn a_cancel_stops_the_walk_while_it_reads() {
-    use stoolap::test_failpoints::{hot_top_k_visits, on_hot_top_k_visit};
+    use stoolap::test_failpoints::{
+        hot_top_k_visits, keep_deadlines, on_hot_top_k_visit, pass_deadlines,
+    };
     let db = Database::open("memory://index_keys_order_cancel").unwrap();
     for sql in [
         "CREATE TABLE big (a INTEGER, b INTEGER)",
@@ -259,9 +261,9 @@ fn a_cancel_stops_the_walk_while_it_reads() {
         db.execute(sql, ()).unwrap();
     }
     let executor = stoolap::Executor::new(std::sync::Arc::clone(db.engine()));
-    let ctx = stoolap::ExecutionContext::new();
-    let handle = ctx.clone();
-    on_hot_top_k_visit(move || handle.cancel());
+    let mut ctx = stoolap::ExecutionContext::new();
+    ctx.set_timeout_ms(3_600_000);
+    on_hot_top_k_visit(pass_deadlines);
     let before = hot_top_k_visits();
     let read = executor
         .execute_with_context(
@@ -272,6 +274,7 @@ fn a_cancel_stops_the_walk_while_it_reads() {
             while rows.next() {}
             rows.last_error().map_or(Ok(()), Err)
         });
+    keep_deadlines();
     let visits = hot_top_k_visits() - before;
     assert!(
         matches!(read, Err(stoolap::Error::QueryCancelled)),

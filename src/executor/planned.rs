@@ -386,15 +386,8 @@ impl Executor {
                 let ctx = ctx.filter(|ctx| !in_txn && ctx.statement_view().is_none())?;
                 return self.run_quiet_aggregate(quiet, ctx);
             }
-            if let Some(ctx) = ctx {
-                // In a transaction the normal path arms a timeout; every
-                // statement refuses a cancel
-                if in_txn && ctx.has_timeout() {
-                    return None;
-                }
-                if let Err(e) = ctx.check_cancelled() {
-                    return Some(Err(e));
-                }
+            if let Some(Err(e)) = ctx.map(ExecutionContext::check_deadline) {
+                return Some(Err(e));
             }
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::pk_lookup_resolved();

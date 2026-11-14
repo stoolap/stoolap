@@ -84,8 +84,8 @@ fn a_cancelled_key_read_is_refused() {
     let statement = stoolap::parser::parse_sql("SELECT id + 1 FROM t WHERE id = 1")
         .unwrap()
         .remove(0);
-    let ctx = ExecutionContext::new();
-    ctx.cancel();
+    let mut ctx = ExecutionContext::new();
+    ctx.set_deadline(Some(std::time::Instant::now()));
     let answer = executor.execute_statement(&statement, &ctx);
     assert!(
         matches!(answer, Err(stoolap::Error::QueryCancelled)),
@@ -182,8 +182,8 @@ fn a_cancelled_aggregate_plan_is_refused() {
         // The first run plans it, the second reads by the plan
         executor.execute(sql).unwrap();
         executor.execute(sql).unwrap();
-        let ctx = ExecutionContext::new();
-        ctx.cancel();
+        let mut ctx = ExecutionContext::new();
+        ctx.set_deadline(Some(std::time::Instant::now()));
         let answer = executor.execute_with_context(sql, &ctx);
         assert!(
             matches!(answer, Err(stoolap::Error::QueryCancelled)),
