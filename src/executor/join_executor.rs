@@ -260,15 +260,35 @@ pub struct StreamingJoinRequest<'a> {
 pub(crate) struct StatementRun<'a> {
     pub(crate) blocks: &'a JoinBlocks,
     pub(crate) run: &'a PreparedRunner<'a>,
+    /// The run as a site over the joined row, then over the pair
+    sites: Option<&'a [SiteRunner<'a>; 2]>,
 }
 
 impl<'a> StatementRun<'a> {
-    /// The run as a site over the joined row, or over the pair when `pair`;
-    /// none when the statement asks nothing of a site
-    pub(crate) fn site(self, pair: bool) -> Option<SiteRunner<'a>> {
-        self.blocks
+    /// `blocks` and their `run`, its `sites` made by [`Self::sites`]
+    pub(crate) fn new(
+        blocks: &'a JoinBlocks,
+        run: &'a PreparedRunner<'a>,
+        sites: Option<&'a [SiteRunner<'a>; 2]>,
+    ) -> Self {
+        Self { blocks, run, sites }
+    }
+
+    /// The sites over the joined row and over the pair a run of `blocks`
+    /// asks through; none when the statement asks nothing of a site
+    pub(crate) fn sites(
+        blocks: &'a JoinBlocks,
+        run: &'a PreparedRunner<'a>,
+    ) -> Option<[SiteRunner<'a>; 2]> {
+        blocks
             .asks_sites()
-            .then(|| SiteRunner::new(self.run, self.blocks.holes(pair)))
+            .then(|| [false, true].map(|pair| SiteRunner::new(run, blocks.holes(pair))))
+    }
+
+    /// The run as a site over the joined row, or over the pair when `pair`
+    pub(crate) fn site(self, pair: bool) -> Option<&'a dyn SubqueryExecutor> {
+        self.sites
+            .map(|sites| &sites[usize::from(pair)] as &dyn SubqueryExecutor)
     }
 }
 
@@ -371,10 +391,10 @@ impl JoinExecutor {
 
     /// The rows of `request`'s join, made as they are read: a hash join's,
     /// probed in slices when it builds across threads, or a nested loop's,
-    /// with no LIMIT and a statement asking nothing of a site; else made at once
-    pub(crate) fn execute_each(&self, request: JoinRequest<'_>) -> Result<JoinRows> {
-        let sites = request.blocks.is_some_and(|run| run.blocks.asks_sites());
-        if request.limit.is_some() || sites {
+    /// with no LIMIT, asking the statement's subqueries through its sites;
+    /// else made at once
+    pub(crate) fn execute_each<'a>(&self, request: JoinRequest<'a>) -> Result<JoinRows<'a>> {
+        if request.limit.is_some() {
             return self
                 .execute(request)
                 .map(|result| JoinRows::Held(result.rows));
@@ -395,6 +415,7 @@ impl JoinExecutor {
                 let mut all_columns = request.left_columns.to_vec();
                 all_columns.extend(request.right_columns.iter().cloned());
                 let (ctx, prepared, blocks) = (request.ctx, request.prepared, request.blocks);
+                let site = blocks.and_then(|blocks| blocks.site(false));
                 if Self::uses_parallel(&analysis, build_rows, None) {
                     JoinPath::ParallelHash.taken();
                     let counts = (sides.2.len(), sides.3.len());
@@ -410,7 +431,8 @@ impl JoinExecutor {
                     );
                     let filters = residual_filters(&analysis, &all_columns, ctx, prepared, blocks)?;
                     let source = StreamSource::Slices(Box::new(slices), Vec::new().into_iter());
-                    return JoinStream::new(source, filters, self.room).map(JoinRows::Streamed);
+                    return JoinStream::new(source, (filters, site), self.room)
+                        .map(JoinRows::Streamed);
                 }
                 JoinPath::Hash.taken();
                 let (op, filters) = self.hash_join_operator(
@@ -421,22 +443,23 @@ impl JoinExecutor {
                     ctx,
                     prepared,
                     blocks,
-                    None,
+                    site,
                 )?;
-                (StreamSource::Operator(Box::new(op)), filters)
+                (StreamSource::Operator(Box::new(op)), (filters, site))
             }
             PairMethod::NestedLoop => {
                 JoinPath::NestedLoop.taken();
+                let blocks = request.blocks;
                 let op = self.nested_loop_operator(
                     sides,
                     request.condition,
                     &analysis.join_type_str,
                     request.ctx,
                     request.prepared,
-                    request.blocks,
-                    None,
+                    blocks,
+                    blocks.and_then(|blocks| blocks.site(true)),
                 )?;
-                (StreamSource::Operator(Box::new(op)), Vec::new())
+                (StreamSource::Operator(Box::new(op)), (Vec::new(), None))
             }
         };
         JoinStream::new(source, residual_filters, self.room).map(JoinRows::Streamed)
@@ -651,7 +674,6 @@ impl JoinExecutor {
             request.blocks,
         )?;
         let site = request.blocks.and_then(|blocks| blocks.site(false));
-        let site = site.as_ref().map(|site| site as &dyn SubqueryExecutor);
 
         // OUTER joins have to reject a pair inside the operator so the row it
         // came from still counts as unmatched; INNER joins can filter the
@@ -865,7 +887,6 @@ impl JoinExecutor {
         // Only INNER joins reach this path: execute_hash_join() routes OUTER
         // joins carrying a residual to the streaming operator.
         let site = blocks.and_then(|blocks| blocks.site(false));
-        let site = site.as_ref().map(|site| site as &dyn SubqueryExecutor);
         for filter in residual_filters(analysis, all_columns, ctx, prepared, blocks)? {
             filter.retain_checked_with(&mut rows, site)?;
         }
@@ -926,7 +947,6 @@ impl JoinExecutor {
     ) -> Result<RowVec> {
         JoinPath::Hash.taken();
         let site = blocks.and_then(|blocks| blocks.site(false));
-        let site = site.as_ref().map(|site| site as &dyn SubqueryExecutor);
         let sides = (left_rows, right_rows, left_columns, right_columns);
         let (mut join_op, inline_filters) = self.hash_join_operator(
             sides,
@@ -1023,7 +1043,6 @@ impl JoinExecutor {
     ) -> Result<RowVec> {
         JoinPath::NestedLoop.taken();
         let site = blocks.and_then(|blocks| blocks.site(true));
-        let site = site.as_ref().map(|site| site as &dyn SubqueryExecutor);
         let sides = (left_rows, right_rows, left_columns, right_columns);
         let mut nl_op = self.nested_loop_operator(
             sides,
@@ -1231,6 +1250,8 @@ enum StreamSource<'a> {
 pub(crate) struct JoinStream<'a> {
     source: StreamSource<'a>,
     residual_filters: Vec<RowFilter>,
+    /// The site the residual filters ask their subqueries through
+    site: Option<&'a dyn SubqueryExecutor>,
     room: usize,
     open: bool,
 }
@@ -1238,18 +1259,22 @@ pub(crate) struct JoinStream<'a> {
 impl<'a> JoinStream<'a> {
     /// The rows `op` makes, opened here, as an aggregation reads them
     pub(crate) fn of_operator(op: Box<dyn Operator + 'a>) -> Result<Self> {
-        Self::new(StreamSource::Operator(op), Vec::new(), 0)
+        Self::new(StreamSource::Operator(op), (Vec::new(), None), 0)
     }
 
     /// The rows the batch index join `op` makes, opened here, filled into
     /// a part without a call per row
     pub(crate) fn of_index_batch(op: BatchIndexNestedLoopJoinOperator<'a>) -> Result<Self> {
-        Self::new(StreamSource::IndexBatch(Box::new(op)), Vec::new(), 0)
+        Self::new(
+            StreamSource::IndexBatch(Box::new(op)),
+            (Vec::new(), None),
+            0,
+        )
     }
 
     fn new(
         mut source: StreamSource<'a>,
-        residual_filters: Vec<RowFilter>,
+        (residual_filters, site): (Vec<RowFilter>, Option<&'a dyn SubqueryExecutor>),
         room: usize,
     ) -> Result<Self> {
         match &mut source {
@@ -1260,26 +1285,27 @@ impl<'a> JoinStream<'a> {
         Ok(Self {
             source,
             residual_filters,
+            site,
             room,
             open: true,
         })
     }
 
     /// The next joined row; None once every row was made
-    pub(crate) fn next_row(&mut self) -> Result<Option<Row>> {
+    pub(crate) fn next_row(&mut self, ctx: &ExecutionContext) -> Result<Option<Row>> {
         if !self.open {
             return Ok(None);
         }
         let row = match &mut self.source {
             StreamSource::Operator(op) => {
-                next_passing(&mut **op, &self.residual_filters, None, self.room)?
+                next_passing(&mut **op, &self.residual_filters, self.site, self.room)?
             }
             StreamSource::IndexBatch(op) => op.next_joined()?,
             StreamSource::Slices(slices, rows) => loop {
                 match rows.next() {
-                    Some(row) if passes(&self.residual_filters, &row, None)? => break Some(row),
-                    Some(_) => {}
-                    None if next_slice(slices, rows) => {}
+                    Some(row) => break Some(row),
+                    None if next_slice(slices, rows, (&self.residual_filters, self.site), ctx)? => {
+                    }
                     None => break None,
                 }
             },
@@ -1301,8 +1327,8 @@ impl<'a> JoinStream<'a> {
     }
 
     /// Into `part`, the next joined rows until it holds `rows` of them;
-    /// false once every row was made. A slice with no residual to ask moves
-    /// its rows over at once, a batch index join fills a hundred at a time;
+    /// false once every row was made. A slice moves the rows its residual
+    /// passed over at once, a batch index join fills a hundred at a time;
     /// every row moved is charged against the deadline
     pub(crate) fn fill(
         &mut self,
@@ -1313,11 +1339,13 @@ impl<'a> JoinStream<'a> {
         while part.len() < rows {
             let held = part.len();
             match &mut self.source {
-                StreamSource::Slices(slices, made) if self.residual_filters.is_empty() => {
+                StreamSource::Slices(slices, made) => {
                     let wanted = rows - part.len();
                     part.extend(made.by_ref().take(wanted).map(|row| (0, row)));
                     ctx.charge(DeadlineSite::JoinParts, part.len() - held)?;
-                    if part.len() < rows && !next_slice(slices, made) {
+                    if part.len() < rows
+                        && !next_slice(slices, made, (&self.residual_filters, self.site), ctx)?
+                    {
                         self.open = false;
                         return Ok(false);
                     }
@@ -1330,7 +1358,7 @@ impl<'a> JoinStream<'a> {
                     }
                     ctx.charge(DeadlineSite::JoinParts, part.len() - held)?;
                 }
-                _ => match self.next_row()? {
+                _ => match self.next_row(ctx)? {
                     Some(row) => {
                         part.push((0, row));
                         ctx.charge(DeadlineSite::JoinParts, 1)?;
@@ -1343,22 +1371,47 @@ impl<'a> JoinStream<'a> {
     }
 }
 
-/// The next slice of `slices` in `rows`; false after the last
-fn next_slice(slices: &mut HashJoinSlices, rows: &mut std::vec::IntoIter<Row>) -> bool {
-    let slice = slices.next_slice(join_part_rows());
+/// The next slice of `slices` in `rows`, the rows `residual_filters` pass
+/// through `site`, each row asked charged against `ctx`'s deadline; false
+/// after the last
+fn next_slice(
+    slices: &mut HashJoinSlices,
+    rows: &mut std::vec::IntoIter<Row>,
+    (residual_filters, site): (&[RowFilter], Option<&dyn SubqueryExecutor>),
+    ctx: &ExecutionContext,
+) -> Result<bool> {
+    let mut slice = slices.next_slice(join_part_rows());
     #[cfg(feature = "test-failpoints")]
     crate::test_failpoints::join_part_held(slice.len());
     if slice.is_empty() {
-        return false;
+        return Ok(false);
+    }
+    if !residual_filters.is_empty() {
+        let mut failed = None;
+        slice.retain(|row| {
+            if failed.is_some() {
+                return false;
+            }
+            let asked = ctx.charge(DeadlineSite::JoinParts, 1);
+            asked
+                .and_then(|()| passes(residual_filters, row, site))
+                .unwrap_or_else(|e| {
+                    failed = Some(e);
+                    false
+                })
+        });
+        if let Some(e) = failed {
+            return Err(e);
+        }
     }
     *rows = slice.into_iter();
-    true
+    Ok(true)
 }
 
 /// A join's rows: all of them made at once, or made as they are read
-pub(crate) enum JoinRows {
+pub(crate) enum JoinRows<'a> {
     Held(RowVec),
-    Streamed(JoinStream<'static>),
+    Streamed(JoinStream<'a>),
 }
 
 impl Default for JoinExecutor {

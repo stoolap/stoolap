@@ -478,11 +478,12 @@ impl MergedValues<'_> {
 }
 
 /// A join's rows as the join makes them, with the values `merged` adds,
-/// those `where_` passes, as an aggregation reads them, each charged
-/// against the deadline
+/// those `where_` passes, asking its subqueries through `site`, as an
+/// aggregation reads them, each charged against the deadline
 struct JoinedRows<'r, 'p> {
     stream: JoinStream<'r>,
     where_: Option<JoinedWhere<'r, 'p>>,
+    site: Option<&'r dyn SubqueryExecutor>,
     ctx: &'r ExecutionContext,
     merged: MergedValues<'r>,
     row: Option<Row>,
@@ -491,12 +492,16 @@ struct JoinedRows<'r, 'p> {
 impl<'r, 'p> JoinedRows<'r, 'p> {
     fn new(
         stream: JoinStream<'r>,
-        where_: Option<JoinedWhere<'r, 'p>>,
+        (where_, site): (
+            Option<JoinedWhere<'r, 'p>>,
+            Option<&'r dyn SubqueryExecutor>,
+        ),
         ctx: &'r ExecutionContext,
     ) -> Self {
         Self {
             stream,
             where_,
+            site,
             ctx,
             merged: MergedValues::default(),
             row: None,
@@ -509,11 +514,11 @@ impl<'r, 'p> JoinedRows<'r, 'p> {
     }
 
     fn next_passed(&mut self) -> Result<Option<Row>> {
-        while let Some(mut row) = self.stream.next_row()? {
+        while let Some(mut row) = self.stream.next_row(self.ctx)? {
             self.ctx.charge(DeadlineSite::JoinedRows, 1)?;
             self.merged.push_onto(&mut row);
             if let Some(where_) = self.where_.as_mut() {
-                if !where_.matches(&row, None)? {
+                if !where_.matches(&row, self.site)? {
                     continue;
                 }
             }
@@ -4064,8 +4069,12 @@ impl Executor {
             })?),
             None => None,
         };
+        let sites = match (blocks.as_deref(), blocks_run.as_ref()) {
+            (Some(blocks), Some(run)) => StatementRun::sites(blocks, run),
+            _ => None,
+        };
         let statement_run = match (blocks.as_deref(), blocks_run.as_ref()) {
-            (Some(blocks), Some(run)) => Some(StatementRun { blocks, run }),
+            (Some(blocks), Some(run)) => Some(StatementRun::new(blocks, run, sites.as_ref())),
             _ => None,
         };
         // A joined side whose merged pairs the blocks read apart has each pair
@@ -4104,13 +4113,7 @@ impl Executor {
             apart,
         };
         let where_blocks = statement_run.and_then(|run| run.site(false));
-        let where_blocks = where_blocks
-            .as_ref()
-            .map(|site| site as &dyn SubqueryExecutor);
         let pair_blocks = statement_run.and_then(|run| run.site(true));
-        let pair_blocks = pair_blocks
-            .as_ref()
-            .map(|site| site as &dyn SubqueryExecutor);
         // The result a held output builds, its blocks told how many rows ask
         let output_result = |output: &JoinOutput, rows: RowVec, applied: bool| {
             if let Some(run) = &blocks_run {
@@ -4869,10 +4872,10 @@ impl Executor {
                         run.ask_rows(outer_result.estimated_count());
                     }
                     // An aggregate reads the joined rows in parts as the join
-                    // makes them, under the general path's conditions
+                    // makes them, under the general path's conditions; the
+                    // blocks were told the rows they ask before the join
                     let in_parts = classification.has_aggregation
                         && !classification.has_window_functions
-                        && blocks.as_deref().is_none_or(|held| !held.asks_sites())
                         && !(side_merged && !apart)
                         && !Self::grouped_family_reach(stmt, classification);
                     let mut result_rows = RowVec::new();
@@ -4943,7 +4946,8 @@ impl Executor {
                                 && inner_key_idx.is_some()
                             {
                                 let stream = JoinStream::of_operator(Box::new(op))?;
-                                let source = JoinedRows::new(stream, cross_row_filter, ctx);
+                                let where_ = (cross_row_filter, where_blocks);
+                                let source = JoinedRows::new(stream, where_, ctx);
                                 return self.aggregate_joined(
                                     plan.as_deref(),
                                     stmt,
@@ -5080,7 +5084,8 @@ impl Executor {
                         }
                         if in_parts {
                             let stream = JoinStream::of_index_batch(op)?;
-                            let source = JoinedRows::new(stream, cross_row_filter, ctx);
+                            let where_ = (cross_row_filter, where_blocks);
+                            let source = JoinedRows::new(stream, where_, ctx);
                             return self.aggregate_joined(
                                 plan.as_deref(),
                                 stmt,
@@ -5807,13 +5812,28 @@ impl Executor {
             None
         };
 
+        // Apply remaining WHERE clause if present (after filter pushdown)
+        // IMPORTANT: When predicates were pushed to left/right (left_filter or right_filter is Some),
+        // we should ONLY apply cross_filter (predicates that reference both tables).
+        // If cross_filter is None and any pushdown happened, we don't need post-join filtering.
+        // Only use stmt.where_clause when NO pushdown happened at all.
+        let did_any_pushdown = where_split;
+        let effective_where = if did_any_pushdown {
+            // Pushdown happened - only apply cross predicates (if any)
+            cross_filter.as_ref()
+        } else {
+            // No pushdown - apply full WHERE clause
+            where_for_join
+        };
+
         // A grouped statement without windows that reads the joined rows as
-        // the join makes them, through no subquery and no star over merged
-        // columns, aggregates them in parts as they are made
+        // the join makes them, with no subquery in the WHERE after the join
+        // and no star over merged columns, aggregates them in parts as they
+        // are made
         let shows_star = (stmt.columns.iter()).any(|c| matches!(c, Expression::Star(_)));
         let in_parts = classification.has_aggregation
             && !classification.has_window_functions
-            && blocks.as_deref().is_none_or(|held| !held.asks_sites())
+            && !effective_where.is_some_and(Self::has_subqueries)
             && !(shows_star
                 && !(excluded_column_indices.is_empty() && join_col_renames.is_empty()))
             && !Self::grouped_family_reach(stmt, classification);
@@ -5859,20 +5879,6 @@ impl Executor {
             }
         }
 
-        // Apply remaining WHERE clause if present (after filter pushdown)
-        // IMPORTANT: When predicates were pushed to left/right (left_filter or right_filter is Some),
-        // we should ONLY apply cross_filter (predicates that reference both tables).
-        // If cross_filter is None and any pushdown happened, we don't need post-join filtering.
-        // Only use stmt.where_clause when NO pushdown happened at all.
-        let did_any_pushdown = where_split;
-        let effective_where = if did_any_pushdown {
-            // Pushdown happened - only apply cross predicates (if any)
-            cross_filter.as_ref()
-        } else {
-            // No pushdown - apply full WHERE clause
-            where_for_join
-        };
-
         if let Some(stream) = stream {
             let where_ = match effective_where {
                 Some(where_expr) => {
@@ -5892,7 +5898,7 @@ impl Executor {
                 coalesced: &coalesced,
                 appended: &appended,
             };
-            let source = JoinedRows::new(stream, where_, ctx).merging(merged);
+            let source = JoinedRows::new(stream, (where_, where_blocks), ctx).merging(merged);
             let bare: Vec<String> = appended_merges(&all_columns, &join_col_renames)
                 .map(|(_, _, name)| name.clone())
                 .collect();
@@ -7365,12 +7371,8 @@ impl Executor {
             }
             None => None,
         };
-        let cross_site = run.and_then(|run| run.site(false));
-        let cross_blocks = cross_site
-            .as_ref()
-            .map(|site| site as &dyn SubqueryExecutor);
-        let pair_site = run.and_then(|run| run.site(true));
-        let pair_blocks = pair_site.as_ref().map(|site| site as &dyn SubqueryExecutor);
+        let cross_blocks = run.and_then(|run| run.site(false));
+        let pair_blocks = run.and_then(|run| run.site(true));
         // A right-side filter the storage layer takes whole runs inside the
         // inner fetch, built once so every chunk sees the same predicate; a
         // partial or refused one stays a residual on the joined row

@@ -962,3 +962,307 @@ mod made_as_read {
         }
     }
 }
+
+/// A row of q: id, a
+type Q = (i64, i64);
+
+/// q: id 1..=20, a = id % 6, which the subqueries below read
+fn q_rows() -> impl Iterator<Item = Q> + Clone {
+    (1..=20).map(|id| (id, id % 6))
+}
+
+fn with_q(db: Database) -> Database {
+    for sql in [
+        "CREATE TABLE q (id INTEGER PRIMARY KEY, a INTEGER)",
+        "INSERT INTO q SELECT value, value % 6 FROM generate_series(1, 20)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    db
+}
+
+/// Whether q holds a row of `a` with an id below `id`
+fn q_below(a: i64, id: i64) -> bool {
+    q_rows().any(|q| q.1 == a && q.0 < id)
+}
+
+/// Per l.g of the pairs of l and r that `meet` and `keep` keeps: the count
+/// and the sum of r.w
+fn lr_groups(
+    meet: impl Fn(&Fixture, &Fixture) -> bool,
+    keep: impl Fn(&Fixture, &Fixture) -> bool,
+) -> Vec<String> {
+    let mut groups: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
+    for l in l_rows() {
+        for r in r_rows().filter(|r| meet(&l, r) && keep(&l, r)) {
+            let group = groups.entry(l.2).or_default();
+            group.0 += 1;
+            group.1 += r.2;
+        }
+    }
+    groups
+        .iter()
+        .map(|(g, (count, sum))| [int(*g), int(*count), int(*sum)].join("|"))
+        .collect()
+}
+
+/// Which (l, r) pairs a statement keeps
+type Keep3 = fn(&Fixture, &Fixture) -> bool;
+
+fn equal_keys(l: &Fixture, r: &Fixture) -> bool {
+    l.1 == r.1
+}
+
+#[test]
+fn a_hash_join_asks_its_on_subqueries_in_parts() {
+    let db = with_q(open("join_aggregate_parts_on_blocks_hash"));
+    let cases: [(&str, Keep3); 3] = [
+        (
+            "SELECT l.g, COUNT(*), SUM(r.w) FROM l JOIN r ON l.k = r.k \
+             AND EXISTS (SELECT 1 FROM q WHERE q.a = r.w AND q.id < l.id) \
+             GROUP BY l.g ORDER BY l.g",
+            |l, r| q_below(r.2, l.0),
+        ),
+        (
+            "SELECT l.g, COUNT(*), SUM(r.w) FROM l JOIN r ON l.k = r.k \
+             AND r.id IN (SELECT q.id * 3 FROM q WHERE q.a = l.g) \
+             GROUP BY l.g ORDER BY l.g",
+            |l, r| q_rows().any(|q| q.1 == l.2 && q.0 * 3 == r.0),
+        ),
+        (
+            "SELECT l.g, COUNT(*), SUM(r.w) FROM l JOIN r ON l.k = r.k \
+             AND l.id + r.id > (SELECT MIN(q.id) * 10 FROM q WHERE q.a = 5) \
+             GROUP BY l.g ORDER BY l.g",
+            |l, r| l.0 + r.0 > 50,
+        ),
+    ];
+    for (sql, keep) in cases {
+        assert_eq!(
+            parted_by(&db, sql, "hash"),
+            lr_groups(equal_keys, keep),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn outer_hash_joins_ask_their_on_subqueries_in_parts() {
+    let db = with_q(open("join_aggregate_parts_on_blocks_outer"));
+    let kept = |l: &Fixture, r: &Fixture| l.1 == r.1 && q_below(r.2, l.0);
+    let n = l_rows()
+        .flat_map(|l| r_rows().filter(move |r| kept(&l, r)))
+        .count() as i64;
+    let lone_l = l_rows().filter(|l| !r_rows().any(|r| kept(l, &r))).count() as i64;
+    let lone_r = r_rows().filter(|r| !l_rows().any(|l| kept(&l, r))).count() as i64;
+    let on = "ON l.k = r.k AND EXISTS (SELECT 1 FROM q WHERE q.a = r.w AND q.id < l.id)";
+    for (kind, total) in [
+        ("LEFT", n + lone_l),
+        ("RIGHT", n + lone_r),
+        ("FULL", n + lone_l + lone_r),
+    ] {
+        let sql = format!("SELECT COUNT(*), COUNT(l.id), COUNT(r.id) FROM l {kind} JOIN r {on}");
+        let want = match kind {
+            "LEFT" => [total, total, n],
+            "RIGHT" => [total, n, total],
+            _ => [total, n + lone_l, n + lone_r],
+        };
+        let want = vec![want.map(int).join("|")];
+        assert_eq!(parted_by(&db, &sql, "hash"), want, "{sql}");
+    }
+}
+
+#[test]
+fn a_nested_loop_asks_its_on_subqueries_in_parts() {
+    let db = with_q(open("join_aggregate_parts_on_blocks_nested"));
+    let below = |l: &Fixture, r: &Fixture| l.1 < r.1;
+    let sql = "SELECT l.g, COUNT(*), SUM(r.w) FROM l JOIN r ON l.k < r.k \
+               AND EXISTS (SELECT 1 FROM q WHERE q.a = r.w AND q.id < l.id) \
+               GROUP BY l.g ORDER BY l.g";
+    assert_eq!(
+        parted_by(&db, sql, "nested_loop"),
+        lr_groups(below, |l, r| q_below(r.2, l.0))
+    );
+    let kept = |l: &Fixture, r: &Fixture| l.1 < r.1 && q_below(r.2, l.0);
+    let n = l_rows()
+        .flat_map(|l| r_rows().filter(move |r| kept(&l, r)))
+        .count() as i64;
+    let lone_l = l_rows().filter(|l| !r_rows().any(|r| kept(l, &r))).count() as i64;
+    let sql = "SELECT COUNT(*), COUNT(r.id) FROM l LEFT JOIN r ON l.k < r.k \
+               AND EXISTS (SELECT 1 FROM q WHERE q.a = r.w AND q.id < l.id)";
+    assert_eq!(
+        parted_by(&db, sql, "nested_loop"),
+        vec![[int(n + lone_l), int(n)].join("|")]
+    );
+}
+
+/// Which (bl.id, br.id) pairs a statement keeps
+type WideKeep = fn(i64, i64) -> bool;
+
+#[test]
+fn a_join_built_across_threads_asks_its_on_subqueries_in_parts() {
+    let db = with_q(open_wide("join_aggregate_parts_on_blocks_wide"));
+    let cases: [(&str, WideKeep); 2] = [
+        (
+            "SELECT bl.g, COUNT(*), SUM(br.v) FROM bl JOIN br ON bl.u = br.u \
+             AND br.v IN (SELECT q.a FROM q WHERE q.id < 4) GROUP BY bl.g ORDER BY bl.g",
+            |_, r| q_rows().any(|q| q.0 < 4 && q.1 == r % 7),
+        ),
+        (
+            "SELECT bl.g, COUNT(*), SUM(br.v) FROM bl JOIN br ON bl.u = br.u \
+             AND EXISTS (SELECT 1 FROM q WHERE q.a = bl.g AND q.id < br.v + 2) \
+             GROUP BY bl.g ORDER BY bl.g",
+            |l, r| q_below(l % 5, r % 7 + 2),
+        ),
+    ];
+    for (sql, keep) in cases {
+        let mut groups: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
+        for (l, r) in wide_pairs().filter(|(l, r)| keep(*l, *r)) {
+            let group = groups.entry(l % 5).or_default();
+            group.0 += 1;
+            group.1 += r % 7;
+        }
+        let want: Vec<String> = groups
+            .iter()
+            .map(|(g, (count, sum))| [int(*g), int(*count), int(*sum)].join("|"))
+            .collect();
+        assert_eq!(parted_across_threads(&db, sql), want, "{sql}");
+    }
+}
+
+#[test]
+fn an_on_that_fails_beside_a_subquery_running_a_join_raises_its_error_in_parts() {
+    let db = with_q(open("join_aggregate_parts_on_blocks_error"));
+    for (on, path) in [("l.k = r.k", "hash"), ("l.k < r.k", "nested_loop")] {
+        let sql = format!(
+            "SELECT COUNT(*) FROM l JOIN r ON {on} \
+             AND CASE WHEN l.id = 3 THEN 9223372036854775807 + l.id ELSE 0 END = 0 \
+             AND EXISTS (SELECT 1 FROM l a JOIN r b ON a.k = b.k \
+             WHERE b.id = r.id AND a.id <> l.id)"
+        );
+        #[cfg(feature = "test-failpoints")]
+        stoolap::test_failpoints::reset_join_paths();
+        let err = match db.query(&sql, ()) {
+            Ok(rows) => rows.map(|r| r.map(|_| ())).collect::<Result<Vec<_>, _>>(),
+            Err(e) => Err(e),
+        }
+        .expect_err("l.id = 3 overflows the ON");
+        #[cfg(feature = "test-failpoints")]
+        assert!(
+            stoolap::test_failpoints::join_paths_taken().contains(&path),
+            "{sql}"
+        );
+        #[cfg(not(feature = "test-failpoints"))]
+        let _ = path;
+        assert!(err.to_string().contains("overflow"), "{sql}: {err}");
+    }
+}
+
+#[test]
+fn an_index_join_asks_its_where_and_on_subqueries_in_parts() {
+    let db = with_q(open_keyed("join_aggregate_parts_index_blocks"));
+    let correlated = "EXISTS (SELECT 1 FROM q WHERE q.a = c.v AND q.id < p.id)";
+    let cases: [(String, &str, Keep); 6] = [
+        (
+            format!("FROM c JOIN p ON p.id = c.pid WHERE {correlated}"),
+            "batch_index_nested_loop",
+            |p, c| q_below(c.2, p.0),
+        ),
+        (
+            "FROM c JOIN p ON p.id = c.pid WHERE c.v IN (SELECT q.a FROM q WHERE q.id < 4)"
+                .to_string(),
+            "batch_index_nested_loop",
+            |_, c| q_rows().any(|q| q.0 < 4 && q.1 == c.2),
+        ),
+        (
+            format!("FROM c JOIN p ON p.id = c.pid AND {correlated}"),
+            "batch_index_nested_loop",
+            |p, c| q_below(c.2, p.0),
+        ),
+        (
+            format!("FROM p JOIN c ON c.pid = p.id WHERE {correlated}"),
+            C_INDEX,
+            |p, c| q_below(c.2, p.0),
+        ),
+        (
+            format!("FROM p JOIN c ON c.pid = p.id AND {correlated}"),
+            C_INDEX,
+            |p, c| q_below(c.2, p.0),
+        ),
+        (
+            "FROM p JOIN c ON c.pid = p.id WHERE p.g + c.v > (SELECT MIN(q.a) + 2 FROM q)"
+                .to_string(),
+            C_INDEX,
+            |p, c| p.1 + c.2 > 2,
+        ),
+    ];
+    for (from, path, keep) in cases {
+        let sql = format!("SELECT p.g, COUNT(*), SUM(c.v) {from} GROUP BY p.g ORDER BY p.g");
+        // A file database hashes the join, whose WHERE subqueries the
+        // general path asks of held rows
+        let got = match path == "hash" && from.contains(" WHERE ") {
+            true => rows(&db, &sql),
+            false => parted_by(&db, &sql, path),
+        };
+        assert_eq!(got, keyed_groups(keep), "{sql}");
+    }
+}
+
+#[test]
+fn a_prepared_join_asks_its_subqueries_again_for_each_parameter_in_parts() {
+    let db = with_q(open_keyed("join_aggregate_parts_blocks_prepared"));
+    for sql in [
+        "CREATE TABLE l (id INTEGER PRIMARY KEY, k INTEGER, g INTEGER)",
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, k INTEGER, w INTEGER)",
+        "INSERT INTO l SELECT value, value % 10, value % 3 FROM generate_series(1, 40)",
+        "INSERT INTO r SELECT value, value % 10 + 3, value % 4 FROM generate_series(1, 60)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let index = db
+        .prepare(
+            "SELECT p.g, COUNT(*), SUM(c.v) FROM c JOIN p ON p.id = c.pid \
+             WHERE EXISTS (SELECT 1 FROM q WHERE q.a = c.v AND q.id < $1) \
+             GROUP BY p.g ORDER BY p.g",
+        )
+        .unwrap();
+    let hash = db
+        .prepare(
+            "SELECT l.g, COUNT(*), SUM(r.w) FROM l JOIN r ON l.k = r.k \
+             AND EXISTS (SELECT 1 FROM q WHERE q.a = r.w AND q.id < $1) \
+             GROUP BY l.g ORDER BY l.g",
+        )
+        .unwrap();
+    let read = |query: &stoolap::Statement, below: i64| -> Vec<String> {
+        #[cfg(feature = "test-failpoints")]
+        {
+            stoolap::test_failpoints::set_join_part_rows(PART_ROWS);
+            stoolap::test_failpoints::reset_join_part_largest();
+        }
+        let mut out = Vec::new();
+        for row in query.query((below,)).unwrap() {
+            let row = row.unwrap();
+            out.push(
+                (0..row.len())
+                    .map(|i| format!("{:?}", row.get_value(i).unwrap()))
+                    .collect::<Vec<_>>()
+                    .join("|"),
+            );
+        }
+        #[cfg(feature = "test-failpoints")]
+        {
+            stoolap::test_failpoints::set_join_part_rows(0);
+            let largest = stoolap::test_failpoints::join_part_largest();
+            assert!(
+                (1..=PART_ROWS).contains(&largest),
+                "$1 = {below}: the aggregation held {largest} joined rows at once"
+            );
+        }
+        out
+    };
+    for below in [5, 15] {
+        let want = keyed_groups(|_, c| q_below(c.2, below));
+        assert_eq!(read(&index, below), want, "index join, $1 = {below}");
+        let want = lr_groups(equal_keys, |_, r| q_below(r.2, below));
+        assert_eq!(read(&hash, below), want, "hash join, $1 = {below}");
+    }
+}
