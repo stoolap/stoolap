@@ -418,14 +418,7 @@ impl Executor {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::compiled_epoch_checked();
         let DmlWrite::Update(columns) = &plan.write else {
-            return or_normal_path(self.write_planned_dml(
-                plan,
-                key,
-                Vec::new(),
-                &[],
-                None,
-                in_txn,
-            ));
+            return or_normal_path(self.write_planned_dml(plan, key, Vec::new(), &[], ctx, in_txn));
         };
         // Row expressions run per row inside the setter, over its old values
         let mut values = Vec::with_capacity(columns.len());

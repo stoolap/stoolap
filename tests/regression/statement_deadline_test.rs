@@ -236,23 +236,22 @@ fn a_write_stopped_at_its_deadline_leaves_no_row_in_or_out_of_a_transaction() {
             }
         }
     }
-    // A COPY past its last row, and a write by key, which charges nothing
+    // A COPY past its last row, and writes by key, which charge nothing,
+    // each by key run twice to reach its cached plan
     let csv = csv_of(50);
     let copy = statement(DeadlineSite::Copy, &csv.path().display().to_string());
+    let (update, delete) = (
+        "UPDATE w SET k = 5 WHERE id = 1",
+        "DELETE FROM w WHERE id = 2",
+    );
     let late = [
         (DeadlineSite::Copy, copy.as_str(), 50, false),
-        (
-            DeadlineSite::Update,
-            "UPDATE w SET k = 5 WHERE id = 1",
-            0,
-            false,
-        ),
-        (
-            DeadlineSite::Update,
-            "UPDATE w SET k = 5 WHERE id = 1",
-            0,
-            true,
-        ),
+        (DeadlineSite::Update, update, 0, false),
+        (DeadlineSite::Update, update, 0, false),
+        (DeadlineSite::Update, update, 0, true),
+        (DeadlineSite::Delete, delete, 0, false),
+        (DeadlineSite::Delete, delete, 0, false),
+        (DeadlineSite::Delete, delete, 0, true),
     ];
     for (site, sql, passed, in_txn) in late {
         if in_txn {
