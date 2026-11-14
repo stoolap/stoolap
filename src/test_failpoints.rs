@@ -4007,6 +4007,15 @@ pub fn reset_all() {
 /// number those charged at that site alone
 static DEADLINES_PASSED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// The charges at a site a test lets pass before its deadline does, or
+/// the charges counted there
+static DEADLINE_CHARGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Modes of [`DEADLINES_PASSED`] past 1: a site's number plus one of these
+const PASSED_AT: usize = 2;
+const PASSED_AFTER: usize = 64;
+const COUNTED_AT: usize = 128;
+
 /// Every statement with a deadline finds it passed at its next check or
 /// charge, on any thread, until [`keep_deadlines`]
 pub fn pass_deadlines() {
@@ -4016,7 +4025,35 @@ pub fn pass_deadlines() {
 /// Every statement with a deadline finds it passed at its next charge at
 /// `site` alone, until [`keep_deadlines`]
 pub fn pass_deadline_at(site: crate::executor::DeadlineSite) {
-    DEADLINES_PASSED.store(2 + site as usize, std::sync::atomic::Ordering::Release);
+    DEADLINES_PASSED.store(
+        PASSED_AT + site as usize,
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+/// The first `charges` charges at `site` pass; after them the deadline is
+/// passed at `site` and at every check, until [`keep_deadlines`]
+pub fn pass_deadline_after(site: crate::executor::DeadlineSite, charges: usize) {
+    DEADLINE_CHARGES.store(charges, std::sync::atomic::Ordering::Release);
+    DEADLINES_PASSED.store(
+        PASSED_AFTER + site as usize,
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+/// Every charge at `site` is counted and passes, until [`keep_deadlines`];
+/// [`deadline_charges`] reads the count
+pub fn count_deadline_charges(site: crate::executor::DeadlineSite) {
+    DEADLINE_CHARGES.store(0, std::sync::atomic::Ordering::Release);
+    DEADLINES_PASSED.store(
+        COUNTED_AT + site as usize,
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
+/// The charges [`count_deadline_charges`] counted
+pub fn deadline_charges() -> usize {
+    DEADLINE_CHARGES.load(std::sync::atomic::Ordering::Acquire)
 }
 
 /// Deadlines are read from the clock alone again
@@ -4032,10 +4069,39 @@ pub(crate) fn deadline_forced() -> bool {
 /// Whether a test has passed the deadline read at `site`, or at a
 /// statement's step for None
 pub(crate) fn deadline_passed_at(site: Option<crate::executor::DeadlineSite>) -> bool {
-    match DEADLINES_PASSED.load(std::sync::atomic::Ordering::Acquire) {
+    use std::sync::atomic::Ordering;
+    let at = |base: usize| site.map(|site| site as usize + base);
+    match DEADLINES_PASSED.load(Ordering::Acquire) {
         0 => false,
         1 => true,
-        passed => site.is_some_and(|site| site as usize + 2 == passed),
+        mode if mode >= COUNTED_AT => {
+            if at(COUNTED_AT) == Some(mode) {
+                DEADLINE_CHARGES.fetch_add(1, Ordering::AcqRel);
+            }
+            false
+        }
+        mode if mode >= PASSED_AFTER => match site {
+            None => DEADLINE_CHARGES.load(Ordering::Acquire) == 0,
+            Some(_) if at(PASSED_AFTER) != Some(mode) => false,
+            Some(_) => {
+                let mut left = DEADLINE_CHARGES.load(Ordering::Acquire);
+                loop {
+                    if left == 0 {
+                        return true;
+                    }
+                    match DEADLINE_CHARGES.compare_exchange_weak(
+                        left,
+                        left - 1,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => return false,
+                        Err(now) => left = now,
+                    }
+                }
+            }
+        },
+        mode => at(PASSED_AT) == Some(mode),
     }
 }
 

@@ -24,6 +24,7 @@
 
 use std::sync::Arc;
 
+use crate::common::deadline::{Deadline, DeadlineSite};
 use crate::common::{CompactVec, I64Map, I64Set};
 use crate::core::predicate::{kind, sql_eq, KeySide, TextReading};
 use crate::core::value::NULL_VALUE;
@@ -138,6 +139,7 @@ impl TextReads {
         table: &dyn Table,
         column: usize,
         reading: TextReading,
+        deadline: Deadline,
     ) -> Result<ValueMap<SmallVec<[i64; 2]>>> {
         let width = table.schema().columns.len();
         let columns: Vec<usize> = (0..width).collect();
@@ -146,6 +148,7 @@ impl TextReads {
         let mut scanner = table.scan_needed(&columns, &needed, None)?;
         let mut by_read: ValueMap<SmallVec<[i64; 2]>> = ValueMap::default();
         while scanner.next() {
+            deadline.charge(DeadlineSite::IndexProbe, 1)?;
             let row_id = scanner.current_row_id();
             if let Some(Value::Text(text)) = scanner.row().get(column) {
                 if let Some(read) = reading.read(text).as_ref().and_then(reading_key) {
@@ -161,13 +164,19 @@ impl TextReads {
     }
 
     /// The ids of the inner rows whose TEXT key reads as `key`
-    fn row_ids(&mut self, table: &dyn Table, column: usize, key: &Value) -> Result<&[i64]> {
+    fn row_ids(
+        &mut self,
+        table: &dyn Table,
+        column: usize,
+        key: &Value,
+        deadline: Deadline,
+    ) -> Result<&[i64]> {
         let Some(reading) = TextReading::of(key) else {
             return Ok(&[]);
         };
         let slot = &mut self.0[reading as usize];
         if slot.is_none() {
-            *slot = Some(Self::scan(table, column, reading)?);
+            *slot = Some(Self::scan(table, column, reading, deadline)?);
         }
         Ok(reading_key(key)
             .and_then(|read| slot.as_ref()?.get(&read))
@@ -181,7 +190,7 @@ impl TextReads {
 struct ViewKeys(ValueMap<SmallVec<[i64; 2]>>);
 
 impl ViewKeys {
-    fn scan(table: &dyn Table, column: usize) -> Result<Self> {
+    fn scan(table: &dyn Table, column: usize, deadline: Deadline) -> Result<Self> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::join_view_keys_scanned();
         let width = table.schema().columns.len();
@@ -191,6 +200,7 @@ impl ViewKeys {
         let mut scanner = table.scan_needed(&columns, &needed, None)?;
         let mut by_key: ValueMap<SmallVec<[i64; 2]>> = ValueMap::default();
         while scanner.next() {
+            deadline.charge(DeadlineSite::IndexProbe, 1)?;
             let row_id = scanner.current_row_id();
             if let Some(key) = scanner.row().get(column).filter(|key| !key.is_null()) {
                 by_key.entry(key.clone()).or_default().push(row_id);
@@ -318,6 +328,8 @@ pub struct IndexNestedLoopJoinOperator<'a> {
     text_reads: TextReads,
     // The inner keys as the statement sees them, once a probe was not
     view_keys: Option<ViewKeys>,
+    // The call's deadline, charged per outer row and inner row read
+    deadline: Deadline,
 }
 
 /// The transaction's uncommitted rows of the inner table: every row it
@@ -432,7 +444,14 @@ impl<'a> IndexNestedLoopJoinOperator<'a> {
             local_rows: None,
             text_reads: TextReads::default(),
             view_keys: None,
+            deadline: Deadline::NONE,
         }
+    }
+
+    /// The call's deadline, which the join charges as it reads rows
+    pub(crate) fn with_deadline(mut self, deadline: Deadline) -> Self {
+        self.deadline = deadline;
+        self
     }
 
     /// Set projection pushdown configuration.
@@ -672,7 +691,7 @@ impl<'a> IndexNestedLoopJoinOperator<'a> {
                 return Ok(());
             };
             if self.view_keys.is_none() {
-                self.view_keys = Some(ViewKeys::scan(&*self.inner_table, idx)?);
+                self.view_keys = Some(ViewKeys::scan(&*self.inner_table, idx, self.deadline)?);
             }
             if let Some(keys) = &self.view_keys {
                 self.row_id_buffer
@@ -744,7 +763,7 @@ impl<'a> IndexNestedLoopJoinOperator<'a> {
         };
         let ids = self
             .text_reads
-            .row_ids(&*self.inner_table, idx, key_value)?;
+            .row_ids(&*self.inner_table, idx, key_value, self.deadline)?;
         self.row_id_buffer.extend_from_slice(ids);
         if !self.fetch_candidates()? {
             return Ok(());
@@ -761,6 +780,7 @@ impl<'a> IndexNestedLoopJoinOperator<'a> {
         }
         match self.outer.next()? {
             Some(row_ref) => {
+                self.deadline.charge(DeadlineSite::IndexProbe, 1)?;
                 let outer_row = row_ref.into_owned();
                 self.outer_rows_seen += 1;
                 #[cfg(any(test, feature = "test-failpoints"))]
@@ -787,6 +807,7 @@ impl<'a> IndexNestedLoopJoinOperator<'a> {
                     if let Some(kept) = &mut self.kept_outer {
                         kept.push(outer_row);
                         while let Some(row) = self.outer.next()? {
+                            self.deadline.charge(DeadlineSite::IndexProbe, 1)?;
                             kept.push(row.into_owned());
                         }
                     } else {
@@ -853,6 +874,7 @@ impl Operator for IndexNestedLoopJoinOperator<'_> {
             // Try to find a match in current inner rows
             let inner_len = self.current_inner_rows.len();
             while self.current_inner_idx < inner_len {
+                self.deadline.charge(DeadlineSite::IndexProbe, 1)?;
                 let inner_idx = self.current_inner_idx;
                 self.current_inner_idx += 1;
 
@@ -1067,6 +1089,8 @@ pub struct BatchIndexNestedLoopJoinOperator<'a> {
 
     // State
     opened: bool,
+    // The call's deadline, charged per outer row, inner row and pair
+    deadline: Deadline,
 }
 
 impl<'a> BatchIndexNestedLoopJoinOperator<'a> {
@@ -1103,7 +1127,14 @@ impl<'a> BatchIndexNestedLoopJoinOperator<'a> {
             // Pre-allocate buffer for typical number of matches
             row_id_buffer: Vec::with_capacity(16),
             opened: false,
+            deadline: Deadline::NONE,
         }
+    }
+
+    /// The call's deadline, which the join charges as it reads and pairs rows
+    pub(crate) fn with_deadline(mut self, deadline: Deadline) -> Self {
+        self.deadline = deadline;
+        self
     }
 
     /// The inner key column, so a row an index entry points at is kept
@@ -1180,6 +1211,7 @@ impl<'a> BatchIndexNestedLoopJoinOperator<'a> {
             projection,
             outer_on_right,
             blocks,
+            deadline,
             ..
         } = self;
         let Some(f) = fetched.as_mut() else {
@@ -1200,6 +1232,7 @@ impl<'a> BatchIndexNestedLoopJoinOperator<'a> {
                 continue;
             };
             f.outer_at += 1;
+            deadline.charge(DeadlineSite::IndexProbe, 1)?;
             let outer_row = &f.outer_rows[outer_idx];
 
             // An index entry may point at a row whose key has since
@@ -1245,6 +1278,7 @@ impl<'a> BatchIndexNestedLoopJoinOperator<'a> {
         // A LEFT join's outer rows none met, with the inner side's NULLs
         if let Some(null_inner) = &f.null_inner {
             while let Some(outer_row) = f.outer_rows.get(f.alone_at) {
+                deadline.charge(DeadlineSite::IndexProbe, 1)?;
                 f.alone_at += 1;
                 if !f.matched[f.alone_at - 1] {
                     let row = combine_rows(projection, *outer_on_right, outer_row, null_inner);
@@ -1292,6 +1326,7 @@ impl Operator for BatchIndexNestedLoopJoinOperator<'_> {
         let mut view_keys: Option<ViewKeys> = None;
 
         while let Some(row_ref) = self.outer.next()? {
+            self.deadline.charge(DeadlineSite::IndexProbe, 1)?;
             let outer_row = row_ref.into_owned();
             let outer_idx = outer_rows.len();
 
@@ -1317,9 +1352,12 @@ impl Operator for BatchIndexNestedLoopJoinOperator<'_> {
                     // Any other key takes the TEXT rows that read as it
                     _ => {
                         if let Some(idx) = self.inner_key_idx {
-                            for &row_id in
-                                text_reads.row_ids(&*self.inner_table, idx, &key_value)?
-                            {
+                            for &row_id in text_reads.row_ids(
+                                &*self.inner_table,
+                                idx,
+                                &key_value,
+                                self.deadline,
+                            )? {
                                 key_to_outer_indices
                                     .entry(row_id)
                                     .or_default()
@@ -1361,7 +1399,8 @@ impl Operator for BatchIndexNestedLoopJoinOperator<'_> {
                             crate::core::Error::internal("an index join without its inner key")
                         })?;
                         if view_keys.is_none() {
-                            view_keys = Some(ViewKeys::scan(&*self.inner_table, idx)?);
+                            view_keys =
+                                Some(ViewKeys::scan(&*self.inner_table, idx, self.deadline)?);
                         }
                         if let Some(keys) = &view_keys {
                             self.row_id_buffer

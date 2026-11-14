@@ -19,6 +19,7 @@
 //! - INTERSECT / INTERSECT ALL
 //! - EXCEPT / EXCEPT ALL
 
+use crate::common::deadline::{Deadline, DeadlineSite};
 use crate::core::row_vec::RowVec;
 use crate::core::{Result, Row};
 use crate::parser::ast::{SelectStatement, SetOperationType};
@@ -45,6 +46,7 @@ impl Executor {
         limit: Option<usize>,
     ) -> Result<Box<dyn QueryResult>> {
         let set_ops = &stmt.set_operations;
+        let deadline = ctx.deadline_of_call();
         // Materialize the left result (with limit for UNION ALL optimization)
         let columns = left_result.columns().to_vec();
 
@@ -60,6 +62,7 @@ impl Executor {
             let mut left_result = left_result;
             let mut row_id = 0i64;
             while left_result.next() {
+                deadline.charge(DeadlineSite::SetOp, 1)?;
                 rows.push((row_id, left_result.take_row()));
                 row_id += 1;
                 if rows.len() >= lim {
@@ -76,10 +79,10 @@ impl Executor {
         {
             // The first operation keeps one row of each value, so the left side does
             let mut left = RowSet::default();
-            left.read(left_result)?;
+            left.read(left_result, deadline)?;
             Running::Set(left)
         } else {
-            Running::Rows(Self::materialize_result(left_result)?)
+            Running::Rows(Self::materialize_result(left_result, deadline)?)
         };
 
         // Process each set operation in sequence
@@ -119,15 +122,15 @@ impl Executor {
             // Apply the set operation
             running = match &set_op.operation {
                 SetOperationType::Union => {
-                    let mut union = running.into_set();
-                    union.read(right_result)?;
+                    let mut union = running.into_set(deadline)?;
+                    union.read(right_result, deadline)?;
                     Running::Set(union)
                 }
                 SetOperationType::Intersect | SetOperationType::Except => {
                     let mut right = RowSet::default();
-                    right.read(right_result)?;
+                    right.read(right_result, deadline)?;
                     let keep_matches = set_op.operation == SetOperationType::Intersect;
-                    running.retain(|row| right.contains(row) == keep_matches)
+                    running.retain(|row| right.contains(row) == keep_matches, deadline)?
                 }
                 SetOperationType::UnionAll => {
                     let mut result_rows = running.into_rows();
@@ -140,6 +143,7 @@ impl Executor {
                             let mut count = 0;
                             let mut row_id = result_rows.len() as i64;
                             while right_result.next() && count < needed {
+                                deadline.charge(DeadlineSite::SetOp, 1)?;
                                 result_rows.push((row_id, right_result.take_row()));
                                 row_id += 1;
                                 count += 1;
@@ -151,7 +155,7 @@ impl Executor {
                             }
                         }
                     } else {
-                        let right_rows = Self::materialize_result(right_result)?;
+                        let right_rows = Self::materialize_result(right_result, deadline)?;
                         for (row_id, (_, row)) in (result_rows.len() as i64..).zip(right_rows) {
                             result_rows.push((row_id, row));
                         }
@@ -161,12 +165,13 @@ impl Executor {
                 SetOperationType::IntersectAll => {
                     let result_rows = running.into_rows();
                     // INTERSECT ALL: keep matching rows with multiplicity with proper collision handling
-                    let right_rows = Self::materialize_result(right_result)?;
+                    let right_rows = Self::materialize_result(right_result, deadline)?;
 
                     // Build hash map: hash -> list of (row_index, remaining_count)
                     // Each unique row in right side gets its own counter
                     let mut right_hash_map: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
                     for (idx, (_, row)) in right_rows.iter().enumerate() {
+                        deadline.charge(DeadlineSite::SetOp, 1)?;
                         let hash = hash_row(row);
                         right_hash_map.entry(hash).or_default().push(idx);
                     }
@@ -177,6 +182,7 @@ impl Executor {
                     for (hash, indices) in right_hash_map {
                         let mut unique_rows_in_bucket: Vec<(usize, usize)> = Vec::new();
                         for &idx in &indices {
+                            deadline.charge(DeadlineSite::SetOp, 1)?;
                             // Find if this row already exists in unique_rows_in_bucket
                             if let Some(entry) =
                                 unique_rows_in_bucket.iter_mut().find(|(rep_idx, _)| {
@@ -194,6 +200,7 @@ impl Executor {
                     let mut intersected_rows = RowVec::new();
                     let mut row_id = 0i64;
                     for (_, left_row) in result_rows {
+                        deadline.charge(DeadlineSite::SetOp, 1)?;
                         let hash = hash_row(&left_row);
 
                         // Find matching right row and decrement its count
@@ -214,11 +221,12 @@ impl Executor {
                 SetOperationType::ExceptAll => {
                     let result_rows = running.into_rows();
                     // EXCEPT ALL: remove matching rows with multiplicity with proper collision handling
-                    let right_rows = Self::materialize_result(right_result)?;
+                    let right_rows = Self::materialize_result(right_result, deadline)?;
 
                     // Build hash map: hash -> list of row indices
                     let mut right_hash_map: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
                     for (idx, (_, row)) in right_rows.iter().enumerate() {
+                        deadline.charge(DeadlineSite::SetOp, 1)?;
                         let hash = hash_row(row);
                         right_hash_map.entry(hash).or_default().push(idx);
                     }
@@ -229,6 +237,7 @@ impl Executor {
                     for (hash, indices) in right_hash_map {
                         let mut unique_rows_in_bucket: Vec<(usize, usize)> = Vec::new();
                         for &idx in &indices {
+                            deadline.charge(DeadlineSite::SetOp, 1)?;
                             // Find if this row already exists in unique_rows_in_bucket
                             if let Some(entry) =
                                 unique_rows_in_bucket.iter_mut().find(|(rep_idx, _)| {
@@ -246,6 +255,7 @@ impl Executor {
                     let mut excepted_rows = RowVec::new();
                     let mut row_id = 0i64;
                     for (_, left_row) in result_rows {
+                        deadline.charge(DeadlineSite::SetOp, 1)?;
                         let hash = hash_row(&left_row);
 
                         // Check if this row should be removed (exists in right with count > 0)
@@ -305,38 +315,51 @@ impl Running {
         }
     }
 
-    fn into_set(self) -> RowSet {
+    fn into_set(self, deadline: Deadline) -> Result<RowSet> {
         match self {
-            Running::Set(set) => set,
+            Running::Set(set) => Ok(set),
             Running::Rows(rows) | Running::Distinct(rows) => {
                 let mut set = RowSet::default();
                 for (_, row) in rows {
+                    deadline.charge(DeadlineSite::SetOp, 1)?;
                     set.insert(row);
                 }
-                set
+                Ok(set)
             }
         }
     }
 
     /// One row of each value that `keep` keeps
-    fn retain(self, keep: impl Fn(&Row) -> bool) -> Running {
+    fn retain(self, keep: impl Fn(&Row) -> bool, deadline: Deadline) -> Result<Running> {
         match self {
             Running::Rows(rows) => {
                 let mut kept = RowSet::default();
                 for (_, row) in rows {
+                    deadline.charge(DeadlineSite::SetOp, 1)?;
                     if keep(&row) {
                         kept.insert(row);
                     }
                 }
-                Running::Set(kept)
+                Ok(Running::Set(kept))
             }
             distinct => {
                 let mut rows = distinct.into_rows();
-                rows.retain(|(_, row)| keep(row));
+                // A charge that fails keeps no row past it and is raised after
+                let mut failed = None;
+                rows.retain(|(_, row)| match deadline.charge(DeadlineSite::SetOp, 1) {
+                    Ok(()) => failed.is_none() && keep(row),
+                    Err(e) => {
+                        failed.get_or_insert(e);
+                        false
+                    }
+                });
+                if let Some(e) = failed {
+                    return Err(e);
+                }
                 for (id, (row_id, _)) in (0i64..).zip(rows.iter_mut()) {
                     *row_id = id;
                 }
-                Running::Distinct(rows)
+                Ok(Running::Distinct(rows))
             }
         }
     }
@@ -382,8 +405,9 @@ impl RowSet {
 
     /// Takes each row of `result` whose value it does not hold; a row it
     /// holds is read in place and never taken
-    fn read(&mut self, mut result: Box<dyn QueryResult>) -> Result<()> {
+    fn read(&mut self, mut result: Box<dyn QueryResult>, deadline: Deadline) -> Result<()> {
         while result.next() {
+            deadline.charge(DeadlineSite::SetOp, 1)?;
             if let Some(at) = self.place(result.row()) {
                 self.rows.push((at as i64, result.take_row()));
             }

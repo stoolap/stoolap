@@ -42,6 +42,7 @@ use super::query_cache::{
 use super::result::{ExecResult, ExecutorResult};
 use super::utils::qualified;
 use super::Executor;
+use crate::common::deadline::DeadlineSite;
 use std::sync::RwLock;
 
 pub(super) struct StatementRollback<'a> {
@@ -1145,12 +1146,13 @@ impl Executor {
                 // A late runtime error (e.g., invalid REGEXP) will fail here
                 // before any inserts, preventing partial writes in the transaction.
                 let columns = select_result.columns().to_vec();
-                let rows = Self::materialize_result(select_result)?;
+                let rows = Self::materialize_result(select_result, ctx.deadline_of_call())?;
                 select_result = Box::new(super::result::ExecutorResult::new(columns, rows));
             }
 
             // Process each row from the SELECT result (streaming or materialized)
             while select_result.next() {
+                ctx.charge(DeadlineSite::Insert, 1)?;
                 let select_row = select_result.row();
                 if select_row.len() != column_indices.len() {
                     return Err(Error::InvalidArgument(format!(
@@ -1390,6 +1392,8 @@ impl Executor {
 
             // A statement whose reads a truncate or drop overtook commits nothing
             ctx.view_held()?;
+            // Nor one that outlasted its deadline
+            ctx.check_deadline()?;
             // Commit if this is a standalone (auto-commit) transaction
             if should_auto_commit {
                 if let Some(mut tx) = standalone_tx {
@@ -1439,6 +1443,7 @@ impl Executor {
             let schema = table.schema_arc();
 
             for (row_at, value_row) in stmt.values.iter().enumerate() {
+                ctx.charge(DeadlineSite::Insert, 1)?;
                 if value_row.len() != column_indices.len() {
                     return Err(Error::InvalidArgument(format!(
                         "INSERT has {} columns but {} values",
@@ -1651,6 +1656,7 @@ impl Executor {
         } else {
             // Fast path: normal INSERT without clones
             for (row_at, value_row) in stmt.values.iter().enumerate() {
+                ctx.charge(DeadlineSite::Insert, 1)?;
                 if value_row.len() != column_indices.len() {
                     return Err(Error::InvalidArgument(format!(
                         "INSERT has {} columns but {} values",
@@ -1761,6 +1767,8 @@ impl Executor {
 
         // A statement whose reads a truncate or drop overtook commits nothing
         ctx.view_held()?;
+        // Nor one that outlasted its deadline
+        ctx.check_deadline()?;
         // Commit if this is a standalone (auto-commit) transaction
         if should_auto_commit {
             if let Some(mut tx) = standalone_tx {
@@ -2109,12 +2117,13 @@ impl Executor {
             if !should_auto_commit {
                 // Explicit tx: fully materialize before writes for atomicity
                 let columns = select_result.columns().to_vec();
-                let rows = Self::materialize_result(select_result)?;
+                let rows = Self::materialize_result(select_result, ctx.deadline_of_call())?;
                 select_result = Box::new(super::result::ExecutorResult::new(columns, rows));
             }
 
             // Process each row from the SELECT result
             while select_result.next() {
+                ctx.charge(DeadlineSite::Insert, 1)?;
                 let select_row = select_result.row();
                 if select_row.len() != column_indices.len() {
                     return Err(Error::InvalidArgument(format!(
@@ -2185,6 +2194,7 @@ impl Executor {
         } else {
             // Regular INSERT with VALUES
             for (row, value_list) in stmt.values.iter().enumerate() {
+                ctx.charge(DeadlineSite::Insert, 1)?;
                 if value_list.len() != column_indices.len() {
                     return Err(Error::InvalidArgument(format!(
                         "INSERT has {} columns but {} values provided",
@@ -2292,6 +2302,8 @@ impl Executor {
 
         // A statement whose reads a truncate or drop overtook commits nothing
         ctx.view_held()?;
+        // Nor one that outlasted its deadline
+        ctx.check_deadline()?;
         // Commit if this is a standalone (auto-commit) transaction
         if should_auto_commit {
             if let Some(mut tx) = standalone_tx {
@@ -2702,6 +2714,7 @@ impl Executor {
             };
             let widen = dml_run.as_ref().is_some_and(|run| run.widens());
             let mut set_row = |row_id: i64, row: Row| -> Result<(Row, bool)> {
+                ctx.charge(DeadlineSite::Update, 1)?;
                 let mut row = match widen {
                     true => super::prepared_select::widened(row, row_id),
                     false => row,
@@ -2877,6 +2890,7 @@ impl Executor {
             let fk_rows = fk_new_values.into_inner();
             if let Some(ref fk_schema) = fk_update_schema {
                 for row in &fk_rows {
+                    ctx.charge(DeadlineSite::ForeignKey, 1)?;
                     super::foreign_key::check_parent_exists(
                         &self.engine,
                         table.txn_id(),
@@ -2901,6 +2915,7 @@ impl Executor {
             for (col_idx, old_val, new_val) in ref_col_changes.into_inner() {
                 if let Some(fks) = fks_by_ref_col.get(&col_idx) {
                     if restricted.contains(&col_idx) {
+                        ctx.charge(DeadlineSite::ForeignKey, 1)?;
                         super::foreign_key::pre_check_restrict_for_update(
                             &self.engine,
                             table.txn_id(),
@@ -2923,6 +2938,7 @@ impl Executor {
                     by_column.into_iter().collect(),
                     None,
                     &mut Default::default(),
+                    ctx.deadline_of_call(),
                 )?;
             }
         }
@@ -2947,6 +2963,8 @@ impl Executor {
 
         // A statement whose reads a truncate or drop overtook commits nothing
         ctx.view_held()?;
+        // Nor one that outlasted its deadline
+        ctx.check_deadline()?;
         // Commit if this is a standalone (auto-commit) transaction
         if should_auto_commit {
             // Commit the transaction - it will commit all tables via commit_all_tables()
@@ -3241,6 +3259,7 @@ impl Executor {
                 if !scanner.next() {
                     break;
                 }
+                ctx.charge(DeadlineSite::Delete, 1)?;
                 let row = scanner.row();
 
                 // Check memory filter if needed
@@ -3288,6 +3307,7 @@ impl Executor {
                     &row_ids,
                     referencing_fks.clone(),
                     fk_values,
+                    ctx.deadline_of_call(),
                 )?)
             } else {
                 None
@@ -3442,6 +3462,8 @@ impl Executor {
 
         // A statement whose reads a truncate or drop overtook commits nothing
         ctx.view_held()?;
+        // Nor one that outlasted its deadline
+        ctx.check_deadline()?;
         // Commit if this is a standalone (auto-commit) transaction
         if should_auto_commit {
             // Commit the transaction - it will commit all tables via commit_all_tables()
@@ -3976,6 +3998,7 @@ impl Executor {
                 by_column,
                 Some(pending_parents),
                 update_plans,
+                ctx.deadline_of_call(),
             )?;
         }
 
@@ -4116,6 +4139,8 @@ impl Executor {
             self.build_returning_result(returning, source_rows, column_names, ctx, prepared, held)?;
         // A statement whose reads a truncate or drop overtook commits nothing
         ctx.view_held()?;
+        // Nor one that outlasted its deadline
+        ctx.check_deadline()?;
         if let Some(mut tx) = standalone_tx {
             tx.commit()?;
         }

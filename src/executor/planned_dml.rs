@@ -418,14 +418,7 @@ impl Executor {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::compiled_epoch_checked();
         let DmlWrite::Update(columns) = &plan.write else {
-            return or_normal_path(self.write_planned_dml(
-                plan,
-                key,
-                Vec::new(),
-                &[],
-                None,
-                in_txn,
-            ));
+            return or_normal_path(self.write_planned_dml(plan, key, Vec::new(), &[], ctx, in_txn));
         };
         // Row expressions run per row inside the setter, over its old values
         let mut values = Vec::with_capacity(columns.len());
@@ -549,6 +542,11 @@ impl Executor {
                 table.update(access, Some(&pk_expr), &mut setter)
             }
         };
+        // A write that outlasted its deadline is undone
+        let written = written.and_then(|rows| match ctx {
+            Some(ctx) => ctx.check_deadline().map(|()| rows),
+            None => Ok(rows),
+        });
         let rows_affected = rollback.finish(written)?;
         if rows_affected > 0 {
             self.semantic_cache.invalidate_table(&plan.table);

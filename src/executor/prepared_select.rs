@@ -8744,11 +8744,13 @@ impl PreparedProjection {
             }
             Ok(())
         })?;
+        let sorted = top.into_rows();
+        run.ctx.check_deadline()?;
         if whole {
-            return Ok(top.into_row_vec());
+            return Ok((0i64..).zip(sorted).collect());
         }
         let mut kept = RowVec::new();
-        for mut out in top.into_rows() {
+        for mut out in sorted {
             let Some(Value::Integer(i)) = out.get(width).cloned() else {
                 return Err(Error::internal("a sorted row lost its source"));
             };
@@ -11720,7 +11722,7 @@ impl Executor {
         if where_.needed.is_some() && table.narrows_scans() {
             return Ok((result, token));
         }
-        let rows = Self::materialize_result(result)?;
+        let rows = Self::materialize_result(result, ctx.deadline_of_call())?;
         self.semantic_write(name, &columns, rows.rows(), predicate, params, stamp);
         Ok((
             Box::new(ExecutorResult::with_arc_columns(columns, rows)),
@@ -12990,7 +12992,10 @@ impl Executor {
             Some(&run.compiled),
         )?;
         let columns = result.columns().to_vec();
-        Ok((columns, Self::materialize_result(result)?))
+        Ok((
+            columns,
+            Self::materialize_result(result, ctx.deadline_of_call())?,
+        ))
     }
 
     /// Whether a source read when a call first needs it is the one the plan
@@ -13027,7 +13032,10 @@ impl Executor {
                 };
                 let result = self.execute_view_body(&view, ctx)?;
                 let columns = result.columns().to_vec();
-                (columns, Self::materialize_result(result)?)
+                (
+                    columns,
+                    Self::materialize_result(result, ctx.deadline_of_call())?,
+                )
             }
             BlockSource::Derived(run, ..) => self.statement_rows(run, ctx)?,
             BlockSource::AsOf(name, as_of) => self.as_of_rows(name, as_of, ctx)?,
@@ -14615,7 +14623,9 @@ fn top_rows(
         }
         Ok(())
     })?;
-    Ok((0i64..).zip(top.into_rows()).collect())
+    let rows = top.into_rows();
+    runner.ctx.check_deadline()?;
+    Ok((0i64..).zip(rows).collect())
 }
 
 /// The rows of `result` as it reads them, then its error, if it failed
@@ -15640,7 +15650,12 @@ impl<'a> PreparedRunner<'a> {
         each: &mut dyn FnMut(&Row) -> Result<()>,
     ) -> Result<()> {
         let scan = match rows {
-            SortInput::Rows(rows) => return rows.iter().try_for_each(|(_, row)| each(row)),
+            SortInput::Rows(rows) => {
+                return rows.iter().try_for_each(|(_, row)| {
+                    self.ctx.charge(DeadlineSite::Sort, 1)?;
+                    each(row)
+                })
+            }
             SortInput::Scan(scan) => scan,
         };
         while scan.next() {
@@ -17523,7 +17538,9 @@ impl PreparedRunner<'_> {
         }
         if !order.distinct.is_empty() {
             // A stable sort: a tie stays in the order read
+            self.ctx.charge(DeadlineSite::Sort, all.len())?;
             all.sort_by(|a, b| order.compare(&a.0, &b.0));
+            self.ctx.check_deadline()?;
             let mut first = super::result::DistinctRows::new(order.distinct.len());
             let rows = all.into_iter().filter(|(_, seen, _)| first.is_new(seen));
             let rows = rows.skip(offset).take(keep - offset);

@@ -22,6 +22,7 @@
 //!
 //! Despite its higher complexity, it supports all join conditions and types.
 
+use crate::common::deadline::{Deadline, DeadlineSite};
 use crate::core::value::NULL_VALUE;
 use crate::core::{Result, Row};
 use crate::executor::expression::{JoinFilter, SubqueryExecutor};
@@ -75,6 +76,9 @@ pub struct NestedLoopJoinOperator<'a> {
     // State tracking
     opened: bool,
     left_exhausted: bool,
+
+    // The call's deadline, charged per row read and pair judged
+    deadline: Deadline,
 }
 
 impl<'a> NestedLoopJoinOperator<'a> {
@@ -116,7 +120,14 @@ impl<'a> NestedLoopJoinOperator<'a> {
             cached_null_left: Row::new(),  // Initialized in open()
             opened: false,
             left_exhausted: false,
+            deadline: Deadline::NONE,
         }
+    }
+
+    /// The call's deadline, which the join charges as it reads and pairs rows
+    pub(crate) fn with_deadline(mut self, deadline: Deadline) -> Self {
+        self.deadline = deadline;
+        self
     }
 
     /// The statement's subquery blocks the filter calls
@@ -163,6 +174,7 @@ impl<'a> NestedLoopJoinOperator<'a> {
     fn advance_left(&mut self) -> Result<bool> {
         match self.left.next()? {
             Some(row_ref) => {
+                self.deadline.charge(DeadlineSite::NestedLoop, 1)?;
                 self.current_left_row = Some(row_ref.into_owned());
                 self.current_right_idx = 0;
                 self.left_had_match = false;
@@ -201,6 +213,7 @@ impl Operator for NestedLoopJoinOperator<'_> {
 
         // Materialize right side (inner loop must be restarted for each left row)
         while let Some(row_ref) = self.right.next()? {
+            self.deadline.charge(DeadlineSite::NestedLoop, 1)?;
             self.right_rows.push(row_ref.into_owned());
         }
 
@@ -229,6 +242,7 @@ impl Operator for NestedLoopJoinOperator<'_> {
         // Phase 2: Return unmatched right rows (for RIGHT/FULL OUTER)
         if self.returning_unmatched_right {
             while self.unmatched_right_idx < self.right_rows.len() {
+                self.deadline.charge(DeadlineSite::NestedLoop, 1)?;
                 let idx = self.unmatched_right_idx;
                 self.unmatched_right_idx += 1;
 
@@ -273,6 +287,7 @@ impl Operator for NestedLoopJoinOperator<'_> {
 
             // Try to find a match in right rows
             while self.current_right_idx < self.right_rows.len() {
+                self.deadline.charge(DeadlineSite::NestedLoop, 1)?;
                 let right_idx = self.current_right_idx;
                 self.current_right_idx += 1;
 

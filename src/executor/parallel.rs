@@ -42,15 +42,14 @@ use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::common::deadline::{Deadline, DeadlineSite};
 use crate::common::{CompactArc, CompactVec};
 use crate::core::value::NULL_VALUE;
-use crate::core::{Row, RowVec, Value};
+use crate::core::{Result, Row, RowVec, Value};
 
 #[cfg(feature = "parallel")]
 use super::expression::RowFilter;
 use super::utils::{hash_composite_key, verify_composite_key_equality};
-#[cfg(feature = "parallel")]
-use crate::core::Result;
 
 /// Get number of parallel threads
 #[cfg(feature = "parallel")]
@@ -446,7 +445,8 @@ pub fn parallel_hash_build(
     build_rows: &[Row],
     key_indices: &[usize],
     config: &ParallelConfig,
-) -> ParallelHashTable {
+    deadline: Deadline,
+) -> Result<ParallelHashTable> {
     let row_count = build_rows.len();
 
     #[cfg(feature = "parallel")]
@@ -466,12 +466,13 @@ pub fn parallel_hash_build(
                     .map(|_| Vec::with_capacity(chunk.len() / partitions + 1))
                     .collect();
                 for (local_idx, row) in chunk.iter().enumerate() {
+                    deadline.charge(DeadlineSite::ParallelJoin, 1)?;
                     let hash = hash_composite_key(row, key_indices);
                     parts[partition_of(hash, shift)].push((hash, base_idx + local_idx));
                 }
-                parts
+                Ok(parts)
             })
-            .collect();
+            .collect::<Result<_>>()?;
 
         // Chunks are taken in order, so each key's rows stay in row order
         let maps: Vec<FxHashMap<u64, Vec<usize>>> = (0..partitions)
@@ -488,10 +489,10 @@ pub fn parallel_hash_build(
             })
             .collect();
 
-        return ParallelHashTable {
+        return Ok(ParallelHashTable {
             storage: HashTableStorage::Partitioned { maps, shift },
             row_count,
-        };
+        });
     }
 
     // Sequential fallback (always compiled)
@@ -501,13 +502,14 @@ pub fn parallel_hash_build(
     let mut table: FxHashMap<u64, Vec<usize>> =
         FxHashMap::with_capacity_and_hasher(row_count, Default::default());
     for (idx, row) in build_rows.iter().enumerate() {
+        deadline.charge(DeadlineSite::ParallelJoin, 1)?;
         let hash = hash_composite_key(row, key_indices);
         table.entry(hash).or_default().push(idx);
     }
-    ParallelHashTable {
+    Ok(ParallelHashTable {
         storage: HashTableStorage::Sequential(table),
         row_count,
-    }
+    })
 }
 
 /// Parallel probe phase of hash join
@@ -527,7 +529,8 @@ pub fn parallel_hash_probe<F>(
     build_rows: &[Row],
     verify_match: F,
     config: &ParallelConfig,
-) -> Vec<(usize, usize)>
+    deadline: Deadline,
+) -> Result<Vec<(usize, usize)>>
 where
     F: Fn(&Row, &Row) -> bool + Sync + Send,
 {
@@ -540,19 +543,21 @@ where
         let n_threads = num_threads();
         let chunk_size = config.chunk_size.max(probe_count / n_threads).max(1000);
 
-        return probe_rows
+        let chunks: Vec<Vec<(usize, usize)>> = probe_rows
             .par_chunks(chunk_size)
             .enumerate()
-            .flat_map(|(chunk_idx, chunk)| {
+            .map(|(chunk_idx, chunk)| {
                 let base_idx = chunk_idx * chunk_size;
                 let mut local_matches = Vec::new();
 
                 for (local_idx, probe_row) in chunk.iter().enumerate() {
+                    deadline.charge(DeadlineSite::ParallelJoin, 1)?;
                     let probe_idx = base_idx + local_idx;
                     let hash = hash_composite_key(probe_row, probe_key_indices);
 
                     if let Some(build_indices) = hash_table.get(&hash) {
                         for &build_idx in build_indices {
+                            deadline.charge(DeadlineSite::ParallelJoin, 1)?;
                             if verify_match(probe_row, &build_rows[build_idx]) {
                                 local_matches.push((probe_idx, build_idx));
                             }
@@ -560,25 +565,28 @@ where
                     }
                 }
 
-                local_matches
+                Ok(local_matches)
             })
-            .collect();
+            .collect::<Result<_>>()?;
+        return Ok(chunks.concat());
     }
 
     // Sequential fallback (always compiled)
     let _ = config; // suppress unused warning when parallel feature is disabled
     let mut matches = Vec::new();
     for (probe_idx, probe_row) in probe_rows.iter().enumerate() {
+        deadline.charge(DeadlineSite::ParallelJoin, 1)?;
         let hash = hash_composite_key(probe_row, probe_key_indices);
         if let Some(build_indices) = hash_table.get(&hash) {
             for &build_idx in build_indices {
+                deadline.charge(DeadlineSite::ParallelJoin, 1)?;
                 if verify_match(probe_row, &build_rows[build_idx]) {
                     matches.push((probe_idx, build_idx));
                 }
             }
         }
     }
-    matches
+    Ok(matches)
 }
 
 /// Hash a row using specific key column indices.
@@ -629,16 +637,19 @@ fn sequential_probe(
     build_col_count: usize,
     (swapped, room): (bool, usize),
     build_matched: Option<&BuildMatchedTracker>,
-) -> (Vec<Row>, Vec<Row>) {
+    deadline: Deadline,
+) -> Result<(Vec<Row>, Vec<Row>)> {
     let mut matched_rows = Vec::new();
     let needs_unmatched_probe = join_type.needs_unmatched_probe(swapped);
 
     for probe_row in probe_rows.iter() {
+        deadline.charge(DeadlineSite::ParallelJoin, 1)?;
         let hash = hash_row_by_keys(probe_row, probe_key_indices);
         let mut matched = false;
 
         if let Some(build_indices) = hash_table.get(&hash) {
             for &build_idx in build_indices {
+                deadline.charge(DeadlineSite::ParallelJoin, 1)?;
                 let build_row = &build_rows[build_idx];
                 if verify_key_match(probe_row, build_row, probe_key_indices, build_key_indices) {
                     matched = true;
@@ -664,7 +675,7 @@ fn sequential_probe(
         }
     }
 
-    (matched_rows, Vec::new())
+    Ok((matched_rows, Vec::new()))
 }
 
 /// Execute a complete parallel hash join
@@ -696,7 +707,8 @@ pub fn parallel_hash_join(
     build_col_count: usize,
     swapped: bool,
     config: &ParallelConfig,
-) -> ParallelJoinResult {
+    deadline: Deadline,
+) -> Result<ParallelJoinResult> {
     parallel_hash_join_with_room(
         probe_rows,
         build_rows,
@@ -704,7 +716,7 @@ pub fn parallel_hash_join(
         join_type,
         (probe_col_count, build_col_count, 0),
         swapped,
-        config,
+        (config, deadline),
     )
 }
 
@@ -717,14 +729,14 @@ pub(crate) fn parallel_hash_join_with_room(
     join_type: JoinType,
     (probe_col_count, build_col_count, room): (usize, usize, usize),
     swapped: bool,
-    config: &ParallelConfig,
-) -> ParallelJoinResult {
+    (config, deadline): (&ParallelConfig, Deadline),
+) -> Result<ParallelJoinResult> {
     let probe_count = probe_rows.len();
     let build_count = build_rows.len();
     let use_parallel = probes_in_parallel(config, build_count, probe_count);
 
     // Build phase: Create hash table (parallel if large enough)
-    let hash_table = parallel_hash_build(build_rows, build_key_indices, config);
+    let hash_table = parallel_hash_build(build_rows, build_key_indices, config, deadline)?;
     let build_matched = tracker_for(join_type, swapped, build_count);
     let probe = Probe {
         build_rows,
@@ -736,19 +748,20 @@ pub(crate) fn parallel_hash_join_with_room(
         use_parallel,
         config,
         build_matched: build_matched.as_ref(),
+        deadline,
     };
-    let mut result_rows = probe.slice(probe_rows);
-    probe.unmatched_build(0, usize::MAX, &mut result_rows);
+    let mut result_rows = probe.slice(probe_rows)?;
+    probe.unmatched_build(0, usize::MAX, &mut result_rows)?;
 
     let matches_found = result_rows.len();
 
-    ParallelJoinResult {
+    Ok(ParallelJoinResult {
         rows: result_rows,
         parallel_used: use_parallel,
         probe_rows_processed: probe_count,
         build_rows_count: build_count,
         matches_found,
-    }
+    })
 }
 
 /// Whether a hash join of `build_count` and `probe_count` rows probes on the
@@ -801,13 +814,14 @@ struct Probe<'a> {
     use_parallel: bool,
     config: &'a ParallelConfig,
     build_matched: Option<&'a BuildMatchedTracker>,
+    deadline: Deadline,
 }
 
 impl Probe<'_> {
     /// The rows `probe_rows` make: their matches, then the probe rows none
     /// met when the join keeps them
     #[allow(unused_variables)]
-    fn slice(&self, probe_rows: &[Row]) -> Vec<Row> {
+    fn slice(&self, probe_rows: &[Row]) -> Result<Vec<Row>> {
         let Probe {
             build_rows,
             hash_table,
@@ -818,20 +832,23 @@ impl Probe<'_> {
             use_parallel,
             config,
             build_matched,
+            deadline,
         } = *self;
         let (matched_rows, unmatched_probe_rows) = {
             #[cfg(feature = "parallel")]
             {
                 if use_parallel && join_type == JoinType::Inner {
                     // For INNER joins, we can fully parallelize the probe phase
-                    let matches: Vec<Row> = probe_rows
+                    let chunks: Vec<Vec<Row>> = probe_rows
                         .par_chunks(probe_chunk_rows(probe_rows.len(), config))
-                        .flat_map(|chunk| {
+                        .map(|chunk| {
                             let mut local_results = Vec::new();
                             for probe_row in chunk {
+                                deadline.charge(DeadlineSite::ParallelJoin, 1)?;
                                 let hash = hash_row_by_keys(probe_row, probe_key_indices);
                                 if let Some(build_indices) = hash_table.get(&hash) {
                                     for &build_idx in build_indices {
+                                        deadline.charge(DeadlineSite::ParallelJoin, 1)?;
                                         let build_row = &build_rows[build_idx];
                                         if verify_key_match(
                                             probe_row,
@@ -851,9 +868,13 @@ impl Probe<'_> {
                                     }
                                 }
                             }
-                            local_results
+                            Ok(local_results)
                         })
-                        .collect();
+                        .collect::<Result<_>>()?;
+                    let mut matches = Vec::with_capacity(chunks.iter().map(Vec::len).sum());
+                    for chunk in chunks {
+                        matches.extend(chunk);
+                    }
                     (matches, Vec::new())
                 } else if use_parallel {
                     // For OUTER joins with parallel execution, use atomic tracking for build side
@@ -868,11 +889,13 @@ impl Probe<'_> {
                             let mut unmatched_results = Vec::new();
 
                             for probe_row in chunk.iter() {
+                                deadline.charge(DeadlineSite::ParallelJoin, 1)?;
                                 let mut matched = false;
                                 let hash = hash_row_by_keys(probe_row, probe_key_indices);
 
                                 if let Some(build_indices) = hash_table.get(&hash) {
                                     for &build_idx in build_indices {
+                                        deadline.charge(DeadlineSite::ParallelJoin, 1)?;
                                         let build_row = &build_rows[build_idx];
                                         if verify_key_match(
                                             probe_row,
@@ -907,9 +930,9 @@ impl Probe<'_> {
                                 }
                             }
 
-                            (matched_results, unmatched_results)
+                            Ok((matched_results, unmatched_results))
                         })
-                        .collect();
+                        .collect::<Result<_>>()?;
 
                     let total_matched: usize = chunk_results.iter().map(|(m, _)| m.len()).sum();
                     let total_unmatched: usize = chunk_results.iter().map(|(_, u)| u.len()).sum();
@@ -941,7 +964,8 @@ impl Probe<'_> {
                         build_col_count,
                         (swapped, room),
                         build_matched,
-                    )
+                        deadline,
+                    )?
                 }
             }
             #[cfg(not(feature = "parallel"))]
@@ -957,21 +981,22 @@ impl Probe<'_> {
                     build_col_count,
                     (swapped, room),
                     build_matched,
-                )
+                    deadline,
+                )?
             }
         };
 
         let mut result_rows = matched_rows;
         result_rows.extend(unmatched_probe_rows);
-        result_rows
+        Ok(result_rows)
     }
 
     /// Into `out`, the build rows from `from` on that no probe row met, at
     /// most `limit` of them, when the join keeps them; where the next
     /// would start
-    fn unmatched_build(&self, from: usize, limit: usize, out: &mut Vec<Row>) -> usize {
+    fn unmatched_build(&self, from: usize, limit: usize, out: &mut Vec<Row>) -> Result<usize> {
         let Some(tracker) = self.build_matched else {
-            return self.build_rows.len();
+            return Ok(self.build_rows.len());
         };
         let (probe_col_count, build_col_count, room) = self.counts;
         let shape = (self.swapped, room);
@@ -980,8 +1005,9 @@ impl Probe<'_> {
         // flag they set visible here
         for (build_idx, build_row) in self.build_rows.iter().enumerate().skip(from) {
             if made == limit {
-                return build_idx;
+                return Ok(build_idx);
             }
+            self.deadline.charge(DeadlineSite::ParallelJoin, 1)?;
             if !tracker.was_matched(build_idx) {
                 let values =
                     combine_build_with_nulls(build_row, build_col_count, probe_col_count, shape);
@@ -989,7 +1015,7 @@ impl Probe<'_> {
                 made += 1;
             }
         }
-        self.build_rows.len()
+        Ok(self.build_rows.len())
     }
 }
 
@@ -1011,6 +1037,7 @@ pub(crate) struct HashJoinSlices {
     /// The probe rows the last slice took and the rows it made
     last: (usize, usize),
     unmatched_from: usize,
+    deadline: Deadline,
 }
 
 impl HashJoinSlices {
@@ -1022,12 +1049,12 @@ impl HashJoinSlices {
         join_type: JoinType,
         counts: (usize, usize, usize),
         swapped: bool,
-        config: ParallelConfig,
-    ) -> Self {
+        (config, deadline): (ParallelConfig, Deadline),
+    ) -> Result<Self> {
         let use_parallel = probes_in_parallel(&config, build_rows.len(), probe_rows.len());
-        let hash_table = parallel_hash_build(&build_rows, &keys.1, &config);
+        let hash_table = parallel_hash_build(&build_rows, &keys.1, &config, deadline)?;
         let build_matched = tracker_for(join_type, swapped, build_rows.len());
-        Self {
+        Ok(Self {
             probe_rows,
             build_rows,
             keys,
@@ -1041,12 +1068,13 @@ impl HashJoinSlices {
             probed: 0,
             last: (0, 0),
             unmatched_from: 0,
-        }
+            deadline,
+        })
     }
 
     /// The rows of the next slice, about `rows` of them once the slices
     /// before it show how many a probe row makes; empty after the last
-    pub(crate) fn next_slice(&mut self, rows: usize) -> Vec<Row> {
+    pub(crate) fn next_slice(&mut self, rows: usize) -> Result<Vec<Row>> {
         let probe = Probe {
             build_rows: &self.build_rows,
             hash_table: &self.hash_table,
@@ -1057,6 +1085,7 @@ impl HashJoinSlices {
             use_parallel: self.use_parallel,
             config: &self.config,
             build_matched: self.build_matched.as_ref(),
+            deadline: self.deadline,
         };
         while self.probed < self.probe_rows.len() {
             let left = self.probe_rows.len() - self.probed;
@@ -1068,16 +1097,16 @@ impl HashJoinSlices {
                 made => (rows as u128 * taken as u128 / made as u128) as usize,
             };
             let take = take.clamp(1, left);
-            let slice = probe.slice(&self.probe_rows[self.probed..self.probed + take]);
+            let slice = probe.slice(&self.probe_rows[self.probed..self.probed + take])?;
             self.probed += take;
             self.last = (take, slice.len());
             if !slice.is_empty() {
-                return slice;
+                return Ok(slice);
             }
         }
         let mut out = Vec::new();
-        self.unmatched_from = probe.unmatched_build(self.unmatched_from, rows, &mut out);
-        out
+        self.unmatched_from = probe.unmatched_build(self.unmatched_from, rows, &mut out)?;
+        Ok(out)
     }
 }
 
@@ -1581,7 +1610,7 @@ mod tests {
             ..Default::default()
         };
 
-        let hash_table = parallel_hash_build(&build_rows, &[0], &config);
+        let hash_table = parallel_hash_build(&build_rows, &[0], &config, Deadline::NONE).unwrap();
 
         assert_eq!(hash_table.row_count, 10_000);
         // Verify some lookups work
@@ -1617,7 +1646,7 @@ mod tests {
         };
 
         // Build hash table
-        let hash_table = parallel_hash_build(&build_rows, &[0], &config);
+        let hash_table = parallel_hash_build(&build_rows, &[0], &config, Deadline::NONE).unwrap();
 
         // Probe
         let matches = parallel_hash_probe(
@@ -1630,7 +1659,9 @@ mod tests {
                 probe.get(0) == build.get(0)
             },
             &config,
-        );
+            Deadline::NONE,
+        )
+        .unwrap();
 
         // Each probe row should match exactly one build row
         // 10K probes, each maps to one of 5K build rows
@@ -1785,7 +1816,9 @@ mod tests {
             2, // build col count
             false,
             &config,
-        );
+            Deadline::NONE,
+        )
+        .unwrap();
 
         // Should have 2 matches (id=1 and id=2)
         assert_eq!(result.rows.len(), 2, "INNER JOIN should have 2 matches");
@@ -1826,7 +1859,9 @@ mod tests {
             2,
             false,
             &config,
-        );
+            Deadline::NONE,
+        )
+        .unwrap();
 
         // Should have 3 rows: 1 matched + 2 unmatched with NULL build columns
         assert_eq!(result.rows.len(), 3, "LEFT JOIN should have 3 rows");
@@ -1875,7 +1910,9 @@ mod tests {
             2,
             false,
             &config,
-        );
+            Deadline::NONE,
+        )
+        .unwrap();
 
         // Should have 3 rows: 1 matched + 2 unmatched with NULL probe columns
         assert_eq!(result.rows.len(), 3, "RIGHT JOIN should have 3 rows");
@@ -1923,7 +1960,9 @@ mod tests {
             2,
             false,
             &config,
-        );
+            Deadline::NONE,
+        )
+        .unwrap();
 
         // Should have 3 rows:
         // 1 matched (id=1)
@@ -1948,7 +1987,9 @@ mod tests {
             1,
             false,
             &config,
-        );
+            Deadline::NONE,
+        )
+        .unwrap();
         assert_eq!(
             result.rows.len(),
             0,
@@ -1966,7 +2007,9 @@ mod tests {
             1,
             false,
             &config,
-        );
+            Deadline::NONE,
+        )
+        .unwrap();
         assert_eq!(
             result.rows.len(),
             0,
@@ -1987,7 +2030,9 @@ mod tests {
             1,
             false,
             &config,
-        );
+            Deadline::NONE,
+        )
+        .unwrap();
         assert_eq!(
             result.rows.len(),
             2,
@@ -2034,7 +2079,9 @@ mod tests {
             2,
             true, // swapped: build=left, probe=right
             &config,
-        );
+            Deadline::NONE,
+        )
+        .unwrap();
 
         // Should have 2 rows:
         // 1 matched row (id=1)

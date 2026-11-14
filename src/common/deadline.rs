@@ -48,11 +48,41 @@ pub enum DeadlineSite {
     Result,
     /// An ordered walk of an index
     IndexWalk,
+    /// An INSERT's rows, as it writes each
+    Insert,
+    /// An UPDATE's rows, as it computes each new row
+    Update,
+    /// A DELETE's rows, as it judges each
+    Delete,
+    /// The child rows a foreign key action reads or writes
+    ForeignKey,
+    /// A COPY's rows, as it reads each from its file
+    Copy,
+    /// A hash join's build rows, probe rows and candidate pairs
+    HashJoin,
+    /// A nested loop join's rows and the pairs it judges
+    NestedLoop,
+    /// An index join's outer rows and the inner rows each probe finds
+    IndexProbe,
+    /// A hash join's rows built and probed on worker threads
+    ParallelJoin,
+    /// The rows an ORDER BY reads, and their count before each sort
+    Sort,
+    /// A window function's rows and partitions
+    Window,
+    /// The rows a UNION, INTERSECT or EXCEPT reads
+    SetOp,
+    /// A recursive CTE's working rows, at each iteration
+    RecursiveCte,
+    /// The rows a table-valued function made, once it returns them
+    Tvf,
+    /// The rows an aggregation folds into groups and the groups it reads
+    Aggregate,
 }
 
 impl DeadlineSite {
     /// Every site, which a test stops a statement at in turn
-    pub const ALL: [DeadlineSite; 7] = [
+    pub const ALL: [DeadlineSite; 22] = [
         DeadlineSite::Scan,
         DeadlineSite::LateKeys,
         DeadlineSite::Block,
@@ -60,16 +90,32 @@ impl DeadlineSite {
         DeadlineSite::JoinParts,
         DeadlineSite::Result,
         DeadlineSite::IndexWalk,
+        DeadlineSite::Insert,
+        DeadlineSite::Update,
+        DeadlineSite::Delete,
+        DeadlineSite::ForeignKey,
+        DeadlineSite::Copy,
+        DeadlineSite::HashJoin,
+        DeadlineSite::NestedLoop,
+        DeadlineSite::IndexProbe,
+        DeadlineSite::ParallelJoin,
+        DeadlineSite::Sort,
+        DeadlineSite::Window,
+        DeadlineSite::SetOp,
+        DeadlineSite::RecursiveCte,
+        DeadlineSite::Tvf,
+        DeadlineSite::Aggregate,
     ];
 }
 
 /// The instant past which a call's statements stop, copied into every
 /// context and result of the call; None runs them to their end
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Deadline(Option<Instant>);
+pub struct Deadline(Option<Instant>);
 
 impl Deadline {
-    pub(crate) const NONE: Self = Self(None);
+    /// No deadline: the work runs to its end
+    pub const NONE: Self = Self(None);
 
     /// Stop past `at`; None never stops
     pub(crate) fn at(at: Option<Instant>) -> Self {
