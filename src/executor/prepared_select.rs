@@ -26,7 +26,7 @@ use smallvec::SmallVec;
 
 use crate::api::params::ParamVec;
 use crate::common::names::eq_names;
-use crate::common::{CompactArc, SmartString};
+use crate::common::{CompactArc, SmartString, StringMap};
 use crate::core::predicate::{kind, KeySide, PredicateSet};
 use crate::core::{
     is_rowid_name, DataType, Error, Operator, Result, Row, RowVec, Schema, SchemaColumn, Value,
@@ -52,8 +52,8 @@ use crate::storage::traits::{
 use super::aggregation::{
     aggregate_alias_key, aggregate_extra_args, aggregate_group_key, aggregate_slot_keys,
     check_grouped_reads, compile_over_slots, group_item_read, grouped_item, grouping_items,
-    ungrouped_column, AggregatePath, CallInputs, FeedInput, GroupByItem, HeldFeed, Modifiers,
-    RowSource, SqlAggregateFunction, COUNT_STAR,
+    ungrouped_column, AggregatePath, CallInputs, FeedInput, GroupByItem, HeldFeed, HeldNames,
+    Modifiers, PostProjection, RowSource, SqlAggregateFunction, COUNT_STAR,
 };
 use super::context::{
     cache_block_answer, get_cached_block_answer, subquery_cache_tables, BlockAnswer, BlockOrigin,
@@ -68,7 +68,7 @@ use super::expression::{
 };
 use super::operators::index_nested_loop::{crosses_inner_key, EQUALITY_CANDIDATE_CAP};
 use super::planned_aggregate::{AggregatePlan, AggregateRead, GlobalSource};
-use super::prepared_join::{JoinSide, JoinSides, SideLeaf};
+use super::prepared_join::{JoinSide, JoinSides, Shelf, SideLeaf};
 use super::projection::{Item, Projection};
 use super::pushdown::{self, coerce_constant, read_as_column, scan_compares};
 use super::query::{
@@ -4302,13 +4302,66 @@ type SourcePrograms = Box<[Box<[SharedProgram]>]>;
 pub(crate) struct PreparedCalls {
     calls: Vec<SqlAggregateFunction>,
     arguments: Box<[Box<[HeldOnce]>]>,
+    /// The output names of a statement without GROUP BY whose SELECT list
+    /// is nothing but its calls, see [`Executor::calls_alone`]
+    pub(crate) alone: Option<CompactArc<Vec<String>>>,
+    /// The places found in each list of columns a run read the calls over
+    places: Shelf<Vec<String>, ColumnPlaces>,
+    /// The SELECT list's projection over each source's columns and slot names
+    projections: Shelf<(Vec<String>, Vec<String>), PostProjection>,
 }
 
-/// A run's aggregate calls, the blocks answering them and their held feed
+/// Where a run finds names in the columns it reads: each column by name,
+/// and the column each call reads alone
+#[derive(Debug)]
+pub(crate) struct ColumnPlaces {
+    pub(crate) map: StringMap<usize>,
+    pub(crate) calls: Vec<Option<usize>>,
+}
+
+impl PreparedCalls {
+    /// The places of `columns`, found once for the runs that read them
+    pub(crate) fn places(&self, columns: &[String]) -> Arc<ColumnPlaces> {
+        let wanted = |held: &Vec<String>| held.as_slice() == columns;
+        if let Some(held) = self.places.find(wanted) {
+            return held;
+        }
+        let places = Arc::new(ColumnPlaces {
+            map: build_column_index_map(columns),
+            calls: Executor::call_columns(&self.calls, columns),
+        });
+        self.places
+            .hold(wanted, || columns.to_vec(), || Arc::clone(&places));
+        places
+    }
+
+    /// The projection over slot rows named `slots` from rows of `columns`,
+    /// which `build` makes once for the runs that read them
+    pub(crate) fn projection(
+        &self,
+        columns: &[String],
+        slots: &[String],
+        build: impl FnOnce() -> Result<PostProjection>,
+    ) -> Result<Arc<PostProjection>> {
+        let wanted = |(held, named): &(Vec<String>, Vec<String>)| held == columns && named == slots;
+        if let Some(held) = self.projections.find(wanted) {
+            return Ok(held);
+        }
+        let projection = Arc::new(build()?);
+        let key = || (columns.to_vec(), slots.to_vec());
+        self.projections
+            .hold(wanted, key, || Arc::clone(&projection));
+        Ok(projection)
+    }
+}
+
+/// A run's aggregate calls, the blocks answering them, their held feed and
+/// what the statement holds for them
 type HeldCalls<'a> = (
     &'a [SqlAggregateFunction],
     Option<&'a dyn SubqueryExecutor>,
     Option<&'a HeldFeed>,
+    Option<&'a PreparedCalls>,
 );
 
 /// What a run of a statement that aggregates its rows or computes windows
@@ -4600,7 +4653,17 @@ impl PreparedSelect {
                 (0..written).map(|_| HeldOnce::new()).collect()
             })
             .collect();
-        Ok(PreparedCalls { calls, arguments })
+        let alone = (written.group_by.columns.is_empty())
+            .then(|| Executor::calls_alone(written, &calls))
+            .flatten()
+            .map(CompactArc::new);
+        Ok(PreparedCalls {
+            calls,
+            arguments,
+            alone,
+            places: Shelf::new(),
+            projections: Shelf::new(),
+        })
     }
 
     /// `read` under the index read the window rule chooses for `written`'s
@@ -13648,6 +13711,7 @@ impl Executor {
             aggregations,
             Some(run as &dyn SubqueryExecutor),
             Some(&held.feed),
+            held.calls.as_ref(),
         );
         let windows = (windows, Some(&held.windows));
         self.grouped_answer(windows, stmt, calls, ctx, input, columns)
@@ -13716,14 +13780,14 @@ impl Executor {
         if QueryClassification::groups(stmt) || windows.0 {
             let columns = read_names(table.schema(), widen);
             if let Some(read) = prepared.read.and_then(Read::grouped).filter(|_| !widen) {
-                let run = (ctx, blocks);
+                let run = (ctx, blocks, prepared.calls);
                 if let Some(result) =
                     self.grouped_aggregate(table, stmt, aggregations, read, run, &columns)?
                 {
                     return Ok((result, None));
                 }
             }
-            let calls = (aggregations, blocks, prepared.feed);
+            let calls = (aggregations, blocks, prepared.feed, prepared.calls);
             return self.table_input(stmt, ctx, (runner, prepared), table, |input| {
                 self.grouped_answer(windows, stmt, calls, ctx, input, &columns)
             });
@@ -13741,13 +13805,17 @@ impl Executor {
         };
         let scan = || {
             let columns = read_names(table.schema(), widen);
+            let places = prepared.calls.map(|calls| calls.places(&columns));
+            let read = (&columns[..], places.as_deref().map(|places| &places.map));
             self.table_input(stmt, ctx, (runner, prepared), table, |input| {
-                self.global_row(aggregations, &columns, ctx, (blocks, prepared.feed), input)
+                self.global_row(aggregations, read, ctx, (blocks, prepared.feed), input)
                     .map(Some)
             })
         };
         let source = (source, pushed.as_deref());
-        let result = self.global_answer(table, stmt, (aggregations, source), ctx, blocks, scan)?;
+        let calls = (aggregations, source);
+        let held = (blocks, prepared.calls);
+        let result = self.global_answer(table, stmt, calls, ctx, held, scan)?;
         let result = result
             .ok_or_else(|| Error::internal("an aggregate whose rows were read without a row"))?;
         Ok((result, None))
@@ -13805,7 +13873,7 @@ impl Executor {
         &self,
         (windows, held): (bool, Option<&HeldWindow>),
         stmt: &SelectStatement,
-        (aggregations, blocks, feed): HeldCalls<'_>,
+        (aggregations, blocks, feed, prepared): HeldCalls<'_>,
         ctx: &ExecutionContext,
         input: FeedInput<'_, impl RowSource>,
         columns: &[String],
@@ -13817,7 +13885,13 @@ impl Executor {
             return self.windows_over_groups(path, stmt, aggregations, ctx, input, columns, run);
         }
         let stmts = (stmt, stmt);
-        let result = self.aggregate_input(path, stmts, aggregations, ctx, input, columns, run)?;
+        let places = prepared.map(|calls| calls.places(columns));
+        let names = HeldNames {
+            calls: prepared,
+            map: places.as_deref().map(|places| &places.map),
+        };
+        let calls = (aggregations, names);
+        let result = self.aggregate_input(path, stmts, calls, ctx, input, columns, run)?;
         Ok((result, None))
     }
 
@@ -13839,6 +13913,7 @@ impl Executor {
             aggregations,
             prepared.blocks.then_some(runner as &dyn SubqueryExecutor),
             prepared.feed,
+            prepared.calls,
         );
         // Without a WHERE the rows a source holds are fed as they are, and a
         // stream's as it hands them over, however many: held to split them

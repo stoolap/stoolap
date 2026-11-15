@@ -30,6 +30,7 @@ use super::aggregation::{AggregatePath, AggregateSlots, Modifiers, SqlAggregateF
 use super::context::ExecutionContext;
 use super::expression::SubqueryExecutor;
 use super::grouped_aggregate::GroupedSource;
+use super::prepared_select::PreparedCalls;
 use super::query_classification::{get_classification, QueryClassification};
 use super::Executor;
 
@@ -360,7 +361,7 @@ impl Executor {
 
     /// Each call's column in `columns`, the one table's, whatever qualifier
     /// names it
-    pub(super) fn call_columns(
+    pub(crate) fn call_columns(
         aggregations: &[SqlAggregateFunction],
         columns: &[String],
     ) -> Vec<Option<usize>> {
@@ -376,7 +377,8 @@ impl Executor {
 
     /// The result of the one row `rows` holds for `aggregations`, the end
     /// of every global aggregate path; `alone` the output names a plan found
-    /// for a SELECT list of nothing but the calls
+    /// for a SELECT list of nothing but the calls, `held` the prepared calls
+    /// that hold its projection
     #[allow(clippy::too_many_arguments)]
     fn finish_global(
         &self,
@@ -386,7 +388,7 @@ impl Executor {
         source_columns: &[String],
         ctx: &ExecutionContext,
         blocks: Option<&dyn SubqueryExecutor>,
-        alone: Option<&CompactArc<Vec<String>>>,
+        (alone, held): (Option<&CompactArc<Vec<String>>>, Option<&PreparedCalls>),
         rows: RowVec,
     ) -> Result<Box<dyn QueryResult>> {
         // The slots' names serve a SELECT list that computes over them
@@ -405,6 +407,7 @@ impl Executor {
             source_columns,
             blocks,
             alone,
+            held,
         };
         self.finish_aggregation(path, slots, ctx, names, rows)
     }
@@ -421,17 +424,26 @@ impl Executor {
             (GlobalSource, Option<&dyn StorageExpr>),
         ),
         ctx: &ExecutionContext,
-        blocks: Option<&dyn SubqueryExecutor>,
+        (blocks, prepared): (Option<&dyn SubqueryExecutor>, Option<&PreparedCalls>),
         scan: impl FnOnce() -> Result<Option<RowVec>>,
     ) -> Result<Option<Box<dyn QueryResult>>> {
         let source_columns = table.schema().column_names_arc();
-        let columns = Self::call_columns(aggregations, &source_columns);
+        let places = prepared.map(|calls| calls.places(&source_columns));
+        let found;
+        let columns = match places.as_deref() {
+            Some(places) => &places.calls,
+            None => {
+                found = Self::call_columns(aggregations, &source_columns);
+                &found
+            }
+        };
+        let alone = prepared.and_then(|calls| calls.alone.as_ref());
         let deadline = ctx.deadline_of_call();
         let row = Self::global_values(
             source,
             table,
             aggregations,
-            &columns,
+            columns,
             false,
             pushed,
             deadline,
@@ -454,7 +466,7 @@ impl Executor {
             &source_columns,
             ctx,
             blocks,
-            None,
+            (alone, prepared),
             rows,
         )
         .map(Some)
@@ -502,7 +514,7 @@ impl Executor {
                 &planned.source_columns,
                 ctx,
                 None,
-                planned.alone.as_ref(),
+                (planned.alone.as_ref(), None),
                 rows,
             )
             .map(Some)

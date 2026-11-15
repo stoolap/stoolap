@@ -1928,7 +1928,13 @@ impl Executor {
         // OPTIMIZATION: Get cached query classification ONCE at entry point
         // This classification is passed through the call chain to avoid
         // redundant hash computations and cache lookups (was 10+ calls per query)
-        let classification = match plan_classification {
+        // A plan holds the classification of its entry's statement, not of
+        // that statement's spelling
+        let own = compiled
+            .filter(|_| !spelled)
+            .map(NestedPlan::classification);
+        let held = plan_classification.or(own);
+        let classification = match held {
             Some(slot) => slot.get_or_init(|| get_classification(stmt)).clone(),
             None => get_classification(stmt),
         };

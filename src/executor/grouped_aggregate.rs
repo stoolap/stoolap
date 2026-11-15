@@ -26,6 +26,7 @@ use super::aggregation::{AggregatePath, AggregateSlots, Modifiers, SqlAggregateF
 use super::context::ExecutionContext;
 use super::expression::{ExprVM, SubqueryExecutor};
 use super::planned_aggregate::{AggregatePlan, AggregateRead};
+use super::prepared_select::PreparedCalls;
 use super::query_classification::QueryClassification;
 use super::row_count::rows_needed;
 use super::Executor;
@@ -184,8 +185,9 @@ impl Executor {
     /// `stmt`'s groups of `aggregations` over `table` by the column `group`,
     /// named and placed, from `source`, else by the index walk when `walks`;
     /// None for the hash grouping, which the scan does. Its `blocks` answer
-    /// the subqueries of its HAVING and SELECT list. Inlined into the table
-    /// scan, it costs that scan's loop more per row
+    /// the subqueries of its HAVING and SELECT list, its `held` calls hold
+    /// its projection. Inlined into the table scan, it costs that scan's
+    /// loop more per row
     #[inline(never)]
     pub(crate) fn grouped_aggregate(
         &self,
@@ -193,7 +195,11 @@ impl Executor {
         stmt: &SelectStatement,
         aggregations: &[SqlAggregateFunction],
         (source, (group, group_index), walks): (GroupedSource, (&str, usize), bool),
-        (ctx, blocks): (&ExecutionContext, Option<&dyn SubqueryExecutor>),
+        (ctx, blocks, held): (
+            &ExecutionContext,
+            Option<&dyn SubqueryExecutor>,
+            Option<&PreparedCalls>,
+        ),
         all_columns: &[String],
     ) -> Result<Option<Box<dyn QueryResult>>> {
         let columns = Self::call_columns(aggregations, all_columns);
@@ -244,6 +250,7 @@ impl Executor {
             source_columns: all_columns,
             blocks,
             alone: None,
+            held,
         };
         self.finish_aggregation(path, slots, ctx, slot_columns, rows)
             .map(Some)

@@ -129,18 +129,18 @@ const MAX_HELD: usize = 16;
 
 /// Values of one kind held by key; a lookup copies no key
 #[derive(Debug)]
-struct Shelf<K, T: ?Sized> {
+pub(crate) struct Shelf<K, T: ?Sized> {
     held: RwLock<Vec<(K, Arc<T>)>>,
 }
 
 impl<K, T: ?Sized> Shelf<K, T> {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             held: RwLock::new(Vec::new()),
         }
     }
 
-    fn find(&self, wanted: impl Fn(&K) -> bool) -> Option<Arc<T>> {
+    pub(crate) fn find(&self, wanted: impl Fn(&K) -> bool) -> Option<Arc<T>> {
         let held = self.held.read().ok()?;
         held.iter()
             .find(|(key, _)| wanted(key))
@@ -148,7 +148,7 @@ impl<K, T: ?Sized> Shelf<K, T> {
     }
 
     /// Holds `value` under `key` while there is room and no key `wanted` accepts
-    fn hold(
+    pub(crate) fn hold(
         &self,
         wanted: impl Fn(&K) -> bool,
         key: impl FnOnce() -> K,

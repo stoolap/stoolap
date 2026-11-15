@@ -37,6 +37,7 @@ use crate::storage::traits::QueryResult;
 use super::context::ExecutionContext;
 use super::expr_key::ExprKey;
 use super::expression::{run_params, ExprVM, SubqueryExecutor};
+use super::prepared_select::PreparedCalls;
 use super::query::order_by_inputs;
 use super::result::ExecutorResult;
 use super::utils::{
@@ -129,6 +130,35 @@ pub(crate) struct AggregateSlots<'a> {
     /// The output names a plan found for a SELECT list of nothing but the
     /// one row's calls, see [`Executor::calls_alone`]
     pub alone: Option<&'a CompactArc<Vec<String>>>,
+    /// The prepared statement's calls, which hold its SELECT list's projection
+    pub held: Option<&'a PreparedCalls>,
+}
+
+/// What a prepared statement holds for a run of its calls: the calls, and
+/// its source columns by name
+#[derive(Clone, Copy, Default)]
+pub(crate) struct HeldNames<'a> {
+    pub calls: Option<&'a PreparedCalls>,
+    pub map: Option<&'a StringMap<usize>>,
+}
+
+/// A SELECT list over the slot rows it was built for: the rows as they
+/// are, each name `Same` lists spelled as its item, or each item read from
+/// its slot or computed
+#[derive(Debug)]
+pub(crate) enum PostProjection {
+    Same(Vec<(usize, String)>),
+    Project(Vec<String>, Vec<SlotRead>),
+}
+
+/// How a projected item reads a slot row
+#[derive(Debug)]
+pub(crate) enum SlotRead {
+    /// The slot's value, NULL for None or past the row
+    Slot(Option<usize>),
+    /// A GROUPING() flag's slot, 0 for None or past the row
+    Flag(Option<usize>),
+    Program(super::expression::SharedProgram),
 }
 
 /// A program over aggregate slot rows: `aliases` read a group item or
@@ -1807,7 +1837,7 @@ impl Executor {
         self.aggregate_input(
             AggregatePath::General,
             (stmt, stmt),
-            &aggregations,
+            (&aggregations, HeldNames::default()),
             ctx,
             input,
             base_columns,
@@ -1823,15 +1853,17 @@ impl Executor {
         &self,
         path: AggregatePath,
         (stmt, written_stmt): (&SelectStatement, &SelectStatement),
-        aggregations: &[SqlAggregateFunction],
+        (aggregations, names): (&[SqlAggregateFunction], HeldNames<'_>),
         ctx: &ExecutionContext,
         input: FeedInput<'_, impl RowSource>,
         base_columns: &[String],
         (blocks, held): (Option<&dyn SubqueryExecutor>, Option<&HeldFeed>),
     ) -> Result<Box<dyn QueryResult>> {
         let run = (blocks, held);
+        let read = (base_columns, names);
         let (columns, rows, group_by_columns) =
-            self.aggregate_groups(stmt, aggregations, ctx, input, base_columns, run)?;
+            self.aggregate_groups(stmt, aggregations, ctx, input, read, run)?;
+        let held = names.calls;
         self.finish_aggregation(
             path,
             AggregateSlots {
@@ -1841,7 +1873,8 @@ impl Executor {
                 group_by_count: group_by_columns.len(),
                 source_columns: base_columns,
                 blocks,
-                alone: None,
+                alone: held.and_then(|calls| calls.alone.as_ref()),
+                held,
             },
             ctx,
             columns,
@@ -1859,7 +1892,7 @@ impl Executor {
         aggregations: &[SqlAggregateFunction],
         ctx: &ExecutionContext,
         input: FeedInput<'_, impl RowSource>,
-        base_columns: &[String],
+        (base_columns, names): (&[String], HeldNames<'_>),
         run: (Option<&dyn SubqueryExecutor>, Option<&HeldFeed>),
     ) -> Result<(Vec<String>, RowVec, Vec<GroupByItem>)> {
         let blocks = run.0;
@@ -1886,33 +1919,44 @@ impl Executor {
         };
 
         // Build result
-        let col_index_map;
+        // The global group finds its columns itself
+        let built;
+        let col_index_map = match names.map {
+            Some(map) => map,
+            None if group_by_columns.is_empty() => {
+                built = StringMap::default();
+                &built
+            }
+            None => {
+                built = build_column_index_map(base_columns);
+                &built
+            }
+        };
         let (result_columns, result_rows) = if group_by_columns.is_empty() {
             // Global aggregation (no GROUP BY)
-            self.execute_global_aggregation(aggregations, input, base_columns, ctx, run)?
+            let read = (base_columns, names);
+            self.execute_global_aggregation(aggregations, input, read, ctx, run)?
         } else if stmt.group_by.modifier != GroupByModifier::None {
             // ROLLUP or CUBE aggregation
-            col_index_map = build_column_index_map(base_columns);
             self.execute_rollup_aggregation(
                 aggregations,
                 &group_by_columns,
                 input,
                 base_columns,
-                &col_index_map,
+                col_index_map,
                 stmt,
                 ctx,
                 run,
             )?
         } else {
             // Regular grouped aggregation - pass limit for early termination
-            col_index_map = build_column_index_map(base_columns);
             self.execute_grouped_aggregation(
                 aggregations,
                 &group_by_columns,
                 stmt,
                 input,
                 base_columns,
-                &col_index_map,
+                col_index_map,
                 ctx,
                 aggregation_limit,
                 run,
@@ -2006,6 +2050,7 @@ impl Executor {
             source_columns,
             blocks,
             alone,
+            held,
         } = slots;
         // Each group HAVING kept asks the blocks of the items and sort keys
         if let Some(blocks) = blocks {
@@ -2045,19 +2090,31 @@ impl Executor {
             .filter(|(_, agg)| agg.hidden)
             .collect();
 
-        // Apply post-aggregation expression evaluation and column projection
-        // Only clone if we need the original data for hidden_aggs processing
-        let (final_columns, final_rows) = if hidden_aggs.is_empty() {
-            // No hidden aggregates - move data directly (no clone)
-            self.apply_post_aggregation_expressions(
+        // A prepared statement's projection is built once for its slot names
+        let project = |columns: Vec<String>, rows: RowVec| match held {
+            Some(calls) => {
+                let projection = calls.projection(source_columns, &columns, || {
+                    let built = (source_columns, aggregations, &columns[..]);
+                    self.post_projection(stmt, built, blocks.is_some(), None)
+                })?;
+                Self::project_slots(&projection, ctx, columns, rows, blocks)
+            }
+            None => self.apply_post_aggregation_expressions(
                 stmt,
                 ctx,
                 source_columns,
                 aggregations,
-                having_columns,
-                having_rows,
+                columns,
+                rows,
                 blocks,
-            )?
+            ),
+        };
+
+        // Apply post-aggregation expression evaluation and column projection
+        // Only clone if we need the original data for hidden_aggs processing
+        let (final_columns, final_rows) = if hidden_aggs.is_empty() {
+            // No hidden aggregates - move data directly (no clone)
+            project(having_columns, having_rows)?
         } else {
             // Hidden aggregates exist: extract only the needed columns
             // up front, then move the aggregated rows instead of cloning
@@ -2087,15 +2144,7 @@ impl Executor {
                 })
                 .collect();
 
-            let (mut cols, mut rows) = self.apply_post_aggregation_expressions(
-                stmt,
-                ctx,
-                source_columns,
-                aggregations,
-                having_columns,
-                having_rows,
-                blocks,
-            )?;
+            let (mut cols, mut rows) = project(having_columns, having_rows)?;
 
             // Append hidden aggregates to the result for ORDER BY to use
             for (col_name, values) in by_index {
@@ -2185,8 +2234,28 @@ impl Executor {
         agg_rows: RowVec,
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<(Vec<String>, RowVec)> {
+        let built = (source_columns, aggregations, &agg_columns[..]);
+        let params = Some(slot_params(ctx, blocks));
+        let projection = self.post_projection(stmt, built, blocks.is_some(), params)?;
+        Self::project_slots(&projection, ctx, agg_columns, agg_rows, blocks)
+    }
+
+    /// The projection of `stmt`'s SELECT list over slot rows named
+    /// `agg_columns`, of `aggregations` over rows of `source_columns`; its
+    /// programs fold `params` when they serve only that execution
+    pub(crate) fn post_projection(
+        &self,
+        stmt: &SelectStatement,
+        (source_columns, aggregations, agg_columns): (
+            &[String],
+            &[SqlAggregateFunction],
+            &[String],
+        ),
+        blocks: bool,
+        params: Option<&[Value]>,
+    ) -> Result<PostProjection> {
         // Parse GROUP BY items for GROUPING() function support
-        let group_by_columns = self.parse_group_by(stmt, &agg_columns)?;
+        let group_by_columns = self.parse_group_by(stmt, agg_columns)?;
         if let Some(name) = ungrouped_read(stmt, &group_by_columns, source_columns) {
             return Err(ungrouped_column(&name));
         }
@@ -2194,7 +2263,7 @@ impl Executor {
         let columns_to_use = &stmt.columns;
 
         // Names find the result columns that bare names and aliases point at
-        let agg_col_index_map = build_column_index_map(&agg_columns);
+        let agg_col_index_map = build_column_index_map(agg_columns);
         // Identities find the slot of each group item and aggregate, however it is named
         let mut slot_keys = aggregate_slot_keys(&group_by_columns, aggregations, &stmt.columns);
         let item_names = agg_columns
@@ -2265,13 +2334,16 @@ impl Executor {
             if columns_match {
                 // The rows are the SELECT list's, named as its items are: a
                 // slot of a column or an alias may carry another spelling
-                let mut agg_columns = agg_columns;
-                for (name, item) in agg_columns.iter_mut().zip(&stmt.columns) {
-                    if let Some(spelled) = item_spelled_name(item).filter(|s| *s != name) {
-                        *name = spelled.to_string();
-                    }
-                }
-                return Ok((agg_columns, agg_rows));
+                let spelled = agg_columns
+                    .iter()
+                    .zip(&stmt.columns)
+                    .enumerate()
+                    .filter_map(|(at, (name, item))| {
+                        let spelled = item_spelled_name(item).filter(|s| *s != name.as_str())?;
+                        Some((at, spelled.to_string()))
+                    })
+                    .collect();
+                return Ok(PostProjection::Same(spelled));
             }
         }
 
@@ -2430,60 +2502,78 @@ impl Executor {
             }
         }
 
+        // Plain expression sources compile once for the row loop; a group
+        // item or aggregate inside one reads its slot, whatever names it
+        let reads = column_sources
+            .into_iter()
+            .map(|source| {
+                Ok(match source {
+                    ColumnSource::AggColumn(col_name) => {
+                        SlotRead::Slot(agg_col_index_map.get(&col_name).copied())
+                    }
+                    ColumnSource::AggSlot(idx) => SlotRead::Slot(Some(idx)),
+                    ColumnSource::Expression(expr) => SlotRead::Program(compile_over_slots(
+                        &expr,
+                        agg_columns,
+                        crate::functions::registry::global_registry(),
+                        Some(&slot_keys),
+                        blocks,
+                        params,
+                    )?),
+                    // The flag sits in a hidden __grouping_N__ column after the aggregates
+                    ColumnSource::GroupingFlag(idx) => SlotRead::Flag(
+                        agg_col_index_map
+                            .get(&format!("__grouping_{}__", idx))
+                            .copied(),
+                    ),
+                })
+            })
+            .collect::<Result<_>>()?;
+        Ok(PostProjection::Project(final_columns, reads))
+    }
+
+    /// The rows of `projection` over the slot rows `agg_rows`, named
+    /// `agg_columns`, it was built for
+    pub(crate) fn project_slots(
+        projection: &PostProjection,
+        ctx: &ExecutionContext,
+        mut agg_columns: Vec<String>,
+        agg_rows: RowVec,
+        blocks: Option<&dyn SubqueryExecutor>,
+    ) -> Result<(Vec<String>, RowVec)> {
+        let (final_columns, reads) = match projection {
+            PostProjection::Same(spelled) => {
+                for (at, name) in spelled {
+                    if let Some(slot) = agg_columns.get_mut(*at) {
+                        slot.clone_from(name);
+                    }
+                }
+                return Ok((agg_columns, agg_rows));
+            }
+            PostProjection::Project(names, reads) => (names.clone(), reads),
+        };
+
         // Evaluate each row
         let mut final_rows = RowVec::with_capacity(agg_rows.len());
         let mut vm = super::expression::ExprVM::new();
 
-        // Plain expression sources compile once for the row loop; a group
-        // item or aggregate inside one reads its slot, whatever names it
-        let source_programs: Vec<Option<super::expression::SharedProgram>> = column_sources
-            .iter()
-            .map(|s| match s {
-                ColumnSource::Expression(expr) => compile_over_slots(
-                    expr,
-                    &agg_columns,
-                    crate::functions::registry::global_registry(),
-                    Some(&slot_keys),
-                    blocks.is_some(),
-                    Some(slot_params(ctx, blocks)),
-                )
-                .map(Some),
-                _ => Ok(None),
-            })
-            .collect::<Result<_>>()?;
-
         for (id, row) in agg_rows {
             ctx.charge(DeadlineSite::Aggregate, 1)?;
             // Use CompactVec directly to avoid Vec→CompactVec conversion
-            let mut new_values: CompactVec<Value> = CompactVec::with_capacity(column_sources.len());
+            let mut new_values: CompactVec<Value> = CompactVec::with_capacity(reads.len());
 
-            for (src_idx, source) in column_sources.iter().enumerate() {
-                let value = match source {
-                    ColumnSource::AggColumn(col_name) => {
-                        if let Some(&idx) = agg_col_index_map.get(col_name) {
-                            row.get(idx).cloned().unwrap_or(Value::null_unknown())
-                        } else {
-                            Value::null_unknown()
-                        }
-                    }
-                    ColumnSource::AggSlot(idx) => {
+            for read in reads {
+                let value = match read {
+                    SlotRead::Slot(Some(idx)) => {
                         row.get(*idx).cloned().unwrap_or(Value::null_unknown())
                     }
-                    ColumnSource::Expression(_) => match &source_programs[src_idx] {
-                        Some(p) => vm.execute(p, &run_context(&row, ctx, blocks))?,
-                        None => Value::null_unknown(),
-                    },
-                    ColumnSource::GroupingFlag(idx) => {
-                        // Look up the grouping flag from the hidden __grouping_N__ columns
-                        // These columns are at the end of the row, after aggregate columns
-                        let grouping_col_name = format!("__grouping_{}__", idx);
-                        if let Some(&col_idx) = agg_col_index_map.get(&grouping_col_name) {
-                            row.get(col_idx).cloned().unwrap_or(Value::Integer(0))
-                        } else {
-                            // Fallback: column is grouped normally
-                            Value::Integer(0)
-                        }
-                    }
+                    SlotRead::Slot(None) => Value::null_unknown(),
+                    SlotRead::Program(p) => vm.execute(p, &run_context(&row, ctx, blocks))?,
+                    // Fallback: column is grouped normally
+                    SlotRead::Flag(at) => at
+                        .and_then(|at| row.get(at))
+                        .cloned()
+                        .unwrap_or(Value::Integer(0)),
                 };
                 new_values.push(value);
             }
@@ -2705,8 +2795,9 @@ impl Executor {
         ),
     ) -> Result<WindowOutput> {
         let run = (blocks, held);
+        let read = (base_columns, HeldNames::default());
         let (columns, rows, items) =
-            self.aggregate_groups(stmt, aggregations, ctx, input, base_columns, run)?;
+            self.aggregate_groups(stmt, aggregations, ctx, input, read, run)?;
         let mut slots = aggregate_slot_keys(&items, aggregations, &stmt.columns);
         let item_names = columns.get(..items.len()).unwrap_or_default();
         Self::bind_group_columns(stmt, base_columns, &items, item_names, &mut slots);
@@ -3301,12 +3392,16 @@ impl Executor {
         &self,
         aggregations: &[SqlAggregateFunction],
         input: FeedInput<'_, impl RowSource>,
-        columns: &[String],
+        (columns, held): (&[String], HeldNames<'_>),
         ctx: &ExecutionContext,
         run: (Option<&dyn SubqueryExecutor>, Option<&HeldFeed>),
     ) -> Result<(Vec<String>, RowVec)> {
-        let rows = self.global_row(aggregations, columns, ctx, run, input)?;
-        let result_columns = aggregations.iter().map(|a| a.get_column_name()).collect();
+        let rows = self.global_row(aggregations, (columns, held.map), ctx, run, input)?;
+        // The names held for the calls alone are the output's
+        let result_columns = match held.calls.and_then(|calls| calls.alone.as_ref()) {
+            Some(_) => Vec::new(),
+            None => aggregations.iter().map(|a| a.get_column_name()).collect(),
+        };
         Ok((result_columns, rows))
     }
 
@@ -3612,24 +3707,32 @@ impl Executor {
     }
 
     /// The one group of `aggregations` over the rows of `input`, whose
-    /// columns are `columns`; the statement's `blocks` answer what the calls
+    /// columns are `columns`, found by name through `held_map` when the
+    /// statement holds one; the statement's `blocks` answer what the calls
     /// ask of each row
     pub(super) fn global_row(
         &self,
         aggregations: &[SqlAggregateFunction],
-        columns: &[String],
+        (columns, held_map): (&[String], Option<&StringMap<usize>>),
         ctx: &ExecutionContext,
         (blocks, held): (Option<&dyn SubqueryExecutor>, Option<&HeldFeed>),
         input: FeedInput<'_, impl RowSource>,
     ) -> Result<RowVec> {
-        let col_index_map = build_column_index_map(columns);
+        let built;
+        let col_index_map = match held_map {
+            Some(map) => map,
+            None => {
+                built = build_column_index_map(columns);
+                &built
+            }
+        };
         let mut groups = GroupedAggregates::global(self.call_templates(aggregations)?);
         let feed = RowFeed::new(
             aggregations,
             &[],
             None,
             columns,
-            &col_index_map,
+            col_index_map,
             ctx,
             (blocks, held),
         )?;
