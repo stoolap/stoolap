@@ -1256,8 +1256,7 @@ fn a_read_past_old_versions_own_rows_or_hidden_rows_charges_them() {
         "SELECT id FROM l WHERE id NOT IN (SELECT id FROM one)",
         5,
     );
-    // A full read charges a chain's versions in one run after the chain
-    charged(&hot, "SELECT v FROM l", 2);
+    charged(&hot, "SELECT v FROM l", 3);
     read(&hot, "ROLLBACK", &ctx).unwrap();
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }

@@ -725,15 +725,15 @@ type Meter<'u> = (Deadline, &'u mut usize);
 /// The row of `chain` that `txn_id` sees through `checker`, unless a
 /// deletion it sees hides it. `last` is the last head transaction asked
 /// and its answer, so a run of heads from one transaction asks once.
-/// `TIMED` counts into `passed` each older version it passes
+/// `TIMED` charges `meter` each older version it passes
 #[inline(always)]
 fn seen_row<'v, C: VisibilityChecker + ?Sized, const TIMED: bool>(
     chain: &'v VersionChainEntry,
     checker: &ReaderChecker<'_, '_, C>,
     txn_id: i64,
     last: &mut (i64, bool),
-    passed: &mut usize,
-) -> Option<&'v Row> {
+    (deadline, unpaid): Meter<'_>,
+) -> crate::core::Result<Option<&'v Row>> {
     let head_txn_id = chain.version.txn_id;
     if head_txn_id != last.0 {
         *last = (head_txn_id, checker.is_visible(head_txn_id, txn_id));
@@ -743,7 +743,7 @@ fn seen_row<'v, C: VisibilityChecker + ?Sized, const TIMED: bool>(
         let mut current = chain.prev.as_deref();
         while let Some(e) = current {
             if TIMED {
-                *passed += 1;
+                deadline.charge_one(DeadlineSite::StorageRead, unpaid)?;
             }
             if checker.is_visible(e.version.txn_id, txn_id) {
                 seen = Some(e);
@@ -752,12 +752,14 @@ fn seen_row<'v, C: VisibilityChecker + ?Sized, const TIMED: bool>(
             current = e.prev.as_deref();
         }
     }
-    let e = seen?;
+    let Some(e) = seen else {
+        return Ok(None);
+    };
     let deleted_at = e.version.deleted_at_txn_id;
     if deleted_at != 0 && checker.is_visible(deleted_at, txn_id) {
-        return None;
+        return Ok(None);
     }
-    Some(&e.version.data)
+    Ok(Some(&e.version.data))
 }
 
 /// Passes `each` the row `seen_row` gives of every chain of `chunks`
@@ -769,11 +771,11 @@ fn visit_visible<'v, C: VisibilityChecker + ?Sized>(
     mut each: impl FnMut(i64, &'v Row) -> crate::core::Result<()>,
 ) -> crate::core::Result<()> {
     let mut last = (0i64, false);
-    let mut passed = 0usize;
+    let mut unpaid = 0usize;
     for (ids, chains) in chunks {
         for (&row_id, chain) in ids.iter().zip(chains) {
-            if let Some(row) = seen_row::<C, false>(chain, checker, txn_id, &mut last, &mut passed)
-            {
+            let meter = (Deadline::NONE, &mut unpaid);
+            if let Some(row) = seen_row::<C, false>(chain, checker, txn_id, &mut last, meter)? {
                 each(row_id, row)?;
             }
         }
@@ -1092,8 +1094,7 @@ fn filtered_each_of<'v, C: VisibilityChecker + ?Sized, const TIMED: bool>(
 }
 
 /// The rows `seen_row` gives of one leaf's chains, passed to `each`;
-/// `TIMED` charges `meter` the older versions passed, a run at a time,
-/// after the chain that ends one
+/// `TIMED` charges `meter` each older version passed
 #[inline(always)]
 fn visit_leaf<'v, C: VisibilityChecker + ?Sized, const TIMED: bool>(
     ids: &'v [i64],
@@ -1101,15 +1102,12 @@ fn visit_leaf<'v, C: VisibilityChecker + ?Sized, const TIMED: bool>(
     checker: &ReaderChecker<'_, '_, C>,
     txn_id: i64,
     last: &mut (i64, bool),
-    (deadline, passed): Meter<'_>,
+    (deadline, unpaid): Meter<'_>,
     each: &mut impl FnMut(i64, &'v Row) -> crate::core::Result<()>,
 ) -> crate::core::Result<()> {
     for (&row_id, chain) in ids.iter().zip(chains) {
-        let row = seen_row::<C, TIMED>(chain, checker, txn_id, last, passed);
-        if TIMED && *passed >= CHARGE_BEAT {
-            deadline.charge(DeadlineSite::StorageRead, std::mem::take(passed))?;
-        }
-        if let Some(row) = row {
+        let meter = (deadline, &mut *unpaid);
+        if let Some(row) = seen_row::<C, TIMED>(chain, checker, txn_id, last, meter)? {
             each(row_id, row)?;
         }
     }
