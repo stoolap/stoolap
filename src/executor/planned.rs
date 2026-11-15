@@ -243,6 +243,7 @@ impl Executor {
         ctx: &ExecutionContext,
     ) -> Option<Vec<String>> {
         self.explain_planned(stmt, ctx, true)
+            .or_else(|| self.explain_with_blocks(stmt, ctx))
             .or_else(|| self.explain_over_source(stmt, ctx))
     }
 
@@ -276,7 +277,7 @@ impl Executor {
     /// `stmt`'s plan over `first`, its first branch's: each set operation
     /// over the rows before it and its right branch as EXPLAIN shows that
     /// statement, under the whole statement's ORDER BY and LIMIT
-    fn explain_set_operations(
+    pub(super) fn explain_set_operations(
         &self,
         stmt: &SelectStatement,
         first: Vec<String>,

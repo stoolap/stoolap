@@ -2871,6 +2871,8 @@ impl Executor {
                                 plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index)
                             }
                         };
+                        #[cfg(feature = "test-failpoints")]
+                        crate::test_failpoints::scan_access_taken(&access);
                         table.update(
                             access,
                             expr.as_deref(),
@@ -3457,6 +3459,8 @@ impl Executor {
                     plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index)
                 }
             };
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::scan_access_taken(&access);
             table.delete(access, where_expr.as_deref(), ctx.deadline_of_call())?
         };
 

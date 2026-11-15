@@ -23,7 +23,7 @@ EXPLAIN ANALYZE query;
 
 Shows the execution plan without running the query.
 
-A SELECT over one table, view, CTE, derived table, VALUES list or table function is planned once, when it is prepared, and EXPLAIN prints that plan: the steps the rows go through, outermost first, each indented under the step it feeds. The access at the bottom is the one the run takes, and the indexes it names are the ones it reads. Other statements (joins, window functions, DISTINCT or a set operation over anything but a table, a WHERE or select list with a subquery, an aggregate that reads its rows with no source of its own, EXPLAIN ANALYZE) print the format shown in their own sections below.
+A SELECT over one table, view, CTE, derived table, VALUES list or table function is planned once, when it is prepared, and EXPLAIN prints that plan: the steps the rows go through, outermost first, each indented under the step it feeds. The access at the bottom is the one the run takes, and the indexes it names are the ones it reads. A SELECT over one table whose WHERE or select list holds a subquery prints its plan the same way, as [Subqueries Over One Table](#subqueries-over-one-table) shows. Other statements (joins, window functions, DISTINCT or a set operation over anything but a table, a WHERE or select list with a subquery over anything but a table, an aggregate that reads its rows with no source of its own, EXPLAIN ANALYZE) print the format shown in their own sections below.
 
 ### Sequential Scan
 
@@ -376,6 +376,45 @@ Limit 2
         Project name, value
           IndexScan products (value > 10)
             Index idx_value (value range)
+```
+
+### Subqueries Over One Table
+
+A SELECT over one table whose WHERE or select list holds a subquery is planned once too, and EXPLAIN prints its plan, then `Prepared: yes` and its subqueries. A subquery compared with a column, or any value that reads no row, is read once per run and taken by the scan as a parameter is, so the plan's index is the one the run reads. It shows as written:
+
+```sql
+EXPLAIN SELECT name FROM products WHERE value > (SELECT AVG(amount) FROM orders);
+```
+
+Output:
+```
+plan
+----
+Project name
+  IndexScan products (value > (SELECT AVG(amount) FROM orders))
+    Index idx_value (value range)
+Prepared: yes
+Subqueries:
+  1: scalar over orders, once per run
+```
+
+A column tested with `IN`, `ANY` or `ALL` against a subquery, or an `EXISTS` that reads the row, reads its rows by the members or keys the subquery gives, which only a run knows. The scan shows what it takes before them, and each run picks its read once they are known:
+
+```sql
+EXPLAIN SELECT name FROM products WHERE id IN (SELECT product_id FROM orders WHERE customer_id = 7);
+```
+
+Output:
+```
+plan
+----
+Project name
+  Filter
+    Scan products
+      read chosen per run, over its sets
+Prepared: yes
+Subqueries:
+  1: IN over orders, once per run
 ```
 
 ### Hash Join

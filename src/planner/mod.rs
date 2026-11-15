@@ -490,6 +490,15 @@ fn read_lines(read: &Read, text: &PlanText<'_>, lines: &mut Vec<String>) {
             alternative(lines, line);
             lines.extend(text.body.iter().map(|l| format!("  {l}")));
         }
+        // A run picks its read once the sets its blocks give are known
+        (Read::Scan(None), _) => {
+            let line = match text.pushed {
+                Some(pushed) => format!("Scan {} {pushed}", text.table),
+                None => format!("Scan {}", text.table),
+            };
+            alternative(lines, line);
+            lines.push("  read chosen per run, over its sets".to_string());
+        }
         (other, _) => {
             for (at, line) in scan(other.scan()).into_iter().enumerate() {
                 match at {
