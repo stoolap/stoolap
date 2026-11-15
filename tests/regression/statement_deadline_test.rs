@@ -1070,3 +1070,93 @@ fn a_long_table_read_charges_each_run_of_its_work() {
     charged(&cold, rows, "SELECT DISTINCT t FROM s", 34 + 9);
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+#[test]
+fn a_read_that_keeps_few_of_the_rows_it_reads_charges_each_run_of_them() {
+    let _guard = FailpointGuard::new();
+    let db = Database::open("memory://statement_deadline_few_kept").unwrap();
+    for sql in [
+        "CREATE TABLE h (id INTEGER PRIMARY KEY, g INTEGER, x INTEGER, half INTEGER)",
+        "INSERT INTO h SELECT value, value, value, value % 2 FROM generate_series(1, 20000)",
+        "CREATE INDEX h_g ON h (g)",
+        "CREATE INDEX h_half ON h (half)",
+        "CREATE TABLE o (id INTEGER PRIMARY KEY, g INTEGER)",
+        "INSERT INTO o SELECT value, value FROM generate_series(1, 500)",
+        "CREATE TABLE one (id INTEGER PRIMARY KEY)",
+        "INSERT INTO one VALUES (1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!(
+        "file://{}?checkpoint_interval=3600&compact_threshold=1000",
+        dir.path().display()
+    );
+    let sealed = Database::open(&dsn).unwrap();
+    for sql in [
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, half INTEGER)",
+        "CREATE INDEX s_half ON s (half)",
+        "INSERT INTO s SELECT value, value % 2 FROM generate_series(1, 140000)",
+        "CREATE TABLE one (id INTEGER PRIMARY KEY)",
+        "INSERT INTO one VALUES (1)",
+    ] {
+        sealed.execute(sql, ()).unwrap();
+    }
+    sealed.engine().seal_for_test().unwrap();
+    let hot = Executor::new(std::sync::Arc::clone(db.engine()));
+    let cold = Executor::new(std::sync::Arc::clone(sealed.engine()));
+    let mut ctx = ExecutionContext::new();
+    ctx.set_timeout_ms(3_600_000);
+    let mut wrong = Vec::new();
+    let mut charged = |executor: &Executor, sql: &str, least: usize| {
+        count_deadline_charges(DeadlineSite::StorageRead);
+        let counted = read(executor, sql, &ctx);
+        let charges = deadline_charges();
+        keep_deadlines();
+        if counted.is_err() || charges < least {
+            wrong.push(format!(
+                "{sql} gave {counted:?} in {charges} charges, under {least}"
+            ));
+        }
+    };
+    // Each run of 4,096 rows read is charged, kept or not
+    charged(&hot, "SELECT id FROM h WHERE x = -1 LIMIT 1", 4);
+    charged(&hot, "SELECT id FROM h LIMIT 1 OFFSET 19990", 4);
+    charged(&hot, "SELECT id FROM h WHERE g > 0 AND x = -1 LIMIT 1", 4);
+    charged(&hot, "SELECT id FROM h WHERE g < 3 OR x = -1 LIMIT 5", 4);
+    charged(
+        &hot,
+        "SELECT id, ROW_NUMBER() OVER (PARTITION BY half ORDER BY id) FROM h LIMIT 1",
+        2,
+    );
+    // The keys NOT IN leaves, then their rows
+    charged(
+        &hot,
+        "SELECT id FROM h WHERE id NOT IN (SELECT id FROM one)",
+        8,
+    );
+    // The inner rows each outer key, or each batch of keys, names
+    charged(&hot, "SELECT o.id, h.x FROM o JOIN h ON o.g = h.g", 100);
+    charged(
+        &cold,
+        "SELECT id FROM s WHERE id NOT IN (SELECT id FROM one) LIMIT 1",
+        34,
+    );
+    charged(
+        &cold,
+        "SELECT id FROM s WHERE id NOT IN (SELECT id FROM one)",
+        68,
+    );
+    // The first partition's rows are looked for among every sealed row
+    charged(
+        &cold,
+        "SELECT id, ROW_NUMBER() OVER (PARTITION BY half ORDER BY id) FROM s LIMIT 1",
+        34,
+    );
+    // A transaction's own row leaves a LIMIT to a read of every row
+    read(&hot, "BEGIN", &ctx).unwrap();
+    read(&hot, "INSERT INTO h VALUES (900000, 0, 0, 0)", &ctx).unwrap();
+    charged(&hot, "SELECT id FROM h WHERE x = -1 LIMIT 1", 4);
+    read(&hot, "ROLLBACK", &ctx).unwrap();
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

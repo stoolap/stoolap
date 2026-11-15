@@ -318,7 +318,7 @@ impl Executor {
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::in_members_read(false);
             let remaining = remaining()?;
-            let mut rows = table.fetch_rows_by_ids(&ids, &membership)?;
+            let mut rows = table.fetch_rows_by_ids(&ids, &membership, deadline)?;
             if let Some(filter) = remaining {
                 filter.retain_checked(&mut rows)?;
             }
@@ -457,7 +457,8 @@ impl Executor {
         if Self::is_primary_key(table, column) {
             let mut keys = Self::primary_key_members(members);
             if let Some(target) = target {
-                return Self::fetch_members_up_to(table, &mut keys, target, &mut ids).map(Some);
+                return Self::fetch_members_up_to(table, &mut keys, target, &mut ids, deadline)
+                    .map(Some);
             }
             ids.extend(keys);
         } else if let Some(index) = table.lookup_index_on_column(column) {
@@ -479,7 +480,7 @@ impl Executor {
         ids.sort_unstable();
         ids.dedup();
         let needed = target.unwrap_or(usize::MAX);
-        Self::fetch_rows_up_to(table, &ids, &ConstBoolExpr::true_expr(), needed).map(Some)
+        Self::fetch_rows_up_to(table, &ids, &ConstBoolExpr::true_expr(), needed, deadline).map(Some)
     }
 
     /// The rows whose `column`, the table's primary key, is none of
@@ -491,6 +492,7 @@ impl Executor {
         left_out: &std::sync::OnceLock<I64Set>,
         members: impl Iterator<Item = &'v Value> + 'v,
         target: Option<usize>,
+        deadline: Deadline,
     ) -> Result<Option<RowVec>> {
         use crate::storage::expression::logical::ConstBoolExpr;
         if !Self::is_primary_key(table, column) {
@@ -501,8 +503,10 @@ impl Executor {
             crate::test_failpoints::left_out_ids_collected();
             Self::primary_key_members(members).collect()
         });
-        let ids = table.visible_row_ids_excluding(excluded, target.unwrap_or(usize::MAX))?;
-        Self::fetch_rows_up_to(table, &ids, &ConstBoolExpr::true_expr(), usize::MAX).map(Some)
+        let limit = target.unwrap_or(usize::MAX);
+        let ids = table.visible_row_ids_excluding(excluded, limit, deadline)?;
+        let all = ConstBoolExpr::true_expr();
+        Self::fetch_rows_up_to(table, &ids, &all, usize::MAX, deadline).map(Some)
     }
 
     fn fetch_rows_up_to(
@@ -510,16 +514,17 @@ impl Executor {
         row_ids: &[i64],
         filter: &dyn crate::storage::expression::Expression,
         needed: usize,
+        deadline: Deadline,
     ) -> Result<RowVec> {
         if needed == usize::MAX || row_ids.len() <= needed {
-            return table.fetch_rows_by_ids(row_ids, filter);
+            return table.fetch_rows_by_ids(row_ids, filter, deadline);
         }
         let mut rows = RowVec::with_capacity(needed);
         let mut at = 0;
         let mut batch = needed.clamp(16, FETCH_BATCH_ROWS);
         while at < row_ids.len() && rows.len() < needed {
             let end = at.saturating_add(batch).min(row_ids.len());
-            rows.extend(table.fetch_rows_by_ids(&row_ids[at..end], filter)?);
+            rows.extend(table.fetch_rows_by_ids(&row_ids[at..end], filter, deadline)?);
             at = end;
             batch = batch.saturating_mul(2).min(FETCH_BATCH_ROWS);
         }
@@ -535,6 +540,7 @@ impl Executor {
         members: &mut impl Iterator<Item = i64>,
         needed: usize,
         taken: &mut Vec<i64>,
+        deadline: Deadline,
     ) -> Result<RowVec> {
         use crate::storage::expression::logical::ConstBoolExpr;
         let filter = ConstBoolExpr::true_expr();
@@ -548,7 +554,7 @@ impl Executor {
             }
             let chunk = &mut taken[start..];
             chunk.sort_unstable();
-            rows.extend(table.fetch_rows_by_ids(chunk, &filter)?);
+            rows.extend(table.fetch_rows_by_ids(chunk, &filter, deadline)?);
             batch = batch.saturating_mul(2).min(FETCH_BATCH_ROWS);
         }
         Ok(rows)
