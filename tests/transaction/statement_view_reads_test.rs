@@ -127,11 +127,7 @@ fn state(table: &dyn Table) -> Vec<(i64, i64)> {
     let mut any = ComparisonExpr::new("id", Operator::Gte, Value::Integer(i64::MIN));
     any.prepare_for_schema(table.schema());
     let mut fetched: Vec<(i64, i64)> = table
-        .fetch_rows_by_ids(
-            &[1, 2, 3, 4, 5, 6, 7],
-            &any,
-            stoolap::executor::Deadline::NONE,
-        )
+        .fetch_rows_by_ids(&[1, 2, 3, 4, 5, 6, 7], &any)
         .unwrap()
         .into_iter()
         .map(|(id, row)| pair(id, &row))

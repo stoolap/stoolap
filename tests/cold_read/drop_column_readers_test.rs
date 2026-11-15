@@ -1179,11 +1179,7 @@ fn an_older_handle_meets_its_transactions_rows_written_after_a_drop() {
     let ops: [(&str, Op); 5] = [
         ("fetch_rows_by_ids", |table, _| {
             table
-                .fetch_rows_by_ids(
-                    &[5],
-                    &ConstBoolExpr::new(true),
-                    stoolap::executor::Deadline::NONE,
-                )
+                .fetch_rows_by_ids(&[5], &ConstBoolExpr::new(true))
                 .map(drop)
         }),
         ("collect_all_rows", |table, _| {

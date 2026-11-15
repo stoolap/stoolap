@@ -15378,10 +15378,9 @@ impl<'a> PreparedRunner<'a> {
             Some(BlockInput::Table(table)) if self.blocks[index].counted.replace(false) => {
                 let held = self.blocks[index].count_ids.borrow();
                 let ids = held.as_ref().map_or(&[][..], |held| held.0.as_slice());
-                let deadline = self.ctx.deadline_of_call();
                 let rows = match expr {
-                    Some(expr) => table.fetch_rows_by_ids(ids, expr, deadline)?,
-                    None => table.fetch_rows_by_ids(ids, &ConstBoolExpr::true_expr(), deadline)?,
+                    Some(expr) => table.fetch_rows_by_ids(ids, expr)?,
+                    None => table.fetch_rows_by_ids(ids, &ConstBoolExpr::true_expr())?,
                 };
                 Ok(Box::new(PointRows { rows, at: None }))
             }
@@ -15447,7 +15446,7 @@ impl<'a> PreparedRunner<'a> {
         if let (Some(point), Some(expr), Some(table)) = (sq.point, expr, table) {
             let params = self.blocks[index].buffer.borrow();
             if let Some(Value::Integer(key)) = sq.pushdown[point].value(&params) {
-                let rows = table.fetch_rows_by_ids(&[key], expr, Deadline::NONE)?;
+                let rows = table.fetch_rows_by_ids(&[key], expr)?;
                 KeyReadPath::BlockPointRows.taken();
                 return Ok(self.widened_block(index, Box::new(PointRows { rows, at: None })));
             }
@@ -16250,14 +16249,9 @@ impl<'a> PreparedRunner<'a> {
                         .as_deref()
                         .filter(|_| self.failed_slots.is_none());
                     if let Some(ids) = ids.and_then(|keys| self.slot_ids(keys)) {
-                        let deadline = ctx.deadline_of_call();
                         let rows = match filter {
-                            Some(filter) => table.fetch_rows_by_ids(&ids, filter, deadline)?,
-                            None => table.fetch_rows_by_ids(
-                                &ids,
-                                &ConstBoolExpr::true_expr(),
-                                deadline,
-                            )?,
+                            Some(filter) => table.fetch_rows_by_ids(&ids, filter)?,
+                            None => table.fetch_rows_by_ids(&ids, &ConstBoolExpr::true_expr())?,
                         };
                         KeyReadPath::RowIds.taken();
                         break 'read (Some(rows.into_iter()), None, true, false);
@@ -16532,7 +16526,6 @@ impl<'a> PreparedRunner<'a> {
         // Only rows that pass without the WHERE may stop at the LIMIT
         let enough = target.filter(|_| passed);
         let column = &table.schema().columns[column].name_lower;
-        let deadline = self.ctx.deadline_of_call();
         let rows = if negated {
             // A key holding an error is not left out: its rows raise it
             let passing = set
@@ -16540,10 +16533,10 @@ impl<'a> PreparedRunner<'a> {
                 .iter()
                 .filter(|(_, outcome)| matches!(outcome, ExistsOutcome::Passed))
                 .filter_map(|(key, _)| key.first());
-            let left_out = &set.left_out;
-            Executor::rows_without_members(table, column, left_out, passing, enough, deadline)?
+            Executor::rows_without_members(table, column, &set.left_out, passing, enough)?
         } else {
             let members = set.outcomes.keys().filter_map(|key| key.first());
+            let deadline = self.ctx.deadline_of_call();
             Executor::rows_of_members(table, column, members, target.is_some(), enough, deadline)?
         };
         #[cfg(feature = "test-failpoints")]
@@ -17340,8 +17333,7 @@ impl PreparedRunner<'_> {
         if let Some((table, key)) = self.point_key(index, sq, &params) {
             let mut rows = self.blocks[index].point_rows.borrow_mut();
             rows.clear();
-            let all = ConstBoolExpr::true_expr();
-            table.fetch_rows_by_ids_into(&[key], &all, &mut rows, Deadline::NONE)?;
+            table.fetch_rows_by_ids_into(&[key], &ConstBoolExpr::true_expr(), &mut rows)?;
             KeyReadPath::BlockPointValue.taken();
             for (_, row) in rows.iter() {
                 self.take_one(&mut vm, projection, row, &params, &mut value)?;
@@ -18545,7 +18537,6 @@ impl PreparedRunner<'_> {
                 &set.left_out,
                 values,
                 target.filter(|_| whole),
-                self.ctx.deadline_of_call(),
             )?;
             return Ok(rows.map(|rows| (rows, true)));
         }

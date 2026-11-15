@@ -710,8 +710,7 @@ mod written_by_the_filter {
     #[test]
     fn a_fetch_by_ids_filter_may_write_through_another_handle_of_its_transaction() {
         read_writing("memory://filter_writes_fetch", false, |table, filter| {
-            let none = stoolap::executor::Deadline::NONE;
-            Ok(table.fetch_rows_by_ids(&[1, 2, 3], filter, none)?.len())
+            Ok(table.fetch_rows_by_ids(&[1, 2, 3], filter)?.len())
         });
     }
 

@@ -747,7 +747,6 @@ impl<'a> IndexNestedLoopJoinOperator<'a> {
             &self.row_id_buffer,
             filter,
             &mut self.current_inner_rows,
-            self.deadline,
         )?;
         Ok(true)
     }
@@ -1470,9 +1469,7 @@ impl Operator for BatchIndexNestedLoopJoinOperator<'_> {
             Some(filter) => filter.as_ref(),
             None => &true_expr,
         };
-        let inner_rows = self
-            .inner_table
-            .fetch_rows_by_ids(&all_row_ids, filter, self.deadline)?;
+        let inner_rows = self.inner_table.fetch_rows_by_ids(&all_row_ids, filter)?;
 
         // An error a join on this thread left behind is not this one's
         if let Some(filter) = &self.residual_filter {
