@@ -9582,6 +9582,32 @@ impl Executor {
                     rows,
                 )))
             }
+            "QUERY_TIMEOUT" => {
+                // This session's timeout in milliseconds for a statement whose
+                // call sets none; zero runs them to their end
+                if let Some(ref value) = stmt.value {
+                    let negative = matches!(
+                        value,
+                        crate::parser::Expression::FloatLiteral(lit) if lit.value < 0.0
+                    );
+                    let timeout_ms = self.extract_pragma_int_value(value)?;
+                    if negative || timeout_ms < 0 {
+                        return Err(Error::invalid_argument(
+                            "query_timeout must not be negative",
+                        ));
+                    }
+                    self.set_query_timeout_ms(timeout_ms as u64);
+                }
+                let mut rows = RowVec::with_capacity(1);
+                rows.push((
+                    0,
+                    Row::from_values(vec![Value::Integer(self.query_timeout_ms() as i64)]),
+                ));
+                Ok(Box::new(ExecutorResult::new(
+                    vec!["query_timeout".to_string()],
+                    rows,
+                )))
+            }
             "GROUP_CACHE_MB" => {
                 // Budget of the decoded row-group column cache, in megabytes;
                 // zero disables it

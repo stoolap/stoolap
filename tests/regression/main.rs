@@ -29,6 +29,7 @@ mod multi_statement_test;
 mod new_sql_features_test;
 mod panic_edges_test;
 mod query_executor_test;
+mod query_timeout_pragma_test;
 mod real_world_sql_test;
 mod result_coverage_test;
 mod runtime_error_test;

@@ -90,6 +90,19 @@ Legacy parameter names are accepted for backward compatibility:
 - `snapshot_interval` maps to `checkpoint_interval`
 - `snapshot_compression` maps to `compression` (sets both WAL and volume)
 
+### Statement Options
+
+| Option | Values | Default | Description |
+|--------|--------|---------|-------------|
+| `query_timeout` | Integer (ms) | 0 | Timeout of a statement whose call sets none (0 = none). Accepted by `memory://` and `file://` |
+
+Every connection opened on the database, a cloned handle included, starts with this timeout; `PRAGMA query_timeout` changes it for one connection. A negative or non-numeric value fails the open.
+
+```
+memory://?query_timeout=5000
+file:///data/mydb?query_timeout=30000
+```
+
 ### Cleanup Options
 
 | Option | Values | Default | Description |

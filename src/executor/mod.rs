@@ -88,7 +88,7 @@ mod volatility;
 mod window;
 
 use rustc_hash::FxHashMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::api::params::ParamVec;
@@ -392,6 +392,9 @@ pub struct Executor {
     /// This session's isolation level as its `u8` value, `LEVEL_UNSET`
     /// until the session sets one
     default_isolation_level: AtomicU8,
+    /// The timeout in milliseconds of a statement whose call sets none, 0
+    /// for none; shared with the executors of this session's transactions
+    query_timeout_ms: Arc<AtomicU64>,
     /// Query cache for parsed statements, shared with the executors of
     /// this session's transactions
     query_cache: Arc<QueryCache>,
@@ -427,6 +430,7 @@ impl Executor {
         Self {
             engine,
             default_isolation_level: AtomicU8::new(LEVEL_UNSET),
+            query_timeout_ms: Arc::new(AtomicU64::new(0)),
             query_cache: Arc::new(QueryCache::default()),
             semantic_cache: Arc::new(SemanticCache::default()),
             statement_gate: RwLock::new(()),
@@ -444,6 +448,7 @@ impl Executor {
             default_isolation_level: AtomicU8::new(
                 self.default_isolation_level.load(Ordering::Relaxed),
             ),
+            query_timeout_ms: Arc::clone(&self.query_timeout_ms),
             query_cache: Arc::clone(&self.query_cache),
             semantic_cache: Arc::clone(&self.semantic_cache),
             statement_gate: RwLock::new(()),
@@ -475,6 +480,17 @@ impl Executor {
     fn store_isolation_level(&self, level: crate::core::IsolationLevel) {
         self.default_isolation_level
             .store(level as u8, Ordering::Relaxed);
+    }
+
+    /// Set the timeout in milliseconds of every statement of this session
+    /// whose call sets none; 0 runs them to their end
+    pub(crate) fn set_query_timeout_ms(&self, timeout_ms: u64) {
+        self.query_timeout_ms.store(timeout_ms, Ordering::Relaxed);
+    }
+
+    /// The timeout in milliseconds of a statement whose call sets none, 0 for none
+    pub(crate) fn query_timeout_ms(&self) -> u64 {
+        self.query_timeout_ms.load(Ordering::Relaxed)
     }
 
     /// This session's isolation level; the engine's until the session sets one
@@ -583,12 +599,16 @@ impl Executor {
     }
 
     /// The compiled PK paths that take borrowed params, under a shared gate
-    /// the caller holds; None when none applies
+    /// the caller holds; None when none applies, or when the session's
+    /// query timeout is on, which only a context carries
     fn param_fast_paths(
         &self,
         plan: &CachedPlanRef,
         params: &[Value],
     ) -> Option<Result<Box<dyn QueryResult>>> {
+        if self.query_timeout_ms() > 0 {
+            return None;
+        }
         if let Err(e) = check_param_count(&plan.params, params.len()) {
             return Some(Err(e));
         }
@@ -1052,13 +1072,18 @@ impl Executor {
 
     /// `ctx` with the bounds every AS OF of `statement`, which `holds` one,
     /// resolves against, taken as it starts, before any path reads a row. A
-    /// CTE read AS OF is refused here, before a path inlines it
+    /// CTE read AS OF is refused here, before a path inlines it. A call
+    /// that sets no deadline gets the session's query timeout from now
     pub(crate) fn with_statement_cut<'c>(
         &self,
         statement: &Statement,
-        ctx: std::borrow::Cow<'c, ExecutionContext>,
+        mut ctx: std::borrow::Cow<'c, ExecutionContext>,
         holds: bool,
     ) -> Result<std::borrow::Cow<'c, ExecutionContext>> {
+        let timeout_ms = self.query_timeout_ms();
+        if timeout_ms > 0 && ctx.deadline().is_none() {
+            ctx.to_mut().set_timeout_ms(timeout_ms);
+        }
         if !holds || ctx.historical_cut().is_some() {
             return Ok(ctx);
         }

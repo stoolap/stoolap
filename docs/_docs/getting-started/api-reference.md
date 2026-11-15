@@ -177,6 +177,8 @@ db.execute_named("INSERT INTO users VALUES (:id, :name, :age)", params)?;
 
 Cancel queries that exceed a time limit. Timeout is in milliseconds; use 0 for no timeout.
 
+A connection can also carry a timeout for every statement whose call sets none, with `PRAGMA query_timeout = ms` or the connection string's `query_timeout`. The timeout a call passes is used instead; a call that passes 0 gets the connection's.
+
 - A call has one deadline, fixed when the call starts. Its subqueries and views, and a query run again because a `TRUNCATE` or `DROP` overtook it, share that deadline.
 - The rows a query returns keep the deadline while you read them, and the time between two reads counts toward it.
 - An `INSERT`, `UPDATE`, `DELETE` or `COPY` that the deadline stops changes no row, the rows its foreign key actions reach included. Inside a transaction the statement is undone and the transaction stays open.
