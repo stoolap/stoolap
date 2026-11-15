@@ -25,6 +25,7 @@ mod collate_test;
 mod date_format_test;
 mod date_time_parsing_test;
 mod date_time_timestamp_test;
+mod filter_commit_reentry_test;
 mod generate_series_test;
 mod greatest_least_rule_test;
 mod hash_functions_test;

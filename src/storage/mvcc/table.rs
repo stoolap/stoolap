@@ -3312,10 +3312,11 @@ impl MVCCTable {
         self.check_read()
     }
 
-    /// The store's rows of [`Self::fetch_rows_charged`], read and filtered
-    /// as `for_each_visible` charges them: a run of ids, and each run of
-    /// older versions a chain walk passes. Compiled apart so the untimed
-    /// loop holds no charge, which costs it registers
+    /// The store's rows of [`Self::fetch_rows_charged`], a run of ids at a
+    /// time, read as `for_each_visible` charges them: the run, and each run
+    /// of older versions a chain walk passes. The filter is asked after the
+    /// store's locks are let go. Compiled apart so the untimed loop holds no
+    /// charge, which costs it registers
     #[inline(never)]
     fn fetch_global_timed(
         &self,
@@ -3325,26 +3326,23 @@ impl MVCCTable {
         deadline: Deadline,
     ) -> Result<()> {
         let fallible = filter.can_fail();
-        let mut failed = None;
-        self.version_store.for_each_visible(
-            global_ids,
-            self.reader(),
-            deadline,
-            |row_id, row| {
-                let row = self.normalize_row_to_schema(row, &self.cached_schema);
-                match passes(filter, fallible, &row) {
-                    Ok(true) => rows.push((row_id, row)),
-                    Ok(false) => {}
-                    Err(e) => {
-                        failed = Some(e);
-                        return false;
-                    }
+        let mut batch = RowVec::new();
+        for ids in global_ids.chunks(CHARGE_BEAT) {
+            batch.clear();
+            self.version_store
+                .for_each_visible(ids, self.reader(), deadline, |row_id, row| {
+                    batch.push((row_id, row));
+                    true
+                })?;
+            self.check_read()?;
+            for (row_id, row) in batch.iter_mut() {
+                let row = self.normalize_row_to_schema(std::mem::take(row), &self.cached_schema);
+                if passes(filter, fallible, &row)? {
+                    rows.push((*row_id, row));
                 }
-                true
-            },
-        )?;
-        self.check_read()?;
-        failed.map_or(Ok(()), Err)
+            }
+        }
+        Ok(())
     }
 
     /// The committed rows of `row_ids` this transaction sees, added to `rows`
