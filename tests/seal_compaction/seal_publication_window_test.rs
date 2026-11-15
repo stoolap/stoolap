@@ -242,9 +242,7 @@ fn active_row_ids_inside_a_seal_keep_a_cold_row_updated_before_it() {
     let mut tx = db.engine().begin_transaction().unwrap();
     let table = tx.get_table("t").unwrap();
     let mut ids = inside_seal(&db, Hold::IndexesCleaned, None, || {
-        table
-            .get_active_row_ids(stoolap::executor::Deadline::NONE)
-            .unwrap()
+        table.get_active_row_ids().unwrap()
     });
     ids.sort_unstable();
     assert_eq!(ids, (1..=20).collect::<Vec<i64>>(), "row 5 inside the seal");

@@ -119,9 +119,7 @@ fn a_storage_read_while_a_sealed_row_s_change_publishes_sees_the_table_before_it
                     .map(|(id, _)| *id)
                     .collect();
                 ids.sort_unstable();
-                let mut active = table
-                    .get_active_row_ids(stoolap::executor::Deadline::NONE)
-                    .unwrap();
+                let mut active = table.get_active_row_ids().unwrap();
                 active.sort_unstable();
                 (
                     table.row_count(stoolap::executor::Deadline::NONE).unwrap(),

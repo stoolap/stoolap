@@ -1834,265 +1834,6 @@ impl SegmentedTable {
             && !hot_skip.contains(&row_id)
     }
 
-    /// One round of `get_active_row_ids` across seals: the ids this handle
-    /// shows, hot and sealed; `TIMED` charges `deadline` a run of sealed
-    /// rows at a time
-    #[inline(always)]
-    fn active_ids_round<const TIMED: bool>(
-        &self,
-        generation: u64,
-        deadline: Deadline,
-    ) -> Result<Option<Vec<i64>>> {
-        #[cfg(any(test, feature = "test-failpoints"))]
-        crate::test_failpoints::merged_read_began();
-        let cut = self.read_cut();
-        let hot_ids = self.hot.get_active_row_ids(deadline)?;
-
-        if !self.segment_mgr.has_segments() {
-            return Ok(Some(hot_ids));
-        }
-
-        // Build hot_skip from hot row_ids + pending tombstones.
-        // Committed tombstones are kept as a shared Arc (no clone).
-        let volumes = self.segment_mgr.get_volumes_newest_first()?;
-        let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-        #[cfg(any(test, feature = "test-failpoints"))]
-        crate::test_failpoints::merged_read_collected();
-        if self.seal_moved(generation) {
-            return Ok(None);
-        }
-        let mut hot_skip: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-        for id in &hot_ids {
-            hot_skip.insert(*id);
-        }
-        self.segment_mgr
-            .insert_pending_tombstones_into(self.pending(), &mut hot_skip);
-
-        let mut ids = Vec::new();
-        for (_, cs) in volumes.iter() {
-            let vol = &cs.volume;
-            if TIMED {
-                let row_ids = vol.row_ids()?;
-                for (run, chunk) in row_ids.chunks(CHARGE_BEAT).enumerate() {
-                    deadline.charge(DeadlineSite::StorageRead, chunk.len())?;
-                    for (i, &id) in (run * CHARGE_BEAT..).zip(chunk) {
-                        if self.shows_cold_row(cs, i, id, &tombstones_arc, &hot_skip, &cut) {
-                            ids.push(id);
-                        }
-                    }
-                }
-            } else {
-                for (i, &id) in vol.row_ids()?.iter().enumerate() {
-                    if self.shows_cold_row(cs, i, id, &tombstones_arc, &hot_skip, &cut) {
-                        ids.push(id);
-                    }
-                }
-            }
-        }
-        ids.extend(hot_ids);
-        Ok(Some(ids))
-    }
-
-    /// [`Self::active_ids_round`] charged, compiled apart so the untimed
-    /// loop holds no charge
-    #[inline(never)]
-    fn active_ids_round_timed(
-        &self,
-        generation: u64,
-        deadline: Deadline,
-    ) -> Result<Option<Vec<i64>>> {
-        self.active_ids_round::<true>(generation, deadline)
-    }
-
-    /// Adds to `result` the rows of the sealed `volume` this handle shows
-    /// whose column `col_idx`, `default` where the volume lacks it, holds
-    /// `value`; `TIMED` charges `deadline` a run of rows at a time, those
-    /// looked at for the first shown one included
-    #[inline(always)]
-    fn partition_rows_of<const TIMED: bool>(
-        &self,
-        (seg_id, cs): &(u64, super::manifest::ColdSegment),
-        (col_idx, partition_value, default_val): (usize, &Value, &Value),
-        (tombstones, hot_skip, cut): (&FxHashMap<i64, u64>, &FxHashSet<i64>, &CommitCut),
-        result: &mut RowVec,
-        deadline: Deadline,
-    ) -> Result<()> {
-        let wants_null = partition_value.is_null();
-        let vol = &cs.volume;
-        let mapping = &cs.mapping;
-        // Resolve partition column through mapping (handles DROP COLUMN ordinal shifts)
-        let phys_col = if col_idx < mapping.sources.len() {
-            match &mapping.sources[col_idx] {
-                super::writer::ColSource::Volume(idx) => Some(*idx),
-                super::writer::ColSource::Default(_) => None,
-            }
-        } else {
-            None
-        };
-        // Skip volume if missing column and default doesn't match target
-        if phys_col.is_none() && default_val != partition_value {
-            return Ok(());
-        }
-        // Zone-map prune on partition column (metadata, works for cold)
-        if let Some(zone) = phys_col.and_then(|pc| vol.meta.zone_maps.get(pc)) {
-            let may_hold = if wants_null {
-                zone.null_count > 0
-            } else {
-                zone.may_contain_eq(
-                    partition_value,
-                    phys_col.and_then(|pc| vol.meta.nan_count(pc)) != Some(0),
-                )
-            };
-            if !may_hold {
-                return Ok(());
-            }
-        }
-        let row_ids = vol.row_ids()?;
-        let shown = |i: usize| {
-            cs.is_visible(i)
-                && !self.is_row_tombstoned(tombstones, row_ids[i], cut)
-                && !hot_skip.contains(&row_ids[i])
-        };
-        let rows = vol.meta.row_count;
-        let first = if TIMED {
-            let mut first = None;
-            for from in (0..rows).step_by(CHARGE_BEAT) {
-                let to = (from + CHARGE_BEAT).min(rows);
-                deadline.charge(DeadlineSite::StorageRead, to - from)?;
-                first = (from..to).find(|&i| shown(i));
-                if first.is_some() {
-                    break;
-                }
-            }
-            first
-        } else {
-            (0..rows).find(|&i| shown(i))
-        };
-        let Some(start) = first else {
-            return Ok(());
-        };
-        // Load cold volume on demand after pruning, through the file
-        // the view captured
-        let loaded;
-        let vol: &Arc<FrozenVolume> = if vol.is_cold() {
-            loaded = match self.load_captured(*seg_id, cs.file.as_ref())? {
-                Some(v) => v,
-                None => return Ok(()),
-            };
-            &loaded
-        } else {
-            vol.mark_accessed();
-            vol
-        };
-
-        let column = phys_col.map(|pc| vol.columns.get(pc)).transpose()?;
-        let mut reader = super::writer::RowReader::new(Arc::clone(vol));
-        let mut unpaid = 0usize;
-        for (i, &rid) in row_ids.iter().enumerate().skip(start) {
-            if TIMED {
-                unpaid += 1;
-                if unpaid == CHARGE_BEAT {
-                    unpaid = 0;
-                    deadline.charge(DeadlineSite::StorageRead, CHARGE_BEAT)?;
-                }
-            }
-            if !cs.is_visible(i) {
-                continue;
-            }
-            if self.is_row_tombstoned(tombstones, rid, cut) || hot_skip.contains(&rid) {
-                continue;
-            }
-            let matches = if let Some(col) = column {
-                if col.is_null(i) {
-                    wants_null
-                } else {
-                    &col.get_value(i) == partition_value
-                }
-            } else {
-                // Missing column → all rows have default, already checked match above
-                true
-            };
-            if matches {
-                let row = reader.row(i, mapping)?;
-                result.push((rid, row));
-            }
-        }
-        if TIMED {
-            deadline.charge(DeadlineSite::StorageRead, unpaid)?;
-        }
-        Ok(())
-    }
-
-    /// One round of `get_rows_for_partition_value` across seals: the rows,
-    /// hot and sealed, whose column `partition.0` holds `partition.1`;
-    /// `TIMED` charges `deadline` a run of rows at a time
-    #[inline(always)]
-    fn partition_round<const TIMED: bool>(
-        &self,
-        generation: u64,
-        (column_name, partition_value): (&str, &Value),
-        deadline: Deadline,
-    ) -> Result<Option<Option<RowVec>>> {
-        let cut = self.read_cut();
-        if !self.segment_mgr.has_segments() {
-            let hot =
-                self.hot
-                    .get_rows_for_partition_value(column_name, partition_value, deadline)?;
-            return Ok((!self.seal_moved(generation)).then_some(hot));
-        }
-
-        if self.segment_mgr.seal_overlap() > 0 {
-            return Ok(Some(None));
-        }
-
-        let schema = self.hot.schema();
-        let col_idx = match schema.column_index_map().get(&column_name.to_lowercase()) {
-            Some(&idx) => idx,
-            None => return Ok(Some(None)),
-        };
-
-        // Get hot rows for this partition value; a hot side that cannot
-        // answer, with local writes among others, leaves it to the scan
-        let Some(mut result) =
-            self.hot
-                .get_rows_for_partition_value(column_name, partition_value, deadline)?
-        else {
-            return Ok(Some(None));
-        };
-
-        // Build hot_skip: hot row_ids + tombstones + pending tombstones
-        // Lazy: prune by zone maps on the partition column before loading cold volumes.
-        let mut hot_skip: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-        let (tombstones_arc, volumes) = self.cold_view(&mut hot_skip, true)?;
-        if self.seal_moved(generation) {
-            return Ok(None);
-        }
-
-        let default_val = self.column_default(col_idx);
-        let key = (col_idx, partition_value, &default_val);
-        let skip = (&*tombstones_arc, &hot_skip, &cut);
-        for volume in volumes.iter() {
-            self.partition_rows_of::<TIMED>(volume, key, skip, &mut result, deadline)?;
-        }
-
-        self.check_cold()?;
-        Ok(Some(Some(result)))
-    }
-
-    /// [`Self::partition_round`] charged, compiled apart so the untimed
-    /// loop holds no charge
-    #[inline(never)]
-    fn partition_round_timed(
-        &self,
-        generation: u64,
-        partition: (&str, &Value),
-        deadline: Deadline,
-    ) -> Result<Option<Option<RowVec>>> {
-        self.partition_round::<true>(generation, partition, deadline)
-    }
-
     /// Whether `cs` shows any of its rows, read a row group at a time
     fn shows_any_row(
         &self,
@@ -5031,89 +4772,6 @@ impl SegmentedTable {
         Ok(())
     }
 
-    /// The sealed rows of `row_ids` that `filter` keeps, added to `buffer`;
-    /// the ids no volume holds go to `hot_ids`, `cached` keeps the reader of
-    /// the last volume read
-    #[inline(always)]
-    fn sealed_rows_into(
-        &self,
-        row_ids: &[i64],
-        (filter, fallible): (&dyn Expression, bool),
-        buffer: &mut RowVec,
-        hot_ids: &mut Vec<i64>,
-        cached: &mut Option<(super::writer::RowReader, super::writer::ColumnMapping)>,
-    ) -> Result<()> {
-        for &row_id in row_ids {
-            if let Some(found) = self.find_segment_row(row_id)? {
-                let idx = found.idx;
-                if !cached
-                    .as_ref()
-                    .is_some_and(|(reader, _)| Arc::ptr_eq(reader.volume(), &found.volume))
-                {
-                    *cached = Some((
-                        super::writer::RowReader::new(Arc::clone(&found.volume)),
-                        found.mapping()?.clone(),
-                    ));
-                }
-                let (reader, mapping) = cached
-                    .as_mut()
-                    .map(|(reader, mapping)| (reader, &*mapping))
-                    .expect("reader just set");
-                let row = reader.row(idx, mapping)?;
-                if passes(filter, fallible, &row)? {
-                    buffer.push((row_id, row));
-                }
-            } else {
-                hot_ids.push(row_id);
-            }
-        }
-        Ok(())
-    }
-
-    /// One round of `fetch_rows_by_ids_into` across seals: the rows of
-    /// `row_ids`, sealed then hot, that `read.0` keeps, added to `buffer`;
-    /// `TIMED` charges `deadline` a run of ids at a time
-    #[inline(always)]
-    fn fetch_round<const TIMED: bool>(
-        &self,
-        row_ids: &[i64],
-        read: (&dyn Expression, bool),
-        buffer: &mut RowVec,
-        deadline: Deadline,
-    ) -> Result<()> {
-        let mut hot_ids = Vec::new();
-        let mut cached = None;
-        if TIMED {
-            for ids in row_ids.chunks(CHARGE_BEAT) {
-                deadline.charge(DeadlineSite::StorageRead, ids.len())?;
-                self.sealed_rows_into(ids, read, buffer, &mut hot_ids, &mut cached)?;
-            }
-        } else {
-            self.sealed_rows_into(row_ids, read, buffer, &mut hot_ids, &mut cached)?;
-        }
-        #[cfg(any(test, feature = "test-failpoints"))]
-        crate::test_failpoints::row_ids_classified();
-
-        if !hot_ids.is_empty() {
-            self.hot
-                .fetch_rows_by_ids_into(&hot_ids, read.0, buffer, deadline)?;
-        }
-        self.check_cold()
-    }
-
-    /// [`Self::fetch_round`] charged, compiled apart so the untimed loop
-    /// holds no charge
-    #[inline(never)]
-    fn fetch_round_timed(
-        &self,
-        row_ids: &[i64],
-        read: (&dyn Expression, bool),
-        buffer: &mut RowVec,
-        deadline: Deadline,
-    ) -> Result<()> {
-        self.fetch_round::<true>(row_ids, read, buffer, deadline)
-    }
-
     fn find_segment_row(&self, row_id: i64) -> Result<Option<SegmentRow>> {
         let cut = self.read_cut();
         // A hot version this transaction sees decides the row; a newer one it
@@ -5596,13 +5254,48 @@ impl Table for SegmentedTable {
         self.segment_mgr.segments_raw().keys().copied().collect()
     }
 
-    fn get_active_row_ids(&self, deadline: Deadline) -> Result<Vec<i64>> {
-        if let Some(result) = self.unsealed(|hot| hot.get_active_row_ids(deadline)) {
+    fn get_active_row_ids(&self) -> Result<Vec<i64>> {
+        if let Some(result) = self.unsealed(|hot| hot.get_active_row_ids()) {
             return result;
         }
-        self.across_seals(|generation| match deadline.is_none() {
-            true => self.active_ids_round::<false>(generation, deadline),
-            false => self.active_ids_round_timed(generation, deadline),
+        self.across_seals(|generation| {
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::merged_read_began();
+            let cut = self.read_cut();
+            let hot_ids = self.hot.get_active_row_ids()?;
+
+            if !self.segment_mgr.has_segments() {
+                return Ok(Some(hot_ids));
+            }
+
+            // Build hot_skip from hot row_ids + pending tombstones.
+            // Committed tombstones are kept as a shared Arc (no clone).
+            let volumes = self.segment_mgr.get_volumes_newest_first()?;
+            let tombstones_arc = self.segment_mgr.tombstone_set_arc();
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::merged_read_collected();
+            if self.seal_moved(generation) {
+                return Ok(None);
+            }
+            let mut hot_skip: FxHashSet<i64> =
+                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+            for id in &hot_ids {
+                hot_skip.insert(*id);
+            }
+            self.segment_mgr
+                .insert_pending_tombstones_into(self.pending(), &mut hot_skip);
+
+            let mut ids = Vec::new();
+            for (_, cs) in volumes.iter() {
+                let vol = &cs.volume;
+                for (i, &id) in vol.row_ids()?.iter().enumerate() {
+                    if self.shows_cold_row(cs, i, id, &tombstones_arc, &hot_skip, &cut) {
+                        ids.push(id);
+                    }
+                }
+            }
+            ids.extend(hot_ids);
+            Ok(Some(ids))
         })
     }
 
@@ -5610,15 +5303,12 @@ impl Table for SegmentedTable {
         &self,
         exclude: &crate::common::I64Set,
         limit: usize,
-        deadline: Deadline,
     ) -> Result<Vec<i64>> {
         // Without a volume the hot walk in key order stops at the limit
-        if let Some(result) =
-            self.unsealed(|hot| hot.visible_row_ids_excluding(exclude, limit, deadline))
-        {
+        if let Some(result) = self.unsealed(|hot| hot.visible_row_ids_excluding(exclude, limit)) {
             return result;
         }
-        crate::storage::traits::table::active_ids_excluding(self, exclude, limit, deadline)
+        crate::storage::traits::table::active_ids_excluding(self, exclude, limit)
     }
 
     fn delete(
@@ -5824,14 +5514,9 @@ impl Table for SegmentedTable {
         })
     }
 
-    fn fetch_rows_by_ids(
-        &self,
-        row_ids: &[i64],
-        filter: &dyn Expression,
-        deadline: Deadline,
-    ) -> Result<RowVec> {
+    fn fetch_rows_by_ids(&self, row_ids: &[i64], filter: &dyn Expression) -> Result<RowVec> {
         let mut results = RowVec::with_capacity(row_ids.len());
-        self.fetch_rows_by_ids_into(row_ids, filter, &mut results, deadline)?;
+        self.fetch_rows_by_ids_into(row_ids, filter, &mut results)?;
         Ok(results)
     }
 
@@ -5840,27 +5525,56 @@ impl Table for SegmentedTable {
         row_ids: &[i64],
         filter: &dyn Expression,
         buffer: &mut RowVec,
-        deadline: Deadline,
     ) -> Result<()> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.fetch_rows_by_ids_into");
         // Taken before the hot-only attempt, so a refused one's rows go too
         let start = buffer.len();
         if let Some(result) =
-            self.unsealed(|hot| hot.fetch_rows_by_ids_into(row_ids, filter, buffer, deadline))
+            self.unsealed(|hot| hot.fetch_rows_by_ids_into(row_ids, filter, buffer))
         {
             return result;
         }
 
-        let read = (filter, filter.can_fail());
+        let fallible = filter.can_fail();
         // An id decided hot before a seal and read after it finds nothing,
         // so the read is settled: a seal landing across it starts it over
         self.settled_across_seals(|| {
             buffer.truncate(start);
-            match deadline.is_none() {
-                true => self.fetch_round::<false>(row_ids, read, buffer, deadline),
-                false => self.fetch_round_timed(row_ids, read, buffer, deadline),
+            let mut hot_ids = Vec::new();
+            let mut cached: Option<(super::writer::RowReader, super::writer::ColumnMapping)> = None;
+
+            for &row_id in row_ids {
+                if let Some(found) = self.find_segment_row(row_id)? {
+                    let idx = found.idx;
+                    if !cached
+                        .as_ref()
+                        .is_some_and(|(reader, _)| Arc::ptr_eq(reader.volume(), &found.volume))
+                    {
+                        cached = Some((
+                            super::writer::RowReader::new(Arc::clone(&found.volume)),
+                            found.mapping()?.clone(),
+                        ));
+                    }
+                    let (reader, mapping) = cached
+                        .as_mut()
+                        .map(|(reader, mapping)| (reader, &*mapping))
+                        .expect("reader just set");
+                    let row = reader.row(idx, mapping)?;
+                    if passes(filter, fallible, &row)? {
+                        buffer.push((row_id, row));
+                    }
+                } else {
+                    hot_ids.push(row_id);
+                }
             }
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::row_ids_classified();
+
+            if !hot_ids.is_empty() {
+                self.hot.fetch_rows_by_ids_into(&hot_ids, filter, buffer)?;
+            }
+            self.check_cold()
         })
     }
 
@@ -7198,12 +6912,127 @@ impl Table for SegmentedTable {
         &self,
         column_name: &str,
         partition_value: &Value,
-        deadline: Deadline,
     ) -> Result<Option<RowVec>> {
-        let partition = (column_name, partition_value);
-        self.newest_across_seals(|generation| match deadline.is_none() {
-            true => self.partition_round::<false>(generation, partition, deadline),
-            false => self.partition_round_timed(generation, partition, deadline),
+        self.newest_across_seals(|generation| {
+            let cut = self.read_cut();
+            if !self.segment_mgr.has_segments() {
+                let hot = self
+                    .hot
+                    .get_rows_for_partition_value(column_name, partition_value)?;
+                return Ok((!self.seal_moved(generation)).then_some(hot));
+            }
+
+            if self.segment_mgr.seal_overlap() > 0 {
+                return Ok(Some(None));
+            }
+
+            let schema = self.hot.schema();
+            let col_idx = match schema.column_index_map().get(&column_name.to_lowercase()) {
+                Some(&idx) => idx,
+                None => return Ok(Some(None)),
+            };
+
+            // Get hot rows for this partition value; a hot side that cannot
+            // answer, with local writes among others, leaves it to the scan
+            let Some(mut result) = self
+                .hot
+                .get_rows_for_partition_value(column_name, partition_value)?
+            else {
+                return Ok(Some(None));
+            };
+
+            // Build hot_skip: hot row_ids + tombstones + pending tombstones
+            // Lazy: prune by zone maps on the partition column before loading cold volumes.
+            let mut hot_skip: FxHashSet<i64> =
+                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+            let (tombstones_arc, volumes) = self.cold_view(&mut hot_skip, true)?;
+            if self.seal_moved(generation) {
+                return Ok(None);
+            }
+
+            let default_val = self.column_default(col_idx);
+            let wants_null = partition_value.is_null();
+            for (seg_id, cs) in volumes.iter() {
+                let vol = &cs.volume;
+                let mapping = &cs.mapping;
+                // Resolve partition column through mapping (handles DROP COLUMN ordinal shifts)
+                let phys_col = if col_idx < mapping.sources.len() {
+                    match &mapping.sources[col_idx] {
+                        super::writer::ColSource::Volume(idx) => Some(*idx),
+                        super::writer::ColSource::Default(_) => None,
+                    }
+                } else {
+                    None
+                };
+                // Skip volume if missing column and default doesn't match target
+                if phys_col.is_none() && &default_val != partition_value {
+                    continue;
+                }
+                // Zone-map prune on partition column (metadata, works for cold)
+                if let Some(zone) = phys_col.and_then(|pc| vol.meta.zone_maps.get(pc)) {
+                    let may_hold = if wants_null {
+                        zone.null_count > 0
+                    } else {
+                        zone.may_contain_eq(
+                            partition_value,
+                            phys_col.and_then(|pc| vol.meta.nan_count(pc)) != Some(0),
+                        )
+                    };
+                    if !may_hold {
+                        continue;
+                    }
+                }
+                let row_ids = vol.row_ids()?;
+                let Some(start) = (0..vol.meta.row_count).find(|&i| {
+                    cs.is_visible(i)
+                        && !self.is_row_tombstoned(&tombstones_arc, row_ids[i], &cut)
+                        && !hot_skip.contains(&row_ids[i])
+                }) else {
+                    continue;
+                };
+                // Load cold volume on demand after pruning, through the file
+                // the view captured
+                let loaded;
+                let vol: &Arc<FrozenVolume> = if vol.is_cold() {
+                    loaded = match self.load_captured(*seg_id, cs.file.as_ref())? {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    &loaded
+                } else {
+                    vol.mark_accessed();
+                    vol
+                };
+
+                let column = phys_col.map(|pc| vol.columns.get(pc)).transpose()?;
+                let mut reader = super::writer::RowReader::new(Arc::clone(vol));
+                for (i, &rid) in row_ids.iter().enumerate().skip(start) {
+                    if !cs.is_visible(i) {
+                        continue;
+                    }
+                    if self.is_row_tombstoned(&tombstones_arc, rid, &cut) || hot_skip.contains(&rid)
+                    {
+                        continue;
+                    }
+                    let matches = if let Some(col) = column {
+                        if col.is_null(i) {
+                            wants_null
+                        } else {
+                            &col.get_value(i) == partition_value
+                        }
+                    } else {
+                        // Missing column → all rows have default, already checked match above
+                        true
+                    };
+                    if matches {
+                        let row = reader.row(i, mapping)?;
+                        result.push((rid, row));
+                    }
+                }
+            }
+
+            self.check_cold()?;
+            Ok(Some(Some(result)))
         })
     }
 
@@ -9872,7 +9701,7 @@ mod tests {
         ) -> Result<i32> {
             Ok(0)
         }
-        fn get_active_row_ids(&self, _: Deadline) -> Result<Vec<i64>> {
+        fn get_active_row_ids(&self) -> Result<Vec<i64>> {
             Ok(self.rows.iter().map(|(id, _)| *id).collect())
         }
         fn collect_hot_row_ids_into(&self, dest: &mut rustc_hash::FxHashSet<i64>) {

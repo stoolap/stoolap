@@ -109,8 +109,7 @@ captured_rows_test!(captured_all_rows, |store, id| store
 captured_rows_test!(captured_arena_rows, |store, id| store
     .get_all_visible_rows_arena(id.into()));
 captured_rows_test!(captured_cached_rows, |store, id| store
-    .get_all_visible_rows_cached(id.into(), stoolap::executor::Deadline::NONE)
-    .unwrap());
+    .get_all_visible_rows_cached(id.into()));
 captured_rows_test!(captured_unsorted_rows, |store, id| store
     .get_all_visible_rows_unsorted(id.into()));
 captured_rows_test!(captured_update_versions, |store, id| update_rows(
@@ -133,8 +132,7 @@ captured_rows_test!(captured_filtered_update, |store, id| update_rows(
         .unwrap()
 ));
 captured_rows_test!(captured_limited_rows, |store, id| store
-    .get_visible_rows_with_limit(id.into(), 1, 0, stoolap::executor::Deadline::NONE)
-    .unwrap());
+    .get_visible_rows_with_limit(id.into(), 1, 0));
 captured_rows_test!(captured_batch, |store, id| store
     .get_visible_rows_batch(id.into(), 0, 1)
     .0);
@@ -170,7 +168,6 @@ captured_rows_test!(captured_filtered_callback, |store, id| {
             id.into(),
             &balance_filter(),
             |_| false,
-            stoolap::executor::Deadline::NONE,
             |row_id, row| {
                 rows.push((row_id, row));
                 true
@@ -180,13 +177,7 @@ captured_rows_test!(captured_filtered_callback, |store, id| {
     rows
 });
 captured_rows_test!(captured_filtered_limit, |store, id| store
-    .get_visible_rows_filtered_with_limit(
-        id.into(),
-        &balance_filter(),
-        1,
-        0,
-        stoolap::executor::Deadline::NONE
-    )
+    .get_visible_rows_filtered_with_limit(id.into(), &balance_filter(), 1, 0)
     .unwrap());
 
 #[test]

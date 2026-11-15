@@ -61,8 +61,7 @@ fn a_group_walk_a_truncate_outran_is_not_an_answer() {
             }
             let mut rows = stoolap::core::RowVec::new();
             for page in ids.pages() {
-                let none = stoolap::executor::Deadline::NONE;
-                table.fetch_rows_by_ids_into(page, &ConstBoolExpr::true_expr(), &mut rows, none)?;
+                table.fetch_rows_by_ids_into(page, &ConstBoolExpr::true_expr(), &mut rows)?;
             }
             assert!(rows.is_empty(), "the truncated rows are gone");
             Ok(true)

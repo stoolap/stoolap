@@ -1248,7 +1248,7 @@ fn fully_hidden_warm_columns_are_not_decoded() {
         .unwrap()
         .is_empty());
     assert!(table
-        .get_rows_for_partition_value("b", &Value::Integer(1), stoolap::executor::Deadline::NONE)
+        .get_rows_for_partition_value("b", &Value::Integer(1))
         .unwrap()
         .unwrap()
         .is_empty());

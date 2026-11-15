@@ -407,8 +407,7 @@ fn a_truncate_during_the_walk_does_not_answer() {
             }
             let mut rows = stoolap::core::RowVec::new();
             for page in ids.pages() {
-                let none = stoolap::executor::Deadline::NONE;
-                table.fetch_rows_by_ids_into(page, &ConstBoolExpr::true_expr(), &mut rows, none)?;
+                table.fetch_rows_by_ids_into(page, &ConstBoolExpr::true_expr(), &mut rows)?;
             }
             assert!(rows.is_empty(), "the truncated rows are gone");
             Ok(true)
