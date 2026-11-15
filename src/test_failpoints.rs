@@ -1696,6 +1696,25 @@ pub fn take_read_paths() -> Vec<&'static str> {
 }
 
 thread_local! {
+    static SCAN_ACCESSES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Notes on this thread the access a statement's scan read by, as EXPLAIN
+/// names its index reads, `Seq` for every row
+pub(crate) fn scan_access_taken(access: &crate::storage::traits::ScanAccess<'_>) {
+    let taken = match access {
+        crate::storage::traits::ScanAccess::Seq => "Seq".to_string(),
+        crate::storage::traits::ScanAccess::Index(plan) => plan.explain().join("; "),
+    };
+    SCAN_ACCESSES.with(|accesses| accesses.borrow_mut().push(taken));
+}
+
+/// The accesses this thread's scans read by since the last call, in order
+pub fn take_scan_accesses() -> Vec<String> {
+    SCAN_ACCESSES.with(|accesses| std::mem::take(&mut *accesses.borrow_mut()))
+}
+
+thread_local! {
     static FK_CHILD_PROBE_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static FK_PARENT_HOLD_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static INDEX_VISITED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
