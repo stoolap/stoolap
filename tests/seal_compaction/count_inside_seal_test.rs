@@ -45,7 +45,7 @@ fn count(db: &Database, how: &Asked) -> i64 {
             let mut tx = db.engine().begin_transaction().unwrap();
             let table = tx.get_table("t").unwrap();
             let n = match how {
-                Asked::RowCount => table.row_count().unwrap(),
+                Asked::RowCount => table.row_count(stoolap::executor::Deadline::NONE).unwrap(),
                 _ => table.fast_row_count().unwrap().unwrap_or(usize::MAX),
             };
             tx.rollback().unwrap();

@@ -144,13 +144,16 @@ captured_rows_test!(captured_batch_into, |store, id| {
 captured_rows_test!(captured_pk_ordered, |store, id| store
     .collect_rows_pk_ordered(id.into(), true, 1, 0)
     .unwrap());
-captured_rows_test!(captured_keyset, |store, id| store.collect_rows_keyset(
-    id.into(),
-    Some(0),
-    None,
-    true,
-    1
-));
+captured_rows_test!(captured_keyset, |store, id| store
+    .collect_rows_keyset(
+        id.into(),
+        Some(0),
+        None,
+        true,
+        1,
+        stoolap::executor::Deadline::NONE
+    )
+    .unwrap());
 captured_rows_test!(captured_filtered_rows, |store, id| store
     .get_all_visible_rows_filtered(
         id.into(),
@@ -180,20 +183,32 @@ captured_rows_test!(captured_filtered_limit, |store, id| store
 #[test]
 fn captured_aggregate() {
     let sum = read_across_update("captured_sum", |store, id| {
-        store.sum_column(id.into(), 1).sum().unwrap()
+        store
+            .sum_column(id.into(), 1, stoolap::executor::Deadline::NONE)
+            .unwrap()
+            .sum()
+            .unwrap()
     });
     assert_eq!(
         sum,
         Value::Integer(100),
         "snapshot must sum the captured value"
     );
-    let min = read_across_update("captured_min", |store, id| store.min_column(id.into(), 1));
+    let min = read_across_update("captured_min", |store, id| {
+        store
+            .min_column(id.into(), 1, stoolap::executor::Deadline::NONE)
+            .unwrap()
+    });
     assert_eq!(
         min,
         Some(Value::Integer(100)),
         "snapshot must read the captured minimum"
     );
-    let max = read_across_update("captured_max", |store, id| store.max_column(id.into(), 1));
+    let max = read_across_update("captured_max", |store, id| {
+        store
+            .max_column(id.into(), 1, stoolap::executor::Deadline::NONE)
+            .unwrap()
+    });
     assert_eq!(
         max,
         Some(Value::Integer(100)),

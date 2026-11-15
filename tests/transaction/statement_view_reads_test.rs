@@ -155,11 +155,14 @@ fn state(table: &dyn Table) -> Vec<(i64, i64)> {
     }
     assert_eq!(looked_up, seen, "rows looked up by primary key");
     assert_eq!(
-        table.row_count().unwrap(),
+        table.row_count(stoolap::executor::Deadline::NONE).unwrap(),
         seen.len(),
         "row count of {seen:?}"
     );
-    if let Some(sum) = table.sum_column(1).unwrap() {
+    if let Some(sum) = table
+        .sum_column(1, stoolap::executor::Deadline::NONE)
+        .unwrap()
+    {
         let expected: i64 = seen.iter().map(|(_, v)| v).sum();
         assert_eq!(sum.count(), seen.len() as u64, "count of {seen:?}");
         if !seen.is_empty() {
@@ -170,11 +173,17 @@ fn state(table: &dyn Table) -> Vec<(i64, i64)> {
             );
         }
     }
-    if let Some(min) = table.min_column(1).unwrap() {
+    if let Some(min) = table
+        .min_column(1, stoolap::executor::Deadline::NONE)
+        .unwrap()
+    {
         let expected = seen.iter().map(|(_, v)| *v).min().map(Value::Integer);
         assert_eq!(min, expected, "min of {seen:?}");
     }
-    if let Some(max) = table.max_column(1).unwrap() {
+    if let Some(max) = table
+        .max_column(1, stoolap::executor::Deadline::NONE)
+        .unwrap()
+    {
         let expected = seen.iter().map(|(_, v)| *v).max().map(Value::Integer);
         assert_eq!(max, expected, "max of {seen:?}");
     }
@@ -309,7 +318,10 @@ fn an_arena_window_taken_across_a_whole_commit_answers_from_the_chains() {
         .join()
         .unwrap();
     });
-    let sum = table.sum_column(1).unwrap().unwrap();
+    let sum = table
+        .sum_column(1, stoolap::executor::Deadline::NONE)
+        .unwrap()
+        .unwrap();
     assert_eq!(
         (sum.sum().unwrap(), sum.count()),
         (Value::Integer(60), 3),
@@ -409,7 +421,12 @@ fn an_arena_pass_a_commit_published_into_answers_from_the_chains() {
     let view = db.engine().registry().capture_view();
     let (_txn, table) = through(&db, &view);
     let sum = sum_with_a_commit_inside_the_arena_pass(&db, || {
-        let sum = table.sum_column(1).unwrap().unwrap().sum().unwrap();
+        let sum = table
+            .sum_column(1, stoolap::executor::Deadline::NONE)
+            .unwrap()
+            .unwrap()
+            .sum()
+            .unwrap();
         sum.as_float64().unwrap()
     });
     assert_eq!(sum, 60.0, "through a view");
@@ -429,11 +446,14 @@ fn a_hot_row_count_without_a_view_waits_out_a_publishing_delete() {
         &["DELETE FROM t WHERE id = 1"],
         Stop::BeforeVisible,
         || {
-            counted = Some(table.row_count().unwrap());
+            counted = Some(table.row_count(stoolap::executor::Deadline::NONE).unwrap());
         },
     );
     assert_eq!(counted, Some(3), "the delete is not visible yet");
-    assert_eq!(table.row_count().unwrap(), 2);
+    assert_eq!(
+        table.row_count(stoolap::executor::Deadline::NONE).unwrap(),
+        2
+    );
 }
 
 #[test]

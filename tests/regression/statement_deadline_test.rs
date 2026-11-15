@@ -786,3 +786,153 @@ fn a_key_read_in_a_transaction_that_outlasts_its_deadline_fails() {
     );
     db.execute("ROLLBACK", ()).unwrap();
 }
+
+/// What a shape runs before its statement, inside the transaction it reads in
+#[derive(Clone, Copy)]
+enum Before {
+    Nothing,
+    OwnRows,
+    UnseenRows,
+}
+
+#[test]
+fn a_table_read_that_took_no_deadline_stops_at_it() {
+    let _guard = FailpointGuard::new();
+    let db = Database::open("memory://statement_deadline_table_reads").unwrap();
+    for sql in [
+        "CREATE TABLE h (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER, g INTEGER)",
+        "INSERT INTO h SELECT value, value % 3, value, value FROM generate_series(1, 20000)",
+        "CREATE INDEX h_g ON h (g)",
+        "CREATE INDEX h_kg ON h (k, g)",
+        "CREATE TABLE q (id INTEGER PRIMARY KEY, v INTEGER)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!(
+        "file://{}?checkpoint_interval=3600&compact_threshold=1000",
+        dir.path().display()
+    );
+    let sealed = Database::open(&dsn).unwrap();
+    for sql in [
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER, t TEXT)",
+        "CREATE INDEX s_t ON s (t)",
+        "INSERT INTO s SELECT value, value % 50, (value * 7919) % 140000, 'x' || (value % 10) \
+         FROM generate_series(1, 140000)",
+    ] {
+        sealed.execute(sql, ()).unwrap();
+    }
+    sealed.engine().seal_for_test().unwrap();
+    for sql in [
+        "DELETE FROM s WHERE id <= 10",
+        "INSERT INTO s SELECT value, value % 50, value, 'y' FROM generate_series(140001, 140100)",
+    ] {
+        sealed.execute(sql, ()).unwrap();
+    }
+    let hot = Executor::new(std::sync::Arc::clone(db.engine()));
+    let cold = Executor::new(std::sync::Arc::clone(sealed.engine()));
+    let mut ctx = ExecutionContext::new();
+    ctx.set_timeout_ms(3_600_000);
+    let rows = DeadlineSite::StorageRead;
+    let fold = DeadlineSite::StorageAggregate;
+    let as_of = "AS OF TIMESTAMP '2200-01-01 00:00:00'";
+    let hot_as_of = format!("SELECT id FROM h {as_of} WHERE v < 0");
+    let cold_as_of = format!("SELECT id FROM s {as_of} WHERE v < 0");
+    // None charged its site before its read took the deadline
+    let shapes = [
+        (
+            &hot,
+            Before::Nothing,
+            rows,
+            "SELECT id FROM h WHERE k = 1 AND v < 0 ORDER BY g LIMIT 1",
+        ),
+        (
+            &cold,
+            Before::Nothing,
+            rows,
+            "SELECT id FROM s WHERE v = -1 ORDER BY id DESC LIMIT 1",
+        ),
+        (
+            &hot,
+            Before::UnseenRows,
+            rows,
+            "SELECT * FROM q WHERE id > 0 ORDER BY id LIMIT 1",
+        ),
+        (
+            &hot,
+            Before::Nothing,
+            rows,
+            "SELECT id, ROW_NUMBER() OVER (PARTITION BY g ORDER BY id) FROM h LIMIT 1",
+        ),
+        (
+            &cold,
+            Before::Nothing,
+            rows,
+            "SELECT id, ROW_NUMBER() OVER (PARTITION BY t ORDER BY id) FROM s LIMIT 1",
+        ),
+        (
+            &cold,
+            Before::Nothing,
+            rows,
+            "SELECT COUNT(DISTINCT t) FROM s",
+        ),
+        (&cold, Before::Nothing, rows, "SELECT DISTINCT t FROM s"),
+        (&hot, Before::Nothing, fold, "SELECT SUM(v) FROM h"),
+        (&hot, Before::Nothing, fold, "SELECT MIN(v) FROM h"),
+        (&hot, Before::Nothing, fold, "SELECT MAX(v) FROM h"),
+        (&cold, Before::Nothing, fold, "SELECT SUM(v) FROM s"),
+        (&cold, Before::Nothing, fold, "SELECT MIN(v) FROM s"),
+        (&cold, Before::Nothing, fold, "SELECT MAX(v) FROM s"),
+        (&hot, Before::Nothing, rows, hot_as_of.as_str()),
+        (&cold, Before::Nothing, rows, cold_as_of.as_str()),
+        (&hot, Before::OwnRows, rows, "SELECT COUNT(*) FROM h"),
+        (&cold, Before::UnseenRows, rows, "SELECT COUNT(*) FROM s"),
+        (
+            &cold,
+            Before::Nothing,
+            DeadlineSite::StorageDelete,
+            "DELETE FROM s WHERE id IN (SELECT 20 UNION SELECT 30)",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    // A sealed top-k walked newest first, past the charges of its hot rows
+    let sql = "SELECT id FROM s WHERE k = 7 AND v > 139990 AND v < 140000 ORDER BY id DESC LIMIT 1";
+    pass_deadline_after(rows, 3);
+    let stopped = read(&cold, sql, &ctx);
+    keep_deadlines();
+    if !matches!(stopped, Err(Error::QueryCancelled)) {
+        wrong.push(format!("{sql} past 3 charges gave {stopped:?}"));
+    }
+    for (executor, before, site, sql) in shapes {
+        match before {
+            Before::Nothing => {
+                read(executor, "BEGIN", &ctx).unwrap();
+            }
+            Before::OwnRows => {
+                read(executor, "BEGIN", &ctx).unwrap();
+                read(executor, "INSERT INTO h VALUES (900000, 1, 5, 5)", &ctx).unwrap();
+            }
+            // Rows another handle commits after the snapshot began
+            Before::UnseenRows => {
+                let hot_side = std::ptr::eq(executor, &hot);
+                let (table, other) = if hot_side { ("q", &db) } else { ("s", &sealed) };
+                read(executor, "BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT", &ctx).unwrap();
+                let begun = format!("SELECT COUNT(*) FROM {table} WHERE id = 1");
+                read(executor, &begun, &ctx).unwrap();
+                let insert = format!(
+                    "INSERT INTO {table} (id, v) SELECT value + 200000, 1 \
+                     FROM generate_series(1, 10000)"
+                );
+                other.execute(&insert, ()).unwrap();
+            }
+        }
+        pass_deadline_at(site);
+        let stopped = read(executor, sql, &ctx);
+        keep_deadlines();
+        read(executor, "ROLLBACK", &ctx).unwrap();
+        if !matches!(stopped, Err(Error::QueryCancelled)) {
+            wrong.push(format!("{sql} gave {stopped:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

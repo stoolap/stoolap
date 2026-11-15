@@ -111,7 +111,7 @@ fn snapshot_rows_propagate_reload_failure_while_the_count_reads_the_metadata() {
             format!("{expected:?}")
         );
         assert_eq!(
-            table.row_count().unwrap(),
+            table.row_count(stoolap::executor::Deadline::NONE).unwrap(),
             3,
             "the two sealed ids and the local row, counted without the volume's data"
         );
@@ -135,7 +135,10 @@ fn distinct_values_propagates_cold_reload_failure() {
         .to_string()
         .contains("cold volume reload failed"));
     assert_eq!(
-        format!("{:?}", table.get_partition_values("v")),
+        format!(
+            "{:?}",
+            table.get_partition_values("v", stoolap::executor::Deadline::NONE)
+        ),
         format!("{expected:?}")
     );
 }
@@ -198,12 +201,16 @@ fn sum_text(sum: stoolap::Result<Option<stoolap::core::SumAccumulator>>) -> Stri
 
 #[test]
 fn sum_propagates_cold_reload_failure() {
-    assert_sum_reload_failure(|table| sum_text(table.sum_column(1)));
+    assert_sum_reload_failure(|table| {
+        sum_text(table.sum_column(1, stoolap::executor::Deadline::NONE))
+    });
 }
 
 #[test]
 fn avg_propagates_cold_reload_failure() {
-    assert_sum_reload_failure(|table| sum_text(table.avg_column(1)));
+    assert_sum_reload_failure(|table| {
+        sum_text(table.avg_column(1, stoolap::executor::Deadline::NONE))
+    });
 }
 
 fn assert_optional_reload_failure(
@@ -236,7 +243,12 @@ fn assert_optional_reload_failure(
 #[test]
 fn min_propagates_cold_reload_failure() {
     assert_optional_reload_failure(
-        |table| format!("{:?}", table.min_column(1)),
+        |table| {
+            format!(
+                "{:?}",
+                table.min_column(1, stoolap::executor::Deadline::NONE)
+            )
+        },
         Some(Value::Integer(20)),
     );
 }
@@ -244,20 +256,38 @@ fn min_propagates_cold_reload_failure() {
 #[test]
 fn max_propagates_cold_reload_failure() {
     assert_optional_reload_failure(
-        |table| format!("{:?}", table.max_column(1)),
+        |table| {
+            format!(
+                "{:?}",
+                table.max_column(1, stoolap::executor::Deadline::NONE)
+            )
+        },
         Some(Value::Integer(20)),
     );
 }
 
 #[test]
 fn partition_count_propagates_cold_reload_failure() {
-    assert_optional_reload_failure(|table| format!("{:?}", table.get_partition_count("v")), 1);
+    assert_optional_reload_failure(
+        |table| {
+            format!(
+                "{:?}",
+                table.get_partition_count("v", stoolap::executor::Deadline::NONE)
+            )
+        },
+        1,
+    );
 }
 
 #[test]
 fn partition_values_propagate_cold_reload_failure() {
     assert_optional_reload_failure(
-        |table| format!("{:?}", table.get_partition_values("v")),
+        |table| {
+            format!(
+                "{:?}",
+                table.get_partition_values("v", stoolap::executor::Deadline::NONE)
+            )
+        },
         vec![Value::Integer(20)],
     );
 }
@@ -441,7 +471,10 @@ fn sum_and_avg_use_resident_stats_without_reloading() {
     let dir = tempfile::tempdir().unwrap();
     let (table, path) = cold_table(dir.path(), false);
     std::fs::remove_file(&path).unwrap();
-    for result in [sum_text(table.sum_column(1)), sum_text(table.avg_column(1))] {
+    for result in [
+        sum_text(table.sum_column(1, stoolap::executor::Deadline::NONE)),
+        sum_text(table.avg_column(1, stoolap::executor::Deadline::NONE)),
+    ] {
         assert_eq!(result, "Ok(Some(\"30 of 2\"))");
     }
     assert!(table.segment_manager().segments_raw()[&1].volume.is_cold());
@@ -521,9 +554,15 @@ fn resident_identity_and_counts_do_not_reload_column_files() {
         let found = format!("{:?}", table.has_row_id(id));
         assert!(found == format!("Ok({expected})") || found == expected.to_string());
     }
-    assert_eq!(table.row_count().unwrap(), 2);
+    assert_eq!(
+        table.row_count(stoolap::executor::Deadline::NONE).unwrap(),
+        2
+    );
     table.segment_manager().add_tombstones(&[1], 1);
-    assert_eq!(table.row_count().unwrap(), 1);
+    assert_eq!(
+        table.row_count(stoolap::executor::Deadline::NONE).unwrap(),
+        1
+    );
     let exists = format!("{:?}", table.segment_manager().row_exists(1));
     assert!(exists == "Ok(false)" || exists == "false");
     let physical = format!("{:?}", table.segment_manager().is_row_id_in_volume(1));

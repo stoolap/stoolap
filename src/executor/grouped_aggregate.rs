@@ -261,7 +261,7 @@ impl Executor {
         use crate::storage::mvcc::version_store::AggregateOp;
         if aggregations.is_empty() {
             let column = &table.schema().columns[group_index].name_lower;
-            let values = table.get_partition_values(column)?;
+            let values = table.get_partition_values(column, deadline)?;
             return Ok(values.map(|values| {
                 (0i64..)
                     .zip(values)

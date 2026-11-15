@@ -2227,10 +2227,11 @@ impl Executor {
             select_items.iter().map(|i| i.output_name.clone()).collect();
 
         // Get partition values from the index (lazy iteration key!)
-        let partition_values = match table.get_partition_values(partition_col)? {
-            Some(values) => values,
-            None => return Ok(None),
-        };
+        let partition_values =
+            match table.get_partition_values(partition_col, ctx.deadline_of_call())? {
+                Some(values) => values,
+                None => return Ok(None),
+            };
 
         // Process partitions one at a time, stopping when we have enough rows
         // Process partitions one at a time, stopping when we have enough

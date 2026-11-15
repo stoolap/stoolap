@@ -246,7 +246,7 @@ fn a_row_count_a_seal_lands_between_counts_again_and_counts_each_row_once() {
         let mut tx = db.engine().begin_transaction().unwrap();
         let table = tx.get_table("t").unwrap();
         let count = match how {
-            "row_count" => Some(table.row_count().unwrap()),
+            "row_count" => Some(table.row_count(stoolap::executor::Deadline::NONE).unwrap()),
             _ => table.fast_row_count().unwrap(),
         };
         drop(table);
@@ -278,7 +278,7 @@ fn a_row_count_holds_no_seal_fence_between_its_two_counts() {
         let mut tx = db.engine().begin_transaction().unwrap();
         let table = tx.get_table("t").unwrap();
         let count = match how {
-            "row_count" => Some(table.row_count().unwrap()),
+            "row_count" => Some(table.row_count(stoolap::executor::Deadline::NONE).unwrap()),
             _ => table.fast_row_count().unwrap(),
         };
         drop(table);

@@ -3399,7 +3399,9 @@ impl Executor {
                 const CHANGED_ROUNDS: usize = 3;
                 let mut rounds = 0;
                 loop {
-                    delete_count = table.delete_found(&mut row_ids, &found, &mut changed)?;
+                    let deadline = ctx.deadline_of_call();
+                    delete_count =
+                        table.delete_found(&mut row_ids, &found, &mut changed, deadline)?;
                     if changed.is_empty() {
                         break;
                     }

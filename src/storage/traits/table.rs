@@ -508,6 +508,7 @@ pub trait Table: Send + Sync {
         row_ids: &mut Vec<i64>,
         found: &FoundVersions,
         changed: &mut Vec<(i64, Row, VersionMark)>,
+        deadline: Deadline,
     ) -> Result<i32>;
 
     /// The ids of the sealed volumes this table holds now; empty for a table
@@ -1308,7 +1309,8 @@ pub trait Table: Send + Sync {
     ///
     /// # Errors
     /// Returns a storage error if visible rows cannot be read.
-    fn row_count(&self) -> Result<usize> {
+    fn row_count(&self, deadline: Deadline) -> Result<usize> {
+        let _ = deadline;
         Ok(0) // Default implementation - override in concrete tables
     }
 
@@ -1401,6 +1403,7 @@ pub trait Table: Send + Sync {
         limit: usize,
         offset: usize,
         needed: Option<&[bool]>,
+        deadline: Deadline,
     ) -> Result<Option<RowVec>> {
         let _ = (
             walk,
@@ -1411,6 +1414,7 @@ pub trait Table: Send + Sync {
             limit,
             offset,
             needed,
+            deadline,
         );
         Ok(None)
     }
@@ -1435,9 +1439,10 @@ pub trait Table: Send + Sync {
         start_from: Option<i64>,
         ascending: bool,
         limit: usize,
-    ) -> Option<RowVec> {
-        let _ = (start_after, start_from, ascending, limit);
-        None // Default implementation - override in concrete tables
+        deadline: Deadline,
+    ) -> Result<Option<RowVec>> {
+        let _ = (start_after, start_from, ascending, limit, deadline);
+        Ok(None) // Default implementation - override in concrete tables
     }
 
     /// Collects rows grouped by an indexed partition column (PARTITION BY optimization)
@@ -1469,8 +1474,12 @@ pub trait Table: Send + Sync {
     ///
     /// # Returns
     /// Some(Vec<Value>) with distinct values, or None if column has no index
-    fn get_partition_values(&self, column_name: &str) -> Result<Option<Vec<Value>>> {
-        let _ = column_name;
+    fn get_partition_values(
+        &self,
+        column_name: &str,
+        deadline: Deadline,
+    ) -> Result<Option<Vec<Value>>> {
+        let _ = (column_name, deadline);
         Ok(None) // Default implementation - override in concrete tables
     }
 
@@ -1482,8 +1491,8 @@ pub trait Table: Send + Sync {
     ///
     /// # Returns
     /// Some(count) excluding NULL values, or None if column has no index
-    fn get_partition_count(&self, column_name: &str) -> Result<Option<usize>> {
-        let _ = column_name;
+    fn get_partition_count(&self, column_name: &str, deadline: Deadline) -> Result<Option<usize>> {
+        let _ = (column_name, deadline);
         Ok(None) // Default implementation - override in concrete tables
     }
 
@@ -1580,6 +1589,7 @@ pub trait Table: Send + Sync {
         &self,
         _point: &ReadPoint,
         _authority: Option<&mut FxHashSet<i64>>,
+        _deadline: Deadline,
     ) -> Result<RowVec> {
         Err(Error::internal("this table keeps no history"))
     }
@@ -1645,7 +1655,11 @@ pub trait Table: Send + Sync {
     ///
     /// # Arguments
     /// * `col_idx` - Column index to sum
-    fn sum_column(&self, _col_idx: usize) -> Result<Option<crate::core::SumAccumulator>> {
+    fn sum_column(
+        &self,
+        _col_idx: usize,
+        _deadline: Deadline,
+    ) -> Result<Option<crate::core::SumAccumulator>> {
         Ok(None) // Default implementation - override in concrete tables
     }
 
@@ -1656,9 +1670,13 @@ pub trait Table: Send + Sync {
     ///
     /// # Arguments
     /// * `col_idx` - Column index to average
-    fn avg_column(&self, _col_idx: usize) -> Result<Option<crate::core::SumAccumulator>> {
+    fn avg_column(
+        &self,
+        _col_idx: usize,
+        deadline: Deadline,
+    ) -> Result<Option<crate::core::SumAccumulator>> {
         // Default: use sum_column if available
-        self.sum_column(_col_idx)
+        self.sum_column(_col_idx, deadline)
     }
 
     /// Compute MIN of a column without materializing rows (deferred aggregation)
@@ -1668,7 +1686,7 @@ pub trait Table: Send + Sync {
     ///
     /// # Arguments
     /// * `col_idx` - Column index to find minimum
-    fn min_column(&self, _col_idx: usize) -> Result<Option<Option<Value>>> {
+    fn min_column(&self, _col_idx: usize, _deadline: Deadline) -> Result<Option<Option<Value>>> {
         Ok(None) // Default implementation - override in concrete tables
     }
 
@@ -1679,7 +1697,7 @@ pub trait Table: Send + Sync {
     ///
     /// # Arguments
     /// * `col_idx` - Column index to find maximum
-    fn max_column(&self, _col_idx: usize) -> Result<Option<Option<Value>>> {
+    fn max_column(&self, _col_idx: usize, _deadline: Deadline) -> Result<Option<Option<Value>>> {
         Ok(None) // Default implementation - override in concrete tables
     }
 

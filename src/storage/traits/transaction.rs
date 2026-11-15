@@ -271,7 +271,12 @@ pub trait Transaction: Send {
 
     /// Every row of `table_name` as it stood at `point`, every column in
     /// the table's order
-    fn rows_at(&self, table_name: &str, point: &ReadPoint) -> Result<RowVec>;
+    fn rows_at(
+        &self,
+        table_name: &str,
+        point: &ReadPoint,
+        deadline: crate::common::deadline::Deadline,
+    ) -> Result<RowVec>;
 }
 
 /// What only this crate can make: the key to a table without the write

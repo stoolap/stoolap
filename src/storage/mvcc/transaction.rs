@@ -1132,9 +1132,14 @@ impl Transaction for MvccTransaction {
         table.select_with_aliases(&col_refs, expr, aliases)
     }
 
-    fn rows_at(&self, table_name: &str, point: &ReadPoint) -> Result<RowVec> {
+    fn rows_at(
+        &self,
+        table_name: &str,
+        point: &ReadPoint,
+        deadline: crate::common::deadline::Deadline,
+    ) -> Result<RowVec> {
         self.check_active()?;
-        self.get_table(table_name)?.rows_at(point, None)
+        self.get_table(table_name)?.rows_at(point, None, deadline)
     }
 }
 
