@@ -5046,7 +5046,7 @@ impl Executor {
                                 && !keeps_outer
                                 && inner_key_idx.is_some()
                             {
-                                let stream = JoinStream::of_operator(Box::new(op))?;
+                                let stream = JoinStream::of_index(op)?;
                                 let where_ = (cross_row_filter, where_blocks);
                                 let source = JoinedRows::new(stream, where_, ctx);
                                 return self.aggregate_joined(

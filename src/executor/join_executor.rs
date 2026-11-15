@@ -85,9 +85,11 @@ use crate::executor::aggregation::{compile_over_pair, compile_over_slots};
 use crate::executor::context::ExecutionContext;
 use crate::executor::expression::{JoinFilter, RowFilter, SharedProgram, SubqueryExecutor};
 use crate::executor::hash_table::JoinHashTable;
-use crate::executor::operator::{MaterializedOperator, Operator};
+use crate::executor::operator::{MaterializedOperator, Operator, RowRef};
 use crate::executor::operators::hash_join::{HashJoinOperator, JoinSide, JoinType};
-use crate::executor::operators::index_nested_loop::BatchIndexNestedLoopJoinOperator;
+use crate::executor::operators::index_nested_loop::{
+    BatchIndexNestedLoopJoinOperator, IndexNestedLoopJoinOperator,
+};
 use crate::executor::operators::nested_loop_join::NestedLoopJoinOperator;
 use crate::executor::parallel::{
     parallel_hash_join_with_room, HashJoinSlices, ParallelConfig, DEFAULT_PARALLEL_JOIN_THRESHOLD,
@@ -1240,10 +1242,12 @@ pub(crate) fn join_part_rows() -> usize {
     JOIN_PART_ROWS
 }
 
-/// What makes a stream's joined rows: an operator, a batch index join, or a
-/// parallel hash join a slice at a time with the rows of its slice not yet read
+/// What makes a stream's joined rows: an operator, an index join, a batch
+/// index join, or a parallel hash join a slice at a time with the rows of its
+/// slice not yet read
 enum StreamSource<'a> {
     Operator(Box<dyn Operator + 'a>),
+    Index(Box<IndexNestedLoopJoinOperator<'a>>),
     IndexBatch(Box<BatchIndexNestedLoopJoinOperator<'a>>),
     Slices(Box<HashJoinSlices>, std::vec::IntoIter<Row>),
 }
@@ -1260,9 +1264,10 @@ pub(crate) struct JoinStream<'a> {
 }
 
 impl<'a> JoinStream<'a> {
-    /// The rows `op` makes, opened here, as an aggregation reads them
-    pub(crate) fn of_operator(op: Box<dyn Operator + 'a>) -> Result<Self> {
-        Self::new(StreamSource::Operator(op), (Vec::new(), None), 0)
+    /// The rows the index join `op` makes, opened here, filled into a part
+    /// without a call per row
+    pub(crate) fn of_index(op: IndexNestedLoopJoinOperator<'a>) -> Result<Self> {
+        Self::new(StreamSource::Index(Box::new(op)), (Vec::new(), None), 0)
     }
 
     /// The rows the batch index join `op` makes, opened here, filled into
@@ -1282,6 +1287,7 @@ impl<'a> JoinStream<'a> {
     ) -> Result<Self> {
         match &mut source {
             StreamSource::Operator(op) => op.open()?,
+            StreamSource::Index(op) => op.open()?,
             StreamSource::IndexBatch(op) => op.open()?,
             StreamSource::Slices(..) => {}
         }
@@ -1303,6 +1309,7 @@ impl<'a> JoinStream<'a> {
             StreamSource::Operator(op) => {
                 next_passing(&mut **op, &self.residual_filters, self.site, self.room)?
             }
+            StreamSource::Index(op) => op.next()?.map(RowRef::into_owned),
             StreamSource::IndexBatch(op) => op.next_joined()?,
             StreamSource::Slices(slices, rows) => loop {
                 match rows.next() {
@@ -1324,6 +1331,7 @@ impl<'a> JoinStream<'a> {
         self.open = false;
         match &mut self.source {
             StreamSource::Operator(op) => op.close(),
+            StreamSource::Index(op) => op.close(),
             StreamSource::IndexBatch(op) => op.close(),
             StreamSource::Slices(..) => Ok(()),
         }
@@ -1354,6 +1362,14 @@ impl<'a> JoinStream<'a> {
                     }
                 }
                 StreamSource::IndexBatch(op) if self.open => {
+                    let until = (part.len() + 100).min(rows);
+                    if !op.fill_joined(part, until)? {
+                        self.close()?;
+                        return Ok(false);
+                    }
+                    ctx.charge(DeadlineSite::JoinParts, part.len() - held)?;
+                }
+                StreamSource::Index(op) if self.open => {
                     let until = (part.len() + 100).min(rows);
                     if !op.fill_joined(part, until)? {
                         self.close()?;
