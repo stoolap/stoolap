@@ -354,7 +354,12 @@ fn a_refused_hot_only_fetch_leaves_nothing_in_the_callers_buffer() {
         Row::from_values(vec![Value::Integer(-1), Value::Integer(-1)]),
     ));
     table
-        .fetch_rows_by_ids_into(&[1, 2, 3], &ConstBoolExpr::true_expr(), &mut buffer)
+        .fetch_rows_by_ids_into(
+            &[1, 2, 3],
+            &ConstBoolExpr::true_expr(),
+            &mut buffer,
+            stoolap::executor::Deadline::NONE,
+        )
         .unwrap();
     drop(table);
     txn.rollback().unwrap();

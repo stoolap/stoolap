@@ -394,7 +394,8 @@ impl Executor {
                 for page in row_ids.pages() {
                     ctx.charge(DeadlineSite::Aggregate, page.len())?;
                     row_buffer.clear();
-                    table.fetch_rows_by_ids_into(page, &true_expr, &mut row_buffer)?;
+                    let none = Deadline::NONE;
+                    table.fetch_rows_by_ids_into(page, &true_expr, &mut row_buffer, none)?;
                     for (_row_id, row) in &row_buffer {
                         for (run, column) in runs.iter_mut().zip(agg_columns) {
                             match column {

@@ -718,15 +718,21 @@ fn chain_seen<C: VisibilityChecker + ?Sized>(
     false
 }
 
+/// The deadline a timed chain walk charges, and the older versions it has
+/// passed since its last charge
+type Meter<'u> = (Deadline, &'u mut usize);
+
 /// The row of `chain` that `txn_id` sees through `checker`, unless a
 /// deletion it sees hides it. `last` is the last head transaction asked
-/// and its answer, so a run of heads from one transaction asks once
+/// and its answer, so a run of heads from one transaction asks once.
+/// `TIMED` counts into `passed` each older version it passes
 #[inline(always)]
-fn seen_row<'v, C: VisibilityChecker + ?Sized>(
+fn seen_row<'v, C: VisibilityChecker + ?Sized, const TIMED: bool>(
     chain: &'v VersionChainEntry,
     checker: &ReaderChecker<'_, '_, C>,
     txn_id: i64,
     last: &mut (i64, bool),
+    passed: &mut usize,
 ) -> Option<&'v Row> {
     let head_txn_id = chain.version.txn_id;
     if head_txn_id != last.0 {
@@ -736,6 +742,9 @@ fn seen_row<'v, C: VisibilityChecker + ?Sized>(
     if seen.is_none() {
         let mut current = chain.prev.as_deref();
         while let Some(e) = current {
+            if TIMED {
+                *passed += 1;
+            }
             if checker.is_visible(e.version.txn_id, txn_id) {
                 seen = Some(e);
                 break;
@@ -760,9 +769,11 @@ fn visit_visible<'v, C: VisibilityChecker + ?Sized>(
     mut each: impl FnMut(i64, &'v Row) -> crate::core::Result<()>,
 ) -> crate::core::Result<()> {
     let mut last = (0i64, false);
+    let mut passed = 0usize;
     for (ids, chains) in chunks {
         for (&row_id, chain) in ids.iter().zip(chains) {
-            if let Some(row) = seen_row(chain, checker, txn_id, &mut last) {
+            if let Some(row) = seen_row::<C, false>(chain, checker, txn_id, &mut last, &mut passed)
+            {
                 each(row_id, row)?;
             }
         }
@@ -770,8 +781,9 @@ fn visit_visible<'v, C: VisibilityChecker + ?Sized>(
     Ok(())
 }
 
-/// [`visit_visible`] charging `deadline` each leaf, compiled apart so the
-/// untimed loop holds no charge, which costs a row loop its registers
+/// [`visit_visible`] charging `deadline` each leaf and each run of older
+/// versions it passes, compiled apart so the untimed loop holds no charge,
+/// which costs a row loop its registers
 #[inline(never)]
 fn visit_timed<'v, C: VisibilityChecker + ?Sized>(
     chunks: impl Iterator<Item = (&'v [i64], &'v [VersionChainEntry])>,
@@ -781,25 +793,323 @@ fn visit_timed<'v, C: VisibilityChecker + ?Sized>(
     mut each: impl FnMut(i64, &'v Row) -> crate::core::Result<()>,
 ) -> crate::core::Result<()> {
     let mut last = (0i64, false);
+    let mut unpaid = 0usize;
     for (ids, chains) in chunks {
         deadline.charge(DeadlineSite::StorageRead, ids.len())?;
-        visit_leaf(ids, chains, checker, txn_id, &mut last, &mut each)?;
+        let meter = (deadline, &mut unpaid);
+        visit_leaf::<C, true>(ids, chains, checker, txn_id, &mut last, meter, &mut each)?;
     }
     Ok(())
 }
 
-/// The rows `seen_row` gives of one leaf's chains, passed to `each`
+/// Adds to `result` the rows of `chains` the reader sees that `matches_row`
+/// keeps, past the first `offset` of them, which `skipped` counts: true
+/// once `result` holds `limit`. `TIMED` charges `meter` each older version
+/// it passes
 #[inline(always)]
-fn visit_leaf<'v, C: VisibilityChecker + ?Sized>(
+fn limited_matches_into<'v, C: VisibilityChecker + ?Sized, const TIMED: bool>(
+    chains: impl Iterator<Item = (&'v i64, &'v VersionChainEntry)>,
+    checker: &ReaderChecker<'_, '_, C>,
+    txn_id: i64,
+    matches_row: &impl Fn(&Row) -> crate::core::Result<bool>,
+    (limit, offset, skipped): (usize, usize, &mut usize),
+    (result, (deadline, unpaid)): (&mut RowVec, Meter<'_>),
+) -> crate::core::Result<bool> {
+    for (&row_id, chain) in chains {
+        let mut current: Option<&VersionChainEntry> = Some(chain);
+
+        while let Some(e) = current {
+            let version_txn_id = e.version.txn_id;
+            let deleted_at_txn_id = e.version.deleted_at_txn_id;
+
+            if checker.is_visible(version_txn_id, txn_id) {
+                if deleted_at_txn_id != 0 && checker.is_visible(deleted_at_txn_id, txn_id) {
+                    break; // Row is deleted
+                }
+
+                if matches_row(&e.version.data)? {
+                    if *skipped < offset {
+                        *skipped += 1;
+                    } else {
+                        result.push((row_id, e.version.data.clone()));
+                        if result.len() >= limit {
+                            return Ok(true); // Early termination!
+                        }
+                    }
+                }
+                break;
+            }
+            if TIMED {
+                deadline.charge_one(DeadlineSite::StorageRead, unpaid)?;
+            }
+            current = e.prev.as_ref().map(|b| b.as_ref());
+        }
+    }
+    Ok(false)
+}
+
+/// Adds to `result` the rows of `chains` the reader sees, past the first
+/// `offset` of them, which `skipped` counts: true once `result` holds
+/// `limit`. `TIMED` charges `meter` each older version it passes
+#[inline(always)]
+fn limited_rows_into<'v, C: VisibilityChecker + ?Sized, const TIMED: bool>(
+    chains: impl Iterator<Item = (&'v i64, &'v VersionChainEntry)>,
+    checker: &ReaderChecker<'_, '_, C>,
+    txn_id: i64,
+    (limit, offset, skipped): (usize, usize, &mut usize),
+    (result, (deadline, unpaid)): (&mut RowVec, Meter<'_>),
+) -> crate::core::Result<bool> {
+    for (&row_id, chain) in chains {
+        // FAST PATH: Check HEAD version first - O(1) for common case
+        let head_txn_id = chain.version.txn_id;
+        let head_deleted_at = chain.version.deleted_at_txn_id;
+
+        // Track the actual visible entry, not just a boolean
+        let visible_entry: Option<&VersionChainEntry> = if checker.is_visible(head_txn_id, txn_id) {
+            // HEAD is visible - check if deleted
+            if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
+                Some(chain)
+            } else {
+                None
+            }
+        } else {
+            // SLOW PATH: HEAD not visible - traverse chain for older versions
+            let mut found_entry: Option<&VersionChainEntry> = None;
+            let mut current: Option<&VersionChainEntry> = chain.prev.as_ref().map(|b| b.as_ref());
+            while let Some(e) = current {
+                if TIMED {
+                    deadline.charge_one(DeadlineSite::StorageRead, unpaid)?;
+                }
+                let version_txn_id = e.version.txn_id;
+                let deleted_at_txn_id = e.version.deleted_at_txn_id;
+
+                if checker.is_visible(version_txn_id, txn_id) {
+                    if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
+                        found_entry = Some(e);
+                    }
+                    break;
+                }
+                current = e.prev.as_ref().map(|b| b.as_ref());
+            }
+            found_entry
+        };
+
+        if let Some(entry) = visible_entry {
+            if *skipped < offset {
+                *skipped += 1;
+            } else {
+                result.push((row_id, entry.version.data.clone()));
+                if result.len() >= limit {
+                    return Ok(true); // Early termination!
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Adds to `result` the ids of `chains` the reader sees that `exclude`
+/// leaves in: true once `result` holds `limit`. `TIMED` charges `meter`
+/// each older version it passes
+#[inline(always)]
+fn ids_excluding_into<'v, C: VisibilityChecker + ?Sized, const TIMED: bool>(
+    chains: impl Iterator<Item = (&'v i64, &'v VersionChainEntry)>,
+    checker: &ReaderChecker<'_, '_, C>,
+    txn_id: i64,
+    (exclude, limit): (&crate::common::I64Set, usize),
+    (result, (deadline, unpaid)): (&mut Vec<i64>, Meter<'_>),
+) -> crate::core::Result<bool> {
+    for (&row_id, chain) in chains {
+        if exclude.contains(row_id) {
+            continue;
+        }
+        // The newest version this transaction sees decides whether
+        // the row exists for it
+        let mut current: Option<&VersionChainEntry> = Some(chain);
+        let mut exists = false;
+        while let Some(e) = current {
+            if checker.is_visible(e.version.txn_id, txn_id) {
+                let deleted_at = e.version.deleted_at_txn_id;
+                exists = deleted_at == 0 || !checker.is_visible(deleted_at, txn_id);
+                break;
+            }
+            if TIMED {
+                deadline.charge_one(DeadlineSite::StorageRead, unpaid)?;
+            }
+            current = e.prev.as_ref().map(|b| b.as_ref());
+        }
+        if exists {
+            result.push(row_id);
+            if result.len() >= limit {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// The store [`VersionStore::for_each_visible`] reads under its locks: the
+/// chains, the arena's row metadata and its rows
+type HeldStore<'s> = (
+    &'s crate::common::CowBTree<VersionChainEntry>,
+    &'s [crate::storage::mvcc::arena::ArenaRowMeta],
+    &'s [CompactArc<[Value]>],
+);
+
+/// Passes `callback` the row the reader sees of each of `row_ids` that has
+/// one: false once `callback` stops. `TIMED` charges `meter` each older
+/// version it passes
+#[inline(always)]
+fn each_visible_of<C: VisibilityChecker + ?Sized, const TIMED: bool>(
+    row_ids: &[i64],
+    (versions, arena_meta, arena_data): HeldStore<'_>,
+    checker: &ReaderChecker<'_, '_, C>,
+    txn_id: i64,
+    (callback, (deadline, unpaid)): (&mut impl FnMut(i64, Row) -> bool, Meter<'_>),
+) -> crate::core::Result<bool> {
+    for &row_id in row_ids {
+        // Speculative arena probe: O(1) for auto-increment PKs
+        if row_id > 0 {
+            let probe_idx = (row_id - 1) as usize;
+            if probe_idx < arena_meta.len() {
+                let meta = arena_meta[probe_idx];
+                if meta.row_id == row_id && checker.is_visible(meta.txn_id, txn_id) {
+                    if meta.deleted_at_txn_id == 0
+                        || !checker.is_visible(meta.deleted_at_txn_id, txn_id)
+                    {
+                        let row = Row::from_arc(CompactArc::clone(&arena_data[probe_idx]));
+                        if !callback(row_id, row) {
+                            return Ok(false);
+                        }
+                    }
+                    continue; // Skip CowBTree lookup
+                }
+            }
+        }
+
+        // CowBTree lookup: O(log n)
+        if let Some(chain) = versions.get(row_id) {
+            let head_txn_id = chain.version.txn_id;
+            let head_deleted_at = chain.version.deleted_at_txn_id;
+
+            if checker.is_visible(head_txn_id, txn_id) {
+                if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
+                    let row = if let Some(idx) = unpack_arena_idx(chain.arena_idx) {
+                        if let Some(arc_row) = arena_data.get(idx) {
+                            Row::from_arc(CompactArc::clone(arc_row))
+                        } else {
+                            chain.version.data.clone()
+                        }
+                    } else {
+                        chain.version.data.clone()
+                    };
+                    if !callback(row_id, row) {
+                        return Ok(false);
+                    }
+                }
+                continue;
+            }
+
+            // Traverse version chain for older visible versions
+            let mut current: Option<&VersionChainEntry> = chain.prev.as_ref().map(|b| b.as_ref());
+            while let Some(e) = current {
+                if TIMED {
+                    deadline.charge_one(DeadlineSite::StorageRead, unpaid)?;
+                }
+                if checker.is_visible(e.version.txn_id, txn_id) {
+                    if e.version.deleted_at_txn_id == 0
+                        || !checker.is_visible(e.version.deleted_at_txn_id, txn_id)
+                    {
+                        let row = if let Some(idx) = unpack_arena_idx(e.arena_idx) {
+                            if let Some(arc_row) = arena_data.get(idx) {
+                                Row::from_arc(CompactArc::clone(arc_row))
+                            } else {
+                                e.version.data.clone()
+                            }
+                        } else {
+                            e.version.data.clone()
+                        };
+                        if !callback(row_id, row) {
+                            return Ok(false);
+                        }
+                    }
+                    break;
+                }
+                current = e.prev.as_ref().map(|b| b.as_ref());
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// Passes `callback` the row the reader sees of each of `chains` that
+/// `matches_row` keeps and `hidden` does not name, asked before a filter
+/// that is `fallible` and after one that is not: false once `callback`
+/// stops. `TIMED` charges `meter` each older version it passes
+#[inline(always)]
+fn filtered_each_of<'v, C: VisibilityChecker + ?Sized, const TIMED: bool>(
+    chains: impl Iterator<Item = (&'v i64, &'v VersionChainEntry)>,
+    checker: &ReaderChecker<'_, '_, C>,
+    txn_id: i64,
+    (matches_row, fallible, hidden): (
+        &impl Fn(&Row) -> crate::core::Result<bool>,
+        bool,
+        &impl Fn(i64) -> bool,
+    ),
+    (callback, (deadline, unpaid)): (&mut impl FnMut(i64, Row) -> bool, Meter<'_>),
+) -> crate::core::Result<bool> {
+    for (&row_id, chain) in chains {
+        // Before a filter that can fail, after one that cannot
+        if fallible && hidden(row_id) {
+            continue;
+        }
+        let mut current: Option<&VersionChainEntry> = Some(chain);
+
+        while let Some(e) = current {
+            let version_txn_id = e.version.txn_id;
+            let deleted_at_txn_id = e.version.deleted_at_txn_id;
+
+            if checker.is_visible(version_txn_id, txn_id) {
+                if deleted_at_txn_id != 0 && checker.is_visible(deleted_at_txn_id, txn_id) {
+                    break;
+                }
+
+                if matches_row(&e.version.data)?
+                    && (fallible || !hidden(row_id))
+                    && !callback(row_id, e.version.data.clone())
+                {
+                    return Ok(false);
+                }
+                break;
+            }
+            if TIMED {
+                deadline.charge_one(DeadlineSite::StorageRead, unpaid)?;
+            }
+            current = e.prev.as_deref();
+        }
+    }
+    Ok(true)
+}
+
+/// The rows `seen_row` gives of one leaf's chains, passed to `each`;
+/// `TIMED` charges `meter` the older versions passed, a run at a time,
+/// after the chain that ends one
+#[inline(always)]
+fn visit_leaf<'v, C: VisibilityChecker + ?Sized, const TIMED: bool>(
     ids: &'v [i64],
     chains: &'v [VersionChainEntry],
     checker: &ReaderChecker<'_, '_, C>,
     txn_id: i64,
     last: &mut (i64, bool),
+    (deadline, passed): Meter<'_>,
     each: &mut impl FnMut(i64, &'v Row) -> crate::core::Result<()>,
 ) -> crate::core::Result<()> {
     for (&row_id, chain) in ids.iter().zip(chains) {
-        if let Some(row) = seen_row(chain, checker, txn_id, last) {
+        let row = seen_row::<C, TIMED>(chain, checker, txn_id, last, passed);
+        if TIMED && *passed >= CHARGE_BEAT {
+            deadline.charge(DeadlineSite::StorageRead, std::mem::take(passed))?;
+        }
+        if let Some(row) = row {
             each(row_id, row)?;
         }
     }
@@ -853,9 +1163,16 @@ impl HotRows {
                 deadline.charge(DeadlineSite::StorageRead, ids.len())?;
             }
             let last = &mut self.last;
-            visit_leaf(ids, chains, &checker, txn_id, last, &mut |id, row| {
-                take(id, row, out)
-            })?;
+            let meter = (Deadline::NONE, &mut 0);
+            visit_leaf::<_, false>(
+                ids,
+                chains,
+                &checker,
+                txn_id,
+                last,
+                meter,
+                &mut |id, row| take(id, row, out),
+            )?;
             self.leaves.advance();
         }
         Ok(self.leaves.leaf().is_some())
@@ -3310,98 +3627,77 @@ impl VersionStore {
     /// This is more efficient than calling get_visible_version() per row_id because:
     /// - Single lock acquisition for CowBTree + arena (not per-row)
     /// - Supports early termination (unlike get_visible_versions_batch which collects all)
-    pub fn for_each_visible<F>(&self, row_ids: &[i64], reader: Reader<'_>, mut callback: F)
+    ///
+    /// `deadline` is charged a run of ids at a time.
+    pub fn for_each_visible<F>(
+        &self,
+        row_ids: &[i64],
+        reader: Reader<'_>,
+        deadline: Deadline,
+        callback: F,
+    ) -> crate::core::Result<()>
     where
         F: FnMut(i64, Row) -> bool,
     {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.for_each_visible");
+        match deadline.is_none() {
+            true => self.each_visible::<false>(row_ids, reader, deadline, callback),
+            false => self.each_visible_timed(row_ids, reader, deadline, callback),
+        }
+    }
+
+    /// [`Self::for_each_visible`]; `TIMED` charges `deadline` a run of ids
+    /// at a time
+    #[inline(always)]
+    fn each_visible<const TIMED: bool>(
+        &self,
+        row_ids: &[i64],
+        reader: Reader<'_>,
+        deadline: Deadline,
+        mut callback: impl FnMut(i64, Row) -> bool,
+    ) -> crate::core::Result<()> {
         if self.closed.load(Ordering::Acquire) || row_ids.is_empty() {
-            return;
+            return Ok(());
         }
 
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => reader.over(&**c),
-            None => return,
+            None => return Ok(()),
         };
         let txn_id = reader.txn_id;
 
         // Lock ordering: versions first, then arena (matches commit path)
         let versions = self.versions.read();
         let arena_guard = self.arena.read_guard();
-        let arena_meta = arena_guard.meta();
-        let arena_data = arena_guard.data();
-
-        for &row_id in row_ids {
-            // Speculative arena probe: O(1) for auto-increment PKs
-            if row_id > 0 {
-                let probe_idx = (row_id - 1) as usize;
-                if probe_idx < arena_meta.len() {
-                    let meta = arena_meta[probe_idx];
-                    if meta.row_id == row_id && checker.is_visible(meta.txn_id, txn_id) {
-                        if meta.deleted_at_txn_id == 0
-                            || !checker.is_visible(meta.deleted_at_txn_id, txn_id)
-                        {
-                            let row = Row::from_arc(CompactArc::clone(&arena_data[probe_idx]));
-                            if !callback(row_id, row) {
-                                return;
-                            }
-                        }
-                        continue; // Skip CowBTree lookup
-                    }
+        let store = (&*versions, arena_guard.meta(), arena_guard.data());
+        let mut unpaid = 0usize;
+        if TIMED {
+            for ids in row_ids.chunks(CHARGE_BEAT) {
+                deadline.charge(DeadlineSite::StorageRead, ids.len())?;
+                let each = (&mut callback, (deadline, &mut unpaid));
+                if !each_visible_of::<_, true>(ids, store, &checker, txn_id, each)? {
+                    break;
                 }
             }
-
-            // CowBTree lookup: O(log n)
-            if let Some(chain) = versions.get(row_id) {
-                let head_txn_id = chain.version.txn_id;
-                let head_deleted_at = chain.version.deleted_at_txn_id;
-
-                if checker.is_visible(head_txn_id, txn_id) {
-                    if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                        let row = if let Some(idx) = unpack_arena_idx(chain.arena_idx) {
-                            if let Some(arc_row) = arena_data.get(idx) {
-                                Row::from_arc(CompactArc::clone(arc_row))
-                            } else {
-                                chain.version.data.clone()
-                            }
-                        } else {
-                            chain.version.data.clone()
-                        };
-                        if !callback(row_id, row) {
-                            return;
-                        }
-                    }
-                    continue;
-                }
-
-                // Traverse version chain for older visible versions
-                let mut current: Option<&VersionChainEntry> =
-                    chain.prev.as_ref().map(|b| b.as_ref());
-                while let Some(e) = current {
-                    if checker.is_visible(e.version.txn_id, txn_id) {
-                        if e.version.deleted_at_txn_id == 0
-                            || !checker.is_visible(e.version.deleted_at_txn_id, txn_id)
-                        {
-                            let row = if let Some(idx) = unpack_arena_idx(e.arena_idx) {
-                                if let Some(arc_row) = arena_data.get(idx) {
-                                    Row::from_arc(CompactArc::clone(arc_row))
-                                } else {
-                                    e.version.data.clone()
-                                }
-                            } else {
-                                e.version.data.clone()
-                            };
-                            if !callback(row_id, row) {
-                                return;
-                            }
-                        }
-                        break;
-                    }
-                    current = e.prev.as_ref().map(|b| b.as_ref());
-                }
-            }
+        } else {
+            let each = (&mut callback, (deadline, &mut unpaid));
+            each_visible_of::<_, false>(row_ids, store, &checker, txn_id, each)?;
         }
+        Ok(())
+    }
+
+    /// [`Self::each_visible`] charged, compiled apart so the untimed loop
+    /// holds no charge
+    #[inline(never)]
+    fn each_visible_timed(
+        &self,
+        row_ids: &[i64],
+        reader: Reader<'_>,
+        deadline: Deadline,
+        callback: impl FnMut(i64, Row) -> bool,
+    ) -> crate::core::Result<()> {
+        self.each_visible::<true>(row_ids, reader, deadline, callback)
     }
 
     /// Counts visible versions for batch operations (COUNT optimization)
@@ -4481,20 +4777,40 @@ impl VersionStore {
     /// Returns all visible rows using RowVec for zero-allocation reuse.
     ///
     /// Same as `get_all_visible_rows_arena` but uses cached RowVec.
-    /// The returned `RowVec` auto-returns to cache on drop.
+    /// The returned `RowVec` auto-returns to cache on drop. `deadline` is
+    /// charged a leaf of the rows read at a time
     #[inline]
-    pub fn get_all_visible_rows_cached(&self, reader: Reader<'_>) -> RowVec {
+    pub fn get_all_visible_rows_cached(
+        &self,
+        reader: Reader<'_>,
+        deadline: Deadline,
+    ) -> crate::core::Result<RowVec> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.get_all_visible_rows_cached");
+        match deadline.is_none() {
+            true => self.all_visible_rows::<false>(reader, deadline),
+            false => self.all_visible_rows::<true>(reader, deadline),
+        }
+    }
+
+    /// [`Self::get_all_visible_rows_cached`]; `TIMED` charges `deadline` a
+    /// leaf of the rows read at a time. Each copy stays out of its caller,
+    /// which keeps the row copy inlined in its loop
+    #[inline(never)]
+    fn all_visible_rows<const TIMED: bool>(
+        &self,
+        reader: Reader<'_>,
+        deadline: Deadline,
+    ) -> crate::core::Result<RowVec> {
         let mut result = RowVec::new();
 
         if self.closed.load(Ordering::Acquire) {
-            return result;
+            return Ok(result);
         }
 
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => reader.over(&**c),
-            None => return result,
+            None => return Ok(result),
         };
         let txn_id = reader.txn_id;
 
@@ -4507,12 +4823,17 @@ impl VersionStore {
         if current_capacity < needed {
             result.reserve(needed - current_capacity);
         }
-        let collected = visit_visible(versions.iter_chunks(), &checker, txn_id, |row_id, row| {
+        let keep = |row_id, row: &Row| {
             result.push((row_id, row.clone()));
             Ok(())
-        });
-        debug_assert!(collected.is_ok());
-        result
+        };
+        if TIMED {
+            visit_timed(versions.iter_chunks(), &checker, txn_id, deadline, keep)?;
+        } else {
+            let collected = visit_visible(versions.iter_chunks(), &checker, txn_id, keep);
+            debug_assert!(collected.is_ok());
+        }
+        Ok(result)
     }
 
     /// Returns all visible rows with their original RowVersions for UPDATE operations.
@@ -4753,21 +5074,38 @@ impl VersionStore {
     /// * `txn_id` - Transaction ID for visibility check
     /// * `limit` - Maximum number of rows to return
     /// * `offset` - Number of rows to skip before collecting
+    /// * `deadline` - Charged a leaf of the rows read at a time
     pub fn get_visible_rows_with_limit(
         &self,
         reader: Reader<'_>,
         limit: usize,
         offset: usize,
-    ) -> RowVec {
+        deadline: Deadline,
+    ) -> crate::core::Result<RowVec> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.get_visible_rows_with_limit");
+        match deadline.is_none() {
+            true => self.rows_with_limit::<false>(reader, (limit, offset), deadline),
+            false => self.rows_with_limit_timed(reader, (limit, offset), deadline),
+        }
+    }
+
+    /// [`Self::get_visible_rows_with_limit`]; `TIMED` charges `deadline` a
+    /// leaf of the rows read at a time
+    #[inline(always)]
+    fn rows_with_limit<const TIMED: bool>(
+        &self,
+        reader: Reader<'_>,
+        (limit, offset): (usize, usize),
+        deadline: Deadline,
+    ) -> crate::core::Result<RowVec> {
         if self.closed.load(Ordering::Acquire) || limit == 0 {
-            return RowVec::new();
+            return Ok(RowVec::new());
         }
 
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => reader.over(&**c),
-            None => return RowVec::new(),
+            None => return Ok(RowVec::new()),
         };
         let txn_id = reader.txn_id;
 
@@ -4779,102 +5117,102 @@ impl VersionStore {
         // the store could actually return
         let mut result = RowVec::with_capacity(limit.min(4096));
         let mut skipped = 0usize;
-
-        for (&row_id, chain) in versions.iter() {
-            // FAST PATH: Check HEAD version first - O(1) for common case
-            let head_txn_id = chain.version.txn_id;
-            let head_deleted_at = chain.version.deleted_at_txn_id;
-
-            // Track the actual visible entry, not just a boolean
-            let visible_entry: Option<&VersionChainEntry> = if checker
-                .is_visible(head_txn_id, txn_id)
-            {
-                // HEAD is visible - check if deleted
-                if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                    Some(chain)
-                } else {
-                    None
-                }
-            } else {
-                // SLOW PATH: HEAD not visible - traverse chain for older versions
-                let mut found_entry: Option<&VersionChainEntry> = None;
-                let mut current: Option<&VersionChainEntry> =
-                    chain.prev.as_ref().map(|b| b.as_ref());
-                while let Some(e) = current {
-                    let version_txn_id = e.version.txn_id;
-                    let deleted_at_txn_id = e.version.deleted_at_txn_id;
-
-                    if checker.is_visible(version_txn_id, txn_id) {
-                        if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id)
-                        {
-                            found_entry = Some(e);
-                        }
-                        break;
-                    }
-                    current = e.prev.as_ref().map(|b| b.as_ref());
-                }
-                found_entry
-            };
-
-            if let Some(entry) = visible_entry {
-                if skipped < offset {
-                    skipped += 1;
-                } else {
-                    result.push((row_id, entry.version.data.clone()));
-                    if result.len() >= limit {
-                        break; // Early termination!
-                    }
+        let mut unpaid = 0usize;
+        if TIMED {
+            for (ids, chains) in versions.iter_chunks() {
+                deadline.charge(DeadlineSite::StorageRead, ids.len())?;
+                let bounds = (limit, offset, &mut skipped);
+                let into = (&mut result, (deadline, &mut unpaid));
+                let leaf = ids.iter().zip(chains);
+                if limited_rows_into::<_, true>(leaf, &checker, txn_id, bounds, into)? {
+                    break;
                 }
             }
+        } else {
+            let bounds = (limit, offset, &mut skipped);
+            let into = (&mut result, (deadline, &mut unpaid));
+            limited_rows_into::<_, false>(versions.iter(), &checker, txn_id, bounds, into)?;
         }
+        Ok(result)
+    }
 
-        result
+    /// [`Self::rows_with_limit`] charged, compiled apart so the untimed
+    /// loop holds no charge
+    #[inline(never)]
+    fn rows_with_limit_timed(
+        &self,
+        reader: Reader<'_>,
+        bounds: (usize, usize),
+        deadline: Deadline,
+    ) -> crate::core::Result<RowVec> {
+        self.rows_with_limit::<true>(reader, bounds, deadline)
     }
 
     /// The row ids visible to `txn_id`, in key order, leaving out the ones
-    /// in `exclude` and stopping after `limit` of them
+    /// in `exclude` and stopping after `limit` of them; `deadline` is
+    /// charged a leaf of the ids read at a time
     pub fn visible_row_ids_excluding(
         &self,
         reader: Reader<'_>,
         exclude: &crate::common::I64Set,
         limit: usize,
-    ) -> Vec<i64> {
+        deadline: Deadline,
+    ) -> crate::core::Result<Vec<i64>> {
+        match deadline.is_none() {
+            true => self.ids_excluding::<false>(reader, (exclude, limit), deadline),
+            false => self.ids_excluding_timed(reader, (exclude, limit), deadline),
+        }
+    }
+
+    /// [`Self::visible_row_ids_excluding`]; `TIMED` charges `deadline` a
+    /// leaf of the ids read at a time
+    #[inline(always)]
+    fn ids_excluding<const TIMED: bool>(
+        &self,
+        reader: Reader<'_>,
+        (exclude, limit): (&crate::common::I64Set, usize),
+        deadline: Deadline,
+    ) -> crate::core::Result<Vec<i64>> {
         if self.closed.load(Ordering::Acquire) || limit == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => reader.over(&**c),
-            None => return Vec::new(),
+            None => return Ok(Vec::new()),
         };
         let txn_id = reader.txn_id;
         // Read under the lock rather than cloning the tree: the walk stops
         // at the limit, and a full one only reads keys and heads
         let versions = self.versions.read();
         let mut result = Vec::with_capacity(limit.min(4096));
-        for (&row_id, chain) in versions.iter() {
-            if exclude.contains(row_id) {
-                continue;
-            }
-            // The newest version this transaction sees decides whether
-            // the row exists for it
-            let mut current: Option<&VersionChainEntry> = Some(chain);
-            let mut exists = false;
-            while let Some(e) = current {
-                if checker.is_visible(e.version.txn_id, txn_id) {
-                    let deleted_at = e.version.deleted_at_txn_id;
-                    exists = deleted_at == 0 || !checker.is_visible(deleted_at, txn_id);
-                    break;
-                }
-                current = e.prev.as_ref().map(|b| b.as_ref());
-            }
-            if exists {
-                result.push(row_id);
-                if result.len() >= limit {
+        let keep = (exclude, limit);
+        let mut unpaid = 0usize;
+        if TIMED {
+            for (ids, chains) in versions.iter_chunks() {
+                deadline.charge(DeadlineSite::StorageRead, ids.len())?;
+                let leaf = ids.iter().zip(chains);
+                let into = (&mut result, (deadline, &mut unpaid));
+                if ids_excluding_into::<_, true>(leaf, &checker, txn_id, keep, into)? {
                     break;
                 }
             }
+        } else {
+            let into = (&mut result, (deadline, &mut unpaid));
+            ids_excluding_into::<_, false>(versions.iter(), &checker, txn_id, keep, into)?;
         }
-        result
+        Ok(result)
+    }
+
+    /// [`Self::ids_excluding`] charged, compiled apart so the untimed loop
+    /// holds no charge
+    #[inline(never)]
+    fn ids_excluding_timed(
+        &self,
+        reader: Reader<'_>,
+        keep: (&crate::common::I64Set, usize),
+        deadline: Deadline,
+    ) -> crate::core::Result<Vec<i64>> {
+        self.ids_excluding::<true>(reader, keep, deadline)
     }
 
     /// Get visible rows with LIMIT (with early termination).
@@ -4886,9 +5224,10 @@ impl VersionStore {
         reader: Reader<'_>,
         limit: usize,
         offset: usize,
-    ) -> RowVec {
+        deadline: Deadline,
+    ) -> crate::core::Result<RowVec> {
         // Delegate to the sorted version
-        self.get_visible_rows_with_limit(reader, limit, offset)
+        self.get_visible_rows_with_limit(reader, limit, offset, deadline)
     }
 
     /// Get a batch of visible rows starting after a given row_id (cursor-based pagination).
@@ -5357,18 +5696,37 @@ impl VersionStore {
     /// returns `true` to continue or `false` to stop iteration.
     /// This avoids materializing all matching rows into a Vec. A row `hidden`
     /// names is left out, before a filter that can fail is asked of it.
+    /// `deadline` is charged a leaf of the rows read at a time.
     pub fn for_each_visible_filtered<F>(
         &self,
         reader: Reader<'_>,
         filter: &dyn crate::storage::expression::Expression,
         hidden: impl Fn(i64) -> bool,
-        mut callback: F,
+        deadline: Deadline,
+        callback: F,
     ) -> crate::core::Result<()>
     where
         F: FnMut(i64, Row) -> bool,
     {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.for_each_visible_filtered");
+        match deadline.is_none() {
+            true => self.filtered_each::<false>(reader, filter, hidden, deadline, callback),
+            false => self.filtered_each_timed(reader, filter, hidden, deadline, callback),
+        }
+    }
+
+    /// [`Self::for_each_visible_filtered`]; `TIMED` charges `deadline` a
+    /// leaf of the rows read at a time
+    #[inline(always)]
+    fn filtered_each<const TIMED: bool>(
+        &self,
+        reader: Reader<'_>,
+        filter: &dyn crate::storage::expression::Expression,
+        hidden: impl Fn(i64) -> bool,
+        deadline: Deadline,
+        mut callback: impl FnMut(i64, Row) -> bool,
+    ) -> crate::core::Result<()> {
         if self.closed.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -5388,35 +5746,36 @@ impl VersionStore {
             |row: &Row| compiled_passes(filter, fallible, &compiled_filter, fully, row);
 
         let versions = self.snapshot_versions();
-
-        for (&row_id, chain) in versions.iter() {
-            // Before a filter that can fail, after one that cannot
-            if fallible && hidden(row_id) {
-                continue;
-            }
-            let mut current: Option<&VersionChainEntry> = Some(chain);
-
-            while let Some(e) = current {
-                let version_txn_id = e.version.txn_id;
-                let deleted_at_txn_id = e.version.deleted_at_txn_id;
-
-                if checker.is_visible(version_txn_id, txn_id) {
-                    if deleted_at_txn_id != 0 && checker.is_visible(deleted_at_txn_id, txn_id) {
-                        break;
-                    }
-
-                    if matches_row(&e.version.data)?
-                        && (fallible || !hidden(row_id))
-                        && !callback(row_id, e.version.data.clone())
-                    {
-                        return Ok(());
-                    }
+        let keep = (&matches_row, fallible, &hidden);
+        let mut unpaid = 0usize;
+        if TIMED {
+            for (ids, chains) in versions.iter_chunks() {
+                deadline.charge(DeadlineSite::StorageRead, ids.len())?;
+                let leaf = ids.iter().zip(chains);
+                let each = (&mut callback, (deadline, &mut unpaid));
+                if !filtered_each_of::<_, true>(leaf, &checker, txn_id, keep, each)? {
                     break;
                 }
-                current = e.prev.as_deref();
             }
+        } else {
+            let each = (&mut callback, (deadline, &mut unpaid));
+            filtered_each_of::<_, false>(versions.iter(), &checker, txn_id, keep, each)?;
         }
         Ok(())
+    }
+
+    /// [`Self::filtered_each`] charged, compiled apart so the untimed loop
+    /// holds no charge
+    #[inline(never)]
+    fn filtered_each_timed(
+        &self,
+        reader: Reader<'_>,
+        filter: &dyn crate::storage::expression::Expression,
+        hidden: impl Fn(i64) -> bool,
+        deadline: Deadline,
+        callback: impl FnMut(i64, Row) -> bool,
+    ) -> crate::core::Result<()> {
+        self.filtered_each::<true>(reader, filter, hidden, deadline, callback)
     }
 
     /// Get visible rows with filter, limit and offset applied at the storage layer.
@@ -5430,15 +5789,34 @@ impl VersionStore {
     /// * `filter` - Expression filter to apply to rows
     /// * `limit` - Maximum number of matching rows to return
     /// * `offset` - Number of matching rows to skip before collecting
+    /// * `deadline` - Charged a leaf of the rows read at a time
     pub fn get_visible_rows_filtered_with_limit(
         &self,
         reader: Reader<'_>,
         filter: &dyn crate::storage::expression::Expression,
         limit: usize,
         offset: usize,
+        deadline: Deadline,
     ) -> crate::core::Result<RowVec> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.get_visible_rows_filtered_with_limit");
+        let bounds = (limit, offset);
+        match deadline.is_none() {
+            true => self.filtered_with_limit::<false>(reader, filter, bounds, deadline),
+            false => self.filtered_with_limit_timed(reader, filter, bounds, deadline),
+        }
+    }
+
+    /// [`Self::get_visible_rows_filtered_with_limit`]; `TIMED` charges
+    /// `deadline` a leaf of the rows read at a time
+    #[inline(always)]
+    fn filtered_with_limit<const TIMED: bool>(
+        &self,
+        reader: Reader<'_>,
+        filter: &dyn crate::storage::expression::Expression,
+        (limit, offset): (usize, usize),
+        deadline: Deadline,
+    ) -> crate::core::Result<RowVec> {
         if self.closed.load(Ordering::Acquire) || limit == 0 {
             return Ok(RowVec::new());
         }
@@ -5466,36 +5844,44 @@ impl VersionStore {
         // the store could actually return
         let mut result = RowVec::with_capacity(limit.min(4096));
         let mut skipped = 0usize;
-
-        for (&row_id, chain) in versions.iter() {
-            let mut current: Option<&VersionChainEntry> = Some(chain);
-
-            while let Some(e) = current {
-                let version_txn_id = e.version.txn_id;
-                let deleted_at_txn_id = e.version.deleted_at_txn_id;
-
-                if checker.is_visible(version_txn_id, txn_id) {
-                    if deleted_at_txn_id != 0 && checker.is_visible(deleted_at_txn_id, txn_id) {
-                        break; // Row is deleted
-                    }
-
-                    if matches_row(&e.version.data)? {
-                        if skipped < offset {
-                            skipped += 1;
-                        } else {
-                            result.push((row_id, e.version.data.clone()));
-                            if result.len() >= limit {
-                                return Ok(result); // Early termination!
-                            }
-                        }
-                    }
+        let mut unpaid = 0usize;
+        if TIMED {
+            for (ids, chains) in versions.iter_chunks() {
+                deadline.charge(DeadlineSite::StorageRead, ids.len())?;
+                let rows = ids.iter().zip(chains);
+                let bounds = (limit, offset, &mut skipped);
+                let into = (&mut result, (deadline, &mut unpaid));
+                if limited_matches_into::<_, true>(
+                    rows,
+                    &checker,
+                    txn_id,
+                    &matches_row,
+                    bounds,
+                    into,
+                )? {
                     break;
                 }
-                current = e.prev.as_ref().map(|b| b.as_ref());
             }
+        } else {
+            let rows = versions.iter();
+            let bounds = (limit, offset, &mut skipped);
+            let into = (&mut result, (deadline, &mut unpaid));
+            limited_matches_into::<_, false>(rows, &checker, txn_id, &matches_row, bounds, into)?;
         }
-
         Ok(result)
+    }
+
+    /// [`Self::filtered_with_limit`] charged, compiled apart so the untimed
+    /// loop holds no charge
+    #[inline(never)]
+    fn filtered_with_limit_timed(
+        &self,
+        reader: Reader<'_>,
+        filter: &dyn crate::storage::expression::Expression,
+        bounds: (usize, usize),
+        deadline: Deadline,
+    ) -> crate::core::Result<RowVec> {
+        self.filtered_with_limit::<true>(reader, filter, bounds, deadline)
     }
 
     /// Get visible rows with filter and LIMIT (with early termination).
@@ -5508,9 +5894,10 @@ impl VersionStore {
         filter: &dyn crate::storage::expression::Expression,
         limit: usize,
         offset: usize,
+        deadline: Deadline,
     ) -> crate::core::Result<RowVec> {
         // Delegate to the sorted version
-        self.get_visible_rows_filtered_with_limit(reader, filter, limit, offset)
+        self.get_visible_rows_filtered_with_limit(reader, filter, limit, offset, deadline)
     }
 
     /// Compute COUNT(*) without materializing any rows
@@ -11301,11 +11688,16 @@ mod tests {
         }
 
         // Get with limit (txn_id, limit, offset)
-        let results = store.get_visible_rows_with_limit(2.into(), 5, 0);
+        let none = Deadline::NONE;
+        let results = store
+            .get_visible_rows_with_limit(2.into(), 5, 0, none)
+            .unwrap();
         assert_eq!(results.len(), 5);
 
         // Test with offset
-        let results_offset = store.get_visible_rows_with_limit(2.into(), 5, 10);
+        let results_offset = store
+            .get_visible_rows_with_limit(2.into(), 5, 10, none)
+            .unwrap();
         assert_eq!(results_offset.len(), 5);
     }
 

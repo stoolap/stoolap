@@ -32,7 +32,11 @@ fn sealed_row(dir: &tempfile::TempDir) -> Database {
 fn fetched_val(tx: &dyn stoolap::Transaction) -> Option<Value> {
     let table = tx.get_table("t").unwrap();
     let rows = table
-        .fetch_rows_by_ids(&[1], &ConstBoolExpr::true_expr())
+        .fetch_rows_by_ids(
+            &[1],
+            &ConstBoolExpr::true_expr(),
+            stoolap::executor::Deadline::NONE,
+        )
         .unwrap();
     rows.into_iter()
         .next()
