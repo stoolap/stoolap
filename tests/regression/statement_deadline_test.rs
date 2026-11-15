@@ -838,6 +838,8 @@ fn a_table_read_that_took_no_deadline_stops_at_it() {
     let as_of = "AS OF TIMESTAMP '2200-01-01 00:00:00'";
     let hot_as_of = format!("SELECT id FROM h {as_of} WHERE v < 0");
     let cold_as_of = format!("SELECT id FROM s {as_of} WHERE v < 0");
+    let hot_as_of_sum = format!("SELECT SUM(v) FROM h {as_of}");
+    let cold_as_of_sum = format!("SELECT SUM(v) FROM s {as_of}");
     // None charged its site before its read took the deadline
     let shapes = [
         (
@@ -886,6 +888,8 @@ fn a_table_read_that_took_no_deadline_stops_at_it() {
         (&cold, Before::Nothing, fold, "SELECT MAX(v) FROM s"),
         (&hot, Before::Nothing, rows, hot_as_of.as_str()),
         (&cold, Before::Nothing, rows, cold_as_of.as_str()),
+        (&hot, Before::Nothing, rows, hot_as_of_sum.as_str()),
+        (&cold, Before::Nothing, rows, cold_as_of_sum.as_str()),
         (&hot, Before::OwnRows, rows, "SELECT COUNT(*) FROM h"),
         (&cold, Before::UnseenRows, rows, "SELECT COUNT(*) FROM s"),
         (
@@ -964,6 +968,8 @@ fn a_long_table_read_charges_each_run_of_its_work() {
         "CREATE INDEX h_b ON h (b) USING BITMAP",
         "CREATE TABLE l (id INTEGER PRIMARY KEY, v INTEGER)",
         "INSERT INTO l VALUES (1, 0)",
+        "CREATE TABLE far (id INTEGER PRIMARY KEY)",
+        "INSERT INTO far SELECT value + 10000000 FROM generate_series(1, 20000)",
     ] {
         db.execute(sql, ()).unwrap();
     }
@@ -1040,6 +1046,8 @@ fn a_long_table_read_charges_each_run_of_its_work() {
     charged(&hot, rows, "SELECT DISTINCT x FROM h", 4);
     charged(&hot, rows, "SELECT DISTINCT b FROM h", 4);
     charged(&hot, rows, "SELECT DISTINCT id FROM h", 4);
+    // Keys past the primary key's bitset
+    charged(&hot, rows, "SELECT DISTINCT id FROM far", 4);
     charged(&cold, rows, "SELECT DISTINCT t FROM s", 7);
     charged(&cold, rows, "SELECT DISTINCT n FROM s", 34);
     charged(

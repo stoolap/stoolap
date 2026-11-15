@@ -739,11 +739,15 @@ impl Index for PkIndex {
         }
         deadline.charge(DeadlineSite::StorageRead, result.len() % CHARGE_BEAT)?;
         if !inner.overflow_empty() {
-            let mut overflow_ids: Vec<i64> = inner.overflow.iter().collect();
-            overflow_ids.sort_unstable();
-            for ids in overflow_ids.chunks(CHARGE_BEAT) {
-                deadline.charge(DeadlineSite::StorageRead, ids.len())?;
-                result.extend(ids.iter().map(|&id| Value::Integer(id)));
+            let mut ids = inner.overflow.iter();
+            loop {
+                let before = result.len();
+                result.extend(ids.by_ref().take(CHARGE_BEAT).map(Value::Integer));
+                let read = result.len() - before;
+                deadline.charge(DeadlineSite::StorageRead, read)?;
+                if read < CHARGE_BEAT {
+                    break;
+                }
             }
         }
         Ok(Some(result))

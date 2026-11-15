@@ -10037,6 +10037,8 @@ impl Executor {
                 self.begin_transaction()?.rows_at(name, &point, deadline)?
             }
         };
+        // A read whose last charge read no clock is checked once more
+        deadline.check()?;
         Ok((columns, rows))
     }
 
