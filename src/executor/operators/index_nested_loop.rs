@@ -831,6 +831,20 @@ impl<'a> IndexNestedLoopJoinOperator<'a> {
     }
 }
 
+impl IndexNestedLoopJoinOperator<'_> {
+    /// Into `out`, the next joined rows of the opened join until it holds
+    /// `until`; false once every row was made
+    pub(crate) fn fill_joined(&mut self, out: &mut RowVec, until: usize) -> Result<bool> {
+        while out.len() < until {
+            match self.next()? {
+                Some(row) => out.push((0, row.into_owned())),
+                None => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+}
+
 impl Operator for IndexNestedLoopJoinOperator<'_> {
     fn open(&mut self) -> Result<()> {
         self.outer.open()?;
