@@ -2249,11 +2249,15 @@ impl Executor {
 
             // Fetch rows for this partition only (KEY OPTIMIZATION!); a
             // table that cannot answer for one leaves the query to the scan
-            let partition_rows =
-                match table.get_rows_for_partition_value(partition_col, &partition_value)? {
-                    Some(rows) => rows,
-                    None => return Ok(None),
-                };
+            let deadline = ctx.deadline_of_call();
+            let partition_rows = match table.get_rows_for_partition_value(
+                partition_col,
+                &partition_value,
+                deadline,
+            )? {
+                Some(rows) => rows,
+                None => return Ok(None),
+            };
 
             if partition_rows.is_empty() {
                 continue;
@@ -2432,6 +2436,8 @@ impl Executor {
                 result_row_id += 1;
             }
         }
+        // A read whose last charge read no clock is checked once more
+        ctx.check_deadline()?;
 
         Ok(Some(Box::new(ExecutorResult::new(
             result_columns,

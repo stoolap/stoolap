@@ -99,10 +99,11 @@ pub(crate) fn active_ids_excluding<T: Table + ?Sized>(
     table: &T,
     exclude: &crate::common::I64Set,
     limit: usize,
+    deadline: Deadline,
 ) -> Result<Vec<i64>> {
     #[cfg(feature = "test-failpoints")]
     crate::test_failpoints::active_ids_gathered();
-    let mut ids = table.get_active_row_ids()?;
+    let mut ids = table.get_active_row_ids(deadline)?;
     ids.sort_unstable();
     Ok(ids
         .into_iter()
@@ -125,7 +126,7 @@ pub(crate) fn count_equal_by_reading<T: Table + ?Sized>(
     let mut count = 0;
     for ids in row_ids.chunks(CHUNK) {
         rows.clear();
-        table.fetch_rows_by_ids_into(ids, &all, &mut rows)?;
+        table.fetch_rows_by_ids_into(ids, &all, &mut rows, Deadline::NONE)?;
         count += rows
             .iter()
             .filter(|(_, row)| row.get(column) == Some(key))
@@ -518,17 +519,20 @@ pub trait Table: Send + Sync {
     }
 
     /// Returns all active row IDs visible to the current transaction.
-    /// Used for NOT IN (anti-join) optimization.
-    fn get_active_row_ids(&self) -> Result<Vec<i64>>;
+    /// Used for NOT IN (anti-join) optimization. `deadline` is charged a
+    /// run of the ids read at a time.
+    fn get_active_row_ids(&self, deadline: Deadline) -> Result<Vec<i64>>;
 
     /// The row ids the current transaction sees, in key order, leaving
-    /// out the ones in `exclude` and stopping after `limit` of them
+    /// out the ones in `exclude` and stopping after `limit` of them;
+    /// `deadline` is charged a run of the ids read at a time
     fn visible_row_ids_excluding(
         &self,
         exclude: &crate::common::I64Set,
         limit: usize,
+        deadline: Deadline,
     ) -> Result<Vec<i64>> {
-        active_ids_excluding(self, exclude, limit)
+        active_ids_excluding(self, exclude, limit, deadline)
     }
 
     /// Populate a FxHashSet with all hot row_ids. Avoids the intermediate Vec
@@ -1502,6 +1506,7 @@ pub trait Table: Send + Sync {
     /// # Arguments
     /// * `column_name` - The indexed column
     /// * `partition_value` - The specific partition value to fetch rows for
+    /// * `deadline` - The statement's deadline, charged a run of rows at a time
     ///
     /// # Returns
     /// Some(RowVec) with rows matching the partition value, or None if column has no index
@@ -1509,8 +1514,9 @@ pub trait Table: Send + Sync {
         &self,
         column_name: &str,
         partition_value: &Value,
+        deadline: Deadline,
     ) -> Result<Option<RowVec>> {
-        let _ = (column_name, partition_value);
+        let _ = (column_name, partition_value, deadline);
         Ok(None) // Default implementation - override in concrete tables
     }
 
@@ -1519,12 +1525,18 @@ pub trait Table: Send + Sync {
     /// # Arguments
     /// * `row_ids` - The row IDs to fetch
     /// * `filter` - Filter expression to apply to fetched rows
+    /// * `deadline` - The statement's deadline, charged a run of ids at a time
     ///
     /// # Returns
     /// RowVec of (row_id, Row) pairs for visible, non-deleted rows that pass the filter
-    fn fetch_rows_by_ids(&self, row_ids: &[i64], filter: &dyn Expression) -> Result<RowVec> {
+    fn fetch_rows_by_ids(
+        &self,
+        row_ids: &[i64],
+        filter: &dyn Expression,
+        deadline: Deadline,
+    ) -> Result<RowVec> {
         let mut results = RowVec::with_capacity(row_ids.len());
-        self.fetch_rows_by_ids_into(row_ids, filter, &mut results)?;
+        self.fetch_rows_by_ids_into(row_ids, filter, &mut results, deadline)?;
         Ok(results)
     }
 
@@ -1534,8 +1546,9 @@ pub trait Table: Send + Sync {
         row_ids: &[i64],
         filter: &dyn Expression,
         buffer: &mut RowVec,
+        deadline: Deadline,
     ) -> Result<()> {
-        let _ = (row_ids, filter, buffer);
+        let _ = (row_ids, filter, buffer, deadline);
         // Default implementation does nothing
         Ok(())
     }
