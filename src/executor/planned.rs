@@ -18,6 +18,7 @@ use std::sync::{Arc, OnceLock, RwLock, Weak};
 
 use smallvec::SmallVec;
 
+use crate::common::deadline::Deadline;
 use crate::core::{Error, KeyRows, Result, Row, RowVec, Value};
 use crate::parser::ast::{Expression, SelectStatement};
 use crate::planner::{steps_over, KeyRead, PlanText, Step};
@@ -663,7 +664,8 @@ impl Executor {
             let tx = self.begin_transaction()?;
             let table = tx.get_read_table_at(table_name, view.as_ref(), TableUse::Read)?;
             check_compiled_token(&*table, token)?;
-            let rows = table.fetch_rows_by_ids(&[pk_value], &ConstBoolExpr::true_expr())?;
+            let all = ConstBoolExpr::true_expr();
+            let rows = table.fetch_rows_by_ids(&[pk_value], &all, Deadline::NONE)?;
             view.as_ref().map_or(Ok(()), StatementView::held)?;
             return Ok(KeyRows::Many(rows));
         }
@@ -695,7 +697,8 @@ impl Executor {
         check_compiled_token(&*table, token)?;
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("exec.pk_lookup_in_transaction");
-        let rows = table.fetch_rows_by_ids(&[pk_value], &ConstBoolExpr::true_expr())?;
+        let all = ConstBoolExpr::true_expr();
+        let rows = table.fetch_rows_by_ids(&[pk_value], &all, Deadline::NONE)?;
         view.as_ref().map_or(Ok(()), StatementView::held)?;
         Ok(KeyRows::Many(rows))
     }

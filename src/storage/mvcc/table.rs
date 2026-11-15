@@ -1536,7 +1536,8 @@ impl MVCCTable {
 
     /// Fast path for index-based row fetching when there are no local transaction changes.
     /// Returns Some(rows) if we can serve from index, None if we should fall through to full path.
-    /// Takes RowIdVec for efficient pooled memory reuse.
+    /// Takes RowIdVec for efficient pooled memory reuse; `deadline` is
+    /// charged a run of ids at a time.
     #[inline]
     fn try_fetch_from_index(
         &self,
@@ -1545,6 +1546,7 @@ impl MVCCTable {
         schema: &Schema,
         limit: usize,
         offset: usize,
+        deadline: Deadline,
     ) -> Result<Option<RowVec>> {
         if limit == 0 {
             return Ok(Some(RowVec::new()));
@@ -1560,8 +1562,11 @@ impl MVCCTable {
         let fallible = expr.can_fail();
         let mut failed = None;
 
-        self.version_store
-            .for_each_visible(&row_ids, self.reader(), |row_id, row_data| {
+        self.version_store.for_each_visible(
+            &row_ids,
+            self.reader(),
+            deadline,
+            |row_id, row_data| {
                 // Re-apply filter (index may return superset for complex expressions)
                 let row = self.normalize_row_to_schema(row_data, schema);
                 match passes(expr, fallible, &row) {
@@ -1582,7 +1587,8 @@ impl MVCCTable {
                     }
                 }
                 true // Continue
-            });
+            },
+        )?;
         match failed {
             Some(e) => Err(e),
             None => Ok(Some(result)),
@@ -1591,13 +1597,15 @@ impl MVCCTable {
 
     /// Up to `limit` rows past `offset` that the OR `expr` keeps, read as an
     /// `IndexPlan::Mixed` of `reads` says: the rows its indexed operands
-    /// name, then a scan asking the other operands of the rows left
+    /// name, then a scan asking the other operands of the rows left; both
+    /// charge `deadline` as they read
     fn mixed_rows_with_limit(
         &self,
         reads: &[Option<IndexPlan>],
         expr: &dyn Expression,
         limit: usize,
         offset: usize,
+        deadline: Deadline,
     ) -> Result<Option<RowVec>> {
         if limit == 0 {
             return Ok(Some(RowVec::new()));
@@ -1693,8 +1701,11 @@ impl MVCCTable {
         let fallible = expr.can_fail();
         let mut failed = None;
 
-        self.version_store
-            .for_each_visible(&deduped_ids, self.reader(), |row_id, row_data| {
+        self.version_store.for_each_visible(
+            &deduped_ids,
+            self.reader(),
+            deadline,
+            |row_id, row_data| {
                 let row = self.normalize_row_to_schema(row_data, schema);
                 // Re-apply full OR filter to ensure correctness (index may return superset)
                 match passes(expr, fallible, &row) {
@@ -1715,7 +1726,8 @@ impl MVCCTable {
                     }
                 }
                 true
-            });
+            },
+        )?;
         if let Some(e) = failed {
             return Err(e);
         }
@@ -1751,6 +1763,7 @@ impl MVCCTable {
             self.reader(),
             unindexed_filter.as_ref(),
             already_found,
+            deadline,
             |row_id, row_data| {
                 let row = self.normalize_row_to_schema(row_data, schema);
                 if scan_skipped < remaining_offset {
@@ -2253,35 +2266,97 @@ impl MVCCTable {
         (token() == Some(quiet)).then_some(count)
     }
 
-    /// The ids of the transaction's own rows in `txn_versions`
-    fn local_ids(txn_versions: &LocalRows<'_>) -> LocalIds {
+    /// `ids`, sorted, with the transaction's own inserts in `txn_versions`
+    /// added and its deletes taken out; `TIMED` charges `deadline` a run of
+    /// its rows at a time, and the committed ids before they are sorted
+    #[inline(always)]
+    fn merge_local_ids<const TIMED: bool>(
+        txn_versions: &LocalRows<'_>,
+        ids: &mut Vec<i64>,
+        deadline: Deadline,
+    ) -> Result<()> {
+        let mut deleted = crate::common::I64Set::new();
+        let mut inserted = Vec::new();
+        let mut unpaid = 0usize;
+        for (row_id, version) in txn_versions.iter_local() {
+            if TIMED {
+                deadline.charge_one(DeadlineSite::StorageRead, &mut unpaid)?;
+            }
+            if version.is_deleted() {
+                deleted.insert(row_id);
+            } else {
+                inserted.push(row_id);
+            }
+        }
+        if TIMED {
+            deadline.charge(DeadlineSite::StorageRead, ids.len())?;
+        }
+        ids.retain(|id| !deleted.contains(*id));
+        ids.extend(inserted);
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(())
+    }
+
+    /// [`Self::merge_local_ids`] charged, compiled apart so the untimed
+    /// loop holds no charge
+    #[inline(never)]
+    fn merge_local_ids_timed(
+        txn_versions: &LocalRows<'_>,
+        ids: &mut Vec<i64>,
+        deadline: Deadline,
+    ) -> Result<()> {
+        Self::merge_local_ids::<true>(txn_versions, ids, deadline)
+    }
+
+    /// The ids of the transaction's own rows in `txn_versions`; `TIMED`
+    /// charges `deadline` a run of them at a time
+    #[inline(always)]
+    fn local_ids<const TIMED: bool>(
+        txn_versions: &LocalRows<'_>,
+        deadline: Deadline,
+    ) -> Result<LocalIds> {
         let mut ids = LocalIds {
             ids: I64Set::new(),
             min: false,
         };
+        let mut unpaid = 0usize;
         for (row_id, _) in txn_versions.iter_local() {
+            if TIMED {
+                deadline.charge_one(DeadlineSite::StorageRead, &mut unpaid)?;
+            }
             if row_id == i64::MIN {
                 ids.min = true;
             } else {
                 ids.ids.insert(row_id);
             }
         }
-        ids
+        Ok(ids)
     }
 
     /// The transaction's own rows in `txn_versions` it did not delete, as
     /// the schema reads them; the guard goes with them, so a filter asked of
-    /// them runs without it
-    fn local_rows(&self, txn_versions: LocalRows<'_>) -> RowVec {
+    /// them runs without it. `TIMED` charges `deadline` a run of them at a
+    /// time
+    #[inline(always)]
+    fn local_rows<const TIMED: bool>(
+        &self,
+        txn_versions: LocalRows<'_>,
+        deadline: Deadline,
+    ) -> Result<RowVec> {
         let mut rows = RowVec::new();
+        let mut unpaid = 0usize;
         for (row_id, version) in txn_versions.iter_local() {
+            if TIMED {
+                deadline.charge_one(DeadlineSite::StorageRead, &mut unpaid)?;
+            }
             if version.is_deleted() {
                 continue;
             }
             let row = self.normalize_row_to_schema(version.data.clone(), &self.cached_schema);
             rows.push((row_id, row));
         }
-        rows
+        Ok(rows)
     }
 
     /// Collect all visible rows, optionally filtered
@@ -2317,7 +2392,7 @@ impl MVCCTable {
             // Use cached version for unfiltered scans (main optimization)
             let raw_rows = self
                 .version_store
-                .get_all_visible_rows_cached(self.reader());
+                .get_all_visible_rows_cached(self.reader(), deadline)?;
 
             // OPTIMIZATION: Skip normalization if first row matches schema column count
             // This is the common case when no ALTER TABLE ADD/DROP COLUMN has occurred
@@ -2344,11 +2419,19 @@ impl MVCCTable {
         // Uses thread-local cached Vec for zero-allocation reuse
         let global_rows = self
             .version_store
-            .get_all_visible_rows_cached(self.reader());
+            .get_all_visible_rows_cached(self.reader(), deadline)?;
 
         // Step 2: The local rows and their ids, the guard let go
-        let local_ids = Self::local_ids(&txn_versions);
-        let local_rows = self.local_rows(txn_versions);
+        let (local_ids, local_rows) = match deadline.is_none() {
+            true => (
+                Self::local_ids::<false>(&txn_versions, deadline)?,
+                self.local_rows::<false>(txn_versions, deadline)?,
+            ),
+            false => (
+                Self::local_ids::<true>(&txn_versions, deadline)?,
+                self.local_rows::<true>(txn_versions, deadline)?,
+            ),
+        };
 
         // Step 3: Pre-allocate result
         let mut rows = RowVec::with_capacity(global_rows.len() + local_rows.len());
@@ -2402,19 +2485,22 @@ impl MVCCTable {
         limit: usize,
         offset: usize,
     ) -> Result<RowVec> {
-        if let Some(rows) = self.access_rows_with_limit(access, filter, limit, offset)? {
+        let none = Deadline::NONE;
+        if let Some(rows) = self.access_rows_with_limit(access, filter, limit, offset, none)? {
             return Ok(rows);
         }
-        self.visible_rows_with_limit(filter, limit, offset)
+        self.visible_rows_with_limit(filter, limit, offset, none)
     }
 
     /// Up to `limit` visible rows past `offset` that `filter` keeps, in row
-    /// order, read without the indexes
+    /// order, read without the indexes; `deadline` is charged as rows are
+    /// read
     fn visible_rows_with_limit(
         &self,
         filter: Option<&dyn Expression>,
         limit: usize,
         offset: usize,
+        deadline: Deadline,
     ) -> Result<RowVec> {
         // The merge below checks the limit after taking a row
         if limit == 0 {
@@ -2437,12 +2523,17 @@ impl MVCCTable {
                     expr,
                     limit,
                     offset,
+                    deadline,
                 )?
             } else {
                 // No filter: use simple LIMIT pushdown
                 // This avoids scanning all 10K rows for LIMIT 10 queries - ~30x speedup
-                self.version_store
-                    .get_visible_rows_with_limit(self.reader(), limit, offset)
+                self.version_store.get_visible_rows_with_limit(
+                    self.reader(),
+                    limit,
+                    offset,
+                    deadline,
+                )?
             };
 
             // Keep row IDs in RowVec
@@ -2451,20 +2542,40 @@ impl MVCCTable {
                 .map(|(row_id, row)| (row_id, self.normalize_row_to_schema(row, schema)))
                 .collect());
         }
+        let bounds = (limit, offset);
+        match deadline.is_none() {
+            true => self.merged_rows_with_limit::<false>(txn_versions, filter, bounds, deadline),
+            false => self.merged_rows_with_limit::<true>(txn_versions, filter, bounds, deadline),
+        }
+    }
+
+    /// [`Self::visible_rows_with_limit`] in a transaction with rows of its
+    /// own, merged over the committed ones; `TIMED` charges `deadline` a run
+    /// of the rows gathered and asked at a time. Each copy stays out of its
+    /// caller
+    #[inline(never)]
+    fn merged_rows_with_limit<const TIMED: bool>(
+        &self,
+        txn_versions: LocalRows<'_>,
+        filter: Option<&dyn Expression>,
+        (limit, offset): (usize, usize),
+        deadline: Deadline,
+    ) -> Result<RowVec> {
+        let schema = &self.cached_schema;
         let fallible = filter.is_some_and(|expr| expr.can_fail());
 
         // Has local versions - use batch fetch then merge with early termination
         // Uses thread-local cached Vec for zero-allocation reuse
         let global_rows = self
             .version_store
-            .get_all_visible_rows_cached(self.reader());
+            .get_all_visible_rows_cached(self.reader(), deadline)?;
 
         // A filter is asked of the local rows as they stood before it ran,
         // copied and the guard let go; with none the guard stays, and a row
         // the limit does not reach is not cloned
-        let local_ids = Self::local_ids(&txn_versions);
+        let local_ids = Self::local_ids::<TIMED>(&txn_versions, deadline)?;
         let (txn_versions, local_rows) = match filter {
-            Some(_) => (None, self.local_rows(txn_versions)),
+            Some(_) => (None, self.local_rows::<TIMED>(txn_versions, deadline)?),
             None => (Some(txn_versions), RowVec::new()),
         };
 
@@ -2472,9 +2583,13 @@ impl MVCCTable {
         // can actually be returned
         let mut result = RowVec::with_capacity(limit.min(4096));
         let mut count = 0;
+        let mut unpaid = 0usize;
 
         // Add global rows that don't have local overrides
         for (row_id, row) in global_rows {
+            if TIMED {
+                deadline.charge_one(DeadlineSite::StorageRead, &mut unpaid)?;
+            }
             if local_ids.hides(row_id) {
                 continue; // Local version takes precedence
             }
@@ -2496,6 +2611,9 @@ impl MVCCTable {
         // Add local versions (both updates and inserts)
         if let Some(txn_versions) = txn_versions {
             for (row_id, version) in txn_versions.iter_local() {
+                if TIMED {
+                    deadline.charge_one(DeadlineSite::StorageRead, &mut unpaid)?;
+                }
                 if version.is_deleted() {
                     continue;
                 }
@@ -2511,6 +2629,9 @@ impl MVCCTable {
             return Ok(result);
         }
         for (row_id, row) in local_rows {
+            if TIMED {
+                deadline.charge_one(DeadlineSite::StorageRead, &mut unpaid)?;
+            }
             if let Some(expr) = filter {
                 if !passes(expr, fallible, &row)? {
                     continue;
@@ -2538,28 +2659,31 @@ impl MVCCTable {
         filter: Option<&dyn Expression>,
         limit: usize,
         offset: usize,
+        deadline: Deadline,
     ) -> Result<RowVec> {
-        if let Some(rows) = self.access_rows_with_limit(access, filter, limit, offset)? {
+        if let Some(rows) = self.access_rows_with_limit(access, filter, limit, offset, deadline)? {
             return Ok(rows);
         }
-        self.limited_rows_unordered(filter, limit, offset)
+        self.limited_rows_unordered(filter, limit, offset, deadline)
     }
 
     /// Up to `limit` rows past `offset` that `access` reads and `filter`
-    /// keeps; None when it reads every row, or declines to
+    /// keeps; None when it reads every row, or declines to. `deadline` is
+    /// charged as rows are read
     fn access_rows_with_limit(
         &self,
         access: ScanAccess<'_>,
         filter: Option<&dyn Expression>,
         limit: usize,
         offset: usize,
+        deadline: Deadline,
     ) -> Result<Option<RowVec>> {
         let (ScanAccess::Index(plan), Some(filter)) = (access, filter) else {
             return Ok(None);
         };
         match plan {
             IndexPlan::Mixed(reads) => {
-                return self.mixed_rows_with_limit(reads, filter, limit, offset)
+                return self.mixed_rows_with_limit(reads, filter, limit, offset, deadline)
             }
             // The one row a key names is past an offset or under no limit
             IndexPlan::Key => {
@@ -2576,19 +2700,22 @@ impl MVCCTable {
         };
         // A key list names the transaction's own rows, read by their ids
         if plan.names_keys() && self.local().has_local_changes() {
-            let rows = self.fetch_rows_by_ids(&row_ids, filter)?;
+            let rows = self.fetch_rows_by_ids(&row_ids, filter, deadline)?;
             return Ok(Some(rows.into_iter().skip(offset).take(limit).collect()));
         }
-        self.try_fetch_from_index(row_ids, filter, &self.cached_schema, limit, offset)
+        let schema = &self.cached_schema;
+        self.try_fetch_from_index(row_ids, filter, schema, limit, offset, deadline)
     }
 
     /// Up to `limit` visible rows past `offset` that `filter` keeps, read
-    /// in no order and stopping once that many are read
+    /// in no order and stopping once that many are read; `deadline` is
+    /// charged as rows are read
     fn limited_rows_unordered(
         &self,
         filter: Option<&dyn Expression>,
         limit: usize,
         offset: usize,
+        deadline: Deadline,
     ) -> Result<RowVec> {
         #[cfg(test)]
         self.full_scans
@@ -2609,13 +2736,15 @@ impl MVCCTable {
                         expr,
                         limit,
                         offset,
+                        deadline,
                     )?
             } else {
                 self.version_store.get_visible_rows_with_limit_unordered(
                     self.reader(),
                     limit,
                     offset,
-                )
+                    deadline,
+                )?
             };
 
             // Keep row IDs in RowVec
@@ -2629,7 +2758,7 @@ impl MVCCTable {
         // Early termination is already implemented in visible_rows_with_limit
         // when there are local changes
         drop(txn_versions);
-        self.visible_rows_with_limit(filter, limit, offset)
+        self.visible_rows_with_limit(filter, limit, offset, deadline)
     }
 
     /// The version read for a row read from the transaction's own
@@ -3183,9 +3312,11 @@ impl MVCCTable {
         self.check_read()
     }
 
-    /// The store's rows of [`Self::fetch_rows_charged`], read and filtered
-    /// a run of ids at a time, each charged before it is read; compiled
-    /// apart so the untimed loop holds no charge, which costs it registers
+    /// The store's rows of [`Self::fetch_rows_charged`], a run of ids at a
+    /// time, read as `for_each_visible` charges them: the run, and each run
+    /// of older versions a chain walk passes. The filter is asked after the
+    /// store's locks are let go. Compiled apart so the untimed loop holds no
+    /// charge, which costs it registers
     #[inline(never)]
     fn fetch_global_timed(
         &self,
@@ -3195,11 +3326,14 @@ impl MVCCTable {
         deadline: Deadline,
     ) -> Result<()> {
         let fallible = filter.can_fail();
+        let mut batch = RowVec::new();
         for ids in global_ids.chunks(CHARGE_BEAT) {
-            deadline.charge(DeadlineSite::StorageRead, ids.len())?;
-            let mut batch = self
-                .version_store
-                .get_visible_versions_batch(ids, self.reader());
+            batch.clear();
+            self.version_store
+                .for_each_visible(ids, self.reader(), deadline, |row_id, row| {
+                    batch.push((row_id, row));
+                    true
+                })?;
             self.check_read()?;
             for (row_id, row) in batch.iter_mut() {
                 let row = self.normalize_row_to_schema(std::mem::take(row), &self.cached_schema);
@@ -3207,6 +3341,38 @@ impl MVCCTable {
                     rows.push((*row_id, row));
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// The committed rows of `row_ids` this transaction sees, added to `rows`
+    #[inline(always)]
+    fn visible_rows_of(&self, row_ids: &[i64], rows: &mut RowVec) {
+        for &row_id in row_ids.iter() {
+            if let Some(version) = self
+                .version_store
+                .get_visible_version(row_id, self.reader())
+            {
+                if !version.is_deleted() {
+                    rows.push((row_id, version.data.clone()));
+                }
+            }
+        }
+    }
+
+    /// [`Self::visible_rows_of`] a run of ids at a time, each charged to
+    /// `deadline` before it is read; compiled apart so the untimed loop
+    /// holds no charge
+    #[inline(never)]
+    fn visible_rows_timed(
+        &self,
+        row_ids: &[i64],
+        rows: &mut RowVec,
+        deadline: Deadline,
+    ) -> Result<()> {
+        for ids in row_ids.chunks(CHARGE_BEAT) {
+            deadline.charge(DeadlineSite::StorageRead, ids.len())?;
+            self.visible_rows_of(ids, rows);
         }
         Ok(())
     }
@@ -3330,8 +3496,9 @@ impl Table for MVCCTable {
         row_ids: &[i64],
         filter: &dyn Expression,
         rows: &mut RowVec,
+        deadline: Deadline,
     ) -> Result<()> {
-        self.fetch_rows_charged(row_ids, filter, rows, Deadline::NONE)
+        self.fetch_rows_charged(row_ids, filter, rows, deadline)
     }
 
     fn create_column(&mut self, name: &str, column_type: DataType, nullable: bool) -> Result<()> {
@@ -3494,30 +3661,22 @@ impl Table for MVCCTable {
         Ok(count)
     }
 
-    fn get_active_row_ids(&self) -> Result<Vec<i64>> {
+    fn get_active_row_ids(&self, deadline: Deadline) -> Result<Vec<i64>> {
         // Only the keys this transaction sees: a committed delete stays in
         // the version tree until it is collected, but it is not a row
         let mut ids = self.version_store.visible_row_ids_excluding(
             self.reader(),
             &crate::common::I64Set::new(),
             usize::MAX,
-        );
+            deadline,
+        )?;
         // The transaction's own inserts and deletes are part of what it sees
         let txn_versions = self.local();
         if txn_versions.has_local_changes() {
-            let mut deleted = crate::common::I64Set::new();
-            let mut inserted = Vec::new();
-            for (row_id, version) in txn_versions.iter_local() {
-                if version.is_deleted() {
-                    deleted.insert(row_id);
-                } else {
-                    inserted.push(row_id);
-                }
+            match deadline.is_none() {
+                true => Self::merge_local_ids::<false>(&txn_versions, &mut ids, deadline)?,
+                false => Self::merge_local_ids_timed(&txn_versions, &mut ids, deadline)?,
             }
-            ids.retain(|id| !deleted.contains(*id));
-            ids.extend(inserted);
-            ids.sort_unstable();
-            ids.dedup();
         }
         Ok(ids)
     }
@@ -3526,14 +3685,15 @@ impl Table for MVCCTable {
         &self,
         exclude: &crate::common::I64Set,
         limit: usize,
+        deadline: Deadline,
     ) -> Result<Vec<i64>> {
         // A transaction with writes of its own reads the whole key list
         if self.local().has_local_changes() {
-            return crate::storage::traits::table::active_ids_excluding(self, exclude, limit);
+            let excluding = crate::storage::traits::table::active_ids_excluding;
+            return excluding(self, exclude, limit, deadline);
         }
-        Ok(self
-            .version_store
-            .visible_row_ids_excluding(self.reader(), exclude, limit))
+        self.version_store
+            .visible_row_ids_excluding(self.reader(), exclude, limit, deadline)
     }
 
     fn collect_hot_row_ids_into(&self, dest: &mut rustc_hash::FxHashSet<i64>) {
@@ -4174,10 +4334,10 @@ impl Table for MVCCTable {
         offset: usize,
         deadline: Deadline,
     ) -> Result<RowVec> {
-        let rows =
-            self.collect_visible_rows_with_limit_unordered(access, where_expr, limit, offset)?;
+        let rows = self.collect_visible_rows_with_limit_unordered(
+            access, where_expr, limit, offset, deadline,
+        )?;
         self.check_read()?;
-        deadline.charge(DeadlineSite::StorageRead, rows.len())?;
         Ok(rows)
     }
 
@@ -5506,6 +5666,7 @@ impl Table for MVCCTable {
         &self,
         column_name: &str,
         partition_value: &Value,
+        deadline: Deadline,
     ) -> Result<Option<RowVec>> {
         // The index names the partition's rows only while it holds what this
         // statement sees
@@ -5524,15 +5685,10 @@ impl Table for MVCCTable {
 
         // Collect visible rows for this partition
         let mut rows = RowVec::with_capacity(row_ids.len());
-        for &row_id in row_ids.iter() {
-            if let Some(version) = self
-                .version_store
-                .get_visible_version(row_id, self.reader())
-            {
-                if !version.is_deleted() {
-                    rows.push((row_id, version.data.clone()));
-                }
-            }
+        if deadline.is_none() {
+            self.visible_rows_of(&row_ids, &mut rows);
+        } else {
+            self.visible_rows_timed(&row_ids, &mut rows, deadline)?;
         }
 
         if self.index_view_epoch() != Some(epoch) {

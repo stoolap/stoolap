@@ -825,7 +825,9 @@ fn a_table_read_that_took_no_deadline_stops_at_it() {
     sealed.engine().seal_for_test().unwrap();
     for sql in [
         "DELETE FROM s WHERE id <= 10",
-        "INSERT INTO s SELECT value, value % 50, value, 'y' FROM generate_series(140001, 140100)",
+        // Hot rows in every partition of t, so each costs a window the same
+        "INSERT INTO s SELECT value, value % 50, value, 'x' || (value % 10) \
+         FROM generate_series(140001, 140100)",
     ] {
         sealed.execute(sql, ()).unwrap();
     }
@@ -1068,5 +1070,196 @@ fn a_long_table_read_charges_each_run_of_its_work() {
         .execute("DELETE FROM s WHERE id <= 100000", ())
         .unwrap();
     charged(&cold, rows, "SELECT DISTINCT t FROM s", 34 + 9);
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_read_that_keeps_few_of_the_rows_it_reads_charges_each_run_of_them() {
+    let _guard = FailpointGuard::new();
+    let db = Database::open("memory://statement_deadline_few_kept").unwrap();
+    for sql in [
+        "CREATE TABLE h (id INTEGER PRIMARY KEY, g INTEGER, x INTEGER, half INTEGER)",
+        "INSERT INTO h SELECT value, value, value, value % 2 FROM generate_series(1, 20000)",
+        "CREATE INDEX h_g ON h (g)",
+        "CREATE INDEX h_half ON h (half)",
+        "CREATE TABLE o (id INTEGER PRIMARY KEY, g INTEGER)",
+        "INSERT INTO o SELECT value, value FROM generate_series(1, 500)",
+        "CREATE TABLE one (id INTEGER PRIMARY KEY)",
+        "INSERT INTO one VALUES (1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!(
+        "file://{}?checkpoint_interval=3600&compact_threshold=1000",
+        dir.path().display()
+    );
+    let sealed = Database::open(&dsn).unwrap();
+    for sql in [
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, half INTEGER)",
+        "CREATE INDEX s_half ON s (half)",
+        "INSERT INTO s SELECT value, value % 2 FROM generate_series(1, 140000)",
+        "CREATE TABLE one (id INTEGER PRIMARY KEY)",
+        "INSERT INTO one VALUES (1)",
+    ] {
+        sealed.execute(sql, ()).unwrap();
+    }
+    sealed.engine().seal_for_test().unwrap();
+    let hot = Executor::new(std::sync::Arc::clone(db.engine()));
+    let cold = Executor::new(std::sync::Arc::clone(sealed.engine()));
+    let mut ctx = ExecutionContext::new();
+    ctx.set_timeout_ms(3_600_000);
+    let mut wrong = Vec::new();
+    let mut charged = |executor: &Executor, sql: &str, least: usize| {
+        count_deadline_charges(DeadlineSite::StorageRead);
+        let counted = read(executor, sql, &ctx);
+        let charges = deadline_charges();
+        keep_deadlines();
+        if counted.is_err() || charges < least {
+            wrong.push(format!(
+                "{sql} gave {counted:?} in {charges} charges, under {least}"
+            ));
+        }
+    };
+    // Each run of 4,096 rows read is charged, kept or not
+    charged(&hot, "SELECT id FROM h WHERE x = -1 LIMIT 1", 4);
+    charged(&hot, "SELECT id FROM h LIMIT 1 OFFSET 19990", 4);
+    charged(&hot, "SELECT id FROM h WHERE g > 0 AND x = -1 LIMIT 1", 4);
+    charged(&hot, "SELECT id FROM h WHERE g < 3 OR x = -1 LIMIT 5", 4);
+    charged(
+        &hot,
+        "SELECT id, ROW_NUMBER() OVER (PARTITION BY half ORDER BY id) FROM h LIMIT 1",
+        2,
+    );
+    // The keys NOT IN leaves, then their rows
+    charged(
+        &hot,
+        "SELECT id FROM h WHERE id NOT IN (SELECT id FROM one)",
+        8,
+    );
+    // The inner rows each outer key, or each batch of keys, names
+    charged(&hot, "SELECT o.id, h.x FROM o JOIN h ON o.g = h.g", 100);
+    charged(
+        &cold,
+        "SELECT id FROM s WHERE id NOT IN (SELECT id FROM one) LIMIT 1",
+        34,
+    );
+    charged(
+        &cold,
+        "SELECT id FROM s WHERE id NOT IN (SELECT id FROM one)",
+        68,
+    );
+    // The first partition's rows are looked for among every sealed row
+    charged(
+        &cold,
+        "SELECT id, ROW_NUMBER() OVER (PARTITION BY half ORDER BY id) FROM s LIMIT 1",
+        34,
+    );
+    // A transaction's own row leaves a LIMIT to a read of every row
+    read(&hot, "BEGIN", &ctx).unwrap();
+    read(&hot, "INSERT INTO h VALUES (900000, 0, 0, 0)", &ctx).unwrap();
+    charged(&hot, "SELECT id FROM h WHERE x = -1 LIMIT 1", 4);
+    read(&hot, "ROLLBACK", &ctx).unwrap();
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_read_past_old_versions_own_rows_or_hidden_rows_charges_them() {
+    let _guard = FailpointGuard::new();
+    let db = Database::open("memory://statement_deadline_unseen_work").unwrap();
+    for sql in [
+        "CREATE TABLE i (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)",
+        "INSERT INTO i SELECT value, CASE WHEN value <= 10000 THEN 1 ELSE value END, value \
+         FROM generate_series(1, 50000)",
+        "CREATE INDEX i_g ON i (g)",
+        "CREATE TABLE o (id INTEGER PRIMARY KEY, g INTEGER)",
+        "INSERT INTO o VALUES (1, 1)",
+        "CREATE TABLE e (id INTEGER PRIMARY KEY, x INTEGER)",
+        "CREATE TABLE l (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)",
+        "CREATE INDEX l_g ON l (g)",
+        "INSERT INTO l VALUES (2, 1, 0)",
+        "CREATE TABLE one (id INTEGER PRIMARY KEY)",
+        "INSERT INTO one VALUES (1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!(
+        "file://{}?checkpoint_interval=3600&compact_threshold=1000",
+        dir.path().display()
+    );
+    let sealed = Database::open(&dsn).unwrap();
+    for sql in [
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, half INTEGER)",
+        "CREATE INDEX p_half ON p (half)",
+        "INSERT INTO p SELECT value, value % 2 FROM generate_series(1, 140000)",
+    ] {
+        sealed.execute(sql, ()).unwrap();
+    }
+    sealed.engine().seal_for_test().unwrap();
+    sealed
+        .execute("DELETE FROM p WHERE id <= 135000", ())
+        .unwrap();
+    let hot = Executor::new(std::sync::Arc::clone(db.engine()));
+    let cold = Executor::new(std::sync::Arc::clone(sealed.engine()));
+    let mut ctx = ExecutionContext::new();
+    ctx.set_timeout_ms(3_600_000);
+    let mut wrong = Vec::new();
+    let mut charged = |executor: &Executor, sql: &str, least: usize| {
+        count_deadline_charges(DeadlineSite::StorageRead);
+        let counted = read(executor, sql, &ctx);
+        let charges = deadline_charges();
+        keep_deadlines();
+        if counted.is_err() || charges < least {
+            wrong.push(format!(
+                "{sql} gave {counted:?} in {charges} charges, under {least}"
+            ));
+        }
+    };
+    // The 10,000 candidates a correlated EXISTS counted on one key
+    charged(
+        &hot,
+        "SELECT EXISTS(SELECT 1 FROM i WHERE i.g = o.g AND i.v < 0) FROM o LIMIT 1",
+        3,
+    );
+    // A hidden prefix of 135,000 sealed rows before the first shown one,
+    // charged a run at a time on top of the 57 charges of the rest
+    charged(
+        &cold,
+        "SELECT id, ROW_NUMBER() OVER (PARTITION BY half ORDER BY id) FROM p LIMIT 1",
+        80,
+    );
+    // The transaction's own 20,000 rows, gathered and asked
+    read(&hot, "BEGIN", &ctx).unwrap();
+    read(
+        &hot,
+        "INSERT INTO e SELECT value, value FROM generate_series(1, 20000)",
+        &ctx,
+    )
+    .unwrap();
+    charged(&hot, "SELECT id FROM e WHERE x = -1 LIMIT 1", 8);
+    charged(
+        &hot,
+        "SELECT id FROM e WHERE id NOT IN (SELECT id FROM one) LIMIT 1",
+        4,
+    );
+    read(&hot, "ROLLBACK", &ctx).unwrap();
+    // A snapshot older than 9,000 versions of the one row of l
+    read(&hot, "BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT", &ctx).unwrap();
+    read(&hot, "SELECT v FROM l", &ctx).unwrap();
+    for _ in 0..9000 {
+        db.execute("UPDATE l SET v = v + 1", ()).unwrap();
+    }
+    charged(&hot, "SELECT v FROM l WHERE v >= 0 LIMIT 1", 3);
+    charged(&hot, "SELECT v FROM l LIMIT 1", 3);
+    charged(&hot, "SELECT v FROM l WHERE g > 0 AND v >= 0 LIMIT 1", 3);
+    charged(
+        &hot,
+        "SELECT id FROM l WHERE id NOT IN (SELECT id FROM one)",
+        5,
+    );
+    charged(&hot, "SELECT v FROM l", 3);
+    charged(&hot, "SELECT v FROM l WHERE id IN (2, 3)", 3);
+    read(&hot, "ROLLBACK", &ctx).unwrap();
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }

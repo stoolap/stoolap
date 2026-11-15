@@ -160,6 +160,18 @@ impl Deadline {
         }
     }
 
+    /// Count one unit of work into `unpaid`, charging `site` each run of
+    /// [`CHARGE_BEAT`] units
+    #[inline(always)]
+    pub(crate) fn charge_one(self, site: DeadlineSite, unpaid: &mut usize) -> Result<()> {
+        *unpaid += 1;
+        if *unpaid == CHARGE_BEAT {
+            *unpaid = 0;
+            return self.charge(site, CHARGE_BEAT);
+        }
+        Ok(())
+    }
+
     /// Fail when the deadline has passed, reading the clock now
     pub fn check(self) -> Result<()> {
         match self.0 {
