@@ -1259,6 +1259,7 @@ fn a_read_past_old_versions_own_rows_or_hidden_rows_charges_them() {
         5,
     );
     charged(&hot, "SELECT v FROM l", 3);
+    charged(&hot, "SELECT v FROM l WHERE id IN (2, 3)", 3);
     read(&hot, "ROLLBACK", &ctx).unwrap();
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
