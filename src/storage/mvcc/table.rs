@@ -713,9 +713,11 @@ impl MVCCTable {
         // Step 2: Batch fetch remaining from version store
         let mut rows_with_originals = match remaining_row_ids.is_empty() {
             true => Vec::new(),
-            false => self
-                .version_store
-                .get_visible_versions_for_update(&remaining_row_ids, self.txn_id),
+            false => self.version_store.get_visible_versions_for_update(
+                &remaining_row_ids,
+                self.txn_id,
+                Deadline::NONE,
+            )?,
         };
         for (_, row, _) in &mut rows_with_originals {
             *row = self.normalize_row_to_schema(std::mem::take(row), schema);
@@ -2687,7 +2689,7 @@ impl MVCCTable {
             }
             // The one row a key names is past an offset or under no limit
             IndexPlan::Key => {
-                let mut rows = self.key_rows(filter)?;
+                let mut rows = self.key_rows(filter, deadline)?;
                 if offset > 0 || limit == 0 {
                     rows.iter_mut().for_each(|rows| rows.clear());
                 }
@@ -2826,10 +2828,16 @@ impl MVCCTable {
                     if let Some(local) = txn_versions.get_local_version(pk_id) {
                         (!local.is_deleted()).then(|| (local.data.clone(), self.local_read(local)))
                     } else {
-                        self.version_store
-                            .get_visible_version(pk_id, self.reader())
-                            .filter(|version| !version.is_deleted())
-                            .map(|version| (version.data.clone(), version))
+                        match deadline.is_none() {
+                            true => self.version_store.get_visible_version(pk_id, self.reader()),
+                            false => self.version_store.get_visible_version_charged(
+                                pk_id,
+                                self.reader(),
+                                (deadline, &mut 0),
+                            )?,
+                        }
+                        .filter(|version| !version.is_deleted())
+                        .map(|version| (version.data.clone(), version))
                     }
                 };
                 self.check_read()?;
@@ -2868,9 +2876,11 @@ impl MVCCTable {
                 }
                 self.set_planned(plan, start, setter)?;
                 if !remaining_row_ids.is_empty() {
-                    let batch_rows = self
-                        .version_store
-                        .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
+                    let batch_rows = self.version_store.get_visible_versions_for_update(
+                        &remaining_row_ids,
+                        self.txn_id,
+                        deadline,
+                    )?;
                     self.check_read()?;
                     let stored = plan.hot.len();
                     for (row_id, row, version) in batch_rows {
@@ -2927,9 +2937,11 @@ impl MVCCTable {
                 )?;
                 plan.hot.truncate(kept);
                 if !remaining_row_ids.is_empty() {
-                    let batch_rows = self
-                        .version_store
-                        .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
+                    let batch_rows = self.version_store.get_visible_versions_for_update(
+                        &remaining_row_ids,
+                        self.txn_id,
+                        deadline,
+                    )?;
                     for (row_id, row, original) in batch_rows {
                         deadline.charge(DeadlineSite::StorageUpdate, 1)?;
                         let row = self.normalize_row_to_schema(row, schema);
@@ -3066,9 +3078,11 @@ impl MVCCTable {
         }
         self.set_planned(plan, start, setter)?;
         if !remaining_row_ids.is_empty() {
-            let batch_rows = self
-                .version_store
-                .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
+            let batch_rows = self.version_store.get_visible_versions_for_update(
+                &remaining_row_ids,
+                self.txn_id,
+                Deadline::NONE,
+            )?;
             self.check_read()?;
             let stored = plan.hot.len();
             for (row_id, row, version) in batch_rows {
@@ -3216,7 +3230,7 @@ impl MVCCTable {
             return Ok(None);
         };
         if let IndexPlan::Key = plan {
-            let rows = self.key_rows(filter)?;
+            let rows = self.key_rows(filter, deadline)?;
             self.check_read()?;
             return Ok(rows);
         }
@@ -3326,14 +3340,12 @@ impl MVCCTable {
         deadline: Deadline,
     ) -> Result<()> {
         let fallible = filter.can_fail();
-        let mut batch = RowVec::new();
         for ids in global_ids.chunks(CHARGE_BEAT) {
-            batch.clear();
-            self.version_store
-                .for_each_visible(ids, self.reader(), deadline, |row_id, row| {
-                    batch.push((row_id, row));
-                    true
-                })?;
+            let mut batch = self.version_store.get_visible_versions_batch_charged(
+                ids,
+                self.reader(),
+                deadline,
+            )?;
             self.check_read()?;
             for (row_id, row) in batch.iter_mut() {
                 let row = self.normalize_row_to_schema(std::mem::take(row), &self.cached_schema);
@@ -3343,6 +3355,80 @@ impl MVCCTable {
             }
         }
         Ok(())
+    }
+
+    /// [`Self::delete_key`] charged, compiled apart so the untimed read holds
+    /// no charge
+    #[inline(never)]
+    fn delete_key_timed(
+        &self,
+        pk_id: i64,
+        expr: &dyn Expression,
+        fallible: bool,
+        deadline: Deadline,
+    ) -> Result<i32> {
+        self.delete_key::<true>(pk_id, expr, fallible, deadline)
+    }
+
+    /// The DELETE of the row the key `pk_id` names when `expr` keeps it;
+    /// `TIMED` charges `deadline` each run of older versions its read passes
+    #[inline(always)]
+    fn delete_key<const TIMED: bool>(
+        &self,
+        pk_id: i64,
+        expr: &dyn Expression,
+        fallible: bool,
+        deadline: Deadline,
+    ) -> Result<i32> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::key_delete_read();
+        // Direct O(1) lookup by primary key
+        // Use get_local_version to preserve delete signal. txn_versions.get()
+        // swallows deletes as None, causing fallback to committed store and
+        // missing uncommitted deletes in the current transaction.
+        let row_with_original = {
+            let txn_versions = self.local();
+            if let Some(local) = txn_versions.get_local_version(pk_id) {
+                if local.is_deleted() {
+                    None // Already locally deleted — don't double-count
+                } else {
+                    // Local version - no need to track original (already in write-set)
+                    Some((local.data.clone(), None))
+                }
+            } else if let Some(version) = match TIMED {
+                false => self.version_store.get_visible_version(pk_id, self.reader()),
+                true => self.version_store.get_visible_version_charged(
+                    pk_id,
+                    self.reader(),
+                    (deadline, &mut 0),
+                )?,
+            } {
+                if !version.is_deleted() {
+                    let data = version.data.clone();
+                    Some((data, Some(version)))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        self.check_read()?;
+
+        if let Some((row, original_version)) = row_with_original {
+            if !passes(expr, fallible, &row)? {
+                return Ok(0);
+            }
+            if let Some(orig) = original_version {
+                // Use optimized put that skips redundant get_visible_version
+                self.writes()?.put_with_original(pk_id, row, orig, true)?;
+            } else {
+                // Local version - use regular put
+                self.writes()?.put(pk_id, row, true)?;
+            }
+            return Ok(1);
+        }
+        Ok(0)
     }
 
     /// The committed rows of `row_ids` this transaction sees, added to `rows`
@@ -3379,8 +3465,9 @@ impl MVCCTable {
 
     /// The row an `IndexPlan::Key` names in `filter`, the transaction's own
     /// version before the committed one, when `filter` keeps it; None when
-    /// the key is not an integer, which leaves the rows to the scan
-    fn key_rows(&self, filter: &dyn Expression) -> Result<Option<RowVec>> {
+    /// the key is not an integer, which leaves the rows to the scan. A timed
+    /// read charges `deadline` the older versions it passes
+    fn key_rows(&self, filter: &dyn Expression, deadline: Deadline) -> Result<Option<RowVec>> {
         let schema = &self.cached_schema;
         // A filter that is the key equality alone keeps the row it names
         let whole = pk_equality_id(filter, schema);
@@ -3393,11 +3480,16 @@ impl MVCCTable {
             let txn_versions = self.local();
             match txn_versions.get_local_version(id) {
                 Some(local) => (!local.is_deleted()).then(|| local.data.clone()),
-                None => self
-                    .version_store
-                    .get_visible_version(id, self.reader())
-                    .filter(|version| !version.is_deleted())
-                    .map(|version| version.data.clone()),
+                None => match deadline.is_none() {
+                    true => self.version_store.get_visible_version(id, self.reader()),
+                    false => self.version_store.get_visible_version_charged(
+                        id,
+                        self.reader(),
+                        (deadline, &mut 0),
+                    )?,
+                }
+                .filter(|version| !version.is_deleted())
+                .map(|version| version.data.clone()),
             }
         };
         let mut rows = RowVec::new();
@@ -3719,7 +3811,7 @@ impl Table for MVCCTable {
             .has_decided_row(|| self.reader(), row_id, self.view.is_some()))
     }
 
-    fn has_visible_row(&self, row_id: i64) -> Result<bool> {
+    fn has_visible_row(&self, row_id: i64, deadline: Deadline) -> Result<bool> {
         let txn_versions = self.local();
         if txn_versions.get_local_version(row_id).is_some() {
             return Ok(true);
@@ -3727,11 +3819,13 @@ impl Table for MVCCTable {
         drop(txn_versions);
         // A row with no committed version here, the case of every sealed row
         // no one changed, has nothing visible: one lookup instead of the walk
-        Ok(self.version_store.has_committed_row(row_id)
-            && self
-                .version_store
-                .has_any_visible_version(&[row_id], self.reader())
-                .is_some())
+        if !self.version_store.has_committed_row(row_id) {
+            return Ok(false);
+        }
+        let store = &self.version_store;
+        Ok(store
+            .has_any_visible_version(&[row_id], self.reader(), deadline)?
+            .is_some())
     }
 
     fn try_claim_row(&self, row_id: i64) -> Result<()> {
@@ -3775,50 +3869,10 @@ impl Table for MVCCTable {
         if let Some(expr) = where_expr {
             let access = write_access(schema, access, Some(expr));
             if let WriteAccess::Key(pk_id) = access {
-                #[cfg(feature = "test-failpoints")]
-                crate::test_failpoints::key_delete_read();
-                // Direct O(1) lookup by primary key
-                // Use get_local_version to preserve delete signal. txn_versions.get()
-                // swallows deletes as None, causing fallback to committed store and
-                // missing uncommitted deletes in the current transaction.
-                let row_with_original = {
-                    let txn_versions = self.local();
-                    if let Some(local) = txn_versions.get_local_version(pk_id) {
-                        if local.is_deleted() {
-                            None // Already locally deleted — don't double-count
-                        } else {
-                            // Local version - no need to track original (already in write-set)
-                            Some((local.data.clone(), None))
-                        }
-                    } else if let Some(version) =
-                        self.version_store.get_visible_version(pk_id, self.reader())
-                    {
-                        if !version.is_deleted() {
-                            let data = version.data.clone();
-                            Some((data, Some(version)))
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
+                return match deadline.is_none() {
+                    true => self.delete_key::<false>(pk_id, expr, fallible, deadline),
+                    false => self.delete_key_timed(pk_id, expr, fallible, deadline),
                 };
-                self.check_read()?;
-
-                if let Some((row, original_version)) = row_with_original {
-                    if !passes(expr, fallible, &row)? {
-                        return Ok(0);
-                    }
-                    if let Some(orig) = original_version {
-                        // Use optimized put that skips redundant get_visible_version
-                        self.writes()?.put_with_original(pk_id, row, orig, true)?;
-                    } else {
-                        // Local version - use regular put
-                        self.writes()?.put(pk_id, row, true)?;
-                    }
-                    return Ok(1);
-                }
-                return Ok(0);
             }
 
             // Every key of the range: PK IS the row_id
@@ -3849,9 +3903,11 @@ impl Table for MVCCTable {
 
                 // Step 2: Batch fetch remaining from version store (1 lock for N rows)
                 if !remaining_row_ids.is_empty() {
-                    let batch_rows = self
-                        .version_store
-                        .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
+                    let batch_rows = self.version_store.get_visible_versions_for_update(
+                        &remaining_row_ids,
+                        self.txn_id,
+                        deadline,
+                    )?;
                     for (row_id, row, version) in batch_rows {
                         deadline.charge(DeadlineSite::StorageDelete, 1)?;
                         rows_with_originals.push((row_id, row, version));
@@ -3922,10 +3978,15 @@ impl Table for MVCCTable {
 
                 // Step 2: Batch fetch remaining from version store (1 lock for N rows)
                 if !remaining_row_ids.is_empty() {
-                    let batch_rows = self
-                        .version_store
-                        .get_visible_versions_batch(&remaining_row_ids, self.reader());
-                    let mut batch_rows = batch_rows;
+                    let store = &self.version_store;
+                    let mut batch_rows = match deadline.is_none() {
+                        true => store.get_visible_versions_batch(&remaining_row_ids, self.reader()),
+                        false => store.get_visible_versions_batch_charged(
+                            &remaining_row_ids,
+                            self.reader(),
+                            deadline,
+                        )?,
+                    };
                     for batch in batch_rows.chunks_mut(CHARGE_BEAT) {
                         deadline.charge(DeadlineSite::StorageDelete, batch.len())?;
                         for (row_id, row) in batch.iter_mut() {
@@ -3980,10 +4041,16 @@ impl Table for MVCCTable {
                 // Mark as deleted
                 self.writes()?.put(row_id, row, true)?;
                 delete_count += 1;
-            } else if let Some(version) = self
-                .version_store
-                .get_visible_version(row_id, self.reader())
-            {
+            } else if let Some(version) = match deadline.is_none() {
+                true => self
+                    .version_store
+                    .get_visible_version(row_id, self.reader()),
+                false => self.version_store.get_visible_version_charged(
+                    row_id,
+                    self.reader(),
+                    (deadline, &mut 0),
+                )?,
+            } {
                 if version.is_deleted() {
                     continue;
                 }
@@ -5287,15 +5354,20 @@ impl Table for MVCCTable {
         if let Some(pk_idx) = self.cached_schema.pk_column_index() {
             let pk_col = &self.cached_schema.columns[pk_idx];
             if pk_col.name_lower == column_name.to_lowercase() {
-                let rows = self.version_store.collect_rows_pk_ordered(
-                    self.reader(),
-                    ascending,
-                    limit,
-                    offset,
-                );
+                let store = &self.version_store;
+                let rows = match deadline.is_none() {
+                    true => store.collect_rows_pk_ordered(self.reader(), ascending, limit, offset),
+                    false => {
+                        let bounds = (limit, offset);
+                        let reader = self.reader();
+                        let rows = store
+                            .collect_rows_pk_ordered_charged(reader, ascending, bounds, deadline)?;
+                        // A read whose last charge read no clock is checked once more
+                        deadline.check()?;
+                        rows
+                    }
+                };
                 self.check_read()?;
-                let read = rows.as_ref().map_or(0, |rows| rows.len() + offset);
-                deadline.charge(DeadlineSite::StorageRead, read)?;
                 return Ok(rows);
             }
         }

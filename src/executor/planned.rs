@@ -416,7 +416,7 @@ impl Executor {
                 None if in_txn => self.active_txn_id().map(|id| id as u64),
                 None => None,
             };
-            let read = self.run_planned(planned, params, (in_txn, transaction), view);
+            let read = self.run_planned(planned, params, (in_txn, transaction), view, ctx);
             // A residual term that outlasted the deadline fails the read
             if let (Some(Ok(_)), Some(Err(e))) = (&read, ctx.map(ExecutionContext::check_deadline))
             {
@@ -437,6 +437,7 @@ impl Executor {
         params: &[Value],
         (in_txn, transaction): (bool, Option<u64>),
         view: Option<&StatementView>,
+        ctx: Option<&ExecutionContext>,
     ) -> Option<Result<Box<dyn QueryResult>>> {
         // Read through the statement, and `read_planned` inlined: a key read
         // borrowed as an argument has its fields loaded ahead of every row
@@ -449,7 +450,7 @@ impl Executor {
                     &plan.table,
                     key,
                     plan.token,
-                    in_txn,
+                    (in_txn, ctx),
                     view,
                     &plan.store,
                     needed,
@@ -610,19 +611,19 @@ impl Executor {
         )))
     }
 
-    /// The row with id `pk_value`: committed state outside a transaction,
-    /// else what the active transaction sees through a handle taken for this
-    /// statement, refused as SchemaChanged unless it holds layout `token`.
-    /// A view the statement already took, `taken`, holds the read to it.
-    /// `held` is the table's store as a plan keeps it, read while it is open.
-    /// A sealed row read in committed state decodes only the columns `needed` marks
+    /// The row with id `pk_value`: committed state outside a transaction, else
+    /// what the active transaction sees, `ctx`'s deadline charged, through a
+    /// handle for this statement; SchemaChanged unless it holds layout `token`.
+    /// A view the statement took, `taken`, holds the read to it; `held` is the
+    /// table's store as a plan keeps it, read while open. A sealed row read in
+    /// committed state decodes only the columns `needed` marks
     #[allow(clippy::too_many_arguments)]
     fn fetch_pk_row(
         &self,
         table_name: &str,
         pk_value: i64,
         token: LayoutToken,
-        in_txn: bool,
+        (in_txn, ctx): (bool, Option<&ExecutionContext>),
         taken: Option<&StatementView>,
         held: &Weak<VersionStore>,
         needed: Option<&[bool]>,
@@ -666,7 +667,8 @@ impl Executor {
             let table = tx.get_read_table_at(table_name, view.as_ref(), TableUse::Read)?;
             check_compiled_token(&*table, token)?;
             let all = ConstBoolExpr::true_expr();
-            let rows = table.fetch_rows_by_ids(&[pk_value], &all, Deadline::NONE)?;
+            let deadline = ctx.map_or(Deadline::NONE, ExecutionContext::deadline_of_call);
+            let rows = table.fetch_rows_by_ids(&[pk_value], &all, deadline)?;
             view.as_ref().map_or(Ok(()), StatementView::held)?;
             return Ok(KeyRows::Many(rows));
         }
@@ -699,7 +701,8 @@ impl Executor {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("exec.pk_lookup_in_transaction");
         let all = ConstBoolExpr::true_expr();
-        let rows = table.fetch_rows_by_ids(&[pk_value], &all, Deadline::NONE)?;
+        let deadline = ctx.map_or(Deadline::NONE, ExecutionContext::deadline_of_call);
+        let rows = table.fetch_rows_by_ids(&[pk_value], &all, deadline)?;
         view.as_ref().map_or(Ok(()), StatementView::held)?;
         Ok(KeyRows::Many(rows))
     }

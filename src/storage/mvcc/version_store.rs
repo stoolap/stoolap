@@ -3352,6 +3352,35 @@ impl VersionStore {
 
     /// Gets the latest visible version of a row
     pub fn get_visible_version(&self, row_id: i64, reader: Reader<'_>) -> Option<RowVersion> {
+        // An untimed read charges nothing, so it fails nowhere
+        self.visible_version::<false>(row_id, reader, (Deadline::NONE, &mut 0), &mut None)
+    }
+
+    /// [`Self::get_visible_version`] charging `meter` each older version
+    /// its chain walk passes
+    #[inline(never)]
+    pub(crate) fn get_visible_version_charged(
+        &self,
+        row_id: i64,
+        reader: Reader<'_>,
+        meter: Meter<'_>,
+    ) -> crate::core::Result<Option<RowVersion>> {
+        let mut failed = None;
+        let found = self.visible_version::<true>(row_id, reader, meter, &mut failed);
+        failed.map_or(Ok(found), Err)
+    }
+
+    /// [`Self::get_visible_version`]; `TIMED` charges `meter` each older
+    /// version the chain walk passes, and a charge that fails goes to
+    /// `failed` with no version returned
+    #[inline(always)]
+    fn visible_version<const TIMED: bool>(
+        &self,
+        row_id: i64,
+        reader: Reader<'_>,
+        (deadline, unpaid): Meter<'_>,
+        failed: &mut Option<crate::core::Error>,
+    ) -> Option<RowVersion> {
         if self.closed.load(Ordering::Acquire) {
             return None;
         }
@@ -3430,6 +3459,12 @@ impl VersionStore {
         let mut current: Option<&VersionChainEntry> = chain.prev.as_ref().map(|b| b.as_ref());
 
         while let Some(e) = current {
+            if TIMED {
+                if let Err(e) = deadline.charge_one(DeadlineSite::StorageRead, unpaid) {
+                    *failed = Some(e);
+                    return None;
+                }
+            }
             let version_txn_id = e.version.txn_id;
             let deleted_at_txn_id = e.version.deleted_at_txn_id;
 
@@ -3450,13 +3485,22 @@ impl VersionStore {
     /// Check if any of the given row_ids have a visible version
     /// Returns the first row_id that has a visible version, or None if none exist
     /// OPTIMIZATION: Used for conflict detection - stops at first hit, no data fetch
+    /// `deadline` is charged each older version a chain walk passes
     #[inline]
-    pub fn has_any_visible_version(&self, row_ids: &[i64], reader: Reader<'_>) -> Option<i64> {
+    pub fn has_any_visible_version(
+        &self,
+        row_ids: &[i64],
+        reader: Reader<'_>,
+        deadline: Deadline,
+    ) -> crate::core::Result<Option<i64>> {
         if self.closed.load(Ordering::Acquire) || row_ids.is_empty() {
-            return None;
+            return Ok(None);
         }
 
-        let checker = reader.over(&**self.visibility_checker.as_ref()?);
+        let Some(checker) = self.visibility_checker.as_ref() else {
+            return Ok(None);
+        };
+        let checker = reader.over(&**checker);
         let txn_id = reader.txn_id;
 
         // Lock ordering: versions first, then arena (matches commit path)
@@ -3474,7 +3518,7 @@ impl VersionStore {
                         if meta.deleted_at_txn_id == 0
                             || !checker.is_visible(meta.deleted_at_txn_id, txn_id)
                         {
-                            return Some(row_id); // Conflict!
+                            return Ok(Some(row_id)); // Conflict!
                         }
                         continue; // Deleted, check next
                     }
@@ -3488,7 +3532,7 @@ impl VersionStore {
 
                 if checker.is_visible(head_txn_id, txn_id) {
                     if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                        return Some(row_id); // Found visible version - conflict!
+                        return Ok(Some(row_id)); // Found visible version - conflict!
                     }
                     continue; // Deleted, check next
                 }
@@ -3498,11 +3542,12 @@ impl VersionStore {
                     chain.prev.as_ref().map(|b| b.as_ref());
 
                 while let Some(e) = current {
+                    deadline.charge(DeadlineSite::StorageRead, 1)?;
                     if checker.is_visible(e.version.txn_id, txn_id) {
                         if e.version.deleted_at_txn_id == 0
                             || !checker.is_visible(e.version.deleted_at_txn_id, txn_id)
                         {
-                            return Some(row_id); // Found visible version - conflict!
+                            return Ok(Some(row_id)); // Found visible version - conflict!
                         }
                         break; // Deleted, move to next row
                     }
@@ -3510,7 +3555,7 @@ impl VersionStore {
                 }
             }
         }
-        None
+        Ok(None)
     }
 
     /// Gets multiple visible versions in a single batch operation
@@ -3698,6 +3743,24 @@ impl VersionStore {
         self.each_visible::<true>(row_ids, reader, deadline, callback)
     }
 
+    /// [`Self::get_visible_versions_batch`] charging `deadline` a run of ids
+    /// and each run of older versions a chain walk passes. The rows come
+    /// back with the store's locks let go, so a filter asked of them may
+    /// write to the table
+    pub(crate) fn get_visible_versions_batch_charged(
+        &self,
+        row_ids: &[i64],
+        reader: Reader<'_>,
+        deadline: Deadline,
+    ) -> crate::core::Result<RowVec> {
+        let mut rows = RowVec::with_capacity(row_ids.len().min(4096));
+        self.each_visible_timed(row_ids, reader, deadline, |row_id, row| {
+            rows.push((row_id, row));
+            true
+        })?;
+        Ok(rows)
+    }
+
     /// Counts visible versions for batch operations (COUNT optimization)
     ///
     /// This is an optimized version of get_visible_versions_batch that only counts
@@ -3846,20 +3909,50 @@ impl VersionStore {
     /// 1. Read the current row data
     /// 2. Track the original version for conflict detection
     /// 3. Skip redundant lookups during put
+    ///
+    /// `deadline` is charged each older version a chain walk passes.
     pub fn get_visible_versions_for_update(
         &self,
         row_ids: &[i64],
         txn_id: i64,
-    ) -> Vec<(i64, Row, RowVersion)> {
+        deadline: Deadline,
+    ) -> crate::core::Result<Vec<(i64, Row, RowVersion)>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.get_visible_versions_for_update");
+        match deadline.is_none() {
+            true => self.versions_for_update::<false>(row_ids, txn_id, deadline),
+            false => self.versions_for_update_timed(row_ids, txn_id, deadline),
+        }
+    }
+
+    /// [`Self::versions_for_update`] charged, compiled apart so the untimed
+    /// loop holds no charge
+    #[inline(never)]
+    fn versions_for_update_timed(
+        &self,
+        row_ids: &[i64],
+        txn_id: i64,
+        deadline: Deadline,
+    ) -> crate::core::Result<Vec<(i64, Row, RowVersion)>> {
+        self.versions_for_update::<true>(row_ids, txn_id, deadline)
+    }
+
+    /// [`Self::get_visible_versions_for_update`]; `TIMED` charges `deadline`
+    /// each older version a chain walk passes
+    #[inline(always)]
+    fn versions_for_update<const TIMED: bool>(
+        &self,
+        row_ids: &[i64],
+        txn_id: i64,
+        deadline: Deadline,
+    ) -> crate::core::Result<Vec<(i64, Row, RowVersion)>> {
         if self.closed.load(Ordering::Acquire) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => c,
-            None => return Vec::new(),
+            None => return Ok(Vec::new()),
         };
 
         let mut results = Vec::with_capacity(row_ids.len());
@@ -3885,6 +3978,9 @@ impl VersionStore {
                 let mut current: Option<&VersionChainEntry> =
                     chain.prev.as_ref().map(|b| b.as_ref());
                 while let Some(e) = current {
+                    if TIMED {
+                        deadline.charge(DeadlineSite::StorageRead, 1)?;
+                    }
                     let version_txn_id = e.version.txn_id;
                     let deleted_at_txn_id = e.version.deleted_at_txn_id;
 
@@ -3900,7 +3996,7 @@ impl VersionStore {
             }
         }
 
-        results
+        Ok(results)
     }
 
     /// Gets the current sequence number for write-set tracking
@@ -4851,6 +4947,31 @@ impl VersionStore {
     ) -> crate::core::Result<Vec<(i64, Row, RowVersion)>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.get_all_visible_rows_for_update");
+        match deadline.is_none() {
+            true => self.rows_for_update::<false>(txn_id, deadline),
+            false => self.rows_for_update_timed(txn_id, deadline),
+        }
+    }
+
+    /// [`Self::rows_for_update`] charged, compiled apart so the untimed
+    /// loop holds no charge
+    #[inline(never)]
+    fn rows_for_update_timed(
+        &self,
+        txn_id: i64,
+        deadline: Deadline,
+    ) -> crate::core::Result<Vec<(i64, Row, RowVersion)>> {
+        self.rows_for_update::<true>(txn_id, deadline)
+    }
+
+    /// [`Self::get_all_visible_rows_for_update`]; `TIMED` charges `deadline`
+    /// each older version a chain walk passes
+    #[inline(always)]
+    fn rows_for_update<const TIMED: bool>(
+        &self,
+        txn_id: i64,
+        deadline: Deadline,
+    ) -> crate::core::Result<Vec<(i64, Row, RowVersion)>> {
         if self.closed.load(Ordering::Acquire) {
             return Ok(Vec::new());
         }
@@ -4886,6 +5007,9 @@ impl VersionStore {
             // SLOW PATH: HEAD not visible - traverse chain for older versions
             let mut current: Option<&VersionChainEntry> = chain.prev.as_ref().map(|b| b.as_ref());
             while let Some(e) = current {
+                if TIMED {
+                    deadline.charge(DeadlineSite::StorageUpdate, 1)?;
+                }
                 let version_txn_id = e.version.txn_id;
                 let deleted_at_txn_id = e.version.deleted_at_txn_id;
 
@@ -4924,6 +5048,42 @@ impl VersionStore {
     ) -> crate::core::Result<Vec<(i64, Row, RowVersion)>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.get_all_visible_rows_for_update_filtered");
+        let keep = (filter, hidden, forgives);
+        match deadline.is_none() {
+            true => self.filtered_for_update::<false>(txn_id, keep, deadline),
+            false => self.filtered_for_update_timed(txn_id, keep, deadline),
+        }
+    }
+
+    /// [`Self::filtered_for_update`] charged, compiled apart so the untimed
+    /// loop holds no charge
+    #[inline(never)]
+    fn filtered_for_update_timed(
+        &self,
+        txn_id: i64,
+        keep: (
+            &dyn crate::storage::expression::Expression,
+            impl Fn(i64) -> bool,
+            impl Fn(i64) -> bool,
+        ),
+        deadline: Deadline,
+    ) -> crate::core::Result<Vec<(i64, Row, RowVersion)>> {
+        self.filtered_for_update::<true>(txn_id, keep, deadline)
+    }
+
+    /// [`Self::get_all_visible_rows_for_update_filtered`]; `TIMED` charges
+    /// `deadline` each older version a chain walk passes
+    #[inline(always)]
+    fn filtered_for_update<const TIMED: bool>(
+        &self,
+        txn_id: i64,
+        (filter, hidden, forgives): (
+            &dyn crate::storage::expression::Expression,
+            impl Fn(i64) -> bool,
+            impl Fn(i64) -> bool,
+        ),
+        deadline: Deadline,
+    ) -> crate::core::Result<Vec<(i64, Row, RowVersion)>> {
         if self.closed.load(Ordering::Acquire) {
             return Ok(Vec::new());
         }
@@ -4982,6 +5142,9 @@ impl VersionStore {
             // SLOW PATH: HEAD not visible - traverse chain for older versions
             let mut current: Option<&VersionChainEntry> = chain.prev.as_ref().map(|b| b.as_ref());
             while let Some(e) = current {
+                if TIMED {
+                    deadline.charge(DeadlineSite::StorageUpdate, 1)?;
+                }
                 let version_txn_id = e.version.txn_id;
                 let deleted_at_txn_id = e.version.deleted_at_txn_id;
 
@@ -5427,15 +5590,44 @@ impl VersionStore {
         limit: usize,
         offset: usize,
     ) -> Option<RowVec> {
+        // An untimed read charges nothing, so it raises no error
+        self.pk_ordered::<false>(reader, ascending, (limit, offset), Deadline::NONE)
+            .unwrap_or_default()
+    }
+
+    /// [`Self::collect_rows_pk_ordered`] charging `deadline` each chain it
+    /// reads and each run of older versions it passes; compiled apart so
+    /// the untimed loop holds no charge
+    #[inline(never)]
+    pub(crate) fn collect_rows_pk_ordered_charged(
+        &self,
+        reader: Reader<'_>,
+        ascending: bool,
+        (limit, offset): (usize, usize),
+        deadline: Deadline,
+    ) -> crate::core::Result<Option<RowVec>> {
+        self.pk_ordered::<true>(reader, ascending, (limit, offset), deadline)
+    }
+
+    /// [`Self::collect_rows_pk_ordered`]; `TIMED` charges `deadline` a run
+    /// of the chains and older versions read
+    #[inline(always)]
+    fn pk_ordered<const TIMED: bool>(
+        &self,
+        reader: Reader<'_>,
+        ascending: bool,
+        (limit, offset): (usize, usize),
+        deadline: Deadline,
+    ) -> crate::core::Result<Option<RowVec>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.collect_rows_pk_ordered");
         if self.closed.load(Ordering::Acquire) || limit == 0 {
-            return Some(RowVec::new());
+            return Ok(Some(RowVec::new()));
         }
 
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => reader.over(&**c),
-            None => return Some(RowVec::new()),
+            None => return Ok(Some(RowVec::new())),
         };
         let txn_id = reader.txn_id;
 
@@ -5447,6 +5639,7 @@ impl VersionStore {
         let capacity = limit.min(versions.len()).min(10_000);
         let mut result = RowVec::with_capacity(capacity);
         let mut skipped = 0usize;
+        let mut unpaid = 0usize;
 
         if ascending {
             // Forward iteration with early termination
@@ -5454,6 +5647,9 @@ impl VersionStore {
                 // Inline visibility check
                 let mut current: Option<&VersionChainEntry> = Some(chain);
                 while let Some(entry) = current {
+                    if TIMED {
+                        deadline.charge_one(DeadlineSite::StorageRead, &mut unpaid)?;
+                    }
                     if checker.is_visible(entry.version.txn_id, txn_id) {
                         if entry.version.deleted_at_txn_id == 0
                             || !checker.is_visible(entry.version.deleted_at_txn_id, txn_id)
@@ -5464,7 +5660,7 @@ impl VersionStore {
                             } else {
                                 result.push((*row_id, entry.version.data.clone()));
                                 if result.len() >= limit {
-                                    return Some(result);
+                                    return Ok(Some(result));
                                 }
                             }
                         }
@@ -5478,6 +5674,9 @@ impl VersionStore {
             for (&row_id, chain) in versions.iter_rev() {
                 let mut current: Option<&VersionChainEntry> = Some(chain);
                 while let Some(entry) = current {
+                    if TIMED {
+                        deadline.charge_one(DeadlineSite::StorageRead, &mut unpaid)?;
+                    }
                     if checker.is_visible(entry.version.txn_id, txn_id) {
                         if entry.version.deleted_at_txn_id == 0
                             || !checker.is_visible(entry.version.deleted_at_txn_id, txn_id)
@@ -5487,7 +5686,7 @@ impl VersionStore {
                             } else {
                                 result.push((row_id, entry.version.data.clone()));
                                 if result.len() >= limit {
-                                    return Some(result);
+                                    return Ok(Some(result));
                                 }
                             }
                         }
@@ -5498,7 +5697,7 @@ impl VersionStore {
             }
         }
 
-        Some(result)
+        Ok(Some(result))
     }
 
     /// Collect visible rows using keyset pagination (WHERE id > X ORDER BY id LIMIT Y)
@@ -9511,7 +9710,7 @@ impl TransactionVersionStore {
                 // uniqueness), but it is the safety net for user-supplied PKs.
                 if self
                     .parent_store
-                    .has_any_visible_version(&[row_id], self.txn_id.into())
+                    .has_any_visible_version(&[row_id], self.txn_id.into(), Deadline::NONE)?
                     .is_some()
                 {
                     return Err(Error::internal(format!(

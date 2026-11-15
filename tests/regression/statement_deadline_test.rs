@@ -1263,3 +1263,78 @@ fn a_read_past_old_versions_own_rows_or_hidden_rows_charges_them() {
     read(&hot, "ROLLBACK", &ctx).unwrap();
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+#[test]
+fn a_read_past_a_long_history_of_one_row_charges_its_versions() {
+    let _guard = FailpointGuard::new();
+    let db = Database::open("memory://statement_deadline_long_history").unwrap();
+    for sql in [
+        "CREATE TABLE l (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)",
+        "CREATE INDEX l_g ON l (g)",
+        "INSERT INTO l VALUES (2, 1, 0)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!(
+        "file://{}?checkpoint_interval=3600&compact_threshold=1000",
+        dir.path().display()
+    );
+    let sealed = Database::open(&dsn).unwrap();
+    for sql in [
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, v INTEGER)",
+        "INSERT INTO s VALUES (1, 0), (2, 0)",
+    ] {
+        sealed.execute(sql, ()).unwrap();
+    }
+    sealed.engine().seal_for_test().unwrap();
+    let hot = Executor::new(std::sync::Arc::clone(db.engine()));
+    let cold = Executor::new(std::sync::Arc::clone(sealed.engine()));
+    let mut ctx = ExecutionContext::new();
+    ctx.set_timeout_ms(3_600_000);
+    let mut wrong = Vec::new();
+    let mut charged = |executor: &Executor, site: DeadlineSite, sql: &str, least: usize| {
+        count_deadline_charges(site);
+        let counted = read(executor, sql, &ctx);
+        let charges = deadline_charges();
+        keep_deadlines();
+        if counted.is_err() || charges < least {
+            wrong.push(format!(
+                "{sql} gave {counted:?} in {charges} charges, under {least}"
+            ));
+        }
+    };
+    let rows = DeadlineSite::StorageRead;
+    // Snapshots older than 9,000 versions of one row each
+    read(&hot, "BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT", &ctx).unwrap();
+    read(&hot, "SELECT v FROM l", &ctx).unwrap();
+    read(&cold, "BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT", &ctx).unwrap();
+    read(&cold, "SELECT v FROM s", &ctx).unwrap();
+    for _ in 0..9000 {
+        db.execute("UPDATE l SET v = v + 1", ()).unwrap();
+        sealed
+            .execute("UPDATE s SET v = v + 1 WHERE id = 1", ())
+            .unwrap();
+    }
+    // A run of 4,096 versions is one charge; a walk that charges each step,
+    // thousands
+    for (sql, least) in [
+        ("SELECT v FROM l ORDER BY id LIMIT 1", 2),
+        ("SELECT v FROM l ORDER BY id DESC LIMIT 1", 2),
+        ("SELECT v FROM l WHERE id = 2", 2),
+        ("SELECT v FROM l WHERE id = 2 AND v >= 0 LIMIT 1", 2),
+        ("UPDATE l SET v = v WHERE g = 1 AND v < 0", 100),
+        ("DELETE FROM l WHERE g = 1 AND v < 0", 2),
+        ("DELETE FROM l WHERE id = 2 AND v < 0", 2),
+    ] {
+        charged(&hot, rows, sql, least);
+    }
+    let update = DeadlineSite::StorageUpdate;
+    charged(&hot, update, "UPDATE l SET v = v WHERE v < 0", 100);
+    charged(&hot, update, "UPDATE l SET v = v", 100);
+    // The hot check of each sealed id walks its row's history
+    charged(&cold, rows, "SELECT v FROM s WHERE id IN (1, 2)", 100);
+    read(&hot, "ROLLBACK", &ctx).unwrap();
+    read(&cold, "ROLLBACK", &ctx).unwrap();
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
