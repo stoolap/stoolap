@@ -188,6 +188,13 @@ impl BTreeIndex {
     pub fn get_all_values(&self, deadline: Deadline) -> Result<Vec<Value>> {
         let sorted_values = self.sorted_values.read();
         let mut values = Vec::with_capacity(sorted_values.len());
+        if deadline.is_none() {
+            sorted_values.walk(Bound::Unbounded, true, &mut |key, _| {
+                values.push(key.clone());
+                true
+            });
+            return Ok(values);
+        }
         let mut stopped = None;
         sorted_values.walk(Bound::Unbounded, true, &mut |key, _| {
             values.push(key.clone());
