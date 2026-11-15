@@ -48,6 +48,12 @@ Stoolap currently supports the following PRAGMA commands:
 | `volume_stats` | Show per-volume storage statistics | - |
 | `verify` | Read every volume file and check it against its checksums | - |
 
+### Statements
+
+| PRAGMA | Description | Default |
+|--------|-------------|---------|
+| `query_timeout` | This connection's timeout in milliseconds for a statement whose call sets none (0 = none) | 0 |
+
 ### Memory and Hot Store
 
 | PRAGMA | Description | Default |
@@ -152,6 +158,16 @@ When a table holds at least this many hot row bytes, a commit that writes to it 
 ```sql
 PRAGMA hot_max_bytes = 268435456;   -- 256 MB per table
 PRAGMA hot_max_bytes;               -- read current value
+```
+
+#### query_timeout
+
+Sets the timeout, in milliseconds, of every statement this connection runs whose call sets no timeout of its own. Each statement's time counts from when it starts, and a query's rows keep its deadline while you read them. A statement past its timeout stops with a query cancelled error, as with the API's timeout methods; see [Timeout Methods](../getting-started/api-reference#timeout-methods) for what a timeout stops and what it cannot. The setting belongs to the connection that runs the PRAGMA: another handle on the same database, a clone included, keeps its own, and a value set inside a transaction stays after it ends. A timeout passed to `execute_with_timeout` or `query_with_timeout` is used instead; a timeout of 0 there leaves the connection's. 0 turns it off. Default: 0, or the connection string's `query_timeout`.
+
+```sql
+PRAGMA query_timeout = 5000;        -- 5 seconds
+PRAGMA query_timeout;               -- read current value
+PRAGMA query_timeout = 0;           -- no timeout
 ```
 
 #### group_cache_mb
@@ -388,6 +404,8 @@ file:///path/to/db?checkpoint_interval=60&compact_threshold=4&keep_snapshots=3&s
 ```
 
 `group_cache_mb` has no connection string form; the cache is process-wide and is set with the PRAGMA.
+
+`query_timeout` is accepted by `memory://` as well as `file://`, and gives the timeout every connection opened on that database starts with; `PRAGMA query_timeout` then changes it for one connection.
 
 Legacy parameter names are accepted for backward compatibility:
 - `snapshot_interval` maps to `checkpoint_interval`

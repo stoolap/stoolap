@@ -72,6 +72,9 @@ static DATABASE_REGISTRY: std::sync::LazyLock<RwLock<FxHashMap<String, Weak<Shar
 struct SharedEngine {
     engine: Arc<MVCCEngine>,
     dsn: String,
+    /// The query timeout in milliseconds every handle starts with, from
+    /// the DSN's `query_timeout`; 0 for none
+    query_timeout_ms: u64,
     /// Temp directory for test-filedb feature. Deleted on drop.
     #[cfg(feature = "test-filedb")]
     _temp_dir: Option<tempfile::TempDir>,
@@ -102,10 +105,9 @@ pub(crate) type DatabaseInnerHandle = DatabaseInner;
 
 impl DatabaseInner {
     fn session(shared: Arc<SharedEngine>) -> Arc<Self> {
-        Arc::new(DatabaseInner {
-            executor: Executor::new(Arc::clone(&shared.engine)),
-            shared,
-        })
+        let executor = Executor::new(Arc::clone(&shared.engine));
+        executor.set_query_timeout_ms(shared.query_timeout_ms);
+        Arc::new(DatabaseInner { executor, shared })
     }
 }
 
@@ -233,6 +235,7 @@ impl Database {
 
         // Parse the DSN
         let (scheme, path) = Self::parse_dsn(dsn)?;
+        let query_timeout_ms = Self::parse_query_timeout(&path)?;
 
         // test-filedb: track temp dir so it lives as long as the engine
         #[cfg(feature = "test-filedb")]
@@ -286,6 +289,7 @@ impl Database {
         let shared = Arc::new(SharedEngine {
             engine,
             dsn: dsn.to_string(),
+            query_timeout_ms,
             #[cfg(feature = "test-filedb")]
             _temp_dir: _temp_dir_holder,
         });
@@ -320,6 +324,7 @@ impl Database {
         let shared = Arc::new(SharedEngine {
             engine,
             dsn: "memory://".to_string(),
+            query_timeout_ms: 0,
             _temp_dir: Some(tmp),
         });
         Ok(Database {
@@ -336,6 +341,7 @@ impl Database {
         let shared = Arc::new(SharedEngine {
             engine,
             dsn: "memory://".to_string(),
+            query_timeout_ms: 0,
         });
         Ok(Database {
             inner: DatabaseInner::session(shared),
@@ -376,6 +382,24 @@ impl Database {
         }
 
         Ok((scheme, path))
+    }
+
+    /// The DSN's `query_timeout` in milliseconds, of either scheme; 0 when absent
+    fn parse_query_timeout(path: &str) -> Result<u64> {
+        let Some((_, query)) = path.split_once('?') else {
+            return Ok(0);
+        };
+        let Some(value) = query
+            .split('&')
+            .find_map(|param| param.strip_prefix("query_timeout="))
+        else {
+            return Ok(0);
+        };
+        value
+            .parse::<i64>()
+            .ok()
+            .and_then(|ms| u64::try_from(ms).ok())
+            .ok_or_else(|| Error::invalid_argument(format!("invalid query_timeout: '{}'", value)))
     }
 
     /// Parse file:// config from query parameters
