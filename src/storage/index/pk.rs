@@ -739,15 +739,17 @@ impl Index for PkIndex {
         }
         deadline.charge(DeadlineSite::StorageRead, result.len() % CHARGE_BEAT)?;
         if !inner.overflow_empty() {
-            let mut ids = inner.overflow.iter();
-            loop {
-                let before = result.len();
-                result.extend(ids.by_ref().take(CHARGE_BEAT).map(Value::Integer));
-                let read = result.len() - before;
-                deadline.charge(DeadlineSite::StorageRead, read)?;
-                if read < CHARGE_BEAT {
-                    break;
+            // The slots a removal left empty are read too
+            inner.overflow.each_run(CHARGE_BEAT, |slots, ids| {
+                if let Err(error) = deadline.charge(DeadlineSite::StorageRead, slots) {
+                    stopped = Some(error);
+                    return false;
                 }
+                result.extend(ids.map(Value::Integer));
+                true
+            });
+            if let Some(error) = stopped {
+                return Err(error);
             }
         }
         Ok(Some(result))
@@ -1499,6 +1501,33 @@ mod tests {
                 20_000_000,
                 100_000_000
             ]
+        );
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[test]
+    fn far_keys_left_in_a_kept_table_are_charged_by_its_slots() {
+        use crate::executor::DeadlineSite;
+        use crate::test_failpoints::{count_deadline_charges, deadline_charges, keep_deadlines};
+        let _guard = crate::test_failpoints::FailpointGuard::new();
+        let idx = make_idx();
+        let far: Vec<i64> = (1..=200_000).map(|i| BITSET_MAX_BITS as i64 + i).collect();
+        for &id in &far {
+            idx.add(&[Value::Integer(id)], id, id).unwrap();
+        }
+        let mut buffers = idx.removal_buffers(far.len()).unwrap();
+        idx.remove_batch_ids(&far[2..], &mut buffers)
+            .unwrap()
+            .unwrap();
+        let slots = idx.data.read().overflow.capacity();
+        count_deadline_charges(DeadlineSite::StorageRead);
+        let values = idx.get_all_values(Deadline::after_ms(3_600_000));
+        let charges = deadline_charges();
+        keep_deadlines();
+        assert_eq!(values.unwrap().map(|v| v.len()), Some(2));
+        assert!(
+            charges >= slots / CHARGE_BEAT,
+            "{charges} charges over {slots} slots"
         );
     }
 }
