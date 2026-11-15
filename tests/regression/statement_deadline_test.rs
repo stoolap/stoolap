@@ -1160,3 +1160,104 @@ fn a_read_that_keeps_few_of_the_rows_it_reads_charges_each_run_of_them() {
     read(&hot, "ROLLBACK", &ctx).unwrap();
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+#[test]
+fn a_read_past_old_versions_own_rows_or_hidden_rows_charges_them() {
+    let _guard = FailpointGuard::new();
+    let db = Database::open("memory://statement_deadline_unseen_work").unwrap();
+    for sql in [
+        "CREATE TABLE i (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)",
+        "INSERT INTO i SELECT value, CASE WHEN value <= 10000 THEN 1 ELSE value END, value \
+         FROM generate_series(1, 50000)",
+        "CREATE INDEX i_g ON i (g)",
+        "CREATE TABLE o (id INTEGER PRIMARY KEY, g INTEGER)",
+        "INSERT INTO o VALUES (1, 1)",
+        "CREATE TABLE e (id INTEGER PRIMARY KEY, x INTEGER)",
+        "CREATE TABLE l (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)",
+        "CREATE INDEX l_g ON l (g)",
+        "INSERT INTO l VALUES (2, 1, 0)",
+        "CREATE TABLE one (id INTEGER PRIMARY KEY)",
+        "INSERT INTO one VALUES (1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!(
+        "file://{}?checkpoint_interval=3600&compact_threshold=1000",
+        dir.path().display()
+    );
+    let sealed = Database::open(&dsn).unwrap();
+    for sql in [
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, half INTEGER)",
+        "CREATE INDEX p_half ON p (half)",
+        "INSERT INTO p SELECT value, value % 2 FROM generate_series(1, 140000)",
+    ] {
+        sealed.execute(sql, ()).unwrap();
+    }
+    sealed.engine().seal_for_test().unwrap();
+    sealed
+        .execute("DELETE FROM p WHERE id <= 135000", ())
+        .unwrap();
+    let hot = Executor::new(std::sync::Arc::clone(db.engine()));
+    let cold = Executor::new(std::sync::Arc::clone(sealed.engine()));
+    let mut ctx = ExecutionContext::new();
+    ctx.set_timeout_ms(3_600_000);
+    let mut wrong = Vec::new();
+    let mut charged = |executor: &Executor, sql: &str, least: usize| {
+        count_deadline_charges(DeadlineSite::StorageRead);
+        let counted = read(executor, sql, &ctx);
+        let charges = deadline_charges();
+        keep_deadlines();
+        if counted.is_err() || charges < least {
+            wrong.push(format!(
+                "{sql} gave {counted:?} in {charges} charges, under {least}"
+            ));
+        }
+    };
+    // The 10,000 candidates a correlated EXISTS counted on one key
+    charged(
+        &hot,
+        "SELECT EXISTS(SELECT 1 FROM i WHERE i.g = o.g AND i.v < 0) FROM o LIMIT 1",
+        3,
+    );
+    // A hidden prefix of 135,000 sealed rows before the first shown one,
+    // charged a run at a time on top of the 57 charges of the rest
+    charged(
+        &cold,
+        "SELECT id, ROW_NUMBER() OVER (PARTITION BY half ORDER BY id) FROM p LIMIT 1",
+        80,
+    );
+    // The transaction's own 20,000 rows, gathered and asked
+    read(&hot, "BEGIN", &ctx).unwrap();
+    read(
+        &hot,
+        "INSERT INTO e SELECT value, value FROM generate_series(1, 20000)",
+        &ctx,
+    )
+    .unwrap();
+    charged(&hot, "SELECT id FROM e WHERE x = -1 LIMIT 1", 8);
+    charged(
+        &hot,
+        "SELECT id FROM e WHERE id NOT IN (SELECT id FROM one) LIMIT 1",
+        4,
+    );
+    read(&hot, "ROLLBACK", &ctx).unwrap();
+    // A snapshot older than 9,000 versions of the one row of l
+    read(&hot, "BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT", &ctx).unwrap();
+    read(&hot, "SELECT v FROM l", &ctx).unwrap();
+    for _ in 0..9000 {
+        db.execute("UPDATE l SET v = v + 1", ()).unwrap();
+    }
+    charged(&hot, "SELECT v FROM l WHERE v >= 0 LIMIT 1", 3);
+    charged(&hot, "SELECT v FROM l LIMIT 1", 3);
+    charged(&hot, "SELECT v FROM l WHERE g > 0 AND v >= 0 LIMIT 1", 3);
+    charged(
+        &hot,
+        "SELECT id FROM l WHERE id NOT IN (SELECT id FROM one)",
+        5,
+    );
+    // A full read charges a chain's versions in one run after the chain
+    charged(&hot, "SELECT v FROM l", 2);
+    read(&hot, "ROLLBACK", &ctx).unwrap();
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

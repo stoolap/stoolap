@@ -2266,35 +2266,97 @@ impl MVCCTable {
         (token() == Some(quiet)).then_some(count)
     }
 
-    /// The ids of the transaction's own rows in `txn_versions`
-    fn local_ids(txn_versions: &LocalRows<'_>) -> LocalIds {
+    /// `ids`, sorted, with the transaction's own inserts in `txn_versions`
+    /// added and its deletes taken out; `TIMED` charges `deadline` a run of
+    /// its rows at a time, and the committed ids before they are sorted
+    #[inline(always)]
+    fn merge_local_ids<const TIMED: bool>(
+        txn_versions: &LocalRows<'_>,
+        ids: &mut Vec<i64>,
+        deadline: Deadline,
+    ) -> Result<()> {
+        let mut deleted = crate::common::I64Set::new();
+        let mut inserted = Vec::new();
+        let mut unpaid = 0usize;
+        for (row_id, version) in txn_versions.iter_local() {
+            if TIMED {
+                deadline.charge_one(DeadlineSite::StorageRead, &mut unpaid)?;
+            }
+            if version.is_deleted() {
+                deleted.insert(row_id);
+            } else {
+                inserted.push(row_id);
+            }
+        }
+        if TIMED {
+            deadline.charge(DeadlineSite::StorageRead, ids.len())?;
+        }
+        ids.retain(|id| !deleted.contains(*id));
+        ids.extend(inserted);
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(())
+    }
+
+    /// [`Self::merge_local_ids`] charged, compiled apart so the untimed
+    /// loop holds no charge
+    #[inline(never)]
+    fn merge_local_ids_timed(
+        txn_versions: &LocalRows<'_>,
+        ids: &mut Vec<i64>,
+        deadline: Deadline,
+    ) -> Result<()> {
+        Self::merge_local_ids::<true>(txn_versions, ids, deadline)
+    }
+
+    /// The ids of the transaction's own rows in `txn_versions`; `TIMED`
+    /// charges `deadline` a run of them at a time
+    #[inline(always)]
+    fn local_ids<const TIMED: bool>(
+        txn_versions: &LocalRows<'_>,
+        deadline: Deadline,
+    ) -> Result<LocalIds> {
         let mut ids = LocalIds {
             ids: I64Set::new(),
             min: false,
         };
+        let mut unpaid = 0usize;
         for (row_id, _) in txn_versions.iter_local() {
+            if TIMED {
+                deadline.charge_one(DeadlineSite::StorageRead, &mut unpaid)?;
+            }
             if row_id == i64::MIN {
                 ids.min = true;
             } else {
                 ids.ids.insert(row_id);
             }
         }
-        ids
+        Ok(ids)
     }
 
     /// The transaction's own rows in `txn_versions` it did not delete, as
     /// the schema reads them; the guard goes with them, so a filter asked of
-    /// them runs without it
-    fn local_rows(&self, txn_versions: LocalRows<'_>) -> RowVec {
+    /// them runs without it. `TIMED` charges `deadline` a run of them at a
+    /// time
+    #[inline(always)]
+    fn local_rows<const TIMED: bool>(
+        &self,
+        txn_versions: LocalRows<'_>,
+        deadline: Deadline,
+    ) -> Result<RowVec> {
         let mut rows = RowVec::new();
+        let mut unpaid = 0usize;
         for (row_id, version) in txn_versions.iter_local() {
+            if TIMED {
+                deadline.charge_one(DeadlineSite::StorageRead, &mut unpaid)?;
+            }
             if version.is_deleted() {
                 continue;
             }
             let row = self.normalize_row_to_schema(version.data.clone(), &self.cached_schema);
             rows.push((row_id, row));
         }
-        rows
+        Ok(rows)
     }
 
     /// Collect all visible rows, optionally filtered
@@ -2360,8 +2422,16 @@ impl MVCCTable {
             .get_all_visible_rows_cached(self.reader(), deadline)?;
 
         // Step 2: The local rows and their ids, the guard let go
-        let local_ids = Self::local_ids(&txn_versions);
-        let local_rows = self.local_rows(txn_versions);
+        let (local_ids, local_rows) = match deadline.is_none() {
+            true => (
+                Self::local_ids::<false>(&txn_versions, deadline)?,
+                self.local_rows::<false>(txn_versions, deadline)?,
+            ),
+            false => (
+                Self::local_ids::<true>(&txn_versions, deadline)?,
+                self.local_rows::<true>(txn_versions, deadline)?,
+            ),
+        };
 
         // Step 3: Pre-allocate result
         let mut rows = RowVec::with_capacity(global_rows.len() + local_rows.len());
@@ -2472,6 +2542,26 @@ impl MVCCTable {
                 .map(|(row_id, row)| (row_id, self.normalize_row_to_schema(row, schema)))
                 .collect());
         }
+        let bounds = (limit, offset);
+        match deadline.is_none() {
+            true => self.merged_rows_with_limit::<false>(txn_versions, filter, bounds, deadline),
+            false => self.merged_rows_with_limit::<true>(txn_versions, filter, bounds, deadline),
+        }
+    }
+
+    /// [`Self::visible_rows_with_limit`] in a transaction with rows of its
+    /// own, merged over the committed ones; `TIMED` charges `deadline` a run
+    /// of the rows gathered and asked at a time. Each copy stays out of its
+    /// caller
+    #[inline(never)]
+    fn merged_rows_with_limit<const TIMED: bool>(
+        &self,
+        txn_versions: LocalRows<'_>,
+        filter: Option<&dyn Expression>,
+        (limit, offset): (usize, usize),
+        deadline: Deadline,
+    ) -> Result<RowVec> {
+        let schema = &self.cached_schema;
         let fallible = filter.is_some_and(|expr| expr.can_fail());
 
         // Has local versions - use batch fetch then merge with early termination
@@ -2483,9 +2573,9 @@ impl MVCCTable {
         // A filter is asked of the local rows as they stood before it ran,
         // copied and the guard let go; with none the guard stays, and a row
         // the limit does not reach is not cloned
-        let local_ids = Self::local_ids(&txn_versions);
+        let local_ids = Self::local_ids::<TIMED>(&txn_versions, deadline)?;
         let (txn_versions, local_rows) = match filter {
-            Some(_) => (None, self.local_rows(txn_versions)),
+            Some(_) => (None, self.local_rows::<TIMED>(txn_versions, deadline)?),
             None => (Some(txn_versions), RowVec::new()),
         };
 
@@ -2493,9 +2583,13 @@ impl MVCCTable {
         // can actually be returned
         let mut result = RowVec::with_capacity(limit.min(4096));
         let mut count = 0;
+        let mut unpaid = 0usize;
 
         // Add global rows that don't have local overrides
         for (row_id, row) in global_rows {
+            if TIMED {
+                deadline.charge_one(DeadlineSite::StorageRead, &mut unpaid)?;
+            }
             if local_ids.hides(row_id) {
                 continue; // Local version takes precedence
             }
@@ -2517,6 +2611,9 @@ impl MVCCTable {
         // Add local versions (both updates and inserts)
         if let Some(txn_versions) = txn_versions {
             for (row_id, version) in txn_versions.iter_local() {
+                if TIMED {
+                    deadline.charge_one(DeadlineSite::StorageRead, &mut unpaid)?;
+                }
                 if version.is_deleted() {
                     continue;
                 }
@@ -2532,6 +2629,9 @@ impl MVCCTable {
             return Ok(result);
         }
         for (row_id, row) in local_rows {
+            if TIMED {
+                deadline.charge_one(DeadlineSite::StorageRead, &mut unpaid)?;
+            }
             if let Some(expr) = filter {
                 if !passes(expr, fallible, &row)? {
                     continue;
@@ -3568,19 +3668,10 @@ impl Table for MVCCTable {
         // The transaction's own inserts and deletes are part of what it sees
         let txn_versions = self.local();
         if txn_versions.has_local_changes() {
-            let mut deleted = crate::common::I64Set::new();
-            let mut inserted = Vec::new();
-            for (row_id, version) in txn_versions.iter_local() {
-                if version.is_deleted() {
-                    deleted.insert(row_id);
-                } else {
-                    inserted.push(row_id);
-                }
+            match deadline.is_none() {
+                true => Self::merge_local_ids::<false>(&txn_versions, &mut ids, deadline)?,
+                false => Self::merge_local_ids_timed(&txn_versions, &mut ids, deadline)?,
             }
-            ids.retain(|id| !deleted.contains(*id));
-            ids.extend(inserted);
-            ids.sort_unstable();
-            ids.dedup();
         }
         Ok(ids)
     }

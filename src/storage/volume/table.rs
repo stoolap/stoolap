@@ -1907,8 +1907,8 @@ impl SegmentedTable {
 
     /// Adds to `result` the rows of the sealed `volume` this handle shows
     /// whose column `col_idx`, `default` where the volume lacks it, holds
-    /// `value`; `TIMED` charges `deadline` the rows passed before the first
-    /// shown one, then a run of rows at a time
+    /// `value`; `TIMED` charges `deadline` a run of rows at a time, those
+    /// looked at for the first shown one included
     #[inline(always)]
     fn partition_rows_of<const TIMED: bool>(
         &self,
@@ -1949,19 +1949,29 @@ impl SegmentedTable {
             }
         }
         let row_ids = vol.row_ids()?;
-        let Some(start) = (0..vol.meta.row_count).find(|&i| {
+        let shown = |i: usize| {
             cs.is_visible(i)
                 && !self.is_row_tombstoned(tombstones, row_ids[i], cut)
                 && !hot_skip.contains(&row_ids[i])
-        }) else {
-            if TIMED {
-                deadline.charge(DeadlineSite::StorageRead, vol.meta.row_count)?;
+        };
+        let rows = vol.meta.row_count;
+        let first = if TIMED {
+            let mut first = None;
+            for from in (0..rows).step_by(CHARGE_BEAT) {
+                let to = (from + CHARGE_BEAT).min(rows);
+                deadline.charge(DeadlineSite::StorageRead, to - from)?;
+                first = (from..to).find(|&i| shown(i));
+                if first.is_some() {
+                    break;
+                }
             }
+            first
+        } else {
+            (0..rows).find(|&i| shown(i))
+        };
+        let Some(start) = first else {
             return Ok(());
         };
-        if TIMED {
-            deadline.charge(DeadlineSite::StorageRead, start)?;
-        }
         // Load cold volume on demand after pruning, through the file
         // the view captured
         let loaded;

@@ -15453,10 +15453,10 @@ impl<'a> PreparedRunner<'a> {
             Some(BlockInput::Table(table)) if self.blocks[index].counted.replace(false) => {
                 let held = self.blocks[index].count_ids.borrow();
                 let ids = held.as_ref().map_or(&[][..], |held| held.0.as_slice());
-                let none = Deadline::NONE;
+                let deadline = self.ctx.deadline_of_call();
                 let rows = match expr {
-                    Some(expr) => table.fetch_rows_by_ids(ids, expr, none)?,
-                    None => table.fetch_rows_by_ids(ids, &ConstBoolExpr::true_expr(), none)?,
+                    Some(expr) => table.fetch_rows_by_ids(ids, expr, deadline)?,
+                    None => table.fetch_rows_by_ids(ids, &ConstBoolExpr::true_expr(), deadline)?,
                 };
                 Ok(Box::new(PointRows { rows, at: None }))
             }
