@@ -256,6 +256,9 @@ pub struct PreparedJoin {
     /// The programs feeding the calls of a grouped statement its grouped
     /// blocks do not run, by the joined rows' columns
     feeds: Shelf<Vec<String>, HeldFeed>,
+    /// The names a grouped statement's blocks read the joined rows by, each
+    /// merged pair apart, by the joined rows' columns
+    apart_names: Shelf<Vec<String>, Vec<String>>,
     /// The plan of each side that runs as a statement of its own: a join or
     /// a derived table
     side_plans: [NestedPlan; 2],
@@ -288,6 +291,7 @@ impl PreparedJoin {
             grouped: std::sync::OnceLock::new(),
             grouped_blocks: Shelf::new(),
             feeds: Shelf::new(),
+            apart_names: Shelf::new(),
             side_plans: Default::default(),
             bare_side_plans: Default::default(),
             filters: std::sync::OnceLock::new(),
@@ -411,6 +415,23 @@ impl PreparedJoin {
         self.feeds
             .hold(wanted, || columns.to_vec(), || Arc::clone(&feed));
         feed
+    }
+
+    /// The names held for joined rows of `columns` with each merged pair
+    /// apart, or the ones `name` gives
+    pub(crate) fn apart_names(
+        &self,
+        columns: &[String],
+        name: impl FnOnce() -> Vec<String>,
+    ) -> Arc<Vec<String>> {
+        let wanted = |held: &Vec<String>| held == columns;
+        if let Some(held) = self.apart_names.find(wanted) {
+            return held;
+        }
+        let named = Arc::new(name());
+        self.apart_names
+            .hold(wanted, || columns.to_vec(), || Arc::clone(&named));
+        named
     }
 
     /// The output held for joined rows of `columns`, or the one `build`

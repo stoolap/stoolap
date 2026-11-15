@@ -103,12 +103,12 @@ fn a_join_aggregated_in_parts_copies_no_column_name_for_each_run() {
 }
 
 /// The most allocations a run of the merged grouped join below makes once
-/// its plan is held: 568 when its family's turn from the parts path was
-/// first carried without one. Lower it when a change saves one
-const MERGED_FAMILY_RUN: usize = 568;
+/// its plan is held: 566 when its family first read the joined rows in
+/// parts, its names held with the plan. Lower it when a change saves one
+const MERGED_FAMILY_RUN: usize = 566;
 
 #[test]
-fn a_merged_grouped_join_turned_from_parts_allocates_nothing_to_say_so() {
+fn a_merged_grouped_join_read_in_parts_copies_no_column_name_for_each_run() {
     let db = Database::open("memory://grouped_join_names_alloc_merged_family").unwrap();
     for sql in [
         "CREATE TABLE l (id INTEGER PRIMARY KEY, k INTEGER)",
