@@ -825,7 +825,9 @@ fn a_table_read_that_took_no_deadline_stops_at_it() {
     sealed.engine().seal_for_test().unwrap();
     for sql in [
         "DELETE FROM s WHERE id <= 10",
-        "INSERT INTO s SELECT value, value % 50, value, 'y' FROM generate_series(140001, 140100)",
+        // Hot rows in every partition of t, so each costs a window the same
+        "INSERT INTO s SELECT value, value % 50, value, 'x' || (value % 10) \
+         FROM generate_series(140001, 140100)",
     ] {
         sealed.execute(sql, ()).unwrap();
     }
