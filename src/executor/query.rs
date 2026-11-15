@@ -3200,8 +3200,11 @@ impl Executor {
     pub(crate) fn distinct_column_values(
         table: &dyn crate::storage::traits::Table,
         column: &str,
+        deadline: crate::common::deadline::Deadline,
     ) -> Result<Option<Vec<Value>>> {
-        let values = table.get_partition_values(column)?;
+        let values = table.get_partition_values(column, deadline)?;
+        // A read whose last charge read no clock is checked once more
+        deadline.check()?;
         if values.is_some() {
             super::result::DistinctPath::Values.taken();
         }
@@ -10049,17 +10052,20 @@ impl Executor {
             .active_transaction
             .lock()
             .map_err(|_| Error::internal("active transaction lock poisoned"))?;
+        let deadline = ctx.deadline_of_call();
         let rows = match (active.as_ref(), ctx.statement_snapshot()) {
-            (Some(tx), _) => tx.transaction.rows_at(name, &point)?,
+            (Some(tx), _) => tx.transaction.rows_at(name, &point, deadline)?,
             (None, Some(snapshot)) => {
                 drop(active);
-                snapshot.rows_at(name, &point)?
+                snapshot.rows_at(name, &point, deadline)?
             }
             (None, None) => {
                 drop(active);
-                self.begin_transaction()?.rows_at(name, &point)?
+                self.begin_transaction()?.rows_at(name, &point, deadline)?
             }
         };
+        // A read whose last charge read no clock is checked once more
+        deadline.check()?;
         Ok((columns, rows))
     }
 

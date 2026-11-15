@@ -757,11 +757,17 @@ fn a_table_shortcut_without_a_view_drops_an_answer_a_commit_moved_rows_under() {
         let table = tx.get_table("c").unwrap();
         let seen = match shortcut {
             "count" => format!("{:?}", table.fast_row_count().unwrap()),
-            "sum" => match table.sum_column(1).unwrap() {
+            "sum" => match table
+                .sum_column(1, stoolap::executor::Deadline::NONE)
+                .unwrap()
+            {
                 Some(sum) => format!("{} of {}", sum.sum().unwrap(), sum.count()),
                 None => "None".to_string(),
             },
-            _ => format!("{:?}", table.row_count().unwrap()),
+            _ => format!(
+                "{:?}",
+                table.row_count(stoolap::executor::Deadline::NONE).unwrap()
+            ),
         };
         if !committed.get() {
             wrong.push(format!(

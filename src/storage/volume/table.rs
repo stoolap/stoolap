@@ -28,7 +28,7 @@
 
 use std::sync::Arc;
 
-use crate::common::deadline::{Deadline, DeadlineSite};
+use crate::common::deadline::{Deadline, DeadlineSite, CHARGE_BEAT};
 use crate::common::names::eq_names;
 use crate::common::{CompactArc, I64Set};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -133,6 +133,32 @@ impl Iterator for ShownPositions<'_> {
         let i = self.base + self.word.trailing_zeros() as usize;
         self.word &= self.word - 1;
         (i < self.rows).then_some(i)
+    }
+}
+
+/// `positions` charged a run at a time: past the deadline they end, the
+/// error left in `stopped`
+struct ChargedPositions<'a> {
+    positions: ShownPositions<'a>,
+    deadline: Deadline,
+    unpaid: usize,
+    stopped: &'a mut Option<crate::core::Error>,
+}
+
+impl Iterator for ChargedPositions<'_> {
+    type Item = usize;
+
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        if self.unpaid == CHARGE_BEAT {
+            self.unpaid = 0;
+            if let Err(e) = self.deadline.charge(DeadlineSite::StorageRead, CHARGE_BEAT) {
+                *self.stopped = Some(e);
+                return None;
+            }
+        }
+        self.unpaid += 1;
+        self.positions.next()
     }
 }
 
@@ -964,8 +990,11 @@ impl SegmentedTable {
 
     /// How many rows `collect_cold_and_hot(None, Seq)` returns: the hot
     /// rows, and the sealed rows counted by their ids, no row built for them
-    fn count_cold_and_hot(&self) -> Result<usize> {
-        if let Some(result) = self.unsealed(|hot| hot.collect_all_rows(None).map(|r| r.len())) {
+    fn count_cold_and_hot(&self, deadline: Deadline) -> Result<usize> {
+        if let Some(result) = self.unsealed(|hot| {
+            hot.collect_access_rows(ScanAccess::Seq, None, deadline)
+                .map(|r| r.len())
+        }) {
             return result;
         }
 
@@ -973,7 +1002,7 @@ impl SegmentedTable {
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::merged_read_began();
             let cut = self.read_cut();
-            let hot_rows = self.hot_rows(None, ScanAccess::Seq, Deadline::NONE)?;
+            let hot_rows = self.hot_rows(None, ScanAccess::Seq, deadline)?;
 
             let mut skip: FxHashSet<i64> =
                 FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
@@ -983,7 +1012,7 @@ impl SegmentedTable {
             self.segment_mgr
                 .insert_pending_tombstones_into(self.pending(), &mut skip);
 
-            let Some(cold) = self.count_cold_rows(&skip, generation, &cut)? else {
+            let Some(cold) = self.count_cold_rows(&skip, generation, &cut, deadline)? else {
                 return Ok(None);
             };
             Ok(Some(cold + hot_rows.len()))
@@ -997,6 +1026,7 @@ impl SegmentedTable {
         hot_skip: &FxHashSet<i64>,
         generation: u64,
         cut: &CommitCut,
+        deadline: Deadline,
     ) -> Result<Option<usize>> {
         self.segment_mgr
             .check_schema_generation(self.schema_generation)?;
@@ -1015,9 +1045,14 @@ impl SegmentedTable {
         let volumes: Vec<_> = view.volumes().collect();
         let count_volume = |(_, cs): &(u64, &super::manifest::ColdSegment)| -> Result<usize> {
             let row_ids = cs.volume.row_ids()?;
-            Ok((0..row_ids.len())
-                .filter(|&i| self.shows_cold_row(cs, i, row_ids[i], tombstones, hot_skip, cut))
-                .count())
+            let mut shown = 0;
+            for rows in row_groups(0..row_ids.len()) {
+                deadline.charge(DeadlineSite::StorageRead, rows.len())?;
+                shown += rows
+                    .filter(|&i| self.shows_cold_row(cs, i, row_ids[i], tombstones, hot_skip, cut))
+                    .count();
+            }
+            Ok(shown)
         };
         #[cfg(feature = "parallel")]
         if volumes.len() >= 4 {
@@ -1342,7 +1377,12 @@ impl SegmentedTable {
     /// The distinct values of column `col_idx` the statement sees, NULL
     /// among them when `with_null`; None when the hot rows of a column with
     /// no hot index cannot be enumerated, under a snapshot, or in a seal's overlap
-    fn distinct_column(&self, col_idx: usize, with_null: bool) -> Result<Option<ValueSet>> {
+    fn distinct_column(
+        &self,
+        col_idx: usize,
+        with_null: bool,
+        deadline: Deadline,
+    ) -> Result<Option<ValueSet>> {
         if self.snapshot_seq.is_some() || self.segment_mgr.seal_overlap() > 0 {
             return Ok(None);
         }
@@ -1355,12 +1395,12 @@ impl SegmentedTable {
             };
             let data_type = column.data_type;
             let mut distinct = ValueSet::default();
-            match self.hot.get_partition_values(&column.name)? {
+            match self.hot.get_partition_values(&column.name, deadline)? {
                 Some(values) => {
                     distinct.extend(values.into_iter().filter(|v| with_null || !v.is_null()))
                 }
                 // Local writes leave the count blind to a row over a deleted id
-                None if self.hot.has_local_changes() || self.hot.row_count()? > 0 => {
+                None if self.hot.has_local_changes() || self.hot.row_count(deadline)? > 0 => {
                     return Ok(Some(None))
                 }
                 None => {}
@@ -1386,6 +1426,7 @@ impl SegmentedTable {
                     (col_idx, data_type, &default, with_null),
                     (&tombstones, &hot_skip, &cut),
                     &mut distinct,
+                    deadline,
                 )?;
             }
             self.check_cold()?;
@@ -1403,10 +1444,11 @@ impl SegmentedTable {
         (col_idx, data_type, default, with_null): (usize, DataType, &Value, bool),
         (tombstones, hot_skip, cut): (&FxHashMap<i64, u64>, &FxHashSet<i64>, &CommitCut),
         distinct: &mut ValueSet,
+        deadline: Deadline,
     ) -> Result<()> {
         let vol = &cs.volume;
         let rows = vol.meta.row_count;
-        let shown = self.shown_rows(cs, tombstones, hot_skip, cut)?;
+        let shown = self.shown_rows(cs, tombstones, hot_skip, cut, deadline)?;
         let positions = ShownPositions {
             bits: shown.as_deref(),
             rows,
@@ -1428,7 +1470,10 @@ impl SegmentedTable {
         };
         if shown.is_none() {
             if let Some(dictionary) = vol.get_column_dictionary(phys)? {
-                distinct.extend(dictionary.iter().map(|text| Value::Text(text.clone())));
+                for texts in dictionary.chunks(CHARGE_BEAT) {
+                    deadline.charge(DeadlineSite::StorageRead, texts.len())?;
+                    distinct.extend(texts.iter().map(|text| Value::Text(text.clone())));
+                }
                 let zone = vol.meta.zone_maps.get(phys);
                 if with_null && zone.is_some_and(|zone| zone.null_count > 0) {
                     distinct.insert(Value::null(data_type));
@@ -1438,7 +1483,7 @@ impl SegmentedTable {
         }
         if let Some(def) = side {
             let column = (phys, data_type, with_null);
-            if Self::side_distinct(cs, def, shown.as_deref(), column, distinct)? {
+            if Self::side_distinct(cs, def, shown.as_deref(), column, distinct, deadline)? {
                 return Ok(());
             }
         }
@@ -1449,18 +1494,42 @@ impl SegmentedTable {
         let (sampled, rows_sampled) =
             (column.first_of_each(sample.clone()).0.len(), sample.count());
         let dictionary = matches!(column, super::column::ColumnData::Dictionary { .. });
-        if !dictionary && sampled * 2 > rows_sampled {
+        let spread = !dictionary && sampled * 2 > rows_sampled;
+        if deadline.is_none() {
+            Self::add_values(column, positions, spread, with_null, distinct);
+            return Ok(());
+        }
+        let mut stopped = None;
+        let positions = ChargedPositions {
+            positions,
+            deadline,
+            unpaid: 0,
+            stopped: &mut stopped,
+        };
+        Self::add_values(column, positions, spread, with_null, distinct);
+        stopped.map_or(Ok(()), Err)
+    }
+
+    /// Adds the values `column` holds at `positions` to `distinct`: every
+    /// one when `spread`, else the first of each
+    fn add_values(
+        column: &super::column::ColumnData,
+        positions: impl Iterator<Item = usize>,
+        spread: bool,
+        with_null: bool,
+        distinct: &mut ValueSet,
+    ) {
+        if spread {
             for i in positions.filter(|&i| with_null || !column.is_null(i)) {
                 distinct.insert(column.get_value(i));
             }
-            return Ok(());
+            return;
         }
         let (firsts, null) = column.first_of_each(positions);
         distinct.extend(firsts.into_iter().map(|i| column.get_value(i)));
         if let Some(i) = null.filter(|_| with_null) {
             distinct.insert(column.get_value(i));
         }
-        Ok(())
     }
 
     /// Adds the keys of `def`'s entry in the side file of `cs` that `shown`
@@ -1472,8 +1541,17 @@ impl SegmentedTable {
         shown: Option<&[u64]>,
         (phys, data_type, with_null): (usize, DataType, bool),
         distinct: &mut ValueSet,
+        deadline: Deadline,
     ) -> Result<bool> {
         use super::secondary::{is_refused, READS};
+        let mut stopped = None;
+        let mut paid = |units: usize| match deadline.charge(DeadlineSite::StorageRead, units) {
+            Ok(()) => true,
+            Err(error) => {
+                stopped = Some(error);
+                false
+            }
+        };
         let Some(side) = cs.side_for(def, Capability::Range) else {
             return Ok(false);
         };
@@ -1505,7 +1583,13 @@ impl SegmentedTable {
             None => {
                 distinct.reserve(entry.n_keys as usize);
                 reader
-                    .each_key_page(|keys| distinct.extend(keys.iter().map(|&key| value(key))))
+                    .each_key_page(|keys| {
+                        let more = paid(keys.len());
+                        if more {
+                            distinct.extend(keys.iter().map(|&key| value(key)));
+                        }
+                        more
+                    })
                     .map_err(side_error)?;
                 zone.null_count > 0
             }
@@ -1517,9 +1601,13 @@ impl SegmentedTable {
                 };
                 distinct.reserve(rows.min(entry.n_keys) as usize);
                 // A refusal comes before any key, so the scan still answers
-                let keyed = match reader.each_shown_key(shown, |key| {
-                    distinct.insert(value(key));
-                }) {
+                let keyed = match reader.each_shown_key(
+                    shown,
+                    |key| {
+                        distinct.insert(value(key));
+                    },
+                    |positions| paid(positions as usize),
+                ) {
                     Ok(keyed) => keyed,
                     Err(error) if is_refused(&error) => {
                         READS.count(&READS.refused, 1);
@@ -1531,6 +1619,9 @@ impl SegmentedTable {
                 zone.null_count > 0 && rows > keyed
             }
         };
+        if let Some(error) = stopped {
+            return Err(error);
+        }
         if with_null && null {
             distinct.insert(Value::null(data_type));
         }
@@ -1546,6 +1637,7 @@ impl SegmentedTable {
         tombstones: &FxHashMap<i64, u64>,
         hot_skip: &FxHashSet<i64>,
         cut: &CommitCut,
+        deadline: Deadline,
     ) -> Result<Option<Vec<u64>>> {
         let vol = &cs.volume;
         let rows = vol.meta.row_count;
@@ -1563,7 +1655,13 @@ impl SegmentedTable {
             cleared = true;
         };
         if hidden <= rows {
+            let mut unpaid = 0;
             for (&id, &seq) in tombstones.iter() {
+                unpaid += 1;
+                if unpaid == CHARGE_BEAT {
+                    unpaid = 0;
+                    deadline.charge(DeadlineSite::StorageRead, CHARGE_BEAT)?;
+                }
                 if let Some(i) = vol
                     .locate(id)
                     .filter(|_| self.is_tombstone_visible(seq, cut))
@@ -1571,15 +1669,24 @@ impl SegmentedTable {
                     hide(i);
                 }
             }
-            hot_skip
-                .iter()
-                .filter_map(|&id| vol.locate(id))
-                .for_each(&mut hide);
+            for &id in hot_skip.iter() {
+                unpaid += 1;
+                if unpaid == CHARGE_BEAT {
+                    unpaid = 0;
+                    deadline.charge(DeadlineSite::StorageRead, CHARGE_BEAT)?;
+                }
+                if let Some(i) = vol.locate(id) {
+                    hide(i);
+                }
+            }
         } else {
             let row_ids = vol.row_ids()?;
-            for (i, id) in row_ids.iter().enumerate() {
-                if hot_skip.contains(id) || self.is_row_tombstoned(tombstones, *id, cut) {
-                    hide(i);
+            for (run, ids) in row_ids.chunks(CHARGE_BEAT).enumerate() {
+                deadline.charge(DeadlineSite::StorageRead, ids.len())?;
+                for (at, id) in ids.iter().enumerate() {
+                    if hot_skip.contains(id) || self.is_row_tombstoned(tombstones, *id, cut) {
+                        hide(run * CHARGE_BEAT + at);
+                    }
                 }
             }
         }
@@ -1725,6 +1832,25 @@ impl SegmentedTable {
         cs.is_visible(i)
             && !self.is_row_tombstoned(tombstones, row_id, cut)
             && !hot_skip.contains(&row_id)
+    }
+
+    /// Whether `cs` shows any of its rows, read a row group at a time
+    fn shows_any_row(
+        &self,
+        cs: &super::manifest::ColdSegment,
+        row_ids: &[i64],
+        tombstones: &FxHashMap<i64, u64>,
+        hot_skip: &FxHashSet<i64>,
+        cut: &CommitCut,
+        deadline: Deadline,
+    ) -> Result<bool> {
+        for mut rows in row_groups(0..cs.volume.meta.row_count) {
+            deadline.charge(DeadlineSite::StorageAggregate, rows.len())?;
+            if rows.any(|i| self.shows_cold_row(cs, i, row_ids[i], tombstones, hot_skip, cut)) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Get the schema default for a column, or typed NULL if no default.
@@ -4290,7 +4416,7 @@ impl SegmentedTable {
                 prep.prepared.extend(prep.deletes.iter().map(|d| d.row_id));
             }
             match ids {
-                Some(ids) => self.prepare_cold_deletes_by_id(snap, cut, ids, &mut prep),
+                Some(ids) => self.prepare_cold_deletes_by_id(snap, cut, ids, &mut prep, deadline),
                 None => {
                     self.prepare_cold_deletes_where(
                         snap,
@@ -4361,6 +4487,7 @@ impl SegmentedTable {
         cut: &CommitCut,
         ids: &[i64],
         prep: &mut ColdDeletes,
+        deadline: Deadline,
     ) -> Result<()> {
         // One id, the `pk = k` case, needs no ordering
         if let [row_id] = *ids {
@@ -4386,18 +4513,21 @@ impl SegmentedTable {
         }
         let mut located: Vec<(u64, usize, i64)> = Vec::new();
         let mut segments: FxHashMap<u64, super::manifest::ColdSegment> = FxHashMap::default();
-        for &row_id in ids {
-            if prep.prepared.contains(&row_id) {
-                continue;
-            }
-            match self.find_segment_row_in(snap, cut, row_id)? {
-                Some((seg_id, cold, idx)) => {
-                    segments.entry(seg_id).or_insert(cold);
-                    located.push((seg_id, idx, row_id));
+        for ids in ids.chunks(CHARGE_BEAT) {
+            deadline.charge(DeadlineSite::StorageDelete, ids.len())?;
+            for &row_id in ids {
+                if prep.prepared.contains(&row_id) {
+                    continue;
                 }
-                None => {
-                    if let Some(hot_ids) = &mut prep.hot_ids {
-                        hot_ids.push(row_id);
+                match self.find_segment_row_in(snap, cut, row_id)? {
+                    Some((seg_id, cold, idx)) => {
+                        segments.entry(seg_id).or_insert(cold);
+                        located.push((seg_id, idx, row_id));
+                    }
+                    None => {
+                        if let Some(hot_ids) = &mut prep.hot_ids {
+                            hot_ids.push(row_id);
+                        }
                     }
                 }
             }
@@ -4406,13 +4536,16 @@ impl SegmentedTable {
         // An id named twice is one row
         located.dedup_by_key(|&mut (_, _, row_id)| row_id);
         let mut old_rows: Option<super::writer::RowReader> = None;
-        for &(seg_id, idx, row_id) in &located {
-            let old_row = Self::cold_row_of(&mut old_rows, &segments[&seg_id], idx)?;
-            prep.deletes.push(ColdDelete {
-                row_id,
-                seg_id,
-                old_row,
-            });
+        for rows in located.chunks(CHARGE_BEAT) {
+            deadline.charge(DeadlineSite::StorageDelete, rows.len())?;
+            for &(seg_id, idx, row_id) in rows {
+                let old_row = Self::cold_row_of(&mut old_rows, &segments[&seg_id], idx)?;
+                prep.deletes.push(ColdDelete {
+                    row_id,
+                    seg_id,
+                    old_row,
+                });
+            }
         }
         Ok(())
     }
@@ -4759,27 +4892,33 @@ impl SegmentedTable {
         hot_skip: &FxHashSet<i64>,
         no_tombstones: bool,
         cut: &CommitCut,
-    ) {
-        for (i, &rid) in row_ids.iter().enumerate() {
-            if col.is_null(i) || !cs.is_visible(i) {
-                continue;
-            }
-            if hot_skip.contains(&rid) {
-                continue;
-            }
-            if !no_tombstones && self.is_row_tombstoned(tombstones, rid, cut) {
-                continue;
-            }
-            let val = col.get_value(i);
-            match overall_min {
-                None => *overall_min = Some(val),
-                Some(ref current) => {
-                    if let Ok(std::cmp::Ordering::Less) = val.compare(current) {
-                        *overall_min = Some(val);
+        deadline: Deadline,
+    ) -> Result<()> {
+        for rows in row_groups(0..row_ids.len()) {
+            deadline.charge(DeadlineSite::StorageAggregate, rows.len())?;
+            for i in rows {
+                let rid = row_ids[i];
+                if col.is_null(i) || !cs.is_visible(i) {
+                    continue;
+                }
+                if hot_skip.contains(&rid) {
+                    continue;
+                }
+                if !no_tombstones && self.is_row_tombstoned(tombstones, rid, cut) {
+                    continue;
+                }
+                let val = col.get_value(i);
+                match overall_min {
+                    None => *overall_min = Some(val),
+                    Some(ref current) => {
+                        if let Ok(std::cmp::Ordering::Less) = val.compare(current) {
+                            *overall_min = Some(val);
+                        }
                     }
                 }
             }
         }
+        Ok(())
     }
 
     /// Generic fallback for max_column scan on non-numeric column types.
@@ -4794,27 +4933,33 @@ impl SegmentedTable {
         hot_skip: &FxHashSet<i64>,
         no_tombstones: bool,
         cut: &CommitCut,
-    ) {
-        for (i, &rid) in row_ids.iter().enumerate() {
-            if col.is_null(i) || !cs.is_visible(i) {
-                continue;
-            }
-            if hot_skip.contains(&rid) {
-                continue;
-            }
-            if !no_tombstones && self.is_row_tombstoned(tombstones, rid, cut) {
-                continue;
-            }
-            let val = col.get_value(i);
-            match overall_max {
-                None => *overall_max = Some(val),
-                Some(ref current) => {
-                    if let Ok(std::cmp::Ordering::Greater) = val.compare(current) {
-                        *overall_max = Some(val);
+        deadline: Deadline,
+    ) -> Result<()> {
+        for rows in row_groups(0..row_ids.len()) {
+            deadline.charge(DeadlineSite::StorageAggregate, rows.len())?;
+            for i in rows {
+                let rid = row_ids[i];
+                if col.is_null(i) || !cs.is_visible(i) {
+                    continue;
+                }
+                if hot_skip.contains(&rid) {
+                    continue;
+                }
+                if !no_tombstones && self.is_row_tombstoned(tombstones, rid, cut) {
+                    continue;
+                }
+                let val = col.get_value(i);
+                match overall_max {
+                    None => *overall_max = Some(val),
+                    Some(ref current) => {
+                        if let Ok(std::cmp::Ordering::Greater) = val.compare(current) {
+                            *overall_max = Some(val);
+                        }
                     }
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -5041,18 +5186,18 @@ impl Table for SegmentedTable {
         row_ids: &mut Vec<i64>,
         found: &FoundVersions,
         changed: &mut Vec<(i64, Row, VersionMark)>,
+        deadline: Deadline,
     ) -> Result<i32> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         let mgr = Arc::clone(&self.segment_mgr);
         let handed = changed.len();
         // A sealed row the snapshot still holds is there to delete; a row
         // it does not is the hot store's, deleted if still visible
-        let mut prepared =
-            self.prepare_cold_deletes(&mgr, Some(row_ids), None, true, Deadline::NONE)?;
+        let mut prepared = self.prepare_cold_deletes(&mgr, Some(row_ids), None, true, deadline)?;
         let Some(mut hot_ids) = prepared.hot_ids else {
             let count =
                 self.apply_cold_deletes_unless_held(prepared.deletes, prepared.seen, |hot, _| {
-                    let count = hot.delete_found(row_ids, found, changed)?;
+                    let count = hot.delete_found(row_ids, found, changed, deadline)?;
                     Ok((changed.len() == handed).then_some(count))
                 })?;
             return Ok(count.unwrap_or_default());
@@ -5087,7 +5232,7 @@ impl Table for SegmentedTable {
                     return Ok(Some(0));
                 }
                 offered = Some(hot_ids.clone());
-                let count = hot.delete_found(&mut hot_ids, found, changed)?;
+                let count = hot.delete_found(&mut hot_ids, found, changed, deadline)?;
                 Ok((changed.len() == handed).then_some(count))
             })?;
         let Some(count) = count else {
@@ -5732,7 +5877,7 @@ impl Table for SegmentedTable {
     // Row count
     // =========================================================================
 
-    fn row_count(&self) -> Result<usize> {
+    fn row_count(&self, deadline: Deadline) -> Result<usize> {
         // Snapshot isolation: deduped_row_count and the fast path subtract ALL
         // tombstones, but a snapshot may not see newer ones. Use full scan.
         // A view that sees every commit takes the fast path
@@ -5740,7 +5885,7 @@ impl Table for SegmentedTable {
             if let Some(count) = self.fast_row_count()? {
                 return Ok(count);
             }
-            return self.count_cold_and_hot();
+            return self.count_cold_and_hot(deadline);
         }
         // O(1) counts held to one seal generation and one commit epoch, else the scan counts
         let counted = self.across_seals(|generation| {
@@ -5756,7 +5901,7 @@ impl Table for SegmentedTable {
                 #[cfg(feature = "test-failpoints")]
                 crate::test_failpoints::hot_and_cold_reads_split();
                 let pending = self.segment_mgr.pending_tombstone_count(self.pending());
-                let count = seg.saturating_sub(pending) + self.hot.row_count()?;
+                let count = seg.saturating_sub(pending) + self.hot.row_count(deadline)?;
                 if self.seal_moved(generation) {
                     return Ok(None);
                 }
@@ -5768,7 +5913,7 @@ impl Table for SegmentedTable {
         })?;
         match counted {
             Some(count) => Ok(count),
-            None => self.count_cold_and_hot(),
+            None => self.count_cold_and_hot(deadline),
         }
     }
 
@@ -5803,13 +5948,13 @@ impl Table for SegmentedTable {
     // Aggregation pushdown
     // =========================================================================
 
-    fn sum_column(&self, col_idx: usize) -> Result<Option<SumAccumulator>> {
+    fn sum_column(&self, col_idx: usize, deadline: Deadline) -> Result<Option<SumAccumulator>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.sum_column");
         // The volume stats count rows a snapshot or a view may not see
         self.newest_across_seals(|generation| {
             let cut = self.read_cut();
-            let hot_result = self.hot.sum_column(col_idx)?;
+            let hot_result = self.hot.sum_column(col_idx, deadline)?;
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::hot_and_cold_reads_split();
 
@@ -5924,11 +6069,19 @@ impl Table for SegmentedTable {
             for (_, cs) in volumes.iter() {
                 let vol = &cs.volume;
                 let row_ids = vol.row_ids()?;
-                let Some(start) = (0..vol.meta.row_count).find(|&i| {
-                    cs.is_visible(i)
-                        && !self.is_row_tombstoned(&tombstones_arc, row_ids[i], &cut)
-                        && !hot_skip.contains(&row_ids[i])
-                }) else {
+                let mut start = None;
+                for mut rows in row_groups(0..vol.meta.row_count) {
+                    deadline.charge(DeadlineSite::StorageAggregate, rows.len())?;
+                    start = rows.find(|&i| {
+                        cs.is_visible(i)
+                            && !self.is_row_tombstoned(&tombstones_arc, row_ids[i], &cut)
+                            && !hot_skip.contains(&row_ids[i])
+                    });
+                    if start.is_some() {
+                        break;
+                    }
+                }
+                let Some(start) = start else {
                     continue;
                 };
                 let mapping = &cs.mapping;
@@ -5941,32 +6094,39 @@ impl Table for SegmentedTable {
                     None
                 };
                 let column = phys.map(|pi| vol.columns.get(pi)).transpose()?;
-                for i in start..vol.meta.row_count {
-                    let rid = row_ids[i];
-                    if !self.shows_cold_row(cs, i, rid, &tombstones_arc, &hot_skip, &cut) {
-                        continue;
-                    }
-                    if let Some(col) = column {
-                        if col.is_null(i) {
+                for rows in row_groups(start..vol.meta.row_count) {
+                    deadline.charge(DeadlineSite::StorageAggregate, rows.len())?;
+                    for i in rows {
+                        let rid = row_ids[i];
+                        if !self.shows_cold_row(cs, i, rid, &tombstones_arc, &hot_skip, &cut) {
                             continue;
                         }
-                        match col {
-                            crate::storage::volume::column::ColumnData::Int64 {
-                                values, ..
-                            } if as_float => total.add_float(values[i] as f64),
-                            crate::storage::volume::column::ColumnData::Int64 {
-                                values, ..
-                            } => total.add_int(values[i]),
-                            crate::storage::volume::column::ColumnData::Float64 {
-                                values, ..
-                            } => total.add_float(values[i]),
-                            crate::storage::volume::column::ColumnData::Boolean {
-                                values, ..
-                            } => total.add_int(values[i] as i64),
-                            _ => {}
+                        if let Some(col) = column {
+                            if col.is_null(i) {
+                                continue;
+                            }
+                            match col {
+                                crate::storage::volume::column::ColumnData::Int64 {
+                                    values,
+                                    ..
+                                } if as_float => total.add_float(values[i] as f64),
+                                crate::storage::volume::column::ColumnData::Int64 {
+                                    values,
+                                    ..
+                                } => total.add_int(values[i]),
+                                crate::storage::volume::column::ColumnData::Float64 {
+                                    values,
+                                    ..
+                                } => total.add_float(values[i]),
+                                crate::storage::volume::column::ColumnData::Boolean {
+                                    values,
+                                    ..
+                                } => total.add_int(values[i] as i64),
+                                _ => {}
+                            }
+                        } else {
+                            add_default(&mut total, 1);
                         }
-                    } else {
-                        add_default(&mut total, 1);
                     }
                 }
             }
@@ -5975,12 +6135,12 @@ impl Table for SegmentedTable {
         })
     }
 
-    fn min_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
+    fn min_column(&self, col_idx: usize, deadline: Deadline) -> Result<Option<Option<Value>>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.min_column");
         self.newest_across_seals(|generation| {
             let cut = self.read_cut();
-            let hot_result = self.hot.min_column(col_idx)?;
+            let hot_result = self.hot.min_column(col_idx, deadline)?;
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::hot_and_cold_reads_split();
 
@@ -6129,26 +6289,30 @@ impl Table for SegmentedTable {
                                         &hot_skip,
                                         no_tombstones,
                                         &cut,
-                                    );
+                                        deadline,
+                                    )?;
                                     continue;
                                 }
                             };
-                            for i in 0..vol.meta.row_count {
-                                if nulls[i] || !cs.is_visible(i) {
-                                    continue;
-                                }
-                                let rid = row_ids[i];
-                                if hot_skip.contains(&rid) {
-                                    continue;
-                                }
-                                if !no_tombstones
-                                    && self.is_row_tombstoned(tombstones_ref, rid, &cut)
-                                {
-                                    continue;
-                                }
-                                let v = values[i];
-                                if best_i64.is_none() || v < best_i64.unwrap_or(i64::MAX) {
-                                    best_i64 = Some(v);
+                            for rows in row_groups(0..vol.meta.row_count) {
+                                deadline.charge(DeadlineSite::StorageAggregate, rows.len())?;
+                                for i in rows {
+                                    if nulls[i] || !cs.is_visible(i) {
+                                        continue;
+                                    }
+                                    let rid = row_ids[i];
+                                    if hot_skip.contains(&rid) {
+                                        continue;
+                                    }
+                                    if !no_tombstones
+                                        && self.is_row_tombstoned(tombstones_ref, rid, &cut)
+                                    {
+                                        continue;
+                                    }
+                                    let v = values[i];
+                                    if best_i64.is_none() || v < best_i64.unwrap_or(i64::MAX) {
+                                        best_i64 = Some(v);
+                                    }
                                 }
                             }
                             if let Some(v) = best_i64 {
@@ -6169,26 +6333,30 @@ impl Table for SegmentedTable {
                                         &hot_skip,
                                         no_tombstones,
                                         &cut,
-                                    );
+                                        deadline,
+                                    )?;
                                     continue;
                                 }
                             };
-                            for i in 0..vol.meta.row_count {
-                                if nulls[i] || !cs.is_visible(i) {
-                                    continue;
-                                }
-                                let rid = row_ids[i];
-                                if hot_skip.contains(&rid) {
-                                    continue;
-                                }
-                                if !no_tombstones
-                                    && self.is_row_tombstoned(tombstones_ref, rid, &cut)
-                                {
-                                    continue;
-                                }
-                                let v = values[i];
-                                if best_f64.is_none_or(|b| compare_floats(v, b).is_lt()) {
-                                    best_f64 = Some(v);
+                            for rows in row_groups(0..vol.meta.row_count) {
+                                deadline.charge(DeadlineSite::StorageAggregate, rows.len())?;
+                                for i in rows {
+                                    if nulls[i] || !cs.is_visible(i) {
+                                        continue;
+                                    }
+                                    let rid = row_ids[i];
+                                    if hot_skip.contains(&rid) {
+                                        continue;
+                                    }
+                                    if !no_tombstones
+                                        && self.is_row_tombstoned(tombstones_ref, rid, &cut)
+                                    {
+                                        continue;
+                                    }
+                                    let v = values[i];
+                                    if best_f64.is_none_or(|b| compare_floats(v, b).is_lt()) {
+                                        best_f64 = Some(v);
+                                    }
                                 }
                             }
                             if let Some(v) = best_f64 {
@@ -6214,26 +6382,30 @@ impl Table for SegmentedTable {
                                         &hot_skip,
                                         no_tombstones,
                                         &cut,
-                                    );
+                                        deadline,
+                                    )?;
                                     continue;
                                 }
                             };
-                            for i in 0..vol.meta.row_count {
-                                if nulls[i] || !cs.is_visible(i) {
-                                    continue;
-                                }
-                                let rid = row_ids[i];
-                                if hot_skip.contains(&rid) {
-                                    continue;
-                                }
-                                if !no_tombstones
-                                    && self.is_row_tombstoned(tombstones_ref, rid, &cut)
-                                {
-                                    continue;
-                                }
-                                let v = values[i];
-                                if best_nanos.is_none() || v < best_nanos.unwrap_or(i64::MAX) {
-                                    best_nanos = Some(v);
+                            for rows in row_groups(0..vol.meta.row_count) {
+                                deadline.charge(DeadlineSite::StorageAggregate, rows.len())?;
+                                for i in rows {
+                                    if nulls[i] || !cs.is_visible(i) {
+                                        continue;
+                                    }
+                                    let rid = row_ids[i];
+                                    if hot_skip.contains(&rid) {
+                                        continue;
+                                    }
+                                    if !no_tombstones
+                                        && self.is_row_tombstoned(tombstones_ref, rid, &cut)
+                                    {
+                                        continue;
+                                    }
+                                    let v = values[i];
+                                    if best_nanos.is_none() || v < best_nanos.unwrap_or(i64::MAX) {
+                                        best_nanos = Some(v);
+                                    }
                                 }
                             }
                             if let Some(nanos) = best_nanos {
@@ -6257,25 +6429,15 @@ impl Table for SegmentedTable {
                                 &hot_skip,
                                 no_tombstones,
                                 &cut,
-                            );
+                                deadline,
+                            )?;
                         }
                     }
                 } else if has_non_null_default {
                     // Column missing from this volume (ALTER TABLE ADD COLUMN):
                     // every visible row has the default value
-                    let has_visible = (0..vol.meta.row_count).any(|i| {
-                        if !cs.is_visible(i) {
-                            return false;
-                        }
-                        let rid = row_ids[i];
-                        if hot_skip.contains(&rid) {
-                            return false;
-                        }
-                        if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid, &cut) {
-                            return false;
-                        }
-                        true
-                    });
+                    let has_visible =
+                        self.shows_any_row(cs, row_ids, tombstones_ref, &hot_skip, &cut, deadline)?;
                     if has_visible {
                         match &overall_min {
                             None => overall_min = Some(default_val.clone()),
@@ -6293,12 +6455,12 @@ impl Table for SegmentedTable {
         })
     }
 
-    fn max_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
+    fn max_column(&self, col_idx: usize, deadline: Deadline) -> Result<Option<Option<Value>>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.max_column");
         self.newest_across_seals(|generation| {
             let cut = self.read_cut();
-            let hot_result = self.hot.max_column(col_idx)?;
+            let hot_result = self.hot.max_column(col_idx, deadline)?;
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::hot_and_cold_reads_split();
 
@@ -6444,26 +6606,30 @@ impl Table for SegmentedTable {
                                         &hot_skip,
                                         no_tombstones,
                                         &cut,
-                                    );
+                                        deadline,
+                                    )?;
                                     continue;
                                 }
                             };
-                            for i in 0..vol.meta.row_count {
-                                if nulls[i] || !cs.is_visible(i) {
-                                    continue;
-                                }
-                                let rid = row_ids[i];
-                                if hot_skip.contains(&rid) {
-                                    continue;
-                                }
-                                if !no_tombstones
-                                    && self.is_row_tombstoned(tombstones_ref, rid, &cut)
-                                {
-                                    continue;
-                                }
-                                let v = values[i];
-                                if best_i64.is_none() || v > best_i64.unwrap_or(i64::MIN) {
-                                    best_i64 = Some(v);
+                            for rows in row_groups(0..vol.meta.row_count) {
+                                deadline.charge(DeadlineSite::StorageAggregate, rows.len())?;
+                                for i in rows {
+                                    if nulls[i] || !cs.is_visible(i) {
+                                        continue;
+                                    }
+                                    let rid = row_ids[i];
+                                    if hot_skip.contains(&rid) {
+                                        continue;
+                                    }
+                                    if !no_tombstones
+                                        && self.is_row_tombstoned(tombstones_ref, rid, &cut)
+                                    {
+                                        continue;
+                                    }
+                                    let v = values[i];
+                                    if best_i64.is_none() || v > best_i64.unwrap_or(i64::MIN) {
+                                        best_i64 = Some(v);
+                                    }
                                 }
                             }
                             if let Some(v) = best_i64 {
@@ -6484,26 +6650,30 @@ impl Table for SegmentedTable {
                                         &hot_skip,
                                         no_tombstones,
                                         &cut,
-                                    );
+                                        deadline,
+                                    )?;
                                     continue;
                                 }
                             };
-                            for i in 0..vol.meta.row_count {
-                                if nulls[i] || !cs.is_visible(i) {
-                                    continue;
-                                }
-                                let rid = row_ids[i];
-                                if hot_skip.contains(&rid) {
-                                    continue;
-                                }
-                                if !no_tombstones
-                                    && self.is_row_tombstoned(tombstones_ref, rid, &cut)
-                                {
-                                    continue;
-                                }
-                                let v = values[i];
-                                if best_f64.is_none_or(|b| compare_floats(v, b).is_gt()) {
-                                    best_f64 = Some(v);
+                            for rows in row_groups(0..vol.meta.row_count) {
+                                deadline.charge(DeadlineSite::StorageAggregate, rows.len())?;
+                                for i in rows {
+                                    if nulls[i] || !cs.is_visible(i) {
+                                        continue;
+                                    }
+                                    let rid = row_ids[i];
+                                    if hot_skip.contains(&rid) {
+                                        continue;
+                                    }
+                                    if !no_tombstones
+                                        && self.is_row_tombstoned(tombstones_ref, rid, &cut)
+                                    {
+                                        continue;
+                                    }
+                                    let v = values[i];
+                                    if best_f64.is_none_or(|b| compare_floats(v, b).is_gt()) {
+                                        best_f64 = Some(v);
+                                    }
                                 }
                             }
                             if let Some(v) = best_f64 {
@@ -6529,26 +6699,30 @@ impl Table for SegmentedTable {
                                         &hot_skip,
                                         no_tombstones,
                                         &cut,
-                                    );
+                                        deadline,
+                                    )?;
                                     continue;
                                 }
                             };
-                            for i in 0..vol.meta.row_count {
-                                if nulls[i] || !cs.is_visible(i) {
-                                    continue;
-                                }
-                                let rid = row_ids[i];
-                                if hot_skip.contains(&rid) {
-                                    continue;
-                                }
-                                if !no_tombstones
-                                    && self.is_row_tombstoned(tombstones_ref, rid, &cut)
-                                {
-                                    continue;
-                                }
-                                let v = values[i];
-                                if best_nanos.is_none() || v > best_nanos.unwrap_or(i64::MIN) {
-                                    best_nanos = Some(v);
+                            for rows in row_groups(0..vol.meta.row_count) {
+                                deadline.charge(DeadlineSite::StorageAggregate, rows.len())?;
+                                for i in rows {
+                                    if nulls[i] || !cs.is_visible(i) {
+                                        continue;
+                                    }
+                                    let rid = row_ids[i];
+                                    if hot_skip.contains(&rid) {
+                                        continue;
+                                    }
+                                    if !no_tombstones
+                                        && self.is_row_tombstoned(tombstones_ref, rid, &cut)
+                                    {
+                                        continue;
+                                    }
+                                    let v = values[i];
+                                    if best_nanos.is_none() || v > best_nanos.unwrap_or(i64::MIN) {
+                                        best_nanos = Some(v);
+                                    }
                                 }
                             }
                             if let Some(nanos) = best_nanos {
@@ -6572,23 +6746,13 @@ impl Table for SegmentedTable {
                                 &hot_skip,
                                 no_tombstones,
                                 &cut,
-                            );
+                                deadline,
+                            )?;
                         }
                     }
                 } else if has_non_null_default {
-                    let has_visible = (0..vol.meta.row_count).any(|i| {
-                        if !cs.is_visible(i) {
-                            return false;
-                        }
-                        let rid = row_ids[i];
-                        if hot_skip.contains(&rid) {
-                            return false;
-                        }
-                        if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid, &cut) {
-                            return false;
-                        }
-                        true
-                    });
+                    let has_visible =
+                        self.shows_any_row(cs, row_ids, tombstones_ref, &hot_skip, &cut, deadline)?;
                     if has_visible {
                         match &overall_max {
                             None => overall_max = Some(default_val.clone()),
@@ -6612,13 +6776,13 @@ impl Table for SegmentedTable {
     // Partition and index-based pushdowns
     // =========================================================================
 
-    fn get_partition_count(&self, column_name: &str) -> Result<Option<usize>> {
+    fn get_partition_count(&self, column_name: &str, deadline: Deadline) -> Result<Option<usize>> {
         // A table with no volumes counts its hot index alone
         let hot = self.newest_across_seals(|generation| {
             if self.segment_mgr.has_segments() {
                 return Ok(Some(None));
             }
-            let hot = self.hot.get_partition_count(column_name)?;
+            let hot = self.hot.get_partition_count(column_name, deadline)?;
             Ok((!self.seal_moved(generation)).then_some(Some(hot)))
         })?;
         if let Some(hot) = hot {
@@ -6629,22 +6793,26 @@ impl Table for SegmentedTable {
             return Ok(None);
         };
         Ok(self
-            .distinct_column(col_idx, false)?
+            .distinct_column(col_idx, false, deadline)?
             .map(|distinct| distinct.len()))
     }
 
-    fn get_partition_values(&self, column_name: &str) -> Result<Option<Vec<Value>>> {
+    fn get_partition_values(
+        &self,
+        column_name: &str,
+        deadline: Deadline,
+    ) -> Result<Option<Vec<Value>>> {
         if self.snapshot_seq.is_some() {
             return Ok(None);
         }
-        if let Some(result) = self.unsealed(|hot| hot.get_partition_values(column_name)) {
+        if let Some(result) = self.unsealed(|hot| hot.get_partition_values(column_name, deadline)) {
             return result;
         }
         let schema = self.hot.schema();
         let Some(&col_idx) = schema.column_index_map().get(&column_name.to_lowercase()) else {
             return Ok(None);
         };
-        let distinct = self.distinct_column(col_idx, true)?;
+        let distinct = self.distinct_column(col_idx, true, deadline)?;
         Ok(distinct.map(|distinct| distinct.into_iter().collect()))
     }
 
@@ -7137,14 +7305,15 @@ impl Table for SegmentedTable {
         start_from: Option<i64>,
         ascending: bool,
         limit: usize,
-    ) -> Option<RowVec> {
-        if let Some(result) = self
-            .unsealed(|hot| hot.collect_rows_pk_keyset(start_after, start_from, ascending, limit))
-        {
+        deadline: Deadline,
+    ) -> Result<Option<RowVec>> {
+        if let Some(result) = self.unsealed(|hot| {
+            hot.collect_rows_pk_keyset(start_after, start_from, ascending, limit, deadline)
+        }) {
             return result;
         }
         // Hot PK index doesn't cover cold data — can't use keyset pagination
-        None
+        Ok(None)
     }
 
     // =========================================================================
@@ -7258,6 +7427,7 @@ impl Table for SegmentedTable {
         limit: usize,
         offset: usize,
         columns: Option<&[bool]>,
+        deadline: Deadline,
     ) -> Result<Option<RowVec>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.scan_top_k");
@@ -7282,6 +7452,7 @@ impl Table for SegmentedTable {
                     limit,
                     offset,
                     columns,
+                    deadline,
                 )?;
                 if self.segment_mgr.seal_generation() == generation
                     && !self.destruction_since(begun)
@@ -7324,11 +7495,14 @@ impl Table for SegmentedTable {
                 needed,
                 0,
                 columns,
+                deadline,
             )?;
             let sealed_copies_checked = hot_top.is_some();
             let hot_rows = match hot_top {
                 Some(rows) => rows,
-                None => self.hot.collect_all_rows(where_expr)?,
+                None => self
+                    .hot
+                    .collect_access_rows(ScanAccess::Seq, where_expr, deadline)?,
             };
             let mut hot_skip: FxHashSet<i64> =
                 FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
@@ -7421,6 +7595,7 @@ impl Table for SegmentedTable {
              -> Result<VolumeScanner> {
                 let mut scanner =
                     VolumeScanner::with_range(Arc::clone(vol), all_cols.clone(), start, end, None)?;
+                scanner.deadline = deadline;
                 scanner.set_skip_sets(Arc::clone(&tombstones_arc), Arc::clone(&hot_skip_arc));
                 scanner.set_visibility_bitmap(cs.visible.clone());
                 scanner.view = self.view.clone();
@@ -7618,8 +7793,10 @@ impl Table for SegmentedTable {
                 known: as_scanned.as_deref().unwrap_or_default(),
                 reader: None,
             };
-            let rows =
-                keep.into_rows(offset, |slot, position, row| kept.fill(slot, position, row))?;
+            let rows = keep.into_rows(offset, |slot, position, row| {
+                deadline.charge(DeadlineSite::StorageRead, 1)?;
+                kept.fill(slot, position, row)
+            })?;
             Ok(Some(Some(rows)))
         })
     }
@@ -8156,12 +8333,18 @@ impl Table for SegmentedTable {
         self.select(columns, expr)
     }
 
-    fn rows_at(&self, point: &ReadPoint, authority: Option<&mut FxHashSet<i64>>) -> Result<RowVec> {
+    fn rows_at(
+        &self,
+        point: &ReadPoint,
+        authority: Option<&mut FxHashSet<i64>>,
+        deadline: Deadline,
+    ) -> Result<RowVec> {
         // A table without volumes answers from the hot store; a truncate
         // that refused this attempt is waited out, not taken for a volume
         let mut authority = authority;
         while !self.segment_mgr.has_segments() {
-            if let Some(result) = self.unsealed(|hot| hot.rows_at(point, authority.as_deref_mut()))
+            if let Some(result) =
+                self.unsealed(|hot| hot.rows_at(point, authority.as_deref_mut(), deadline))
             {
                 return result;
             }
@@ -8173,7 +8356,7 @@ impl Table for SegmentedTable {
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::merged_read_began();
             let mut decided = FxHashSet::default();
-            let hot_rows = self.hot.rows_at(point, Some(&mut decided))?;
+            let hot_rows = self.hot.rows_at(point, Some(&mut decided), deadline)?;
             if let Some(authority) = authority.as_deref_mut() {
                 authority.extend(decided.iter().copied());
             }
@@ -8185,7 +8368,7 @@ impl Table for SegmentedTable {
                 generation,
                 Some(point),
                 &CommitCut::every(),
-                Deadline::NONE,
+                deadline,
             )?
             else {
                 return Ok(None);
@@ -9514,6 +9697,7 @@ mod tests {
             _: &mut Vec<i64>,
             _: &FoundVersions,
             _: &mut Vec<(i64, Row, VersionMark)>,
+            _: Deadline,
         ) -> Result<i32> {
             Ok(0)
         }
@@ -9590,13 +9774,13 @@ mod tests {
         ) -> Result<Box<dyn QueryResult>> {
             Err(crate::core::Error::internal("not implemented"))
         }
-        fn row_count(&self) -> Result<usize> {
+        fn row_count(&self, _: Deadline) -> Result<usize> {
             Ok(self.rows.len())
         }
         fn fast_row_count(&self) -> Result<Option<usize>> {
             Ok(Some(self.rows.len()))
         }
-        fn max_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
+        fn max_column(&self, col_idx: usize, _: Deadline) -> Result<Option<Option<Value>>> {
             let mut max: Option<Value> = None;
             for (_, row) in &self.rows {
                 if let Some(val) = row.get(col_idx) {
@@ -9614,7 +9798,7 @@ mod tests {
             }
             Ok(Some(max))
         }
-        fn sum_column(&self, col_idx: usize) -> Result<Option<SumAccumulator>> {
+        fn sum_column(&self, col_idx: usize, _: Deadline) -> Result<Option<SumAccumulator>> {
             let mut sum = SumAccumulator::default();
             for (_, row) in &self.rows {
                 if let Some(value) = row.get(col_idx) {
@@ -9650,7 +9834,7 @@ mod tests {
         );
         let table = SegmentedTable::hot_only(Box::new(hot));
 
-        assert_eq!(table.row_count().unwrap(), 2);
+        assert_eq!(table.row_count(Deadline::NONE).unwrap(), 2);
         assert_eq!(table.segment_count(), 0);
     }
 
@@ -9690,7 +9874,7 @@ mod tests {
 
         let table = SegmentedTable::new(Box::new(hot), mgr);
 
-        assert_eq!(table.row_count().unwrap(), 5); // 3 segment + 2 hot
+        assert_eq!(table.row_count(Deadline::NONE).unwrap(), 5); // 3 segment + 2 hot
         assert_eq!(table.fast_row_count().unwrap(), Some(5));
     }
 
@@ -9750,7 +9934,7 @@ mod tests {
 
         let table = SegmentedTable::new(Box::new(hot), mgr);
 
-        let max = table.max_column(1).unwrap();
+        let max = table.max_column(1, Deadline::NONE).unwrap();
         assert_eq!(max, Some(Some(Value::Float(500.0))));
     }
 
@@ -9780,7 +9964,7 @@ mod tests {
 
         let table = SegmentedTable::new(Box::new(hot), mgr);
 
-        let sum = table.sum_column(1).unwrap().unwrap();
+        let sum = table.sum_column(1, Deadline::NONE).unwrap().unwrap();
         assert_eq!(sum.sum().unwrap(), Value::Float(530.0));
         assert_eq!(sum.count(), 3);
     }
@@ -9832,7 +10016,7 @@ mod tests {
         let hot = MockHotTable::new(schema.clone(), vec![]);
 
         let mut table = SegmentedTable::hot_only(Box::new(hot));
-        assert_eq!(table.row_count().unwrap(), 0);
+        assert_eq!(table.row_count(Deadline::NONE).unwrap(), 0);
 
         table
             .insert(Row::from_values(vec![
@@ -9840,7 +10024,7 @@ mod tests {
                 Value::Float(10.0),
             ]))
             .unwrap();
-        assert_eq!(table.row_count().unwrap(), 1);
+        assert_eq!(table.row_count(Deadline::NONE).unwrap(), 1);
     }
 
     #[test]

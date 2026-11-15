@@ -1455,6 +1455,25 @@ impl I64Set {
             .chain(if self.has_min { Some(EMPTY) } else { None })
     }
 
+    /// Hands `each` the members of every run of `slots` slots with the run's
+    /// length, empty slots counted, until it returns false; i64::MIN, held
+    /// beside the slots, comes last as a run of one
+    pub fn each_run(
+        &self,
+        slots: usize,
+        mut each: impl FnMut(usize, &mut dyn Iterator<Item = i64>) -> bool,
+    ) {
+        for run in self.slots.chunks(slots.max(1)) {
+            let mut members = run.iter().copied().filter(|&slot| slot != EMPTY);
+            if !each(run.len(), &mut members) {
+                return;
+            }
+        }
+        if self.has_min {
+            each(1, &mut std::iter::once(EMPTY));
+        }
+    }
+
     /// Drains all values from the set, returning an iterator over them
     #[inline]
     pub fn drain(&mut self) -> impl Iterator<Item = i64> + '_ {

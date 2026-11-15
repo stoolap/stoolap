@@ -2190,13 +2190,21 @@ impl MVCCTable {
     ///
     /// OPTIMIZATION: Uses single-pass counting instead of per-row visibility checks.
     /// Reduces lock acquisitions from O(N) to O(1) for the global store.
-    pub fn row_count(&self) -> usize {
+    pub fn row_count(&self, deadline: Deadline) -> Result<usize> {
         // Count global visible versions in single pass (O(1) lock instead of O(N))
-        let mut count = self.version_store.count_visible_rows(self.reader());
+        let mut count = self
+            .version_store
+            .count_visible_rows(self.reader(), deadline)?;
 
         // Adjust for local changes (uncommitted in this transaction)
         let txn_versions = self.local();
+        let mut unpaid = 0;
         for (row_id, version) in txn_versions.iter_local() {
+            unpaid += 1;
+            if unpaid == CHARGE_BEAT {
+                unpaid = 0;
+                deadline.charge(DeadlineSite::StorageRead, CHARGE_BEAT)?;
+            }
             // Check if this row exists in global store
             let exists_in_global = self.version_store.quick_check_row_existence(row_id);
 
@@ -2213,7 +2221,7 @@ impl MVCCTable {
             }
         }
 
-        count
+        Ok(count)
     }
 
     /// Fast O(1) row count for COUNT(*) queries without local changes
@@ -3475,6 +3483,7 @@ impl Table for MVCCTable {
         row_ids: &mut Vec<i64>,
         found: &FoundVersions,
         changed: &mut Vec<(i64, Row, VersionMark)>,
+        _deadline: Deadline,
     ) -> Result<i32> {
         let _admitted = TxnGate::admit_for(&self.gate)?;
         let mut deleted = None;
@@ -3959,6 +3968,7 @@ impl Table for MVCCTable {
         limit: usize,
         offset: usize,
         _columns: Option<&[bool]>,
+        deadline: Deadline,
     ) -> Result<Option<RowVec>> {
         let needed = limit.saturating_add(offset);
         if needed == 0 {
@@ -4027,6 +4037,8 @@ impl Table for MVCCTable {
         let fallible = expr.can_fail();
         let mut failed = None;
         let mut walked = true;
+        let timed = !deadline.is_none();
+        let mut unpaid = 0;
         for (lower, upper) in parts.into_iter().flatten() {
             if !walked || stale || failed.is_some() || rows.len() >= needed {
                 break;
@@ -4039,6 +4051,17 @@ impl Table for MVCCTable {
                 &mut |row_id, key_value| {
                     #[cfg(feature = "test-failpoints")]
                     crate::test_failpoints::hot_top_k_visited();
+                    if timed {
+                        unpaid += 1;
+                        if unpaid == CHARGE_BEAT {
+                            unpaid = 0;
+                            let charged = deadline.charge(DeadlineSite::StorageRead, CHARGE_BEAT);
+                            if let Err(e) = charged {
+                                failed = Some(e);
+                                return false;
+                            }
+                        }
+                    }
                     // A version comes back only when it is visible and its
                     // deletion, if any, is not: the raw deleted flag may belong
                     // to an aborted or unfinished transaction
@@ -4069,6 +4092,7 @@ impl Table for MVCCTable {
         if let Some(e) = failed {
             return Err(e);
         }
+        deadline.charge(DeadlineSite::StorageRead, unpaid)?;
         if !walked || stale || self.committed_index_epoch() != Some(epoch) {
             return Ok(None);
         }
@@ -5056,13 +5080,13 @@ impl Table for MVCCTable {
         None
     }
 
-    fn row_count(&self) -> Result<usize> {
+    fn row_count(&self, deadline: Deadline) -> Result<usize> {
         // Try O(1) fast path first
         if let Some(count) = MVCCTable::fast_row_count(self) {
             return Ok(count);
         }
         // Fall back to optimized single-pass counting
-        Ok(MVCCTable::row_count(self))
+        MVCCTable::row_count(self, deadline)
     }
 
     fn row_count_hint(&self) -> usize {
@@ -5190,7 +5214,7 @@ impl Table for MVCCTable {
         }
 
         // Fallback path: Get all values and sort (for non-B-tree indexes)
-        let Some(all_values) = index.get_all_values() else {
+        let Some(all_values) = index.get_all_values(deadline)? else {
             return Ok(None);
         };
         #[cfg(feature = "test-failpoints")]
@@ -5350,15 +5374,18 @@ impl Table for MVCCTable {
         start_from: Option<i64>,
         ascending: bool,
         limit: usize,
-    ) -> Option<RowVec> {
+        deadline: Deadline,
+    ) -> Result<Option<RowVec>> {
         // Only works if table has a single-column INTEGER PRIMARY KEY
-        self.cached_schema.pk_column_index()?;
+        if self.cached_schema.pk_column_index().is_none() {
+            return Ok(None);
+        }
 
         // If transaction has local changes, fall back to regular path
         {
             let txn_versions = self.local();
             if txn_versions.has_local_changes() {
-                return None;
+                return Ok(None);
             }
         }
 
@@ -5370,10 +5397,13 @@ impl Table for MVCCTable {
             start_from,
             ascending,
             limit,
-        );
+            deadline,
+        )?;
         // Rows of another layout: the regular path reports the change
-        self.check_read().ok()?;
-        Some(rows)
+        if self.check_read().is_err() {
+            return Ok(None);
+        }
+        Ok(Some(rows))
     }
 
     fn collect_rows_grouped_by_partition(
@@ -5393,7 +5423,7 @@ impl Table for MVCCTable {
         };
 
         // Get all unique values from the index (partition keys)
-        let Some(all_values) = index.get_all_values() else {
+        let Some(all_values) = index.get_all_values(deadline)? else {
             return Ok(None);
         };
         if all_values.is_empty() {
@@ -5435,7 +5465,11 @@ impl Table for MVCCTable {
         Ok(Some(result))
     }
 
-    fn get_partition_values(&self, column_name: &str) -> Result<Option<Vec<Value>>> {
+    fn get_partition_values(
+        &self,
+        column_name: &str,
+        deadline: Deadline,
+    ) -> Result<Option<Vec<Value>>> {
         // The index keys are the values only while it holds what this
         // statement sees; a commit that moved it during the read reads again
         loop {
@@ -5445,14 +5479,14 @@ impl Table for MVCCTable {
             let Some(index) = self.version_store.get_index_by_column(column_name) else {
                 return Ok(None);
             };
-            let values = index.get_all_values();
+            let values = index.get_all_values(deadline)?;
             if self.index_view_epoch() == Some(epoch) {
                 return Ok(values);
             }
         }
     }
 
-    fn get_partition_count(&self, column_name: &str) -> Result<Option<usize>> {
+    fn get_partition_count(&self, column_name: &str, _deadline: Deadline) -> Result<Option<usize>> {
         // The index keys are the values only while it holds what this
         // statement sees
         let Some(epoch) = self.index_view_epoch() else {
@@ -5563,8 +5597,13 @@ impl Table for MVCCTable {
         Ok(result.with_aliases(aliases.clone()))
     }
 
-    fn rows_at(&self, point: &ReadPoint, authority: Option<&mut FxHashSet<i64>>) -> Result<RowVec> {
-        let mut rows = self.version_store.rows_at(point, authority)?;
+    fn rows_at(
+        &self,
+        point: &ReadPoint,
+        authority: Option<&mut FxHashSet<i64>>,
+        deadline: Deadline,
+    ) -> Result<RowVec> {
+        let mut rows = self.version_store.rows_at(point, authority, deadline)?;
         self.check_read()?;
         // The handle's schema: a column change since raised the mark the read
         // checked, so every row read predates it
@@ -5596,7 +5635,11 @@ impl Table for MVCCTable {
             .get_segments_to_scan(column, operator, value)
     }
 
-    fn sum_column(&self, col_idx: usize) -> Result<Option<crate::core::SumAccumulator>> {
+    fn sum_column(
+        &self,
+        col_idx: usize,
+        deadline: Deadline,
+    ) -> Result<Option<crate::core::SumAccumulator>> {
         // Only use deferred aggregation if no uncommitted local changes
         // (local changes are in txn_versions, not the main version_store)
         let txn_versions = self.local();
@@ -5605,12 +5648,14 @@ impl Table for MVCCTable {
         }
         drop(txn_versions);
 
-        let sum = self.version_store.sum_column(self.reader(), col_idx);
+        let sum = self
+            .version_store
+            .sum_column(self.reader(), col_idx, deadline)?;
         self.check_read()?;
         Ok(Some(sum))
     }
 
-    fn min_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
+    fn min_column(&self, col_idx: usize, deadline: Deadline) -> Result<Option<Option<Value>>> {
         // Only use deferred aggregation if no uncommitted local changes
         let txn_versions = self.local();
         if txn_versions.has_local_changes() {
@@ -5618,12 +5663,14 @@ impl Table for MVCCTable {
         }
         drop(txn_versions);
 
-        let min = self.version_store.min_column(self.reader(), col_idx);
+        let min = self
+            .version_store
+            .min_column(self.reader(), col_idx, deadline)?;
         self.check_read()?;
         Ok(Some(min))
     }
 
-    fn max_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
+    fn max_column(&self, col_idx: usize, deadline: Deadline) -> Result<Option<Option<Value>>> {
         // Only use deferred aggregation if no uncommitted local changes
         let txn_versions = self.local();
         if txn_versions.has_local_changes() {
@@ -5631,7 +5678,9 @@ impl Table for MVCCTable {
         }
         drop(txn_versions);
 
-        let max = self.version_store.max_column(self.reader(), col_idx);
+        let max = self
+            .version_store
+            .max_column(self.reader(), col_idx, deadline)?;
         self.check_read()?;
         Ok(Some(max))
     }
@@ -6097,7 +6146,7 @@ mod tests {
 
         let mut table = MVCCTable::new(txn_id, version_store, txn_versions);
 
-        assert_eq!(table.row_count(), 0);
+        assert_eq!(table.row_count(Deadline::NONE).unwrap(), 0);
 
         table
             .insert(Row::from_values(vec![Value::Integer(1)]))
@@ -6106,7 +6155,7 @@ mod tests {
             .insert(Row::from_values(vec![Value::Integer(2)]))
             .unwrap();
 
-        assert_eq!(table.row_count(), 2);
+        assert_eq!(table.row_count(Deadline::NONE).unwrap(), 2);
     }
 
     #[test]

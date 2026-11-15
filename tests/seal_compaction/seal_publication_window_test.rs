@@ -281,7 +281,17 @@ fn top_k_inside_a_seal_keeps_a_cold_row_updated_before_it() {
     let table = tx.get_table("t").unwrap();
     let rows = inside_seal(&db, Hold::IndexesCleaned, None, || {
         let rows = table
-            .scan_top_k(None, None, "v", true, false, 100, 0, None)
+            .scan_top_k(
+                None,
+                None,
+                "v",
+                true,
+                false,
+                100,
+                0,
+                None,
+                stoolap::executor::Deadline::NONE,
+            )
             .unwrap()
             .expect("the top-k path answers");
         row_pairs(&rows)
@@ -306,7 +316,11 @@ fn a_read_at_the_newest_point_inside_a_seal_keeps_a_cold_row_updated_before_it()
         .point_at_time(i64::MAX, registry.historical_cut())
         .unwrap();
     let rows = inside_seal(&db, Hold::IndexesCleaned, None, || {
-        row_pairs(&table.rows_at(&point, None).unwrap())
+        row_pairs(
+            &table
+                .rows_at(&point, None, stoolap::executor::Deadline::NONE)
+                .unwrap(),
+        )
     });
     assert_eq!(rows, after_update(), "row 5 inside the seal");
     tx.rollback().unwrap();
@@ -320,7 +334,7 @@ fn partition_values_inside_a_seal_keep_a_cold_row_updated_before_it() {
     let table = tx.get_table("t").unwrap();
     let mut values: Vec<i64> = inside_seal(&db, Hold::IndexesCleaned, None, || {
         table
-            .get_partition_values("v")
+            .get_partition_values("v", stoolap::executor::Deadline::NONE)
             .unwrap()
             .expect("the indexed column's values answer")
             .into_iter()

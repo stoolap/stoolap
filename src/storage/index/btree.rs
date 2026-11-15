@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use super::value_tree::{Ids, ValueTree};
+use crate::common::deadline::{Deadline, DeadlineSite, CHARGE_BEAT};
 use crate::common::I64Map;
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
@@ -183,15 +184,33 @@ impl BTreeIndex {
         count
     }
 
-    /// Gets all values in key order
-    pub fn get_all_values(&self) -> Vec<Value> {
+    /// Gets all values in key order, each run of them charged to `deadline`
+    pub fn get_all_values(&self, deadline: Deadline) -> Result<Vec<Value>> {
         let sorted_values = self.sorted_values.read();
         let mut values = Vec::with_capacity(sorted_values.len());
+        if deadline.is_none() {
+            sorted_values.walk(Bound::Unbounded, true, &mut |key, _| {
+                values.push(key.clone());
+                true
+            });
+            return Ok(values);
+        }
+        let mut stopped = None;
         sorted_values.walk(Bound::Unbounded, true, &mut |key, _| {
             values.push(key.clone());
+            if values.len() % CHARGE_BEAT == 0 {
+                if let Err(error) = deadline.charge(DeadlineSite::StorageRead, CHARGE_BEAT) {
+                    stopped = Some(error);
+                    return false;
+                }
+            }
             true
         });
-        values
+        if let Some(error) = stopped {
+            return Err(error);
+        }
+        deadline.charge(DeadlineSite::StorageRead, values.len() % CHARGE_BEAT)?;
+        Ok(values)
     }
 
     /// Gets all row IDs for a specific value
@@ -747,11 +766,11 @@ impl Index for BTreeIndex {
         max
     }
 
-    fn get_all_values(&self) -> Option<Vec<Value>> {
+    fn get_all_values(&self, deadline: Deadline) -> Result<Option<Vec<Value>>> {
         if self.closed.load(AtomicOrdering::Acquire) {
-            return None;
+            return Ok(None);
         }
-        Some(BTreeIndex::get_all_values(self))
+        BTreeIndex::get_all_values(self, deadline).map(Some)
     }
 
     fn get_distinct_count_excluding_null(&self) -> Option<usize> {
@@ -1469,7 +1488,7 @@ mod tests {
         index.add(&[Value::Integer(10)], 2, 2).unwrap();
         index.add(&[Value::Integer(20)], 3, 3).unwrap();
 
-        let values = index.get_all_values();
+        let values = index.get_all_values(Deadline::NONE).unwrap();
         assert_eq!(values.len(), 3);
         // Values may not be sorted (HashMap)
         assert!(values.contains(&Value::Integer(10)));

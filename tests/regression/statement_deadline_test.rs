@@ -786,3 +786,287 @@ fn a_key_read_in_a_transaction_that_outlasts_its_deadline_fails() {
     );
     db.execute("ROLLBACK", ()).unwrap();
 }
+
+/// What a shape runs before its statement, inside the transaction it reads in
+#[derive(Clone, Copy)]
+enum Before {
+    Nothing,
+    OwnRows,
+    UnseenRows,
+}
+
+#[test]
+fn a_table_read_that_took_no_deadline_stops_at_it() {
+    let _guard = FailpointGuard::new();
+    let db = Database::open("memory://statement_deadline_table_reads").unwrap();
+    for sql in [
+        "CREATE TABLE h (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER, g INTEGER)",
+        "INSERT INTO h SELECT value, value % 3, value, value FROM generate_series(1, 20000)",
+        "CREATE INDEX h_g ON h (g)",
+        "CREATE INDEX h_kg ON h (k, g)",
+        "CREATE TABLE q (id INTEGER PRIMARY KEY, v INTEGER)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!(
+        "file://{}?checkpoint_interval=3600&compact_threshold=1000",
+        dir.path().display()
+    );
+    let sealed = Database::open(&dsn).unwrap();
+    for sql in [
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER, t TEXT)",
+        "CREATE INDEX s_t ON s (t)",
+        "INSERT INTO s SELECT value, value % 50, (value * 7919) % 140000, 'x' || (value % 10) \
+         FROM generate_series(1, 140000)",
+    ] {
+        sealed.execute(sql, ()).unwrap();
+    }
+    sealed.engine().seal_for_test().unwrap();
+    for sql in [
+        "DELETE FROM s WHERE id <= 10",
+        "INSERT INTO s SELECT value, value % 50, value, 'y' FROM generate_series(140001, 140100)",
+    ] {
+        sealed.execute(sql, ()).unwrap();
+    }
+    let hot = Executor::new(std::sync::Arc::clone(db.engine()));
+    let cold = Executor::new(std::sync::Arc::clone(sealed.engine()));
+    let mut ctx = ExecutionContext::new();
+    ctx.set_timeout_ms(3_600_000);
+    let rows = DeadlineSite::StorageRead;
+    let fold = DeadlineSite::StorageAggregate;
+    let as_of = "AS OF TIMESTAMP '2200-01-01 00:00:00'";
+    let hot_as_of = format!("SELECT id FROM h {as_of} WHERE v < 0");
+    let cold_as_of = format!("SELECT id FROM s {as_of} WHERE v < 0");
+    let hot_as_of_sum = format!("SELECT SUM(v) FROM h {as_of}");
+    let cold_as_of_sum = format!("SELECT SUM(v) FROM s {as_of}");
+    // None charged its site before its read took the deadline
+    let shapes = [
+        (
+            &hot,
+            Before::Nothing,
+            rows,
+            "SELECT id FROM h WHERE k = 1 AND v < 0 ORDER BY g LIMIT 1",
+        ),
+        (
+            &cold,
+            Before::Nothing,
+            rows,
+            "SELECT id FROM s WHERE v = -1 ORDER BY id DESC LIMIT 1",
+        ),
+        (
+            &hot,
+            Before::UnseenRows,
+            rows,
+            "SELECT * FROM q WHERE id > 0 ORDER BY id LIMIT 1",
+        ),
+        (
+            &hot,
+            Before::Nothing,
+            rows,
+            "SELECT id, ROW_NUMBER() OVER (PARTITION BY g ORDER BY id) FROM h LIMIT 1",
+        ),
+        (
+            &cold,
+            Before::Nothing,
+            rows,
+            "SELECT id, ROW_NUMBER() OVER (PARTITION BY t ORDER BY id) FROM s LIMIT 1",
+        ),
+        (
+            &cold,
+            Before::Nothing,
+            rows,
+            "SELECT COUNT(DISTINCT t) FROM s",
+        ),
+        (&cold, Before::Nothing, rows, "SELECT DISTINCT t FROM s"),
+        (&hot, Before::Nothing, rows, "SELECT g FROM h GROUP BY g"),
+        (&hot, Before::Nothing, fold, "SELECT SUM(v) FROM h"),
+        (&hot, Before::Nothing, fold, "SELECT MIN(v) FROM h"),
+        (&hot, Before::Nothing, fold, "SELECT MAX(v) FROM h"),
+        (&cold, Before::Nothing, fold, "SELECT SUM(v) FROM s"),
+        (&cold, Before::Nothing, fold, "SELECT MIN(v) FROM s"),
+        (&cold, Before::Nothing, fold, "SELECT MAX(v) FROM s"),
+        (&hot, Before::Nothing, rows, hot_as_of.as_str()),
+        (&cold, Before::Nothing, rows, cold_as_of.as_str()),
+        (&hot, Before::Nothing, rows, hot_as_of_sum.as_str()),
+        (&cold, Before::Nothing, rows, cold_as_of_sum.as_str()),
+        (&hot, Before::OwnRows, rows, "SELECT COUNT(*) FROM h"),
+        (&cold, Before::UnseenRows, rows, "SELECT COUNT(*) FROM s"),
+        (
+            &cold,
+            Before::Nothing,
+            DeadlineSite::StorageDelete,
+            "DELETE FROM s WHERE id IN (SELECT 20 UNION SELECT 30)",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    // A sealed top-k walked newest first, past the charges of its hot rows
+    let sql = "SELECT id FROM s WHERE k = 7 AND v > 139990 AND v < 140000 ORDER BY id DESC LIMIT 1";
+    pass_deadline_after(rows, 3);
+    let stopped = read(&cold, sql, &ctx);
+    keep_deadlines();
+    if !matches!(stopped, Err(Error::QueryCancelled)) {
+        wrong.push(format!("{sql} past 3 charges gave {stopped:?}"));
+    }
+    for (executor, before, site, sql) in shapes {
+        match before {
+            Before::Nothing => {
+                read(executor, "BEGIN", &ctx).unwrap();
+            }
+            Before::OwnRows => {
+                read(executor, "BEGIN", &ctx).unwrap();
+                read(executor, "INSERT INTO h VALUES (900000, 1, 5, 5)", &ctx).unwrap();
+            }
+            // Rows another handle commits after the snapshot began
+            Before::UnseenRows => {
+                let hot_side = std::ptr::eq(executor, &hot);
+                let (table, other) = if hot_side { ("q", &db) } else { ("s", &sealed) };
+                read(executor, "BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT", &ctx).unwrap();
+                let begun = format!("SELECT COUNT(*) FROM {table} WHERE id = 1");
+                read(executor, &begun, &ctx).unwrap();
+                let insert = format!(
+                    "INSERT INTO {table} (id, v) SELECT value + 200000, 1 \
+                     FROM generate_series(1, 10000)"
+                );
+                other.execute(&insert, ()).unwrap();
+            }
+        }
+        pass_deadline_at(site);
+        let stopped = read(executor, sql, &ctx);
+        keep_deadlines();
+        if !matches!(stopped, Err(Error::QueryCancelled)) {
+            wrong.push(format!("{sql} gave {stopped:?}"));
+        }
+        // A read is checked once more after its last charge
+        if site != DeadlineSite::StorageDelete {
+            count_deadline_charges(site);
+            let counted = read(executor, sql, &ctx);
+            let charges = deadline_charges();
+            pass_deadline_after(site, charges);
+            let ended = read(executor, sql, &ctx);
+            keep_deadlines();
+            if counted.is_err() || charges == 0 || !matches!(ended, Err(Error::QueryCancelled)) {
+                wrong.push(format!(
+                    "{sql} counted {counted:?} in {charges} charges, past them gave {ended:?}"
+                ));
+            }
+        }
+        read(executor, "ROLLBACK", &ctx).unwrap();
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_long_table_read_charges_each_run_of_its_work() {
+    let _guard = FailpointGuard::new();
+    let db = Database::open("memory://statement_deadline_long_reads").unwrap();
+    for sql in [
+        "CREATE TABLE h (id INTEGER PRIMARY KEY, g INTEGER, x INTEGER, b INTEGER)",
+        "INSERT INTO h SELECT value, value, value, value FROM generate_series(1, 20000)",
+        "CREATE INDEX h_g ON h (g)",
+        "CREATE INDEX h_x ON h (x) USING HASH",
+        "CREATE INDEX h_b ON h (b) USING BITMAP",
+        "CREATE TABLE l (id INTEGER PRIMARY KEY, v INTEGER)",
+        "INSERT INTO l VALUES (1, 0)",
+        "CREATE TABLE far (id INTEGER PRIMARY KEY)",
+        "INSERT INTO far SELECT value + 10000000 FROM generate_series(1, 20000)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!(
+        "file://{}?checkpoint_interval=3600&compact_threshold=1000",
+        dir.path().display()
+    );
+    let sealed = Database::open(&dsn).unwrap();
+    for sql in [
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, n INTEGER, t TEXT, p TEXT)",
+        "CREATE INDEX s_n ON s (n)",
+        "CREATE INDEX s_t ON s (t)",
+        "INSERT INTO s SELECT value, value, 't' || (value % 30000), 'p' || value \
+         FROM generate_series(1, 140000)",
+    ] {
+        sealed.execute(sql, ()).unwrap();
+    }
+    sealed.engine().seal_for_test().unwrap();
+    let hot = Executor::new(std::sync::Arc::clone(db.engine()));
+    let cold = Executor::new(std::sync::Arc::clone(sealed.engine()));
+    let mut ctx = ExecutionContext::new();
+    ctx.set_timeout_ms(3_600_000);
+    let rows = DeadlineSite::StorageRead;
+    // A snapshot older than 5,000 versions of the one row of l
+    read(&hot, "BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT", &ctx).unwrap();
+    read(&hot, "SELECT v FROM l", &ctx).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    let before = db
+        .query("SELECT CAST(NOW() AS TEXT)", ())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .get::<String>(0)
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    for _ in 0..5000 {
+        db.execute("UPDATE l SET v = v + 1", ()).unwrap();
+    }
+    let as_of = format!("SELECT v FROM l AS OF TIMESTAMP '{before}'");
+    let mut wrong = Vec::new();
+    let mut charged = |executor: &Executor, site: DeadlineSite, sql: &str, least: usize| {
+        count_deadline_charges(site);
+        let counted = read(executor, sql, &ctx);
+        let charges = deadline_charges();
+        keep_deadlines();
+        if counted.is_err() || charges < least {
+            wrong.push(format!(
+                "{sql} gave {counted:?} in {charges} charges, under {least}"
+            ));
+        }
+    };
+    // Each run of 4,096 units of work is charged: at least work / 4,096 charges
+    charged(&hot, rows, "SELECT COUNT(*) FROM l", 1);
+    // A file table under a snapshot leaves SUM to a read of its rows
+    #[cfg(not(feature = "test-filedb"))]
+    charged(
+        &hot,
+        DeadlineSite::StorageAggregate,
+        "SELECT SUM(v) FROM l",
+        1,
+    );
+    // A run of versions, then the last part of one
+    charged(
+        &hot,
+        rows,
+        "SELECT * FROM l WHERE id > 0 ORDER BY id LIMIT 1",
+        2,
+    );
+    read(&hot, "ROLLBACK", &ctx).unwrap();
+    charged(&hot, rows, &as_of, 1);
+    charged(&hot, rows, "SELECT DISTINCT g FROM h", 4);
+    charged(&hot, rows, "SELECT DISTINCT x FROM h", 4);
+    charged(&hot, rows, "SELECT DISTINCT b FROM h", 4);
+    charged(&hot, rows, "SELECT DISTINCT id FROM h", 4);
+    // Keys past the primary key's bitset
+    charged(&hot, rows, "SELECT DISTINCT id FROM far", 4);
+    charged(&cold, rows, "SELECT DISTINCT t FROM s", 7);
+    charged(&cold, rows, "SELECT DISTINCT n FROM s", 34);
+    charged(
+        &cold,
+        rows,
+        "SELECT p FROM s WHERE n >= 0 ORDER BY n LIMIT 20000",
+        20000,
+    );
+    // A deleted row is hidden by its tombstone and by its hot delete: 120,000
+    // hidden ids located one by one, then 80,000 shown positions read
+    sealed
+        .execute("DELETE FROM s WHERE id <= 60000", ())
+        .unwrap();
+    charged(&cold, rows, "SELECT DISTINCT n FROM s", 34);
+    charged(&cold, rows, "SELECT DISTINCT t FROM s", 29 + 19);
+    // More hidden ids than rows: each of the 140,000 row ids is looked up
+    sealed
+        .execute("DELETE FROM s WHERE id <= 100000", ())
+        .unwrap();
+    charged(&cold, rows, "SELECT DISTINCT t FROM s", 34 + 9);
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

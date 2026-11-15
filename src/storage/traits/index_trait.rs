@@ -15,6 +15,7 @@
 //! Index trait for database indexes
 //!
 
+use crate::common::deadline::Deadline;
 use crate::common::I64Map;
 use crate::core::{DataType, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
@@ -397,10 +398,10 @@ pub trait Index: Send + Sync {
         None // Default implementation - override in concrete indexes
     }
 
-    /// Every distinct value the index holds, NULL included; None when the
-    /// index cannot list them, or is closed
-    fn get_all_values(&self) -> Option<Vec<Value>> {
-        None
+    /// Every distinct value the index holds, NULL included, each run of
+    /// them charged to `deadline`; None when the index cannot list them, or is closed
+    fn get_all_values(&self, _deadline: Deadline) -> Result<Option<Vec<Value>>> {
+        Ok(None)
     }
 
     /// Returns the count of distinct non-null values in the index

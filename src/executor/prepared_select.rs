@@ -14284,7 +14284,7 @@ impl Executor {
             .and_then(|plan| plan.read.distinct_values());
         let values = match (&source, column) {
             (StatementSource::Table(table), Some(column)) => {
-                Self::distinct_column_values(&**table, column)?
+                Self::distinct_column_values(&**table, column, ctx.deadline_of_call())?
             }
             _ => None,
         };
@@ -15967,7 +15967,14 @@ impl<'a> PreparedRunner<'a> {
                 )?
             }
             OrderedRead::Keyset => match keyset_start(table.schema(), storage_expr.as_deref()) {
-                Some(Some(start)) => table.collect_rows_pk_keyset(None, Some(start), true, limit),
+                Some(Some(start)) => {
+                    let deadline = ctx.deadline_of_call();
+                    let rows =
+                        table.collect_rows_pk_keyset(None, Some(start), true, limit, deadline)?;
+                    // A read whose last charge read no clock is checked once more
+                    ctx.check_deadline()?;
+                    rows
+                }
                 Some(None) => Some(RowVec::new()),
                 None => None,
             },
@@ -15992,8 +15999,9 @@ impl<'a> PreparedRunner<'a> {
             limit,
             offset,
             where_.needed.as_deref(),
+            ctx.deadline_of_call(),
         )?;
-        // A read that checks for no deadline is the statement's all the same
+        // A read whose last charge read no clock is checked once more
         ctx.check_deadline()?;
         if rows.is_some() {
             super::result::OrderLimitPath::PreparedTopK.taken();

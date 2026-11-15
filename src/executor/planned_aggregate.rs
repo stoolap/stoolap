@@ -235,11 +235,17 @@ impl Executor {
                 if quiet {
                     return Ok(None);
                 }
-                Ok(Self::stats_values(table, aggregations, columns, quiet)?
-                    .map(|values| (GlobalSource::Stats, values)))
+                Ok(
+                    Self::stats_values(table, aggregations, columns, quiet, deadline)?
+                        .map(|values| (GlobalSource::Stats, values)),
+                )
             }
-            GlobalSource::Stats => Ok(Self::stats_values(table, aggregations, columns, quiet)?
-                .map(|values| (source, values))),
+            GlobalSource::Stats => {
+                Ok(
+                    Self::stats_values(table, aggregations, columns, quiet, deadline)?
+                        .map(|values| (source, values)),
+                )
+            }
             GlobalSource::StorageFiltered => match pushed {
                 Some(pushed) => {
                     Ok(
@@ -285,25 +291,33 @@ impl Executor {
         aggregations: &[SqlAggregateFunction],
         columns: &[Option<usize>],
         quiet: bool,
+        deadline: Deadline,
     ) -> Result<Option<CompactVec<Value>>> {
         let mut values = CompactVec::with_capacity(aggregations.len());
         for (agg, &column) in aggregations.iter().zip(columns) {
             let null = || Value::null(crate::core::DataType::Integer);
             let value = match (agg.name.as_str(), column) {
                 ("COUNT", _) if agg.distinct => table
-                    .get_partition_count(bare_column(agg))?
+                    .get_partition_count(bare_column(agg), deadline)?
                     .map(|count| Value::Integer(count as i64)),
                 // Through no view only the count that vouches for itself; through
                 // one, the count of what the view sees
                 ("COUNT", _) if agg.counts_rows() => match quiet {
                     true => table.fast_row_count()?,
-                    false => Some(table.row_count()?),
+                    false => Some(table.row_count(deadline)?),
                 }
                 .map(|count| Value::Integer(count as i64)),
-                ("SUM", Some(idx)) => table.sum_column(idx)?.map(|sum| sum.sum()).transpose()?,
-                ("AVG", Some(idx)) => table.avg_column(idx)?.map(|sum| sum.avg()),
-                ("MIN", Some(idx)) => table.min_column(idx)?.map(|min| min.unwrap_or_else(null)),
-                ("MAX", Some(idx)) => table.max_column(idx)?.map(|max| max.unwrap_or_else(null)),
+                ("SUM", Some(idx)) => table
+                    .sum_column(idx, deadline)?
+                    .map(|sum| sum.sum())
+                    .transpose()?,
+                ("AVG", Some(idx)) => table.avg_column(idx, deadline)?.map(|sum| sum.avg()),
+                ("MIN", Some(idx)) => table
+                    .min_column(idx, deadline)?
+                    .map(|min| min.unwrap_or_else(null)),
+                ("MAX", Some(idx)) => table
+                    .max_column(idx, deadline)?
+                    .map(|max| max.unwrap_or_else(null)),
                 _ => None,
             };
             match value {
@@ -311,6 +325,8 @@ impl Executor {
                 None => return Ok(None),
             }
         }
+        // A read whose last charge read no clock is checked once more
+        deadline.check()?;
         Ok(Some(values))
     }
 

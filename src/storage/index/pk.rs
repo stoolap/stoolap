@@ -31,6 +31,7 @@ use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::common::deadline::{Deadline, DeadlineSite, CHARGE_BEAT};
 use crate::common::{I64Map, I64Set};
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
@@ -719,21 +720,39 @@ impl Index for PkIndex {
         }
     }
 
-    fn get_all_values(&self) -> Option<Vec<Value>> {
+    fn get_all_values(&self, deadline: Deadline) -> Result<Option<Vec<Value>>> {
         let inner = self.data.read();
         let mut result = Vec::with_capacity(inner.count);
+        let mut stopped = None;
         for_each_set_bit(&inner.words, |rid| {
             result.push(Value::Integer(rid));
+            if result.len() % CHARGE_BEAT == 0 {
+                if let Err(error) = deadline.charge(DeadlineSite::StorageRead, CHARGE_BEAT) {
+                    stopped = Some(error);
+                    return false;
+                }
+            }
             true
         });
+        if let Some(error) = stopped {
+            return Err(error);
+        }
+        deadline.charge(DeadlineSite::StorageRead, result.len() % CHARGE_BEAT)?;
         if !inner.overflow_empty() {
-            let mut overflow_ids: Vec<i64> = inner.overflow.iter().collect();
-            overflow_ids.sort_unstable();
-            for id in overflow_ids {
-                result.push(Value::Integer(id));
+            // The slots a removal left empty are read too
+            inner.overflow.each_run(CHARGE_BEAT, |slots, ids| {
+                if let Err(error) = deadline.charge(DeadlineSite::StorageRead, slots) {
+                    stopped = Some(error);
+                    return false;
+                }
+                result.extend(ids.map(Value::Integer));
+                true
+            });
+            if let Some(error) = stopped {
+                return Err(error);
             }
         }
-        Some(result)
+        Ok(Some(result))
     }
 
     fn get_distinct_count_excluding_null(&self) -> Option<usize> {
@@ -1482,6 +1501,33 @@ mod tests {
                 20_000_000,
                 100_000_000
             ]
+        );
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[test]
+    fn far_keys_left_in_a_kept_table_are_charged_by_its_slots() {
+        use crate::executor::DeadlineSite;
+        use crate::test_failpoints::{count_deadline_charges, deadline_charges, keep_deadlines};
+        let _guard = crate::test_failpoints::FailpointGuard::new();
+        let idx = make_idx();
+        let far: Vec<i64> = (1..=200_000).map(|i| BITSET_MAX_BITS as i64 + i).collect();
+        for &id in &far {
+            idx.add(&[Value::Integer(id)], id, id).unwrap();
+        }
+        let mut buffers = idx.removal_buffers(far.len()).unwrap();
+        idx.remove_batch_ids(&far[2..], &mut buffers)
+            .unwrap()
+            .unwrap();
+        let slots = idx.data.read().overflow.capacity();
+        count_deadline_charges(DeadlineSite::StorageRead);
+        let values = idx.get_all_values(Deadline::after_ms(3_600_000));
+        let charges = deadline_charges();
+        keep_deadlines();
+        assert_eq!(values.unwrap().map(|v| v.len()), Some(2));
+        assert!(
+            charges >= slots / CHARGE_BEAT,
+            "{charges} charges over {slots} slots"
         );
     }
 }

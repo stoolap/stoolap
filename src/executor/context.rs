@@ -683,14 +683,15 @@ impl StatementSnapshot {
         &self,
         name: &str,
         point: &crate::storage::mvcc::commit_log::ReadPoint,
+        deadline: Deadline,
     ) -> crate::core::Result<crate::core::RowVec> {
         match &self.0.reads {
             SnapshotReads::Transaction { transaction, .. } => {
-                transaction.lock().rows_at(name, point)
+                transaction.lock().rows_at(name, point, deadline)
             }
-            SnapshotReads::View { view, engine, .. } => {
-                engine.read_table_in_view(name, view)?.rows_at(point, None)
-            }
+            SnapshotReads::View { view, engine, .. } => engine
+                .read_table_in_view(name, view)?
+                .rows_at(point, None, deadline),
         }
     }
 }

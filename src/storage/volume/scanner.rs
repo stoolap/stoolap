@@ -416,6 +416,8 @@ impl VolumeScanner {
                         }
                     }
                 }
+                let rows = self.end_idx - group_start.max(self.current_idx);
+                self.deadline.charge(DeadlineSite::StorageRead, rows)?;
                 let mut blocks = GroupBlocks::new();
                 if !self.dict_filters.is_empty() && self.candidates_group != Some(group_idx) {
                     let lo = group_start.max(self.current_idx);

@@ -1168,13 +1168,21 @@ fn warm_collection_propagates_column_failure() {
 #[test]
 fn warm_sum_propagates_column_failure() {
     use stoolap::storage::traits::Table;
-    assert_warm_read_failure(|table| table.sum_column(1).map(drop));
+    assert_warm_read_failure(|table| {
+        table
+            .sum_column(1, stoolap::executor::Deadline::NONE)
+            .map(drop)
+    });
 }
 
 #[test]
 fn warm_partitions_propagate_column_failure() {
     use stoolap::storage::traits::Table;
-    assert_warm_read_failure(|table| table.get_partition_values("b").map(drop));
+    assert_warm_read_failure(|table| {
+        table
+            .get_partition_values("b", stoolap::executor::Deadline::NONE)
+            .map(drop)
+    });
 }
 
 #[test]
@@ -1216,9 +1224,24 @@ fn fully_hidden_warm_columns_are_not_decoded() {
     use stoolap::storage::traits::Table;
     let table = malformed_warm_table();
     table.segment_manager().add_tombstones(&[1, 2], 1);
-    assert_eq!(table.sum_column(1).unwrap().map(|sum| sum.count()), Some(0));
-    assert_eq!(table.get_partition_count("b").unwrap(), Some(0));
-    assert!(table.get_partition_values("b").unwrap().unwrap().is_empty());
+    assert_eq!(
+        table
+            .sum_column(1, stoolap::executor::Deadline::NONE)
+            .unwrap()
+            .map(|sum| sum.count()),
+        Some(0)
+    );
+    assert_eq!(
+        table
+            .get_partition_count("b", stoolap::executor::Deadline::NONE)
+            .unwrap(),
+        Some(0)
+    );
+    assert!(table
+        .get_partition_values("b", stoolap::executor::Deadline::NONE)
+        .unwrap()
+        .unwrap()
+        .is_empty());
     assert!(table
         .collect_rows_grouped_by_partition("b", stoolap::executor::Deadline::NONE)
         .unwrap()
@@ -1375,7 +1398,10 @@ fn late_compaction_failure_removes_output_and_preserves_original_volumes() {
     engine.force_checkpoint_cycle().unwrap();
     let mut tx = engine.begin_transaction().unwrap();
     assert_eq!(
-        tx.get_table("group_access").unwrap().row_count().unwrap(),
+        tx.get_table("group_access")
+            .unwrap()
+            .row_count(stoolap::executor::Deadline::NONE)
+            .unwrap(),
         131_070
     );
     tx.rollback().unwrap();

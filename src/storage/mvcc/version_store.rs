@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 
-use crate::common::deadline::{Deadline, DeadlineSite};
+use crate::common::deadline::{Deadline, DeadlineSite, CHARGE_BEAT};
 use crate::common::names::eq_names;
 use crate::common::SmartString;
 
@@ -664,8 +664,9 @@ fn sum_live_heads<const LEAD: u8>(
     data: &[CompactArc<[Value]>],
     col_idx: usize,
     mut visible: impl FnMut(i64) -> bool,
-) -> SumAccumulator {
-    let mut sum = SumAccumulator::default();
+    total: &mut SumAccumulator,
+) {
+    let mut sum = *total;
     let mut last_txn_id: i64 = 0;
     let mut last_visible = false;
     for (meta, row) in meta.iter().zip(data) {
@@ -682,7 +683,23 @@ fn sum_live_heads<const LEAD: u8>(
             }
         }
     }
-    sum
+    *total = sum;
+}
+
+/// [`sum_live_heads`] a run of heads at a time, each run charged first
+fn sum_heads_charged<const LEAD: u8>(
+    meta: &[crate::storage::mvcc::arena::ArenaRowMeta],
+    data: &[CompactArc<[Value]>],
+    col_idx: usize,
+    mut visible: impl FnMut(i64) -> bool,
+    deadline: Deadline,
+) -> crate::core::Result<SumAccumulator> {
+    let mut sum = SumAccumulator::default();
+    for (metas, rows) in meta.chunks(CHARGE_BEAT).zip(data.chunks(CHARGE_BEAT)) {
+        deadline.charge(DeadlineSite::StorageAggregate, metas.len())?;
+        sum_live_heads::<LEAD>(metas, rows, col_idx, &mut visible, &mut sum);
+    }
+    Ok(sum)
 }
 
 /// Whether any version of `chain` is visible to `txn_id` through `checker`
@@ -2341,11 +2358,18 @@ impl VersionStore {
         &self,
         point: &ReadPoint,
         mut authority: Option<&mut FxHashSet<i64>>,
+        deadline: Deadline,
     ) -> Result<RowVec, Error> {
         self.check_history(point)?;
         let versions = self.versions.read().clone();
         let mut rows = RowVec::new();
+        let mut unpaid = 0;
         for (&row_id, head) in versions.iter() {
+            unpaid += 1;
+            if unpaid == CHARGE_BEAT {
+                unpaid = 0;
+                deadline.charge(DeadlineSite::StorageRead, CHARGE_BEAT)?;
+            }
             let mut current = Some(head);
             while let Some(entry) = current {
                 if self.point_sees(point, &entry.version)? {
@@ -2358,6 +2382,12 @@ impl VersionStore {
                     break;
                 }
                 current = entry.prev.as_deref();
+                // Each older version read counts as a row
+                unpaid += 1;
+                if unpaid == CHARGE_BEAT {
+                    unpaid = 0;
+                    deadline.charge(DeadlineSite::StorageRead, CHARGE_BEAT)?;
+                }
             }
         }
         self.check_history(point)?;
@@ -3755,14 +3785,18 @@ impl VersionStore {
     ///
     /// OPTIMIZATION: This method counts rows in O(1) lock acquisition instead of O(N)
     /// by iterating through versions once without cloning any row data.
-    pub fn count_visible_rows(&self, reader: Reader<'_>) -> usize {
+    pub fn count_visible_rows(
+        &self,
+        reader: Reader<'_>,
+        deadline: Deadline,
+    ) -> crate::core::Result<usize> {
         if self.closed.load(Ordering::Acquire) {
-            return 0;
+            return Ok(0);
         }
 
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => reader.over(&**c),
-            None => return 0,
+            None => return Ok(0),
         };
         let txn_id = reader.txn_id;
 
@@ -3774,24 +3808,33 @@ impl VersionStore {
 
             if arena_len > 0 {
                 let mut count = 0usize;
-                for meta in arena_meta {
-                    if meta.txn_id != 0
-                        && meta.deleted_at_txn_id == 0
-                        && checker.is_visible(meta.txn_id, txn_id)
-                    {
-                        count += 1;
+                for metas in arena_meta.chunks(CHARGE_BEAT) {
+                    deadline.charge(DeadlineSite::StorageRead, metas.len())?;
+                    for meta in metas {
+                        if meta.txn_id != 0
+                            && meta.deleted_at_txn_id == 0
+                            && checker.is_visible(meta.txn_id, txn_id)
+                        {
+                            count += 1;
+                        }
                     }
                 }
                 if self.publish_epoch_if_quiet() == Some(epoch) {
-                    return count;
+                    return Ok(count);
                 }
             }
         }
 
         // SLOW PATH: Full CowBTree iteration
         let mut count = 0;
+        let mut unpaid = 0;
         let versions = self.versions.read().clone();
         for chain in versions.values() {
+            unpaid += 1;
+            if unpaid == CHARGE_BEAT {
+                unpaid = 0;
+                deadline.charge(DeadlineSite::StorageRead, CHARGE_BEAT)?;
+            }
             // FAST PATH: Check HEAD version first - O(1) for common case
             let head_txn_id = chain.version.txn_id;
             let head_deleted_at = chain.version.deleted_at_txn_id;
@@ -3807,6 +3850,11 @@ impl VersionStore {
             // SLOW PATH: HEAD not visible - traverse chain for older versions
             let mut current: Option<&VersionChainEntry> = chain.prev.as_ref().map(|b| b.as_ref());
             while let Some(e) = current {
+                unpaid += 1;
+                if unpaid == CHARGE_BEAT {
+                    unpaid = 0;
+                    deadline.charge(DeadlineSite::StorageRead, CHARGE_BEAT)?;
+                }
                 let version_txn_id = e.version.txn_id;
                 let deleted_at_txn_id = e.version.deleted_at_txn_id;
 
@@ -3820,7 +3868,7 @@ impl VersionStore {
             }
         }
 
-        count
+        Ok(count)
     }
 
     /// Returns the count of committed non-deleted rows (O(1) operation)
@@ -5137,16 +5185,17 @@ impl VersionStore {
         start_from_row_id: Option<i64>,
         ascending: bool,
         limit: usize,
-    ) -> RowVec {
+        deadline: Deadline,
+    ) -> crate::core::Result<RowVec> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.collect_rows_keyset");
         if self.closed.load(Ordering::Acquire) || limit == 0 {
-            return RowVec::new();
+            return Ok(RowVec::new());
         }
 
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => reader.over(&**c),
-            None => return RowVec::new(),
+            None => return Ok(RowVec::new()),
         };
         let txn_id = reader.txn_id;
 
@@ -5154,23 +5203,30 @@ impl VersionStore {
         let versions = self.snapshot_versions();
 
         // Helper to find visible version and get row data
-        let find_visible_row = |chain: &VersionChainEntry| -> Option<Row> {
-            let mut current: Option<&VersionChainEntry> = Some(chain);
-            while let Some(e) = current {
-                let version_txn_id = e.version.txn_id;
-                let deleted_at_txn_id = e.version.deleted_at_txn_id;
+        let find_visible_row =
+            |chain: &VersionChainEntry, unpaid: &mut usize| -> crate::core::Result<Option<Row>> {
+                let mut current: Option<&VersionChainEntry> = Some(chain);
+                while let Some(e) = current {
+                    let version_txn_id = e.version.txn_id;
+                    let deleted_at_txn_id = e.version.deleted_at_txn_id;
 
-                if checker.is_visible(version_txn_id, txn_id) {
-                    if deleted_at_txn_id != 0 && checker.is_visible(deleted_at_txn_id, txn_id) {
-                        break; // Row is deleted
+                    if checker.is_visible(version_txn_id, txn_id) {
+                        if deleted_at_txn_id != 0 && checker.is_visible(deleted_at_txn_id, txn_id) {
+                            break; // Row is deleted
+                        }
+
+                        return Ok(Some(e.version.data.clone()));
                     }
-
-                    return Some(e.version.data.clone());
+                    current = e.prev.as_ref().map(|b| b.as_ref());
+                    // Each older version read counts as an entry
+                    *unpaid += 1;
+                    if *unpaid == CHARGE_BEAT {
+                        *unpaid = 0;
+                        deadline.charge(DeadlineSite::StorageRead, CHARGE_BEAT)?;
+                    }
                 }
-                current = e.prev.as_ref().map(|b| b.as_ref());
-            }
-            None
-        };
+                Ok(None)
+            };
 
         // Determine range bounds
         let start_bound = if let Some(after_id) = start_after_row_id {
@@ -5185,11 +5241,18 @@ impl VersionStore {
         // A user-supplied limit can be i64::MAX; only pre-allocate what
         // the store could actually return
         let mut result = RowVec::with_capacity(limit.min(4096));
+        // Entries no snapshot sees are walked past uncounted by the limit
+        let mut unpaid = 0;
 
         if ascending {
             for (&row_id, chain) in versions.range((start_bound, std::ops::Bound::Unbounded::<i64>))
             {
-                if let Some(row_data) = find_visible_row(chain) {
+                unpaid += 1;
+                if unpaid == CHARGE_BEAT {
+                    unpaid = 0;
+                    deadline.charge(DeadlineSite::StorageRead, CHARGE_BEAT)?;
+                }
+                if let Some(row_data) = find_visible_row(chain, &mut unpaid)? {
                     result.push((row_id, row_data));
                     if result.len() >= limit {
                         break;
@@ -5201,7 +5264,12 @@ impl VersionStore {
             for (&row_id, chain) in
                 versions.range_rev((start_bound, std::ops::Bound::Unbounded::<i64>))
             {
-                if let Some(row_data) = find_visible_row(chain) {
+                unpaid += 1;
+                if unpaid == CHARGE_BEAT {
+                    unpaid = 0;
+                    deadline.charge(DeadlineSite::StorageRead, CHARGE_BEAT)?;
+                }
+                if let Some(row_data) = find_visible_row(chain, &mut unpaid)? {
                     result.push((row_id, row_data));
                     if result.len() >= limit {
                         break;
@@ -5209,8 +5277,9 @@ impl VersionStore {
                 }
             }
         }
+        deadline.charge(DeadlineSite::StorageRead, unpaid)?;
 
-        result
+        Ok(result)
     }
 
     /// Get all visible rows with filter applied during collection
@@ -5451,8 +5520,8 @@ impl VersionStore {
     /// - Only visibility checks are performed
     /// - O(n) time, O(1) memory
     #[inline]
-    pub fn count_visible(&self, txn_id: i64) -> usize {
-        self.count_visible_rows(txn_id.into())
+    pub fn count_visible(&self, txn_id: i64) -> crate::core::Result<usize> {
+        self.count_visible_rows(txn_id.into(), Deadline::NONE)
     }
 
     /// Compute SUM(column) without materializing full rows
@@ -5460,12 +5529,17 @@ impl VersionStore {
     /// OPTIMIZATION: Single-pass approach that combines visibility checking with summing.
     /// Avoids Vec allocation and second iteration over indices.
     /// Returns the exact sum, for SUM and AVG to read.
-    pub fn sum_column(&self, reader: Reader<'_>, col_idx: usize) -> SumAccumulator {
+    pub fn sum_column(
+        &self,
+        reader: Reader<'_>,
+        col_idx: usize,
+        deadline: Deadline,
+    ) -> crate::core::Result<SumAccumulator> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.sum_column");
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => reader.over(&**c),
-            None => return SumAccumulator::default(),
+            None => return Ok(SumAccumulator::default()),
         };
         let txn_id = reader.txn_id;
         let mut sum = SumAccumulator::default();
@@ -5482,45 +5556,62 @@ impl VersionStore {
             let visible = |version_txn_id| checker.is_visible(version_txn_id, txn_id);
             let heads = match declared {
                 Some(DataType::Integer) => {
-                    sum_live_heads::<SUM_INTEGER>(meta, data, col_idx, visible)
+                    sum_heads_charged::<SUM_INTEGER>(meta, data, col_idx, visible, deadline)
                 }
-                Some(DataType::Float) => sum_live_heads::<SUM_FLOAT>(meta, data, col_idx, visible),
+                Some(DataType::Float) => {
+                    sum_heads_charged::<SUM_FLOAT>(meta, data, col_idx, visible, deadline)
+                }
                 Some(DataType::Boolean) => {
-                    sum_live_heads::<SUM_BOOLEAN>(meta, data, col_idx, visible)
+                    sum_heads_charged::<SUM_BOOLEAN>(meta, data, col_idx, visible, deadline)
                 }
-                _ => sum_live_heads::<SUM_ANY>(meta, data, col_idx, visible),
-            };
+                _ => sum_heads_charged::<SUM_ANY>(meta, data, col_idx, visible, deadline),
+            }?;
             if !arena_guard.is_empty() && self.publish_epoch_if_quiet() == Some(epoch) {
-                return heads;
+                return Ok(heads);
             }
             // arena_guard dropped here — no need to hold it for slow path
         }
 
         // SLOW PATH: the version of every chain the reader sees
-        self.visit_visible_chains(&checker, txn_id, |row| {
-            if let Some(val) = row.get(col_idx) {
-                sum.add(val);
-            }
-        });
-        sum
+        self.visit_visible_chains(
+            &checker,
+            txn_id,
+            |row| {
+                if let Some(val) = row.get(col_idx) {
+                    sum.add(val);
+                }
+            },
+            deadline,
+        )?;
+        Ok(sum)
     }
 
     /// Compute MIN(column) without materializing full rows
     ///
     /// OPTIMIZATION: Single-pass approach that combines visibility checking with min computation.
-    pub fn min_column(&self, reader: Reader<'_>, col_idx: usize) -> Option<Value> {
+    pub fn min_column(
+        &self,
+        reader: Reader<'_>,
+        col_idx: usize,
+        deadline: Deadline,
+    ) -> crate::core::Result<Option<Value>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.min_column");
-        self.column_extreme(reader, col_idx, CompiledAggregate::min())
+        self.column_extreme(reader, col_idx, CompiledAggregate::min(), deadline)
     }
 
     /// Compute MAX(column) without materializing full rows
     ///
     /// OPTIMIZATION: Single-pass approach that combines visibility checking with max computation.
-    pub fn max_column(&self, reader: Reader<'_>, col_idx: usize) -> Option<Value> {
+    pub fn max_column(
+        &self,
+        reader: Reader<'_>,
+        col_idx: usize,
+        deadline: Deadline,
+    ) -> crate::core::Result<Option<Value>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.max_column");
-        self.column_extreme(reader, col_idx, CompiledAggregate::max())
+        self.column_extreme(reader, col_idx, CompiledAggregate::max(), deadline)
     }
 
     /// Returns the count of rows
@@ -7390,17 +7481,26 @@ impl VersionStore {
     }
 
     /// Runs `visit` over the version of every chain `txn_id` sees, read from
-    /// the chains as captured once
+    /// the chains as captured once. Kept out of line: the heads pass it
+    /// stands behind runs faster without it inlined
+    #[inline(never)]
     fn visit_visible_chains<C: VisibilityChecker + ?Sized>(
         &self,
         checker: &ReaderChecker<'_, '_, C>,
         txn_id: i64,
         mut visit: impl FnMut(&[Value]),
-    ) {
+        deadline: Deadline,
+    ) -> crate::core::Result<()> {
         let versions = self.snapshot_versions();
         // Asked once per run of versions from one transaction
         let (mut last_txn_id, mut last_visible) = (0i64, false);
+        let mut unpaid = 0;
         for chain in versions.values() {
+            unpaid += 1;
+            if unpaid == CHARGE_BEAT {
+                unpaid = 0;
+                deadline.charge(DeadlineSite::StorageAggregate, CHARGE_BEAT)?;
+            }
             let mut current: Option<&VersionChainEntry> = Some(chain);
             while let Some(e) = current {
                 if e.version.txn_id != last_txn_id {
@@ -7415,8 +7515,15 @@ impl VersionStore {
                     break;
                 }
                 current = e.prev.as_deref();
+                // Each older version read counts as a row
+                unpaid += 1;
+                if unpaid == CHARGE_BEAT {
+                    unpaid = 0;
+                    deadline.charge(DeadlineSite::StorageAggregate, CHARGE_BEAT)?;
+                }
             }
         }
+        Ok(())
     }
 
     /// The MIN or MAX `run` takes over a column of every row `reader` sees
@@ -7425,8 +7532,11 @@ impl VersionStore {
         reader: Reader<'_>,
         col_idx: usize,
         mut run: CompiledAggregate,
-    ) -> Option<Value> {
-        let checker = reader.over(&**self.visibility_checker.as_ref()?);
+        deadline: Deadline,
+    ) -> crate::core::Result<Option<Value>> {
+        let Some(checker) = self.visibility_checker.as_ref().map(|c| reader.over(&**c)) else {
+            return Ok(None);
+        };
         let pass = self.visit_live_heads(
             &checker,
             reader,
@@ -7435,20 +7545,25 @@ impl VersionStore {
                     run.accumulate(value);
                 }
             },
-            Deadline::NONE,
+            deadline,
         );
-        if !matches!(pass, HeadsPass::Answered) {
-            run.reset();
-            self.visit_visible_chains(&checker, reader.txn_id, |row| {
-                if let Some(value) = row.get(col_idx) {
-                    run.accumulate(value);
-                }
-            });
+        match pass {
+            HeadsPass::Answered => {}
+            HeadsPass::Stopped => return Err(crate::core::Error::QueryCancelled),
+            HeadsPass::Unheld | HeadsPass::Empty => {
+                run.reset();
+                let accumulate = |row: &[Value]| {
+                    if let Some(value) = row.get(col_idx) {
+                        run.accumulate(value);
+                    }
+                };
+                self.visit_visible_chains(&checker, reader.txn_id, accumulate, deadline)?;
+            }
         }
-        match run.result() {
+        Ok(match run.result() {
             Ok(value) if !value.is_null() => Some(value),
             _ => None,
-        }
+        })
     }
 }
 
@@ -11130,7 +11245,10 @@ mod tests {
         let store =
             VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
 
-        assert_eq!(store.count_visible_rows(1.into()), 0);
+        assert_eq!(
+            store.count_visible_rows(1.into(), Deadline::NONE).unwrap(),
+            0
+        );
 
         // Add rows
         for i in 1..=10 {
@@ -11139,7 +11257,10 @@ mod tests {
             store.add_version(i, version);
         }
 
-        assert_eq!(store.count_visible_rows(2.into()), 10);
+        assert_eq!(
+            store.count_visible_rows(2.into(), Deadline::NONE).unwrap(),
+            10
+        );
     }
 
     #[test]
@@ -11201,7 +11322,7 @@ mod tests {
             store.add_version(i, version);
         }
 
-        let sum = store.sum_column(2.into(), 0);
+        let sum = store.sum_column(2.into(), 0, Deadline::NONE).unwrap();
         assert_eq!(sum.sum().unwrap(), Value::Integer(150)); // 10 + 20 + 30 + 40 + 50
         assert_eq!(sum.count(), 5);
     }
@@ -11234,7 +11355,7 @@ mod tests {
         txn.commit().unwrap();
 
         for (col, what) in [(1, "a FLOAT column"), (2, "an INTEGER column")] {
-            let sum = store.sum_column(2.into(), col);
+            let sum = store.sum_column(2.into(), col, Deadline::NONE).unwrap();
             assert_eq!(sum.sum().unwrap(), Value::Float(7.5), "{what}");
             assert_eq!(sum.count(), 3, "{what}");
         }
@@ -11254,7 +11375,7 @@ mod tests {
             store.add_version((i + 1) as i64, version);
         }
 
-        let sum = store.sum_column(2.into(), 0);
+        let sum = store.sum_column(2.into(), 0, Deadline::NONE).unwrap();
         assert_eq!(sum.sum().unwrap(), Value::Float(7.5));
         assert_eq!(sum.count(), 3);
     }
@@ -11272,10 +11393,10 @@ mod tests {
             store.add_version(i, version);
         }
 
-        let min = store.min_column(2.into(), 0);
+        let min = store.min_column(2.into(), 0, Deadline::NONE).unwrap();
         assert_eq!(min, Some(Value::from(10)));
 
-        let max = store.max_column(2.into(), 0);
+        let max = store.max_column(2.into(), 0, Deadline::NONE).unwrap();
         assert_eq!(max, Some(Value::from(50)));
     }
 
@@ -11283,10 +11404,10 @@ mod tests {
     fn test_version_store_min_max_empty() {
         let store = VersionStore::new("test_table".to_string(), test_schema());
 
-        let min = store.min_column(1.into(), 0);
+        let min = store.min_column(1.into(), 0, Deadline::NONE).unwrap();
         assert!(min.is_none());
 
-        let max = store.max_column(1.into(), 0);
+        let max = store.max_column(1.into(), 0, Deadline::NONE).unwrap();
         assert!(max.is_none());
     }
 
@@ -11616,7 +11737,7 @@ mod tests {
         let store =
             VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
 
-        assert_eq!(store.count_visible(1), 0);
+        assert_eq!(store.count_visible(1).unwrap(), 0);
 
         // Add rows
         for i in 1..=10 {
@@ -11625,7 +11746,7 @@ mod tests {
             store.add_version(i, version);
         }
 
-        assert_eq!(store.count_visible(2), 10);
+        assert_eq!(store.count_visible(2).unwrap(), 10);
     }
 
     // =========================================================================

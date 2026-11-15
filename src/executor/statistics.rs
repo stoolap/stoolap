@@ -156,7 +156,7 @@ impl Executor {
         let schema = table.schema().clone();
 
         // Get row count
-        let row_count = table.row_count()?;
+        let row_count = table.row_count(crate::common::deadline::Deadline::NONE)?;
 
         // The committed state the zone maps describe: one publish epoch, read
         // as the newest with no writes of this transaction mixed in

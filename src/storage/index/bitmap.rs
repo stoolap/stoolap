@@ -49,6 +49,7 @@ use std::sync::Arc;
 use ahash::AHashMap;
 use roaring::RoaringTreemap;
 
+use crate::common::deadline::{Deadline, DeadlineSite, CHARGE_BEAT};
 use crate::common::{CompactArc, I64Map};
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
@@ -730,10 +731,20 @@ impl Index for BitmapIndex {
         RowIdVec::from_vec(collected)
     }
 
-    fn get_all_values(&self) -> Option<Vec<Value>> {
+    fn get_all_values(&self, deadline: Deadline) -> Result<Option<Vec<Value>>> {
         let bitmaps = self.bitmaps.read();
-        // Dereference CompactArc<Value> to clone inner Value
-        Some(bitmaps.keys().map(|arc| (**arc).clone()).collect())
+        let mut values = Vec::with_capacity(bitmaps.len());
+        let mut keys = bitmaps.keys();
+        loop {
+            let before = values.len();
+            // Dereference CompactArc<Value> to clone inner Value
+            values.extend(keys.by_ref().take(CHARGE_BEAT).map(|arc| (**arc).clone()));
+            let read = values.len() - before;
+            deadline.charge(DeadlineSite::StorageRead, read)?;
+            if read < CHARGE_BEAT {
+                return Ok(Some(values));
+            }
+        }
     }
 
     fn distinct_keys_hint(&self) -> Option<usize> {
