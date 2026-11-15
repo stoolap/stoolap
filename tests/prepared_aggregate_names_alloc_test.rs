@@ -114,7 +114,7 @@ const PROJECTED_RUNS: [(&str, &str, usize); 3] = [
         29,
     ),
     (
-        "global",
+        "projected_global",
         "SELECT SUM(a) + 1, COUNT(*) * 2 FROM t WHERE k = $1",
         28,
     ),
@@ -130,6 +130,38 @@ fn a_prepared_aggregate_projects_its_list_once_for_its_runs() {
         })
         .collect();
     assert!(over.is_empty(), "held runs allocated more: {over:#?}");
+}
+
+/// The allocations of one run of a prepared aggregate whose projection
+/// reads a TEXT vector parameter, over `groups` groups
+fn grouped_allocations(groups: usize) -> usize {
+    let db = Database::open(&format!("memory://prepared_aggregate_names_bound_{groups}")).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute(
+        &format!("INSERT INTO t (id, k) SELECT g.value, g.value % {groups} FROM generate_series(1, 40) g"),
+        (),
+    )
+    .unwrap();
+    let sql = "SELECT k, COUNT(*) + VEC_DISTANCE_L2($1, $1) FROM t GROUP BY k";
+    let query = db.prepare(sql).unwrap();
+    let run = || query.query(("[1.0, 2.0, 3.0]",)).unwrap().count();
+    assert_eq!(run(), groups, "{sql}");
+    let before = ALLOCATIONS.with(Cell::get);
+    run();
+    ALLOCATIONS.with(Cell::get) - before
+}
+
+#[test]
+fn a_held_projection_binds_its_parameters_once_for_its_groups() {
+    let few = grouped_allocations(4);
+    let many = grouped_allocations(40);
+    // A group costs its own rows, two allocations; its parameters none
+    let per_group = (many - few) / 36;
+    assert!(
+        per_group <= 2,
+        "{few} allocations over 4 groups, {many} over 40: {per_group} a group"
+    );
 }
 
 #[test]

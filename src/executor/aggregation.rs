@@ -2553,6 +2553,22 @@ impl Executor {
             PostProjection::Project(names, reads) => (names.clone(), reads),
         };
 
+        // A program binds this run's parameters and sets once, not per group
+        let params = slot_params(ctx, blocks);
+        let bind = |program: &super::expression::SharedProgram| {
+            let program = super::expression::Program::bound(program.clone(), params);
+            blocks
+                .and_then(|blocks| blocks.bind_members(&program))
+                .unwrap_or(program)
+        };
+        let programs: smallvec::SmallVec<[Option<super::expression::SharedProgram>; 8]> = reads
+            .iter()
+            .map(|read| match read {
+                SlotRead::Program(program) => Some(bind(program)),
+                _ => None,
+            })
+            .collect();
+
         // Evaluate each row
         let mut final_rows = RowVec::with_capacity(agg_rows.len());
         let mut vm = super::expression::ExprVM::new();
@@ -2562,13 +2578,16 @@ impl Executor {
             // Use CompactVec directly to avoid Vec→CompactVec conversion
             let mut new_values: CompactVec<Value> = CompactVec::with_capacity(reads.len());
 
-            for read in reads {
+            for (at, read) in reads.iter().enumerate() {
                 let value = match read {
                     SlotRead::Slot(Some(idx)) => {
                         row.get(*idx).cloned().unwrap_or(Value::null_unknown())
                     }
                     SlotRead::Slot(None) => Value::null_unknown(),
-                    SlotRead::Program(p) => vm.execute(p, &run_context(&row, ctx, blocks))?,
+                    SlotRead::Program(held) => {
+                        let program = programs.get(at).and_then(Option::as_ref).unwrap_or(held);
+                        vm.execute(program, &run_context(&row, ctx, blocks))?
+                    }
                     // Fallback: column is grouped normally
                     SlotRead::Flag(at) => at
                         .and_then(|at| row.get(at))
