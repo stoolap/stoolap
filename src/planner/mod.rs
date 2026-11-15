@@ -591,12 +591,15 @@ pub fn scan_choice(
     let Some(pushed) = pushed else {
         return ScanChoice::Seq;
     };
-    let held = std::sync::Arc::downgrade(store);
+    let held = || std::sync::Arc::downgrade(store);
     if let Some(plan) = index_plan::decide(store, schema, pushed, false) {
-        return ScanChoice::Index(plan, held);
+        return ScanChoice::Index(plan, held());
     }
-    match index_plan::decide(store, schema, pushed, true).filter(|_| limited) {
-        Some(plan) => ScanChoice::Limited(plan, held),
+    if !limited {
+        return ScanChoice::Seq;
+    }
+    match index_plan::decide(store, schema, pushed, true) {
+        Some(plan) => ScanChoice::Limited(plan, held()),
         None => ScanChoice::Seq,
     }
 }
