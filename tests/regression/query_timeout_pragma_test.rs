@@ -29,8 +29,12 @@ fn a_handle_reads_and_sets_its_query_timeout() {
     assert_eq!((set, timeout_of(&db)), (5000, 5000));
     db.execute("PRAGMA QUERY_TIMEOUT = 0", ()).unwrap();
     assert_eq!(timeout_of(&db), 0);
-    assert!(db.execute("PRAGMA QUERY_TIMEOUT = -1", ()).is_err());
-    assert_eq!(timeout_of(&db), 0, "a refused value leaves the timeout");
+    db.execute("PRAGMA QUERY_TIMEOUT = 300", ()).unwrap();
+    for refused in ["-1", "-0.5"] {
+        let sql = format!("PRAGMA QUERY_TIMEOUT = {refused}");
+        assert!(db.execute(&sql, ()).is_err(), "{refused} was taken");
+        assert_eq!(timeout_of(&db), 300, "{refused} changed the timeout");
+    }
 }
 
 #[test]
@@ -78,7 +82,9 @@ fn a_query_timeout_past_the_clock_runs_to_the_end() {
 #[cfg(feature = "test-failpoints")]
 mod stops {
     use stoolap::executor::DeadlineSite;
-    use stoolap::test_failpoints::{keep_deadlines, pass_deadline_at, FailpointGuard};
+    use stoolap::test_failpoints::{
+        keep_deadlines, pass_deadline_after, pass_deadline_at, FailpointGuard,
+    };
     use stoolap::{Database, Error};
 
     const SCAN: &str = "SELECT id FROM t WHERE v * 1 > 0 ORDER BY v DESC";
@@ -150,6 +156,36 @@ mod stops {
         );
         db.execute("PRAGMA QUERY_TIMEOUT = 0", ()).unwrap();
         assert_eq!(past_the_scan(|| rows(db.query(SCAN, ()))).ok(), Some(2000));
+    }
+
+    #[test]
+    fn a_cached_statement_with_parameters_stops_at_its_handles_query_timeout() {
+        let _guard = FailpointGuard::new();
+        let db = table("memory://query_timeout_pragma_params");
+        db.execute("CREATE INDEX t_v ON t(v)", ()).unwrap();
+        let by_id = "SELECT v FROM t WHERE id = $1";
+        let by_v = "SELECT id FROM t WHERE v = $1";
+        let prepared = db.prepare(by_v).unwrap();
+        let past_every_check = |run: &dyn Fn() -> stoolap::Result<usize>| {
+            pass_deadline_after(DeadlineSite::Scan, 0);
+            let result = run();
+            keep_deadlines();
+            result
+        };
+        let ways = |db: &Database| {
+            [
+                past_every_check(&|| rows(db.query(by_id, (7,)))),
+                past_every_check(&|| rows(db.query(by_v, (7,)))),
+                past_every_check(&|| rows(prepared.query((7,)))),
+            ]
+            .map(|result| match result {
+                Err(Error::QueryCancelled) => "cancelled".to_string(),
+                other => format!("{other:?}"),
+            })
+        };
+        assert_eq!(ways(&db), ["Ok(1)", "Ok(1)", "Ok(1)"], "no timeout set");
+        db.execute("PRAGMA QUERY_TIMEOUT = 3600000", ()).unwrap();
+        assert_eq!(ways(&db), ["cancelled", "cancelled", "cancelled"]);
     }
 
     #[test]

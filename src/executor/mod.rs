@@ -599,12 +599,16 @@ impl Executor {
     }
 
     /// The compiled PK paths that take borrowed params, under a shared gate
-    /// the caller holds; None when none applies
+    /// the caller holds; None when none applies, or when the session's
+    /// query timeout is on, which only a context carries
     fn param_fast_paths(
         &self,
         plan: &CachedPlanRef,
         params: &[Value],
     ) -> Option<Result<Box<dyn QueryResult>>> {
+        if self.query_timeout_ms() > 0 {
+            return None;
+        }
         if let Err(e) = check_param_count(&plan.params, params.len()) {
             return Some(Err(e));
         }

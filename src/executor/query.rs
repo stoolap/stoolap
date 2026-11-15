@@ -9586,8 +9586,12 @@ impl Executor {
                 // This session's timeout in milliseconds for a statement whose
                 // call sets none; zero runs them to their end
                 if let Some(ref value) = stmt.value {
+                    let negative = matches!(
+                        value,
+                        crate::parser::Expression::FloatLiteral(lit) if lit.value < 0.0
+                    );
                     let timeout_ms = self.extract_pragma_int_value(value)?;
-                    if timeout_ms < 0 {
+                    if negative || timeout_ms < 0 {
                         return Err(Error::invalid_argument(
                             "query_timeout must not be negative",
                         ));
