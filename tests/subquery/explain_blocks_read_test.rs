@@ -48,64 +48,100 @@ fn explain(db: &Database, sql: &str) -> String {
         .join("\n")
 }
 
-/// Each statement, how many rows it answers, and the read its plan names:
-/// an index read the run takes, or None for a read each run picks over
-/// the sets its blocks give
-const SHAPES: [(&str, usize, Option<&str>); 9] = [
+/// The first column of every row `sql` answers, in order
+fn firsts(db: &Database, sql: &str) -> Vec<i64> {
+    let mut values: Vec<i64> = db
+        .query(sql, ())
+        .unwrap()
+        .map(|row| row.unwrap().get::<i64>(0).unwrap())
+        .collect();
+    values.sort_unstable();
+    values
+}
+
+/// Each statement, the first column of its rows, and the read its plan
+/// names: an index read the run takes, or None for a read each run picks
+/// over the sets its blocks give
+#[allow(clippy::type_complexity)]
+const SHAPES: [(&str, &[i64], Option<&str>); 11] = [
     (
         "SELECT id FROM t WHERE v > (SELECT MAX(x) FROM m)",
-        10,
+        &[1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 1999, 2000],
         Some("Index t_v (v range)"),
     ),
     (
         "SELECT id FROM t WHERE v > (SELECT MAX(x) FROM m) AND w = 3",
-        2,
+        &[1991, 1998],
         Some("Index t_v (v range)"),
     ),
     (
         "SELECT COUNT(*) FROM t WHERE v > (SELECT MAX(x) FROM m)",
-        1,
+        &[10],
         Some("Index t_v (v range)"),
     ),
     (
         "SELECT id FROM t WHERE id = (SELECT MIN(x) FROM m)",
-        1,
+        &[50],
         Some("PkKey"),
     ),
     (
         "SELECT id, (SELECT MAX(x) FROM m) FROM t WHERE v > 1995",
-        5,
+        &[1996, 1997, 1998, 1999, 2000],
         Some("Index t_v (v range)"),
     ),
     (
         "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM m WHERE x = 50) AND v > 1995",
-        5,
+        &[1996, 1997, 1998, 1999, 2000],
         Some("Index t_v (v range)"),
     ),
-    ("SELECT id FROM t WHERE v > ALL (SELECT x FROM m)", 10, None),
-    ("SELECT id FROM t WHERE v IN (SELECT x FROM m)", 2, None),
+    (
+        "SELECT id, (SELECT MAX(x) FROM m) FROM t WHERE v = 2000 OR w = -1 LIMIT 1",
+        &[2000],
+        Some("MixedOr"),
+    ),
+    (
+        "SELECT id FROM t WHERE v = 2000 OR w = -1 LIMIT 1",
+        &[2000],
+        Some("MixedOr"),
+    ),
+    (
+        "SELECT id FROM t WHERE v > ALL (SELECT x FROM m)",
+        &[1991, 1992, 1993, 1994, 1995, 1996, 1997, 1998, 1999, 2000],
+        None,
+    ),
+    (
+        "SELECT id FROM t WHERE v IN (SELECT x FROM m)",
+        &[50, 1990],
+        None,
+    ),
     (
         "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM m WHERE m.x = t.v)",
-        2,
+        &[50, 1990],
         None,
     ),
 ];
 
 fn check(db: &Database, wrong: &mut Vec<String>, at: &str) {
-    for (sql, rows, read) in SHAPES {
+    for (sql, expected, read) in SHAPES {
         let plan = explain(db, sql);
         test_failpoints::take_scan_accesses();
-        let answered = db.query(sql, ()).unwrap().count();
+        let answered = firsts(db, sql);
         let taken = test_failpoints::take_scan_accesses();
-        if answered != rows {
-            wrong.push(format!("{at} {sql}: {answered} rows, not {rows}"));
+        if answered != expected {
+            wrong.push(format!("{at} {sql}: answered {answered:?}"));
         }
-        if plan.contains("Seq Scan") || !plan.lines().any(|line| line == "Prepared: yes") {
+        // A statement without a subquery prints its plan with no Prepared line
+        let asks = sql.contains("(SELECT");
+        if plan.contains("Seq Scan") || asks != plan.lines().any(|line| line == "Prepared: yes") {
             wrong.push(format!("{at} {sql}: not the prepared plan\n{plan}"));
         }
         match read {
             Some(read) => {
-                if !plan.contains(read) || taken.iter().any(|access| access != read) {
+                // Every read the run took is the plan's, each of its lines shown
+                let shown = |access: &String| {
+                    access.contains(read) && access.split("; ").all(|line| plan.contains(line))
+                };
+                if !plan.contains(read) || taken.is_empty() || !taken.iter().all(shown) {
                     wrong.push(format!("{at} {sql}: ran {taken:?}, planned\n{plan}"));
                 }
             }

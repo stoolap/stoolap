@@ -193,6 +193,25 @@ Project id, name, category, value
       Index idx_value (value range)
 ```
 
+An OR whose operands an index reads only some of is read by every row, unless a LIMIT stops the read: then the indexed operands are read first, and a scan finds the rest only if they do not fill it. The plan shows both:
+
+```sql
+EXPLAIN SELECT * FROM products WHERE category = 'Books' OR name = 'Pen' LIMIT 1;
+```
+
+Output:
+```
+plan
+----
+Limit 1
+  Project id, name, category, value
+    IndexScan products ((category = 'Books') OR (name = 'Pen')) to a LIMIT
+      MixedOr
+        Index idx_category (category =)
+        Scan
+    else SeqScan products ((category = 'Books') OR (name = 'Pen'))
+```
+
 A multi-column index shows as `CompositeIndex name (a =, b range)`: equalities on its leading columns and a range, with an upper bound, on the next one.
 
 ### Aggregates Over One Table
@@ -380,7 +399,7 @@ Limit 2
 
 ### Subqueries Over One Table
 
-A SELECT over one table whose WHERE or select list holds a subquery is planned once too, and EXPLAIN prints its plan, then `Prepared: yes` and its subqueries. A subquery compared with a column, or any value that reads no row, is read once per run and taken by the scan as a parameter is, so the plan's index is the one the run reads. It shows as written:
+A SELECT over one table whose WHERE or select list holds a subquery is planned once too, and EXPLAIN prints its plan, then `Prepared: yes` and its subqueries. A subquery that reads no enclosing row and is compared with a column in a top-level AND, or any other such value that reads no row, is read once per run and taken by the scan as a parameter is, so the plan's index is the one the run reads. It shows as written:
 
 ```sql
 EXPLAIN SELECT name FROM products WHERE value > (SELECT AVG(amount) FROM orders);

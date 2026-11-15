@@ -9278,7 +9278,13 @@ impl PreparedSelect {
                     read: Read::Scan(None),
                 });
             } else {
-                let scan = Some(scan_choice(&store, schema, where_.pushdown.as_ref()));
+                // A LIMIT stops the read of rows no step after it reorders or counts
+                let stops = stmt.limit.is_some()
+                    && stmt.order_by.is_empty()
+                    && !stmt.distinct
+                    && !aggregated
+                    && !windowed;
+                let scan = Some(scan_choice(&store, schema, where_.pushdown.as_ref(), stops));
                 // A block reads columns of the row that the WHERE's own
                 // names do not show
                 if blocks.subqueries.is_empty() {
@@ -10906,7 +10912,7 @@ impl PreparedDml {
             .filter(|where_| where_.sets.is_empty() && where_.narrowing.is_none())
             .and_then(|where_| {
                 let store = executor.engine.get_version_store(&schema.table_name).ok()?;
-                Some(scan_choice(&store, schema, where_.pushdown.as_ref()))
+                Some(scan_choice(&store, schema, where_.pushdown.as_ref(), false))
             });
         Ok(Self {
             validity,
@@ -11468,7 +11474,8 @@ impl JoinBlocks {
                 // As a statement over the table plans its scan
                 if blockless {
                     if let Ok(store) = executor.engine.get_version_store(&schema.table_name) {
-                        side_scans[i] = Some(scan_choice(&store, schema, where_.pushdown.as_ref()));
+                        side_scans[i] =
+                            Some(scan_choice(&store, schema, where_.pushdown.as_ref(), false));
                     }
                 }
                 side_wheres[i] = Some(where_);
@@ -11910,7 +11917,7 @@ impl Executor {
                         .engine
                         .get_version_store(name)
                         .ok()
-                        .map(|store| scan_choice(&store, table.schema(), both.as_ref()));
+                        .map(|store| scan_choice(&store, table.schema(), both.as_ref(), false));
                     with_extra.as_ref()
                 }
                 (chosen, _) => chosen.as_ref(),
@@ -12280,7 +12287,7 @@ impl<'a> DmlRunner<'a> {
     /// None when it was decided over another store than the one `target`
     /// reads, or not decided, which leaves it to the run
     pub(crate) fn access(&self, target: &dyn Table) -> Option<ScanAccess<'a>> {
-        self.prepared.scan.as_ref()?.access(target)
+        self.prepared.scan.as_ref()?.access(target, false)
     }
 
     /// The scan of `table` that takes the whole WHERE, found without reading
@@ -16420,6 +16427,10 @@ impl<'a> PreparedRunner<'a> {
                             )?,
                         };
                         KeyReadPath::RowIds.taken();
+                        #[cfg(feature = "test-failpoints")]
+                        crate::test_failpoints::scan_access_taken(&ScanAccess::Index(
+                            &crate::storage::mvcc::index_plan::IndexPlan::Key,
+                        ));
                         break 'read (Some(rows.into_iter()), None, true, false);
                     }
                     // An index reads the values a failed slot does not have
@@ -16439,7 +16450,7 @@ impl<'a> PreparedRunner<'a> {
                     // widened row is read below, where its id is in hand
                     let limited = target.filter(|_| scanned_whole && !where_.widen);
                     let decided;
-                    let access = match scan.and_then(|scan| scan.access(table)) {
+                    let access = match scan.and_then(|scan| scan.access(table, limited.is_some())) {
                         Some(access) => access,
                         None => {
                             decided = filter.and_then(|filter| match limited {

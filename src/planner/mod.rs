@@ -538,6 +538,10 @@ pub enum ScanChoice {
     Seq,
     /// The rows the indexes of `store` give for the conjuncts
     Index(IndexPlan, Weak<VersionStore>),
+    /// A WHERE of one OR that an index reads only some operands of: a read
+    /// that stops at a count of rows takes the indexed ones first, any
+    /// other read every row
+    Limited(IndexPlan, Weak<VersionStore>),
 }
 
 /// The column of `schema` a DISTINCT statement reads the distinct values of
@@ -576,26 +580,38 @@ pub(crate) fn distinct_values_column(
 }
 
 /// The scan for `pushed`, the conjuncts a scan takes of a WHERE, over a
-/// table of `schema` whose indexes `store` holds
+/// table of `schema` whose indexes `store` holds; one that a LIMIT may stop
+/// when `limited`
 pub fn scan_choice(
     store: &std::sync::Arc<VersionStore>,
     schema: &Schema,
     pushed: Option<&Expression>,
+    limited: bool,
 ) -> ScanChoice {
-    match pushed.and_then(|pushed| index_plan::decide(store, schema, pushed, false)) {
-        Some(plan) => ScanChoice::Index(plan, std::sync::Arc::downgrade(store)),
+    let Some(pushed) = pushed else {
+        return ScanChoice::Seq;
+    };
+    let held = std::sync::Arc::downgrade(store);
+    if let Some(plan) = index_plan::decide(store, schema, pushed, false) {
+        return ScanChoice::Index(plan, held);
+    }
+    match index_plan::decide(store, schema, pushed, true).filter(|_| limited) {
+        Some(plan) => ScanChoice::Limited(plan, held),
         None => ScanChoice::Seq,
     }
 }
 
 impl ScanChoice {
-    /// The access a scan of `table` reads by; None when the indexes were
-    /// chosen over another store than the one `table` reads, which leaves
-    /// the choice to the run
-    pub(crate) fn access(&self, table: &dyn Table) -> Option<ScanAccess<'_>> {
+    /// The access a scan of `table` reads by, one that stops at a count of
+    /// rows when `limited`; None when the indexes were chosen over another
+    /// store than the one `table` reads, which leaves the choice to the run
+    pub(crate) fn access(&self, table: &dyn Table, limited: bool) -> Option<ScanAccess<'_>> {
         match self {
             Self::Seq => Some(ScanAccess::Seq),
-            Self::Index(plan, store) => table.reads_store(store).then_some(ScanAccess::Index(plan)),
+            Self::Limited(_, _) if !limited => Some(ScanAccess::Seq),
+            Self::Index(plan, store) | Self::Limited(plan, store) => {
+                table.reads_store(store).then_some(ScanAccess::Index(plan))
+            }
         }
     }
 
@@ -604,11 +620,15 @@ impl ScanChoice {
     pub fn explain(&self, table: &str, pushed: Option<&Expression>) -> Vec<String> {
         let mut lines = vec![match (self, pushed) {
             (Self::Index(..), Some(pushed)) => format!("IndexScan {table} {pushed}"),
+            (Self::Limited(..), Some(pushed)) => format!("IndexScan {table} {pushed} to a LIMIT"),
             (_, Some(pushed)) => format!("SeqScan {table} {pushed}"),
             (_, None) => format!("SeqScan {table}"),
         }];
-        if let Self::Index(plan, _) = self {
+        if let Self::Index(plan, _) | Self::Limited(plan, _) = self {
             lines.extend(plan.explain().into_iter().map(|read| format!("  {read}")));
+        }
+        if let (Self::Limited(..), Some(pushed)) = (self, pushed) {
+            lines.push(format!("else SeqScan {table} {pushed}"));
         }
         lines
     }
