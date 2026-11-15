@@ -291,9 +291,16 @@ pub struct NestedPlan {
     /// Set once the statement passed `statement_form_error`; a failure
     /// is checked again, as the registry may gain an aggregate
     checked: std::sync::OnceLock<()>,
+    /// The statement's classification, for a caller that holds none
+    classification: std::sync::OnceLock<Arc<QueryClassification>>,
 }
 
 impl NestedPlan {
+    /// The statement's classification, made when it first runs
+    pub(crate) fn classification(&self) -> &std::sync::OnceLock<Arc<QueryClassification>> {
+        &self.classification
+    }
+
     /// The compiled state of this statement itself
     pub fn slot(&self) -> &RwLock<CompiledExecution> {
         &self.plan

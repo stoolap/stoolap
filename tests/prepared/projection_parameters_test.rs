@@ -102,6 +102,55 @@ fn a_positional_parameter_reads_in_every_projection() {
 }
 
 #[test]
+fn a_prepared_aggregate_projection_reads_each_runs_parameter() {
+    let db = open("prepared_aggregate");
+    let mut wrong = Vec::new();
+    for (sql, at, runs) in [
+        (
+            "SELECT g, COUNT(*) + $1 FROM t GROUP BY g ORDER BY g",
+            1,
+            [
+                (100, vec!["Some(Integer(102))", "Some(Integer(101))"]),
+                (7, vec!["Some(Integer(9))", "Some(Integer(8))"]),
+            ],
+        ),
+        (
+            "SELECT CASE WHEN SUM(v) > $1 THEN 'big' ELSE 'small' END FROM t GROUP BY g ORDER BY g",
+            0,
+            [
+                (25, vec!["Some(Text(\"big\"))", "Some(Text(\"big\"))"]),
+                (40, vec!["Some(Text(\"small\"))", "Some(Text(\"small\"))"]),
+            ],
+        ),
+        (
+            "SELECT SUM(v) + $1 FROM t WHERE g = 1",
+            0,
+            [
+                (100, vec!["Some(Integer(130))"]),
+                (7, vec!["Some(Integer(37))"]),
+            ],
+        ),
+        (
+            "SELECT COUNT(*) + $1 FROM (SELECT v FROM t WHERE v > 15) s",
+            0,
+            [
+                (100, vec!["Some(Integer(102))"]),
+                (7, vec!["Some(Integer(9))"]),
+            ],
+        ),
+    ] {
+        let query = db.prepare(sql).unwrap();
+        for (param, expected) in runs {
+            let seen = column(query.query((param,)).unwrap(), at);
+            if seen != expected {
+                wrong.push(format!("{sql} with {param}: {seen:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
 fn a_named_parameter_reads_in_a_streamed_projection() {
     let db = open("named");
     let seen = column(
