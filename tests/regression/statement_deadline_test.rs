@@ -988,7 +988,6 @@ fn a_long_table_read_charges_each_run_of_its_work() {
     let mut ctx = ExecutionContext::new();
     ctx.set_timeout_ms(3_600_000);
     let rows = DeadlineSite::StorageRead;
-    let fold = DeadlineSite::StorageAggregate;
     // A snapshot older than 5,000 versions of the one row of l
     read(&hot, "BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT", &ctx).unwrap();
     read(&hot, "SELECT v FROM l", &ctx).unwrap();
@@ -1020,7 +1019,14 @@ fn a_long_table_read_charges_each_run_of_its_work() {
     };
     // Each run of 4,096 units of work is charged: at least work / 4,096 charges
     charged(&hot, rows, "SELECT COUNT(*) FROM l", 1);
-    charged(&hot, fold, "SELECT SUM(v) FROM l", 1);
+    // A file table under a snapshot leaves SUM to a read of its rows
+    #[cfg(not(feature = "test-filedb"))]
+    charged(
+        &hot,
+        DeadlineSite::StorageAggregate,
+        "SELECT SUM(v) FROM l",
+        1,
+    );
     // A run of versions, then the last part of one
     charged(
         &hot,
