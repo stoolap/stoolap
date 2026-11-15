@@ -262,6 +262,8 @@ impl Executor {
         if aggregations.is_empty() {
             let column = &table.schema().columns[group_index].name_lower;
             let values = table.get_partition_values(column, deadline)?;
+            // A read whose last charge read no clock is checked once more
+            deadline.check()?;
             return Ok(values.map(|values| {
                 (0i64..)
                     .zip(values)

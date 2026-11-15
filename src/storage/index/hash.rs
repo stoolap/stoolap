@@ -45,6 +45,7 @@ use std::sync::Arc;
 use rustc_hash::FxHashMap;
 
 use super::id_list::IdList;
+use crate::common::deadline::{Deadline, DeadlineSite, CHARGE_BEAT};
 use crate::common::{CompactArc, I64Map};
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::{ComparisonExpr, Expression, InListExpr};
@@ -682,13 +683,19 @@ impl Index for HashIndex {
         results
     }
 
-    fn get_all_values(&self) -> Option<Vec<Value>> {
+    fn get_all_values(&self, deadline: Deadline) -> Result<Option<Vec<Value>>> {
         if self.closed.load(AtomicOrdering::Acquire) {
-            return None;
+            return Ok(None);
         }
         let hash_to_values = self.hash_to_values.read();
         let mut result = Vec::with_capacity(hash_to_values.len());
+        let mut unpaid = 0;
         for entries in hash_to_values.values() {
+            unpaid += entries.len();
+            if unpaid >= CHARGE_BEAT {
+                deadline.charge(DeadlineSite::StorageRead, unpaid)?;
+                unpaid = 0;
+            }
             for (values, _row_ids) in entries {
                 // For single-column index, return the value directly
                 if values.len() == 1 {
@@ -696,7 +703,8 @@ impl Index for HashIndex {
                 }
             }
         }
-        Some(result)
+        deadline.charge(DeadlineSite::StorageRead, unpaid)?;
+        Ok(Some(result))
     }
 
     fn get_distinct_count_excluding_null(&self) -> Option<usize> {

@@ -5214,7 +5214,7 @@ impl Table for MVCCTable {
         }
 
         // Fallback path: Get all values and sort (for non-B-tree indexes)
-        let Some(all_values) = index.get_all_values() else {
+        let Some(all_values) = index.get_all_values(deadline)? else {
             return Ok(None);
         };
         #[cfg(feature = "test-failpoints")]
@@ -5423,7 +5423,7 @@ impl Table for MVCCTable {
         };
 
         // Get all unique values from the index (partition keys)
-        let Some(all_values) = index.get_all_values() else {
+        let Some(all_values) = index.get_all_values(deadline)? else {
             return Ok(None);
         };
         if all_values.is_empty() {
@@ -5479,12 +5479,7 @@ impl Table for MVCCTable {
             let Some(index) = self.version_store.get_index_by_column(column_name) else {
                 return Ok(None);
             };
-            let values = index.get_all_values();
-            // The index hands its keys over in one call
-            deadline.charge(
-                DeadlineSite::StorageRead,
-                values.as_ref().map_or(0, Vec::len),
-            )?;
+            let values = index.get_all_values(deadline)?;
             if self.index_view_epoch() == Some(epoch) {
                 return Ok(values);
             }

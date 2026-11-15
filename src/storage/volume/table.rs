@@ -1448,7 +1448,7 @@ impl SegmentedTable {
     ) -> Result<()> {
         let vol = &cs.volume;
         let rows = vol.meta.row_count;
-        let shown = self.shown_rows(cs, tombstones, hot_skip, cut)?;
+        let shown = self.shown_rows(cs, tombstones, hot_skip, cut, deadline)?;
         let positions = ShownPositions {
             bits: shown.as_deref(),
             rows,
@@ -1470,7 +1470,10 @@ impl SegmentedTable {
         };
         if shown.is_none() {
             if let Some(dictionary) = vol.get_column_dictionary(phys)? {
-                distinct.extend(dictionary.iter().map(|text| Value::Text(text.clone())));
+                for texts in dictionary.chunks(CHARGE_BEAT) {
+                    deadline.charge(DeadlineSite::StorageRead, texts.len())?;
+                    distinct.extend(texts.iter().map(|text| Value::Text(text.clone())));
+                }
                 let zone = vol.meta.zone_maps.get(phys);
                 if with_null && zone.is_some_and(|zone| zone.null_count > 0) {
                     distinct.insert(Value::null(data_type));
@@ -1480,7 +1483,7 @@ impl SegmentedTable {
         }
         if let Some(def) = side {
             let column = (phys, data_type, with_null);
-            if Self::side_distinct(cs, def, shown.as_deref(), column, distinct)? {
+            if Self::side_distinct(cs, def, shown.as_deref(), column, distinct, deadline)? {
                 return Ok(());
             }
         }
@@ -1538,8 +1541,17 @@ impl SegmentedTable {
         shown: Option<&[u64]>,
         (phys, data_type, with_null): (usize, DataType, bool),
         distinct: &mut ValueSet,
+        deadline: Deadline,
     ) -> Result<bool> {
         use super::secondary::{is_refused, READS};
+        let mut stopped = None;
+        let mut paid = |units: usize| match deadline.charge(DeadlineSite::StorageRead, units) {
+            Ok(()) => true,
+            Err(error) => {
+                stopped = Some(error);
+                false
+            }
+        };
         let Some(side) = cs.side_for(def, Capability::Range) else {
             return Ok(false);
         };
@@ -1571,7 +1583,13 @@ impl SegmentedTable {
             None => {
                 distinct.reserve(entry.n_keys as usize);
                 reader
-                    .each_key_page(|keys| distinct.extend(keys.iter().map(|&key| value(key))))
+                    .each_key_page(|keys| {
+                        let more = paid(keys.len());
+                        if more {
+                            distinct.extend(keys.iter().map(|&key| value(key)));
+                        }
+                        more
+                    })
                     .map_err(side_error)?;
                 zone.null_count > 0
             }
@@ -1583,9 +1601,13 @@ impl SegmentedTable {
                 };
                 distinct.reserve(rows.min(entry.n_keys) as usize);
                 // A refusal comes before any key, so the scan still answers
-                let keyed = match reader.each_shown_key(shown, |key| {
-                    distinct.insert(value(key));
-                }) {
+                let keyed = match reader.each_shown_key(
+                    shown,
+                    |key| {
+                        distinct.insert(value(key));
+                    },
+                    |positions| paid(positions as usize),
+                ) {
                     Ok(keyed) => keyed,
                     Err(error) if is_refused(&error) => {
                         READS.count(&READS.refused, 1);
@@ -1597,6 +1619,9 @@ impl SegmentedTable {
                 zone.null_count > 0 && rows > keyed
             }
         };
+        if let Some(error) = stopped {
+            return Err(error);
+        }
         if with_null && null {
             distinct.insert(Value::null(data_type));
         }
@@ -1612,6 +1637,7 @@ impl SegmentedTable {
         tombstones: &FxHashMap<i64, u64>,
         hot_skip: &FxHashSet<i64>,
         cut: &CommitCut,
+        deadline: Deadline,
     ) -> Result<Option<Vec<u64>>> {
         let vol = &cs.volume;
         let rows = vol.meta.row_count;
@@ -1629,7 +1655,13 @@ impl SegmentedTable {
             cleared = true;
         };
         if hidden <= rows {
+            let mut unpaid = 0;
             for (&id, &seq) in tombstones.iter() {
+                unpaid += 1;
+                if unpaid == CHARGE_BEAT {
+                    unpaid = 0;
+                    deadline.charge(DeadlineSite::StorageRead, CHARGE_BEAT)?;
+                }
                 if let Some(i) = vol
                     .locate(id)
                     .filter(|_| self.is_tombstone_visible(seq, cut))
@@ -1637,15 +1669,24 @@ impl SegmentedTable {
                     hide(i);
                 }
             }
-            hot_skip
-                .iter()
-                .filter_map(|&id| vol.locate(id))
-                .for_each(&mut hide);
+            for &id in hot_skip.iter() {
+                unpaid += 1;
+                if unpaid == CHARGE_BEAT {
+                    unpaid = 0;
+                    deadline.charge(DeadlineSite::StorageRead, CHARGE_BEAT)?;
+                }
+                if let Some(i) = vol.locate(id) {
+                    hide(i);
+                }
+            }
         } else {
             let row_ids = vol.row_ids()?;
-            for (i, id) in row_ids.iter().enumerate() {
-                if hot_skip.contains(id) || self.is_row_tombstoned(tombstones, *id, cut) {
-                    hide(i);
+            for (run, ids) in row_ids.chunks(CHARGE_BEAT).enumerate() {
+                deadline.charge(DeadlineSite::StorageRead, ids.len())?;
+                for (at, id) in ids.iter().enumerate() {
+                    if hot_skip.contains(id) || self.is_row_tombstoned(tombstones, *id, cut) {
+                        hide(run * CHARGE_BEAT + at);
+                    }
                 }
             }
         }
@@ -7752,8 +7793,10 @@ impl Table for SegmentedTable {
                 known: as_scanned.as_deref().unwrap_or_default(),
                 reader: None,
             };
-            let rows =
-                keep.into_rows(offset, |slot, position, row| kept.fill(slot, position, row))?;
+            let rows = keep.into_rows(offset, |slot, position, row| {
+                deadline.charge(DeadlineSite::StorageRead, 1)?;
+                kept.fill(slot, position, row)
+            })?;
             Ok(Some(Some(rows)))
         })
     }

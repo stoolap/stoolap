@@ -2365,13 +2365,13 @@ impl VersionStore {
         let mut rows = RowVec::new();
         let mut unpaid = 0;
         for (&row_id, head) in versions.iter() {
-            unpaid += 1;
-            if unpaid == CHARGE_BEAT {
-                unpaid = 0;
-                deadline.charge(DeadlineSite::StorageRead, CHARGE_BEAT)?;
-            }
             let mut current = Some(head);
             while let Some(entry) = current {
+                unpaid += 1;
+                if unpaid == CHARGE_BEAT {
+                    unpaid = 0;
+                    deadline.charge(DeadlineSite::StorageRead, CHARGE_BEAT)?;
+                }
                 if self.point_sees(point, &entry.version)? {
                     if let Some(authority) = authority.as_deref_mut() {
                         authority.insert(row_id);
@@ -3844,6 +3844,11 @@ impl VersionStore {
             // SLOW PATH: HEAD not visible - traverse chain for older versions
             let mut current: Option<&VersionChainEntry> = chain.prev.as_ref().map(|b| b.as_ref());
             while let Some(e) = current {
+                unpaid += 1;
+                if unpaid == CHARGE_BEAT {
+                    unpaid = 0;
+                    deadline.charge(DeadlineSite::StorageRead, CHARGE_BEAT)?;
+                }
                 let version_txn_id = e.version.txn_id;
                 let deleted_at_txn_id = e.version.deleted_at_txn_id;
 
@@ -5191,10 +5196,11 @@ impl VersionStore {
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
 
-        // Helper to find visible version and get row data
-        let find_visible_row = |chain: &VersionChainEntry| -> Option<Row> {
+        // Helper to find visible version and get row data, counting the versions it reads
+        let find_visible_row = |chain: &VersionChainEntry, read: &mut usize| -> Option<Row> {
             let mut current: Option<&VersionChainEntry> = Some(chain);
             while let Some(e) = current {
+                *read += 1;
                 let version_txn_id = e.version.txn_id;
                 let deleted_at_txn_id = e.version.deleted_at_txn_id;
 
@@ -5229,12 +5235,12 @@ impl VersionStore {
         if ascending {
             for (&row_id, chain) in versions.range((start_bound, std::ops::Bound::Unbounded::<i64>))
             {
-                unpaid += 1;
-                if unpaid == CHARGE_BEAT {
+                let found = find_visible_row(chain, &mut unpaid);
+                if unpaid >= CHARGE_BEAT {
+                    deadline.charge(DeadlineSite::StorageRead, unpaid)?;
                     unpaid = 0;
-                    deadline.charge(DeadlineSite::StorageRead, CHARGE_BEAT)?;
                 }
-                if let Some(row_data) = find_visible_row(chain) {
+                if let Some(row_data) = found {
                     result.push((row_id, row_data));
                     if result.len() >= limit {
                         break;
@@ -5246,12 +5252,12 @@ impl VersionStore {
             for (&row_id, chain) in
                 versions.range_rev((start_bound, std::ops::Bound::Unbounded::<i64>))
             {
-                unpaid += 1;
-                if unpaid == CHARGE_BEAT {
+                let found = find_visible_row(chain, &mut unpaid);
+                if unpaid >= CHARGE_BEAT {
+                    deadline.charge(DeadlineSite::StorageRead, unpaid)?;
                     unpaid = 0;
-                    deadline.charge(DeadlineSite::StorageRead, CHARGE_BEAT)?;
                 }
-                if let Some(row_data) = find_visible_row(chain) {
+                if let Some(row_data) = found {
                     result.push((row_id, row_data));
                     if result.len() >= limit {
                         break;
@@ -7476,13 +7482,13 @@ impl VersionStore {
         let (mut last_txn_id, mut last_visible) = (0i64, false);
         let mut unpaid = 0;
         for chain in versions.values() {
-            unpaid += 1;
-            if unpaid == CHARGE_BEAT {
-                unpaid = 0;
-                deadline.charge(DeadlineSite::StorageAggregate, CHARGE_BEAT)?;
-            }
             let mut current: Option<&VersionChainEntry> = Some(chain);
             while let Some(e) = current {
+                unpaid += 1;
+                if unpaid == CHARGE_BEAT {
+                    unpaid = 0;
+                    deadline.charge(DeadlineSite::StorageAggregate, CHARGE_BEAT)?;
+                }
                 if e.version.txn_id != last_txn_id {
                     last_txn_id = e.version.txn_id;
                     last_visible = checker.is_visible(last_txn_id, txn_id);

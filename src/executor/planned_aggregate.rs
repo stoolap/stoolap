@@ -325,6 +325,8 @@ impl Executor {
                 None => return Ok(None),
             }
         }
+        // A read whose last charge read no clock is checked once more
+        deadline.check()?;
         Ok(Some(values))
     }
 

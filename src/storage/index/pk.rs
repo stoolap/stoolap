@@ -31,6 +31,7 @@ use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::common::deadline::{Deadline, DeadlineSite, CHARGE_BEAT};
 use crate::common::{I64Map, I64Set};
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
@@ -719,21 +720,33 @@ impl Index for PkIndex {
         }
     }
 
-    fn get_all_values(&self) -> Option<Vec<Value>> {
+    fn get_all_values(&self, deadline: Deadline) -> Result<Option<Vec<Value>>> {
         let inner = self.data.read();
         let mut result = Vec::with_capacity(inner.count);
+        let mut stopped = None;
         for_each_set_bit(&inner.words, |rid| {
             result.push(Value::Integer(rid));
+            if result.len() % CHARGE_BEAT == 0 {
+                if let Err(error) = deadline.charge(DeadlineSite::StorageRead, CHARGE_BEAT) {
+                    stopped = Some(error);
+                    return false;
+                }
+            }
             true
         });
+        if let Some(error) = stopped {
+            return Err(error);
+        }
+        deadline.charge(DeadlineSite::StorageRead, result.len() % CHARGE_BEAT)?;
         if !inner.overflow_empty() {
             let mut overflow_ids: Vec<i64> = inner.overflow.iter().collect();
             overflow_ids.sort_unstable();
-            for id in overflow_ids {
-                result.push(Value::Integer(id));
+            for ids in overflow_ids.chunks(CHARGE_BEAT) {
+                deadline.charge(DeadlineSite::StorageRead, ids.len())?;
+                result.extend(ids.iter().map(|&id| Value::Integer(id)));
             }
         }
-        Some(result)
+        Ok(Some(result))
     }
 
     fn get_distinct_count_excluding_null(&self) -> Option<usize> {

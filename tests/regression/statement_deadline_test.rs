@@ -877,6 +877,7 @@ fn a_table_read_that_took_no_deadline_stops_at_it() {
             "SELECT COUNT(DISTINCT t) FROM s",
         ),
         (&cold, Before::Nothing, rows, "SELECT DISTINCT t FROM s"),
+        (&hot, Before::Nothing, rows, "SELECT g FROM h GROUP BY g"),
         (&hot, Before::Nothing, fold, "SELECT SUM(v) FROM h"),
         (&hot, Before::Nothing, fold, "SELECT MIN(v) FROM h"),
         (&hot, Before::Nothing, fold, "SELECT MAX(v) FROM h"),
@@ -929,10 +930,129 @@ fn a_table_read_that_took_no_deadline_stops_at_it() {
         pass_deadline_at(site);
         let stopped = read(executor, sql, &ctx);
         keep_deadlines();
-        read(executor, "ROLLBACK", &ctx).unwrap();
         if !matches!(stopped, Err(Error::QueryCancelled)) {
             wrong.push(format!("{sql} gave {stopped:?}"));
         }
+        // A read is checked once more after its last charge
+        if site != DeadlineSite::StorageDelete {
+            count_deadline_charges(site);
+            let counted = read(executor, sql, &ctx);
+            let charges = deadline_charges();
+            pass_deadline_after(site, charges);
+            let ended = read(executor, sql, &ctx);
+            keep_deadlines();
+            if counted.is_err() || charges == 0 || !matches!(ended, Err(Error::QueryCancelled)) {
+                wrong.push(format!(
+                    "{sql} counted {counted:?} in {charges} charges, past them gave {ended:?}"
+                ));
+            }
+        }
+        read(executor, "ROLLBACK", &ctx).unwrap();
     }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn a_long_table_read_charges_each_run_of_its_work() {
+    let _guard = FailpointGuard::new();
+    let db = Database::open("memory://statement_deadline_long_reads").unwrap();
+    for sql in [
+        "CREATE TABLE h (id INTEGER PRIMARY KEY, g INTEGER, x INTEGER, b INTEGER)",
+        "INSERT INTO h SELECT value, value, value, value FROM generate_series(1, 20000)",
+        "CREATE INDEX h_g ON h (g)",
+        "CREATE INDEX h_x ON h (x) USING HASH",
+        "CREATE INDEX h_b ON h (b) USING BITMAP",
+        "CREATE TABLE l (id INTEGER PRIMARY KEY, v INTEGER)",
+        "INSERT INTO l VALUES (1, 0)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!(
+        "file://{}?checkpoint_interval=3600&compact_threshold=1000",
+        dir.path().display()
+    );
+    let sealed = Database::open(&dsn).unwrap();
+    for sql in [
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, n INTEGER, t TEXT, p TEXT)",
+        "CREATE INDEX s_n ON s (n)",
+        "CREATE INDEX s_t ON s (t)",
+        "INSERT INTO s SELECT value, value, 't' || (value % 30000), 'p' || value \
+         FROM generate_series(1, 140000)",
+    ] {
+        sealed.execute(sql, ()).unwrap();
+    }
+    sealed.engine().seal_for_test().unwrap();
+    let hot = Executor::new(std::sync::Arc::clone(db.engine()));
+    let cold = Executor::new(std::sync::Arc::clone(sealed.engine()));
+    let mut ctx = ExecutionContext::new();
+    ctx.set_timeout_ms(3_600_000);
+    let rows = DeadlineSite::StorageRead;
+    let fold = DeadlineSite::StorageAggregate;
+    // A snapshot older than 5,000 versions of the one row of l
+    read(&hot, "BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT", &ctx).unwrap();
+    read(&hot, "SELECT v FROM l", &ctx).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    let before = db
+        .query("SELECT CAST(NOW() AS TEXT)", ())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .get::<String>(0)
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    for _ in 0..5000 {
+        db.execute("UPDATE l SET v = v + 1", ()).unwrap();
+    }
+    let as_of = format!("SELECT v FROM l AS OF TIMESTAMP '{before}'");
+    let mut wrong = Vec::new();
+    let mut charged = |executor: &Executor, site: DeadlineSite, sql: &str, least: usize| {
+        count_deadline_charges(site);
+        let counted = read(executor, sql, &ctx);
+        let charges = deadline_charges();
+        keep_deadlines();
+        if counted.is_err() || charges < least {
+            wrong.push(format!(
+                "{sql} gave {counted:?} in {charges} charges, under {least}"
+            ));
+        }
+    };
+    // Each run of 4,096 units of work is charged: at least work / 4,096 charges
+    charged(&hot, rows, "SELECT COUNT(*) FROM l", 1);
+    charged(&hot, fold, "SELECT SUM(v) FROM l", 1);
+    // A run of versions, then the last part of one
+    charged(
+        &hot,
+        rows,
+        "SELECT * FROM l WHERE id > 0 ORDER BY id LIMIT 1",
+        2,
+    );
+    read(&hot, "ROLLBACK", &ctx).unwrap();
+    charged(&hot, rows, &as_of, 1);
+    charged(&hot, rows, "SELECT DISTINCT g FROM h", 4);
+    charged(&hot, rows, "SELECT DISTINCT x FROM h", 4);
+    charged(&hot, rows, "SELECT DISTINCT b FROM h", 4);
+    charged(&hot, rows, "SELECT DISTINCT id FROM h", 4);
+    charged(&cold, rows, "SELECT DISTINCT t FROM s", 7);
+    charged(&cold, rows, "SELECT DISTINCT n FROM s", 34);
+    charged(
+        &cold,
+        rows,
+        "SELECT p FROM s WHERE n >= 0 ORDER BY n LIMIT 20000",
+        20000,
+    );
+    // A deleted row is hidden by its tombstone and by its hot delete: 120,000
+    // hidden ids located one by one, then 80,000 shown positions read
+    sealed
+        .execute("DELETE FROM s WHERE id <= 60000", ())
+        .unwrap();
+    charged(&cold, rows, "SELECT DISTINCT n FROM s", 34);
+    charged(&cold, rows, "SELECT DISTINCT t FROM s", 29 + 19);
+    // More hidden ids than rows: each of the 140,000 row ids is looked up
+    sealed
+        .execute("DELETE FROM s WHERE id <= 100000", ())
+        .unwrap();
+    charged(&cold, rows, "SELECT DISTINCT t FROM s", 34 + 9);
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }

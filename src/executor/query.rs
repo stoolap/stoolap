@@ -3192,6 +3192,8 @@ impl Executor {
         deadline: crate::common::deadline::Deadline,
     ) -> Result<Option<Vec<Value>>> {
         let values = table.get_partition_values(column, deadline)?;
+        // A read whose last charge read no clock is checked once more
+        deadline.check()?;
         if values.is_some() {
             super::result::DistinctPath::Values.taken();
         }

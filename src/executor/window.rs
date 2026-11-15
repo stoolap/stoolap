@@ -2232,6 +2232,8 @@ impl Executor {
                 Some(values) => values,
                 None => return Ok(None),
             };
+        // A read whose last charge read no clock is checked once more
+        ctx.check_deadline()?;
 
         // Process partitions one at a time, stopping when we have enough rows
         // Process partitions one at a time, stopping when we have enough

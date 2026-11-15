@@ -2348,27 +2348,30 @@ impl Reader {
         range_bytes_with(self, lower, upper)
     }
 
-    /// Hands each key page's keys to `each`, in key order
-    pub fn each_key_page(&self, mut each: impl FnMut(&[i64])) -> std::io::Result<()> {
+    /// Hands each key page's keys to `each`, in key order, until `each`
+    /// returns false
+    pub fn each_key_page(&self, mut each: impl FnMut(&[i64]) -> bool) -> std::io::Result<()> {
         for page in 0..column_of(self)?.key_pages.len() {
-            self.with_page(PageKind::Keys, page, |content| match content {
-                PageContent::Keys { keys, .. } => {
-                    each(keys);
-                    Ok(())
-                }
+            let more = self.with_page(PageKind::Keys, page, |content| match content {
+                PageContent::Keys { keys, .. } => Ok(each(keys)),
                 _ => Err(invalid("expected a key page")),
             })??;
+            if !more {
+                break;
+            }
         }
         Ok(())
     }
 
     /// Hands `each` every key with a position `shown` holds, in key order,
     /// and returns how many positions `shown` holds. The copy of a key page
-    /// is charged first: a refusal comes before any key
+    /// is charged first: a refusal comes before any key. `more` is asked
+    /// before each run of positions with its length; false stops the walk
     pub fn each_shown_key(
         &self,
         shown: impl Fn(u32) -> bool,
         mut each: impl FnMut(i64),
+        mut more: impl FnMut(u64) -> bool,
     ) -> std::io::Result<u64> {
         let col = column_of(self)?;
         let room = KEYS_PER_PAGE.min(col.n_keys as usize);
@@ -2409,6 +2412,9 @@ impl Reader {
                     .get(page + 1)
                     .map_or(col.n_positions, |p| p.pos_start)
                     .min(end);
+                if !more(stop - at) {
+                    return Ok(count);
+                }
                 self.with_page(PageKind::Positions, page, |content| {
                     let PageContent::Positions(positions) = content else {
                         return Err(invalid("expected a position page"));
@@ -6941,7 +6947,9 @@ mod tests {
         let reader = file.reader(1, 1).unwrap();
         INDEX_PAGES.set_budget_bytes(INDEX_PAGES.stats().charged_bytes as u64);
         let mut keys = 0;
-        let err = reader.each_shown_key(|_| true, |_| keys += 1).unwrap_err();
+        let err = reader
+            .each_shown_key(|_| true, |_| keys += 1, |_| true)
+            .unwrap_err();
         assert!(is_refused(&err), "{err}");
         assert_eq!(keys, 0, "a refused walk hands on no key");
         INDEX_PAGES.set_budget_bytes(DEFAULT_BUDGET_BYTES);
@@ -6954,6 +6962,7 @@ mod tests {
                     keys += 1;
                     least = least.min(INDEX_PAGES.stats().charged_bytes);
                 },
+                |_| true,
             )
             .unwrap();
         assert_eq!((shown, keys), (100_000, 20_000), "the even keys' positions");

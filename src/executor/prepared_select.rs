@@ -15969,7 +15969,11 @@ impl<'a> PreparedRunner<'a> {
             OrderedRead::Keyset => match keyset_start(table.schema(), storage_expr.as_deref()) {
                 Some(Some(start)) => {
                     let deadline = ctx.deadline_of_call();
-                    table.collect_rows_pk_keyset(None, Some(start), true, limit, deadline)?
+                    let rows =
+                        table.collect_rows_pk_keyset(None, Some(start), true, limit, deadline)?;
+                    // A read whose last charge read no clock is checked once more
+                    ctx.check_deadline()?;
+                    rows
                 }
                 Some(None) => Some(RowVec::new()),
                 None => None,
