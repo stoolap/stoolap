@@ -15,15 +15,16 @@
 //! # Stoolap - High-performance embedded SQL database
 //!
 //! Stoolap is a modern embedded SQL database written in pure Rust. It provides
-//! full ACID transactions with MVCC, a sophisticated cost-based query optimizer,
-//! and features that rival established databases like PostgreSQL and DuckDB.
+//! full ACID transactions with MVCC, a row store for recent writes beside
+//! compressed columnar volumes, and a planner that picks indexes and join
+//! order from row estimates.
 //!
 //! ## Key Features
 //!
 //! - **MVCC Transactions** - Full multi-version concurrency control with snapshot isolation
 //! - **Multiple Index Types** - B-tree, Hash, and Bitmap indexes (auto-selected by data type)
 //! - **Multi-Column Indexes** - Composite indexes for complex query patterns
-//! - **Cost-Based Optimizer** - PostgreSQL-style optimizer with adaptive execution
+//! - **Estimate-Driven Planning** - Index choice and INNER join order from per-index row estimates
 //! - **Parallel Query Execution** - Automatic parallelization using Rayon
 //! - **Semantic Query Caching** - Intelligent result caching with predicate subsumption
 //! - **AS OF Temporal Queries** - Built-in time-travel queries
@@ -60,7 +61,6 @@
 //! - [`parser`] - SQL parser
 //! - [`functions`] - 101+ SQL functions (scalar, aggregate, window)
 //! - [`executor`] - Query executor with parallel execution
-//! - [`optimizer`] - Expression simplification and join bloom filters
 //! - [`common`] - Utilities (I64Map, version)
 
 // stoolap-jemalloc as the global allocator, on by default, without its
@@ -82,9 +82,9 @@ pub mod core;
 pub mod executor;
 pub mod functions;
 mod heap_profile;
-pub mod optimizer;
+pub(crate) mod optimizer;
 pub mod parser;
-pub mod planner;
+pub(crate) mod planner;
 pub mod storage;
 
 #[cfg(target_arch = "wasm32")]
