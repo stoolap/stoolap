@@ -67,6 +67,26 @@ impl Executor {
 
         // Use inlined statement if available, otherwise original
         let explain_stmt = inlined_statement.as_ref().unwrap_or(&stmt.statement);
+        // A run of INNER joins is explained in the order it runs in
+        let ordered = match &**explain_stmt {
+            Statement::Select(select) => self.reorder_joins(select, CteNames::Context(ctx)),
+            _ => None,
+        };
+        let ordered_statement =
+            (ordered.as_ref()).map(|o| Box::new(Statement::Select(o.stmt.clone())));
+        let explain_stmt = ordered_statement.as_ref().unwrap_or(explain_stmt);
+        let note_order = |lines: &mut Vec<String>| {
+            let Some(order) = &ordered else {
+                return;
+            };
+            let at = lines.iter().position(|line| line.starts_with("SELECT"));
+            let line = format!(
+                "  Join order: {} (written {})",
+                order.chosen.join(", "),
+                order.written.join(", ")
+            );
+            lines.insert(at.map_or(0, |at| at + 1), line);
+        };
 
         if stmt.analyze {
             // EXPLAIN ANALYZE: Execute the query and collect statistics
@@ -136,6 +156,7 @@ impl Executor {
             if let Some(ran) = ran {
                 plan_lines.extend(explain_held_blocks(ran, 1));
             }
+            note_order(&mut plan_lines);
 
             // Return the plan as a result
             let columns = vec!["plan".to_string()];
@@ -163,6 +184,7 @@ impl Executor {
                 Some(lines) => plan_lines = lines,
                 None => self.explain_statement(explain_stmt, &mut plan_lines, 0),
             }
+            note_order(&mut plan_lines);
 
             // Return as a single-column result
             let columns = vec!["plan".to_string()];
@@ -916,13 +938,24 @@ impl Executor {
                     let filters = [left_where.as_ref(), right_where.as_ref()];
                     let shares = self.join_side_shares(None, sides, filters, &[]);
                     let rows = [0, 1].map(|i| self.estimate_side_rows(sides[i], shares[i]));
-                    let crossed = join.condition.is_none() && join.using_columns.is_empty();
-                    match rows.map(|rows| (rows != u64::MAX).then_some(rows)) {
-                        [Some(left), Some(right)] if crossed => Some(left.saturating_mul(right)),
-                        [Some(left), Some(right)] => Some(left.min(right)),
-                        [Some(rows), None] | [None, Some(rows)] if !crossed => Some(rows),
-                        _ => None,
+                    let [Some(left), Some(right)] =
+                        rows.map(|rows| (rows != u64::MAX).then_some(rows))
+                    else {
+                        return None;
+                    };
+                    if join.condition.is_none() && join.using_columns.is_empty() {
+                        return Some(left.saturating_mul(right));
                     }
+                    let kept = [left as f64, right as f64];
+                    let inner = self.equality_join_rows(join, kept)?;
+                    // An outer join keeps every row of its kept side
+                    let kept_side = match join.join_type.as_str() {
+                        "LEFT" => kept[0],
+                        "RIGHT" => kept[1],
+                        "FULL" => kept[0].max(kept[1]),
+                        _ => 0.0,
+                    };
+                    Some(inner.max(kept_side).ceil() as u64)
                 });
                 match estimated.flatten() {
                     Some(rows) => lines.push(format!(

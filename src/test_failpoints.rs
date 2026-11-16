@@ -3847,6 +3847,8 @@ pub(crate) fn group_column_decoded(col: usize, group: usize) {
 thread_local! {
     static SMALL_OUTER_JOINS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static JOIN_SIDE_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static JOIN_ORDERS_DECIDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static JOIN_ORDER_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static STREAMING_JOINS_STREAMED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static INDEX_JOIN_OUTER_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIMIT_HASH_LEFT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -3890,6 +3892,22 @@ pub fn small_outer_joins() -> usize {
 
 pub(crate) fn small_outer_joined() {
     SMALL_OUTER_JOINS.with(|n| n.set(n.get() + 1));
+}
+
+/// Join orders this thread decided, and runs it took in a reordered one, so far
+pub fn join_orders() -> (usize, usize) {
+    (
+        JOIN_ORDERS_DECIDED.with(std::cell::Cell::get),
+        JOIN_ORDER_RUNS.with(std::cell::Cell::get),
+    )
+}
+
+pub(crate) fn join_order_decided() {
+    JOIN_ORDERS_DECIDED.with(|n| n.set(n.get() + 1));
+}
+
+pub(crate) fn join_order_ran() {
+    JOIN_ORDER_RUNS.with(|n| n.set(n.get() + 1));
 }
 
 /// Sides this thread's two-table joins executed, so far

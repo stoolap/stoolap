@@ -9,7 +9,7 @@ order: 2
 
 Stoolap plans a statement once, when it is prepared, and the run reads that plan. The choices are made by rules over the statement's shape, the schema and the indexes. Where a choice depends on what only a run knows, such as a parameter's value or how many rows a side of a join holds, the plan names the possible reads and the run picks one; `EXPLAIN` prints them, the alternative after `else`.
 
-Stoolap does not have a cost-based optimizer yet: no choice below is made by comparing estimated costs, and the join order is the one the statement is written in. [Limitations](#limitations) lists what this means for queries.
+One choice is made by comparing estimated costs: the order of a run of three or more `INNER JOIN`s over tables, described in [Join Order](#join-order). The others are made by rules; [Limitations](#limitations) lists what this means for queries.
 
 ## Reading One Table
 
@@ -70,16 +70,28 @@ On sealed (cold) data, zone maps and per-column bloom filters skip row groups th
 
 Between a hash join and a nested loop, the run decides from the number of rows each side actually returned. For an outer join the hash table is built on the side whose rows may go unmatched (the right side of a `LEFT` or `FULL JOIN`, the left side of a `RIGHT JOIN`), so the kept side streams through it; for an inner join, on the smaller side.
 
-Tables are joined in the order the statement writes them. Writing the most selective table first can make a large difference:
+### Join Order
+
+Three or more tables joined by `INNER JOIN ... ON` are joined from the table estimated to keep the fewest rows under its own `WHERE` terms. Each next table is one an equality of the `ON` conditions reaches, the one whose step is estimated cheapest: a step that probes the next table's primary key or an index reads a key per row so far, any other step reads the table whole. The order is taken only when it is estimated to cost at most half of the written one; otherwise the tables are joined as written.
 
 ```sql
--- The filter on customers keeps few rows: reading customers first means
--- only those rows probe orders
-SELECT o.id, c.name
-FROM customers c
-JOIN orders o ON o.customer_id = c.id
-WHERE c.region = 'EU';
+-- Written with the selective table last, joined s, u, t: the two rows of s
+-- probe u's index on sid, and those rows probe t's primary key
+SELECT COUNT(*)
+FROM t
+JOIN u ON t.id = u.tid
+JOIN s ON u.sid = s.id
+WHERE s.x = 1;
 ```
+
+The order is decided when the statement first runs and kept until `ANALYZE` runs, an index or a table changes, or a table's rows grow or shrink about fourfold. The estimates read literals; a parameter counts as an unknown value. `EXPLAIN` prints the order taken beside the written one:
+
+```
+SELECT
+  Join order: s, u, t (written t, u, s)
+```
+
+The answer is the written statement's, columns and names included; without `ORDER BY` the rows may come in another order. The written order is kept for `SELECT *` and `t.*`, whose columns follow the tables' order, and for a run that holds an outer join, a `CROSS` or comma join, `USING` or `NATURAL`, a subquery, view, CTE or `AS OF` side, a window function, or a subquery anywhere in the statement. Tables joined by an outer join above an `INNER` run keep their places, and the run below may still be reordered.
 
 ## Statistics
 
@@ -106,7 +118,9 @@ Where a choice depends on how many rows a side of a join keeps under its own con
 
 `AND` multiplies the shares of its terms; `OR` adds them, less their overlap.
 
-Two choices read the estimates: a join under a small `LIMIT` that streams through a hash table builds that table on the side estimated smaller, and an `INNER JOIN` whose right side is estimated small beside its left one reads the right side first and probes the left table's index for each of its rows. `EXPLAIN` prints a join's estimate as `rows=`.
+An equality join of two sides is estimated to give the product of their rows over the larger of the two keys' distinct counts, and no more than one side's rows where the other side's key is a primary key or a unique index. A distinct count comes from the key's index while the table's rows are all in memory, else from `ANALYZE`; without either, the key is taken to hold a value per row.
+
+Three choices read the estimates: the [join order](#join-order), a join under a small `LIMIT` that streams through a hash table, which builds that table on the side estimated smaller, and an `INNER JOIN` whose right side is estimated small beside its left one, which reads the right side first and probes the left table's index for each of its rows. `EXPLAIN` prints a join's estimate as `rows=`.
 
 `EXPLAIN ANALYZE` leaves nothing behind: what one run found changes no later estimate.
 
@@ -187,7 +201,7 @@ SELECT (actual time=2.5ms, rows=1500)
 
 These choices are made by rule, not by estimated cost:
 
-- **Join order** is the written order. A selective table written last makes every earlier join read rows the filter later drops.
+- **Join order** is the written order outside a run of `INNER JOIN`s over tables (see [Join Order](#join-order)), and for every table of a `SELECT *`. There, a selective table written last makes every earlier join read rows the filter later drops.
 - **Index or scan**: an index is read even when the one holding the fewest rows holds most of the table's rows, where a scan would be cheaper on hot data.
 - **Ordered reads under LIMIT** walk the index even when the WHERE matches rows only far along it, where filtering first and sorting the few matches would be cheaper.
 
@@ -213,7 +227,7 @@ CREATE INDEX idx_orders_customer_date ON orders(customer_id, order_date);
 
 ### Write the Most Selective Table First
 
-Joins run in the written order, so put the table with the most selective filter first.
+Where the written order is kept (see [Limitations](#limitations)), put the table with the most selective filter first.
 
 ### Use EXPLAIN to Understand Plans
 

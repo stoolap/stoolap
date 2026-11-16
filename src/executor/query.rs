@@ -1855,6 +1855,13 @@ impl Executor {
         let volatile_ctx = self.read_volatile_counts(stmt, ctx)?;
         let ctx = volatile_ctx.as_ref().unwrap_or(ctx);
 
+        // A run of INNER joins runs in the order its plan decided
+        if let Some(ordered) = self.ordered_plan(stmt, ctx, compiled) {
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::join_order_ran();
+            return self.select_with_plan(&ordered.order.stmt, ctx, None, Some(&ordered.plan));
+        }
+
         // Check for CTEs (WITH clause). A statement with one keeps every
         // subquery for the aggregation entry, which runs with the CTEs bound
         // A statement of the prepared or grouped family keeps its plan: its

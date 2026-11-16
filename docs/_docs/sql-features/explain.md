@@ -816,7 +816,14 @@ A join printed in the general format carries the rows it is estimated to give:
 -> Hash Join (INNER Join) (rows=1)
 ```
 
-It is the fewer of the rows each table side is estimated to keep under its own conditions, or their product for a join without a condition. The estimate comes from the tables' indexes, their statistics or default shares, as [Row Estimates]({% link _docs/performance/query-optimizer.md %}#row-estimates) describes. A side that is not a table has no estimate: the join prints the other side's, or none when neither side is a table or the join has no condition.
+For an equality join of two tables it is their rows under their own conditions joined by the key estimated to keep the fewest, as [Row Estimates]({% link _docs/performance/query-optimizer.md %}#row-estimates) describes; an outer join keeps at least the rows of its kept side. A join without a condition prints the product of its sides' rows. A join with a side that is not a table, or without an equality, prints none.
+
+When a run of `INNER JOIN`s is joined in another order than written, the plan shows the joins as they run, and a line after `SELECT` names both orders:
+
+```
+SELECT
+  Join order: s, u, t (written t, u, s)
+```
 
 ## Use Cases
 
