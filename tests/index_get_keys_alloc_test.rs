@@ -106,52 +106,72 @@ fn a_key_read_with_other_keys_allocates_as_one_with_a_single_key() {
 
 #[test]
 fn a_sealed_choice_among_indexes_allocates_nothing_more_per_volume() {
-    let dir = tempfile::tempdir().unwrap();
-    // Each checkpoint seals the rows inserted since into a volume of its own
-    let db = Database::open(&format!(
-        "file://{}?checkpoint_interval=3600&compact_threshold=64",
-        dir.path().display()
-    ))
-    .unwrap();
-    for sql in [
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c INTEGER, e INTEGER)",
-        "CREATE INDEX t_a ON t (a)",
-        "CREATE INDEX t_c ON t (c)",
-        "CREATE INDEX t_e ON t (e)",
-    ] {
-        db.execute(sql, ()).unwrap();
-    }
-    let seal = |batch: i64| {
-        let (from, to) = (batch * 500 + 1, batch * 500 + 500);
-        db.execute(
-            &format!(
-                "INSERT INTO t SELECT value, value % 2, value % 3, value % 5 \
-                 FROM generate_series({from}, {to})"
-            ),
-            (),
-        )
+    // Three indexes, and nine, more than a small inline buffer holds
+    for indexes in [3, 9] {
+        let dir = tempfile::tempdir().unwrap();
+        // Each checkpoint seals the rows inserted since into a volume of its own
+        let db = Database::open(&format!(
+            "file://{}?checkpoint_interval=3600&compact_threshold=64",
+            dir.path().display()
+        ))
         .unwrap();
-        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
-    };
-    // Every volume holds each key, so no bloom filter or zone map leaves one
-    // out before its side file is asked
-    let reads = |db: &Database| {
-        (
-            per_read(db, "SELECT COUNT(*) FROM t WHERE e = $1", &[1]),
-            per_read(
-                db,
-                "SELECT COUNT(*) FROM t WHERE a = $1 AND c = $2 AND e = $3",
-                &[1, 1, 1],
-            ),
-        )
-    };
-    (0..3).for_each(seal);
-    let (single_three, chosen_three) = reads(&db);
-    (3..6).for_each(seal);
-    let (single_six, chosen_six) = reads(&db);
-    assert!(
-        chosen_six.saturating_sub(chosen_three) <= single_six.saturating_sub(single_three),
-        "allocations per read over three and six volumes, one index {single_three} and \
-         {single_six}, three indexes {chosen_three} and {chosen_six}"
-    );
+        // t indexes every column; u, the same rows, only two of them, the
+        // fewest a choice among indexes asks
+        let columns: Vec<String> = (1..=indexes).map(|c| format!("c{c} INTEGER")).collect();
+        for table in ["t", "u"] {
+            db.execute(
+                &format!(
+                    "CREATE TABLE {table} (id INTEGER PRIMARY KEY, {})",
+                    columns.join(", ")
+                ),
+                (),
+            )
+            .unwrap();
+        }
+        for c in 1..=indexes {
+            db.execute(&format!("CREATE INDEX t_c{c} ON t (c{c})"), ())
+                .unwrap();
+        }
+        for c in 1..=2 {
+            db.execute(&format!("CREATE INDEX u_c{c} ON u (c{c})"), ())
+                .unwrap();
+        }
+        // Column cN holds value % (N + 1): every volume holds each key, so no
+        // bloom filter or zone map leaves one out before its side file is asked
+        let values: Vec<String> = (1..=indexes)
+            .map(|c| format!("value % {}", c + 1))
+            .collect();
+        let seal = |batch: usize| {
+            let (from, to) = (batch * 500 + 1, batch * 500 + 500);
+            for table in ["t", "u"] {
+                db.execute(
+                    &format!(
+                        "INSERT INTO {table} SELECT value, {} FROM generate_series({from}, {to})",
+                        values.join(", ")
+                    ),
+                    (),
+                )
+                .unwrap();
+            }
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        };
+        let terms: Vec<String> = (1..=indexes).map(|c| format!("c{c} = ${c}")).collect();
+        let terms = terms.join(" AND ");
+        let ones = vec![1; indexes];
+        let reads = |db: &Database| {
+            (
+                per_read(db, &format!("SELECT COUNT(*) FROM u WHERE {terms}"), &ones),
+                per_read(db, &format!("SELECT COUNT(*) FROM t WHERE {terms}"), &ones),
+            )
+        };
+        (0..3).for_each(seal);
+        let (two_three, all_three) = reads(&db);
+        (3..6).for_each(seal);
+        let (two_six, all_six) = reads(&db);
+        assert!(
+            all_six.saturating_sub(all_three) <= two_six.saturating_sub(two_three),
+            "allocations per read over three and six volumes, two indexes {two_three} and \
+             {two_six}, {indexes} indexes {all_three} and {all_six}"
+        );
+    }
 }

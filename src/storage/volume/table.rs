@@ -196,9 +196,14 @@ struct SideAsk {
 /// counts first
 type SideAsks = smallvec::SmallVec<[SideAsk; 2]>;
 
-/// Each ask's estimated positions in one volume with its place among the
-/// asks, held inline for as many indexes as a WHERE bounds in practice
-type CountedAsks = smallvec::SmallVec<[(u64, usize); 8]>;
+thread_local! {
+    /// Each ask's estimated positions in the volume being decided, with its
+    /// place among the asks: one buffer a thread keeps for every volume it
+    /// decides, so the ordering allocates nothing per volume
+    static COUNTED_ASKS: std::cell::Cell<Vec<(u64, usize)>> = const {
+        std::cell::Cell::new(Vec::new())
+    };
+}
 
 enum AskKeys {
     /// An ordered i64 entry's keys in `[low, high]`, empty when low is above
@@ -3044,21 +3049,34 @@ impl SegmentedTable {
         cs: &super::manifest::ColdSegment,
         asks: &[SideAsk],
     ) -> Result<SideDecision> {
+        match asks {
+            [] => Ok(SideDecision::Scan),
+            [only] => self.ask_decision(cs, only, true),
+            _ => {
+                let mut counted = COUNTED_ASKS.with(std::cell::Cell::take);
+                let decided = self.decide_fewest_first(cs, asks, &mut counted);
+                COUNTED_ASKS.with(|held| held.set(counted));
+                decided
+            }
+        }
+    }
+
+    /// [`Self::side_decision`] for several asks, tried in the order
+    /// `fewest_first` gives them in `counted`: a count the directory
+    /// misjudged sends the volume on to the next
+    fn decide_fewest_first(
+        &self,
+        cs: &super::manifest::ColdSegment,
+        asks: &[SideAsk],
+        counted: &mut Vec<(u64, usize)>,
+    ) -> Result<SideDecision> {
         use super::secondary::READS;
-        let ordered = match asks {
-            [] => return Ok(SideDecision::Scan),
-            [only] => return self.ask_decision(cs, only, true),
-            _ => match self.fewest_first(cs, asks)? {
-                Some(ordered) => ordered,
-                None => {
-                    READS.count(&READS.misses, 1);
-                    return Ok(SideDecision::Empty);
-                }
-            },
-        };
-        // A count the directory misjudged sends the volume on to the next
-        let last = ordered.len() - 1;
-        for (tried, (_, at)) in ordered.into_iter().enumerate() {
+        if !self.fewest_first(cs, asks, counted)? {
+            READS.count(&READS.misses, 1);
+            return Ok(SideDecision::Empty);
+        }
+        let last = counted.len() - 1;
+        for (tried, &(_, at)) in counted.iter().enumerate() {
             match self.ask_decision(cs, &asks[at], tried == last)? {
                 SideDecision::Scan => {}
                 decided => return Ok(decided),
@@ -3661,16 +3679,17 @@ impl SegmentedTable {
         asks
     }
 
-    /// The positions in `asks` by the positions the directory counts for
-    /// their side file entry in `cs`, fewest first, without reading a page;
-    /// those the directory cannot count after them, in their order. None when
-    /// one rules every row of the volume out
+    /// Fills `counted` with the places in `asks` by the positions the
+    /// directory counts for their side file entry in `cs`, fewest first,
+    /// without reading a page; those the directory cannot count after them,
+    /// in their order. False when one rules every row of the volume out
     fn fewest_first(
         &self,
         cs: &super::manifest::ColdSegment,
         asks: &[SideAsk],
-    ) -> Result<Option<CountedAsks>> {
-        let mut counted = CountedAsks::new();
+        counted: &mut Vec<(u64, usize)>,
+    ) -> Result<bool> {
+        counted.clear();
         for (at, ask) in asks.iter().enumerate() {
             let keys = ask.keys.range();
             let side = cs.side_for(&ask.def, keys.capability());
@@ -3686,12 +3705,12 @@ impl SegmentedTable {
                 }
             };
             let Some(estimate) = estimate.map_err(side_error)? else {
-                return Ok(None);
+                return Ok(false);
             };
             counted.push((estimate, at));
         }
         counted.sort_unstable();
-        Ok(Some(counted))
+        Ok(true)
     }
 
     /// The single-column TEXT entry a key probe of `column` asks
