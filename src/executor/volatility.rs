@@ -179,16 +179,13 @@ impl Walk<'_> {
             | Expression::NullLiteral(_)
             | Expression::IntervalLiteral(_)
             | Expression::Parameter(_) => Volatility::Fixed,
-            Expression::CteReference(_) => Volatility::PerStatement,
             Expression::Prefix(prefix) => one(&prefix.right),
             Expression::Infix(infix) => one(&infix.left).max(one(&infix.right)),
             Expression::List(list) => self.all(&list.elements),
             Expression::ExpressionList(list) => self.all(&list.expressions),
-            Expression::Distinct(distinct) => one(&distinct.expr),
             Expression::Exists(exists) => self.block(&exists.subquery),
             Expression::AllAny(all_any) => one(&all_any.left).max(self.block(&all_any.subquery)),
             Expression::In(in_expr) => one(&in_expr.left).max(one(&in_expr.right)),
-            Expression::InHashSet(in_set) => one(&in_set.column),
             Expression::QuantifiedSet(set) => one(&set.left),
             Expression::Between(between) => one(&between.expr)
                 .max(one(&between.lower))

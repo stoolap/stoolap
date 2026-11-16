@@ -3119,14 +3119,6 @@ impl Executor {
                     self.extract_aggregates_from_expr(expr, aggregations, non_agg_columns, ctx)?;
                 }
             }
-            Expression::Distinct(distinct) => {
-                self.extract_aggregates_from_expr(
-                    &distinct.expr,
-                    aggregations,
-                    non_agg_columns,
-                    ctx,
-                )?;
-            }
             // An aggregate a window function takes as its argument, or
             // partitions or orders by, is computed like any other
             Expression::Window(window) => {

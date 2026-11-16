@@ -361,22 +361,11 @@ fn write_expr(expr: &Expression, hasher: &mut KeyHasher) {
             hasher.tag(b'L');
             write_list(&list.expressions, hasher);
         }
-        Expression::Distinct(distinct) => {
-            hasher.tag(b'd');
-            write_expr(&distinct.expr, hasher);
-        }
         Expression::In(in_expr) => {
             hasher.tag(b'i');
             hasher.flag(in_expr.not);
             write_expr(&in_expr.left, hasher);
             write_expr(&in_expr.right, hasher);
-        }
-        // A set built at run time is itself only: two builds never share a key
-        Expression::InHashSet(set) => {
-            hasher.tag(b'h');
-            hasher.flag(set.not);
-            hasher.write_usize(crate::common::CompactArc::as_ptr(&set.values) as usize);
-            write_expr(&set.column, hasher);
         }
         Expression::QuantifiedSet(set) => {
             hasher.tag(b'A');
@@ -459,8 +448,7 @@ fn write_expr(expr: &Expression, hasher: &mut KeyHasher) {
         | Expression::JoinSource(_)
         | Expression::SubquerySource(_)
         | Expression::ValuesSource(_)
-        | Expression::FunctionTableSource(_)
-        | Expression::CteReference(_) => write_source(expr, hasher),
+        | Expression::FunctionTableSource(_) => write_source(expr, hasher),
     }
 }
 
@@ -627,10 +615,6 @@ fn write_source(source: &Expression, hasher: &mut KeyHasher) {
                 hasher.name(&as_of.as_of_type);
                 write_expr(&as_of.value, hasher);
             }
-        }
-        Expression::CteReference(cte) => {
-            hasher.tag(b'r');
-            write_source_name(&cte.name, cte.alias.as_ref(), hasher);
         }
         other => write_expr(other, hasher),
     }

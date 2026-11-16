@@ -71,12 +71,6 @@ pub enum TokenType {
     Punctuator,
     /// Comment (-- or /* */)
     Comment,
-    /// Date literal
-    Date,
-    /// Time literal
-    Time,
-    /// Timestamp literal
-    Timestamp,
     /// Parameter ($1, ?)
     Parameter,
 }
@@ -94,9 +88,6 @@ impl fmt::Display for TokenType {
             TokenType::Operator => write!(f, "OPERATOR"),
             TokenType::Punctuator => write!(f, "PUNCTUATOR"),
             TokenType::Comment => write!(f, "COMMENT"),
-            TokenType::Date => write!(f, "DATE"),
-            TokenType::Time => write!(f, "TIME"),
-            TokenType::Timestamp => write!(f, "TIMESTAMP"),
             TokenType::Parameter => write!(f, "PARAMETER"),
         }
     }

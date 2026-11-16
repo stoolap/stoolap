@@ -202,9 +202,7 @@ fn contains_context_dependent_function(expr: &Expression) -> bool {
             .iter()
             .any(contains_context_dependent_function),
         Expression::Aliased(aliased) => contains_context_dependent_function(&aliased.expression),
-        Expression::Distinct(distinct) => contains_context_dependent_function(&distinct.expr),
         Expression::AllAny(all_any) => contains_context_dependent_function(&all_any.left),
-        Expression::InHashSet(in_hash) => contains_context_dependent_function(&in_hash.column),
         Expression::QuantifiedSet(quantified) => {
             contains_context_dependent_function(&quantified.left)
         }

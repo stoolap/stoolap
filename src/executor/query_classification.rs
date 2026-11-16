@@ -491,15 +491,6 @@ impl QueryClassification {
                     );
                 }
             }
-            Expression::Distinct(distinct) => {
-                Self::analyze_where_expr_recursive(
-                    &distinct.expr,
-                    has_exists,
-                    has_in_subquery,
-                    has_scalar_subquery,
-                    has_all_any,
-                );
-            }
             Expression::Aliased(aliased) => {
                 Self::analyze_where_expr_recursive(
                     &aliased.expression,
@@ -819,13 +810,6 @@ fn hash_expression_structure<H: std::hash::Hasher>(expr: &Expression, hasher: &m
             if let Some(ref escape) = like.escape {
                 hash_expression_structure(escape, hasher);
             }
-        }
-        Expression::Distinct(distinct) => {
-            hash_expression_structure(&distinct.expr, hasher);
-        }
-        Expression::InHashSet(in_hash) => {
-            hash_expression_structure(&in_hash.column, hasher);
-            in_hash.values.len().hash(hasher);
         }
         Expression::QuantifiedSet(quantified) => {
             hash_expression_structure(&quantified.left, hasher);

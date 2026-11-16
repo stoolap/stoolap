@@ -37,8 +37,8 @@ use crate::core::{DataType, Error, Operator, Row, Schema, Value};
 use crate::executor::operators::index_nested_loop::ColumnSource;
 use crate::parser::ast::{
     AliasedExpression, BetweenExpression, BooleanLiteral, CastExpression, Expression, FloatLiteral,
-    FunctionCall, GroupByModifier, Identifier, InExpression, InHashSetExpression, InfixExpression,
-    InfixOperator, IntegerLiteral, LikeExpression, ListExpression, NullLiteral, PrefixExpression,
+    FunctionCall, GroupByModifier, Identifier, InExpression, InfixExpression, InfixOperator,
+    IntegerLiteral, LikeExpression, ListExpression, NullLiteral, PrefixExpression,
     QualifiedIdentifier, SelectStatement, StringLiteral, WindowFrameBound,
 };
 use crate::parser::token::{Position, Token, TokenType};
@@ -411,9 +411,7 @@ pub(crate) fn visit_column_refs_outside<'e>(
         Expression::Infix(i) => all([&*i.left, &*i.right], skip, visit),
         Expression::List(l) => all(&l.elements, skip, visit),
         Expression::ExpressionList(l) => all(&l.expressions, skip, visit),
-        Expression::Distinct(d) => one(&d.expr, visit),
         Expression::In(i) => all([&*i.left, &*i.right], skip, visit),
-        Expression::InHashSet(h) => one(&h.column, visit),
         Expression::QuantifiedSet(q) => one(&q.left, visit),
         Expression::Between(b) => all([&*b.expr, &*b.lower, &*b.upper], skip, visit),
         Expression::Like(l) => all(
@@ -864,9 +862,6 @@ fn collect_table_qualifiers_impl(expr: &Expression, qualifiers: &mut FxHashSet<S
                 }
             }
         }
-        Expression::InHashSet(in_set) => {
-            collect_table_qualifiers_impl(&in_set.column, qualifiers);
-        }
         Expression::QuantifiedSet(quantified) => {
             collect_table_qualifiers_impl(&quantified.left, qualifiers);
         }
@@ -979,9 +974,6 @@ pub fn collect_unqualified_columns(expr: &Expression, columns: &mut FxHashSet<St
                 }
             }
         }
-        Expression::InHashSet(in_set) => {
-            collect_unqualified_columns(&in_set.column, columns);
-        }
         Expression::QuantifiedSet(quantified) => {
             collect_unqualified_columns(&quantified.left, columns);
         }
@@ -1055,12 +1047,6 @@ pub fn get_table_alias_from_expr(expr: &Expression) -> Option<String> {
                 .unwrap_or_else(|| fs.function.value.to_string()),
         ),
         Expression::ValuesSource(vs) => vs.alias.as_ref().map(|a| a.value.to_string()),
-        Expression::CteReference(cr) => Some(
-            cr.alias
-                .as_ref()
-                .map(|a| a.value.to_string())
-                .unwrap_or_else(|| cr.name.value.to_string()),
-        ),
         _ => None,
     }
 }
@@ -1106,12 +1092,6 @@ pub fn strip_table_qualifier(expr: &Expression, table_alias: &str) -> Expression
                 not: in_expr.not,
             })
         }
-        Expression::InHashSet(in_set) => Expression::InHashSet(InHashSetExpression {
-            token: in_set.token.clone(),
-            column: Box::new(strip_table_qualifier(&in_set.column, table_alias)),
-            values: in_set.values.clone(),
-            not: in_set.not,
-        }),
         Expression::QuantifiedSet(quantified) => {
             quantified.with_left(strip_table_qualifier(&quantified.left, table_alias))
         }
@@ -1198,12 +1178,6 @@ pub fn add_table_qualifier(expr: &Expression, table_alias: &str) -> Expression {
                 not: in_expr.not,
             })
         }
-        Expression::InHashSet(in_set) => Expression::InHashSet(InHashSetExpression {
-            token: in_set.token.clone(),
-            column: Box::new(add_table_qualifier(&in_set.column, table_alias)),
-            values: in_set.values.clone(),
-            not: in_set.not,
-        }),
         Expression::QuantifiedSet(quantified) => {
             quantified.with_left(add_table_qualifier(&quantified.left, table_alias))
         }
@@ -1417,8 +1391,7 @@ impl FormWalk<'_> {
             | Expression::BooleanLiteral(_)
             | Expression::NullLiteral(_)
             | Expression::IntervalLiteral(_)
-            | Expression::Parameter(_)
-            | Expression::CteReference(_) => Ok(()),
+            | Expression::Parameter(_) => Ok(()),
             Expression::Prefix(prefix) => self.expression(&prefix.right, at),
             Expression::Infix(infix) => {
                 self.expression(&infix.left, at)?;
@@ -1426,7 +1399,6 @@ impl FormWalk<'_> {
             }
             Expression::List(list) => self.all(&list.elements, at),
             Expression::ExpressionList(list) => self.all(&list.expressions, at),
-            Expression::Distinct(distinct) => self.expression(&distinct.expr, at),
             Expression::Exists(exists) => self.select(&exists.subquery),
             Expression::AllAny(all_any) => {
                 if super::expression::QuantifiedMembers::operator(&all_any.operator).is_none() {
@@ -1442,7 +1414,6 @@ impl FormWalk<'_> {
                 self.expression(&in_expr.left, at)?;
                 self.expression(&in_expr.right, at)
             }
-            Expression::InHashSet(in_set) => self.expression(&in_set.column, at),
             Expression::QuantifiedSet(set) => self.expression(&set.left, at),
             Expression::Between(between) => {
                 self.expression(&between.expr, at)?;
@@ -1595,7 +1566,6 @@ pub fn expression_contains_aggregate(expr: &Expression) -> bool {
                     .is_some_and(expression_contains_aggregate)
         }
         Expression::AllAny(all_any) => expression_contains_aggregate(&all_any.left),
-        Expression::Distinct(distinct) => expression_contains_aggregate(&distinct.expr),
         Expression::Case(case) => {
             if case
                 .value
@@ -1765,7 +1735,6 @@ fn holds_text_literal(expr: &Expression) -> bool {
         }
         Expression::Prefix(prefix) => holds_text_literal(&prefix.right),
         Expression::Cast(cast) => holds_text_literal(&cast.expr),
-        Expression::Distinct(distinct) => holds_text_literal(&distinct.expr),
         Expression::Aliased(aliased) => holds_text_literal(&aliased.expression),
         Expression::Case(case) => {
             case.value.as_deref().is_some_and(holds_text_literal)

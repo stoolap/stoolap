@@ -7322,9 +7322,7 @@ impl Executor {
             }
             E::List(l) => any(&l.elements),
             E::ExpressionList(l) => any(&l.expressions),
-            E::Distinct(d) => Self::filter_has_subquery(&d.expr),
             E::In(i) => Self::filter_has_subquery(&i.left) || Self::filter_has_subquery(&i.right),
-            E::InHashSet(i) => Self::filter_has_subquery(&i.column),
             E::QuantifiedSet(q) => Self::filter_has_subquery(&q.left),
             E::Between(b) => {
                 Self::filter_has_subquery(&b.expr)
@@ -7360,7 +7358,6 @@ impl Executor {
             | E::JoinSource(_)
             | E::SubquerySource(_)
             | E::ValuesSource(_)
-            | E::CteReference(_)
             | E::FunctionTableSource(_) => true,
         }
     }
@@ -8185,7 +8182,6 @@ impl Executor {
             Expression::List(list) => list.elements.iter().any(check),
             Expression::ExpressionList(list) => list.expressions.iter().any(check),
             Expression::Like(l) => check(&l.left) || check(&l.pattern),
-            Expression::Distinct(d) => check(&d.expr),
             Expression::Window(w) => w.function.arguments.iter().any(check),
             // Anything else is left to the sort, which reads the projected row
             _ => true,

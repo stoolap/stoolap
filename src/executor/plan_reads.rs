@@ -183,7 +183,6 @@ impl Reads<'_> {
                 self.expr(&infix.right);
             }
             Expression::List(list) => list.elements.iter().for_each(|e| self.expr(e)),
-            Expression::Distinct(distinct) => self.expr(&distinct.expr),
             Expression::Exists(exists) => self.select(&exists.subquery),
             Expression::AllAny(all_any) => {
                 self.expr(&all_any.left);
@@ -193,7 +192,6 @@ impl Reads<'_> {
                 self.expr(&in_expr.left);
                 self.expr(&in_expr.right);
             }
-            Expression::InHashSet(in_set) => self.expr(&in_set.column),
             Expression::QuantifiedSet(set) => self.expr(&set.left),
             Expression::Between(between) => {
                 self.expr(&between.expr);
@@ -237,7 +235,6 @@ impl Reads<'_> {
             Expression::ValuesSource(values) => {
                 values.rows.iter().flatten().for_each(|e| self.expr(e));
             }
-            Expression::CteReference(cte) => self.name(&cte.name.value_lower),
             Expression::FunctionTableSource(source) => {
                 source.arguments.iter().for_each(|e| self.expr(e));
             }

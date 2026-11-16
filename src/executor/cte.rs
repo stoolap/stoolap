@@ -574,7 +574,6 @@ impl Executor {
     /// Extract the base CTE/table name for registry lookup (ignores aliases)
     fn extract_cte_name_for_lookup(&self, expr: &Expression) -> Option<String> {
         match expr {
-            Expression::CteReference(cte_ref) => Some(cte_ref.name.value.to_string()),
             Expression::TableSource(simple_table_source) => {
                 Some(simple_table_source.name.value.to_string())
             }
@@ -815,7 +814,6 @@ impl Executor {
     /// Check if an expression references a CTE
     fn expr_references_cte(&self, expr: &Expression, cte_name: &str) -> bool {
         match expr {
-            Expression::CteReference(cte_ref) => eq_names(&cte_ref.name.value, cte_name),
             Expression::TableSource(ts) => eq_names(&ts.name.value, cte_name),
             Expression::Identifier(id) => eq_names(&id.value, cte_name),
             Expression::JoinSource(js) => {
@@ -922,12 +920,6 @@ impl Executor {
     /// Count CTE references in an expression
     fn count_cte_references_in_expr(&self, expr: &Expression, ref_counts: &mut StringMap<usize>) {
         match expr {
-            Expression::CteReference(cte_ref) => {
-                let name: &str = cte_ref.name.value_lower.as_str();
-                if let Some(count) = ref_counts.get_mut(name) {
-                    *count += 1;
-                }
-            }
             Expression::TableSource(ts) => {
                 let name: &str = ts.name.value_lower.as_str();
                 if let Some(count) = ref_counts.get_mut(name) {
@@ -955,12 +947,6 @@ impl Executor {
                 for element in &list.expressions {
                     self.count_cte_references_in_expr(element, ref_counts);
                 }
-            }
-            Expression::Distinct(distinct) => {
-                self.count_cte_references_in_expr(&distinct.expr, ref_counts);
-            }
-            Expression::InHashSet(in_set) => {
-                self.count_cte_references_in_expr(&in_set.column, ref_counts);
             }
             Expression::QuantifiedSet(quantified) => {
                 self.count_cte_references_in_expr(&quantified.left, ref_counts);
@@ -1063,23 +1049,6 @@ impl Executor {
         cte_defs: &StringMap<&CommonTableExpression>,
     ) -> Option<Expression> {
         match expr {
-            Expression::CteReference(cte_ref) => {
-                // Use pre-computed lowercase from value_lower if available
-                let name = &cte_ref.name.value_lower;
-                cte_defs.get(name.as_str()).map(|cte| {
-                    // Convert CTE to SubquerySource
-                    let alias = cte_ref
-                        .alias
-                        .clone()
-                        .unwrap_or_else(|| cte_ref.name.clone());
-                    Expression::SubquerySource(Box::new(SubqueryTableSource {
-                        token: Token::new(TokenType::Punctuator, "(", Position::new(0, 0, 0)),
-                        subquery: cte.query.clone(),
-                        alias: Some(alias),
-                        keeps_names: false,
-                    }))
-                })
-            }
             Expression::TableSource(ts) => {
                 // Use pre-computed lowercase from value_lower
                 let name = &ts.name.value_lower;

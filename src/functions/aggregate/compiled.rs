@@ -83,18 +83,6 @@ pub enum CompiledAggregate {
     /// MAX(column) - maximum value (type-generic using Value comparison)
     Max { max_value: Option<Value> },
 
-    /// MIN for integers only (faster path)
-    MinInteger { min_value: Option<i64> },
-
-    /// MAX for integers only (faster path)
-    MaxInteger { max_value: Option<i64> },
-
-    /// MIN for floats only (faster path)
-    MinFloat { min_value: Option<f64> },
-
-    /// MAX for floats only (faster path)
-    MaxFloat { max_value: Option<f64> },
-
     /// Fallback to dynamic dispatch for complex aggregates, with the call's
     /// modifiers in its state
     Dynamic(AggregateState),
@@ -141,22 +129,6 @@ impl std::fmt::Debug for CompiledAggregate {
             CompiledAggregate::Max { max_value } => {
                 f.debug_struct("Max").field("max_value", max_value).finish()
             }
-            CompiledAggregate::MinInteger { min_value } => f
-                .debug_struct("MinInteger")
-                .field("min_value", min_value)
-                .finish(),
-            CompiledAggregate::MaxInteger { max_value } => f
-                .debug_struct("MaxInteger")
-                .field("max_value", max_value)
-                .finish(),
-            CompiledAggregate::MinFloat { min_value } => f
-                .debug_struct("MinFloat")
-                .field("min_value", min_value)
-                .finish(),
-            CompiledAggregate::MaxFloat { max_value } => f
-                .debug_struct("MaxFloat")
-                .field("max_value", max_value)
-                .finish(),
             CompiledAggregate::Dynamic(state) => f.debug_tuple("Dynamic").field(state).finish(),
         }
     }
@@ -236,19 +208,9 @@ impl CompiledAggregate {
         CompiledAggregate::Min { min_value: None }
     }
 
-    /// Create a compiled MIN aggregate for integers
-    pub fn min_integer() -> Self {
-        CompiledAggregate::MinInteger { min_value: None }
-    }
-
     /// Create a compiled MAX aggregate (generic)
     pub fn max() -> Self {
         CompiledAggregate::Max { max_value: None }
-    }
-
-    /// Create a compiled MAX aggregate for integers
-    pub fn max_integer() -> Self {
-        CompiledAggregate::MaxInteger { max_value: None }
     }
 
     /// Compile from a function name and configuration
@@ -404,54 +366,6 @@ impl CompiledAggregate {
                 }
             }
 
-            // MIN for integers (faster path)
-            CompiledAggregate::MinInteger { min_value } => {
-                if let Value::Integer(v) = value {
-                    match min_value {
-                        None => *min_value = Some(*v),
-                        Some(current) if *v < *current => *min_value = Some(*v),
-                        _ => {}
-                    }
-                }
-            }
-
-            // MAX for integers (faster path)
-            CompiledAggregate::MaxInteger { max_value } => {
-                if let Value::Integer(v) = value {
-                    match max_value {
-                        None => *max_value = Some(*v),
-                        Some(current) if *v > *current => *max_value = Some(*v),
-                        _ => {}
-                    }
-                }
-            }
-
-            // MIN for floats (faster path)
-            CompiledAggregate::MinFloat { min_value } => {
-                if let Value::Float(v) = value {
-                    match min_value {
-                        None => *min_value = Some(*v),
-                        Some(current) if compare_floats(*v, *current).is_lt() => {
-                            *min_value = Some(*v)
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            // MAX for floats (faster path)
-            CompiledAggregate::MaxFloat { max_value } => {
-                if let Value::Float(v) = value {
-                    match max_value {
-                        None => *max_value = Some(*v),
-                        Some(current) if compare_floats(*v, *current).is_gt() => {
-                            *max_value = Some(*v)
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
             // Dynamic fallback
             CompiledAggregate::Dynamic(state) => {
                 state.accumulate(value);
@@ -470,10 +384,6 @@ impl CompiledAggregate {
                 | CompiledAggregate::Avg { .. }
                 | CompiledAggregate::Min { .. }
                 | CompiledAggregate::Max { .. }
-                | CompiledAggregate::MinInteger { .. }
-                | CompiledAggregate::MaxInteger { .. }
-                | CompiledAggregate::MinFloat { .. }
-                | CompiledAggregate::MaxFloat { .. }
         )
     }
 
@@ -487,10 +397,6 @@ impl CompiledAggregate {
             CompiledAggregate::Min { min_value: v } | CompiledAggregate::Max { max_value: v } => {
                 v.clone()
             }
-            CompiledAggregate::MinInteger { min_value: v }
-            | CompiledAggregate::MaxInteger { max_value: v } => v.map(Value::Integer),
-            CompiledAggregate::MinFloat { min_value: v }
-            | CompiledAggregate::MaxFloat { max_value: v } => v.map(Value::Float),
             _ => None,
         };
         if let Some(value) = extreme {
@@ -538,20 +444,6 @@ impl CompiledAggregate {
                 max_value.clone().unwrap_or_else(Value::null_unknown)
             }
 
-            CompiledAggregate::MinInteger { min_value } => min_value
-                .map(Value::Integer)
-                .unwrap_or_else(Value::null_unknown),
-            CompiledAggregate::MaxInteger { max_value } => max_value
-                .map(Value::Integer)
-                .unwrap_or_else(Value::null_unknown),
-
-            CompiledAggregate::MinFloat { min_value } => min_value
-                .map(Value::Float)
-                .unwrap_or_else(Value::null_unknown),
-            CompiledAggregate::MaxFloat { max_value } => max_value
-                .map(Value::Float)
-                .unwrap_or_else(Value::null_unknown),
-
             CompiledAggregate::Dynamic(state) => return state.result(),
         })
     }
@@ -581,12 +473,6 @@ impl CompiledAggregate {
             CompiledAggregate::Min { min_value } => *min_value = None,
             CompiledAggregate::Max { max_value } => *max_value = None,
 
-            CompiledAggregate::MinInteger { min_value } => *min_value = None,
-            CompiledAggregate::MaxInteger { max_value } => *max_value = None,
-
-            CompiledAggregate::MinFloat { min_value } => *min_value = None,
-            CompiledAggregate::MaxFloat { max_value } => *max_value = None,
-
             CompiledAggregate::Dynamic(state) => state.reset(),
         }
     }
@@ -605,8 +491,8 @@ mod tests {
     fn float_min_and_max_order_nan_last() {
         let is_nan = |v: Value| matches!(v, Value::Float(f) if f.is_nan());
         for order in [[f64::NAN, -2.0, 1.5], [-2.0, 1.5, f64::NAN]] {
-            let mut min = CompiledAggregate::MinFloat { min_value: None };
-            let mut max = CompiledAggregate::MaxFloat { max_value: None };
+            let mut min = CompiledAggregate::min();
+            let mut max = CompiledAggregate::max();
             for v in order {
                 min.accumulate(&Value::Float(v));
                 max.accumulate(&Value::Float(v));
@@ -614,7 +500,7 @@ mod tests {
             assert_eq!(min.result().unwrap(), Value::Float(-2.0), "{order:?}");
             assert!(is_nan(max.result().unwrap()), "{order:?}");
         }
-        let mut min = CompiledAggregate::MinFloat { min_value: None };
+        let mut min = CompiledAggregate::min();
         min.accumulate(&Value::Float(f64::NAN));
         assert!(is_nan(min.result().unwrap()));
     }
@@ -711,24 +597,6 @@ mod tests {
     #[test]
     fn test_max_integers() {
         let mut agg = CompiledAggregate::max();
-        agg.accumulate(&Value::Integer(5));
-        agg.accumulate(&Value::Integer(2));
-        agg.accumulate(&Value::Integer(8));
-        assert_eq!(agg.result().unwrap(), Value::Integer(8));
-    }
-
-    #[test]
-    fn test_min_integer_fast() {
-        let mut agg = CompiledAggregate::min_integer();
-        agg.accumulate(&Value::Integer(5));
-        agg.accumulate(&Value::Integer(2));
-        agg.accumulate(&Value::Integer(8));
-        assert_eq!(agg.result().unwrap(), Value::Integer(2));
-    }
-
-    #[test]
-    fn test_max_integer_fast() {
-        let mut agg = CompiledAggregate::max_integer();
         agg.accumulate(&Value::Integer(5));
         agg.accumulate(&Value::Integer(2));
         agg.accumulate(&Value::Integer(8));

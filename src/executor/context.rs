@@ -147,7 +147,6 @@ pub(crate) fn expr_tables(expr: &Expression, tables: &mut CacheTables) -> Option
         | Expression::JoinSource(_)
         | Expression::SubquerySource(_)
         | Expression::ValuesSource(_)
-        | Expression::CteReference(_)
         | Expression::FunctionTableSource(_) => None,
         Expression::Prefix(p) => expr_tables(&p.right, tables),
         Expression::Infix(i) => {
@@ -156,12 +155,10 @@ pub(crate) fn expr_tables(expr: &Expression, tables: &mut CacheTables) -> Option
         }
         Expression::List(l) => exprs_tables(&l.elements, tables),
         Expression::ExpressionList(l) => exprs_tables(&l.expressions, tables),
-        Expression::Distinct(d) => expr_tables(&d.expr, tables),
         Expression::In(i) => {
             expr_tables(&i.left, tables)?;
             expr_tables(&i.right, tables)
         }
-        Expression::InHashSet(h) => expr_tables(&h.column, tables),
         Expression::QuantifiedSet(q) => expr_tables(&q.left, tables),
         Expression::Between(b) => {
             expr_tables(&b.expr, tables)?;

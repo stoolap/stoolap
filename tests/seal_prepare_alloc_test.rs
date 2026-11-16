@@ -84,7 +84,8 @@ fn a_preparation_walks_a_small_older_volume_instead_of_collecting_the_new_ids() 
     let path = write_volume_to_disk(dir.path(), "t", 1, &volume_of(&old_ids)).unwrap();
     let old = Arc::new(read_volume_from_disk(&path).unwrap());
     let mgr = SegmentManager::new("t", None);
-    mgr.register_segment(1, old, meta_for(1, &old_ids), None);
+    mgr.register_segment(1, old, meta_for(1, &old_ids), None)
+        .unwrap();
 
     let new_ids: Vec<i64> = (20_001..=120_000).collect();
     let new = Arc::new(volume_of(&new_ids));
