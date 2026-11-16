@@ -128,6 +128,7 @@ impl ColumnAggregateStats {
     }
 
     /// Get the average value.
+    #[cfg(test)]
     pub fn avg(&self) -> Option<f64> {
         if self.numeric_count == 0 {
             None
@@ -161,6 +162,7 @@ impl VolumeAggregateStats {
     }
 
     /// Merge stats from another volume.
+    #[cfg(test)]
     pub fn merge(&mut self, other: &VolumeAggregateStats) {
         self.total_rows += other.total_rows;
         self.live_rows += other.live_rows;
@@ -172,24 +174,28 @@ impl VolumeAggregateStats {
     }
 
     /// Get COUNT(*) for this volume.
+    #[cfg(test)]
     #[inline]
     pub fn count_star(&self) -> u64 {
         self.live_rows
     }
 
     /// Get SUM(col) for a specific column.
+    #[cfg(test)]
     #[inline]
     pub fn sum(&self, col_idx: usize) -> f64 {
         self.columns[col_idx].sum_as_f64()
     }
 
     /// Get MIN(col) for a specific column.
+    #[cfg(test)]
     #[inline]
     pub fn min(&self, col_idx: usize) -> &Value {
         &self.columns[col_idx].min
     }
 
     /// Get MAX(col) for a specific column.
+    #[cfg(test)]
     #[inline]
     pub fn max(&self, col_idx: usize) -> &Value {
         &self.columns[col_idx].max

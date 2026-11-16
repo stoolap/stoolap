@@ -423,6 +423,7 @@ impl<'a> HashJoinOperator<'a> {
     ///
     /// For self-joins (t1 JOIN t1), this avoids scanning the table twice
     /// by reusing the same materialized data for both build and probe.
+    #[cfg(test)]
     pub fn self_join(
         input: Box<dyn Operator>,
         join_type: JoinType,

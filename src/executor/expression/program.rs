@@ -425,11 +425,13 @@ impl Program {
     }
 
     /// Create an empty program that returns NULL
+    #[cfg(test)]
     pub fn null() -> Self {
         Self::new(vec![Op::LoadNull(crate::core::DataType::Null), Op::Return])
     }
 
     /// Create a program that returns a constant value
+    #[cfg(test)]
     pub fn constant(value: Value) -> Self {
         Self::new(vec![Op::LoadConst(value), Op::Return])
     }
@@ -441,6 +443,7 @@ impl Program {
     }
 
     /// Check if this program needs a second row (for joins)
+    #[cfg(test)]
     #[inline]
     pub fn needs_second_row(&self) -> bool {
         self.needs_second_row
@@ -464,12 +467,14 @@ impl Program {
     }
 
     /// Get the number of operations
+    #[cfg(test)]
     #[inline]
     pub fn len(&self) -> usize {
         self.ops.len()
     }
 
     /// Check if program is empty
+    #[cfg(test)]
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()

@@ -335,6 +335,7 @@ impl TableManifest {
     }
 
     /// Allocate a new segment ID.
+    #[cfg(test)]
     pub fn allocate_segment_id(&mut self) -> u64 {
         let id = self.next_segment_id;
         self.next_segment_id += 1;

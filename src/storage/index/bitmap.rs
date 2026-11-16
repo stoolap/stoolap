@@ -162,6 +162,7 @@ impl BitmapIndex {
     }
 
     /// Get the current cardinality (number of distinct values)
+    #[cfg(test)]
     pub fn cardinality(&self) -> usize {
         self.distinct_count.load(AtomicOrdering::Relaxed)
     }

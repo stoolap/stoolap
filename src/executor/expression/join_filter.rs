@@ -50,6 +50,7 @@ impl JoinFilter {
     /// Check if a pair of rows satisfies the join condition. An error in it
     /// reads as false, sets `failed` and is kept on this thread until
     /// `take_error`
+    #[cfg(test)]
     #[inline]
     pub fn matches(&self, left_row: &Row, right_row: &Row, failed: &mut bool) -> bool {
         self.matches_with(left_row, right_row, failed, None)

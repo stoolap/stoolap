@@ -98,11 +98,13 @@ impl BloomFilterOperator {
     }
 
     /// Get the number of rows checked by the filter.
+    #[cfg(test)]
     pub fn rows_checked(&self) -> u64 {
         self.rows_checked
     }
 
     /// Get the number of rows that passed the filter.
+    #[cfg(test)]
     pub fn rows_passed(&self) -> u64 {
         self.rows_passed
     }

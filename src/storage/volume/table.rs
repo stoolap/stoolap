@@ -1216,6 +1216,7 @@ impl SegmentedTable {
     }
 
     /// Create a segmented table with no segments (equivalent to plain MVCCTable).
+    #[cfg(test)]
     pub fn hot_only(hot: Box<dyn Table>) -> Self {
         Self {
             segment_mgr: Arc::new(SegmentManager::new("", None)),
@@ -2140,6 +2141,7 @@ impl SegmentedTable {
     }
 
     /// Get the number of frozen segments.
+    #[cfg(test)]
     pub fn segment_count(&self) -> usize {
         self.segment_mgr.segment_count()
     }

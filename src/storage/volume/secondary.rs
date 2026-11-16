@@ -312,6 +312,7 @@ impl Ledger {
         self.refused.fetch_add(1, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     pub fn reset_peak(&self) {
         self.peak
             .store(self.charged.load(Ordering::Acquire), Ordering::Release);
@@ -905,6 +906,7 @@ impl Page {
     }
 
     /// The capacity the page's vectors hold, as charged
+    #[cfg(test)]
     pub fn bytes(&self) -> usize {
         self.bytes
     }
@@ -1827,6 +1829,7 @@ impl IndexFile {
     /// The upper bound the directory alone gives on the positions of keys
     /// in `[low, high]`: every position of every key page the range
     /// touches, boundary pages whole.
+    #[cfg(test)]
     pub fn candidate_bound(&self, identity: u64, low: i64, high: i64) -> std::io::Result<u64> {
         let col = self
             .directory
@@ -1940,6 +1943,7 @@ impl IndexFile {
 
     /// The exact position index range of keys in `[low, high]`; reads the
     /// boundary key pages through the cache alone.
+    #[cfg(test)]
     pub fn range(&self, identity: u64, low: i64, high: i64) -> std::io::Result<(u64, u64)> {
         range_with(
             &Cached {
@@ -1953,6 +1957,7 @@ impl IndexFile {
 
     /// The exact position index range of an ordered-bytes entry's keys in
     /// `[lower, upper)`; reads the boundary key pages through the cache alone
+    #[cfg(test)]
     pub fn range_bytes(
         &self,
         identity: u64,
@@ -2020,6 +2025,7 @@ impl IndexFile {
     /// entry for `identity`, yielding them in windows of at most `window`
     /// positions, each window sorted ascending; the window is the cursor's
     /// whole workspace, reserved before it is allocated, for its life.
+    #[cfg(test)]
     pub fn cursor(
         &self,
         identity: u64,
@@ -2844,6 +2850,7 @@ fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::
 
 /// Positions of one key or one range, a bounded window at a time, the
 /// pages through the cache alone.
+#[cfg(test)]
 pub struct Cursor<'a> {
     pages: Cached<'a>,
     next: u64,
@@ -2853,6 +2860,7 @@ pub struct Cursor<'a> {
     _reservation: Reservation,
 }
 
+#[cfg(test)]
 impl Cursor<'_> {
     /// Positions left to yield, including the current window
     pub fn remaining(&self) -> u64 {
@@ -5313,6 +5321,7 @@ impl SideWalk {
     }
 
     /// Candidates left, including the current window's rest
+    #[cfg(test)]
     pub fn remaining(&self) -> u64 {
         self.reader.remaining() + (self.reader.window().len() - self.at) as u64
     }

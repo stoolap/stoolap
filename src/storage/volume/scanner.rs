@@ -654,6 +654,7 @@ impl VolumeScanner {
     }
 
     /// Create an empty scanner (for zone-map-pruned volumes that match nothing).
+    #[cfg(test)]
     pub fn empty() -> Self {
         Self {
             volume: Arc::new(FrozenVolume {

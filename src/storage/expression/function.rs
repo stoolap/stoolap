@@ -128,6 +128,7 @@ impl FunctionExpr {
     }
 
     /// Create a function expression for equality comparison
+    #[cfg(test)]
     pub fn eq(
         function: Arc<dyn ScalarFunction>,
         arguments: Vec<FunctionArg>,
