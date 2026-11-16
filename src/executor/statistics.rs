@@ -215,7 +215,8 @@ impl Executor {
             column_stats_list.push((col_def.name.clone(), col_stats));
         }
 
-        // Store zone maps in the table once no charge can stop the analysis
+        // Store zone maps in the table once the deadline can stop nothing more
+        deadline.check()?;
         table.set_zone_maps(zone_maps);
 
         // Drop the table reference before using tx again

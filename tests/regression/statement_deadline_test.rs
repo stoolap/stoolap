@@ -1372,7 +1372,7 @@ fn an_analyze_stopped_at_its_deadline_fails_and_keeps_the_tables_before() {
     ctx.set_timeout_ms(3_600_000);
     let one_table = charges_of(&executor, &ctx, DeadlineSite::Analyze, "ANALYZE a1");
     read(&executor, "DELETE FROM _sys_table_stats", &ctx).unwrap();
-    pass_deadline_after(DeadlineSite::Analyze, one_table);
+    pass_deadline_after(DeadlineSite::Analyze, one_table + 1);
     let stopped = read(&executor, "ANALYZE", &ctx);
     keep_deadlines();
     assert!(
@@ -1387,5 +1387,42 @@ fn an_analyze_stopped_at_its_deadline_fails_and_keeps_the_tables_before() {
         rows.row().get(0),
         Some(&stoolap::Value::Integer(1)),
         "the table analyzed before the deadline keeps its statistics"
+    );
+}
+
+#[test]
+fn an_analyze_past_its_deadline_after_its_last_charge_stores_nothing() {
+    let _guard = FailpointGuard::new();
+    let db = Database::open("memory://statement_deadline_analyze_last").unwrap();
+    db.execute(
+        "CREATE TABLE a1 (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO a1 SELECT value, value % 7, value FROM generate_series(1, 5000)",
+        (),
+    )
+    .unwrap();
+    let executor = Executor::new(std::sync::Arc::clone(db.engine()));
+    let mut ctx = ExecutionContext::new();
+    ctx.set_timeout_ms(3_600_000);
+    let all = charges_of(&executor, &ctx, DeadlineSite::Analyze, "ANALYZE a1");
+    read(&executor, "DELETE FROM _sys_table_stats", &ctx).unwrap();
+    pass_deadline_after(DeadlineSite::Analyze, all);
+    let stopped = read(&executor, "ANALYZE a1", &ctx);
+    keep_deadlines();
+    assert!(
+        matches!(stopped, Err(Error::QueryCancelled)),
+        "ANALYZE past its deadline after its last charge gave {stopped:?}"
+    );
+    let mut rows = executor
+        .execute_with_context("SELECT COUNT(*) FROM _sys_table_stats", &ctx)
+        .unwrap();
+    assert!(rows.next());
+    assert_eq!(
+        rows.row().get(0),
+        Some(&stoolap::Value::Integer(0)),
+        "a table stopped after its last charge stores no statistics"
     );
 }
