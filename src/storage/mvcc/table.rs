@@ -4534,6 +4534,8 @@ impl Table for MVCCTable {
         if index.index_type() != IndexType::BTree && index.index_type() != IndexType::PrimaryKey {
             return Ok(None);
         }
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("tbl.walk_btree_groups");
         // No volume can ever move a row out of this table's index, so the walk
         // reads it directly and the callback runs under the index lock
         match index.for_each_group(f) {
