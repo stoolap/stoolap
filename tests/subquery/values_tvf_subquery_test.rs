@@ -284,8 +284,8 @@ impl ScalarFunction for Counted {
 fn a_table_function_a_false_where_keeps_no_row_of_runs_no_argument_subquery() {
     let _guard = serial();
     global_registry().register_scalar::<Counted>().unwrap();
-    let mut engine = MVCCEngine::in_memory();
-    stoolap::storage::traits::Engine::open(&mut engine).unwrap();
+    let engine = MVCCEngine::in_memory();
+    engine.open_engine().unwrap();
     let executor = Executor::new(Arc::new(engine));
     for sql in [
         "CREATE TABLE u (id INTEGER PRIMARY KEY, v INTEGER)",

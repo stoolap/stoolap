@@ -52,226 +52,6 @@ pub fn clear_row_vec_pool() {
     });
 }
 
-// ============================================================================
-// Pool Statistics (only when dhat-heap feature is enabled)
-// ============================================================================
-
-/// Pool statistics for debugging and profiling
-#[cfg(feature = "dhat-heap")]
-#[derive(Debug, Default)]
-pub struct PoolStats {
-    /// Number of successful pool hits (buffer reused)
-    pub hits: u64,
-    /// Number of pool misses (new allocation needed)
-    pub misses: u64,
-    /// Number of buffers returned to pool
-    pub returns: u64,
-    /// Number of buffers evicted (pool full, smaller buffer discarded)
-    pub evictions: u64,
-    /// Number of oversized buffers discarded (exceeded MAX_CACHED_CAPACITY)
-    pub oversized_discards: u64,
-    /// Total bytes requested via with_capacity
-    pub bytes_requested: u64,
-    /// Total bytes served from pool (capacity * 16 bytes per element)
-    pub bytes_from_pool: u64,
-    /// Current pool size
-    pub current_pool_size: usize,
-    /// Total capacity in pool (sum of all buffer capacities)
-    pub total_pool_capacity: usize,
-}
-
-#[cfg(feature = "dhat-heap")]
-impl PoolStats {
-    /// Calculate hit rate as percentage
-    pub fn hit_rate(&self) -> f64 {
-        let total = self.hits + self.misses;
-        if total == 0 {
-            0.0
-        } else {
-            (self.hits as f64 / total as f64) * 100.0
-        }
-    }
-
-    /// Estimated bytes saved by pool reuse
-    pub fn bytes_saved(&self) -> u64 {
-        self.bytes_from_pool
-    }
-}
-
-#[cfg(feature = "dhat-heap")]
-impl std::fmt::Display for PoolStats {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "RowVec Pool Statistics:")?;
-        writeln!(f, "  Hits:              {:>10}", self.hits)?;
-        writeln!(f, "  Misses:            {:>10}", self.misses)?;
-        writeln!(f, "  Hit Rate:          {:>9.1}%", self.hit_rate())?;
-        writeln!(f, "  Returns:           {:>10}", self.returns)?;
-        writeln!(f, "  Evictions:         {:>10}", self.evictions)?;
-        writeln!(f, "  Oversized Discards:{:>10}", self.oversized_discards)?;
-        writeln!(
-            f,
-            "  Bytes Requested:   {:>10}",
-            format_bytes(self.bytes_requested)
-        )?;
-        writeln!(
-            f,
-            "  Bytes From Pool:   {:>10}",
-            format_bytes(self.bytes_from_pool)
-        )?;
-        writeln!(
-            f,
-            "  Bytes Saved:       {:>10}",
-            format_bytes(self.bytes_saved())
-        )?;
-        writeln!(f, "  Current Pool Size: {:>10}", self.current_pool_size)?;
-        writeln!(
-            f,
-            "  Pool Capacity:     {:>10}",
-            format_bytes(self.total_pool_capacity as u64 * 16)
-        )?;
-        Ok(())
-    }
-}
-
-#[cfg(feature = "dhat-heap")]
-fn format_bytes(bytes: u64) -> String {
-    if bytes >= 1_073_741_824 {
-        format!("{:.2} GB", bytes as f64 / 1_073_741_824.0)
-    } else if bytes >= 1_048_576 {
-        format!("{:.2} MB", bytes as f64 / 1_048_576.0)
-    } else if bytes >= 1024 {
-        format!("{:.2} KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{} B", bytes)
-    }
-}
-
-#[cfg(feature = "dhat-heap")]
-thread_local! {
-    static POOL_STATS: RefCell<PoolStats> = RefCell::new(PoolStats::default());
-}
-
-/// Get current pool statistics (only available with dhat-heap feature)
-#[cfg(feature = "dhat-heap")]
-pub fn get_pool_stats() -> PoolStats {
-    POOL_STATS.with(|stats| {
-        let mut s = stats.borrow().clone();
-        // Update current pool state
-        ROW_VEC_POOL.with(|pool| {
-            let pool = pool.borrow();
-            s.current_pool_size = pool.len();
-            s.total_pool_capacity = pool.iter().map(|v| v.capacity()).sum();
-        });
-        s
-    })
-}
-
-/// Print pool statistics to stderr (only available with dhat-heap feature)
-#[cfg(feature = "dhat-heap")]
-pub fn print_pool_stats() {
-    eprintln!("{}", get_pool_stats());
-}
-
-/// Reset pool statistics (only available with dhat-heap feature)
-#[cfg(feature = "dhat-heap")]
-pub fn reset_pool_stats() {
-    POOL_STATS.with(|stats| {
-        *stats.borrow_mut() = PoolStats::default();
-    });
-}
-
-#[cfg(feature = "dhat-heap")]
-impl Clone for PoolStats {
-    fn clone(&self) -> Self {
-        Self {
-            hits: self.hits,
-            misses: self.misses,
-            returns: self.returns,
-            evictions: self.evictions,
-            oversized_discards: self.oversized_discards,
-            bytes_requested: self.bytes_requested,
-            bytes_from_pool: self.bytes_from_pool,
-            current_pool_size: self.current_pool_size,
-            total_pool_capacity: self.total_pool_capacity,
-        }
-    }
-}
-
-// Helper macros for stats tracking (no-op when feature is disabled)
-#[cfg(feature = "dhat-heap")]
-macro_rules! track_hit {
-    ($capacity:expr) => {
-        POOL_STATS.with(|stats| {
-            let mut s = stats.borrow_mut();
-            s.hits += 1;
-            s.bytes_from_pool += ($capacity as u64) * 16;
-        });
-    };
-}
-
-#[cfg(not(feature = "dhat-heap"))]
-macro_rules! track_hit {
-    ($capacity:expr) => {};
-}
-
-#[cfg(feature = "dhat-heap")]
-macro_rules! track_miss {
-    ($capacity:expr) => {
-        POOL_STATS.with(|stats| {
-            let mut s = stats.borrow_mut();
-            s.misses += 1;
-            s.bytes_requested += ($capacity as u64) * 16;
-        });
-    };
-}
-
-#[cfg(not(feature = "dhat-heap"))]
-macro_rules! track_miss {
-    ($capacity:expr) => {};
-}
-
-#[cfg(feature = "dhat-heap")]
-macro_rules! track_return {
-    () => {
-        POOL_STATS.with(|stats| {
-            stats.borrow_mut().returns += 1;
-        });
-    };
-}
-
-#[cfg(not(feature = "dhat-heap"))]
-macro_rules! track_return {
-    () => {};
-}
-
-#[cfg(feature = "dhat-heap")]
-macro_rules! track_eviction {
-    () => {
-        POOL_STATS.with(|stats| {
-            stats.borrow_mut().evictions += 1;
-        });
-    };
-}
-
-#[cfg(not(feature = "dhat-heap"))]
-macro_rules! track_eviction {
-    () => {};
-}
-
-#[cfg(feature = "dhat-heap")]
-macro_rules! track_oversized {
-    () => {
-        POOL_STATS.with(|stats| {
-            stats.borrow_mut().oversized_discards += 1;
-        });
-    };
-}
-
-#[cfg(not(feature = "dhat-heap"))]
-macro_rules! track_oversized {
-    () => {};
-}
-
 /// Cached row vector that returns to thread-local cache on drop.
 ///
 /// Use this for table scans to reuse Vec allocations across queries.
@@ -290,16 +70,10 @@ impl RowVec {
         // (can happen if Drop triggers nested RowVec creation on the same thread)
         let v = ROW_VEC_POOL.with(|pool| pool.try_borrow_mut().ok().and_then(|mut p| p.pop()));
         match v {
-            Some(buf) => {
-                track_hit!(buf.capacity());
-                Self { inner: Some(buf) }
-            }
-            None => {
-                track_miss!(16);
-                Self {
-                    inner: Some(Vec::with_capacity(16)),
-                }
-            }
+            Some(buf) => Self { inner: Some(buf) },
+            None => Self {
+                inner: Some(Vec::with_capacity(16)),
+            },
         }
     }
 
@@ -331,22 +105,14 @@ impl RowVec {
         match v {
             Some(mut buf) => {
                 let buf_cap = buf.capacity();
-                if buf_cap >= capacity {
-                    // Perfect hit - buffer is large enough
-                    track_hit!(buf_cap);
-                } else {
-                    // Partial hit - need to grow buffer
-                    track_hit!(buf_cap);
+                if buf_cap < capacity {
                     buf.reserve(capacity - buf_cap);
                 }
                 Self { inner: Some(buf) }
             }
-            None => {
-                track_miss!(capacity);
-                Self {
-                    inner: Some(Vec::with_capacity(capacity)),
-                }
-            }
+            None => Self {
+                inner: Some(Vec::with_capacity(capacity)),
+            },
         }
     }
 
@@ -465,7 +231,6 @@ impl Drop for RowVec {
             let cap = v.capacity();
             // Don't cache very large buffers to prevent unbounded memory retention
             if cap > MAX_CACHED_CAPACITY {
-                track_oversized!();
                 return; // Let it deallocate
             }
             v.clear();
@@ -479,7 +244,6 @@ impl Drop for RowVec {
                     // Pool has room - insert in sorted position (by capacity, ascending)
                     let insert_idx = pool.partition_point(|b| b.capacity() < cap);
                     pool.insert(insert_idx, v);
-                    track_return!();
                 } else {
                     // Pool full - smart eviction: keep larger buffers (more versatile)
                     // Replace smallest if this buffer is larger
@@ -488,8 +252,6 @@ impl Drop for RowVec {
                         pool.remove(0);
                         let insert_idx = pool.partition_point(|b| b.capacity() < cap);
                         pool.insert(insert_idx, v);
-                        track_return!();
-                        track_eviction!();
                     }
                     // Otherwise let v deallocate - it's smaller than everything in pool
                 }
@@ -762,21 +524,6 @@ impl RowIdVec {
         }
     }
 
-    /// Create from an existing Vec<i64>.
-    /// NOTE: This bypasses the cache - use when you already have allocated data.
-    #[inline]
-    pub fn from_vec(v: Vec<i64>) -> Self {
-        Self { inner: Some(v) }
-    }
-
-    /// Extract the inner Vec directly, bypassing cache return.
-    /// Use this when you need to pass the Vec to APIs that require Vec<i64>.
-    /// The allocation is NOT returned to the cache.
-    #[inline]
-    pub fn into_vec(mut self) -> Vec<i64> {
-        self.inner.take().unwrap_or_default()
-    }
-
     /// Get length
     #[inline]
     pub fn len(&self) -> usize {
@@ -805,34 +552,10 @@ impl RowIdVec {
         }
     }
 
-    /// Clear the vector (keeps allocation)
-    #[inline]
-    pub fn clear(&mut self) {
-        if let Some(v) = self.inner.as_mut() {
-            v.clear();
-        }
-    }
-
     /// Get iterator over row IDs
     #[inline]
     pub fn iter(&self) -> impl Iterator<Item = &i64> {
         self.inner.as_ref().unwrap().iter()
-    }
-
-    /// Reserve capacity
-    #[inline]
-    pub fn reserve(&mut self, additional: usize) {
-        if let Some(v) = self.inner.as_mut() {
-            v.reserve(additional);
-        }
-    }
-
-    /// Sort the row IDs
-    #[inline]
-    pub fn sort(&mut self) {
-        if let Some(v) = self.inner.as_mut() {
-            v.sort_unstable();
-        }
     }
 
     /// Dedup the row IDs (requires sorted)

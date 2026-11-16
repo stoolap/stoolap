@@ -24,9 +24,7 @@ use std::sync::Arc;
 use crate::common::deadline::{Deadline, DeadlineSite, CHARGE_BEAT};
 use crate::common::names::eq_names;
 use crate::common::{CompactArc, I64Set};
-use crate::core::{
-    DataType, Error, IndexType, Result, Row, RowIdVec, RowVec, Schema, SchemaColumn, Value,
-};
+use crate::core::{DataType, Error, IndexType, Result, Row, RowIdVec, RowVec, Schema, Value};
 use crate::storage::expression::logical::OrExpr;
 use crate::storage::expression::{passes, Expression};
 use crate::storage::index::id_list::GroupIds;
@@ -579,6 +577,38 @@ impl MVCCTable {
         (self.cached_schema, self.layout) = self.version_store.schema_and_layout();
     }
 
+    /// Adds a column through this handle, whole at once: the statement path
+    /// records the change first and lays the rows out after
+    fn create_column_with_default_value(
+        &mut self,
+        name: &str,
+        column_type: DataType,
+        nullable: bool,
+        default_expr: Option<String>,
+        default_value: Option<Value>,
+    ) -> Result<()> {
+        crate::core::check_column_name(name)?;
+        if let Some(Value::Timestamp(t)) = &default_value {
+            crate::core::value::timestamp_in_range(*t)?;
+        }
+        let next_id = self.version_store.schema().columns.len();
+        let column = crate::core::SchemaColumn::with_default_value(
+            next_id,
+            name,
+            column_type,
+            nullable,
+            false,
+            false,
+            default_expr,
+            default_value,
+            None,
+        );
+        self.version_store.add_column(column)?;
+        self.version_store.lay_out_rows();
+        self.take_schema();
+        Ok(())
+    }
+
     /// The transaction's local store for a write: the rows it writes now
     /// are laid out as this handle's schema says
     fn writes(&self) -> Result<TxnStoreWrite<'_>> {
@@ -661,11 +691,6 @@ impl MVCCTable {
             // NULL type - use BTree as safe default
             DataType::Null => IndexType::BTree,
         }
-    }
-
-    /// Gets the current auto-increment value
-    pub fn get_current_auto_increment_value(&self) -> i64 {
-        self.version_store.get_auto_increment_counter()
     }
 
     /// Normalize a row to match the current schema
@@ -2576,16 +2601,6 @@ impl MVCCTable {
         Ok(rows)
     }
 
-    /// Collect visible rows WITHOUT sorting for GROUP BY optimization.
-    ///
-    /// This skips the O(n log n) sort since GROUP BY doesn't care about row order.
-    /// Returns rows in version store iteration order.
-    #[inline]
-    fn collect_visible_rows_unsorted(&self) -> Result<RowVec> {
-        // For GROUP BY, order doesn't matter - use same cached path
-        self.collect_visible_rows(None, Deadline::NONE)
-    }
-
     /// Collect visible rows with early termination when limit is reached
     /// This is the LIMIT pushdown optimization
     fn collect_visible_rows_with_limit(
@@ -3737,51 +3752,7 @@ impl Table for MVCCTable {
     }
 
     fn create_column(&mut self, name: &str, column_type: DataType, nullable: bool) -> Result<()> {
-        self.create_column_with_default(name, column_type, nullable, None)
-    }
-
-    fn create_column_with_default(
-        &mut self,
-        name: &str,
-        column_type: DataType,
-        nullable: bool,
-        default_expr: Option<String>,
-    ) -> Result<()> {
-        self.create_column_with_default_value(name, column_type, nullable, default_expr, None)
-    }
-
-    fn create_column_with_default_value(
-        &mut self,
-        name: &str,
-        column_type: DataType,
-        nullable: bool,
-        default_expr: Option<String>,
-        default_value: Option<Value>,
-    ) -> Result<()> {
-        crate::core::check_column_name(name)?;
-        if let Some(Value::Timestamp(t)) = &default_value {
-            crate::core::value::timestamp_in_range(*t)?;
-        }
-        // The version store's schema is the truth: the new column's id
-        // comes from it, and the cached copy follows it whole
-        let next_id = self.version_store.schema().columns.len();
-        let column = SchemaColumn::with_default_value(
-            next_id,
-            name,
-            column_type,
-            nullable,
-            false, // primary_key
-            false, // auto_increment
-            default_expr,
-            default_value,
-            None, // check_expr
-        );
-        // A handle's change is whole at once; the statement path records
-        // the change first and lays the rows out after
-        self.version_store.add_column(column)?;
-        self.version_store.lay_out_rows();
-        self.take_schema();
-        Ok(())
+        self.create_column_with_default_value(name, column_type, nullable, None, None)
     }
 
     fn drop_column(&mut self, name: &str) -> Result<()> {
@@ -4475,12 +4446,6 @@ impl Table for MVCCTable {
     fn collect_all_rows(&self, where_expr: Option<&dyn Expression>) -> Result<RowVec> {
         // Return cached row vector directly - caller iterates (i64, Row) tuples
         let rows = self.collect_visible_rows(where_expr, Deadline::NONE)?;
-        self.check_read()?;
-        Ok(rows)
-    }
-
-    fn collect_all_rows_unsorted(&self) -> Result<RowVec> {
-        let rows = self.collect_visible_rows_unsorted()?;
         self.check_read()?;
         Ok(rows)
     }
@@ -5204,15 +5169,6 @@ impl Table for MVCCTable {
         self.version_store.get_index(name)
     }
 
-    fn get_unique_indexes(&self) -> Vec<(String, Vec<String>)> {
-        self.version_store
-            .get_all_indexes()
-            .into_iter()
-            .filter(|idx| idx.is_unique())
-            .map(|idx| (idx.name().to_string(), idx.column_names().to_vec()))
-            .collect()
-    }
-
     fn for_each_unique_non_pk_index(
         &self,
         f: &mut dyn FnMut(&dyn Index) -> Result<()>,
@@ -5238,13 +5194,6 @@ impl Table for MVCCTable {
 
     fn acquire_upsert_lock(&self) -> Option<Box<dyn std::any::Any>> {
         Some(Box::new(self.version_store.acquire_upsert_lock()))
-    }
-
-    fn get_multi_column_index(
-        &self,
-        predicate_columns: &[&str],
-    ) -> Option<(std::sync::Arc<dyn Index>, usize)> {
-        self.version_store.get_multi_column_index(predicate_columns)
     }
 
     fn create_btree_index(
@@ -5336,106 +5285,11 @@ impl Table for MVCCTable {
         Ok(())
     }
 
-    /// Create a multi-column index using MultiColumnIndex
-    fn create_multi_column_index(
+    fn get_multi_column_index(
         &self,
-        name: &str,
-        columns: &[&str],
-        is_unique: bool,
-    ) -> Result<()> {
-        super::engine::check_index_name(name, IndexType::MultiColumn)?;
-        let schema = self.version_store.schema();
-
-        // Validate and collect column info
-        let mut column_names = Vec::with_capacity(columns.len());
-        let mut column_ids = Vec::with_capacity(columns.len());
-        let mut data_types = Vec::with_capacity(columns.len());
-        let mut col_indices = Vec::with_capacity(columns.len());
-
-        for col_name in columns {
-            let (col_idx, col) = schema
-                .find_column(col_name)
-                .ok_or(Error::ColumnNotFound(col_name.to_string()))?;
-            column_names.push(col.name.clone());
-            column_ids.push(col.id as i32);
-            data_types.push(col.data_type);
-            col_indices.push(col_idx);
-        }
-
-        // Check if index with same name already exists
-        if self.version_store.index_exists(name) {
-            return Err(Error::IndexAlreadyExists(name.to_string()));
-        }
-
-        // Create the multi-column index with capacity hint
-        let expected_rows = self.version_store.row_count();
-        let index = MultiColumnIndex::new(
-            name.to_string(),
-            self.name().to_string(),
-            column_names,
-            column_ids,
-            data_types,
-            is_unique,
-            expected_rows,
-        );
-
-        // Populate the index with existing data using batch_slice
-        let mut entries: Vec<(i64, Vec<Value>)> = Vec::new();
-
-        for row_id in self.version_store.get_all_visible_row_ids(self.reader()) {
-            if let Some(version) = self
-                .version_store
-                .get_visible_version(row_id, self.reader())
-            {
-                if !version.is_deleted() {
-                    // Collect values for all columns in the index
-                    let values: Vec<Value> = col_indices
-                        .iter()
-                        .map(|&idx| {
-                            version
-                                .data
-                                .get(idx)
-                                .cloned()
-                                .unwrap_or(Value::Null(DataType::Null))
-                        })
-                        .collect();
-                    entries.push((row_id, values));
-                }
-            }
-        }
-
-        // Add all entries in a single batch operation
-        if !entries.is_empty() {
-            let entry_refs: Vec<(i64, &[Value])> = entries
-                .iter()
-                .map(|(row_id, values)| (*row_id, values.as_slice()))
-                .collect();
-            index.add_batch_slice(&entry_refs)?;
-        }
-        self.check_local_unique(&index, &col_indices)?;
-
-        // Add to version store
-        self.version_store
-            .add_index(name.to_string(), Arc::new(index));
-
-        Ok(())
-    }
-
-    fn drop_btree_index(&self, column_name: &str) -> Result<()> {
-        // Generate default index name
-        let index_name = format!("idx_{}_{}_btree", self.name(), column_name);
-
-        // Check if index exists
-        if !self.version_store.index_exists(&index_name) {
-            return Err(Error::internal(format!(
-                "btree index not found for column: {}",
-                column_name
-            )));
-        }
-
-        // Remove from version store
-        self.version_store.remove_index(&index_name);
-        Ok(())
+        predicate_columns: &[&str],
+    ) -> Option<(std::sync::Arc<dyn Index>, usize)> {
+        self.version_store.get_multi_column_index(predicate_columns)
     }
 
     fn get_index_min_value(&self, column_name: &str) -> Option<Value> {
@@ -5959,19 +5813,6 @@ impl Table for MVCCTable {
         Ok(Box::new(result))
     }
 
-    fn select_with_aliases(
-        &self,
-        columns: &[&str],
-        expr: Option<&dyn Expression>,
-        aliases: &FxHashMap<String, String>,
-    ) -> Result<Box<dyn QueryResult>> {
-        // Get base result
-        let result = self.select(columns, expr)?;
-
-        // Apply aliases
-        Ok(result.with_aliases(aliases.clone()))
-    }
-
     fn rows_at(
         &self,
         point: &ReadPoint,
@@ -5998,16 +5839,6 @@ impl Table for MVCCTable {
 
     fn get_zone_maps(&self) -> Option<std::sync::Arc<crate::storage::mvcc::zonemap::TableZoneMap>> {
         self.version_store.get_zone_maps()
-    }
-
-    fn get_segments_to_scan(
-        &self,
-        column: &str,
-        operator: crate::core::Operator,
-        value: &Value,
-    ) -> Option<Vec<u32>> {
-        self.version_store
-            .get_segments_to_scan(column, operator, value)
     }
 
     fn sum_column(

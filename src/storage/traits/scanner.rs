@@ -164,16 +164,6 @@ impl VecScanner {
             closed: false,
         }
     }
-
-    /// Creates a scanner that will return an error
-    pub fn with_error(error: crate::core::Error) -> Self {
-        Self {
-            rows: Vec::new(),
-            current_index: None,
-            error: Some(error),
-            closed: false,
-        }
-    }
 }
 
 impl Scanner for VecScanner {
@@ -261,13 +251,6 @@ mod tests {
 
         assert!(!scanner.next());
         assert!(scanner.err().is_none());
-    }
-
-    #[test]
-    fn test_vec_scanner_with_error() {
-        let mut scanner = VecScanner::with_error(crate::core::Error::internal("test error"));
-        assert!(!scanner.next());
-        assert!(scanner.err().is_some());
     }
 
     #[test]

@@ -261,14 +261,10 @@ impl<T: ?Sized + CompactArcDrop> CompactArc<T> {
         ptr::addr_eq(this.ptr.as_ptr(), other.ptr.as_ptr())
     }
 
-    /// Returns the number of strong references to this allocation.
-    ///
-    /// Note: This uses `Relaxed` ordering and should only be used for
-    /// debugging/logging purposes, not for synchronization decisions.
-    #[inline]
-    pub fn strong_count(this: &Self) -> usize {
-        // SAFETY: this.ptr is always valid (NonNull) and points to a properly initialized
-        // Header. Reading the atomic count with Relaxed ordering is always safe.
+    /// The number of strong references, for the tests of the reference count
+    #[cfg(test)]
+    pub(crate) fn strong_count(this: &Self) -> usize {
+        // SAFETY: this.ptr is always valid (NonNull) and points to an initialized Header.
         unsafe { (*this.ptr.as_ptr()).count.load(AtomicOrdering::Relaxed) }
     }
 
@@ -433,32 +429,6 @@ impl<T: CompactArcDrop> CompactArc<T> {
         let header = this.ptr.as_ptr();
         unsafe { (header as *const u8).add(data_offset_for::<T>()) as *const T }
     }
-
-    /// Converts a `CompactArc<T>` into a raw pointer.
-    #[inline]
-    pub fn into_raw(this: Self) -> *const T {
-        // Use raw pointer arithmetic instead of &*this to avoid Stacked Borrows
-        // violation: a SharedReadOnly retag from &*this would conflict with
-        // the SharedReadWrite needed by Drop to decrement the refcount.
-        let header = this.ptr.as_ptr();
-        let ptr = unsafe { (header as *const u8).add(data_offset_for::<T>()) as *const T };
-        mem::forget(this);
-        ptr
-    }
-
-    /// Constructs a `CompactArc<T>` from a raw pointer.
-    ///
-    /// # Safety
-    ///
-    /// The raw pointer must have been previously returned by `CompactArc::into_raw`.
-    #[inline]
-    pub unsafe fn from_raw(ptr: *const T) -> Self {
-        let header = (ptr as *const u8).sub(data_offset_for::<T>()) as *mut Header;
-        CompactArc {
-            ptr: NonNull::new_unchecked(header),
-            _marker: PhantomData,
-        }
-    }
 }
 
 impl<T: CompactArcDrop> Deref for CompactArc<T> {
@@ -590,20 +560,6 @@ impl CompactArc<str> {
                 _marker: PhantomData,
             }
         }
-    }
-
-    /// Returns the length of the string in bytes.
-    #[inline]
-    pub fn len(&self) -> usize {
-        // SAFETY: self.ptr is valid and points to an initialized Header.
-        // The len field contains the string length set during construction.
-        unsafe { (*self.ptr.as_ptr()).len }
-    }
-
-    /// Returns true if the string is empty.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 }
 
@@ -1086,16 +1042,6 @@ mod tests {
         *CompactArc::make_mut(&mut arc) = 200;
         assert_eq!(*arc, 200);
         assert_eq!(*arc2, 100);
-    }
-
-    #[test]
-    fn test_into_raw_from_raw() {
-        let arc = CompactArc::new(42);
-        let ptr = CompactArc::into_raw(arc);
-
-        // SAFETY: ptr was obtained from into_raw and has not been used since
-        let arc2 = unsafe { CompactArc::from_raw(ptr) };
-        assert_eq!(*arc2, 42);
     }
 
     #[test]

@@ -17,7 +17,6 @@
 //! This module provides the core MVCC implementation for Stoolap, including:
 //!
 //! - [`TransactionRegistry`] - Transaction state management and visibility
-//! - [`get_fast_timestamp`] - Fast monotonic timestamp generation
 //! - [`VersionStore`] - Row version storage and visibility checking
 //! - [`TransactionVersionStore`] - Transaction-local changes before commit
 //!
@@ -55,9 +54,7 @@ pub mod zonemap;
 
 // Re-export index types (moved to storage::index)
 pub use crate::storage::index::{
-    intersect_multiple_sorted_ids, intersect_sorted_ids, union_multiple_sorted_ids,
-    union_sorted_ids, BTreeIndex, BitmapIndex, CompositeKey, HashIndex, HnswIndex,
-    MultiColumnIndex, PkIndex,
+    BTreeIndex, BitmapIndex, CompositeKey, HashIndex, HnswIndex, MultiColumnIndex, PkIndex,
 };
 
 // Re-export main types
@@ -68,11 +65,11 @@ pub use persistence::{
     DEFAULT_CHECKPOINT_INTERVAL, DEFAULT_KEEP_SNAPSHOTS,
 };
 pub use registry::{TransactionRegistry, INVALID_TRANSACTION_ID, RECOVERY_TRANSACTION_ID};
-pub use scanner::{EmptyScanner, MVCCScanner};
+pub use scanner::MVCCScanner;
 pub use snapshot::{DiskVersionStore, SnapshotReader, SnapshotWriter};
 pub use table::MVCCTable;
+pub use timestamp::last_write_order;
 pub(crate) use timestamp::next_write_order;
-pub use timestamp::{get_fast_timestamp, last_write_order};
 pub use transaction::{
     MvccTransaction, SealFenceGuard, TransactionEngineOperations, TransactionState,
 };
@@ -85,5 +82,5 @@ pub use wal_manager::{
     DEFAULT_WAL_FLUSH_TRIGGER, DEFAULT_WAL_MAX_SIZE,
 };
 pub use zonemap::{
-    ColumnZoneMap, PruneStats, TableZoneMap, ZoneMapBuilder, ZoneMapEntry, DEFAULT_SEGMENT_SIZE,
+    ColumnZoneMap, TableZoneMap, ZoneMapBuilder, ZoneMapEntry, DEFAULT_SEGMENT_SIZE,
 };

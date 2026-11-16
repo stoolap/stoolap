@@ -392,11 +392,6 @@ impl ConstBoolExpr {
         Self::new(true)
     }
 
-    /// Create a FALSE expression
-    pub fn false_expr() -> Self {
-        Self::new(false)
-    }
-
     /// Get the constant boolean value (for expression compilation)
     pub fn value(&self) -> bool {
         self.value

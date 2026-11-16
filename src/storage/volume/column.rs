@@ -1001,15 +1001,6 @@ impl ColumnBloomFilter {
         &self.bits
     }
 
-    /// Serialize the bitset to bytes in little-endian format.
-    pub fn bits_as_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.bits.len() * 8);
-        for &word in &self.bits {
-            out.extend_from_slice(&word.to_le_bytes());
-        }
-        out
-    }
-
     /// A filter that rejects nothing, for a column the file has none for
     pub fn accept_all() -> Self {
         Self::from_parts(64, &[0xFF; 8])
@@ -1164,12 +1155,6 @@ impl ZoneMap {
             .map(|o| o != std::cmp::Ordering::Less)
             .unwrap_or(true);
         above_min && below_max
-    }
-
-    /// Check if a predicate `column BETWEEN low AND high` can possibly match.
-    #[inline]
-    pub fn may_contain_between(&self, low: &Value, high: &Value, nans: bool) -> bool {
-        self.may_contain_gte(low, nans) && self.may_contain_lte(high, nans)
     }
 }
 

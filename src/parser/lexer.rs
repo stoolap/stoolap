@@ -582,37 +582,12 @@ impl<'a> Lexer<'a> {
         self.token_since(start)
     }
 
-    /// Get the last error encountered
-    pub fn get_error(&self) -> Option<&str> {
-        self.last_error.as_deref()
-    }
-
     /// Peek at the next token without advancing
     pub fn peek_token(&mut self) -> Token {
         let mark = self.mark();
         let token = self.next_token();
         self.reset(mark);
         token
-    }
-
-    /// Peek at the next n tokens without advancing
-    pub fn peek_tokens(&mut self, n: usize) -> Vec<Token> {
-        if n == 0 {
-            return Vec::new();
-        }
-
-        let mark = self.mark();
-        let mut tokens = Vec::with_capacity(n);
-        for _ in 0..n {
-            let token = self.next_token();
-            if token.is_eof() {
-                tokens.push(token);
-                break;
-            }
-            tokens.push(token);
-        }
-        self.reset(mark);
-        tokens
     }
 }
 
@@ -931,21 +906,6 @@ mod tests {
     }
 
     #[test]
-    fn test_peek_tokens() {
-        let mut lexer = Lexer::new("SELECT * FROM users");
-
-        let peeked = lexer.peek_tokens(3);
-        assert_eq!(peeked.len(), 3);
-        assert_eq!(peeked[0].literal, "SELECT");
-        assert_eq!(peeked[1].literal, "*");
-        assert_eq!(peeked[2].literal, "FROM");
-
-        // Position should not have changed
-        let actual = lexer.next_token();
-        assert_eq!(actual.literal, "SELECT");
-    }
-
-    #[test]
     fn test_complex_query() {
         let query = r#"
             SELECT u.id, u.name, COUNT(o.id) as order_count
@@ -981,7 +941,10 @@ mod tests {
             Keyword::Order,
             Keyword::Limit,
         ] {
-            assert!(tokens.iter().any(|t| t.is_keyword(keyword)), "{keyword:?}");
+            assert!(
+                tokens.iter().any(|t| t.keyword == Some(keyword)),
+                "{keyword:?}"
+            );
         }
     }
 
@@ -1070,7 +1033,7 @@ mod tests {
         let token = lexer.next_token();
         assert_eq!(token.token_type, TokenType::Float);
         assert_eq!(token.literal, "1e+");
-        assert!(lexer.get_error().is_some());
+        assert!(lexer.last_error.is_some());
 
         // a bare $ is a parameter without a number: an error token
         let mut lexer = Lexer::new("$ ");
@@ -1081,7 +1044,7 @@ mod tests {
         let token = lexer.next_token();
         assert_eq!(token.token_type, TokenType::Comment);
         assert_eq!(token.literal, "/* never closed");
-        assert!(lexer.get_error().is_some());
+        assert!(lexer.last_error.is_some());
 
         // a quoted identifier that never closes is an error token
         let mut lexer = Lexer::new("\"never closed");

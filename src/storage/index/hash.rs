@@ -46,9 +46,8 @@ use rustc_hash::FxHashMap;
 
 use super::id_list::IdList;
 use crate::common::deadline::{Deadline, DeadlineSite, CHARGE_BEAT};
-use crate::common::{CompactArc, I64Map};
-use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
-use crate::storage::expression::{ComparisonExpr, Expression, InListExpr};
+use crate::common::CompactArc;
+use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, Value};
 use crate::storage::traits::Index;
 
 /// Fixed seeds for deterministic hashing across add/find operations
@@ -236,14 +235,6 @@ impl Index for HashIndex {
         &self.name
     }
 
-    fn table_name(&self) -> &str {
-        &self.table_name
-    }
-
-    fn build(&mut self) -> Result<()> {
-        Ok(())
-    }
-
     fn add(&self, values: &[Value], row_id: i64, _ref_id: i64) -> Result<()> {
         if self.closed.load(AtomicOrdering::Acquire) {
             return Err(Error::IndexClosed);
@@ -290,13 +281,6 @@ impl Index for HashIndex {
         Ok(())
     }
 
-    fn add_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
-        for (row_id, values) in entries.iter() {
-            self.add(values, row_id, 0)?;
-        }
-        Ok(())
-    }
-
     fn remove(&self, values: &[Value], row_id: i64, _ref_id: i64) -> Result<()> {
         if self.closed.load(AtomicOrdering::Acquire) {
             return Err(Error::IndexClosed);
@@ -321,13 +305,6 @@ impl Index for HashIndex {
             }
         }
 
-        Ok(())
-    }
-
-    fn remove_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
-        for (row_id, values) in entries.iter() {
-            self.remove(values, row_id, 0)?;
-        }
         Ok(())
     }
 
@@ -668,47 +645,6 @@ impl Index for HashIndex {
         // Hash index does not support range queries - do nothing
     }
 
-    fn get_filtered_row_ids(&self, expr: &dyn Expression) -> RowIdVec {
-        // Try to optimize for IN list expressions
-        if let Some(in_list) = expr.as_any().downcast_ref::<InListExpr>() {
-            // Check if this IN list is on our indexed column
-            if let Some(col_name) = in_list.get_column_name() {
-                if self.column_names.len() == 1 && self.column_names[0] == col_name {
-                    // Use efficient get_row_ids_in
-                    let values = in_list.get_values();
-                    return self.get_row_ids_in(values);
-                }
-            }
-        }
-
-        // Try to optimize for equality expressions
-        if let Some(comparison) = expr.as_any().downcast_ref::<ComparisonExpr>() {
-            if comparison.operator() == Operator::Eq {
-                if let Some(col_name) = comparison.get_column_name() {
-                    if self.column_names.len() == 1 && self.column_names[0] == col_name {
-                        // Use efficient equality lookup
-                        return self.get_row_ids_equal(&[comparison.value().to_value()]);
-                    }
-                }
-            }
-        }
-
-        // Fallback: return all row IDs and let caller filter
-        // This is inefficient but necessary for correctness for complex expressions
-        let hash_to_values = self.hash_to_values.read();
-        let mut results = RowIdVec::new();
-
-        for entries in hash_to_values.values() {
-            for (_values, row_ids) in entries {
-                for page in row_ids.pages() {
-                    results.extend_from_slice(page);
-                }
-            }
-        }
-
-        results
-    }
-
     fn get_all_values(&self, deadline: Deadline) -> Result<Option<Vec<Value>>> {
         if self.closed.load(AtomicOrdering::Acquire) {
             return Ok(None);
@@ -770,11 +706,6 @@ impl Index for HashIndex {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
-    }
-
-    fn close(&mut self) -> Result<()> {
-        self.closed.store(true, AtomicOrdering::Release);
-        self.clear()
     }
 }
 

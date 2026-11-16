@@ -163,7 +163,7 @@ impl<V> I64Map<V> {
         self.len == 0 && self.min_slot.is_none()
     }
 
-    #[inline(always)]
+    #[cfg(test)]
     pub fn capacity(&self) -> usize {
         self.slots.len()
     }
@@ -400,25 +400,6 @@ impl<V> I64Map<V> {
         Some(value)
     }
 
-    /// Removes `key` and keeps the capacity: the table is never rehashed
-    /// here, for a caller that replaces the map whole once it is empty
-    pub fn remove_keeping_capacity(&mut self, key: i64) -> Option<V> {
-        if key == EMPTY {
-            return self.sentinel_remove();
-        }
-        self.take_slot(key)
-    }
-
-    /// When the map is empty and larger than `fresh`, swaps the two tables:
-    /// `fresh` then holds the old one, for the caller to drop later
-    pub fn swap_if_empty(&mut self, fresh: &mut Self) -> bool {
-        let swap = self.is_empty() && self.capacity() > fresh.capacity();
-        if swap {
-            std::mem::swap(self, fresh);
-        }
-        swap
-    }
-
     fn take_slot(&mut self, key: i64) -> Option<V> {
         let mask = self.mask;
         let mut idx = Self::hash(key) & mask;
@@ -527,13 +508,6 @@ impl<V> I64Map<V> {
         debug_assert_eq!(self.len, old_len);
     }
 
-    /// Shrink the map to fit its current contents, releasing excess memory.
-    ///
-    /// Call this after removing many entries to reclaim memory.
-    pub fn shrink_to_fit(&mut self) {
-        self.shrink();
-    }
-
     pub fn clear(&mut self) {
         for slot in self.slots.iter_mut() {
             if slot.key != EMPTY {
@@ -584,21 +558,6 @@ impl<V> I64Map<V> {
                 }
             })
             .chain(self.min_slot.as_ref())
-    }
-
-    #[inline]
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (i64, &mut V)> {
-        self.slots
-            .iter_mut()
-            .filter_map(|slot| {
-                if slot.key != EMPTY {
-                    // SAFETY: slot.key != EMPTY means the value is initialized.
-                    Some((slot.key, unsafe { slot.value.assume_init_mut() }))
-                } else {
-                    None
-                }
-            })
-            .chain(self.min_slot.as_mut().map(|v| (EMPTY, v)))
     }
 
     /// Retains only the elements specified by the predicate.
@@ -741,22 +700,6 @@ pub enum Entry<'a, V> {
 
 impl<'a, V> Entry<'a, V> {
     #[inline(always)]
-    pub fn or_insert(self, default: V) -> &'a mut V {
-        match self {
-            Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => e.insert(default),
-        }
-    }
-
-    #[inline(always)]
-    pub fn or_insert_with<F: FnOnce() -> V>(self, f: F) -> &'a mut V {
-        match self {
-            Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => e.insert(f()),
-        }
-    }
-
-    #[inline(always)]
     pub fn or_default(self) -> &'a mut V
     where
         V: Default,
@@ -764,17 +707,6 @@ impl<'a, V> Entry<'a, V> {
         match self {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => e.insert(V::default()),
-        }
-    }
-
-    #[inline(always)]
-    pub fn and_modify<F: FnOnce(&mut V)>(self, f: F) -> Self {
-        match self {
-            Entry::Occupied(mut e) => {
-                f(e.get_mut());
-                Entry::Occupied(e)
-            }
-            Entry::Vacant(e) => Entry::Vacant(e),
         }
     }
 }
@@ -789,55 +721,6 @@ enum EntryTarget<'a, V> {
 enum VacantTarget<'a, V> {
     Slot { map: &'a mut I64Map<V>, idx: usize },
     Sentinel(&'a mut Option<V>),
-}
-
-/// Encode an `f64` as an [`I64Map`] or [`I64Set`] key.
-///
-/// The map takes its bucket from the low bits of the key, so a key whose
-/// entropy sits above them lands in a handful of buckets. Raw `f64::to_bits()`
-/// is exactly that shape: an IEEE-754 double holding a round value carries its
-/// significant bits at the top of the mantissa and leaves the low mantissa
-/// bits zero. Keying a map directly with the bit pattern puts every group of a
-/// `GROUP BY <double column>` into one bucket and turns the scan quadratic, on
-/// data as ordinary as whole numbers or money amounts.
-///
-/// The bit pattern is passed through the SplitMix64 finalizer, whose steps are
-/// each invertible, so the encoding is a bijection: distinct doubles keep
-/// distinct keys and grouping stays exact. [`f64_from_key`] recovers the
-/// original value.
-///
-/// The encoding preserves the bit-level identity of the value, so `0.0` and
-/// `-0.0` remain distinct keys and NaN payloads stay distinguished, exactly as
-/// the raw bit pattern did.
-#[inline]
-pub fn key_from_f64(value: f64) -> i64 {
-    let mut x = value.to_bits();
-    x ^= x >> 30;
-    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    x ^= x >> 27;
-    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
-    x ^= x >> 31;
-    x as i64
-}
-
-/// Recover the `f64` that [`key_from_f64`] encoded.
-///
-/// Each step undoes one step of the finalizer in reverse order. Undoing
-/// `x ^= x >> s` takes the shift applied at `s`, then `2s`, until it reaches
-/// past the width, and the multiplications are undone with the multiplicative
-/// inverses of their constants modulo 2^64.
-#[inline]
-pub fn f64_from_key(key: i64) -> f64 {
-    let mut x = key as u64;
-    x ^= x >> 31;
-    x ^= x >> 62;
-    x = x.wrapping_mul(0x3196_42b2_d24d_8ec3);
-    x ^= x >> 27;
-    x ^= x >> 54;
-    x = x.wrapping_mul(0x96de_1b17_3f11_9089);
-    x ^= x >> 30;
-    x ^= x >> 60;
-    f64::from_bits(x)
 }
 
 pub struct OccupiedEntry<'a, V> {
@@ -878,89 +761,6 @@ impl<'a, V> OccupiedEntry<'a, V> {
             EntryTarget::Sentinel(slot) => slot.as_mut().expect("occupied sentinel"),
         }
     }
-
-    #[inline(always)]
-    pub fn insert(&mut self, value: V) -> V {
-        match &mut self.target {
-            EntryTarget::Slot { map, idx } => {
-                // SAFETY: OccupiedEntry is only created for occupied slots.
-                let slot = unsafe { map.slots.get_unchecked_mut(*idx) };
-                // SAFETY: The slot is occupied, so value is initialized.
-                let old = unsafe { slot.value.as_ptr().read() };
-                slot.value.write(value);
-                old
-            }
-            EntryTarget::Sentinel(slot) => slot.replace(value).expect("occupied sentinel"),
-        }
-    }
-
-    pub fn remove(self) -> V {
-        match self.target {
-            EntryTarget::Slot { map, idx } => {
-                // Extract value directly - we already have the index
-                // SAFETY: OccupiedEntry is only created for occupied slots.
-                let key = unsafe { map.slots.get_unchecked(idx).key };
-                // SAFETY: The slot is occupied, so value is initialized.
-                let value = unsafe { map.slots.get_unchecked(idx).value.as_ptr().read() };
-                map.len -= 1;
-
-                // Backward shift deletion at known index
-                let mask = map.mask;
-                let mut empty_idx = idx;
-                let mut next_idx = (idx + 1) & mask;
-
-                loop {
-                    // SAFETY: next_idx is always in bounds due to masking.
-                    let next_slot = unsafe { map.slots.get_unchecked(next_idx) };
-
-                    if next_slot.key == EMPTY {
-                        break;
-                    }
-
-                    let next_home = I64Map::<V>::hash(next_slot.key) & mask;
-
-                    // Check if empty_idx is between next_home and next_idx (considering wrap)
-                    let can_move = if next_home <= next_idx {
-                        empty_idx >= next_home && empty_idx < next_idx
-                    } else {
-                        empty_idx >= next_home || empty_idx < next_idx
-                    };
-
-                    if can_move {
-                        // Move entry back
-                        // SAFETY: Both indices are in bounds, src slot is occupied, dst slot is empty.
-                        // Derive both pointers from a single as_mut_ptr() call to avoid
-                        // Stacked Borrows invalidation (as_ptr then as_mut_ptr conflicts).
-                        unsafe {
-                            let base = map.slots.as_mut_ptr();
-                            let src = base.add(next_idx);
-                            let dst = base.add(empty_idx);
-                            (*dst).key = (*src).key;
-                            std::ptr::copy_nonoverlapping(
-                                (*src).value.as_ptr(),
-                                (*dst).value.as_mut_ptr(),
-                                1,
-                            );
-                        }
-                        empty_idx = next_idx;
-                    }
-
-                    next_idx = (next_idx + 1) & mask;
-                }
-
-                // SAFETY: empty_idx is in bounds and we're marking the now-empty slot.
-                unsafe {
-                    map.slots.get_unchecked_mut(empty_idx).key = EMPTY;
-                }
-
-                // Suppress unused variable warning
-                let _ = key;
-
-                value
-            }
-            EntryTarget::Sentinel(slot) => slot.take().expect("occupied sentinel"),
-        }
-    }
 }
 
 pub struct VacantEntry<'a, V> {
@@ -969,11 +769,6 @@ pub struct VacantEntry<'a, V> {
 }
 
 impl<'a, V> VacantEntry<'a, V> {
-    #[inline(always)]
-    pub fn key(&self) -> i64 {
-        self.key
-    }
-
     #[inline(always)]
     pub fn insert(self, value: V) -> &'a mut V {
         match self.target {
@@ -1158,42 +953,6 @@ impl I64Set {
     #[inline(always)]
     pub fn capacity(&self) -> usize {
         self.slots.len()
-    }
-
-    /// Reserves capacity for at least `additional` more elements to be inserted
-    /// in the set. The collection may reserve more space to avoid frequent reallocations.
-    pub fn reserve(&mut self, additional: usize) {
-        let target_len = self.len + additional;
-        let target_cap = if target_len == 0 {
-            MIN_CAPACITY
-        } else {
-            target_len
-                .saturating_mul(LOAD_FACTOR_DEN)
-                .saturating_div(LOAD_FACTOR_NUM)
-                .next_power_of_two()
-                .max(MIN_CAPACITY)
-        };
-
-        if target_cap <= self.slots.len() {
-            return;
-        }
-
-        let new_cap = target_cap;
-        let new_mask = new_cap - 1;
-
-        let new_slots: Vec<i64> = vec![EMPTY; new_cap];
-        let old_slots = std::mem::replace(&mut self.slots, new_slots.into_boxed_slice());
-        let old_len = self.len;
-        self.len = 0;
-        self.mask = new_mask;
-
-        for slot in old_slots.iter() {
-            if *slot != EMPTY {
-                self.insert(*slot);
-            }
-        }
-
-        debug_assert_eq!(self.len, old_len);
     }
 
     /// FxHash with pre-mixing - same as I64Map
@@ -1432,21 +1191,6 @@ impl I64Set {
         debug_assert_eq!(self.len, old_len);
     }
 
-    /// Shrink the set to fit its current contents, releasing excess memory.
-    ///
-    /// Call this after removing many entries to reclaim memory.
-    pub fn shrink_to_fit(&mut self) {
-        self.shrink();
-    }
-
-    pub fn clear(&mut self) {
-        for slot in self.slots.iter_mut() {
-            *slot = EMPTY;
-        }
-        self.len = 0;
-        self.has_min = false;
-    }
-
     #[inline]
     pub fn iter(&self) -> impl Iterator<Item = i64> + '_ {
         self.slots
@@ -1472,26 +1216,6 @@ impl I64Set {
         if self.has_min {
             each(1, &mut std::iter::once(EMPTY));
         }
-    }
-
-    /// Drains all values from the set, returning an iterator over them
-    #[inline]
-    pub fn drain(&mut self) -> impl Iterator<Item = i64> + '_ {
-        // Hand the storage to the iterator instead of clearing lazily:
-        // a drain dropped half-way used to leave the slots populated
-        // while len said the set was empty, so contains() still matched
-        let old_slots = std::mem::replace(
-            &mut self.slots,
-            vec![EMPTY; MIN_CAPACITY].into_boxed_slice(),
-        );
-        let had_min = std::mem::replace(&mut self.has_min, false);
-        self.len = 0;
-        self.mask = MIN_CAPACITY - 1;
-        old_slots
-            .into_vec()
-            .into_iter()
-            .filter(|&slot| slot != EMPTY)
-            .chain(if had_min { Some(EMPTY) } else { None })
     }
 }
 
@@ -1626,46 +1350,6 @@ mod tests {
     const LARGE: i64 = 1_000_000;
 
     #[test]
-    fn removing_while_keeping_capacity_never_walks_the_map() {
-        let mut map: I64Map<i64> = I64Map::with_capacity(LARGE as usize);
-        for key in 0..LARGE {
-            map.insert(key, key);
-        }
-        let capacity = map.capacity();
-        let before = slot_visits();
-        let mut next = 0;
-        for left in [4_096, 1, 0] {
-            while map.len() > left {
-                assert_eq!(map.remove_keeping_capacity(next), Some(next));
-                next += 1;
-            }
-            assert_eq!(
-                (slot_visits() - before, map.capacity()),
-                (0, capacity),
-                "{left} left"
-            );
-        }
-        let mut old = I64Map::new();
-        assert!(map.swap_if_empty(&mut old), "an empty large map is swapped");
-        assert_eq!((old.capacity(), map.capacity()), (capacity, MIN_CAPACITY));
-        assert_eq!(slot_visits() - before, 0, "the swap walks nothing");
-        drop(old);
-        assert_eq!(
-            slot_visits() - before,
-            capacity,
-            "the old map is walked when dropped"
-        );
-    }
-
-    #[test]
-    fn a_map_with_rows_left_is_not_swapped() {
-        let mut map: I64Map<i64> = I64Map::with_capacity(LARGE as usize);
-        map.insert(1, 1);
-        assert!(!map.swap_if_empty(&mut I64Map::new()));
-        assert_eq!(map.get(1), Some(&1));
-    }
-
-    #[test]
     fn a_plain_remove_still_shrinks() {
         let mut map: I64Map<i64> = I64Map::with_capacity(LARGE as usize);
         for key in 0..LARGE {
@@ -1753,94 +1437,6 @@ mod tests {
         [1024usize, 4096, 65536]
             .into_iter()
             .map(|cap| (cap, cap * 3 / 4))
-    }
-
-    /// The encoding must be exactly reversible, or grouping would report the
-    /// wrong value for every float group.
-    #[test]
-    fn test_float_key_round_trips() {
-        let mut values = vec![
-            0.0,
-            -0.0,
-            1.0,
-            -1.0,
-            0.1,
-            -0.1,
-            f64::MIN,
-            f64::MAX,
-            f64::MIN_POSITIVE,
-            f64::EPSILON,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            f64::from_bits(1),                  // smallest subnormal
-            f64::from_bits(0x7ff8000000000001), // a NaN payload
-        ];
-        // A spread of ordinary values plus a deterministic pseudo-random walk
-        // over raw bit patterns, so exponents and mantissas of every shape are
-        // covered rather than just the friendly ones.
-        for i in 1..2000i64 {
-            values.push(i as f64);
-            values.push(i as f64 * 0.01);
-            values.push(1.0 / i as f64);
-        }
-        let mut x = 0x243f_6a88_85a3_08d3u64;
-        for _ in 0..20_000 {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            values.push(f64::from_bits(x));
-        }
-
-        for value in values {
-            let key = key_from_f64(value);
-            let back = f64_from_key(key);
-            assert_eq!(
-                back.to_bits(),
-                value.to_bits(),
-                "round trip changed the bit pattern of {value:?}"
-            );
-        }
-    }
-
-    /// Distinct doubles must keep distinct keys, or two groups would merge.
-    #[test]
-    fn test_float_key_is_injective() {
-        let mut keys = std::collections::HashSet::new();
-        for i in 0..50_000i64 {
-            assert!(
-                keys.insert(key_from_f64(i as f64 * 0.5)),
-                "two doubles collapsed onto one key"
-            );
-        }
-    }
-
-    /// Float keys must spread across buckets.
-    ///
-    /// A double holding a round value keeps its significant bits at the top of
-    /// the mantissa and its low mantissa bits at zero, and the map's bucket
-    /// comes from the low bits of the key, so feeding the raw bit pattern in
-    /// puts every group into one bucket. The bar here is half the keys landing
-    /// in distinct buckets; an ideal hash reaches about 0.7 * n at this load.
-    #[test]
-    fn test_float_keys_spread_across_buckets() {
-        for (cap, n) in sweep() {
-            type FloatFamily = (&'static str, fn(usize) -> f64);
-            let families: [FloatFamily; 5] = [
-                ("whole", |i| i as f64),
-                ("halves", |i| i as f64 * 0.5),
-                ("money", |i| i as f64 * 0.01),
-                ("irregular", |i| i as f64 * 1.000_000_123_4),
-                ("tiny", |i| i as f64 * 1e-9),
-            ];
-            for (name, f) in families {
-                let keys: Vec<i64> = (1..=n).map(|i| key_from_f64(f(i))).collect();
-                let occupancy = bucket_occupancy(&keys, cap);
-                assert!(
-                    occupancy > n / 2,
-                    "{n} {name} float keys landed in {occupancy} of {cap} buckets"
-                );
-            }
-        }
     }
 
     /// A dense key range inside one 2^16 block must never collide.
@@ -2011,15 +1607,6 @@ mod tests {
     #[test]
     fn test_entry_api() {
         let mut map = I64Map::new();
-
-        *map.entry(1).or_insert(10) += 5;
-        assert_eq!(map.get(1), Some(&15));
-
-        *map.entry(1).or_insert(100) += 5;
-        assert_eq!(map.get(1), Some(&20));
-
-        map.entry(2).or_insert_with(|| 42);
-        assert_eq!(map.get(2), Some(&42));
 
         let v: &mut i32 = map.entry(3).or_default();
         *v = 99;
@@ -2282,35 +1869,6 @@ mod tests {
     }
 
     #[test]
-    fn test_shrink_to_fit() {
-        let mut map: I64Map<i64> = I64Map::with_capacity(1000);
-
-        // Insert only a few entries
-        for i in 0..10 {
-            map.insert(i, i);
-        }
-
-        let initial_capacity = map.capacity();
-        assert!(initial_capacity >= 1000);
-
-        // Shrink to fit
-        map.shrink_to_fit();
-
-        let after_shrink = map.capacity();
-        assert!(
-            after_shrink < initial_capacity,
-            "capacity should shrink: {} < {}",
-            after_shrink,
-            initial_capacity
-        );
-
-        // Verify entries still work
-        for i in 0..10 {
-            assert_eq!(map.get(i), Some(&i));
-        }
-    }
-
-    #[test]
     fn test_strided_keys_no_collision_catastrophe() {
         // This test verifies that strided keys (e.g., multiples of 1024)
         // don't cause catastrophic collisions that would result in O(N^2) behavior.
@@ -2376,22 +1934,6 @@ mod tests {
     }
 
     #[test]
-    fn test_i64set_partial_drain_leaves_no_stale_keys() {
-        let mut set = I64Set::new();
-        set.insert(5);
-        set.insert(6);
-        set.insert(7);
-        {
-            let mut d = set.drain();
-            let _ = d.next();
-        }
-        assert!(set.is_empty(), "drain must empty the set");
-        for k in [5, 6, 7] {
-            assert!(!set.contains(k), "stale key {k} still visible after drain");
-        }
-    }
-
-    #[test]
     fn test_i64_min_drain() {
         let mut map = I64Map::<i64>::new();
         map.insert(i64::MIN, 42);
@@ -2417,27 +1959,18 @@ mod tests {
     #[test]
     fn test_i64_min_entry_api() {
         let mut map = I64Map::<i64>::new();
-        *map.entry(i64::MIN).or_insert(1) += 5;
-        assert_eq!(map.get(i64::MIN), Some(&6));
-
-        match map.entry(i64::MIN) {
-            Entry::Occupied(mut e) => {
-                assert_eq!(*e.get(), 6);
-                assert_eq!(e.insert(9), 6);
-                assert_eq!(e.remove(), 9);
-            }
-            Entry::Vacant(_) => panic!("sentinel entry should be occupied"),
-        }
-        assert!(map.get(i64::MIN).is_none());
-
         match map.entry(i64::MIN) {
             Entry::Vacant(e) => {
-                assert_eq!(e.key(), i64::MIN);
                 *e.insert(4) += 1;
             }
             Entry::Occupied(_) => panic!("sentinel entry should be vacant"),
         }
         assert_eq!(map.get(i64::MIN), Some(&5));
+
+        match map.entry(i64::MIN) {
+            Entry::Occupied(e) => assert_eq!(*e.get(), 5),
+            Entry::Vacant(_) => panic!("sentinel entry should be occupied"),
+        }
 
         map.retain(|k, _| k != i64::MIN);
         assert!(map.get(i64::MIN).is_none());
@@ -2567,35 +2100,6 @@ mod tests {
     }
 
     #[test]
-    fn test_i64set_shrink_to_fit() {
-        let mut set = I64Set::with_capacity(1000);
-
-        // Insert only a few entries
-        for i in 0..10 {
-            set.insert(i);
-        }
-
-        let initial_capacity = set.capacity();
-        assert!(initial_capacity >= 1000);
-
-        // Shrink to fit
-        set.shrink_to_fit();
-
-        let after_shrink = set.capacity();
-        assert!(
-            after_shrink < initial_capacity,
-            "capacity should shrink: {} < {}",
-            after_shrink,
-            initial_capacity
-        );
-
-        // Verify entries still work
-        for i in 0..10 {
-            assert!(set.contains(i));
-        }
-    }
-
-    #[test]
     fn test_i64set_strided_keys() {
         let mut set = I64Set::with_capacity(10000);
         let stride = 1024;
@@ -2660,10 +2164,5 @@ mod tests {
         assert!(!set.remove(i64::MIN));
         assert!(!set.contains(i64::MIN));
         assert_eq!(set.len(), 2);
-
-        set.insert(i64::MIN);
-        set.clear();
-        assert!(set.is_empty());
-        assert!(!set.contains(i64::MIN));
     }
 }

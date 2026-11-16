@@ -239,11 +239,6 @@ impl CachedResult {
         }
     }
 
-    /// Check if this cached result has expired
-    pub fn is_expired(&self, ttl: Duration) -> bool {
-        self.cached_at.elapsed() > ttl
-    }
-
     /// Check if this cached result has expired, using a pre-computed `now` instant.
     /// Avoids repeated `Instant::now()` calls (each is a syscall on macOS).
     #[inline]

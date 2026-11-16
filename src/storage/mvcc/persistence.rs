@@ -23,15 +23,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::RwLock;
 use std::time::Duration;
 
 use crate::common::time_compat::{SystemTime, UNIX_EPOCH};
 
 use crate::common::{CompactArc, SmartString};
-use crate::core::{DataType, Error, IndexType, Result, Row, Schema, Value};
+use crate::core::{DataType, Error, IndexType, Result, Row, Value};
 use crate::storage::mvcc::version_store::RowVersion;
 use crate::storage::mvcc::wal_manager::{WALEntry, WALManager, WALOperationType};
 use crate::storage::PersistenceConfig;
@@ -305,8 +303,6 @@ impl IndexMetadata {
 pub struct PersistenceMeta {
     /// Last checkpoint time (Unix nanoseconds)
     pub last_checkpoint_time: AtomicI64,
-    /// LSN covered by the last snapshot
-    pub last_snapshot_lsn: AtomicU64,
     /// Last WAL LSN (used during recovery)
     pub last_wal_lsn: AtomicU64,
 }
@@ -321,14 +317,8 @@ pub struct PersistenceManager {
     meta: PersistenceMeta,
     /// Whether persistence is enabled
     enabled: AtomicBool,
-    /// Checkpoint interval
-    checkpoint_interval: Duration,
-    /// Number of snapshots to keep
-    keep_count: usize,
     /// Running flag for background tasks
     running: AtomicBool,
-    /// Table schemas cache
-    schemas: RwLock<FxHashMap<String, CompactArc<Schema>>>,
     /// Whether volumes are written compressed, as configured at open
     volume_compression: bool,
 }
@@ -343,10 +333,7 @@ impl PersistenceManager {
                 wal: None,
                 meta: PersistenceMeta::default(),
                 enabled: AtomicBool::new(false),
-                checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
-                keep_count: DEFAULT_KEEP_SNAPSHOTS,
                 running: AtomicBool::new(false),
-                schemas: RwLock::new(FxHashMap::default()),
                 volume_compression: config.volume_compression,
             });
         }
@@ -365,28 +352,12 @@ impl PersistenceManager {
         // Get initial LSN from WAL
         let initial_lsn = wal.current_lsn();
 
-        // Configure intervals
-        let checkpoint_interval = if config.checkpoint_interval > 0 {
-            Duration::from_secs(config.checkpoint_interval as u64)
-        } else {
-            DEFAULT_CHECKPOINT_INTERVAL
-        };
-
-        let keep_count = if config.keep_snapshots > 0 {
-            config.keep_snapshots as usize
-        } else {
-            DEFAULT_KEEP_SNAPSHOTS
-        };
-
         let pm = Self {
             path: path.to_path_buf(),
             wal: Some(wal),
             meta: PersistenceMeta::default(),
             enabled: AtomicBool::new(true),
-            checkpoint_interval,
-            keep_count,
             running: AtomicBool::new(false),
-            schemas: RwLock::new(FxHashMap::default()),
             volume_compression: config.volume_compression,
         };
 
@@ -553,37 +524,6 @@ impl PersistenceManager {
         Ok(())
     }
 
-    /// Record an index operation (CREATE INDEX, DROP INDEX)
-    pub fn record_index_operation(
-        &self,
-        table_name: &str,
-        op: WALOperationType,
-        index_data: &[u8],
-    ) -> Result<()> {
-        if !self.is_enabled() {
-            return Ok(());
-        }
-
-        let wal = self.wal.as_ref().ok_or(Error::WalNotInitialized)?;
-
-        let entry = WALEntry::new(
-            DDL_TXN_ID,
-            table_name.to_string(),
-            0,
-            op,
-            index_data.to_vec(),
-        );
-
-        // One unit with its marker, as for any DDL
-        wal.append_unit(vec![entry, WALEntry::commit_marker(DDL_TXN_ID)], false)?;
-
-        // Attempt WAL rotation if file exceeds max size.
-        // Failure is non-critical: the commit is already persisted.
-        let _ = wal.maybe_rotate();
-
-        Ok(())
-    }
-
     /// Record DML and return its assigned WAL LSN, or None when persistence is disabled.
     pub fn record_dml_operation(
         &self,
@@ -665,30 +605,6 @@ impl PersistenceManager {
         wal.replay_two_phase(from_lsn, callback)
     }
 
-    /// Create a checkpoint and return the LSN at the checkpoint point
-    ///
-    /// Returns the LSN that represents the checkpoint point. All data up to
-    /// this LSN is guaranteed to be durably written to disk when this returns.
-    /// Returns 0 if persistence is not enabled.
-    pub fn create_checkpoint(&self, active_transactions: Vec<i64>) -> Result<u64> {
-        if !self.is_enabled() {
-            return Ok(0);
-        }
-
-        let wal = self.wal.as_ref().ok_or(Error::WalNotInitialized)?;
-
-        let checkpoint_lsn = wal.create_checkpoint(active_transactions)?;
-
-        // Update last checkpoint time
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as i64)
-            .unwrap_or(0);
-        self.meta.last_checkpoint_time.store(now, Ordering::Release);
-
-        Ok(checkpoint_lsn)
-    }
-
     /// Get the persistence path
     pub fn path(&self) -> &Path {
         &self.path
@@ -716,46 +632,9 @@ impl PersistenceManager {
         self.wal.as_ref().map_or(Ok(()), |wal| wal.check_writable())
     }
 
-    /// Get the checkpoint interval
-    pub fn checkpoint_interval(&self) -> Duration {
-        self.checkpoint_interval
-    }
-
     /// Get the last checkpoint time in Unix nanoseconds
     pub fn last_checkpoint_time(&self) -> i64 {
         self.meta.last_checkpoint_time.load(Ordering::Acquire)
-    }
-
-    /// Get the number of snapshots to keep
-    pub fn keep_count(&self) -> usize {
-        self.keep_count
-    }
-
-    /// Register a table schema
-    pub fn register_schema(&self, name: &str, schema: CompactArc<Schema>) {
-        let mut schemas = self
-            .schemas
-            .write()
-            .expect("schemas lock poisoned in register_schema");
-        schemas.insert(name.to_string(), schema);
-    }
-
-    /// Get a table schema
-    pub fn get_schema(&self, name: &str) -> Option<CompactArc<Schema>> {
-        let schemas = self
-            .schemas
-            .read()
-            .expect("schemas lock poisoned in get_schema");
-        schemas.get(name).cloned()
-    }
-
-    /// Remove a table schema
-    pub fn remove_schema(&self, name: &str) {
-        let mut schemas = self
-            .schemas
-            .write()
-            .expect("schemas lock poisoned in remove_schema");
-        schemas.remove(name);
     }
 }
 
@@ -1372,31 +1251,5 @@ mod tests {
             assert_eq!(data_count, 5);
             assert_eq!(commit_count, 5); // 5 commit markers for 5 transactions
         }
-    }
-
-    #[test]
-    fn test_persistence_manager_checkpoint() {
-        let dir = tempdir().unwrap();
-        let config = PersistenceConfig {
-            enabled: true,
-            sync_mode: SyncMode::Full,
-            ..Default::default()
-        };
-
-        let pm = PersistenceManager::new(Some(dir.path()), &config).unwrap();
-        pm.start().unwrap();
-
-        // Add some entries
-        pm.record_ddl_operation("test", WALOperationType::CreateTable, b"schema")
-            .unwrap();
-
-        // Create checkpoint
-        pm.create_checkpoint(vec![]).unwrap();
-
-        // Verify checkpoint exists
-        let checkpoint_path = dir.path().join("wal").join("checkpoint.meta");
-        assert!(checkpoint_path.exists());
-
-        pm.stop().unwrap();
     }
 }

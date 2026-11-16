@@ -37,9 +37,8 @@ pub use expression::{
 
 // Re-export index types
 pub use index::{
-    intersect_multiple_sorted_ids, intersect_sorted_ids, union_multiple_sorted_ids,
-    union_sorted_ids, BTreeIndex, BitmapIndex, CompositeKey, HashIndex, HnswDistanceMetric,
-    HnswIndex, MultiColumnIndex, PkIndex,
+    BTreeIndex, BitmapIndex, CompositeKey, HashIndex, HnswDistanceMetric, HnswIndex,
+    MultiColumnIndex, PkIndex,
 };
 
 // Re-export config types
@@ -53,10 +52,9 @@ pub use traits::{
 
 // Re-export MVCC types
 pub use mvcc::{
-    get_fast_timestamp, EmptyScanner as MvccEmptyScanner, MVCCEngine, MVCCScanner, MVCCTable,
-    MvccTransaction, RowVersion, TransactionEngineOperations, TransactionRegistry,
-    TransactionState, TransactionVersionStore, VersionStore, VisibilityChecker, WriteSetEntry,
-    INVALID_TRANSACTION_ID, RECOVERY_TRANSACTION_ID,
+    MVCCEngine, MVCCScanner, MVCCTable, MvccTransaction, RowVersion, TransactionEngineOperations,
+    TransactionRegistry, TransactionState, TransactionVersionStore, VersionStore,
+    VisibilityChecker, WriteSetEntry, INVALID_TRANSACTION_ID, RECOVERY_TRANSACTION_ID,
 };
 
 // Re-export WAL types
@@ -73,9 +71,7 @@ pub use mvcc::{
 };
 
 // Re-export Zone Map types
-pub use mvcc::{
-    ColumnZoneMap, PruneStats, TableZoneMap, ZoneMapBuilder, ZoneMapEntry, DEFAULT_SEGMENT_SIZE,
-};
+pub use mvcc::{ColumnZoneMap, TableZoneMap, ZoneMapBuilder, ZoneMapEntry, DEFAULT_SEGMENT_SIZE};
 
 // Re-export Statistics types
 pub use statistics::{

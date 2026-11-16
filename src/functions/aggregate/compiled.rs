@@ -241,11 +241,6 @@ impl CompiledAggregate {
         CompiledAggregate::MinInteger { min_value: None }
     }
 
-    /// Create a compiled MIN aggregate for floats
-    pub fn min_float() -> Self {
-        CompiledAggregate::MinFloat { min_value: None }
-    }
-
     /// Create a compiled MAX aggregate (generic)
     pub fn max() -> Self {
         CompiledAggregate::Max { max_value: None }
@@ -254,11 +249,6 @@ impl CompiledAggregate {
     /// Create a compiled MAX aggregate for integers
     pub fn max_integer() -> Self {
         CompiledAggregate::MaxInteger { max_value: None }
-    }
-
-    /// Create a compiled MAX aggregate for floats
-    pub fn max_float() -> Self {
-        CompiledAggregate::MaxFloat { max_value: None }
     }
 
     /// Create from an aggregate call's state (fallback)
@@ -620,8 +610,8 @@ mod tests {
     fn float_min_and_max_order_nan_last() {
         let is_nan = |v: Value| matches!(v, Value::Float(f) if f.is_nan());
         for order in [[f64::NAN, -2.0, 1.5], [-2.0, 1.5, f64::NAN]] {
-            let mut min = CompiledAggregate::min_float();
-            let mut max = CompiledAggregate::max_float();
+            let mut min = CompiledAggregate::MinFloat { min_value: None };
+            let mut max = CompiledAggregate::MaxFloat { max_value: None };
             for v in order {
                 min.accumulate(&Value::Float(v));
                 max.accumulate(&Value::Float(v));
@@ -629,7 +619,7 @@ mod tests {
             assert_eq!(min.result().unwrap(), Value::Float(-2.0), "{order:?}");
             assert!(is_nan(max.result().unwrap()), "{order:?}");
         }
-        let mut min = CompiledAggregate::min_float();
+        let mut min = CompiledAggregate::MinFloat { min_value: None };
         min.accumulate(&Value::Float(f64::NAN));
         assert!(is_nan(min.result().unwrap()));
     }

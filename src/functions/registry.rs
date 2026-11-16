@@ -531,13 +531,6 @@ impl FunctionRegistry {
         self.is_aggregate(name) || self.is_scalar(name) || self.is_window(name) || self.is_tvf(name)
     }
 
-    /// Get function info by name
-    pub fn get_info(&self, name: &str) -> Option<FunctionInfo> {
-        let name = name.to_uppercase();
-        let infos = self.function_info.read().unwrap();
-        infos.get(&name).cloned()
-    }
-
     /// How often a call of `name` may answer differently: the most volatile
     /// of the functions the name can run, whichever kind a path resolves it
     /// to. The transaction id the compiler reads itself is one per statement;
@@ -629,15 +622,6 @@ mod tests {
         let row_number = registry.get_window("ROW_NUMBER");
         assert!(row_number.is_some());
         assert_eq!(row_number.unwrap().name(), "ROW_NUMBER");
-    }
-
-    #[test]
-    fn test_function_info() {
-        let registry = FunctionRegistry::new();
-        let info = registry.get_info("COUNT");
-        assert!(info.is_some());
-        let info = info.unwrap();
-        assert_eq!(info.name, "COUNT");
     }
 
     #[test]

@@ -213,131 +213,6 @@ fn filter_by_workers(rows: &[(i64, Row)], filter: &RowFilter) -> Result<Vec<bool
     }
 }
 
-/// Parallel filter with ownership transfer (more efficient for large results)
-///
-/// Uses parallel boolean marking + sequential extraction to minimize allocations.
-/// Only allocates: 1 bit-vec for marks + 1 RowVec for results.
-pub fn parallel_filter_owned(
-    rows: RowVec,
-    predicate: impl Fn(&Row) -> bool + Sync + Send,
-    config: &ParallelConfig,
-) -> RowVec {
-    #[cfg(feature = "parallel")]
-    {
-        let row_count = rows.len();
-        if config.should_parallel_filter(row_count) {
-            // Phase 1: Parallel marking - each thread marks matching rows
-            // Uses Vec<bool> which is 1 byte per row (could use bitvec for 1 bit)
-            let chunk_size = (row_count / num_threads()).max(1000);
-            let marks: Vec<bool> = rows
-                .par_chunks(chunk_size)
-                .flat_map(|chunk| {
-                    chunk
-                        .iter()
-                        .map(|(_, row)| predicate(row))
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-
-            // Count matches for pre-allocation
-            let match_count = marks.iter().filter(|&&b| b).count();
-
-            // Phase 2: Sequential extraction into RowVec (from cache)
-            let mut result = RowVec::with_capacity(match_count);
-            for ((id, row), keep) in rows.into_iter().zip(marks) {
-                if keep {
-                    result.push((id, row));
-                }
-            }
-            return result;
-        }
-    }
-
-    // Sequential fallback (always compiled)
-    let _ = config; // suppress unused warning when parallel feature is disabled
-    rows.into_iter().filter(|(_, r)| predicate(r)).collect()
-}
-
-/// Parallel sort using rayon's par_sort_unstable_by
-///
-/// For large datasets, parallel sort can provide 2-4x speedup.
-/// Uses unstable sort (faster, doesn't preserve order of equal elements).
-pub fn parallel_sort<F>(rows: &mut [(i64, Row)], compare: F, config: &ParallelConfig)
-where
-    F: Fn(&Row, &Row) -> std::cmp::Ordering + Sync + Send,
-{
-    #[cfg(feature = "parallel")]
-    if config.should_parallel_sort(rows.len()) {
-        rows.par_sort_unstable_by(|(_, a), (_, b)| compare(a, b));
-        return;
-    }
-    let _ = config; // suppress unused warning when parallel feature is disabled
-    rows.sort_unstable_by(|(_, a), (_, b)| compare(a, b));
-}
-
-/// Parallel sort that's unstable (faster but doesn't preserve order of equal elements)
-pub fn parallel_sort_unstable<F>(rows: &mut [(i64, Row)], compare: F, config: &ParallelConfig)
-where
-    F: Fn(&Row, &Row) -> std::cmp::Ordering + Sync + Send,
-{
-    #[cfg(feature = "parallel")]
-    if config.should_parallel_sort(rows.len()) {
-        rows.par_sort_unstable_by(|(_, a), (_, b)| compare(a, b));
-        return;
-    }
-    let _ = config; // suppress unused warning when parallel feature is disabled
-    rows.sort_unstable_by(|(_, a), (_, b)| compare(a, b));
-}
-
-/// Parallel projection - evaluate expressions on rows in parallel
-///
-/// For complex SELECT expressions (not simple column references),
-/// parallel evaluation can speed up projection significantly.
-/// Uses in-place parallel mapping to minimize allocations.
-pub fn parallel_project<F>(rows: RowVec, project_fn: F, config: &ParallelConfig) -> RowVec
-where
-    F: Fn(&Row) -> Row + Sync + Send,
-{
-    #[cfg(feature = "parallel")]
-    let row_count = rows.len();
-
-    #[cfg(feature = "parallel")]
-    if config.should_parallel_filter(row_count) {
-        // Parallel projection using par_chunks for better cache locality
-        let chunk_size = (row_count / num_threads()).max(1000);
-        let projected: Vec<(i64, Row)> = rows
-            .par_chunks(chunk_size)
-            .flat_map(|chunk| {
-                chunk
-                    .iter()
-                    .map(|(id, row)| (*id, project_fn(row)))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-
-        return RowVec::from_vec(projected);
-    }
-
-    // Sequential fallback (always compiled)
-    let _ = config; // suppress unused warning when parallel feature is disabled
-    rows.into_iter()
-        .map(|(id, r)| (id, project_fn(&r)))
-        .collect()
-}
-
-/// Statistics about parallel execution for monitoring/debugging
-#[derive(Clone, Debug, Default)]
-pub struct ParallelStats {
-    /// Number of rows processed
-    pub rows_processed: usize,
-    /// Number of rows that passed the filter
-    pub rows_passed: usize,
-    /// Number of chunks used
-    pub chunks_used: usize,
-    /// Whether parallel execution was used
-    pub parallel_used: bool,
-}
-
 // ============================================================================
 // Parallel Hash Join
 // ============================================================================
@@ -1277,20 +1152,6 @@ where
     rows.sort_unstable_by(|(_, a), (_, b)| compare(a, b));
 }
 
-/// Parallel ORDER BY with unstable sort (faster, but doesn't preserve order of equal elements)
-pub fn parallel_order_by_unstable<F>(rows: &mut [(i64, Row)], compare: F, config: &ParallelConfig)
-where
-    F: Fn(&Row, &Row) -> std::cmp::Ordering + Sync + Send,
-{
-    #[cfg(feature = "parallel")]
-    if config.should_parallel_sort(rows.len()) {
-        rows.par_sort_unstable_by(|(_, a), (_, b)| compare(a, b));
-        return;
-    }
-    let _ = config; // suppress unused warning when parallel feature is disabled
-    rows.sort_unstable_by(|(_, a), (_, b)| compare(a, b));
-}
-
 /// Distance metric for vector search
 #[derive(Debug, Clone, Copy)]
 pub enum DistanceMetric {
@@ -1493,48 +1354,6 @@ mod tests {
     use crate::core::Value;
     use crate::executor::utils::rows_equal;
 
-    fn make_test_rows(count: usize) -> RowVec {
-        (0..count)
-            .map(|i| {
-                (
-                    i as i64,
-                    Row::from_values(vec![
-                        Value::Integer(i as i64),
-                        Value::Integer(i as i64 % 10),
-                    ]),
-                )
-            })
-            .collect()
-    }
-
-    #[test]
-    fn test_parallel_sort() {
-        let mut rows: RowVec = (0..1000)
-            .rev()
-            .map(|i| (i, Row::from_values(vec![Value::Integer(i)])))
-            .collect();
-
-        let config = ParallelConfig {
-            min_rows_for_parallel_sort: 100,
-            ..Default::default()
-        };
-
-        parallel_sort(
-            &mut rows,
-            |a, b| {
-                let a_val = a.get(0).and_then(|v| v.as_int64()).unwrap_or(0);
-                let b_val = b.get(0).and_then(|v| v.as_int64()).unwrap_or(0);
-                a_val.cmp(&b_val)
-            },
-            &config,
-        );
-
-        // Verify sorted
-        for (i, (_, row)) in rows.iter().enumerate() {
-            assert_eq!(row.get(0), Some(&Value::Integer(i as i64)));
-        }
-    }
-
     #[test]
     fn test_parallel_config_thresholds() {
         let config = ParallelConfig::default();
@@ -1547,50 +1366,6 @@ mod tests {
 
         let disabled = ParallelConfig::disabled();
         assert!(!disabled.should_parallel_filter(1_000_000)); // Always false when disabled
-    }
-
-    #[test]
-    fn test_parallel_filter_owned() {
-        let rows = make_test_rows(50_000);
-        let config = ParallelConfig::default();
-
-        // Filter rows where second column (value) < 5
-        let result = parallel_filter_owned(
-            rows,
-            |row| {
-                if let Some(Value::Integer(v)) = row.get(1) {
-                    *v < 5
-                } else {
-                    false
-                }
-            },
-            &config,
-        );
-
-        // 50% selectivity: values 0-4 pass out of 0-9
-        assert_eq!(result.len(), 25_000);
-    }
-
-    #[test]
-    fn test_sequential_fallback_small_dataset() {
-        let rows = make_test_rows(100); // Below threshold
-        let config = ParallelConfig::default();
-
-        // Should use sequential path
-        let result = parallel_filter_owned(
-            rows,
-            |row| {
-                if let Some(Value::Integer(v)) = row.get(1) {
-                    *v < 5
-                } else {
-                    false
-                }
-            },
-            &config,
-        );
-
-        // 50% selectivity
-        assert_eq!(result.len(), 50);
     }
 
     #[test]

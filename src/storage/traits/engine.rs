@@ -19,7 +19,6 @@ use rustc_hash::FxHashMap;
 
 use crate::common::CompactArc;
 use crate::core::{IsolationLevel, Result, RowVec, Schema};
-use crate::storage::config::Config;
 use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::traits::{Index, Transaction};
 
@@ -31,29 +30,11 @@ use crate::storage::traits::{Index, Transaction};
 /// # Example
 ///
 /// ```ignore
-/// let config = Config::with_path("/tmp/mydb");
-/// let mut engine = MvccEngine::new(config);
-/// engine.open()?;
-///
 /// let tx = engine.begin_transaction()?;
 /// // ... perform operations ...
 /// tx.commit()?;
-///
-/// engine.close()?;
 /// ```
 pub trait Engine: Send + Sync {
-    /// Opens the storage engine
-    ///
-    /// This initializes the engine, opens the database path (if any),
-    /// recovers from WAL, and loads existing data.
-    fn open(&mut self) -> Result<()>;
-
-    /// Closes the storage engine
-    ///
-    /// This flushes pending writes, seals all hot rows into cold volumes
-    /// (when checkpoint_on_close is enabled), and releases all resources.
-    fn close(&mut self) -> Result<()>;
-
     /// Begins a new transaction
     ///
     /// The transaction will use the engine's default isolation level.
@@ -65,19 +46,8 @@ pub trait Engine: Send + Sync {
     /// * `level` - The isolation level for the transaction
     fn begin_transaction_with_level(&self, level: IsolationLevel) -> Result<Box<dyn Transaction>>;
 
-    /// Returns the path to the database directory
-    ///
-    /// Returns `None` if operating in memory-only mode.
-    fn path(&self) -> Option<&str>;
-
     /// Checks if a table exists
     fn table_exists(&self, table_name: &str) -> Result<bool>;
-
-    /// Checks if an index exists
-    fn index_exists(&self, index_name: &str, table_name: &str) -> Result<bool>;
-
-    /// Gets an index by name
-    fn get_index(&self, table_name: &str, index_name: &str) -> Result<Box<dyn Index>>;
 
     /// Gets the schema for a table
     ///
@@ -107,19 +77,6 @@ pub trait Engine: Send + Sync {
     /// Gets the current default isolation level
     fn get_isolation_level(&self) -> IsolationLevel;
 
-    /// Sets the default isolation level for new transactions
-    fn set_isolation_level(&mut self, level: IsolationLevel) -> Result<()>;
-
-    /// Gets the current engine configuration
-    ///
-    /// Returns a clone of the configuration to avoid lifetime issues with internal locks.
-    fn get_config(&self) -> Config;
-
-    /// Updates the engine configuration
-    ///
-    /// Note: Some configuration changes may require a restart to take effect.
-    fn update_config(&mut self, config: Config) -> Result<()>;
-
     /// Creates a full backup snapshot of all tables to .bin files.
     /// Backup files are stored in the snapshots/ directory.
     /// The keep_snapshots config limits how many backup files are retained per table.
@@ -135,20 +92,10 @@ pub trait Engine: Send + Sync {
         ))
     }
 
-    /// Runs the checkpoint cycle: seal hot buffers to volumes, persist manifests,
-    /// compact volumes, and truncate WAL. Used by the background checkpoint thread.
-    /// Respects seal thresholds (only seals when hot buffer exceeds size limits).
-    fn checkpoint_cycle(&self) -> Result<()>;
-
     /// Runs the checkpoint cycle with force seal: seals ALL hot rows into volumes
     /// regardless of threshold, then persists manifests, compacts, and truncates WAL.
     /// Used by PRAGMA CHECKPOINT and close_engine where all data must be durable.
     fn force_checkpoint_cycle(&self) -> Result<()>;
-
-    /// Deduplicate overlapping segments. Returns count of ghost duplicates fixed.
-    fn dedup_segments(&self) -> usize {
-        0
-    }
 
     /// Record an index creation operation to WAL for persistence
     ///

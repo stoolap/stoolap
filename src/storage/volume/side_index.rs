@@ -427,20 +427,6 @@ enum Bound<'v> {
 /// above it, past every key equal to its value
 type Edge<'v> = Option<(Bound<'v>, bool)>;
 
-/// Turns `prefix` into the least byte string above every string it starts:
-/// the last byte below 0xFF goes up by one and what follows it goes. False
-/// when no such string exists, every byte being 0xFF
-pub fn successor(prefix: &mut Vec<u8>) -> bool {
-    while let Some(last) = prefix.last_mut() {
-        if *last < 0xFF {
-            *last += 1;
-            return true;
-        }
-        prefix.pop();
-    }
-    false
-}
-
 /// What a comparison of a key column with a value asks of the entry
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolved {

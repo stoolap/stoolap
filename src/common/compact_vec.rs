@@ -159,12 +159,6 @@ impl<T> CompactVec<T> {
         self.ptr.as_ptr()
     }
 
-    /// Returns a raw mutable pointer to the vector's buffer.
-    #[inline(always)]
-    pub fn as_mut_ptr(&mut self) -> *mut T {
-        self.ptr.as_ptr()
-    }
-
     /// Appends an element to the back of the vector.
     #[inline]
     pub fn push(&mut self, value: T) {
@@ -235,21 +229,6 @@ impl<T> CompactVec<T> {
         if required > cap {
             let new_cap = required.max(cap.saturating_mul(2)).min(u32::MAX as usize);
             self.realloc(new_cap);
-        }
-    }
-
-    /// Reserves capacity for exactly `additional` more elements.
-    #[inline]
-    pub fn reserve_exact(&mut self, additional: usize) {
-        let len = Self::unpack_len(self.len_cap) as usize;
-        let cap = Self::unpack_cap(self.len_cap) as usize;
-        let required = len
-            .checked_add(additional)
-            .filter(|&required| required <= u32::MAX as usize)
-            .expect("CompactVec capacity overflow");
-
-        if required > cap {
-            self.realloc(required);
         }
     }
 
@@ -343,28 +322,6 @@ impl<T> CompactVec<T> {
         }
     }
 
-    /// Removes an element from the vector and returns it, replacing it with the last element.
-    #[inline]
-    pub fn swap_remove(&mut self, index: usize) -> T {
-        let len = self.len();
-        assert!(index < len, "swap_remove index out of bounds");
-
-        // SAFETY: index < len is asserted above. We read the element at index,
-        // then copy the last element to fill the gap, and decrement length.
-        unsafe {
-            let ptr = self.ptr.as_ptr();
-            let value = ptr::read(ptr.add(index));
-
-            // Copy last element to the removed position (if not removing last)
-            if index < len - 1 {
-                ptr::copy_nonoverlapping(ptr.add(len - 1), ptr.add(index), 1);
-            }
-
-            self.set_len(len - 1);
-            value
-        }
-    }
-
     /// Inserts an element at position `index`, shifting all elements after it to the right.
     ///
     /// # Panics
@@ -392,88 +349,6 @@ impl<T> CompactVec<T> {
             // Write the new element
             ptr::write(ptr, element);
             self.set_len(len + 1);
-        }
-    }
-
-    /// Retains only the elements specified by the predicate.
-    ///
-    /// Removes all elements `e` such that `f(&e)` returns `false`.
-    /// This method operates in place, visiting each element exactly once in the
-    /// original order, and preserves the order of the retained elements.
-    #[inline]
-    pub fn retain<F>(&mut self, mut f: F)
-    where
-        F: FnMut(&T) -> bool,
-    {
-        let original_len = self.len();
-
-        // The vector disowns its elements while they are being shifted; the
-        // guard hands back exactly the surviving ones, even if `f` panics.
-        // SAFETY: the guard below restores a correct length in every exit path.
-        unsafe {
-            self.set_len(0);
-        }
-
-        struct RetainGuard<'a, T> {
-            vec: &'a mut CompactVec<T>,
-            read_idx: usize,
-            write_idx: usize,
-            original_len: usize,
-        }
-
-        impl<T> Drop for RetainGuard<'_, T> {
-            fn drop(&mut self) {
-                let tail = self.original_len - self.read_idx;
-                if tail > 0 && self.write_idx != self.read_idx {
-                    // SAFETY: [read_idx..original_len] is still initialized and
-                    // write_idx < read_idx, so the move is backwards in place.
-                    unsafe {
-                        let ptr = self.vec.ptr.as_ptr();
-                        ptr::copy(ptr.add(self.read_idx), ptr.add(self.write_idx), tail);
-                    }
-                }
-                // SAFETY: exactly write_idx + tail elements are initialized.
-                unsafe {
-                    self.vec.set_len(self.write_idx + tail);
-                }
-            }
-        }
-
-        let mut guard = RetainGuard {
-            vec: self,
-            read_idx: 0,
-            write_idx: 0,
-            original_len,
-        };
-
-        while guard.read_idx < original_len {
-            let ptr = guard.vec.ptr.as_ptr();
-            // SAFETY: read_idx < original_len, so the element is initialized.
-            let keep = unsafe { f(&*ptr.add(guard.read_idx)) };
-            if keep {
-                if guard.write_idx != guard.read_idx {
-                    // SAFETY: write_idx < read_idx, so the two slots are distinct.
-                    unsafe {
-                        ptr::copy_nonoverlapping(
-                            ptr.add(guard.read_idx),
-                            ptr.add(guard.write_idx),
-                            1,
-                        );
-                    }
-                }
-                guard.write_idx += 1;
-                guard.read_idx += 1;
-            } else {
-                // Advance past the slot before dropping it: if `T::drop`
-                // panics, the guard must not count this element as untouched
-                // tail and hand the dropped value back to the vector.
-                let idx = guard.read_idx;
-                guard.read_idx += 1;
-                // SAFETY: the element is initialized and is not moved anywhere.
-                unsafe {
-                    ptr::drop_in_place(ptr.add(idx));
-                }
-            }
         }
     }
 
@@ -670,45 +545,12 @@ impl<T> CompactVec<T> {
         self.as_mut_slice().iter_mut()
     }
 
-    /// Drains elements from `start` to end, returning an iterator.
-    /// Elements are removed from the vector.
-    #[inline]
-    pub fn drain(&mut self, range: std::ops::RangeFrom<usize>) -> Drain<'_, T> {
-        let start = range.start;
-        let len = self.len();
-        assert!(start <= len, "drain start index out of bounds");
-
-        // Shorten the vector before yielding anything: a Drain that is leaked
-        // after moving elements out must not leave them owned by the vector.
-        // SAFETY: start <= len, and [0..start] stays initialized.
-        unsafe {
-            self.set_len(start);
-        }
-
-        Drain {
-            vec: self,
-            current: start,
-            end: len,
-        }
-    }
-
     /// Gets a reference to an element.
     #[inline(always)]
     pub fn get(&self, index: usize) -> Option<&T> {
         if index < self.len() {
             // SAFETY: index < len is checked above, so the element is valid.
             unsafe { Some(&*self.ptr.as_ptr().add(index)) }
-        } else {
-            None
-        }
-    }
-
-    /// Gets a mutable reference to an element.
-    #[inline(always)]
-    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
-        if index < self.len() {
-            // SAFETY: index < len is checked above, so the element is valid.
-            unsafe { Some(&mut *self.ptr.as_ptr().add(index)) }
         } else {
             None
         }
@@ -733,12 +575,6 @@ impl<T> CompactVec<T> {
         unsafe { Vec::from_raw_parts(ptr, len, cap) }
     }
 
-    /// Converts the vector into a boxed slice.
-    #[inline]
-    pub fn into_boxed_slice(self) -> Box<[T]> {
-        self.into_vec().into_boxed_slice()
-    }
-
     /// Creates a CompactVec from a standard Vec.
     #[inline]
     pub fn from_vec(vec: Vec<T>) -> Self {
@@ -761,21 +597,7 @@ impl<T> CompactVec<T> {
     }
 }
 
-impl<T: Clone> CompactVec<T> {
-    /// Resizes the vector to `new_len`, filling with clones of `value`.
-    pub fn resize(&mut self, new_len: usize, value: T) {
-        let len = self.len();
-
-        if new_len > len {
-            self.reserve(new_len - len);
-            for _ in len..new_len {
-                self.push(value.clone());
-            }
-        } else {
-            self.truncate(new_len);
-        }
-    }
-}
+impl<T: Clone> CompactVec<T> {}
 
 impl<T> Drop for CompactVec<T> {
     fn drop(&mut self) {
@@ -1065,63 +887,6 @@ impl<T> From<CompactVec<T>> for Vec<T> {
     }
 }
 
-/// Drain iterator for CompactVec.
-/// Removes elements from the vector as they are iterated.
-pub struct Drain<'a, T> {
-    vec: &'a mut CompactVec<T>,
-    current: usize,
-    end: usize,
-}
-
-impl<'a, T> Iterator for Drain<'a, T> {
-    type Item = T;
-
-    #[inline]
-    fn next(&mut self) -> Option<T> {
-        if self.current < self.end {
-            // SAFETY: current < end <= original len, so the element is valid.
-            // After reading, we increment current so it won't be read again.
-            let item = unsafe { ptr::read(self.vec.ptr.as_ptr().add(self.current)) };
-            self.current += 1;
-            Some(item)
-        } else {
-            None
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.end - self.current;
-        (remaining, Some(remaining))
-    }
-}
-
-impl<'a, T> ExactSizeIterator for Drain<'a, T> {
-    fn len(&self) -> usize {
-        self.end - self.current
-    }
-}
-
-impl<'a, T> Drop for Drain<'a, T> {
-    fn drop(&mut self) {
-        let remaining = self.end - self.current;
-        if remaining > 0 {
-            let first = self.current;
-            self.current = self.end;
-            // Drop the rest as a slice: slice drop glue keeps dropping the
-            // remaining elements when one destructor panics, where an
-            // element-by-element loop would strand them. The vector no longer
-            // owns this range, so nothing else would ever free them.
-            // SAFETY: [first..end] are initialized and owned by this drain.
-            unsafe {
-                let start = self.vec.ptr.as_ptr().add(first);
-                ptr::drop_in_place(ptr::slice_from_raw_parts_mut(start, remaining));
-            }
-        }
-        // The length was already lowered to `start` by `drain()`, so there is
-        // nothing to restore here.
-    }
-}
-
 /// Owning iterator for CompactVec.
 pub struct IntoIter<T> {
     vec: CompactVec<T>,
@@ -1304,17 +1069,6 @@ mod tests {
     }
 
     #[test]
-    fn test_swap_remove() {
-        let mut vec = CompactVec::new();
-        vec.push(1);
-        vec.push(2);
-        vec.push(3);
-
-        assert_eq!(vec.swap_remove(0), 1);
-        assert_eq!(vec.as_slice(), &[3, 2]);
-    }
-
-    #[test]
     fn test_into_vec_and_back() {
         let compact: CompactVec<i32> = (0..5).collect();
         let std_vec: Vec<i32> = compact.into_vec();
@@ -1335,168 +1089,6 @@ mod tests {
 
         let cloned = vec.clone();
         assert_eq!(cloned[0], "hello");
-    }
-
-    /// A retain predicate that panics must not leave the vector holding
-    /// duplicated elements: every element is dropped exactly once.
-    #[test]
-    fn test_retain_panic_does_not_double_drop() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-        struct Tracked(usize);
-
-        impl Drop for Tracked {
-            fn drop(&mut self) {
-                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        DROP_COUNT.store(0, Ordering::SeqCst);
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut vec: CompactVec<Tracked> = CompactVec::new();
-            for i in 0..5 {
-                vec.push(Tracked(i));
-            }
-            vec.retain(|item| {
-                if item.0 == 3 {
-                    panic!("intentional panic in retain predicate");
-                }
-                item.0 != 2
-            });
-        }));
-
-        assert!(result.is_err(), "the predicate panic must propagate");
-        assert_eq!(
-            DROP_COUNT.load(Ordering::SeqCst),
-            5,
-            "each of the 5 elements must be dropped exactly once"
-        );
-    }
-
-    /// A destructor that panics while `retain` is dropping a rejected element
-    /// must not hand that element back to the vector.
-    #[test]
-    fn test_retain_destructor_panic_does_not_double_drop() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
-        static PANICKED: AtomicBool = AtomicBool::new(false);
-
-        struct PanicOnDrop(usize);
-
-        impl Drop for PanicOnDrop {
-            fn drop(&mut self) {
-                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
-                // Panic once, so a second drop of the same slot is observable
-                // in the counter instead of aborting the process.
-                if self.0 == 2 && !PANICKED.swap(true, Ordering::SeqCst) {
-                    panic!("intentional panic in destructor");
-                }
-            }
-        }
-
-        DROP_COUNT.store(0, Ordering::SeqCst);
-        PANICKED.store(false, Ordering::SeqCst);
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut vec: CompactVec<PanicOnDrop> = CompactVec::new();
-            for i in 0..5 {
-                vec.push(PanicOnDrop(i));
-            }
-            vec.retain(|item| item.0 != 2);
-        }));
-
-        assert!(result.is_err(), "the destructor panic must propagate");
-        assert_eq!(
-            DROP_COUNT.load(Ordering::SeqCst),
-            5,
-            "each of the 5 elements must be dropped exactly once"
-        );
-    }
-
-    /// A destructor that panics while a Drain is cleaning up must not strand
-    /// the elements behind it: the vector no longer owns them.
-    #[test]
-    fn test_drain_drop_finishes_after_destructor_panic() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
-        static PANICKED: AtomicBool = AtomicBool::new(false);
-
-        struct PanicOnDrop(usize);
-
-        impl Drop for PanicOnDrop {
-            fn drop(&mut self) {
-                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
-                if self.0 == 2 && !PANICKED.swap(true, Ordering::SeqCst) {
-                    panic!("intentional panic in destructor");
-                }
-            }
-        }
-
-        DROP_COUNT.store(0, Ordering::SeqCst);
-        PANICKED.store(false, Ordering::SeqCst);
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut vec: CompactVec<PanicOnDrop> = CompactVec::new();
-            for i in 0..5 {
-                vec.push(PanicOnDrop(i));
-            }
-            drop(vec.drain(1..));
-        }));
-
-        assert!(result.is_err(), "the destructor panic must propagate");
-        assert_eq!(
-            DROP_COUNT.load(Ordering::SeqCst),
-            5,
-            "the drain must drop 1..5 and the vector must drop 0, none stranded"
-        );
-    }
-
-    /// A partially consumed Drain that is forgotten must leave the vector at
-    /// the drain start, so the consumed elements are not dropped a second time.
-    #[test]
-    fn test_forgotten_drain_does_not_double_drop() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-        struct Tracked;
-
-        impl Drop for Tracked {
-            fn drop(&mut self) {
-                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        DROP_COUNT.store(0, Ordering::SeqCst);
-
-        let mut vec: CompactVec<Tracked> = CompactVec::new();
-        for _ in 0..4 {
-            vec.push(Tracked);
-        }
-
-        let mut drain = vec.drain(2..);
-        let taken = drain.next();
-        assert!(taken.is_some());
-        drop(taken);
-        std::mem::forget(drain);
-
-        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            vec.len(),
-            2,
-            "drain must lower the length before yielding elements"
-        );
-
-        drop(vec);
-
-        // 0 and 1 are dropped with the vector, 2 was dropped above, 3 is leaked
-        // by mem::forget. Nothing is dropped twice.
-        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 3);
     }
 
     /// A zero-sized element type never touches the allocator, with or
@@ -1526,7 +1118,7 @@ mod tests {
 
     /// Repeated small reservations must grow geometrically, not once per call.
     #[test]
-    fn test_reserve_amortizes_and_reserve_exact_does_not() {
+    fn test_reserve_amortizes() {
         let mut v: CompactVec<u64> = CompactVec::new();
         let mut reallocations = 0;
         let mut last_cap = v.capacity();
@@ -1542,12 +1134,6 @@ mod tests {
             reallocations <= 12,
             "reserve(1) x1000 reallocated {reallocations} times"
         );
-
-        let mut e: CompactVec<u64> = CompactVec::new();
-        e.reserve_exact(37);
-        assert_eq!(e.capacity(), 37);
-        e.reserve_exact(10);
-        assert_eq!(e.capacity(), 37, "already has room, must not grow");
     }
 
     /// Test panic safety in Clone implementation

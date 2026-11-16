@@ -63,11 +63,6 @@ impl NullCheckExpr {
         Self::new(column, false)
     }
 
-    /// Check if this is an IS NULL check (vs IS NOT NULL)
-    pub fn checks_for_null(&self) -> bool {
-        self.is_null
-    }
-
     /// Check if this is an IS NULL check (alias for checks_for_null, for expression compilation)
     pub fn is_null_check(&self) -> bool {
         self.is_null
@@ -253,14 +248,5 @@ mod tests {
         aliased.prepare_for_schema(&schema);
 
         assert!(aliased.evaluate(&row).unwrap());
-    }
-
-    #[test]
-    fn test_checks_for_null() {
-        let expr = NullCheckExpr::is_null("col");
-        assert!(expr.checks_for_null());
-
-        let expr = NullCheckExpr::is_not_null("col");
-        assert!(!expr.checks_for_null());
     }
 }

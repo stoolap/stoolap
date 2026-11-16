@@ -202,11 +202,6 @@ impl CompoundExpr {
     pub fn operator(&self) -> Operator {
         self.operator
     }
-
-    /// Get the comparison value
-    pub fn comparison_value(&self) -> &Value {
-        &self.value
-    }
 }
 
 impl Expression for CompoundExpr {

@@ -329,11 +329,6 @@ impl CompiledFilter {
         CompiledFilter::Dynamic(expr.clone_box())
     }
 
-    /// Compile from a Box<dyn Expression>
-    pub fn compile_boxed(expr: &dyn Expression, schema: &Schema) -> Self {
-        Self::compile(expr, schema)
-    }
-
     /// Compile a float-constant comparison against an INTEGER column with
     /// exact numeric semantics. A whole-number float in i64 range becomes
     /// the equivalent integer filter; a fractional in-range float rewrites

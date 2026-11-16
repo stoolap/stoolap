@@ -16,10 +16,6 @@
 //!
 //! Run with: cargo run --release --example rust_benchmark
 
-#[cfg(feature = "dhat-heap")]
-#[global_allocator]
-static ALLOC: dhat::Alloc = dhat::Alloc;
-
 use rand::Rng;
 use std::time::Instant;
 use stoolap::Database;
@@ -31,9 +27,6 @@ const ITERATIONS_HEAVY: usize = 50; // Full scans, JOINs
 const WARMUP: usize = 10;
 
 fn main() {
-    #[cfg(feature = "dhat-heap")]
-    let _profiler = dhat::Profiler::new_heap();
-
     let filedb = std::env::args().any(|a| a == "--filedb");
     let _temp_dir = if filedb {
         Some(tempfile::tempdir().unwrap())
@@ -1220,11 +1213,4 @@ fn main() {
     );
 
     println!("============================================================");
-
-    // Print RowVec pool statistics when profiling
-    #[cfg(feature = "dhat-heap")]
-    {
-        println!();
-        stoolap::core::row_vec::print_pool_stats();
-    }
 }

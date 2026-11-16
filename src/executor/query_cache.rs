@@ -696,6 +696,7 @@ impl QueryCache {
     }
 
     /// Get cache statistics
+    #[cfg(test)]
     pub fn stats(&self) -> CacheStats {
         let plans = match self.plans.read() {
             Ok(p) => p,

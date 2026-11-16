@@ -282,12 +282,6 @@ impl JoinHashTable {
     pub fn bucket_count(&self) -> usize {
         self.bucket_heads.len()
     }
-
-    /// Get the load factor (entries / buckets).
-    #[inline]
-    pub fn load_factor(&self) -> f64 {
-        self.len as f64 / self.bucket_heads.len() as f64
-    }
 }
 
 /// Zero-allocation iterator over probe results.
@@ -522,26 +516,6 @@ mod tests {
 
         let matches: Vec<_> = table.probe(100).collect();
         assert!(matches.is_empty());
-    }
-
-    #[test]
-    fn test_load_factor() {
-        let mut table = JoinHashTable::with_capacity(100);
-
-        for i in 0..100 {
-            table.insert(i as u64, i as u32);
-        }
-
-        // With 100 entries, load factor depends on bucket count
-        // We target ~75% load factor, but it can vary
-        let load = table.load_factor();
-        assert!(
-            load > 0.3 && load <= 1.0,
-            "Load factor {} out of expected range",
-            load
-        );
-        // Verify we have all entries
-        assert_eq!(table.len(), 100);
     }
 
     #[test]

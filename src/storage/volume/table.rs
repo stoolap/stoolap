@@ -5459,34 +5459,6 @@ impl Table for SegmentedTable {
         self.hot.create_column(name, column_type, nullable)
     }
 
-    fn create_column_with_default(
-        &mut self,
-        name: &str,
-        column_type: DataType,
-        nullable: bool,
-        default_expr: Option<String>,
-    ) -> Result<()> {
-        self.hot
-            .create_column_with_default(name, column_type, nullable, default_expr)
-    }
-
-    fn create_column_with_default_value(
-        &mut self,
-        name: &str,
-        column_type: DataType,
-        nullable: bool,
-        default_expr: Option<String>,
-        default_value: Option<Value>,
-    ) -> Result<()> {
-        self.hot.create_column_with_default_value(
-            name,
-            column_type,
-            nullable,
-            default_expr,
-            default_value,
-        )
-    }
-
     fn drop_column(&mut self, name: &str) -> Result<()> {
         self.hot.drop_column(name)
     }
@@ -5860,38 +5832,6 @@ impl Table for SegmentedTable {
         deadline: Deadline,
     ) -> Result<RowVec> {
         self.collect_cold_and_hot(where_expr, access, deadline)
-    }
-
-    fn collect_all_rows_unsorted(&self) -> Result<RowVec> {
-        if let Some(result) = self.unsealed(|hot| hot.collect_all_rows_unsorted()) {
-            return result;
-        }
-
-        self.across_seals(|generation| {
-            #[cfg(any(test, feature = "test-failpoints"))]
-            crate::test_failpoints::merged_read_began();
-            let cut = self.read_cut();
-            let hot_rows = self.hot.collect_all_rows_unsorted()?;
-
-            let mut skip: FxHashSet<i64> =
-                FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
-            for &(id, _) in &hot_rows {
-                skip.insert(id);
-            }
-            self.segment_mgr
-                .insert_pending_tombstones_into(self.pending(), &mut skip);
-
-            let none = Deadline::NONE;
-            let Some(mut all_rows) =
-                self.collect_cold_rows(None, skip, generation, None, &cut, none)?
-            else {
-                return Ok(None);
-            };
-            for entry in hot_rows {
-                all_rows.push(entry);
-            }
-            Ok(Some(all_rows))
-        })
     }
 
     fn collect_rows_by_ids(&self, row_ids: &[i64]) -> Result<RowVec> {
@@ -8181,22 +8121,6 @@ impl Table for SegmentedTable {
             .create_btree_index(column_name, is_unique, custom_name)
     }
 
-    fn drop_btree_index(&self, column_name: &str) -> Result<()> {
-        self.hot.drop_btree_index(column_name)
-    }
-
-    fn create_multi_column_index(
-        &self,
-        name: &str,
-        columns: &[&str],
-        is_unique: bool,
-    ) -> Result<()> {
-        if is_unique && self.segment_mgr.has_segments() {
-            self.validate_cold_unique(name, columns)?;
-        }
-        self.hot.create_multi_column_index(name, columns, is_unique)
-    }
-
     fn has_index_on_column(&self, column_name: &str) -> bool {
         self.hot.has_index_on_column(column_name)
     }
@@ -8395,10 +8319,6 @@ impl Table for SegmentedTable {
 
     fn get_index(&self, name: &str) -> Option<Arc<dyn Index>> {
         self.hot.get_index(name)
-    }
-
-    fn get_unique_indexes(&self) -> Vec<(String, Vec<String>)> {
-        self.hot.get_unique_indexes()
     }
 
     fn for_each_unique_non_pk_index(
@@ -8607,18 +8527,6 @@ impl Table for SegmentedTable {
         Ok(Box::new(crate::executor::result::ExecutorResult::new(
             col_names, all_rows,
         )))
-    }
-
-    fn select_with_aliases(
-        &self,
-        columns: &[&str],
-        expr: Option<&dyn Expression>,
-        aliases: &FxHashMap<String, String>,
-    ) -> Result<Box<dyn QueryResult>> {
-        if let Some(result) = self.unsealed(|hot| hot.select_with_aliases(columns, expr, aliases)) {
-            return result;
-        }
-        self.select(columns, expr)
     }
 
     fn rows_at(
@@ -10047,21 +9955,10 @@ mod tests {
         fn create_btree_index(&self, _: &str, _: bool, _: Option<&str>) -> Result<()> {
             Ok(())
         }
-        fn drop_btree_index(&self, _: &str) -> Result<()> {
-            Ok(())
-        }
         fn rename_column(&mut self, _: &str, _: &str) -> Result<()> {
             Ok(())
         }
         fn select(&self, _: &[&str], _: Option<&dyn Expression>) -> Result<Box<dyn QueryResult>> {
-            Err(crate::core::Error::internal("not implemented"))
-        }
-        fn select_with_aliases(
-            &self,
-            _: &[&str],
-            _: Option<&dyn Expression>,
-            _: &FxHashMap<String, String>,
-        ) -> Result<Box<dyn QueryResult>> {
             Err(crate::core::Error::internal("not implemented"))
         }
         fn row_count(&self, _: Deadline) -> Result<usize> {

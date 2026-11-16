@@ -122,7 +122,6 @@ pub use parallel::{
     ParallelConfig,
     ParallelHashTable,
     ParallelJoinResult,
-    ParallelStats,
     SortDirection,
     SortSpec,
     DEFAULT_PARALLEL_CHUNK_SIZE,
@@ -921,11 +920,6 @@ impl Executor {
         &self.query_cache
     }
 
-    /// Get query cache statistics
-    pub fn cache_stats(&self) -> CacheStats {
-        self.query_cache.stats()
-    }
-
     /// Clear the query cache
     pub fn clear_cache(&self) {
         self.query_cache.clear();
@@ -1402,20 +1396,6 @@ impl Executor {
             .map(|(stmt, params)| self.query_cache.put(sql, Arc::new(stmt), params)))
     }
 
-    /// Execute a pre-cached plan directly, skipping cache lookup.
-    ///
-    /// This is the fast path for prepared statements: the caller holds a
-    /// `CachedPlanRef` obtained from `get_or_create_plan()` and passes it
-    /// here on every execution, avoiding normalize + hash + RwLock read
-    /// per call.
-    pub fn execute_with_cached_plan(
-        &self,
-        plan: &CachedPlanRef,
-        ctx: &ExecutionContext,
-    ) -> Result<Box<dyn QueryResult>> {
-        self.execute_plan_in(plan, std::borrow::Cow::Borrowed(ctx))
-    }
-
     /// [`Self::execute_with_cached_plan`] for a context the caller gives up:
     /// a statement's view goes into it without a copy
     pub(crate) fn execute_with_cached_plan_owned(
@@ -1687,15 +1667,15 @@ mod tests {
             .unwrap();
 
         // First execution - should parse and cache
-        let stats_before = executor.cache_stats();
+        let stats_before = executor.query_cache.stats();
         executor.execute("SELECT * FROM users").unwrap();
-        let stats_after = executor.cache_stats();
+        let stats_after = executor.query_cache.stats();
         assert!(stats_after.size > stats_before.size);
 
         // Second execution - should use cache
-        let size_before = executor.cache_stats().size;
+        let size_before = executor.query_cache.stats().size;
         executor.execute("SELECT * FROM users").unwrap();
-        let size_after = executor.cache_stats().size;
+        let size_after = executor.query_cache.stats().size;
         assert_eq!(size_before, size_after); // No new entries
     }
 
@@ -1734,10 +1714,10 @@ mod tests {
 
         executor.execute("SELECT 1").unwrap();
         executor.execute("SELECT 2").unwrap();
-        assert!(executor.cache_stats().size > 0);
+        assert!(executor.query_cache.stats().size > 0);
 
         executor.clear_cache();
-        assert_eq!(executor.cache_stats().size, 0);
+        assert_eq!(executor.query_cache.stats().size, 0);
     }
 
     #[test]
@@ -1745,12 +1725,12 @@ mod tests {
         let executor = create_test_executor();
 
         executor.execute("SELECT 1").unwrap();
-        let size = executor.cache_stats().size;
+        let size = executor.query_cache.stats().size;
 
         // Whitespace around the query shares its plan; whitespace inside does not
         executor.execute("  SELECT 1\n").unwrap();
-        assert_eq!(executor.cache_stats().size, size);
+        assert_eq!(executor.query_cache.stats().size, size);
         executor.execute("SELECT  1").unwrap();
-        assert_eq!(executor.cache_stats().size, size + 1);
+        assert_eq!(executor.query_cache.stats().size, size + 1);
     }
 }

@@ -78,30 +78,6 @@ impl BetweenExpr {
         }
     }
 
-    /// Create a BETWEEN expression with custom inclusivity
-    pub fn with_inclusivity(
-        column: impl Into<String>,
-        lower: Value,
-        upper: Value,
-        inclusive: bool,
-    ) -> Self {
-        Self {
-            column: column.into(),
-            lower_bound: lower,
-            upper_bound: upper,
-            inclusive,
-            not: false,
-            col_index: None,
-            aliases: FxHashMap::default(),
-            original_column: None,
-        }
-    }
-
-    /// Check if inclusive
-    pub fn is_inclusive(&self) -> bool {
-        self.inclusive
-    }
-
     /// Get the bounds (for expression compilation)
     pub fn get_bounds(&self) -> (&Value, &Value) {
         (&self.lower_bound, &self.upper_bound)
@@ -554,22 +530,6 @@ mod tests {
         ]);
 
         // 10 BETWEEN 1 AND 10 (inclusive, on upper bound)
-        assert!(expr.evaluate(&row).unwrap());
-    }
-
-    #[test]
-    fn test_exclusive_bounds() {
-        let schema = test_schema();
-        let row = Row::from_values(vec![Value::integer(1), Value::float(0.0), Value::text("a")]);
-
-        // 1 BETWEEN 1 AND 10 (exclusive - should fail)
-        let mut expr =
-            BetweenExpr::with_inclusivity("id", Value::integer(1), Value::integer(10), false);
-        expr.prepare_for_schema(&schema);
-        assert!(!expr.evaluate(&row).unwrap());
-
-        let row = Row::from_values(vec![Value::integer(5), Value::float(0.0), Value::text("a")]);
-        // 5 BETWEEN 1 AND 10 (exclusive - should pass)
         assert!(expr.evaluate(&row).unwrap());
     }
 

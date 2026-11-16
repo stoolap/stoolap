@@ -38,8 +38,6 @@ pub enum FunctionType {
     Scalar,
     /// Window function (operates over a window of rows)
     Window,
-    /// Table-valued function (generates rows)
-    TableValued,
 }
 
 /// Data type for function signatures

@@ -1523,16 +1523,6 @@ impl<V: Clone> CowBTree<V> {
         self.len = 0;
     }
 
-    /// Returns the cached maximum key, or None if the tree is empty.
-    #[inline]
-    pub fn max_key(&self) -> Option<i64> {
-        if self.root.is_some() {
-            Some(self.max_key)
-        } else {
-            None
-        }
-    }
-
     fn insert_rightmost_entry(&mut self, key: i64, value: V) -> *mut V {
         let root = self.root.as_mut().unwrap();
         let (result, ptr) = Self::insert_rightmost_return_ptr(root, key, value);
@@ -1589,7 +1579,6 @@ impl<V: Clone> CowBTree<V> {
         match leaf_result {
             Ok(idx) => Entry::Occupied(OccupiedEntry {
                 tree: self,
-                key,
                 path,
                 leaf_idx: idx,
             }),
@@ -1660,30 +1649,15 @@ pub enum Entry<'a, V: Clone> {
 }
 
 impl<'a, V: Clone> Entry<'a, V> {
+    #[cfg(test)]
     pub fn or_insert(self, default: V) -> &'a mut V {
         match self {
-            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Occupied(OccupiedEntry {
+                tree,
+                path,
+                leaf_idx,
+            }) => tree.get_mut_with_path(0, &path, leaf_idx).unwrap(),
             Entry::Vacant(entry) => entry.insert(default),
-        }
-    }
-
-    pub fn and_modify<F>(self, f: F) -> Self
-    where
-        F: FnOnce(&mut V),
-    {
-        match self {
-            Entry::Occupied(mut entry) => {
-                f(entry.get_mut());
-                Entry::Occupied(entry)
-            }
-            Entry::Vacant(entry) => Entry::Vacant(entry),
-        }
-    }
-
-    pub fn key(&self) -> i64 {
-        match self {
-            Entry::Occupied(entry) => entry.key(),
-            Entry::Vacant(entry) => entry.key(),
         }
     }
 }
@@ -1691,17 +1665,11 @@ impl<'a, V: Clone> Entry<'a, V> {
 /// An occupied entry in the CowBTree
 pub struct OccupiedEntry<'a, V: Clone> {
     tree: &'a mut CowBTree<V>,
-    key: i64,
     path: NodePath,
     leaf_idx: usize,
 }
 
 impl<'a, V: Clone> OccupiedEntry<'a, V> {
-    #[inline]
-    pub fn key(&self) -> i64 {
-        self.key
-    }
-
     /// O(log n) - traverses the cached path to reach the leaf
     #[inline]
     pub fn get(&self) -> &V {
@@ -1710,18 +1678,6 @@ impl<'a, V: Clone> OccupiedEntry<'a, V> {
             node = node.child(idx);
         }
         &node.values()[self.leaf_idx]
-    }
-
-    pub fn get_mut(&mut self) -> &mut V {
-        self.tree
-            .get_mut_with_path(self.key, &self.path, self.leaf_idx)
-            .unwrap()
-    }
-
-    pub fn into_mut(self) -> &'a mut V {
-        self.tree
-            .get_mut_with_path(self.key, &self.path, self.leaf_idx)
-            .unwrap()
     }
 
     pub fn insert(&mut self, value: V) -> V {
@@ -1759,11 +1715,6 @@ pub struct VacantEntry<'a, V: Clone> {
 }
 
 impl<'a, V: Clone> VacantEntry<'a, V> {
-    #[inline]
-    pub fn key(&self) -> i64 {
-        self.key
-    }
-
     #[inline]
     pub fn insert(self, value: V) -> &'a mut V {
         if self.is_rightmost {
@@ -2484,17 +2435,11 @@ mod tests {
         let v = tree.entry(1).or_insert(20);
         assert_eq!(*v, 10);
 
-        tree.entry(1).and_modify(|v| *v += 5);
-        assert_eq!(tree.get(1), Some(&15));
-
         for i in 2..100 {
             tree.entry(i).or_insert(i * 10);
         }
         assert_eq!(tree.len(), 99);
         assert_eq!(tree.get(50), Some(&500));
-
-        tree.entry(50).and_modify(|v| *v = 999);
-        assert_eq!(tree.get(50), Some(&999));
     }
 
     #[test]
@@ -2504,7 +2449,6 @@ mod tests {
         match tree.entry(42) {
             Entry::Occupied(_) => panic!("Expected vacant"),
             Entry::Vacant(v) => {
-                assert_eq!(v.key(), 42);
                 let val = v.insert(420);
                 assert_eq!(*val, 420);
             }
@@ -2518,7 +2462,6 @@ mod tests {
         match tree.entry(30) {
             Entry::Occupied(_) => panic!("Expected vacant"),
             Entry::Vacant(v) => {
-                assert_eq!(v.key(), 30);
                 v.insert(300);
             }
         }
@@ -2551,13 +2494,6 @@ mod tests {
 
         match tree.entry(50) {
             Entry::Occupied(o) => {
-                assert_eq!(o.key(), 50);
-            }
-            Entry::Vacant(_) => panic!("Expected occupied"),
-        }
-
-        match tree.entry(50) {
-            Entry::Occupied(o) => {
                 assert_eq!(*o.get(), 500);
             }
             Entry::Vacant(_) => panic!("Expected occupied"),
@@ -2565,27 +2501,12 @@ mod tests {
 
         match tree.entry(50) {
             Entry::Occupied(mut o) => {
-                *o.get_mut() = 5000;
-            }
-            Entry::Vacant(_) => panic!("Expected occupied"),
-        }
-        assert_eq!(tree.get(50), Some(&5000));
-
-        match tree.entry(50) {
-            Entry::Occupied(mut o) => {
                 let old = o.insert(50000);
-                assert_eq!(old, 5000);
+                assert_eq!(old, 500);
             }
             Entry::Vacant(_) => panic!("Expected occupied"),
         }
         assert_eq!(tree.get(50), Some(&50000));
-
-        let val_ref = match tree.entry(50) {
-            Entry::Occupied(o) => o.into_mut(),
-            Entry::Vacant(_) => panic!("Expected occupied"),
-        };
-        *val_ref = 500000;
-        assert_eq!(tree.get(50), Some(&500000));
     }
 
     #[test]
@@ -3158,48 +3079,6 @@ mod tests {
     }
 
     #[test]
-    fn test_entry_key_method() {
-        let mut tree: CowBTree<i64> = CowBTree::new();
-
-        tree.insert(10, 100);
-        tree.insert(20, 200);
-
-        // Test Entry::key() on occupied entry
-        let key = tree.entry(10).key();
-        assert_eq!(key, 10);
-
-        // Test Entry::key() on vacant entry
-        let key = tree.entry(15).key();
-        assert_eq!(key, 15);
-
-        // Verify tree wasn't modified by key() calls
-        assert_eq!(tree.len(), 2);
-    }
-
-    #[test]
-    fn test_and_modify_on_vacant() {
-        let mut tree: CowBTree<i64> = CowBTree::new();
-
-        tree.insert(10, 100);
-
-        // and_modify on vacant entry should return Vacant unchanged
-        let entry = tree.entry(20).and_modify(|v| *v += 1);
-        match entry {
-            Entry::Vacant(v) => {
-                assert_eq!(v.key(), 20);
-                v.insert(200);
-            }
-            Entry::Occupied(_) => panic!("Expected Vacant after and_modify on non-existent key"),
-        }
-
-        assert_eq!(tree.get(20), Some(&200));
-
-        // and_modify on occupied entry should modify the value
-        tree.entry(10).and_modify(|v| *v += 1);
-        assert_eq!(tree.get(10), Some(&101));
-    }
-
-    #[test]
     fn test_entry_api_root_split() {
         // Test that entry API correctly handles root splits
         // This happens when inserting via entry() causes the tree to grow a new level
@@ -3520,7 +3399,10 @@ mod tests {
 
         // Now use entry API with random access patterns
         for i in (0..20_000).step_by(7) {
-            tree.entry(i).and_modify(|v| *v *= 2);
+            if let Entry::Occupied(mut o) = tree.entry(i) {
+                let v = *o.get();
+                o.insert(v * 2);
+            }
         }
 
         // Verify modifications

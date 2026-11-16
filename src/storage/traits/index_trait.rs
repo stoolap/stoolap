@@ -16,9 +16,7 @@
 //!
 
 use crate::common::deadline::Deadline;
-use crate::common::I64Map;
 use crate::core::{DataType, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
-use crate::storage::expression::Expression;
 use crate::storage::index::id_list::GroupIds;
 
 /// What a seal's cleanup of one index uses under the fence, made by the index
@@ -51,12 +49,6 @@ pub trait Index: Send + Sync {
     /// Returns the name of the index
     fn name(&self) -> &str;
 
-    /// Returns the name of the table this index belongs to
-    fn table_name(&self) -> &str;
-
-    /// Builds the index from existing data
-    fn build(&mut self) -> Result<()>;
-
     /// Adds values to the index with the given row IDs
     ///
     /// # Arguments
@@ -67,12 +59,6 @@ pub trait Index: Send + Sync {
     /// Note: Uses `&self` with interior mutability for thread-safe concurrent access
     fn add(&self, values: &[Value], row_id: i64, ref_id: i64) -> Result<()>;
 
-    /// Adds multiple entries to the index in a single batch operation
-    ///
-    /// # Arguments
-    /// * `entries` - Map from row_id to column values
-    fn add_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()>;
-
     /// Removes values from the index
     ///
     /// # Arguments
@@ -82,12 +68,6 @@ pub trait Index: Send + Sync {
     ///
     /// Note: Uses `&self` with interior mutability for thread-safe concurrent access
     fn remove(&self, values: &[Value], row_id: i64, ref_id: i64) -> Result<()>;
-
-    /// Removes multiple entries from the index in a single batch operation
-    ///
-    /// # Arguments
-    /// * `entries` - Map from row_id to column values
-    fn remove_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()>;
 
     /// Adds multiple entries from a slice with single lock acquisition
     ///
@@ -386,15 +366,6 @@ pub trait Index: Send + Sync {
         }
     }
 
-    /// Returns row IDs that match the given expression
-    ///
-    /// # Arguments
-    /// * `expr` - The expression to evaluate
-    ///
-    /// # Returns
-    /// Pooled RowIdVec of row IDs matching the expression
-    fn get_filtered_row_ids(&self, expr: &dyn Expression) -> RowIdVec;
-
     /// Returns the minimum value in the index (for MIN aggregate optimization)
     ///
     /// This enables O(1) or O(log n) MIN queries on indexed columns
@@ -456,22 +427,9 @@ pub trait Index: Send + Sync {
         None // Default implementation - only B-tree indexes support this
     }
 
-    /// Returns grouped row IDs in sorted order by index value (for GROUP BY optimization)
-    ///
-    /// This enables streaming GROUP BY by iterating through the B-tree in order,
-    /// processing one group at a time without needing a hash map.
-    ///
-    /// # Returns
-    /// Vector of (group_value, row_ids) pairs in sorted order,
-    /// or None if the index doesn't support ordered group access
-    fn get_grouped_row_ids(&self) -> Option<Vec<(Value, Vec<i64>)>> {
-        None // Default implementation - only B-tree indexes support this
-    }
-
     /// Iterates through groups in sorted order, calling the callback for each group.
     ///
-    /// This is a zero-allocation alternative to `get_grouped_row_ids` that processes
-    /// groups one at a time without collecting all groups upfront. This is more
+    /// This processes groups one at a time without collecting all groups upfront. This is more
     /// efficient when:
     /// - Early termination is possible (LIMIT)
     /// - Only a few groups pass filtering (HAVING)
@@ -556,9 +514,6 @@ pub trait Index: Send + Sync {
 
     /// Downcast to concrete type for type-specific operations (e.g., HNSW graph serialization).
     fn as_any(&self) -> &dyn std::any::Any;
-
-    /// Closes the index and releases any resources
-    fn close(&mut self) -> Result<()>;
 }
 
 #[cfg(test)]

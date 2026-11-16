@@ -847,15 +847,6 @@ impl ExecutionContext {
         }
     }
 
-    /// Get a positional parameter by index (1-based)
-    pub fn get_param(&self, index: usize) -> Option<&Value> {
-        if index == 0 || index > self.params.len() {
-            None
-        } else {
-            self.params.get(index - 1)
-        }
-    }
-
     /// Get all positional parameters
     pub fn params(&self) -> &[Value] {
         &self.params
@@ -902,29 +893,9 @@ impl ExecutionContext {
         self.auto_commit
     }
 
-    /// Set auto-commit mode
-    pub fn set_auto_commit(&mut self, auto_commit: bool) {
-        self.auto_commit = auto_commit;
-    }
-
     /// Get the current database/schema name
     pub fn current_database(&self) -> Option<&str> {
         self.current_database.as_ref().as_deref()
-    }
-
-    /// Set the current database/schema name
-    pub fn set_current_database(&mut self, database: impl Into<String>) {
-        self.current_database = Arc::new(Some(database.into()));
-    }
-
-    /// Get a session variable
-    pub fn get_session_var(&self, name: &str) -> Option<&Value> {
-        self.session_vars.get(name)
-    }
-
-    /// Set a session variable
-    pub fn set_session_var(&mut self, name: impl Into<String>, value: Value) {
-        Arc::make_mut(&mut self.session_vars).insert(name.into(), value);
     }
 
     /// The instant past which the call's statements stop, if any
@@ -1303,20 +1274,6 @@ impl ExecutionContextBuilder {
         self
     }
 
-    /// Set a session variable
-    pub fn session_var(self, name: impl Into<String>, value: Value) -> Self {
-        Self {
-            ctx: ExecutionContext {
-                session_vars: Arc::new({
-                    let mut m = (*self.ctx.session_vars).clone();
-                    m.insert(name.into(), value);
-                    m
-                }),
-                ..self.ctx
-            },
-        }
-    }
-
     /// Set the query timeout
     pub fn timeout_ms(mut self, timeout_ms: u64) -> Self {
         self.ctx.set_timeout_ms(timeout_ms);
@@ -1424,10 +1381,8 @@ mod tests {
             Value::text("hello")
         ]);
         assert_eq!(ctx.param_count(), 2);
-        assert_eq!(ctx.get_param(1), Some(&Value::Integer(1)));
-        assert_eq!(ctx.get_param(2), Some(&Value::text("hello")));
-        assert_eq!(ctx.get_param(0), None); // 0 is invalid
-        assert_eq!(ctx.get_param(3), None); // Out of bounds
+        assert_eq!(ctx.params.first(), Some(&Value::Integer(1)));
+        assert_eq!(ctx.params.get(1), Some(&Value::text("hello")));
     }
 
     #[test]
@@ -1475,15 +1430,6 @@ mod tests {
     }
 
     #[test]
-    fn test_context_session_vars() {
-        let mut ctx = ExecutionContext::new();
-        ctx.set_session_var("timezone", Value::text("UTC"));
-
-        assert_eq!(ctx.get_session_var("timezone"), Some(&Value::text("UTC")));
-        assert_eq!(ctx.get_session_var("unknown"), None);
-    }
-
-    #[test]
     fn test_context_builder() {
         let ctx = ExecutionContextBuilder::new()
             .params(smallvec::smallvec![Value::Integer(1)])
@@ -1494,8 +1440,8 @@ mod tests {
             .build();
 
         assert_eq!(ctx.param_count(), 2);
-        assert_eq!(ctx.get_param(1), Some(&Value::Integer(1)));
-        assert_eq!(ctx.get_param(2), Some(&Value::Integer(2)));
+        assert_eq!(ctx.params.first(), Some(&Value::Integer(1)));
+        assert_eq!(ctx.params.get(1), Some(&Value::Integer(2)));
         assert!(!ctx.auto_commit());
         assert_eq!(ctx.current_database(), Some("mydb"));
         assert!(ctx.deadline().is_some());

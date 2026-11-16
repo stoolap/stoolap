@@ -79,18 +79,6 @@ impl ComparisonValue {
     pub fn is_null(&self) -> bool {
         matches!(self, ComparisonValue::Null)
     }
-
-    /// Convert to a Value
-    pub fn to_value(&self) -> Value {
-        match self {
-            ComparisonValue::Null => Value::Null(DataType::Text),
-            ComparisonValue::Integer(i) => Value::Integer(*i),
-            ComparisonValue::Float(f) => Value::Float(*f),
-            ComparisonValue::Text(s) => Value::Text(SmartString::new(s)),
-            ComparisonValue::Boolean(b) => Value::Boolean(*b),
-            ComparisonValue::Timestamp(t) => Value::Timestamp(*t),
-        }
-    }
 }
 
 /// Comparison expression (column op value)
@@ -184,14 +172,6 @@ impl ComparisonExpr {
     /// Get the comparison value
     pub fn value(&self) -> &ComparisonValue {
         &self.value
-    }
-
-    /// Get the integer value if this is an integer comparison
-    pub fn integer_value(&self) -> Option<i64> {
-        match &self.value {
-            ComparisonValue::Integer(i) => Some(*i),
-            _ => None,
-        }
     }
 
     /// Compare two integers with the configured operator

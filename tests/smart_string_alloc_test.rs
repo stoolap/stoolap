@@ -63,7 +63,7 @@ fn a_string_past_fifteen_bytes_takes_one_allocation() {
     assert_eq!(allocations(|| SmartString::new(sixteen)).0, 1);
     assert_eq!(allocations(|| Value::text(sixteen)).0, 1);
     assert_eq!(
-        allocations(|| SmartString::concat("abcdefgh", "ijklmnop")).0,
+        allocations(|| SmartString::concat_many(&["abcdefgh", "ijklmnop"])).0,
         1
     );
     let owned = sixteen.to_string();

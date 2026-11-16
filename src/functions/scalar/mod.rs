@@ -124,16 +124,6 @@ macro_rules! validate_arg_count {
     };
 }
 
-/// Borrow a Value as a string slice if it's Text (zero allocation)
-/// Returns None for non-Text values
-#[inline]
-pub fn value_as_str(value: &Value) -> Option<&str> {
-    match value {
-        Value::Text(s) => Some(s.as_ref()),
-        _ => None,
-    }
-}
-
 /// A Value as text, the form [`Value::text_form`] gives; empty for NULL
 pub fn value_to_string(value: &Value) -> String {
     value.as_string().unwrap_or_default()

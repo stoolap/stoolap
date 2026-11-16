@@ -353,19 +353,6 @@ impl TableManifest {
         self.dead_copies.retain(|id, _| !id_set.contains(id));
     }
 
-    /// Find which segment contains a given row_id.
-    ///
-    /// Uses min/max row_id metadata for fast rejection.
-    /// Returns (segment_index, segment_meta) if found.
-    pub fn find_segment_for_row_id(&self, row_id: i64) -> Option<(usize, &SegmentMeta)> {
-        for (i, seg) in self.segments.iter().enumerate() {
-            if row_id >= seg.min_row_id && row_id <= seg.max_row_id {
-                return Some((i, seg));
-            }
-        }
-        None
-    }
-
     /// Serialize the manifest with the table's committed tombstones, as
     /// (row_id, commit_seq), to bytes (V6 format).
     pub fn serialize(&self, tombstones: &FxHashMap<i64, u64>) -> io::Result<Vec<u8>> {
@@ -2296,24 +2283,6 @@ impl SegmentManager {
         )
     }
 
-    /// Check if a value exists in cold segments (acquires locks per call).
-    /// For batch operations, prefer cold_snapshot() + check_value_exists_with_snapshot().
-    pub fn check_value_exists_in_segments(
-        &self,
-        col_idx: usize,
-        value: &crate::core::Value,
-    ) -> crate::core::Result<Option<i64>> {
-        let snapshot = self.cold_snapshot();
-        self.check_value_exists_impl(
-            &snapshot.seg_ids,
-            &snapshot.segs,
-            &snapshot.ts,
-            col_idx,
-            value,
-            None,
-        )
-    }
-
     /// Resolve the current value at a logical column for a given row_id.
     /// Iterates newest-first with per-volume physical mapping. Used by
     /// overlap verification to check the authoritative version after
@@ -2493,24 +2462,6 @@ impl SegmentManager {
             values,
             column_defaults,
             loads.map(|loads| loads as &dyn CapturedVolumes),
-        )
-    }
-
-    pub fn find_row_id_by_values(
-        &self,
-        col_indices: &[usize],
-        values: &[&Value],
-        column_defaults: &[Value],
-    ) -> crate::core::Result<Option<i64>> {
-        let snapshot = self.cold_snapshot();
-        self.find_row_id_by_values_impl(
-            &snapshot.seg_ids,
-            &snapshot.segs,
-            &snapshot.ts,
-            col_indices,
-            values,
-            column_defaults,
-            None,
         )
     }
 
@@ -3501,14 +3452,6 @@ impl SegmentManager {
         }
     }
 
-    /// Clear all tombstones (after compaction has resolved them).
-    /// Lock order: manifest FIRST, then tombstones.
-    pub fn clear_tombstones(&self) {
-        let _manifest = self.manifest.write();
-        *self.tombstones.write() = Arc::new(FxHashMap::default());
-        self.invalidate_count();
-    }
-
     /// Remove tombstones only for row_ids that were in the compacted volumes.
     /// Used by partial compaction (merging a subset of volumes) where tombstones
     /// for unmerged volumes must remain.
@@ -3567,11 +3510,6 @@ impl SegmentManager {
     /// Check if the tombstone set is empty without cloning.
     pub fn is_tombstone_set_empty(&self) -> bool {
         self.tombstones.read().is_empty()
-    }
-
-    /// Get write access to the tombstone map (for seal cleanup).
-    pub fn tombstones_write(&self) -> parking_lot::RwLockWriteGuard<'_, Arc<FxHashMap<i64, u64>>> {
-        self.tombstones.write()
     }
 
     // ---- Per-transaction pending tombstones ----
@@ -3747,81 +3685,6 @@ impl SegmentManager {
             }
         }
         Ok(false)
-    }
-
-    /// Get a cold row by row_id. Returns the Row if found and not tombstoned.
-    /// Iterates newest-first so overlapping row_ids return the newest version.
-    /// Uses metadata-only search, reloads only the target cold volume if needed.
-    pub fn get_cold_row(&self, row_id: i64) -> crate::core::Result<Option<crate::core::Row>> {
-        let ts = Arc::clone(&*self.tombstones.read());
-        if ts.contains_key(&row_id) {
-            return Ok(None);
-        }
-        let (seg_ids, segments) = {
-            let manifest = self.manifest.read();
-            let seg_ids: Vec<(u64, i64, i64)> = manifest
-                .segments
-                .iter()
-                .rev()
-                .map(|m| (m.segment_id, m.min_row_id, m.max_row_id))
-                .collect();
-            let segments = Arc::clone(&*self.segments.read());
-            (seg_ids, segments)
-        };
-        for (seg_id, min_id, max_id) in &seg_ids {
-            if row_id < *min_id || row_id > *max_id {
-                continue;
-            }
-            if let Some(cold) = segments.get(seg_id) {
-                if let Some(idx) = cold.locate_authoritative(row_id) {
-                    if cold.volume.is_cold() {
-                        if let Some(vol) = self.ensure_volume(*seg_id)? {
-                            return Ok(Some(vol.get_row(idx)?));
-                        }
-                        // Segment removed by compaction — retry with fresh state.
-                        return self.get_cold_row_retry(row_id);
-                    }
-                    cold.volume.mark_accessed();
-                    return Ok(Some(cold.volume.get_row(idx)?));
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    /// Retry get_cold_row with a fresh consistent snapshot after compaction.
-    fn get_cold_row_retry(&self, row_id: i64) -> crate::core::Result<Option<crate::core::Row>> {
-        self.ensure_columns();
-        let (seg_ids, segments) = {
-            let manifest = self.manifest.read();
-            let seg_ids: Vec<u64> = manifest
-                .segments
-                .iter()
-                .rev()
-                .map(|m| m.segment_id)
-                .collect();
-            let segments = Arc::clone(&*self.segments.read());
-            (seg_ids, segments)
-        };
-        for seg_id in &seg_ids {
-            if let Some(cold) = segments.get(seg_id) {
-                if let Some(idx) = cold.locate_authoritative(row_id) {
-                    if cold.volume.is_cold() {
-                        return Err(crate::core::Error::Internal {
-                            message: format!(
-                                "table '{}': cold volume reload failed for segment {}; \
-                                 refusing to serve partial data",
-                                self.table_name.read(),
-                                seg_id
-                            ),
-                        });
-                    }
-                    cold.volume.mark_accessed();
-                    return Ok(Some(cold.volume.get_row(idx)?));
-                }
-            }
-        }
-        Ok(None)
     }
 
     /// Get a cold row by row_id, normalized to the current schema.
@@ -4207,11 +4070,6 @@ impl SegmentManager {
             .map_or(0, |(_, lsn)| *lsn)
     }
 
-    /// Raise the recorded log position to `lsn`
-    pub fn note_ddl_lsn(&self, lsn: u64) {
-        Self::note_ddl_lsn_in(&mut self.manifest.write(), lsn);
-    }
-
     fn note_ddl_lsn_in(manifest: &mut TableManifest, lsn: u64) {
         match manifest
             .dropped_columns
@@ -4223,30 +4081,6 @@ impl SegmentManager {
                 .dropped_columns
                 .push((SmartString::from(super::writer::DDL_LSN_MARKER), lsn)),
         }
-    }
-
-    /// Note: record_column_readd was removed. dropped_columns is permanent
-    /// until compaction rewrites all old volumes. After ADD COLUMN re-adds a
-    /// dropped name, compute_column_mapping_with_drops handles it correctly:
-    /// old volumes have the column at an old position (blocked by drop mask),
-    /// new volumes don't have it at all (mapped to Default).
-    ///
-    /// Clear dropped column tracking (called after compaction replaces all old volumes).
-    pub fn clear_dropped_columns(&self) {
-        self.manifest.write().dropped_columns.clear();
-    }
-
-    /// Check if a column name was dropped (for compute_column_mapping).
-    pub fn is_column_dropped(&self, col_name: &str) -> bool {
-        self.manifest
-            .read()
-            .dropped_columns
-            .iter()
-            .any(|(name, _)| name.as_str() == col_name)
-    }
-
-    pub fn get_dropped_columns(&self) -> Vec<(SmartString, u64)> {
-        self.manifest.read().dropped_columns.clone()
     }
 
     pub fn set_seal_overlap(&self, count: usize) {
@@ -4504,11 +4338,6 @@ impl SegmentManager {
         self.remove_segments_inner(segment_ids, true);
     }
 
-    /// Remove segments without invalidating the unique lookup cache (for compaction).
-    pub fn remove_segments_compacted(&self, segment_ids: &[u64]) {
-        self.remove_segments_inner(segment_ids, false);
-    }
-
     fn remove_segments_inner(&self, segment_ids: &[u64], _invalidate_cache: bool) {
         let seg_ids: Vec<u64> = {
             let mut manifest = self.manifest.write();
@@ -4532,26 +4361,6 @@ impl SegmentManager {
         }
         self.forget_key_order(segment_ids);
         self.invalidate_count();
-    }
-
-    /// Atomically replace old segments with a new compacted segment.
-    /// Both operations happen under a single manifest+segments write lock,
-    /// so concurrent queries never see the intermediate state where both
-    /// old and new segments are registered (which causes duplicate scanning).
-    pub fn replace_segments_atomic(
-        &self,
-        new_segment_id: u64,
-        new_volume: Arc<FrozenVolume>,
-        new_meta: SegmentMeta,
-        old_segment_ids: &[u64],
-        schema: Option<&crate::core::Schema>,
-    ) -> crate::core::Result<()> {
-        self.replace_segments_atomic_multi(
-            vec![(new_segment_id, new_volume, new_meta)],
-            old_segment_ids,
-            schema,
-            Vec::new(),
-        )
     }
 
     /// Atomically replace old segments with multiple new ones, `sides`
@@ -5373,35 +5182,6 @@ mod tests {
     }
 
     #[test]
-    fn test_manifest_find_segment() {
-        let mut m = TableManifest::new("t");
-        m.add_segment(SegmentMeta {
-            segment_id: 1,
-            file_path: PathBuf::from("a.vol"),
-            row_count: 100,
-            min_row_id: 1,
-            max_row_id: 100,
-            creation_lsn: 0,
-            seal_seq: 0,
-            schema_version: 0,
-        });
-        m.add_segment(SegmentMeta {
-            segment_id: 2,
-            file_path: PathBuf::from("b.vol"),
-            row_count: 100,
-            min_row_id: 101,
-            max_row_id: 200,
-            creation_lsn: 0,
-            seal_seq: 0,
-            schema_version: 0,
-        });
-
-        assert_eq!(m.find_segment_for_row_id(50).unwrap().1.segment_id, 1);
-        assert_eq!(m.find_segment_for_row_id(150).unwrap().1.segment_id, 2);
-        assert!(m.find_segment_for_row_id(300).is_none());
-    }
-
-    #[test]
     fn test_manifest_serialize_roundtrip() {
         let mut m = TableManifest::new("my_table");
         m.next_segment_id = 5;
@@ -5717,11 +5497,6 @@ mod tests {
         assert_eq!(mgr.total_row_count(), 9);
         assert!(mgr.is_tombstoned(5));
         assert!(!mgr.is_tombstoned(4));
-
-        // Clear tombstones
-        mgr.clear_tombstones();
-        assert!(mgr.row_exists(5).unwrap());
-        assert_eq!(mgr.total_row_count(), 10);
     }
 
     #[test]
@@ -5927,12 +5702,11 @@ mod tests {
             .unwrap();
             assert!(!mgr.decide_key_order(seg_id, &[2]).unwrap());
         }
-        mgr.replace_segments_atomic(
-            5,
-            descending_k_volume(&schema, 4),
-            meta_of(5, 4),
+        mgr.replace_segments_atomic_multi(
+            vec![(5, descending_k_volume(&schema, 4), meta_of(5, 4))],
             &[1],
             None,
+            Vec::new(),
         )
         .unwrap();
         mgr.remove_segments(&[2]);
@@ -6044,12 +5818,7 @@ mod tests {
         for stage in ["registered", "recomputed"] {
             assert_eq!(visible_positions(&mgr, 1), vec![0, 1], "{stage}");
             assert_eq!(visible_positions(&mgr, 2), vec![1], "{stage}");
-            let point = mgr.get_cold_row(1).unwrap().is_some();
-            assert_eq!(
-                (point, mgr.deduped_row_count().unwrap()),
-                (true, 3),
-                "{stage}"
-            );
+            assert_eq!(mgr.deduped_row_count().unwrap(), 3, "{stage}");
             mgr.recompute_visibility();
         }
     }
@@ -6858,7 +6627,6 @@ mod tests {
             mgr.get_volumes_newest_first().is_err(),
             "get_volumes_newest_first must fail instead of dropping the segment"
         );
-        assert!(mgr.get_cold_row(50).is_err(), "get_cold_row must fail");
         assert!(
             mgr.segments_snapshot().is_err(),
             "the DML statement snapshot must fail before any mutation"
@@ -6928,21 +6696,24 @@ mod tests {
 
         // Background compaction replaces segment 1 with segment 2 while the
         // statement snapshot is live.
-        mgr.replace_segments_atomic(
-            2,
-            build_volume(1..=10),
-            SegmentMeta {
-                segment_id: 2,
-                file_path: PathBuf::from("s2.vol"),
-                row_count: 10,
-                min_row_id: 1,
-                max_row_id: 10,
-                creation_lsn: 0,
-                seal_seq: 1,
-                schema_version: 0,
-            },
+        mgr.replace_segments_atomic_multi(
+            vec![(
+                2,
+                build_volume(1..=10),
+                SegmentMeta {
+                    segment_id: 2,
+                    file_path: PathBuf::from("s2.vol"),
+                    row_count: 10,
+                    min_row_id: 1,
+                    max_row_id: 10,
+                    creation_lsn: 0,
+                    seal_seq: 1,
+                    schema_version: 0,
+                },
+            )],
             &[1],
             None,
+            Vec::new(),
         )
         .unwrap();
 
@@ -7006,13 +6777,7 @@ mod tests {
 
         let target = Value::Integer(5);
         let defaults = [Value::Integer(0)];
-        // Review probe: the live lookup fails to reload...
-        assert!(
-            mgr.find_row_id_by_values(&[0], &[&target], &defaults)
-                .is_err(),
-            "live lookup must fail on unreloadable cold state"
-        );
-        // ...while the statement-snapshot lookup keeps serving its view.
+        // The statement-snapshot lookup keeps serving its view
         let found = mgr
             .find_row_id_by_values_in(&snap, &[0], &[&target], &defaults)
             .unwrap();

@@ -22,10 +22,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
-use stoolap::common::I64Map;
-use stoolap::core::{
-    DataType, IndexEntry, IndexType, Operator, Result, Row, RowIdVec, Schema, Value,
-};
+use stoolap::core::{DataType, IndexEntry, IndexType, Operator, Result, Row, Schema, Value};
 use stoolap::storage::expression::{ComparisonExpr, Expression};
 use stoolap::storage::index::MultiColumnIndex;
 use stoolap::storage::traits::{Engine, Index};
@@ -593,12 +590,6 @@ impl Index for StopAfterIndexAdd {
     fn name(&self) -> &str {
         self.inner.name()
     }
-    fn table_name(&self) -> &str {
-        self.inner.table_name()
-    }
-    fn build(&mut self) -> Result<()> {
-        Ok(())
-    }
     fn add(&self, values: &[Value], row_id: i64, ref_id: i64) -> Result<()> {
         self.inner.add(values, row_id, ref_id)?;
         if self.armed.swap(false, Ordering::SeqCst) {
@@ -611,14 +602,8 @@ impl Index for StopAfterIndexAdd {
         }
         Ok(())
     }
-    fn add_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
-        self.inner.add_batch(entries)
-    }
     fn remove(&self, values: &[Value], row_id: i64, ref_id: i64) -> Result<()> {
         self.inner.remove(values, row_id, ref_id)
-    }
-    fn remove_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
-        self.inner.remove_batch(entries)
     }
     fn column_ids(&self) -> &[i32] {
         self.inner.column_ids()
@@ -654,9 +639,6 @@ impl Index for StopAfterIndexAdd {
     fn find_with_operator(&self, op: Operator, values: &[Value]) -> Result<Vec<IndexEntry>> {
         self.inner.find_with_operator(op, values)
     }
-    fn get_filtered_row_ids(&self, expr: &dyn Expression) -> RowIdVec {
-        self.inner.get_filtered_row_ids(expr)
-    }
     fn walk_prefix_ordered(
         &self,
         prefix: &[Value],
@@ -670,9 +652,6 @@ impl Index for StopAfterIndexAdd {
     }
     fn as_any(&self) -> &dyn std::any::Any {
         self.inner.as_any()
-    }
-    fn close(&mut self) -> Result<()> {
-        Ok(())
     }
 }
 

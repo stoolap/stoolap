@@ -210,16 +210,6 @@ impl Token {
         self.token_type == TokenType::Eof
     }
 
-    /// Check if this is an error token
-    pub fn is_error(&self) -> bool {
-        self.token_type == TokenType::Error
-    }
-
-    /// Check if this is the given keyword
-    pub fn is_keyword(&self, keyword: Keyword) -> bool {
-        self.keyword == Some(keyword)
-    }
-
     /// Check if this is an operator with the given value
     pub fn is_operator(&self, op: &str) -> bool {
         self.token_type == TokenType::Operator && self.literal == op
@@ -731,14 +721,12 @@ mod tests {
         let token = Token::new(TokenType::Keyword, "SELECT", Position::new(0, 1, 1));
         assert_eq!(token.token_type, TokenType::Keyword);
         assert_eq!(token.literal, "SELECT");
-        assert!(token.is_keyword(Keyword::Select));
-        assert!(!token.is_keyword(Keyword::From));
     }
 
     #[test]
     fn test_error_token() {
         let token = Token::error("unexpected character", "x", Position::new(5, 1, 6));
-        assert!(token.is_error());
+        assert_eq!(token.token_type, TokenType::Error);
         // Error message is stored in literal field
         assert_eq!(token.literal.as_str(), "unexpected character");
     }

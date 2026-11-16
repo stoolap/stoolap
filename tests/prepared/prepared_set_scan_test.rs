@@ -248,8 +248,8 @@ fn a_block_error_is_raised_again_without_reading_the_block_again() {
     let _turn = COUNTED.lock().unwrap_or_else(|e| e.into_inner());
     // No other test here calls SET_SCAN_TICK
     global_registry().register_scalar::<Tick>().unwrap();
-    let mut engine = MVCCEngine::in_memory();
-    stoolap::storage::traits::Engine::open(&mut engine).unwrap();
+    let engine = MVCCEngine::in_memory();
+    engine.open_engine().unwrap();
     let executor = Executor::new(Arc::new(engine));
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, i INTEGER)",

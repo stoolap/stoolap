@@ -29,8 +29,6 @@ use std::fmt;
 use std::ops::Index;
 
 use super::error::{Error, Result};
-use super::schema::Schema;
-use super::types::DataType;
 use super::value::Value;
 use crate::common::{CompactArc, CompactVec};
 
@@ -258,34 +256,6 @@ impl Row {
         }
     }
 
-    /// Combine two rows into this row buffer (for JOINs) - reuses allocation
-    #[inline]
-    pub fn combine_into(&mut self, left: &Row, right: &Row) {
-        let total_len = left.len() + right.len();
-        let vec = self.storage.make_mut();
-        vec.clear();
-        vec.reserve(total_len);
-        // Use extend_clone to avoid Cloned iterator adapter overhead
-        vec.extend_clone(left.as_slice());
-        vec.extend_clone(right.as_slice());
-    }
-
-    /// Combine rows: clone left, move right (for JOINs) - reuses allocation
-    #[inline]
-    pub fn combine_into_clone_move(&mut self, left: &Row, right: Row) {
-        let total_len = left.len() + right.len();
-        let vec = self.storage.make_mut();
-        vec.clear();
-        vec.reserve(total_len);
-        // Use extend_clone to avoid Cloned iterator adapter overhead
-        vec.extend_clone(left.as_slice());
-        // Move right values
-        match right.storage {
-            RowStorage::Owned(right_vec) => vec.extend(right_vec),
-            RowStorage::Shared(arc) => vec.extend_clone(&arc),
-        }
-    }
-
     /// Combine rows: move both (for JOINs) - reuses allocation
     #[inline]
     pub fn combine_into_owned(&mut self, left: Row, right: Row) {
@@ -336,13 +306,7 @@ impl Row {
         }
     }
 
-    /// Combine two owned rows (for JOINs) - moves values without cloning
-    #[inline]
-    pub fn from_combined_owned(left: Row, right: Row) -> Self {
-        Self::from_combined_owned_with_room(left, right, 0)
-    }
-
-    /// [`Self::from_combined_owned`], with room for `room` values more
+    /// Combine two owned rows (for JOINs), with room for `room` values more
     #[inline]
     pub(crate) fn from_combined_owned_with_room(left: Row, right: Row, room: usize) -> Self {
         // Fast path: both Owned
@@ -371,19 +335,6 @@ impl Row {
                     storage: RowStorage::Owned(values),
                 }
             }
-        }
-    }
-
-    /// Create a row with null values for a given schema
-    #[inline]
-    pub fn null_row(schema: &Schema) -> Self {
-        let values: CompactVec<Value> = schema
-            .columns
-            .iter()
-            .map(|col| Value::null(col.data_type))
-            .collect();
-        Self {
-            storage: RowStorage::Owned(values),
         }
     }
 
@@ -537,31 +488,16 @@ impl Row {
         }
     }
 
-    /// Extract the first value, consuming the row
-    #[inline]
-    pub fn take_first_value(self) -> Option<Value> {
-        match self.storage {
-            RowStorage::Owned(mut vec) => {
-                if vec.is_empty() {
-                    None
-                } else {
-                    Some(vec.swap_remove(0))
-                }
-            }
-            RowStorage::Shared(arc) => arc.first().cloned(),
-        }
+    /// Check if storage is owned
+    #[cfg(test)]
+    pub fn is_owned(&self) -> bool {
+        matches!(self.storage, RowStorage::Owned(_))
     }
 
     /// Check if storage is shared (Arc-wrapped)
     #[inline]
     pub fn is_shared(&self) -> bool {
         matches!(self.storage, RowStorage::Shared(_))
-    }
-
-    /// Check if storage is owned
-    #[inline]
-    pub fn is_owned(&self) -> bool {
-        matches!(self.storage, RowStorage::Owned(_))
     }
 
     /// Convert Row to CompactArc<[Value]>, consuming self
@@ -588,15 +524,6 @@ impl Row {
                 // Use from_compact_vec directly - avoids intermediate Vec conversion
                 storage: RowStorage::Shared(CompactArc::from_compact_vec(vec)),
             },
-        }
-    }
-
-    /// Get CompactArc<[Value]> reference if shared, None if owned
-    #[inline]
-    pub fn as_arc(&self) -> Option<&CompactArc<[Value]>> {
-        match &self.storage {
-            RowStorage::Shared(arc) => Some(arc),
-            RowStorage::Owned(_) => None,
         }
     }
 
@@ -672,44 +599,6 @@ impl Row {
         }
     }
 
-    /// Validate the row against a schema
-    pub fn validate(&self, schema: &Schema) -> Result<()> {
-        let len = self.len();
-
-        // Check column count
-        if len != schema.columns.len() {
-            return Err(Error::table_columns_not_match(schema.columns.len(), len));
-        }
-
-        // Check each value
-        for (i, (value, col)) in self.iter().zip(schema.columns.iter()).enumerate() {
-            // Check nullability
-            if value.is_null() && !col.nullable && !col.primary_key {
-                return Err(Error::not_null_constraint(&col.name));
-            }
-
-            // Check type compatibility (skip for null values)
-            if !value.is_null() {
-                let value_type = value.data_type();
-                if value_type != col.data_type {
-                    // Allow some implicit conversions
-                    let compatible = matches!(
-                        (value_type, col.data_type),
-                        (DataType::Integer, DataType::Float) | (DataType::Float, DataType::Integer)
-                    );
-                    if !compatible {
-                        return Err(Error::type_conversion(
-                            format!("column {} at index {}: {:?}", col.name, i, value_type),
-                            format!("{:?}", col.data_type),
-                        ));
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     /// Clone the row, selecting only the specified column indices
     #[inline]
     pub fn clone_subset(&self, indices: &[usize]) -> Row {
@@ -744,12 +633,6 @@ impl Row {
     // === Compatibility methods for gradual migration ===
     // These methods maintain API compatibility with code expecting CompactArc
 
-    /// Alias for is_owned (backwards compatibility)
-    #[inline]
-    pub fn is_inline(&self) -> bool {
-        self.is_owned()
-    }
-
     /// Clear and use as inline storage (backwards compatibility)
     #[inline]
     pub fn clear_inline(&mut self) {
@@ -769,14 +652,6 @@ impl Row {
         if vec.capacity() < capacity {
             vec.reserve(capacity - vec.len());
         }
-    }
-
-    /// Refill with values (backwards compatibility)
-    #[inline]
-    pub fn refill_inline<I: Iterator<Item = Value>>(&mut self, values: I) {
-        let vec = self.storage.make_mut();
-        vec.clear();
-        vec.extend(values);
     }
 }
 
@@ -856,15 +731,7 @@ macro_rules! row {
 mod tests {
     use super::*;
     use crate::common::CompactArc;
-    use crate::core::schema::SchemaBuilder;
-
-    fn create_test_schema() -> Schema {
-        SchemaBuilder::new("test")
-            .add_primary_key("id", DataType::Integer)
-            .add("name", DataType::Text)
-            .add_nullable("email", DataType::Text)
-            .build()
-    }
+    use crate::core::types::DataType;
 
     #[test]
     fn test_row_creation() {
@@ -979,43 +846,6 @@ mod tests {
         assert_eq!(selected[1], Value::float(3.5));
 
         assert!(row.select_columns(&[0, 10]).is_err());
-    }
-
-    #[test]
-    fn test_row_validate() {
-        let schema = create_test_schema();
-
-        // Valid row
-        let row = Row::from_values(vec![
-            Value::integer(1),
-            Value::text("Alice"),
-            Value::null(DataType::Text),
-        ]);
-        assert!(row.validate(&schema).is_ok());
-
-        // Wrong column count
-        let row = Row::from_values(vec![Value::integer(1)]);
-        assert!(row.validate(&schema).is_err());
-
-        // Not null constraint violation
-        let row = Row::from_values(vec![
-            Value::integer(1),
-            Value::null(DataType::Text), // name is not nullable
-            Value::null(DataType::Text),
-        ]);
-        let err = row.validate(&schema).unwrap_err();
-        assert!(matches!(err, Error::NotNullConstraint { .. }));
-    }
-
-    #[test]
-    fn test_row_null_row() {
-        let schema = create_test_schema();
-        let row = Row::null_row(&schema);
-
-        assert_eq!(row.len(), 3);
-        assert!(row[0].is_null());
-        assert!(row[1].is_null());
-        assert!(row[2].is_null());
     }
 
     #[test]

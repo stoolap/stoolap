@@ -223,19 +223,6 @@ fn collect_all_rows_inside_a_seal_keeps_a_cold_row_updated_before_it() {
 }
 
 #[test]
-fn collect_all_rows_unsorted_inside_a_seal_keeps_a_cold_row_updated_before_it() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = cold_row_updated(&dir, false);
-    let mut tx = db.engine().begin_transaction().unwrap();
-    let table = tx.get_table("t").unwrap();
-    let rows = inside_seal(&db, Hold::IndexesCleaned, None, || {
-        row_pairs(&table.collect_all_rows_unsorted().unwrap())
-    });
-    assert_eq!(rows, after_update(), "row 5 inside the seal");
-    tx.rollback().unwrap();
-}
-
-#[test]
 fn active_row_ids_inside_a_seal_keep_a_cold_row_updated_before_it() {
     let dir = tempfile::tempdir().unwrap();
     let db = cold_row_updated(&dir, false);

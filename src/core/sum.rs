@@ -71,7 +71,6 @@ impl SumAccumulator {
     }
 
     /// The number of values added
-    #[inline]
     pub fn count(&self) -> u64 {
         self.count
     }

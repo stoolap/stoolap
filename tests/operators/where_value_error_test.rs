@@ -149,8 +149,8 @@ fn a_where_value_is_computed_once_when_another_fails() {
     stoolap::functions::global_registry()
         .register_scalar::<Tick>()
         .unwrap();
-    let mut engine = stoolap::storage::mvcc::engine::MVCCEngine::in_memory();
-    stoolap::storage::traits::Engine::open(&mut engine).unwrap();
+    let engine = stoolap::storage::mvcc::engine::MVCCEngine::in_memory();
+    engine.open_engine().unwrap();
     let executor = stoolap::executor::Executor::new(Arc::new(engine));
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",

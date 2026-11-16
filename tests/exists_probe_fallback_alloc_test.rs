@@ -16,12 +16,37 @@
 //! EXISTS probe was answered from
 
 // The library's own allocator features set a global allocator of their own
-#![cfg(not(any(feature = "jemalloc", feature = "dhat-heap")))]
+#![cfg(not(feature = "jemalloc"))]
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicIsize, Ordering};
 
 use stoolap::Database;
 
+static LIVE: AtomicIsize = AtomicIsize::new(0);
+
+struct LiveBytes;
+
+unsafe impl GlobalAlloc for LiveBytes {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        LIVE.fetch_add(layout.size() as isize, Ordering::Relaxed);
+        System.alloc(layout)
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        LIVE.fetch_sub(layout.size() as isize, Ordering::Relaxed);
+        System.dealloc(ptr, layout)
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        LIVE.fetch_add(
+            new_size as isize - layout.size() as isize,
+            Ordering::Relaxed,
+        );
+        System.realloc(ptr, layout, new_size)
+    }
+}
+
 #[global_allocator]
-static ALLOC: dhat::Alloc = dhat::Alloc;
+static ALLOC: LiveBytes = LiveBytes;
 
 #[test]
 fn clearing_all_caches_releases_the_probe_fallback_set() {
@@ -41,7 +66,6 @@ fn clearing_all_caches_releases_the_probe_fallback_set() {
     db.execute("INSERT INTO o VALUES (1, -1)", ()).unwrap();
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     db.execute("BEGIN", ()).unwrap();
-    let profiler = dhat::Profiler::builder().testing().build();
     let found: Vec<i64> = db
         .query(
             "SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM t WHERE t.k = o.k) LIMIT 10",
@@ -52,12 +76,11 @@ fn clearing_all_caches_releases_the_probe_fallback_set() {
         .collect();
     assert_eq!(found, [1]);
     stoolap::executor::clear_all_thread_local_caches();
-    let cleared = dhat::HeapStats::get().curr_bytes;
+    let cleared = LIVE.load(Ordering::Relaxed);
     db.query("SELECT 1", ())
         .unwrap()
         .for_each(|r| drop(r.unwrap()));
-    let next_select = dhat::HeapStats::get().curr_bytes;
-    drop(profiler);
+    let next_select = LIVE.load(Ordering::Relaxed);
     assert!(
         cleared <= next_select + 64 * 1024,
         "clear_all kept {} bytes the next statement released",

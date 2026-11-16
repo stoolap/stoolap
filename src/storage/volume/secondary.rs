@@ -1573,12 +1573,6 @@ pub struct IndexFile {
     _charges: Vec<Held>,
 }
 
-/// An error a caller answers by reopening the file.
-pub fn is_generation_changed(error: &std::io::Error) -> bool {
-    error.kind() == std::io::ErrorKind::InvalidData
-        && error.to_string().contains("generation changed")
-}
-
 impl IndexFile {
     /// Opens `path` through the process's handle of it. `file_id`
     /// distinguishes files in the page cache; the segment id is the
@@ -2293,7 +2287,8 @@ struct OwnPages {
 
 impl Reader {
     /// Pages this reader read through its own buffers
-    pub fn own_pages(&self) -> u64 {
+    #[cfg(test)]
+    fn own_pages(&self) -> u64 {
         self.own.borrow().pages
     }
 
@@ -5056,13 +5051,6 @@ pub fn stage_side_for(
     }
 }
 
-/// The side file to attach beside `volume_path` at reopen, from a read of
-/// its directory; see `SideFiles::open_for`
-pub fn open_side_for(volume_path: &Path, file_id: u64) -> Option<Arc<IndexFile>> {
-    let dir = volume_path.parent()?;
-    SideFiles::in_dir(dir).open_for(volume_path, file_id)
-}
-
 fn retire_file(side: &Path) {
     match VolumeFile::retire_path(side) {
         Ok(()) => {}
@@ -6860,7 +6848,7 @@ mod tests {
         INDEX_PAGES.clear();
         // Beside a volume, the newest generation is the one attached
         let volume = dir.path().join("v.vol");
-        let attached = open_side_for(&volume, 4).unwrap();
+        let attached = SideFiles::in_dir(dir.path()).open_for(&volume, 4).unwrap();
         assert_eq!(attached.generation(), new.generation());
         assert_eq!(side_stem(&replacement).as_deref(), Some("v"));
     }
@@ -7486,10 +7474,11 @@ mod tests {
         );
         let bytes = std::fs::read(&side).unwrap();
         std::fs::write(&side, &bytes[..bytes.len() - 3]).unwrap();
-        assert!(open_side_for(&volume_path, 1).is_none());
+        let open = || SideFiles::in_dir(volume_path.parent().unwrap()).open_for(&volume_path, 1);
+        assert!(open().is_none());
         assert!(side.exists(), "the file stays for whoever can read it");
         std::fs::write(&side, &bytes).unwrap();
-        assert!(open_side_for(&volume_path, 1).is_some());
+        assert!(open().is_some());
     }
 
     #[test]

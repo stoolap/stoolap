@@ -89,12 +89,6 @@ impl SchemaColumn {
         }
     }
 
-    /// Set vector dimensions (for VECTOR columns)
-    pub fn with_vector_dimensions(mut self, dims: u16) -> Self {
-        self.vector_dimensions = dims;
-        self
-    }
-
     /// Create a new column definition with all options
     #[allow(clippy::too_many_arguments)]
     pub fn with_constraints(
@@ -152,21 +146,6 @@ impl SchemaColumn {
             check_expr,
             vector_dimensions: 0,
         }
-    }
-
-    /// Create a simple non-nullable, non-primary-key column
-    pub fn simple(id: usize, name: impl Into<String>, data_type: DataType) -> Self {
-        Self::new(id, name, data_type, false, false)
-    }
-
-    /// Create a nullable column
-    pub fn nullable(id: usize, name: impl Into<String>, data_type: DataType) -> Self {
-        Self::new(id, name, data_type, true, false)
-    }
-
-    /// Create a primary key column
-    pub fn primary_key(id: usize, name: impl Into<String>, data_type: DataType) -> Self {
-        Self::new(id, name, data_type, false, true)
     }
 }
 
@@ -383,22 +362,6 @@ impl Schema {
         }
     }
 
-    /// Create a new schema with explicit timestamps
-    pub fn with_timestamps(
-        table_name: impl Into<String>,
-        columns: Vec<SchemaColumn>,
-        created_at: DateTime<Utc>,
-        updated_at: DateTime<Utc>,
-    ) -> Self {
-        Self::with_timestamps_and_foreign_keys(
-            table_name,
-            columns,
-            Vec::new(),
-            created_at,
-            updated_at,
-        )
-    }
-
     /// Create a new schema with explicit timestamps and foreign key constraints
     pub fn with_timestamps_and_foreign_keys(
         table_name: impl Into<String>,
@@ -465,16 +428,6 @@ impl Schema {
         }
     }
 
-    /// Get the number of columns
-    pub fn column_count(&self) -> usize {
-        self.columns.len()
-    }
-
-    /// Check if the schema has any columns
-    pub fn is_empty(&self) -> bool {
-        self.columns.is_empty()
-    }
-
     /// Find a column by name (case-insensitive)
     /// Returns the column index and reference
     /// OPTIMIZATION: Uses cached column_index_map for O(1) lookup
@@ -483,11 +436,6 @@ impl Schema {
         self.column_index_map()
             .get(&name_lower)
             .map(|&idx| (idx, &self.columns[idx]))
-    }
-
-    /// Get a column by index
-    pub fn get_column(&self, index: usize) -> Option<&SchemaColumn> {
-        self.columns.get(index)
     }
 
     /// Get a column by name (case-insensitive)
@@ -508,11 +456,6 @@ impl Schema {
     /// Check if a column exists by name
     pub fn has_column(&self, name: &str) -> bool {
         self.find_column(name).is_some()
-    }
-
-    /// Get all column names as borrowed strings (allocates Vec but not strings)
-    pub fn column_names(&self) -> Vec<&str> {
-        self.columns.iter().map(|c| c.name.as_str()).collect()
     }
 
     /// Get all column names as owned strings (cached - only clones once)
@@ -567,11 +510,6 @@ impl Schema {
         self.columns.iter().filter(|c| c.primary_key).collect()
     }
 
-    /// Check if the schema has a primary key
-    pub fn has_primary_key(&self) -> bool {
-        self.columns.iter().any(|c| c.primary_key)
-    }
-
     /// Get the primary key column indices (cached for performance)
     /// OPTIMIZATION: Cached to avoid allocating Vec on every call
     #[inline]
@@ -622,14 +560,6 @@ impl Schema {
                     column = col.name.escape_debug(),
                 ))
             })?;
-        }
-        Ok(())
-    }
-
-    /// Validate column count matches expected value
-    pub fn validate_column_count(&self, expected: usize) -> Result<()> {
-        if self.columns.len() != expected {
-            return Err(Error::table_columns_not_match(expected, self.columns.len()));
         }
         Ok(())
     }
@@ -982,14 +912,14 @@ impl SchemaBuilder {
         self
     }
 
-    /// Add a simple non-nullable column
-    pub fn add(self, name: impl Into<String>, data_type: DataType) -> Self {
-        self.column(name, data_type, false, false)
-    }
-
     /// Add a nullable column
     pub fn add_nullable(self, name: impl Into<String>, data_type: DataType) -> Self {
         self.column(name, data_type, true, false)
+    }
+
+    /// Add a simple non-nullable column
+    pub fn add(self, name: impl Into<String>, data_type: DataType) -> Self {
+        self.column(name, data_type, false, false)
     }
 
     /// Add a primary key column
@@ -1101,26 +1031,10 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_column_helpers() {
-        let simple = SchemaColumn::simple(0, "name", DataType::Text);
-        assert!(!simple.nullable);
-        assert!(!simple.primary_key);
-
-        let nullable = SchemaColumn::nullable(1, "email", DataType::Text);
-        assert!(nullable.nullable);
-        assert!(!nullable.primary_key);
-
-        let pk = SchemaColumn::primary_key(2, "id", DataType::Integer);
-        assert!(!pk.nullable);
-        assert!(pk.primary_key);
-    }
-
-    #[test]
     fn test_schema_creation() {
         let schema = create_test_schema();
         assert_eq!(schema.table_name, "users");
-        assert_eq!(schema.column_count(), 4);
-        assert!(!schema.is_empty());
+        assert_eq!(schema.columns.len(), 4);
     }
 
     #[test]
@@ -1144,28 +1058,14 @@ mod tests {
     fn test_schema_get_column() {
         let schema = create_test_schema();
 
-        let col = schema.get_column(0).unwrap();
-        assert_eq!(col.name, "id");
-
         let col = schema.get_column_by_name("email").unwrap();
         assert_eq!(col.data_type, DataType::Text);
         assert!(col.nullable);
-
-        assert!(schema.get_column(100).is_none());
-    }
-
-    #[test]
-    fn test_schema_column_names() {
-        let schema = create_test_schema();
-        let names = schema.column_names();
-        assert_eq!(names, vec!["id", "name", "email", "active"]);
     }
 
     #[test]
     fn test_schema_primary_key() {
         let schema = create_test_schema();
-
-        assert!(schema.has_primary_key());
 
         let pk_cols = schema.primary_key_columns();
         assert_eq!(pk_cols.len(), 1);
@@ -1176,40 +1076,26 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_validate_column_count() {
-        let schema = create_test_schema();
-
-        assert!(schema.validate_column_count(4).is_ok());
-
-        let err = schema.validate_column_count(3).unwrap_err();
-        assert!(matches!(
-            err,
-            Error::TableColumnsNotMatch {
-                expected: 3,
-                got: 4
-            }
-        ));
-    }
-
-    #[test]
     fn test_schema_add_column() {
         let mut schema = create_test_schema();
-        let original_count = schema.column_count();
+        let original_count = schema.columns.len();
 
         schema
-            .add_column(SchemaColumn::simple(
+            .add_column(SchemaColumn::new(
                 original_count,
                 "age",
                 DataType::Integer,
+                false,
+                false,
             ))
             .unwrap();
 
-        assert_eq!(schema.column_count(), original_count + 1);
+        assert_eq!(schema.columns.len(), original_count + 1);
         assert!(schema.has_column("age"));
 
         // Duplicate column should fail
         let err = schema
-            .add_column(SchemaColumn::simple(0, "age", DataType::Integer))
+            .add_column(SchemaColumn::new(0, "age", DataType::Integer, false, false))
             .unwrap_err();
         assert!(matches!(err, Error::DuplicateColumn));
     }
@@ -1220,7 +1106,7 @@ mod tests {
 
         let removed = schema.remove_column("email").unwrap();
         assert_eq!(removed.name, "email");
-        assert_eq!(schema.column_count(), 3);
+        assert_eq!(schema.columns.len(), 3);
         assert!(!schema.has_column("email"));
 
         // Column IDs should be re-indexed
@@ -1297,7 +1183,7 @@ mod tests {
             .build();
 
         assert_eq!(schema.table_name, "products");
-        assert_eq!(schema.column_count(), 4);
+        assert_eq!(schema.columns.len(), 4);
         assert!(schema.get_column_by_name("id").unwrap().primary_key);
         assert!(schema.get_column_by_name("description").unwrap().nullable);
     }

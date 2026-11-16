@@ -164,40 +164,6 @@ pub enum Operator {
     IsNotNull = 10,
 }
 
-impl Operator {
-    /// Returns true if this operator needs a right-hand value
-    pub fn needs_value(&self) -> bool {
-        !matches!(self, Operator::IsNull | Operator::IsNotNull)
-    }
-
-    /// Returns true if this operator is a null check
-    pub fn is_null_check(&self) -> bool {
-        matches!(self, Operator::IsNull | Operator::IsNotNull)
-    }
-
-    /// Returns the negation of this operator, if applicable
-    pub fn negate(&self) -> Option<Self> {
-        match self {
-            Operator::Eq => Some(Operator::Ne),
-            Operator::Ne => Some(Operator::Eq),
-            Operator::Gt => Some(Operator::Lte),
-            Operator::Gte => Some(Operator::Lt),
-            Operator::Lt => Some(Operator::Gte),
-            Operator::Lte => Some(Operator::Gt),
-            Operator::In => Some(Operator::NotIn),
-            Operator::NotIn => Some(Operator::In),
-            Operator::IsNull => Some(Operator::IsNotNull),
-            Operator::IsNotNull => Some(Operator::IsNull),
-            Operator::Like => None, // LIKE doesn't have a simple negation
-        }
-    }
-
-    /// Returns the type ID as u8 for serialization
-    pub fn as_u8(&self) -> u8 {
-        *self as u8
-    }
-}
-
 impl fmt::Display for Operator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -327,11 +293,6 @@ pub enum IsolationLevel {
 }
 
 impl IsolationLevel {
-    /// Returns the type ID as u8 for serialization
-    pub fn as_u8(&self) -> u8 {
-        *self as u8
-    }
-
     /// Create IsolationLevel from u8
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
@@ -425,12 +386,7 @@ pub struct IndexEntry {
     pub ref_id: i64,
 }
 
-impl IndexEntry {
-    /// Create a new index entry
-    pub fn new(row_id: i64, ref_id: i64) -> Self {
-        Self { row_id, ref_id }
-    }
-}
+impl IndexEntry {}
 
 #[cfg(test)]
 mod tests {
@@ -561,31 +517,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_operator_needs_value() {
-        assert!(Operator::Eq.needs_value());
-        assert!(Operator::Ne.needs_value());
-        assert!(Operator::Gt.needs_value());
-        assert!(Operator::Like.needs_value());
-        assert!(!Operator::IsNull.needs_value());
-        assert!(!Operator::IsNotNull.needs_value());
-    }
-
-    #[test]
-    fn test_operator_negate() {
-        assert_eq!(Operator::Eq.negate(), Some(Operator::Ne));
-        assert_eq!(Operator::Ne.negate(), Some(Operator::Eq));
-        assert_eq!(Operator::Gt.negate(), Some(Operator::Lte));
-        assert_eq!(Operator::Gte.negate(), Some(Operator::Lt));
-        assert_eq!(Operator::Lt.negate(), Some(Operator::Gte));
-        assert_eq!(Operator::Lte.negate(), Some(Operator::Gt));
-        assert_eq!(Operator::In.negate(), Some(Operator::NotIn));
-        assert_eq!(Operator::NotIn.negate(), Some(Operator::In));
-        assert_eq!(Operator::IsNull.negate(), Some(Operator::IsNotNull));
-        assert_eq!(Operator::IsNotNull.negate(), Some(Operator::IsNull));
-        assert_eq!(Operator::Like.negate(), None);
-    }
-
     // =========================================================================
     // IndexType tests
     // =========================================================================
@@ -639,8 +570,6 @@ mod tests {
 
     #[test]
     fn test_isolationlevel_u8_conversion() {
-        assert_eq!(IsolationLevel::ReadCommitted.as_u8(), 0);
-        assert_eq!(IsolationLevel::SnapshotIsolation.as_u8(), 1);
         assert_eq!(
             IsolationLevel::from_u8(0),
             Some(IsolationLevel::ReadCommitted)
@@ -655,13 +584,6 @@ mod tests {
     // =========================================================================
     // IndexEntry tests
     // =========================================================================
-
-    #[test]
-    fn test_index_entry() {
-        let entry = IndexEntry::new(42, 100);
-        assert_eq!(entry.row_id, 42);
-        assert_eq!(entry.ref_id, 100);
-    }
 
     #[test]
     fn test_default_values() {

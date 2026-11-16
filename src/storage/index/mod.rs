@@ -34,10 +34,7 @@ pub(crate) mod value_tree;
 
 // Re-export main types
 pub use bitmap::BitmapIndex;
-pub use btree::{
-    intersect_multiple_sorted_ids, intersect_sorted_ids, union_multiple_sorted_ids,
-    union_sorted_ids, BTreeIndex,
-};
+pub use btree::BTreeIndex;
 pub use hash::HashIndex;
 pub use hnsw::{
     default_ef_construction, default_ef_search, default_m_for_dims, HnswDistanceMetric, HnswIndex,

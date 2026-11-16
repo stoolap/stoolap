@@ -47,10 +47,10 @@ use crate::storage::expression::CompiledFilter;
 use crate::storage::mvcc::arena::{Relayout, RowArena};
 use crate::storage::mvcc::commit_log::ReadPoint;
 use crate::storage::mvcc::key_hold::KeyHolds;
+use crate::storage::mvcc::next_write_order;
 #[cfg(not(test))]
 use crate::storage::mvcc::registry::TransactionRegistry;
 use crate::storage::mvcc::registry::{CommitCut, HistoryEvent, StatementView};
-use crate::storage::mvcc::{get_fast_timestamp, next_write_order};
 use crate::storage::traits::PlannedUpdate;
 use crate::storage::volume::side_index::SideIndexDef;
 use crate::storage::Index;
@@ -83,11 +83,14 @@ pub struct RowVersion {
 impl RowVersion {
     /// Creates a new row version
     pub fn new(txn_id: i64, data: Row) -> Self {
+        Self::new_with_timestamp(txn_id, data, next_write_order())
+    }
+
+    /// Creates a new deleted version
+    pub fn new_deleted(txn_id: i64, data: Row) -> Self {
         Self {
-            txn_id,
-            deleted_at_txn_id: 0,
-            data,
-            create_time: get_fast_timestamp(),
+            deleted_at_txn_id: txn_id,
+            ..Self::new(txn_id, data)
         }
     }
 
@@ -98,27 +101,6 @@ impl RowVersion {
         Self {
             txn_id,
             deleted_at_txn_id: 0,
-            data,
-            create_time,
-        }
-    }
-
-    /// Creates a new deleted version
-    pub fn new_deleted(txn_id: i64, data: Row) -> Self {
-        Self {
-            txn_id,
-            deleted_at_txn_id: txn_id,
-            data,
-            create_time: get_fast_timestamp(),
-        }
-    }
-
-    /// Creates a new deleted version with a pre-computed timestamp
-    #[inline]
-    pub fn new_deleted_with_timestamp(txn_id: i64, data: Row, create_time: i64) -> Self {
-        Self {
-            txn_id,
-            deleted_at_txn_id: txn_id,
             data,
             create_time,
         }
@@ -366,8 +348,6 @@ pub struct Applied {
 pub struct WriteSetEntry {
     /// Version when first read (None if row didn't exist)
     pub read_version: Option<RowVersion>,
-    /// Sequence number when read
-    pub read_version_seq: i64,
     /// The version read is a volume's copy of the row: the indexes that
     /// keep sealed rows held its keys, the hot indexes never did
     pub sealed: bool,
@@ -1962,25 +1942,6 @@ impl VersionStore {
         }
     }
 
-    /// Sets the maximum version history limit per row
-    ///
-    /// This controls how many previous versions are kept for each row.
-    /// Lower values reduce memory usage but limit time-travel query range.
-    /// - 0 = unlimited (not recommended for write-heavy workloads)
-    /// - 1 = only keep immediate previous (minimal memory, limited AS OF range)
-    /// - 10 = default, good balance for most workloads
-    ///
-    /// Note: Values above 254 are capped to 254 for practical reasons.
-    pub fn set_max_version_history(&mut self, limit: usize) {
-        // Cap at 254 for practical memory management
-        self.max_version_history = limit.min(254);
-    }
-
-    /// Gets the current max version history limit
-    pub fn max_version_history(&self) -> usize {
-        self.max_version_history
-    }
-
     /// What a new head keeps of `existing`'s chain. Past the history limit
     /// the chain goes, except what a snapshot or view still reads: cut below
     /// a version the maintenance limit sees within the first `limit`
@@ -2130,6 +2091,16 @@ impl VersionStore {
         Ok(())
     }
 
+    /// Drops `name` with no record and no cold rows to follow, as a
+    /// table handle does: close, rebind, publish and open back to back
+    pub fn drop_column_at_once(&self, name: &str) -> Result<(), Error> {
+        let without = self.close_for_drop(name)?;
+        self.rebind_indexes_for_drop();
+        self.publish_drop(without);
+        self.open_after_drop();
+        Ok(())
+    }
+
     /// Adds `column` to the schema and closes the table: the rows follow at
     /// `lay_out_rows`, which opens it, once the change is durable; a change
     /// that fails to record reopens at `reopen_after_refused_add`
@@ -2254,16 +2225,6 @@ impl VersionStore {
     pub fn open_after_drop(&self) {
         let _schema = self.schema.write();
         self.layout.fetch_add(1, Ordering::AcqRel);
-    }
-
-    /// Drops `name` with no record and no cold rows to follow, as a
-    /// table handle does: close, rebind, publish and open back to back
-    pub fn drop_column_at_once(&self, name: &str) -> Result<(), Error> {
-        let without = self.close_for_drop(name)?;
-        self.rebind_indexes_for_drop();
-        self.publish_drop(without);
-        self.open_after_drop();
-        Ok(())
     }
 
     /// Moves every row to the schema's layout: a row narrower than the
@@ -2633,11 +2594,6 @@ impl VersionStore {
             .map_or(live, |&(row_id, _)| row_id.max(live))
     }
 
-    /// Returns the current auto-increment value without incrementing
-    pub fn get_current_auto_increment_value(&self) -> i64 {
-        self.auto_increment_counter.load(Ordering::Acquire)
-    }
-
     /// Whether the registry lets versions of `txn_id` into this store
     pub fn admit_publication(&self, txn_id: i64) -> bool {
         self.visibility_checker
@@ -2799,6 +2755,12 @@ impl VersionStore {
         self.visibility_checker
             .as_ref()
             .map_or(0, |checker| checker.committing_sequence(txn_id))
+    }
+
+    /// Sets the maximum version history kept per row, 0 for unlimited
+    #[cfg(test)]
+    pub fn set_max_version_history(&mut self, limit: usize) {
+        self.max_version_history = limit.min(254);
     }
 
     /// Adds a new version for a row
@@ -3999,14 +3961,6 @@ impl VersionStore {
         Ok(results)
     }
 
-    /// Gets the current sequence number for write-set tracking
-    pub fn get_current_sequence(&self) -> i64 {
-        self.visibility_checker
-            .as_ref()
-            .map(|c| c.get_current_sequence())
-            .unwrap_or(0)
-    }
-
     /// Returns all row IDs in the version store (sorted)
     pub fn get_all_row_ids(&self) -> Vec<i64> {
         if self.closed.load(Ordering::Acquire) {
@@ -4016,19 +3970,6 @@ impl VersionStore {
         // Clone tree to avoid holding lock for the duration of iteration
         let versions = self.versions.read().clone();
         versions.keys().collect()
-    }
-
-    /// Populate a FxHashSet with all hot row_ids. Iterates the B-tree under
-    /// read lock without cloning — much cheaper than get_all_row_ids() + collect()
-    /// for skip-set construction.
-    pub fn collect_row_ids_into(&self, dest: &mut rustc_hash::FxHashSet<i64>) {
-        if self.closed.load(Ordering::Acquire) {
-            return;
-        }
-        let versions = self.versions.read();
-        for key in versions.keys() {
-            dest.insert(key);
-        }
     }
 
     /// [`Self::collect_seen_row_ids_into`] for a reader of the newest
@@ -4702,16 +4643,6 @@ impl VersionStore {
         Ok(count)
     }
 
-    /// Returns all visible rows for a transaction (optimized batch operation)
-    ///
-    /// This is more efficient than calling get_visible_version for each row
-    /// because it batches the visibility checks and avoids repeated map lookups.
-    /// Results are sorted by row_id.
-    #[inline]
-    pub fn get_all_visible_rows(&self, reader: Reader<'_>) -> RowVec {
-        self.get_all_visible_rows_internal(reader)
-    }
-
     /// Extract the rows whose head is visible to `txn_id` and live, AND the
     /// root they were read from. Used by seal: `classify_sealed_rows`
     /// compares each copied head's `txn_id` with the current head's.
@@ -4768,109 +4699,8 @@ impl VersionStore {
         (rows, ExtractionSnapshot { inner: root })
     }
 
-    /// Internal implementation for getting all visible rows
-    #[inline]
-    fn get_all_visible_rows_internal(&self, reader: Reader<'_>) -> RowVec {
-        if self.closed.load(Ordering::Acquire) {
-            return RowVec::new();
-        }
-
-        let checker = match self.visibility_checker.as_ref() {
-            Some(c) => reader.over(&**c),
-            None => return RowVec::new(),
-        };
-        let txn_id = reader.txn_id;
-
-        // Clone CowBTree to release read lock early, allowing concurrent commits
-        let versions = self.snapshot_versions();
-
-        let mut results = RowVec::with_capacity(versions.len());
-
-        for (&row_id, chain) in versions.iter() {
-            // FAST PATH: Check HEAD version first - O(1) for common case
-            let head_txn_id = chain.version.txn_id;
-            let head_deleted_at = chain.version.deleted_at_txn_id;
-
-            if checker.is_visible(head_txn_id, txn_id) {
-                // HEAD is visible - check if deleted
-                if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                    results.push((row_id, chain.version.data.clone()));
-                }
-                continue;
-            }
-
-            // SLOW PATH: HEAD not visible - traverse chain for older versions
-            let mut current: Option<&VersionChainEntry> = chain.prev.as_ref().map(|b| b.as_ref());
-            while let Some(e) = current {
-                let version_txn_id = e.version.txn_id;
-                let deleted_at_txn_id = e.version.deleted_at_txn_id;
-
-                if checker.is_visible(version_txn_id, txn_id) {
-                    if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
-                        results.push((row_id, e.version.data.clone()));
-                    }
-                    break;
-                }
-                current = e.prev.as_ref().map(|b| b.as_ref());
-            }
-        }
-
-        results
-    }
-
-    /// Returns all visible rows from a captured version root.
-    #[inline]
-    pub fn get_all_visible_rows_arena(&self, reader: Reader<'_>) -> RowVec {
-        if self.closed.load(Ordering::Acquire) {
-            return RowVec::new();
-        }
-
-        let checker = match self.visibility_checker.as_ref() {
-            Some(c) => reader.over(&**c),
-            None => return RowVec::new(),
-        };
-        let txn_id = reader.txn_id;
-
-        // Clone CowBTree to release read lock early, allowing concurrent commits
-        let versions = self.snapshot_versions();
-
-        let mut result = RowVec::with_capacity(versions.len());
-
-        for (&row_id, chain) in versions.iter() {
-            // FAST PATH: Check HEAD version first - O(1) for common case
-            let head_txn_id = chain.version.txn_id;
-            let head_deleted_at = chain.version.deleted_at_txn_id;
-
-            if checker.is_visible(head_txn_id, txn_id) {
-                // HEAD is visible - check if deleted
-                if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                    result.push((row_id, chain.version.data.clone()));
-                }
-                continue;
-            }
-
-            // SLOW PATH: HEAD not visible - traverse chain for older versions
-            let mut current: Option<&VersionChainEntry> = chain.prev.as_ref().map(|b| b.as_ref());
-            while let Some(e) = current {
-                let version_txn_id = e.version.txn_id;
-                let deleted_at_txn_id = e.version.deleted_at_txn_id;
-
-                if checker.is_visible(version_txn_id, txn_id) {
-                    if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
-                        result.push((row_id, e.version.data.clone()));
-                    }
-                    break;
-                }
-                current = e.prev.as_ref().map(|b| b.as_ref());
-            }
-        }
-
-        result
-    }
-
     /// Returns all visible rows using RowVec for zero-allocation reuse.
     ///
-    /// Same as `get_all_visible_rows_arena` but uses cached RowVec.
     /// The returned `RowVec` auto-returns to cache on drop. `deadline` is
     /// charged a leaf of the rows read at a time
     #[inline]
@@ -4934,11 +4764,9 @@ impl VersionStore {
     ///
     /// This is optimized for UPDATE operations that need to track the original version
     /// for conflict detection. By returning the RowVersion along with the row data,
-    /// callers can use `put_batch_with_originals()` to avoid redundant `get_visible_version()`
-    /// calls during the put phase.
+    /// callers can avoid redundant `get_visible_version()` calls during the put phase.
     ///
     /// Returns: Vec of (row_id, row_data, original_version) tuples.
-    /// Note: read_version_seq is obtained from visibility_checker, not from create_time.
     #[inline]
     pub fn get_all_visible_rows_for_update(
         &self,
@@ -5172,58 +5000,6 @@ impl VersionStore {
         Ok(result)
     }
 
-    /// Returns all visible rows.
-    ///
-    /// Note: Functionally identical to get_all_visible_rows_arena (iteration is ordered).
-    #[inline]
-    pub fn get_all_visible_rows_unsorted(&self, reader: Reader<'_>) -> RowVec {
-        if self.closed.load(Ordering::Acquire) {
-            return RowVec::new();
-        }
-
-        let checker = match self.visibility_checker.as_ref() {
-            Some(c) => reader.over(&**c),
-            None => return RowVec::new(),
-        };
-        let txn_id = reader.txn_id;
-
-        // Clone CowBTree to release read lock early, allowing concurrent commits
-        let versions = self.snapshot_versions();
-
-        let mut result = RowVec::with_capacity(versions.len());
-
-        for (&row_id, chain) in versions.iter() {
-            // FAST PATH: Check HEAD version first - O(1) for common case
-            let head_txn_id = chain.version.txn_id;
-            let head_deleted_at = chain.version.deleted_at_txn_id;
-
-            if checker.is_visible(head_txn_id, txn_id) {
-                // HEAD is visible - check if deleted
-                if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                    result.push((row_id, chain.version.data.clone()));
-                }
-                continue;
-            }
-
-            // SLOW PATH: HEAD not visible - traverse chain for older versions
-            let mut current: Option<&VersionChainEntry> = chain.prev.as_ref().map(|b| b.as_ref());
-            while let Some(e) = current {
-                let version_txn_id = e.version.txn_id;
-                let deleted_at_txn_id = e.version.deleted_at_txn_id;
-
-                if checker.is_visible(version_txn_id, txn_id) {
-                    if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
-                        result.push((row_id, e.version.data.clone()));
-                    }
-                    break;
-                }
-                current = e.prev.as_ref().map(|b| b.as_ref());
-            }
-        }
-
-        result
-    }
-
     /// Get visible rows with limit and offset applied at the storage layer.
     ///
     /// # True Early Termination
@@ -5389,184 +5165,6 @@ impl VersionStore {
     ) -> crate::core::Result<RowVec> {
         // Delegate to the sorted version
         self.get_visible_rows_with_limit(reader, limit, offset, deadline)
-    }
-
-    /// Get a batch of visible rows starting after a given row_id (cursor-based pagination).
-    ///
-    /// This is designed for lazy/streaming scanners that fetch rows in batches.
-    /// Uses range() for efficient cursor-based iteration.
-    ///
-    /// # Arguments
-    /// * `txn_id` - Transaction ID for visibility check
-    /// * `after_row_id` - Start fetching rows AFTER this row_id (use i64::MIN to start from beginning)
-    /// * `batch_size` - Maximum number of rows to return in this batch
-    ///
-    /// # Returns
-    /// A tuple of (rows, has_more) where has_more indicates if there are more rows to fetch
-    pub fn get_visible_rows_batch(
-        &self,
-        reader: Reader<'_>,
-        after_row_id: i64,
-        batch_size: usize,
-    ) -> (RowVec, bool) {
-        if self.closed.load(Ordering::Acquire) || batch_size == 0 {
-            return (RowVec::new(), false);
-        }
-
-        let checker = match self.visibility_checker.as_ref() {
-            Some(c) => reader.over(&**c),
-            None => return (RowVec::new(), false),
-        };
-        let txn_id = reader.txn_id;
-
-        // Clone CowBTree to release read lock early, allowing concurrent commits
-        let versions = self.snapshot_versions();
-
-        // Use range for efficient cursor-based iteration
-        let mut result = RowVec::with_capacity(batch_size);
-        let mut has_more = false;
-
-        // Use range to start after the cursor row_id
-        for (&row_id, chain) in versions.range((
-            std::ops::Bound::Excluded(after_row_id),
-            std::ops::Bound::Unbounded::<i64>,
-        )) {
-            // FAST PATH: Check HEAD version first - O(1) for common case
-            let head_txn_id = chain.version.txn_id;
-            let head_deleted_at = chain.version.deleted_at_txn_id;
-
-            // Track the actual visible entry, not just a boolean
-            let visible_entry: Option<&VersionChainEntry> = if checker
-                .is_visible(head_txn_id, txn_id)
-            {
-                // HEAD is visible - check if deleted
-                if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                    Some(chain)
-                } else {
-                    None
-                }
-            } else {
-                // SLOW PATH: HEAD not visible - traverse chain for older versions
-                let mut found_entry: Option<&VersionChainEntry> = None;
-                let mut current: Option<&VersionChainEntry> =
-                    chain.prev.as_ref().map(|b| b.as_ref());
-                while let Some(e) = current {
-                    let version_txn_id = e.version.txn_id;
-                    let deleted_at_txn_id = e.version.deleted_at_txn_id;
-
-                    if checker.is_visible(version_txn_id, txn_id) {
-                        if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id)
-                        {
-                            found_entry = Some(e);
-                        }
-                        break;
-                    }
-                    current = e.prev.as_ref().map(|b| b.as_ref());
-                }
-                found_entry
-            };
-
-            if let Some(entry) = visible_entry {
-                if result.len() >= batch_size {
-                    has_more = true;
-                    break; // Early termination - found one more than needed
-                }
-                result.push((row_id, entry.version.data.clone()));
-            }
-        }
-
-        (result, has_more)
-    }
-
-    /// Fetch visible rows into an existing buffer (avoids allocation)
-    ///
-    /// This is the same as `get_visible_rows_batch` but reuses the provided buffer
-    /// instead of allocating a new Vec. The buffer is cleared before filling.
-    ///
-    /// # Arguments
-    /// * `txn_id` - Transaction ID for visibility checks
-    /// * `after_row_id` - Cursor position (exclusive lower bound)
-    /// * `batch_size` - Maximum number of rows to fetch
-    /// * `buffer` - Existing buffer to fill (will be cleared first)
-    ///
-    /// # Returns
-    /// `has_more` - true if there are more rows to fetch after this batch
-    pub fn get_visible_rows_batch_into(
-        &self,
-        reader: Reader<'_>,
-        after_row_id: i64,
-        batch_size: usize,
-        buffer: &mut RowVec,
-    ) -> bool {
-        buffer.clear();
-
-        if self.closed.load(Ordering::Acquire) || batch_size == 0 {
-            return false;
-        }
-
-        let checker = match self.visibility_checker.as_ref() {
-            Some(c) => reader.over(&**c),
-            None => return false,
-        };
-        let txn_id = reader.txn_id;
-
-        // Clone CowBTree to release read lock early, allowing concurrent commits
-        let versions = self.snapshot_versions();
-
-        // Use range for efficient cursor-based iteration
-        buffer.reserve(batch_size);
-        let mut has_more = false;
-
-        // Use range to start after the cursor row_id
-        for (&row_id, chain) in versions.range((
-            std::ops::Bound::Excluded(after_row_id),
-            std::ops::Bound::Unbounded::<i64>,
-        )) {
-            // FAST PATH: Check HEAD version first - O(1) for common case
-            let head_txn_id = chain.version.txn_id;
-            let head_deleted_at = chain.version.deleted_at_txn_id;
-
-            // Track the actual visible entry, not just a boolean
-            let visible_entry: Option<&VersionChainEntry> = if checker
-                .is_visible(head_txn_id, txn_id)
-            {
-                // HEAD is visible - check if deleted
-                if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                    Some(chain)
-                } else {
-                    None
-                }
-            } else {
-                // SLOW PATH: HEAD not visible - traverse chain for older versions
-                let mut found_entry: Option<&VersionChainEntry> = None;
-                let mut current: Option<&VersionChainEntry> =
-                    chain.prev.as_ref().map(|b| b.as_ref());
-                while let Some(e) = current {
-                    let version_txn_id = e.version.txn_id;
-                    let deleted_at_txn_id = e.version.deleted_at_txn_id;
-
-                    if checker.is_visible(version_txn_id, txn_id) {
-                        if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id)
-                        {
-                            found_entry = Some(e);
-                        }
-                        break;
-                    }
-                    current = e.prev.as_ref().map(|b| b.as_ref());
-                }
-                found_entry
-            };
-
-            if let Some(entry) = visible_entry {
-                if buffer.len() >= batch_size {
-                    has_more = true;
-                    break; // Early termination - found one more than needed
-                }
-                buffer.push((row_id, entry.version.data.clone()));
-            }
-        }
-
-        has_more
     }
 
     /// Collect visible rows ordered by row_id (PRIMARY KEY) with efficient OFFSET/LIMIT
@@ -6095,17 +5693,6 @@ impl VersionStore {
     ) -> crate::core::Result<RowVec> {
         // Delegate to the sorted version
         self.get_visible_rows_filtered_with_limit(reader, filter, limit, offset, deadline)
-    }
-
-    /// Compute COUNT(*) without materializing any rows
-    ///
-    /// This is the FASTEST path for `SELECT COUNT(*) FROM table`:
-    /// - No row data is loaded
-    /// - Only visibility checks are performed
-    /// - O(n) time, O(1) memory
-    #[inline]
-    pub fn count_visible(&self, txn_id: i64) -> crate::core::Result<usize> {
-        self.count_visible_rows(txn_id.into(), Deadline::NONE)
     }
 
     /// Compute SUM(column) without materializing full rows
@@ -6739,34 +6326,6 @@ impl VersionStore {
         guard.clone()
     }
 
-    /// Gets the segments that need to be scanned for a given predicate
-    ///
-    /// Uses zone maps to determine which segments can be pruned (skipped)
-    pub fn get_segments_to_scan(
-        &self,
-        column: &str,
-        operator: crate::core::Operator,
-        value: &crate::core::Value,
-    ) -> Option<Vec<u32>> {
-        let guard = self.zone_maps.read();
-        guard
-            .as_ref()
-            .and_then(|zm| zm.get_segments_to_scan(column, operator, value))
-    }
-
-    /// Gets prune statistics for a single-column predicate
-    pub fn get_prune_stats(
-        &self,
-        column: &str,
-        operator: crate::core::Operator,
-        value: &crate::core::Value,
-    ) -> Option<crate::storage::mvcc::zonemap::PruneStats> {
-        let guard = self.zone_maps.read();
-        guard
-            .as_ref()
-            .and_then(|zm| zm.get_prune_stats(column, operator, value))
-    }
-
     /// Close the version store
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
@@ -6944,22 +6503,6 @@ impl VersionStore {
     /// Drop an index by name (alias for remove_index)
     pub fn drop_index(&self, name: &str) -> Option<Arc<dyn Index>> {
         self.remove_index(name)
-    }
-
-    /// Create an index from persistence metadata during WAL replay
-    ///
-    /// This recreates an index from its persisted metadata.
-    ///
-    /// # Arguments
-    /// * `meta` - Index metadata from WAL
-    /// * `skip_population` - If true, creates the index structure without populating it.
-    ///   This is used during batch recovery to defer population to a single-pass scan.
-    pub fn create_index_from_metadata(
-        &self,
-        meta: &crate::storage::mvcc::persistence::IndexMetadata,
-        skip_population: bool,
-    ) -> crate::core::Result<()> {
-        self.create_index_from_metadata_with_graph(meta, skip_population, None)
     }
 
     /// Create an index from persisted metadata, optionally loading HNSW graph from disk.
@@ -7857,25 +7400,9 @@ impl VersionStore {
         cleaned
     }
 
-    /// Iterate over all committed (non-deleted) versions for snapshot creation
-    ///
-    /// This method iterates over all rows that are visible to a snapshot transaction
-    /// (i.e., all committed, non-deleted rows). The callback receives the row_id and
-    /// a reference to the RowVersion. Return false from the callback to stop iteration.
-    ///
-    /// This is designed for creating point-in-time snapshots to disk.
-    pub fn for_each_committed_version<F>(&self, callback: F)
-    where
-        F: FnMut(i64, &RowVersion) -> bool,
-    {
-        // Delegate to the cutoff version with no cutoff (0 means no filtering)
-        self.for_each_committed_version_with_cutoff(callback, 0);
-    }
-
-    /// Iterate over committed versions with a commit sequence cutoff for consistent snapshots
-    ///
-    /// This is the same as `for_each_committed_version` but only includes transactions
-    /// that were committed before the given `commit_seq_cutoff`. This ensures consistent
+    /// Iterate over committed (non-deleted) versions with a commit sequence
+    /// cutoff for consistent snapshots: only transactions committed before
+    /// the given `commit_seq_cutoff`. This ensures consistent
     /// point-in-time snapshots even when new transactions commit during iteration.
     ///
     /// # Arguments
@@ -8991,11 +8518,6 @@ impl TransactionVersionStore {
         }
     }
 
-    /// Returns the transaction ID
-    pub fn txn_id(&self) -> i64 {
-        self.txn_id
-    }
-
     /// Read-only access to local versions for rollback cleanup.
     pub fn local_versions_ref(&self) -> Option<&I64Map<VersionList>> {
         self.local_versions.as_ref()
@@ -9105,18 +8627,10 @@ impl TransactionVersionStore {
                     .get_visible_version(row_id, self.txn_id.into());
                 let row_exists = read_version.is_some();
 
-                let read_version_seq = self
-                    .parent_store
-                    .visibility_checker
-                    .as_ref()
-                    .map(|c| c.get_current_sequence())
-                    .unwrap_or(0);
-
                 self.ensure_write_set().insert(
                     row_id,
                     WriteSetEntry {
                         read_version,
-                        read_version_seq,
                         sealed: false,
                         shared: false,
                     },
@@ -9204,18 +8718,10 @@ impl TransactionVersionStore {
                 .is_none_or(|ws| !ws.contains_key(row_id));
 
             if needs_write_set_entry {
-                let read_version_seq = self
-                    .parent_store
-                    .visibility_checker
-                    .as_ref()
-                    .map(|c| c.get_current_sequence())
-                    .unwrap_or(0);
-
                 self.ensure_write_set().insert(
                     row_id,
                     WriteSetEntry {
                         read_version: Some(original_version),
-                        read_version_seq,
                         sealed: false,
                         shared: false,
                     },
@@ -9227,84 +8733,6 @@ impl TransactionVersionStore {
             if !is_delete {
                 self.note_key_change(row_id, &rv.data);
             }
-            self.ensure_local_versions().insert(row_id, smallvec![rv]);
-        }
-        Ok(())
-    }
-
-    /// Optimized batch put for UPDATE operations with pre-fetched original versions
-    ///
-    /// This avoids redundant get_visible_version() calls by accepting the original
-    /// versions that were already fetched during the batch read.
-    ///
-    /// Parameters:
-    /// - rows: Vec of (row_id, new_row_data, original_version)
-    ///   Note: read_version_seq is obtained from visibility_checker, not from create_time
-    pub fn put_batch_with_originals(
-        &mut self,
-        rows: Vec<(i64, Row, RowVersion)>,
-    ) -> Result<(), Error> {
-        // A batch with no row binds nothing
-        if rows.is_empty() {
-            return Ok(());
-        }
-        let now = next_write_order();
-        self.note_layout(now)?;
-
-        for (row_id, data, original_version) in rows {
-            self.local_written(row_id);
-            // Convert to Shared (Arc) storage immediately for efficient Arc sharing
-            let data = Row::from_arc(data.into_arc());
-
-            // The call's write order, not RowVersion::new's clock read
-            let rv = RowVersion::new_with_timestamp(self.txn_id, data, now);
-
-            // Check if already in local versions (already processed in this transaction)
-            if self
-                .local_versions
-                .as_ref()
-                .is_some_and(|lv| lv.contains_key(row_id))
-            {
-                self.note_key_change(row_id, &rv.data);
-                if let Some(versions) = self.ensure_local_versions().get_mut(row_id) {
-                    // Append new version to history
-                    versions.push(rv);
-                }
-                continue;
-            }
-
-            // Track in write-set using the pre-fetched original version
-            let needs_write_set_entry = self
-                .write_set
-                .as_ref()
-                .is_none_or(|ws| !ws.contains_key(row_id));
-
-            if needs_write_set_entry {
-                // Get current sequence for conflict detection
-                // Note: We get a fresh sequence instead of relying on create_time because
-                // callers may use get_visible_version() which doesn't set create_time to the sequence
-                let read_version_seq = self
-                    .parent_store
-                    .visibility_checker
-                    .as_ref()
-                    .map(|c| c.get_current_sequence())
-                    .unwrap_or(0);
-                self.ensure_write_set().insert(
-                    row_id,
-                    WriteSetEntry {
-                        read_version: Some(original_version),
-                        read_version_seq,
-                        sealed: false,
-                        shared: false,
-                    },
-                );
-
-                // Claim the row for update
-                self.parent_store.try_claim_row(row_id, self.txn_id)?;
-            }
-
-            // Insert new version history for this row
-            self.note_key_change(row_id, &rv.data);
             self.ensure_local_versions().insert(row_id, smallvec![rv]);
         }
         Ok(())
@@ -9355,12 +8783,6 @@ impl TransactionVersionStore {
         }
         let now = next_write_order();
         self.bind_layout(layout, now);
-        let read_version_seq = self
-            .parent_store
-            .visibility_checker
-            .as_ref()
-            .map(|c| c.get_current_sequence())
-            .unwrap_or(0);
         let txn_id = self.txn_id;
         for change in &mut plan.cold {
             self.local_written(change.row_id);
@@ -9379,7 +8801,6 @@ impl TransactionVersionStore {
                 Entry::Vacant(e) => {
                     e.insert(WriteSetEntry {
                         read_version: Some(original),
-                        read_version_seq,
                         sealed: true,
                         shared: false,
                     });
@@ -9405,7 +8826,6 @@ impl TransactionVersionStore {
             if let Entry::Vacant(e) = self.ensure_write_set().entry(row_id) {
                 e.insert(WriteSetEntry {
                     read_version: Some(read),
-                    read_version_seq,
                     sealed: false,
                     shared: false,
                 });
@@ -9451,18 +8871,10 @@ impl TransactionVersionStore {
                         .get_visible_version(row_id, self.txn_id.into());
                     let row_exists = read_version.is_some();
 
-                    let read_version_seq = self
-                        .parent_store
-                        .visibility_checker
-                        .as_ref()
-                        .map(|c| c.get_current_sequence())
-                        .unwrap_or(0);
-
                     self.ensure_write_set().insert(
                         row_id,
                         WriteSetEntry {
                             read_version,
-                            read_version_seq,
                             sealed: false,
                             shared: false,
                         },
@@ -9525,18 +8937,10 @@ impl TransactionVersionStore {
                 .is_none_or(|ws| !ws.contains_key(row_id));
 
             if needs_write_set_entry {
-                let read_version_seq = self
-                    .parent_store
-                    .visibility_checker
-                    .as_ref()
-                    .map(|c| c.get_current_sequence())
-                    .unwrap_or(0);
-
                 self.ensure_write_set().insert(
                     row_id,
                     WriteSetEntry {
                         read_version: Some(original_version),
-                        read_version_seq,
                         sealed: false,
                         shared: false,
                     },
@@ -9637,12 +9041,6 @@ impl TransactionVersionStore {
                 let version = versions.iter().rev().find(|v| v.create_time <= cut);
                 version.map(|v| (k, v))
             })
-    }
-
-    /// Get the local version for a row (without checking parent)
-    /// Returns the most recent version in the transaction's history
-    pub fn get_local_version(&self, row_id: i64) -> Option<&RowVersion> {
-        self.local_version_at(row_id, EVERY_WRITE)
     }
 
     /// Get a row, checking local versions first then parent store
@@ -10438,11 +9836,6 @@ impl TransactionVersionStore {
         self.release_all_claims();
     }
 
-    /// Discard later local versions and release claims with no surviving write.
-    pub fn rollback_to_timestamp(&mut self, timestamp: i64) {
-        self.rollback_to_timestamp_with_pending(timestamp, &[]);
-    }
-
     /// Retain claims for surviving cold tombstones as well as local versions.
     /// `pending` contains sorted row IDs after the cold rollback.
     pub(crate) fn rollback_to_timestamp_with_pending(&mut self, timestamp: i64, pending: &[i64]) {
@@ -10514,7 +9907,6 @@ impl TransactionVersionStore {
             Entry::Vacant(e) => {
                 e.insert(WriteSetEntry {
                     read_version: None,
-                    read_version_seq: 0,
                     sealed: false,
                     shared: false,
                 });
@@ -10885,16 +10277,10 @@ mod tests {
         ));
         let row = |id: i64, v: i64| Row::from(vec![Value::from(id), Value::from(v)]);
         let mut txn = TransactionVersionStore::new(Arc::clone(&store), 5);
-        // Each row claimed twice, so its entry is shared, with a sequence of its own
+        // Each row claimed twice, so its entry is shared
         for id in [1, 2] {
             txn.track_external_claim(id);
             txn.track_external_claim(id);
-            txn.write_set
-                .as_mut()
-                .unwrap()
-                .get_mut(id)
-                .unwrap()
-                .read_version_seq = 40 + id;
         }
         let mut plan = PlannedUpdate::default();
         plan.cold.push(ColdChange {
@@ -10909,9 +10295,9 @@ mod tests {
         let ws = txn.write_set.as_ref().unwrap();
         let sealed = ws.get(1).unwrap();
         assert_eq!(
-            (sealed.read_version_seq, sealed.shared, sealed.sealed),
-            (41, true, true),
-            "the sealed row's entry lost its sequence or sharing"
+            (sealed.shared, sealed.sealed),
+            (true, true),
+            "the sealed row's entry lost its sharing"
         );
         assert_eq!(
             sealed.read_version.as_ref().map(|version| &version.data),
@@ -10920,8 +10306,8 @@ mod tests {
         );
         let hot = ws.get(2).unwrap();
         assert_eq!(
-            (hot.read_version_seq, hot.shared, hot.sealed),
-            (42, true, false),
+            (hot.shared, hot.sealed),
+            (true, false),
             "the hot row's entry was replaced"
         );
         assert!(
@@ -10984,7 +10370,10 @@ mod tests {
             "the update is undone"
         );
         assert_eq!(
-            store.get_all_visible_rows(99.into()).len(),
+            store
+                .get_all_visible_rows_cached(99.into(), Deadline::NONE)
+                .unwrap()
+                .len(),
             2,
             "the arena agrees"
         );
@@ -11279,7 +10668,7 @@ mod tests {
             }
             let met = txn.claim_key(&*index, &[Value::from(-1i64)], 1).unwrap();
             assert!(met.is_some(), "a holder of -1 besides row 1");
-            txn.rollback_to_timestamp(cut);
+            txn.rollback_to_timestamp_with_pending(cut, &[]);
         }
         let tracking = txn.tracking.as_deref().unwrap();
         let entered: usize = (tracking.local_keys[0].1.by_hash.values())
@@ -11320,10 +10709,10 @@ mod tests {
     fn test_version_store_auto_increment() {
         let store = VersionStore::new("test_table".to_string(), test_schema());
 
-        assert_eq!(store.get_current_auto_increment_value(), 0);
+        assert_eq!(store.get_auto_increment_counter(), 0);
         assert_eq!(store.try_next_auto_increment_id(), Some(1));
         assert_eq!(store.try_next_auto_increment_id(), Some(2));
-        assert_eq!(store.get_current_auto_increment_value(), 2);
+        assert_eq!(store.get_auto_increment_counter(), 2);
     }
 
     #[test]
@@ -11331,15 +10720,15 @@ mod tests {
         let store = VersionStore::new("test_table".to_string(), test_schema());
 
         assert!(store.set_auto_increment_counter(10));
-        assert_eq!(store.get_current_auto_increment_value(), 10);
+        assert_eq!(store.get_auto_increment_counter(), 10);
 
         // Should not go backwards
         assert!(!store.set_auto_increment_counter(5));
-        assert_eq!(store.get_current_auto_increment_value(), 10);
+        assert_eq!(store.get_auto_increment_counter(), 10);
 
         // Should update if higher
         assert!(store.set_auto_increment_counter(20));
-        assert_eq!(store.get_current_auto_increment_value(), 20);
+        assert_eq!(store.get_auto_increment_counter(), 20);
     }
 
     #[test]
@@ -11502,13 +10891,6 @@ mod tests {
         // Should NOT be visible in parent store
         let visible = store.get_visible_version(100, 2.into());
         assert!(visible.is_none());
-    }
-
-    #[test]
-    fn test_version_history_limit_default() {
-        let store = VersionStore::new("test_table".to_string(), test_schema());
-        // Default limit is 10
-        assert_eq!(store.max_version_history(), 10);
     }
 
     #[test]
@@ -11681,18 +11063,6 @@ mod tests {
     }
 
     #[test]
-    fn test_row_version_deleted_with_timestamp() {
-        let row = Row::from(vec![Value::from(1)]);
-        let timestamp = 87654321;
-        let version = RowVersion::new_deleted_with_timestamp(1, row, timestamp);
-
-        assert_eq!(version.txn_id, 1);
-        assert_eq!(version.deleted_at_txn_id, 1);
-        assert_eq!(version.create_time, timestamp);
-        assert!(version.is_deleted());
-    }
-
-    #[test]
     fn test_row_version_debug_display() {
         let row = Row::from(vec![Value::from(42)]);
         let version = RowVersion::new(1, row);
@@ -11714,19 +11084,16 @@ mod tests {
 
         let entry = WriteSetEntry {
             read_version: Some(version),
-            read_version_seq: 42,
             sealed: false,
             shared: false,
         };
 
         let cloned = entry.clone();
         assert!(cloned.read_version.is_some());
-        assert_eq!(cloned.read_version_seq, 42);
 
         // Test with None
         let empty_entry = WriteSetEntry {
             read_version: None,
-            read_version_seq: 0,
             sealed: false,
             shared: false,
         };
@@ -12099,18 +11466,6 @@ mod tests {
     }
 
     #[test]
-    fn test_version_store_get_current_sequence() {
-        let checker = Arc::new(TestVisibilityChecker::new());
-        let store =
-            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
-
-        // Sequence should increment
-        let seq1 = store.get_current_sequence();
-        let seq2 = store.get_current_sequence();
-        assert!(seq2 > seq1);
-    }
-
-    #[test]
     fn test_version_store_apply_recovered_version() {
         let store = VersionStore::new("test_table".to_string(), test_schema());
 
@@ -12238,7 +11593,9 @@ mod tests {
             store.add_version(i, version);
         }
 
-        let rows = store.get_all_visible_rows(2.into());
+        let rows = store
+            .get_all_visible_rows_cached(2.into(), Deadline::NONE)
+            .unwrap();
         assert_eq!(rows.len(), 5);
 
         // Verify values
@@ -12326,7 +11683,10 @@ mod tests {
         let store =
             VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
 
-        assert_eq!(store.count_visible(1).unwrap(), 0);
+        assert_eq!(
+            store.count_visible_rows(1.into(), Deadline::NONE).unwrap(),
+            0
+        );
 
         // Add rows
         for i in 1..=10 {
@@ -12335,7 +11695,10 @@ mod tests {
             store.add_version(i, version);
         }
 
-        assert_eq!(store.count_visible(2).unwrap(), 10);
+        assert_eq!(
+            store.count_visible_rows(2.into(), Deadline::NONE).unwrap(),
+            10
+        );
     }
 
     // =========================================================================

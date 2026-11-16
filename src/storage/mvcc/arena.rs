@@ -31,7 +31,7 @@ use parking_lot::{Mutex, RwLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::common::CompactArc;
-use crate::core::{Row, Value};
+use crate::core::Value;
 
 /// Given a row's values, the row in a new layout, or None when the row
 /// keeps the layout it has
@@ -63,14 +63,6 @@ pub struct ArenaRowMeta {
     pub txn_id: i64,
     /// Transaction ID that deleted this row (0 if not deleted)
     pub deleted_at_txn_id: i64,
-}
-
-impl ArenaRowMeta {
-    /// Check if this row is deleted
-    #[inline]
-    pub fn is_deleted(&self) -> bool {
-        self.deleted_at_txn_id != 0
-    }
 }
 
 /// Inner arena data protected by single lock
@@ -136,128 +128,9 @@ impl RowArena {
     }
 
     /// Insert a row into the arena
-    ///
-    /// Returns the index of the row metadata.
-    /// Reuses cleared slots from the free list to prevent unbounded growth.
-    #[inline]
+    #[cfg(test)]
     pub fn insert(&self, row_id: i64, txn_id: i64, values: &[Value]) -> usize {
-        // Check free list first (separate lock, doesn't affect read path)
-        let reuse_idx = self.free_list.lock().pop();
-
-        let mut inner = self.inner.write();
-
-        // Convert values to CompactArc<[Value]>
-        let arc_data: CompactArc<[Value]> = CompactArc::from(values.to_vec());
-        self.bytes.fetch_add(row_bytes(values), Ordering::Relaxed);
-
-        let meta = ArenaRowMeta {
-            row_id,
-            txn_id,
-            deleted_at_txn_id: 0,
-        };
-
-        // Reuse a slot from the free list if available
-        if let Some(idx) = reuse_idx {
-            inner.data[idx] = arc_data;
-            inner.meta[idx] = meta;
-            idx
-        } else {
-            inner.data.push(arc_data);
-            let idx = inner.meta.len();
-            inner.meta.push(meta);
-            idx
-        }
-    }
-
-    /// Insert a row from a Row struct
-    /// Handles all storage types: Shared Arc is cloned O(1), Owned values create new Arc.
-    /// Reuses cleared slots from the free list to prevent unbounded growth.
-    #[inline]
-    pub fn insert_row(&self, row_id: i64, txn_id: i64, row: &Row) -> usize {
-        // Check free list first (separate lock, doesn't affect read path)
-        let reuse_idx = self.free_list.lock().pop();
-
-        let mut inner = self.inner.write();
-
-        // Store Arc for O(1) clone on read
-        // If row is Shared, clone the Arc (O(1))
-        // If row is Owned, create new Arc from values
-        let arc_data = match row.as_arc() {
-            Some(arc) => CompactArc::clone(arc),
-            None => {
-                // Owned storage: create new Arc from values
-                let values: Vec<Value> = row.iter().cloned().collect();
-                CompactArc::from(values)
-            }
-        };
-        self.bytes
-            .fetch_add(row_bytes(&arc_data), Ordering::Relaxed);
-
-        let meta = ArenaRowMeta {
-            row_id,
-            txn_id,
-            deleted_at_txn_id: 0,
-        };
-
-        // Reuse a slot from the free list if available
-        if let Some(idx) = reuse_idx {
-            inner.data[idx] = arc_data;
-            inner.meta[idx] = meta;
-            idx
-        } else {
-            inner.data.push(arc_data);
-            let idx = inner.meta.len();
-            inner.meta.push(meta);
-            idx
-        }
-    }
-
-    /// Insert a row and return both the index AND the Arc
-    /// This allows the caller to reuse the Arc for O(1) clones
-    /// Handles all storage types: Shared Arc is cloned O(1), Owned values create new Arc.
-    /// Reuses cleared slots from the free list to prevent unbounded growth.
-    #[inline]
-    pub fn insert_row_get_arc(
-        &self,
-        row_id: i64,
-        txn_id: i64,
-        row: &Row,
-    ) -> (usize, CompactArc<[Value]>) {
-        // Check free list first (separate lock, doesn't affect read path)
-        let reuse_idx = self.free_list.lock().pop();
-
-        let mut inner = self.inner.write();
-
-        // Create Arc once, clone for storage and return
-        let arc_data = match row.as_arc() {
-            Some(arc) => CompactArc::clone(arc),
-            None => {
-                // Owned storage: create new Arc from values
-                let values: Vec<Value> = row.iter().cloned().collect();
-                CompactArc::from(values)
-            }
-        };
-        self.bytes
-            .fetch_add(row_bytes(&arc_data), Ordering::Relaxed);
-
-        let meta = ArenaRowMeta {
-            row_id,
-            txn_id,
-            deleted_at_txn_id: 0,
-        };
-
-        // Reuse a slot from the free list if available
-        let idx = if let Some(idx) = reuse_idx {
-            inner.data[idx] = CompactArc::clone(&arc_data);
-            inner.meta[idx] = meta;
-            idx
-        } else {
-            inner.data.push(CompactArc::clone(&arc_data));
-            let idx = inner.meta.len();
-            inner.meta.push(meta);
-            idx
-        };
-        (idx, arc_data)
+        self.insert_arc(row_id, txn_id, CompactArc::from(values.to_vec()))
     }
 
     /// Insert an already-created Arc directly - avoids copy when caller has Arc
@@ -491,25 +364,6 @@ impl RowArena {
         let inner = self.inner.read();
         inner.data.get(arena_idx).cloned()
     }
-
-    /// Get both metadata and Arc for a row by arena index - O(1) with single lock
-    ///
-    /// This is optimized for the visibility fast path where we need to check
-    /// txn_id and deleted_at_txn_id before returning the data.
-    #[inline]
-    pub fn get_meta_and_arc(
-        &self,
-        arena_idx: usize,
-    ) -> Option<(ArenaRowMeta, CompactArc<[Value]>)> {
-        let inner = self.inner.read();
-        if arena_idx < inner.meta.len() {
-            let meta = inner.meta[arena_idx];
-            let arc = CompactArc::clone(&inner.data[arena_idx]);
-            Some((meta, arc))
-        } else {
-            None
-        }
-    }
 }
 
 impl Default for RowArena {
@@ -661,7 +515,6 @@ mod tests {
         arena.mark_deleted(idx, 101);
 
         let guard = arena.read_guard();
-        assert!(guard.meta()[0].is_deleted());
         assert_eq!(guard.meta()[0].deleted_at_txn_id, 101);
     }
 
