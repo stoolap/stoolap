@@ -1272,6 +1272,8 @@ fn a_read_past_a_long_history_of_one_row_charges_its_versions() {
         "CREATE TABLE l (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)",
         "CREATE INDEX l_g ON l (g)",
         "INSERT INTO l VALUES (2, 1, 0)",
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, v INTEGER)",
+        "INSERT INTO m VALUES (1, 0), (2, 0), (3, 0)",
     ] {
         db.execute(sql, ()).unwrap();
     }
@@ -1305,13 +1307,18 @@ fn a_read_past_a_long_history_of_one_row_charges_its_versions() {
         }
     };
     let rows = DeadlineSite::StorageRead;
-    // Snapshots older than 9,000 versions of one row each
+    // Snapshots older than 9,000 versions of one row each, and 3,000 of
+    // each row of m
     read(&hot, "BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT", &ctx).unwrap();
     read(&hot, "SELECT v FROM l", &ctx).unwrap();
+    read(&hot, "SELECT v FROM m", &ctx).unwrap();
     read(&cold, "BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT", &ctx).unwrap();
     read(&cold, "SELECT v FROM s", &ctx).unwrap();
-    for _ in 0..9000 {
+    for i in 0..9000 {
         db.execute("UPDATE l SET v = v + 1", ()).unwrap();
+        if i < 3000 {
+            db.execute("UPDATE m SET v = v + 1", ()).unwrap();
+        }
         sealed
             .execute("UPDATE s SET v = v + 1 WHERE id = 1", ())
             .unwrap();
@@ -1326,6 +1333,8 @@ fn a_read_past_a_long_history_of_one_row_charges_its_versions() {
         ("UPDATE l SET v = v WHERE g = 1 AND v < 0", 100),
         ("DELETE FROM l WHERE g = 1 AND v < 0", 2),
         ("DELETE FROM l WHERE id = 2 AND v < 0", 2),
+        // Rows of fewer than 4,096 versions each still add up
+        ("DELETE FROM m WHERE v < 0", 2),
     ] {
         charged(&hot, rows, sql, least);
     }

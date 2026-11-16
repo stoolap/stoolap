@@ -4013,6 +4013,8 @@ impl Table for MVCCTable {
 
         // Get all visible rows
         let row_ids = self.version_store.get_all_row_ids();
+        // One count of passed versions across every row the walk reads
+        let mut unpaid = 0usize;
 
         for row_id in row_ids {
             deadline.charge(DeadlineSite::StorageDelete, 1)?;
@@ -4048,7 +4050,7 @@ impl Table for MVCCTable {
                 false => self.version_store.get_visible_version_charged(
                     row_id,
                     self.reader(),
-                    (deadline, &mut 0),
+                    (deadline, &mut unpaid),
                 )?,
             } {
                 if version.is_deleted() {
