@@ -196,6 +196,10 @@ struct SideAsk {
 /// counts first
 type SideAsks = smallvec::SmallVec<[SideAsk; 2]>;
 
+/// Each ask's estimated positions in one volume with its place among the
+/// asks, held inline for as many indexes as a WHERE bounds in practice
+type CountedAsks = smallvec::SmallVec<[(u64, usize); 8]>;
+
 enum AskKeys {
     /// An ordered i64 entry's keys in `[low, high]`, empty when low is above
     I64(i64, i64),
@@ -3054,8 +3058,8 @@ impl SegmentedTable {
         };
         // A count the directory misjudged sends the volume on to the next
         let last = ordered.len() - 1;
-        for (at, ask) in ordered.into_iter().enumerate() {
-            match self.ask_decision(cs, ask, at == last)? {
+        for (tried, (_, at)) in ordered.into_iter().enumerate() {
+            match self.ask_decision(cs, &asks[at], tried == last)? {
                 SideDecision::Scan => {}
                 decided => return Ok(decided),
             }
@@ -3657,16 +3661,16 @@ impl SegmentedTable {
         asks
     }
 
-    /// The asks of `asks` by the positions the directory counts for their
-    /// side file entry in `cs`, fewest first, without reading a page; those
-    /// the directory cannot count after them, in their order. None when one
-    /// rules every row of the volume out
-    fn fewest_first<'a>(
+    /// The positions in `asks` by the positions the directory counts for
+    /// their side file entry in `cs`, fewest first, without reading a page;
+    /// those the directory cannot count after them, in their order. None when
+    /// one rules every row of the volume out
+    fn fewest_first(
         &self,
         cs: &super::manifest::ColdSegment,
-        asks: &'a [SideAsk],
-    ) -> Result<Option<smallvec::SmallVec<[&'a SideAsk; 2]>>> {
-        let mut counted: smallvec::SmallVec<[(u64, usize); 2]> = smallvec::SmallVec::new();
+        asks: &[SideAsk],
+    ) -> Result<Option<CountedAsks>> {
+        let mut counted = CountedAsks::new();
         for (at, ask) in asks.iter().enumerate() {
             let keys = ask.keys.range();
             let side = cs.side_for(&ask.def, keys.capability());
@@ -3687,7 +3691,7 @@ impl SegmentedTable {
             counted.push((estimate, at));
         }
         counted.sort_unstable();
-        Ok(Some(counted.into_iter().map(|(_, at)| &asks[at]).collect()))
+        Ok(Some(counted))
     }
 
     /// The single-column TEXT entry a key probe of `column` asks

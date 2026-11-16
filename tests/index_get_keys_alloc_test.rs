@@ -14,7 +14,8 @@
 
 //! A key read with other indexed equalities to take its rows by allocates
 //! no more than one with a single key, whether the first key settles it or
-//! the others are counted
+//! the others are counted; a sealed read choosing among several indexes
+//! allocates no more for each further volume than one asking a single index
 
 // The jemalloc feature, on by default, sets the library's own global allocator
 #![cfg(not(feature = "jemalloc"))]
@@ -100,5 +101,57 @@ fn a_key_read_with_other_keys_allocates_as_one_with_a_single_key() {
     assert!(
         settled <= single && counted <= single,
         "allocations per read, one key {single}, first key settles {settled}, others counted {counted}"
+    );
+}
+
+#[test]
+fn a_sealed_choice_among_indexes_allocates_nothing_more_per_volume() {
+    let dir = tempfile::tempdir().unwrap();
+    // Each checkpoint seals the rows inserted since into a volume of its own
+    let db = Database::open(&format!(
+        "file://{}?checkpoint_interval=3600&compact_threshold=64",
+        dir.path().display()
+    ))
+    .unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c INTEGER, e INTEGER)",
+        "CREATE INDEX t_a ON t (a)",
+        "CREATE INDEX t_c ON t (c)",
+        "CREATE INDEX t_e ON t (e)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let seal = |batch: i64| {
+        let (from, to) = (batch * 500 + 1, batch * 500 + 500);
+        db.execute(
+            &format!(
+                "INSERT INTO t SELECT value, value % 2, value % 3, value % 5 \
+                 FROM generate_series({from}, {to})"
+            ),
+            (),
+        )
+        .unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    };
+    // Every volume holds each key, so no bloom filter or zone map leaves one
+    // out before its side file is asked
+    let reads = |db: &Database| {
+        (
+            per_read(db, "SELECT COUNT(*) FROM t WHERE e = $1", &[1]),
+            per_read(
+                db,
+                "SELECT COUNT(*) FROM t WHERE a = $1 AND c = $2 AND e = $3",
+                &[1, 1, 1],
+            ),
+        )
+    };
+    (0..3).for_each(seal);
+    let (single_three, chosen_three) = reads(&db);
+    (3..6).for_each(seal);
+    let (single_six, chosen_six) = reads(&db);
+    assert!(
+        chosen_six.saturating_sub(chosen_three) <= single_six.saturating_sub(single_three),
+        "allocations per read over three and six volumes, one index {single_three} and \
+         {single_six}, three indexes {chosen_three} and {chosen_six}"
     );
 }
