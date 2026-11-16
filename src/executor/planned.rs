@@ -537,7 +537,7 @@ impl Executor {
                 &plan.table,
                 &store,
                 (plan.key.column(), &value),
-                &[],
+                (0, &|_| None),
                 INDEX_GET_ROWS,
                 plan.token,
             )?,
@@ -551,7 +551,8 @@ impl Executor {
     }
 
     /// `fetch_index_rows`'s read of a key read with other keys to take its
-    /// rows by, `value` its own key's; None when a key reads no value
+    /// rows by, `value` its own key's; each other key's value is bound only
+    /// when the read asks for it, one that binds NULL left out
     #[inline(never)]
     fn fetch_rows_by_fewest(
         &self,
@@ -560,23 +561,15 @@ impl Executor {
         store: &Arc<VersionStore>,
         value: &Value,
     ) -> Result<Option<RowVec>> {
-        let instead: Option<SmallVec<[(usize, Value); 2]>> = plan
-            .instead
-            .iter()
-            .map(|key| Some((key.column(), key.value(params).filter(|v| !v.is_null())?)))
-            .collect();
-        let Some(instead) = instead else {
-            return Ok(None);
+        let key_at = |at: usize| {
+            let key = plan.instead.get(at)?;
+            Some((key.column(), key.value(params).filter(|v| !v.is_null())?))
         };
-        let instead: SmallVec<[(usize, &Value); 2]> = instead
-            .iter()
-            .map(|(column, value)| (*column, value))
-            .collect();
         self.engine.fetch_latest_equal_in::<true>(
             &plan.table,
             store,
             (plan.key.column(), value),
-            &instead,
+            (plan.instead.len(), &key_at),
             INDEX_GET_ROWS,
             plan.token,
         )

@@ -18,13 +18,8 @@
 
 #![cfg(feature = "test-failpoints")]
 
-use std::sync::Mutex;
-
 use stoolap::core::Value;
 use stoolap::{test_failpoints, Database};
-
-// The side file counters are process-wide
-static SERIAL: Mutex<()> = Mutex::new(());
 
 const ROWS: i64 = 4000;
 
@@ -48,6 +43,18 @@ fn open(dsn: &str, sealed: bool) -> Database {
         "CREATE INDEX t_w ON t (w)".to_string(),
         "CREATE INDEX t_v ON t (v)".to_string(),
         "CREATE INDEX t_s ON t (s)".to_string(),
+        // b holds two values far apart, so a side file directory's estimate
+        // of b = 0 misjudges it; c two text values, d one a row
+        "CREATE TABLE x (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT, d TEXT)".to_string(),
+        format!(
+            "INSERT INTO x SELECT g.value, g.value % 100, \
+             CASE WHEN g.value % 2 = 0 THEN 0 ELSE 1000000000 END, \
+             'c' || (g.value % 2), 'd' || g.value FROM generate_series(1, {ROWS}) g"
+        ),
+        "CREATE INDEX x_a ON x (a)".to_string(),
+        "CREATE INDEX x_b ON x (b)".to_string(),
+        "CREATE INDEX x_c ON x (c)".to_string(),
+        "CREATE INDEX x_d ON x (d)".to_string(),
     ] {
         db.execute(&sql, ()).unwrap();
     }
@@ -67,21 +74,7 @@ fn ids(db: &Database, sql: &str, params: Vec<Value>) -> Vec<i64> {
     out
 }
 
-/// The side file's candidate positions and the volumes it left to the scan
-/// as too many, so far
-fn side_reads(db: &Database) -> (i64, i64) {
-    let rows = db.query("PRAGMA INDEX_READ_STATS", ()).unwrap();
-    let columns = rows.columns().to_vec();
-    let at = |name: &str| columns.iter().position(|c| c == name).unwrap();
-    let (candidates, scans) = (at("candidates"), at("cost_scans"));
-    let row = rows.into_iter().next().unwrap().unwrap();
-    (
-        row.get::<i64>(candidates).unwrap(),
-        row.get::<i64>(scans).unwrap(),
-    )
-}
-
-/// Hot index ids the reads took so far
+/// Hot index ids this thread's reads took so far
 fn hot_ids() -> usize {
     test_failpoints::hot_index_ids_read() + test_failpoints::equality_candidate_ids_copied_count()
 }
@@ -162,13 +155,25 @@ fn cases() -> Vec<(String, Vec<Value>, Vec<i64>, usize)> {
             vec![1001, 1003],
             8,
         ),
+        (
+            "SELECT id FROM x WHERE a = 2 AND b = 0".to_string(),
+            vec![],
+            (0..ROWS / 100).map(|n| n * 100 + 2).collect(),
+            64,
+        ),
+        (
+            "SELECT id FROM x WHERE c = 'c1' AND d = 'd1001'".to_string(),
+            vec![],
+            vec![1001],
+            8,
+        ),
     ]
 }
 
 fn check(db: &Database, sealed: bool, wrong: &mut Vec<String>) {
     let at = if sealed { "sealed" } else { "hot" };
     for (sql, params, expected, most) in cases() {
-        let (candidates, scans) = side_reads(db);
+        let (candidates, scans) = test_failpoints::side_decisions();
         let hot = hot_ids();
         let answered = ids(db, &sql, params);
         if answered != expected {
@@ -176,12 +181,18 @@ fn check(db: &Database, sealed: bool, wrong: &mut Vec<String>) {
                 "{at} {sql}: answered {answered:?}, expected {expected:?}"
             ));
         }
-        let (candidates, scans) = (side_reads(db).0 - candidates, side_reads(db).1 - scans);
+        let after = test_failpoints::side_decisions();
+        let (candidates, scans) = (after.0 - candidates, after.1 - scans);
         let hot = hot_ids() - hot;
-        let read = if sealed { candidates as usize } else { hot };
-        if read > most || scans != 0 {
+        // Every key named exists, so an index read takes one id at least; a
+        // volume narrows a range on its sorted column and an IN list itself,
+        // with no side file walk
+        let read = if sealed { candidates } else { hot };
+        let walked = !sealed || !(sql.contains(" v > ") || sql.contains(" IN ("));
+        if (walked && read == 0) || read > most || scans != 0 {
             wrong.push(format!(
-                "{at} {sql}: read {read} ids, {scans} volumes scanned for too many, at most {most}"
+                "{at} {sql}: read {read} ids, {scans} volumes scanned for too many, \
+                 1 to {most} expected"
             ));
         }
     }
@@ -189,7 +200,6 @@ fn check(db: &Database, sealed: bool, wrong: &mut Vec<String>) {
 
 #[test]
 fn a_read_starts_from_the_index_holding_the_fewest_rows() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let mut wrong = Vec::new();
     let db = open("memory://index_fewest_rows_hot", false);
     check(&db, false, &mut wrong);
@@ -204,7 +214,6 @@ fn a_read_starts_from_the_index_holding_the_fewest_rows() {
 
 #[test]
 fn local_writes_and_dml_read_the_fewest_rows_index_too() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let key = b(1001);
     for sealed in [false, true] {
         let dir = tempfile::tempdir().unwrap();
@@ -245,7 +254,6 @@ fn local_writes_and_dml_read_the_fewest_rows_index_too() {
 
 #[test]
 fn explain_names_the_fewest_rows_choice() {
-    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let db = open("memory://index_fewest_rows_explain", false);
     let plan = |sql: &str| -> String {
         db.query(&format!("EXPLAIN {sql}"), ())

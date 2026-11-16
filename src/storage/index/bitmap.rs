@@ -721,9 +721,8 @@ impl Index for BitmapIndex {
         if key != high || self.closed.load(AtomicOrdering::Acquire) || self.column_ids.len() != 1 {
             return None;
         }
-        let arc_key = self.value_to_arc_key(std::slice::from_ref(key));
         let bitmaps = self.bitmaps.read();
-        let count = bitmaps.get(&arc_key).map_or(0, |bitmap| bitmap.len());
+        let count = bitmaps.get(key).map_or(0, |bitmap| bitmap.len());
         Some(
             usize::try_from(count)
                 .unwrap_or(usize::MAX)

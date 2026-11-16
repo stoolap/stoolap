@@ -1168,6 +1168,11 @@ fn next_memory_index_identity() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
+/// The keys a key read may take its rows by instead of its own: how many,
+/// and each by its position as its column and a value that is not NULL,
+/// made only when asked
+pub(crate) type InsteadKeys<'a> = (usize, &'a dyn Fn(usize) -> Option<(usize, Value)>);
+
 /// MVCC Storage Engine
 ///
 /// Provides multi-version concurrency control with snapshot isolation.
@@ -9753,17 +9758,18 @@ impl MVCCEngine {
     }
 
     /// The rows of a table without sealed rows holding `value` at `column`
-    /// by the column's own index, or, `INSTEAD`, a key of `instead` whose
-    /// index holds fewer ids, the fewest, in the latest committed state of one
-    /// quiet publish epoch, in row id order; None when the table has sealed
-    /// rows, more than `cap` rows may hold every key, an index cannot answer
-    /// or the table publishes or seals meanwhile
+    /// by the column's own index, or, `INSTEAD`, a key of the `instead`
+    /// keys, each taken by its position when asked, whose index holds fewer
+    /// ids, the fewest, in the latest committed state of one quiet publish
+    /// epoch, in row id order; None when the table has sealed rows, more than
+    /// `cap` rows may hold every key, an index cannot answer or the table
+    /// publishes or seals meanwhile
     pub(crate) fn fetch_latest_equal_in<const INSTEAD: bool>(
         &self,
         table_name: &str,
         store: &Arc<VersionStore>,
         (column, value): (usize, &Value),
-        instead: &[(usize, &Value)],
+        instead: InsteadKeys<'_>,
         cap: usize,
         token: crate::storage::mvcc::version_store::LayoutToken,
     ) -> Result<Option<crate::core::RowVec>> {
@@ -9854,25 +9860,28 @@ impl MVCCEngine {
     fn read_fewer_ids(
         store: &VersionStore,
         schema: &crate::core::Schema,
-        keys: &[(usize, &Value)],
+        (keys, key_at): InsteadKeys<'_>,
         held: usize,
         ids: &mut Vec<i64>,
     ) -> Result<Option<bool>> {
         use crate::storage::traits::CappedEqual;
-        let mut fewest: Option<(usize, usize, &Value)> = None;
-        for &(column, value) in keys {
+        let mut fewest: Option<(usize, usize, Value)> = None;
+        for at in 0..keys {
+            let Some((column, value)) = key_at(at) else {
+                continue;
+            };
             let (Some(index), Some(name)) = (
                 store.index_on(column),
                 schema.columns.get(column).map(|c| c.name.as_str()),
             ) else {
                 continue;
             };
-            let below = fewest.map_or(held, |(count, ..)| count);
+            let below = fewest.as_ref().map_or(held, |(count, ..)| *count);
             let count = crate::storage::mvcc::table::index_equality_count(
                 &*index,
                 schema,
                 name,
-                value,
+                &value,
                 below.saturating_sub(1),
             );
             if let Some(count) = count.filter(|&count| count < below) {
@@ -9882,6 +9891,7 @@ impl MVCCEngine {
         let Some((count, column, value)) = fewest else {
             return Ok(Some(false));
         };
+        let value = &value;
         let (Some(index), Some(name)) = (
             store.index_on(column),
             schema.columns.get(column).map(|c| c.name.as_str()),
