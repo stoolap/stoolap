@@ -23,7 +23,7 @@ EXPLAIN ANALYZE query;
 
 Shows the execution plan without running the query.
 
-A SELECT over one table, view, CTE, derived table, VALUES list or table function is planned once, when it is prepared, and EXPLAIN prints that plan: the steps the rows go through, outermost first, each indented under the step it feeds. The access at the bottom is the one the run takes, and the indexes it names are the ones it reads. A SELECT over one table whose WHERE or select list holds a subquery prints its plan the same way, as [Subqueries Over One Table](#subqueries-over-one-table) shows. Other statements (joins, window functions, DISTINCT or a set operation over anything but a table, a WHERE or select list with a subquery over anything but a table, an aggregate that reads its rows with no source of its own, EXPLAIN ANALYZE) print the format shown in their own sections below.
+A SELECT over one table, view, CTE, derived table, VALUES list or table function is planned once, when it is prepared, and EXPLAIN prints that plan: the steps the rows go through, outermost first, each indented under the step it feeds. The access at the bottom is the one the run takes, and the indexes it names are the ones it reads. A SELECT over one of these sources whose WHERE or select list holds a subquery prints its plan the same way, as [Subqueries Over One Source](#subqueries-over-one-source) shows. Other statements (joins, window functions, DISTINCT or a set operation over anything but a table, an aggregate that reads its rows with no source of its own, EXPLAIN ANALYZE) print the format shown in their own sections below.
 
 ### Sequential Scan
 
@@ -397,9 +397,9 @@ Limit 2
             Index idx_value (value range)
 ```
 
-### Subqueries Over One Table
+### Subqueries Over One Source
 
-A SELECT over one table whose WHERE or select list holds a subquery is planned once too, and EXPLAIN prints its plan, then `Prepared: yes` and its subqueries. A subquery that reads no enclosing row and is compared with a column in a top-level AND, or any other such value that reads no row, is read once per run and taken by the scan as a parameter is, so the plan's index is the one the run reads. It shows as written:
+A SELECT over one table, view, CTE, derived table, VALUES list or table function, or with no FROM, whose WHERE or select list holds a subquery is planned once too, and EXPLAIN prints its plan, then `Prepared: yes` and its subqueries. Over a source that is not a table, the rows the source gives are each judged by the whole WHERE, its subqueries included, shown after the source's name as in [Views, CTEs and Derived Tables](#views-ctes-and-derived-tables). Over a table, a subquery that reads no enclosing row and is compared with a column in a top-level AND, or any other such value that reads no row, is read once per run and taken by the scan as a parameter is, so the plan's index is the one the run reads. It shows as written:
 
 ```sql
 EXPLAIN SELECT name FROM products WHERE value > (SELECT AVG(amount) FROM orders);
@@ -434,6 +434,29 @@ Project name
 Prepared: yes
 Subqueries:
   1: IN over orders, once per run
+```
+
+Every CTE of the statement runs before it. One that is not the statement's source, such as a CTE only a subquery reads, is listed after the subqueries under `Ctes:`, with its query's plan under its name:
+
+```sql
+EXPLAIN WITH big AS (SELECT amount FROM orders WHERE amount > 100)
+SELECT name FROM products WHERE value > (SELECT AVG(amount) FROM big);
+```
+
+Output:
+```
+plan
+----
+Project name
+  IndexScan products (value > (SELECT AVG(amount) FROM big))
+    Index idx_value (value range)
+Prepared: yes
+Subqueries:
+  1: scalar over big, once per run
+Ctes:
+  big
+    Project amount
+      SeqScan orders (amount > 100)
 ```
 
 ### Hash Join

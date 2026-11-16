@@ -198,7 +198,7 @@ impl Executor {
             (&schema, true),
             scope,
             param_count,
-            epoch,
+            (epoch, true),
             keyed_branch,
         )?;
         // A LIMIT or OFFSET read per run leaves the statement to a scan, and
@@ -243,7 +243,6 @@ impl Executor {
         ctx: &ExecutionContext,
     ) -> Option<Vec<String>> {
         self.explain_planned(stmt, ctx, true)
-            .or_else(|| self.explain_with_blocks(stmt, ctx))
             .or_else(|| self.explain_over_source(stmt, ctx))
     }
 
