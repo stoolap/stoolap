@@ -727,13 +727,8 @@ impl QueryPlanner {
         upper: std::ops::Bound<&Value>,
     ) -> Option<f64> {
         use std::ops::Bound::Included;
-        let index = compared.index.as_deref()?;
-        let (table_name, store) = run.counting?;
+        let (index, store, rows) = self.counting(compared, run)?;
         let (lower, upper) = (compared.read_bound(lower)?, compared.read_bound(upper)?);
-        let rows = (*run.hot_rows.get_or_init(|| {
-            (self.engine.row_count_hint(table_name))
-                .filter(|&rows| rows > 0 && rows == store.committed_row_count())
-        }))?;
         let (lower, upper) = (lower.as_ref().map(|v| &**v), upper.as_ref().map(|v| &**v));
         let count = match (lower, upper) {
             (Included(low), Included(high)) if low == high => {
@@ -758,17 +753,43 @@ impl QueryPlanner {
     /// None unless it counts every one
     fn counted_members(&self, compared: &Compared, run: &Run) -> Option<f64> {
         use std::ops::Bound::Included;
-        compared.index.as_ref()?;
-        let mut keys: smallvec::SmallVec<[std::borrow::Cow<'_, Value>; 8]> =
-            smallvec::SmallVec::with_capacity(compared.values.len());
-        for member in &compared.values {
-            keys.push(compared.read_value(member.bind(run.params)?)?);
-        }
-        keys.sort_unstable();
-        keys.dedup();
-        (keys.iter())
-            .map(|key| self.counted_share(compared, run, Included(key), Included(key)))
-            .sum()
+        self.counting(compared, run)?;
+        let mut keys = IN_KEYS.with(std::cell::Cell::take);
+        keys.clear();
+        let read = (compared.values.iter()).try_for_each(|member| {
+            keys.push(compared.read_value(member.bind(run.params)?)?.into_owned());
+            Some(())
+        });
+        let share = read.and_then(|()| {
+            keys.sort_unstable();
+            keys.dedup();
+            (keys.iter())
+                .map(|key| self.counted_share(compared, run, Included(key), Included(key)))
+                .sum()
+        });
+        keys.clear();
+        IN_KEYS.with(|held| held.set(keys));
+        share
+    }
+
+    /// The compared column's index, the table's store and its rows, while
+    /// the index counts them: all of the table's rows hot
+    fn counting<'r>(
+        &self,
+        compared: &'r Compared,
+        run: &Run<'r>,
+    ) -> Option<(
+        &'r dyn crate::storage::traits::Index,
+        &'r VersionStore,
+        usize,
+    )> {
+        let index = compared.index.as_deref()?;
+        let (table_name, store) = run.counting?;
+        let rows = (*run.hot_rows.get_or_init(|| {
+            (self.engine.row_count_hint(table_name))
+                .filter(|&rows| rows > 0 && rows == store.committed_row_count())
+        }))?;
+        Some((index, store, rows))
     }
 
     /// Whether `a = b` compares a column of `table_name` that no two rows
@@ -991,6 +1012,12 @@ impl QueryPlanner {
 
 /// The most rows an estimate counts in a range before it estimates instead
 const RANGE_COUNT_CAP: usize = 4096;
+
+thread_local! {
+    /// An IN list's keys as its column reads them, one buffer a thread keeps
+    /// for every list it counts, so a run allocates nothing for it
+    static IN_KEYS: std::cell::Cell<Vec<Value>> = const { std::cell::Cell::new(Vec::new()) };
+}
 
 /// The share of a table's rows a predicate keeps, resolved once per
 /// statistics epoch for runs to bind and count

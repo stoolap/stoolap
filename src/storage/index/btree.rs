@@ -248,8 +248,13 @@ impl BTreeIndex {
                     rows.copy_into(&mut results);
                 }
             }
-            Operator::Lt => collect(Bound::Unbounded, &|key| key.cmp(value) == Ordering::Less),
-            Operator::Lte => collect(Bound::Unbounded, &|key| key.cmp(value) != Ordering::Greater),
+            // NULL, the first key, is below no value
+            Operator::Lt => collect(Bound::Excluded(&NULL), &|key| {
+                key.cmp(value) == Ordering::Less
+            }),
+            Operator::Lte => collect(Bound::Excluded(&NULL), &|key| {
+                key.cmp(value) != Ordering::Greater
+            }),
             Operator::Gt => collect(Bound::Excluded(value), &|_| true),
             Operator::Gte => collect(Bound::Included(value), &|_| true),
             Operator::IsNull => {
@@ -1426,7 +1431,7 @@ mod tests {
     }
 
     #[test]
-    fn a_range_count_leaves_out_the_null_key() {
+    fn a_range_count_and_read_leave_out_the_null_key() {
         use std::ops::Bound;
         let index = create_test_index();
         index.add(&[Value::Null(DataType::Integer)], 1, 1).unwrap();
@@ -1438,6 +1443,13 @@ mod tests {
         assert_eq!(below, Some(1), "k < 5 keeps the row of 1, no NULL");
         let all = index.count_capped(Bound::Unbounded, Bound::Unbounded, 10);
         assert_eq!(all, Some(2), "no bound keeps the NULLs out still");
+        for op in [Operator::Lt, Operator::Lte] {
+            let read = index
+                .find_with_operator(op, std::slice::from_ref(&five))
+                .unwrap();
+            let ids: Vec<i64> = read.iter().map(|entry| entry.row_id).collect();
+            assert_eq!(ids, vec![3], "{op:?} 5 reads the row of 1, no NULL");
+        }
     }
 
     #[test]
