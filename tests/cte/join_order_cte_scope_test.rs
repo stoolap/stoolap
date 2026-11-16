@@ -44,6 +44,15 @@ fn cte_context() -> ExecutionContext {
     ExecutionContext::new().with_cte_data(Arc::new(ctes))
 }
 
+fn lines(result: stoolap::Result<Box<dyn stoolap::storage::traits::QueryResult>>) -> Vec<String> {
+    let mut result = result.unwrap();
+    let mut lines = Vec::new();
+    while result.next() {
+        lines.push(format!("{:?}", result.row().get(0)));
+    }
+    lines
+}
+
 fn count(result: stoolap::Result<Box<dyn stoolap::storage::traits::QueryResult>>) -> String {
     match result {
         Ok(mut result) => match (result.next(), result.row().get(0)) {
@@ -73,14 +82,7 @@ fn a_held_join_order_is_not_taken_over_ctes_of_the_tables_names() {
     }
     // Over the tables x is t.x; over the CTEs, u.x
     let sql = "SELECT COUNT(*) FROM t JOIN u ON t.k = u.k JOIN s ON x = s.m WHERE s.m = 1";
-    let explained: Vec<String> = {
-        let mut result = executor.execute(&format!("EXPLAIN {sql}")).unwrap();
-        let mut lines = Vec::new();
-        while result.next() {
-            lines.push(format!("{:?}", result.row().get(0)));
-        }
-        lines
-    };
+    let explained = lines(executor.execute(&format!("EXPLAIN {sql}")));
     assert!(
         explained
             .iter()
@@ -97,5 +99,18 @@ fn a_held_join_order_is_not_taken_over_ctes_of_the_tables_names() {
         count(executor.execute(sql)),
         "4000",
         "over the tables after"
+    );
+    let analyze = format!("EXPLAIN ANALYZE {sql}");
+    let over_tables = lines(executor.execute(&analyze));
+    assert!(
+        over_tables
+            .iter()
+            .any(|line| line.contains("Join order: s, t, u")),
+        "{over_tables:?}"
+    );
+    let over_ctes = lines(executor.execute_with_context(&analyze, &cte_context()));
+    assert!(
+        !over_ctes.iter().any(|line| line.contains("Join order")),
+        "the run over the CTEs took the written order: {over_ctes:?}"
     );
 }

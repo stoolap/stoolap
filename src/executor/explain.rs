@@ -71,8 +71,9 @@ impl Executor {
         // A run of INNER joins is explained in the order the plan `ran` ran
         // it in, or the order a run would take now
         let order_of = |ran: Option<&NestedPlan>| match &**explain_stmt {
-            Statement::Select(select) => (ran.and_then(super::join_order::held_join_order))
-                .unwrap_or_else(|| self.reorder_joins(select, CteNames::Context(ctx))),
+            Statement::Select(select) => (ran
+                .and_then(|ran| super::join_order::taken_join_order(select, ctx, ran)))
+            .unwrap_or_else(|| self.reorder_joins(select, CteNames::Context(ctx))),
             _ => None,
         };
         let note_order = |lines: &mut Vec<String>, ordered: &Option<JoinOrder>| {

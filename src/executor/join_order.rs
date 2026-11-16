@@ -55,13 +55,26 @@ pub(crate) struct OrderedPlan {
     pub plan: NestedPlan,
 }
 
-/// The order the plan `plan` ran its statement's joins in: None inside
-/// when it ran them as written; None when it holds no decision
-pub(crate) fn held_join_order(plan: &NestedPlan) -> Option<Option<JoinOrder>> {
+/// The order a run of `stmt` in `ctx` under `plan` took its joins in: None
+/// inside when it ran them as written; None when the plan holds no decision
+pub(crate) fn taken_join_order(
+    stmt: &SelectStatement,
+    ctx: &ExecutionContext,
+    plan: &NestedPlan,
+) -> Option<Option<JoinOrder>> {
+    if join_run(stmt).is_some_and(|run| ctes_hide(run, ctx)) {
+        return Some(None);
+    }
     match &*plan.join_order().read().ok()? {
         HeldOrder::Decided(_, ordered) => Some(ordered.as_ref().map(|o| o.order.clone())),
         _ => None,
     }
+}
+
+/// Whether a CTE of `ctx` stands for a table of `run`, which then runs as
+/// written whatever its plan holds
+fn ctes_hide(run: &JoinTableSource, ctx: &ExecutionContext) -> bool {
+    run_tables(run).any(|table| CteNames::Context(ctx).hides(&table.name.value_lower))
 }
 
 /// A statement whose joins run in another order than written
@@ -84,17 +97,6 @@ pub(crate) struct OrderKey {
 
 /// Each table's log2 row bucket, inline for the runs of up to eight tables
 type Buckets = smallvec::SmallVec<[u32; 8]>;
-
-impl OrderKey {
-    /// Whether an order decided under `self` still holds under `now`: the
-    /// same epochs, and no table's rows moved by two buckets
-    pub(crate) fn holds(&self, now: &OrderKey) -> bool {
-        self.schema == now.schema
-            && self.stats == now.stats
-            && self.buckets.len() == now.buckets.len()
-            && (self.buckets.iter().zip(&now.buckets)).all(|(a, b)| a.abs_diff(*b) < 2)
-    }
-}
 
 /// One joined table of the reordered run
 struct Leaf<'s> {
@@ -151,26 +153,45 @@ impl Executor {
         let Some(compiled) = compiled else {
             return decide();
         };
-        if matches!(*compiled.join_order().read().ok()?, HeldOrder::Fixed) {
-            return None;
-        }
-        // A table a CTE of the context hides runs as written, whatever is held
-        if run_tables(run).any(|table| CteNames::Context(ctx).hides(&table.name.value_lower)) {
-            return None;
-        }
-        let key = self.join_order_key(run)?;
-        if let HeldOrder::Decided(held, plan) = &*compiled.join_order().read().ok()? {
-            if held.holds(&key) {
-                return plan.clone();
+        {
+            let held = compiled.join_order().read().ok()?;
+            match &*held {
+                HeldOrder::Fixed => return None,
+                _ if ctes_hide(run, ctx) => return None,
+                HeldOrder::Decided(key, plan) if self.key_holds(key, run) => return plan.clone(),
+                _ => {}
             }
         }
+        let key = self.join_order_key(run)?;
         let plan = decide();
         *compiled.join_order().write().ok()? = HeldOrder::Decided(key, plan.clone());
         plan
     }
 
+    /// Whether an order decided under `held` still holds for `run`: the same
+    /// epochs, and no table's rows moved by two buckets; read without
+    /// collecting the buckets
+    fn key_holds(&self, held: &OrderKey, run: &JoinTableSource) -> bool {
+        if held.schema != self.engine.schema_epoch() || held.stats != self.engine.stats_epoch() {
+            return false;
+        }
+        let mut buckets = held.buckets.iter();
+        for source in run_tables(run) {
+            let rows = self.engine.row_count_hint(&source.name.value_lower);
+            let (Some(&bucket), Some(rows)) = (buckets.next(), rows) else {
+                return false;
+            };
+            if (usize::BITS - rows.leading_zeros()).abs_diff(bucket) >= 2 {
+                return false;
+            }
+        }
+        buckets.next().is_none()
+    }
+
     /// The memo key of the order of the run of joins `run`
     fn join_order_key(&self, run: &JoinTableSource) -> Option<OrderKey> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::join_order_key_collected();
         let buckets = run_tables(run)
             .map(|source| {
                 let rows = self.engine.row_count_hint(&source.name.value_lower)?;
@@ -307,7 +328,7 @@ impl Executor {
         let terms = (extract_and_conditions(join.condition.as_deref()?).into_iter())
             .map(|expr| {
                 Some(Term {
-                    expr: qualify(expr, &leaves),
+                    expr: qualify(expr, &leaves)?,
                     leaves: term_leaves(expr, &leaves)?,
                 })
             })
@@ -418,7 +439,8 @@ fn reads_plain_names(stmt: &SelectStatement) -> bool {
         && clauses(stmt).all(|expr| visit_column_refs(expr, &mut |_| {}))
 }
 
-/// Every expression of `stmt` that names columns, its join conditions included
+/// Every expression of `stmt` that names columns, its join conditions, LIMIT
+/// and OFFSET included
 fn clauses(stmt: &SelectStatement) -> impl Iterator<Item = &Expression> {
     let mut conditions = Vec::new();
     let mut at = stmt.table_expr.as_deref();
@@ -432,6 +454,8 @@ fn clauses(stmt: &SelectStatement) -> impl Iterator<Item = &Expression> {
         .chain(&stmt.group_by.columns)
         .chain(stmt.having.as_deref())
         .chain(stmt.order_by.iter().map(|o| &o.expression))
+        .chain(stmt.limit.as_deref())
+        .chain(stmt.offset.as_deref())
         .chain(conditions)
 }
 
@@ -460,7 +484,7 @@ fn term_leaves(expr: &Expression, leaves: &[Leaf<'_>]) -> Option<Vec<usize>> {
 
 /// Every ON term of the run, its bare names qualified by the leaves its join
 /// sees as written, with the leaves it reads; None when one reads a name
-/// those leaves do not hold
+/// none of those leaves holds, or several do
 fn run_terms(run: &JoinTableSource, leaves: &[Leaf<'_>]) -> Option<Vec<Term>> {
     let mut terms = Vec::new();
     let (mut at, mut seen) = (Some(run), leaves.len());
@@ -468,7 +492,7 @@ fn run_terms(run: &JoinTableSource, leaves: &[Leaf<'_>]) -> Option<Vec<Term>> {
         let scope = &leaves[..seen];
         for expr in extract_and_conditions(join.condition.as_deref()?) {
             terms.push(Term {
-                expr: qualify(expr, scope),
+                expr: qualify(expr, scope)?,
                 leaves: term_leaves(expr, scope)?,
             });
         }
@@ -481,24 +505,23 @@ fn run_terms(run: &JoinTableSource, leaves: &[Leaf<'_>]) -> Option<Vec<Term>> {
     Some(terms)
 }
 
-/// `expr` with each bare name qualified by the leaf of `scope` that holds
-/// it, so it reads the same column wherever its term is joined
-fn qualify(expr: &Expression, scope: &[Leaf<'_>]) -> Expression {
+/// `expr` with each bare name qualified by the one leaf of `scope` that
+/// holds it, so it reads the same column wherever its term is joined; None
+/// for a name no leaf or several hold
+fn qualify(expr: &Expression, scope: &[Leaf<'_>]) -> Option<Expression> {
     if let Expression::Identifier(id) = expr {
-        let holder = scope
-            .iter()
-            .find(|leaf| leaf.schema.has_column(&id.value_lower));
-        return match holder {
-            Some(leaf) => Expression::QualifiedIdentifier(QualifiedIdentifier {
-                qualifier: (leaf.source.alias.clone()).unwrap_or_else(|| leaf.source.name.clone()),
-                name: id.clone(),
-            }),
-            None => expr.clone(),
+        // A name two leaves hold is the binder's error to raise, as written
+        let mut holders = (scope.iter()).filter(|leaf| leaf.schema.has_column(&id.value_lower));
+        let (Some(leaf), None) = (holders.next(), holders.next()) else {
+            return None;
         };
+        return Some(Expression::QualifiedIdentifier(QualifiedIdentifier {
+            qualifier: (leaf.source.alias.clone()).unwrap_or_else(|| leaf.source.name.clone()),
+            name: id.clone(),
+        }));
     }
-    let Ok(qualified) =
-        expr.try_map_children::<std::convert::Infallible>(&mut |child| Ok(qualify(child, scope)));
-    qualified
+    expr.try_map_children(&mut |child| qualify(child, scope).ok_or(()))
+        .ok()
 }
 
 /// The equality `term` states between a column of each of two leaves

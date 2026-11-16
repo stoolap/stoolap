@@ -3849,6 +3849,7 @@ thread_local! {
     static JOIN_SIDE_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static JOIN_ORDERS_DECIDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static JOIN_ORDER_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static JOIN_ORDER_KEYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static STREAMING_JOINS_STREAMED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static INDEX_JOIN_OUTER_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static LIMIT_HASH_LEFT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -3900,6 +3901,15 @@ pub fn join_orders() -> (usize, usize) {
         JOIN_ORDERS_DECIDED.with(std::cell::Cell::get),
         JOIN_ORDER_RUNS.with(std::cell::Cell::get),
     )
+}
+
+/// Join order keys this thread collected, each for a decision made, so far
+pub fn join_order_keys() -> usize {
+    JOIN_ORDER_KEYS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn join_order_key_collected() {
+    JOIN_ORDER_KEYS.with(|n| n.set(n.get() + 1));
 }
 
 pub(crate) fn join_order_decided() {

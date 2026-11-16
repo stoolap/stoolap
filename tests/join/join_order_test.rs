@@ -19,7 +19,7 @@
 
 #![cfg(feature = "test-failpoints")]
 
-use stoolap::test_failpoints::join_orders;
+use stoolap::test_failpoints::{join_order_keys, join_orders};
 use stoolap::Database;
 
 /// `t` 5,000 rows; `u` 5,000, its `tid` the id of a `t` row and `sid` the id
@@ -203,6 +203,8 @@ fn the_written_order_is_kept_where_the_rule_does_not_reach() {
                 .to_string(),
             100,
         ),
+        // A subquery the LIMIT holds
+        (format!("SELECT COUNT(*) {TRAP} LIMIT (SELECT 1)"), 100),
         // Two tables, and a written order already the cheapest
         (
             "SELECT COUNT(*) FROM u JOIN s ON u.sid = s.id WHERE s.x = 1".to_string(),
@@ -264,6 +266,56 @@ fn a_moved_on_term_reads_the_column_its_written_join_saw() {
     let (answer, reordered, _) = ran(&db, sql);
     assert_eq!(answer, vec![vec![15]], "the rows of t.v = 1, not s.v");
     assert!(reordered, "{sql} ran reordered");
+}
+
+#[test]
+fn an_on_term_naming_a_column_two_written_tables_hold_stays_ambiguous() {
+    let db = Database::open("memory://join_order_on_ambiguous").unwrap();
+    tables(&db);
+    // The first ON sees t and u, which both hold id
+    let sql = "SELECT COUNT(*) FROM t JOIN u ON t.id = u.tid AND id = 50 \
+               JOIN s ON u.sid = s.id WHERE s.x = 1";
+    let error = db.query(sql, ()).err().map(|e| e.to_string());
+    assert!(
+        error.as_deref().is_some_and(|e| e.contains("ambiguous")),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn a_held_order_of_nine_tables_is_checked_without_collecting_a_key() {
+    let db = Database::open("memory://join_order_nine_tables").unwrap();
+    for sql in [
+        "CREATE TABLE p (id INTEGER PRIMARY KEY)",
+        "INSERT INTO p VALUES (1)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let mut sql = String::from("SELECT COUNT(*) FROM p a1");
+    for at in 2..=9 {
+        sql.push_str(&format!(" JOIN p a{at} ON a{at}.id = a{}.id", at - 1));
+    }
+    let stmt = db.prepare(&sql).unwrap();
+    let keys = || {
+        let before = join_order_keys();
+        assert_eq!(stmt.query(()).unwrap().count(), 1, "{sql}");
+        join_order_keys() - before
+    };
+    assert_eq!(keys(), 1, "the first run decides, under a key it collects");
+    assert_eq!(keys(), 0, "a later run reads the held key as it stands");
+    assert_eq!(keys(), 0);
+}
+
+#[test]
+fn explain_analyze_keeps_the_subqueries_of_a_limit() {
+    let db = Database::open("memory://join_order_limit_subquery").unwrap();
+    tables(&db);
+    let explained = plan(
+        &db,
+        &format!("ANALYZE SELECT COUNT(*) {TRAP} LIMIT (SELECT 1)"),
+    );
+    assert!(explained.contains("Subqueries:"), "{explained}");
+    assert!(!explained.contains("Join order"), "{explained}");
 }
 
 #[test]
