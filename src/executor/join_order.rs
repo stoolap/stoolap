@@ -19,7 +19,8 @@
 
 use crate::common::SmartString;
 use crate::parser::ast::{
-    Expression, InfixOperator, JoinTableSource, SelectStatement, SimpleTableSource,
+    Expression, InfixOperator, JoinTableSource, QualifiedIdentifier, SelectStatement,
+    SimpleTableSource,
 };
 use crate::storage::traits::Engine;
 
@@ -54,8 +55,17 @@ pub(crate) struct OrderedPlan {
     pub plan: NestedPlan,
 }
 
+/// The order the plan `plan` ran its statement's joins in: None inside
+/// when it ran them as written; None when it holds no decision
+pub(crate) fn held_join_order(plan: &NestedPlan) -> Option<Option<JoinOrder>> {
+    match &*plan.join_order().read().ok()? {
+        HeldOrder::Decided(_, ordered) => Some(ordered.as_ref().map(|o| o.order.clone())),
+        _ => None,
+    }
+}
+
 /// A statement whose joins run in another order than written
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct JoinOrder {
     pub stmt: SelectStatement,
     /// The joined tables by alias, as written and as joined
@@ -69,8 +79,11 @@ pub(crate) struct JoinOrder {
 pub(crate) struct OrderKey {
     schema: u64,
     stats: u64,
-    buckets: Vec<u32>,
+    buckets: Buckets,
 }
+
+/// Each table's log2 row bucket, inline for the runs of up to eight tables
+type Buckets = smallvec::SmallVec<[u32; 8]>;
 
 impl OrderKey {
     /// Whether an order decided under `self` still holds under `now`: the
@@ -95,9 +108,9 @@ struct Leaf<'s> {
     all_hot: bool,
 }
 
-/// An ON term of the run, with the leaves it reads
-struct Term<'s> {
-    expr: &'s Expression,
+/// An ON term of the run, its names qualified, with the leaves it reads
+struct Term {
+    expr: Expression,
     leaves: Vec<usize>,
 }
 
@@ -107,6 +120,7 @@ struct Edge {
 }
 
 /// The facts a step's estimate reads of one side of an edge
+#[derive(Clone, Copy)]
 struct Column {
     /// Whether no two rows share a value: a primary key or a unique index
     unique: bool,
@@ -125,7 +139,7 @@ impl Executor {
         ctx: &ExecutionContext,
         compiled: Option<&NestedPlan>,
     ) -> Option<Arc<OrderedPlan>> {
-        let (_, sources) = join_run(stmt)?;
+        let run = join_run(stmt)?;
         let decide = || {
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::join_order_decided();
@@ -140,7 +154,11 @@ impl Executor {
         if matches!(*compiled.join_order().read().ok()?, HeldOrder::Fixed) {
             return None;
         }
-        let key = self.join_order_key(&sources)?;
+        // A table a CTE of the context hides runs as written, whatever is held
+        if run_tables(run).any(|table| CteNames::Context(ctx).hides(&table.name.value_lower)) {
+            return None;
+        }
+        let key = self.join_order_key(run)?;
         if let HeldOrder::Decided(held, plan) = &*compiled.join_order().read().ok()? {
             if held.holds(&key) {
                 return plan.clone();
@@ -151,14 +169,14 @@ impl Executor {
         plan
     }
 
-    /// The memo key of the order of a run of joins over `sources`
-    fn join_order_key(&self, sources: &[&SimpleTableSource]) -> Option<OrderKey> {
-        let buckets = (sources.iter())
+    /// The memo key of the order of the run of joins `run`
+    fn join_order_key(&self, run: &JoinTableSource) -> Option<OrderKey> {
+        let buckets = run_tables(run)
             .map(|source| {
                 let rows = self.engine.row_count_hint(&source.name.value_lower)?;
                 Some(usize::BITS - rows.leading_zeros())
             })
-            .collect::<Option<Vec<u32>>>()?;
+            .collect::<Option<Buckets>>()?;
         Some(OrderKey {
             schema: self.engine.schema_epoch(),
             stats: self.engine.stats_epoch(),
@@ -175,14 +193,29 @@ impl Executor {
         stmt: &SelectStatement,
         ctes: CteNames<'_>,
     ) -> Option<JoinOrder> {
-        let (run, sources) = join_run(stmt)?;
+        let run = join_run(stmt)?;
         if !reads_plain_names(stmt) {
             return None;
         }
+        let mut sources: Vec<&SimpleTableSource> = run_tables(run).collect();
+        sources.reverse();
         let leaves = self.leaves(&sources, stmt, ctes)?;
         let terms = run_terms(run, &leaves)?;
         let edges: Vec<Edge> = terms.iter().filter_map(|t| edge(t, &leaves)).collect();
-        let columns = |leaf: usize, column: &str| self.column_facts(&leaves[leaf], column);
+        // Each column's facts, read once for the whole decision
+        let known: std::cell::RefCell<Vec<(usize, SmartString, Column)>> = Default::default();
+        let columns = |leaf: usize, column: &str| {
+            let held = (known.borrow().iter())
+                .find(|(at, name, _)| *at == leaf && name == column)
+                .map(|(_, _, facts)| *facts);
+            held.unwrap_or_else(|| {
+                let facts = self.column_facts(&leaves[leaf], column);
+                known
+                    .borrow_mut()
+                    .push((leaf, SmartString::from(column), facts));
+                facts
+            })
+        };
         let written: Vec<usize> = (0..leaves.len()).collect();
         let written_cost = order_cost(&written, &leaves, &edges, &columns)?;
         let chosen = greedy_order(&leaves, &edges, &columns)?;
@@ -274,7 +307,7 @@ impl Executor {
         let terms = (extract_and_conditions(join.condition.as_deref()?).into_iter())
             .map(|expr| {
                 Some(Term {
-                    expr,
+                    expr: qualify(expr, &leaves),
                     leaves: term_leaves(expr, &leaves)?,
                 })
             })
@@ -302,7 +335,7 @@ impl Executor {
         } else {
             let counted = (index.as_ref())
                 .filter(|_| leaf.all_hot)
-                .and_then(|index| index.get_distinct_count_excluding_null());
+                .and_then(|index| index.distinct_keys_hint());
             let analyzed = || {
                 (self.get_query_planner().get_column_stats(table, column))
                     .map(|stats| stats.distinct_count as usize)
@@ -318,21 +351,13 @@ impl Executor {
     }
 }
 
-/// The run of INNER joins at the bottom of `stmt`'s left-deep join tree, and
-/// its base tables in written order: three or more, each joined by an ON
-fn join_run(stmt: &SelectStatement) -> Option<(&JoinTableSource, Vec<&SimpleTableSource>)> {
+/// The run of INNER joins at the bottom of `stmt`'s left-deep join tree:
+/// three or more base tables, each joined by an ON; found without allocating
+fn join_run(stmt: &SelectStatement) -> Option<&JoinTableSource> {
     if stmt.with.is_some() || !stmt.set_operations.is_empty() || stmt.prepared.is_some() {
         return None;
     }
     let Expression::JoinSource(top) = stmt.table_expr.as_deref()? else {
-        return None;
-    };
-    // The joins down the left spine, top first
-    let mut spine = vec![&**top];
-    while let Expression::JoinSource(left) = spine.last()?.left.as_ref() {
-        spine.push(left);
-    }
-    let Expression::TableSource(first) = spine.last()?.left.as_ref() else {
         return None;
     };
     let inner = |join: &JoinTableSource| {
@@ -341,18 +366,45 @@ fn join_run(stmt: &SelectStatement) -> Option<(&JoinTableSource, Vec<&SimpleTabl
             && join.using_columns.is_empty()
             && matches!(join.right.as_ref(), Expression::TableSource(_))
     };
-    let below = spine.iter().rev().take_while(|join| inner(join)).count();
-    if below < 2 {
-        return None;
-    }
-    let run = spine[spine.len() - below];
-    let mut sources = vec![&**first];
-    for join in spine.iter().rev().take(below) {
-        if let Expression::TableSource(right) = join.right.as_ref() {
-            sources.push(right);
+    // The top of the INNER joins down the left spine that reach its bottom
+    let (mut run, mut joins) = (None, 0usize);
+    let mut at: &JoinTableSource = top;
+    loop {
+        if inner(at) {
+            run = run.or(Some(at));
+            joins += 1;
+        } else {
+            (run, joins) = (None, 0);
+        }
+        match at.left.as_ref() {
+            Expression::JoinSource(left) => at = left,
+            Expression::TableSource(_) => break,
+            _ => return None,
         }
     }
-    Some((run, sources))
+    run.filter(|_| joins >= 2)
+}
+
+/// The base tables of `run`, the last joined first
+fn run_tables(run: &JoinTableSource) -> impl Iterator<Item = &SimpleTableSource> {
+    let (mut at, mut first) = (Some(run), None);
+    std::iter::from_fn(move || {
+        let Some(join) = at else {
+            return first.take();
+        };
+        at = match join.left.as_ref() {
+            Expression::JoinSource(left) => Some(&**left),
+            Expression::TableSource(source) => {
+                first = Some(&**source);
+                None
+            }
+            _ => None,
+        };
+        match join.right.as_ref() {
+            Expression::TableSource(source) => Some(&**source),
+            _ => None,
+        }
+    })
 }
 
 /// Whether every column reference of `stmt` is one a name walk sees: no
@@ -406,29 +458,52 @@ fn term_leaves(expr: &Expression, leaves: &[Leaf<'_>]) -> Option<Vec<usize>> {
     known.then(|| (0..leaves.len()).filter(|&at| read[at]).collect())
 }
 
-/// Every ON term of the run, with the leaves it reads; None when one reads
-/// a name the run's leaves do not hold
-fn run_terms<'s>(run: &'s JoinTableSource, leaves: &[Leaf<'_>]) -> Option<Vec<Term<'s>>> {
+/// Every ON term of the run, its bare names qualified by the leaves its join
+/// sees as written, with the leaves it reads; None when one reads a name
+/// those leaves do not hold
+fn run_terms(run: &JoinTableSource, leaves: &[Leaf<'_>]) -> Option<Vec<Term>> {
     let mut terms = Vec::new();
-    let mut at = Some(run);
+    let (mut at, mut seen) = (Some(run), leaves.len());
     while let Some(join) = at {
+        let scope = &leaves[..seen];
         for expr in extract_and_conditions(join.condition.as_deref()?) {
             terms.push(Term {
-                expr,
-                leaves: term_leaves(expr, leaves)?,
+                expr: qualify(expr, scope),
+                leaves: term_leaves(expr, scope)?,
             });
         }
         at = match join.left.as_ref() {
             Expression::JoinSource(left) => Some(left),
             _ => None,
         };
+        seen -= 1;
     }
     Some(terms)
 }
 
+/// `expr` with each bare name qualified by the leaf of `scope` that holds
+/// it, so it reads the same column wherever its term is joined
+fn qualify(expr: &Expression, scope: &[Leaf<'_>]) -> Expression {
+    if let Expression::Identifier(id) = expr {
+        let holder = scope
+            .iter()
+            .find(|leaf| leaf.schema.has_column(&id.value_lower));
+        return match holder {
+            Some(leaf) => Expression::QualifiedIdentifier(QualifiedIdentifier {
+                qualifier: (leaf.source.alias.clone()).unwrap_or_else(|| leaf.source.name.clone()),
+                name: id.clone(),
+            }),
+            None => expr.clone(),
+        };
+    }
+    let Ok(qualified) =
+        expr.try_map_children::<std::convert::Infallible>(&mut |child| Ok(qualify(child, scope)));
+    qualified
+}
+
 /// The equality `term` states between a column of each of two leaves
-fn edge(term: &Term<'_>, leaves: &[Leaf<'_>]) -> Option<Edge> {
-    let Expression::Infix(infix) = term.expr else {
+fn edge(term: &Term, leaves: &[Leaf<'_>]) -> Option<Edge> {
+    let Expression::Infix(infix) = &term.expr else {
         return None;
     };
     if !matches!(infix.op_type, InfixOperator::Equal) || term.leaves.len() != 2 {
@@ -552,7 +627,7 @@ fn rebuild(
     run: &JoinTableSource,
     order: &[usize],
     leaves: &[Leaf<'_>],
-    terms: &[Term<'_>],
+    terms: &[Term],
 ) -> Option<Expression> {
     let position = |leaf: usize| order.iter().position(|&at| at == leaf);
     let mut on: Vec<Vec<Expression>> = vec![Vec::new(); order.len()];

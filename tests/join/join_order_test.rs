@@ -251,6 +251,48 @@ fn the_order_is_decided_again_when_its_facts_move() {
 }
 
 #[test]
+fn a_moved_on_term_reads_the_column_its_written_join_saw() {
+    let db = Database::open("memory://join_order_on_scope").unwrap();
+    tables(&db);
+    db.execute("ALTER TABLE s ADD COLUMN v INTEGER DEFAULT 9", ())
+        .unwrap();
+    // As written, the first ON sees t and u alone, so its v is t.v
+    let sql = "SELECT COUNT(*) FROM t JOIN u ON t.id = u.tid AND v = 1 \
+               JOIN s ON u.sid = s.id WHERE s.x = 1";
+    let explained = plan(&db, sql);
+    assert!(explained.contains("Join order: s, u, t"), "{explained}");
+    let (answer, reordered, _) = ran(&db, sql);
+    assert_eq!(answer, vec![vec![15]], "the rows of t.v = 1, not s.v");
+    assert!(reordered, "{sql} ran reordered");
+}
+
+#[test]
+fn explain_analyze_prints_the_order_its_run_took() {
+    let db = Database::open("memory://join_order_explain_analyze").unwrap();
+    tables(&db);
+    for sql in ["CREATE INDEX s_x ON s (x)", "CREATE INDEX t_v ON t (v)"] {
+        db.execute(sql, ()).unwrap();
+    }
+    let sql = "SELECT COUNT(*) FROM t JOIN u ON t.id = u.tid JOIN s ON u.sid = s.id \
+               WHERE s.x = 1 AND t.v = 3";
+    let analyzed = || plan(&db, &format!("ANALYZE {sql}"));
+    let first = analyzed();
+    assert!(first.contains("Join order: s, u, t"), "{first}");
+    // Every s row now has x = 1 and one t row v = 3: the counts would start
+    // from t, as written, while the epochs and the row buckets stay
+    db.execute("UPDATE s SET x = 1", ()).unwrap();
+    db.execute("UPDATE t SET v = 0 WHERE v = 3 AND id > 10", ())
+        .unwrap();
+    let fresh = plan(&db, sql);
+    assert!(!fresh.contains("Join order"), "{fresh}");
+    let second = analyzed();
+    assert!(
+        second.contains("Join order: s, u, t (written t, u, s)"),
+        "the run took the order its plan held: {second}"
+    );
+}
+
+#[test]
 fn a_sealed_join_runs_reordered() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(&format!(
