@@ -486,6 +486,19 @@ impl QueryPlanner {
         }
     }
 
+    /// The rows an equality join gives of `rows` rows a side: their product
+    /// over the larger of the keys' distinct counts, and no more than the
+    /// other side's rows where a side's key is `unique`
+    pub(crate) fn join_rows(rows: [f64; 2], distinct: [f64; 2], unique: [bool; 2]) -> f64 {
+        let mut joined = rows[0] * rows[1] / distinct[0].max(distinct[1]).max(1.0);
+        for side in 0..2 {
+            if unique[side] {
+                joined = joined.min(rows[1 - side]);
+            }
+        }
+        joined
+    }
+
     /// Estimate the position of a value within a range (0.0 to 1.0)
     /// Used for linear interpolation when histogram is not available
     fn estimate_value_position(value: &Value, min: &Value, max: &Value) -> f64 {

@@ -40,6 +40,7 @@ mod join_nested_sides_test;
 mod join_on_blocks_test;
 mod join_on_condition_test;
 mod join_optimizer_test;
+mod join_order_test;
 mod join_output_blocks_test;
 mod join_output_keys_test;
 mod join_output_projection_test;

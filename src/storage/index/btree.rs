@@ -659,6 +659,10 @@ impl Index for BTreeIndex {
         Some(sorted_values.len() - nulls)
     }
 
+    fn distinct_keys_hint(&self) -> Option<usize> {
+        Some(self.sorted_values.read().len())
+    }
+
     fn get_row_ids_ordered(
         &self,
         ascending: bool,

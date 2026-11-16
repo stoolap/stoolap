@@ -293,6 +293,8 @@ pub struct NestedPlan {
     checked: std::sync::OnceLock<()>,
     /// The statement's classification, for a caller that holds none
     classification: std::sync::OnceLock<Arc<QueryClassification>>,
+    /// The order the statement's joins run in, decided on first need
+    join_order: RwLock<super::join_order::HeldOrder>,
 }
 
 impl NestedPlan {
@@ -304,6 +306,11 @@ impl NestedPlan {
     /// The compiled state of this statement itself
     pub fn slot(&self) -> &RwLock<CompiledExecution> {
         &self.plan
+    }
+
+    /// The order the statement's joins run in
+    pub(crate) fn join_order(&self) -> &RwLock<super::join_order::HeldOrder> {
+        &self.join_order
     }
 
     /// Set once the statement passed the checks made before it runs

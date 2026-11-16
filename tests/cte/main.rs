@@ -29,6 +29,7 @@ mod cte_simple_alias_test;
 mod cte_subquery_matrix_test;
 mod cte_subquery_test;
 mod cte_test;
+mod join_order_cte_scope_test;
 mod recursive_cte_anchor_test;
 mod recursive_cte_runner_test;
 mod recursive_cte_test;
