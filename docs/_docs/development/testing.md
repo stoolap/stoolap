@@ -132,7 +132,7 @@ B-tree, Hash, Bitmap indexes, index selection, and multi-column indexes.
 
 Files: `join_simple_test.rs`, `join_comprehensive_test.rs`, `join_optimizer_test.rs`, `hash_join_test.rs`
 
-Hash Join, Nested Loop, Index Nested Loop, and join order optimization.
+Hash Join, Nested Loop, and Index Nested Loop.
 
 ### Subquery Tests (7 files)
 
@@ -166,7 +166,7 @@ Scalar functions, date/time functions, JSON functions, vector functions, hash fu
 
 Files: `query_executor_test.rs`, `query_optimization_paths_test.rs`, `cardinality_feedback_test.rs`, `adaptive_execution_test.rs`, `expression_pushdown_test.rs`, `filter_pushdown_test.rs`
 
-Cost estimation, join algorithm selection, pushdown optimization, and adaptive execution.
+Row estimates in EXPLAIN, join algorithm selection, and pushdown.
 
 ### DML Tests (8 files)
 

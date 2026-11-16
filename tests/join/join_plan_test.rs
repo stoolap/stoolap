@@ -13,14 +13,13 @@
 // limitations under the License.
 
 //! A join plans how it runs once; what moves without changing the plan,
-//! statistics and the workload's memory limit, is read per run, and a run
+//! its statistics, is read per run, and a run
 //! that cannot take the planned index reads each side once all the same
 
 #![cfg(feature = "test-failpoints")]
 
 use std::sync::{Mutex, MutexGuard};
 
-use stoolap::optimizer::{global_workload_learner, WorkloadConfig};
 use stoolap::test_failpoints::limit_hash_left_builds;
 use stoolap::Database;
 
@@ -278,38 +277,4 @@ fn explain_analyze_of_a_cte_teaches_the_table_of_its_name_no_correction() {
         0,
         "the CTE's one row is no scan of the table fc_t"
     );
-}
-
-#[test]
-fn a_workload_memory_limit_keeps_a_join_off_a_hash_table() {
-    let _guard = serial();
-    let db = Database::open("memory://join_plan_memory_limit").unwrap();
-    for sql in [
-        "CREATE TABLE p (id INTEGER PRIMARY KEY, k INTEGER)",
-        "CREATE TABLE q (id INTEGER PRIMARY KEY, k INTEGER)",
-        "INSERT INTO p SELECT g.value, g.value % 100 FROM generate_series(1, 12000) g",
-        "INSERT INTO q SELECT g.value, g.value % 100 FROM generate_series(1, 12000) g",
-        "ANALYZE p",
-        "ANALYZE q",
-    ] {
-        db.execute(sql, ()).unwrap();
-    }
-    let plan = |db: &Database| -> String {
-        db.query("EXPLAIN SELECT p.id, q.id FROM p JOIN q ON q.k = p.k", ())
-            .unwrap()
-            .map(|row| row.unwrap().get::<String>(0).unwrap())
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let learner = global_workload_learner();
-    let before = learner.config();
-    let free = plan(&db);
-    learner.set_config(WorkloadConfig {
-        memory_limit_mb: 1,
-        ..before.clone()
-    });
-    let limited = plan(&db);
-    learner.set_config(before);
-    assert!(free.contains("Hash Join"), "{free}");
-    assert!(limited.contains("Nested Loop"), "{limited}");
 }

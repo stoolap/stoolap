@@ -15,7 +15,7 @@ Stoolap is a high-performance embedded SQL database written in pure Rust. Its ar
 
 - Memory-first design with optional disk persistence
 - Full ACID transactions with MVCC
-- Cost-based query optimizer with adaptive execution
+- Statements planned once when prepared, the plan shown by EXPLAIN
 - Multiple index types (B-tree, Hash, Bitmap, HNSW)
 - Parallel query execution via Rayon
 - Minimal unsafe code (only in performance-critical hot paths)
@@ -37,11 +37,11 @@ Stoolap's architecture consists of the following major components:
    - Syntax parser (parser.rs)
    - AST builder (ast.rs)
 
-2. **Planner/Optimizer** - Converts AST into an optimized execution plan
-   - Cost-based planning with I/O and CPU costs
-   - Statistics-based optimization
-   - Join order optimization (dynamic programming)
-   - Adaptive query execution
+2. **Planner** - Converts the AST into the plan the executor runs
+   - Reads chosen by rules over the statement, the schema and the indexes
+   - Run-time branches the plan names, for what only a run knows
+   - Expression simplification and constant folding
+   - Joins in the written order (see [Query Planning]({% link _docs/performance/query-optimizer.md %}))
 
 3. **Executor** - Executes the plan and produces results
    - Query executor (query.rs)
@@ -100,10 +100,9 @@ When a query is executed, it flows through the system as follows:
    - Query is prepared for execution
 
 3. **Planning and Optimization**
-   - Execution plan is generated with cost estimates
-   - Statistics are used to optimize the plan
-   - Indexes are selected based on query patterns
-   - Join ordering is optimized using dynamic programming
+   - The plan is built once, when the statement is prepared
+   - Indexes are selected by the terms of the WHERE they answer
+   - Joins run in the order the statement writes them
 
 4. **Execution**
    - For read queries:
@@ -170,10 +169,10 @@ src/
 │   ├── scalar/    # String, math, date, JSON, vector functions
 │   ├── aggregate/ # COUNT, SUM, AVG, etc.
 │   └── window/    # ROW_NUMBER, RANK, LAG, etc.
-├── optimizer/     # Cost-based query optimizer
-│   ├── cost.rs    # Cost estimator
-│   ├── join.rs    # Join optimization
-│   └── ...
+├── optimizer/     # Expression simplification, join bloom filters
+│   ├── simplify.rs
+│   ├── bloom.rs
+│   └── feedback.rs
 ├── parser/        # SQL parser (lexer, AST, parser)
 ├── storage/       # Storage engine
 │   ├── index/     # B-tree, Hash, Bitmap, HNSW indexes

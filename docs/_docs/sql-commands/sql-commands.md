@@ -967,14 +967,14 @@ See [EXPLAIN]({% link _docs/sql-features/explain.md %}) for detailed documentati
 
 ### ANALYZE
 
-Collects statistics for the query optimizer.
+Collects table and column statistics and zone maps.
 
 ```sql
 -- Analyze a specific table
 ANALYZE table_name;
 ```
 
-Statistics are used by the cost-based optimizer to choose efficient query plans.
+The statistics give `EXPLAIN` its row estimates and the build side of a hash join under a small `LIMIT`; the zone maps let a scan skip data no row of which can match (see [Query Planning]({% link _docs/performance/query-optimizer.md %})).
 
 ### VACUUM
 
