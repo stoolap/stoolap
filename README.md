@@ -29,7 +29,7 @@ It targets low-latency transactional workloads and real-time analytical queries,
 Stoolap is designed around practical embedded database needs:
 
 - **ACID + MVCC**: concurrent reads and writes with transaction isolation
-- **Cost-based optimization**: statistics-aware planning with adaptive execution
+- **Planned execution**: each statement planned once when prepared, with the plan shown by EXPLAIN
 - **Rich SQL surface**: joins, subqueries, CTEs, window functions, advanced aggregations
 - **Multiple index types**: B-tree, Hash, Bitmap, multi-column, and HNSW for vectors
 - **Pure Rust runtime**: memory-safe implementation, no C/C++ dependency chain
@@ -41,8 +41,6 @@ Stoolap is designed around practical embedded database needs:
 | AS OF Time-Travel Queries | ✅ | ❌ | ❌ | ❌* |
 | MVCC Transactions | ✅ | ❌ | ✅ | ✅ |
 | Hot/Cold Columnar Storage | ✅ | ❌ | ✅ | ❌ |
-| Cost-Based Optimizer | ✅ | ❌ | ✅ | ✅ |
-| Adaptive Query Execution | ✅ | ❌ | ❌ | ❌ |
 | Semantic Query Caching | ✅ | ❌ | ❌ | ❌ |
 | Parallel Query Execution | ✅ | ❌ | ✅ | ✅ |
 | Native Vector / HNSW Search | ✅ | ❌ | ❌ | ❌ |
@@ -143,7 +141,7 @@ SELECT * FROM accounts AS OF TIMESTAMP '2024-01-15 10:30:00';
 SELECT * FROM inventory AS OF TRANSACTION 1234;
 ```
 
-### Cost-Based Query Optimizer
+### Query Plans
 
 ```sql
 ANALYZE orders;

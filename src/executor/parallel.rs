@@ -62,7 +62,7 @@ fn num_threads() -> usize {
 pub use super::operators::hash_join::JoinType;
 
 // Default thresholds for parallel execution - single source of truth
-// These are used by both ParallelConfig and CostEstimator
+// These are used by ParallelConfig
 pub const DEFAULT_PARALLEL_FILTER_THRESHOLD: usize = 10_000;
 pub const DEFAULT_PARALLEL_SORT_THRESHOLD: usize = 50_000;
 pub const DEFAULT_PARALLEL_JOIN_THRESHOLD: usize = 10_000;

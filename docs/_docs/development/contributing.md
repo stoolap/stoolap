@@ -165,12 +165,13 @@ src/
   core/          Core types (Value, Row, Schema, Error)
   executor/      Query execution engine
     query.rs     Main query executor
-    planner.rs   Cost-based query planner
+    planner.rs   Table statistics and row estimates
     expression/  Expression VM and compiled evaluators
     operators/   Volcano join operators (hash, merge, nested loop)
     subquery.rs  Subquery execution (EXISTS, IN, scalar)
   functions/     Built-in functions (scalar/, aggregate/, window/)
-  optimizer/     Cost-based optimizer (cost, join DP, bloom, feedback)
+  optimizer/     Expression simplification, join bloom filters, feedback
+  planner/       Statement plans (reads, joins, subquery blocks)
   parser/        SQL parser (lexer, AST, parser)
   storage/       Storage engine (mvcc/, index/, statistics)
   ffi/           C FFI layer (--features ffi)

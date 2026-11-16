@@ -120,7 +120,7 @@ For optimal performance with Stoolap's parallel execution:
 
 1. **Ensure sufficient data**: Parallel overhead only pays off for larger datasets
 2. **Use appropriate indexes**: Even with parallelism, indexes are still important
-3. **Analyze tables**: Run ANALYZE to give the optimizer accurate cardinality estimates
+3. **Analyze tables**: Run ANALYZE so zone maps and row estimates match the data
 4. **Check EXPLAIN output**: Verify parallel execution is being used as expected
 
 ## Implementation Details

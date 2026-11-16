@@ -1,175 +1,104 @@
 ---
 layout: doc
-title: Query Optimizer
+title: Query Planning
 category: Performance
 order: 2
 ---
 
-# Query Optimizer
+# Query Planning
 
-Stoolap includes a sophisticated cost-based query optimizer that analyzes queries and chooses efficient execution plans. The optimizer uses table statistics, index information, and cost models to make intelligent decisions.
+Stoolap plans a statement once, when it is prepared, and the run reads that plan. The choices are made by rules over the statement's shape, the schema and the indexes. Where a choice depends on what only a run knows, such as a parameter's value or how many rows a side of a join holds, the plan names the possible reads and the run picks one; `EXPLAIN` prints them, the alternative after `else`.
 
-## Overview
+Stoolap does not have a cost-based optimizer yet: no choice below is made by comparing estimated costs, and the join order is the one the statement is written in. [Limitations](#limitations) lists what this means for queries.
 
-The query optimizer performs several tasks:
-- **Cost estimation**: Calculates the expected cost of different execution strategies
-- **Access method selection**: Chooses between table scans, index lookups, and primary key access
-- **Join ordering**: Determines the optimal order to join multiple tables
-- **Join algorithm selection**: Chooses Hash Join or Nested Loop Join
-- **Predicate pushdown**: Moves filters close to data sources
-- **Expression simplification**: Optimizes boolean and arithmetic expressions
+## Reading One Table
 
-## Cost Model
+| Read | When |
+|------|------|
+| Primary key | `WHERE pk = value`, `pk IN (...)` or a range on the primary key |
+| Index | an equality, a range or an `IN` list on an indexed column, or on the leading columns of a composite index |
+| Several indexes | the `AND` of terms on different indexed columns: the reads are intersected; an `OR` of indexed terms reads each and merges them |
+| Ordered read | `ORDER BY` an indexed column with a `LIMIT`: rows are read in index order and the read stops at the limit |
+| Sequential scan | no term an index or the primary key can answer |
 
-### Cost Components
-
-The optimizer considers two main cost components:
-
-1. **I/O Cost**: Reading data from storage
-   - Sequential page reads (table scans)
-   - Random page reads (index access)
-
-2. **CPU Cost**: Processing data
-   - Tuple processing
-   - Predicate evaluation
-   - Join operations
-
-### Access Methods
-
-The optimizer chooses from these access methods:
-
-| Method | Use Case | Cost |
-|--------|----------|------|
-| Primary Key Lookup | WHERE pk = value | Lowest (O(1)) |
-| Index Scan | WHERE indexed_col = value | Low (O(log n)) |
-| Index Range Scan | WHERE indexed_col > value | Medium |
-| Sequential Scan | No usable index | Highest (O(n)) |
-
-### Example
+Every term of the WHERE that the read does not answer is checked on each row it returns.
 
 ```sql
--- The optimizer evaluates multiple strategies
-SELECT * FROM users WHERE id = 123;
-
--- Strategy 1: Sequential scan - O(n) rows
--- Strategy 2: PK lookup - O(1)
--- Winner: PK lookup (much lower cost)
+EXPLAIN SELECT id FROM users WHERE status = 'active' AND age = 30;
 ```
 
-## Table Statistics
+```
+plan
+----
+Project id
+  Filter
+    IndexGet users status = 'active'
+    else IndexScan users ((status = 'active') AND (age = 30))
+      Intersect
+        Index idx_status (status =)
+        Index idx_age (age =)
+```
 
-The optimizer uses statistics collected by `ANALYZE` to make better decisions.
+The rule takes every index that answers a term. It does not compare how many rows each one returns, so an index on a column with few distinct values is read and intersected even when another index alone would return far fewer rows.
 
-### ANALYZE Command
+An ordered read names the sort it falls back to:
 
 ```sql
--- Collect statistics for a table
+EXPLAIN SELECT id FROM users WHERE age > 30 ORDER BY age LIMIT 5;
+```
+
+```
+plan
+----
+Limit 5
+  Project id
+    TopK users age ASC (age > 30)
+    else TopN age ASC
+      IndexScan users (age > 30)
+        Index idx_age (age range)
+```
+
+On sealed (cold) data, zone maps and per-column bloom filters skip row groups that cannot hold a matching row, whatever the read.
+
+## Joins
+
+| Method | When |
+|--------|------|
+| Index nested loop | one side is a table whose primary key or an index covers its join column: the other side is read and each of its rows probes that key |
+| Hash join | an equality condition: a hash table is built on one side and the other side probes it; on the general path a bloom filter of the build keys skips probe rows early |
+| Nested loop | no equality condition, a side with no rows, or a side so small that comparing every pair costs less than building a hash table |
+
+Between a hash join and a nested loop, the run decides from the number of rows each side actually returned. For an outer join the hash table is built on the side whose rows may go unmatched (the right side of a `LEFT` or `FULL JOIN`, the left side of a `RIGHT JOIN`), so the kept side streams through it; for an inner join, on the smaller side.
+
+Tables are joined in the order the statement writes them. Writing the most selective table first can make a large difference:
+
+```sql
+-- The filter on customers keeps few rows: reading customers first means
+-- only those rows probe orders
+SELECT o.id, c.name
+FROM customers c
+JOIN orders o ON o.customer_id = c.id
+WHERE c.region = 'EU';
+```
+
+## Statistics
+
+`ANALYZE` collects, per table, the row count and, per column, the number of distinct values, NULL count, minimum and maximum, and a histogram:
+
+```sql
 ANALYZE users;
 
--- Statistics are stored in system tables
 SELECT * FROM _sys_table_stats WHERE table_name = 'users';
 SELECT * FROM _sys_column_stats WHERE table_name = 'users';
 ```
 
 `ANALYZE` without a table name analyzes every table, each one on its own. It keeps the query timeout: past it, the statement stops with a query cancelled error, the table it was reading keeps its old statistics, and the tables it finished before keep their new ones.
 
-### Statistics Collected
-
-| Statistic | Description |
-|-----------|-------------|
-| Row count | Total number of rows in the table |
-| Distinct count | Number of unique values per column |
-| NULL count | Number of NULL values per column |
-| Min/Max values | Range of values per column |
-| Histograms | Distribution of values for selectivity estimation |
-
-### Selectivity Estimation
-
-Statistics help estimate how selective predicates are:
-
-```sql
--- Without statistics: assume 10% selectivity
--- With statistics: use actual data distribution
-SELECT * FROM orders WHERE status = 'pending';
-```
-
-## Join Optimization
-
-### Join Ordering
-
-For queries joining multiple tables, the optimizer uses dynamic programming to find the optimal join order:
-
-```sql
--- The optimizer considers all possible join orders
-SELECT *
-FROM orders o
-JOIN customers c ON o.customer_id = c.id
-JOIN products p ON o.product_id = p.id;
-
--- Possible orders:
--- 1. (orders JOIN customers) JOIN products
--- 2. (orders JOIN products) JOIN customers
--- 3. (customers JOIN orders) JOIN products
--- etc.
-```
-
-### Join Algorithms
-
-The optimizer selects the best join algorithm:
-
-| Algorithm | Best For | Requirements |
-|-----------|----------|--------------|
-| Hash Join | Large tables, equality joins | Memory for hash table |
-| Nested Loop | Small tables, any join condition | None |
-
-### Semi-Join Optimization
-
-For EXISTS and IN subqueries, the optimizer may use semi-join:
-
-```sql
--- Can use semi-join optimization
-SELECT * FROM customers c
-WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id);
-```
-
-## Adaptive Query Execution
-
-Stoolap implements Adaptive Query Execution (AQE), which can adjust the execution plan at runtime based on actual data characteristics.
-
-### How AQE Works
-
-1. **Initial Plan**: Optimizer creates plan using statistics
-2. **Runtime Monitoring**: Actual row counts are tracked during execution
-3. **Plan Adjustment**: If actual differs significantly from estimated, the plan may be adjusted
-
-### Cardinality Feedback
-
-The optimizer learns from query execution:
-
-```sql
--- First execution: uses estimated cardinality
-SELECT * FROM orders WHERE amount > 1000;
-
--- Subsequent executions: uses feedback from actual row counts
--- This improves future estimates for similar queries
-```
-
-## Bloom Filter Propagation
-
-For join-heavy queries, the optimizer can use Bloom filters to reduce data movement:
-
-```sql
--- Bloom filter can pre-filter orders before join
-SELECT * FROM orders o
-JOIN customers c ON o.customer_id = c.id
-WHERE c.region = 'US';
-```
-
-The filter on `customers.region` creates a Bloom filter that filters `orders` early.
+Today the statistics are read for the row estimates `EXPLAIN` prints and, for a join under a small `LIMIT` that streams through a hash table, to build that table on the side estimated smaller. `ANALYZE` also builds zone maps: see [Expression Simplification](#expression-simplification).
 
 ## Expression Simplification
 
-The optimizer simplifies expressions when possible:
+The planner simplifies expressions before it plans the read.
 
 ### Constant Folding
 
@@ -206,31 +135,31 @@ A WHERE that keeps no row, because one of its `AND` terms is a constant that is 
 
 ### EXPLAIN
 
-Shows the planned execution strategy:
+Shows the plan the run reads:
 
 ```sql
 EXPLAIN SELECT * FROM users WHERE id = 1;
 ```
 
-Output:
 ```
 plan
 ----
-Project id, name, email
+Project id, name, email, status, age
   PkGet users id = 1
   else IndexScan users (id = 1)
     PkKey
 ```
 
+See [EXPLAIN]({% link _docs/sql-features/explain.md %}) for every plan line.
+
 ### EXPLAIN ANALYZE
 
-Shows the plan with actual runtime statistics:
+Runs the statement and shows the plan with the time and rows of the run:
 
 ```sql
 EXPLAIN ANALYZE SELECT * FROM users WHERE status = 'active';
 ```
 
-Output:
 ```
 plan
 ----
@@ -240,56 +169,41 @@ SELECT (actual time=2.5ms, rows=1500)
        Filter: (status = 'active')
 ```
 
+## Limitations
+
+These choices are made by rule, not by estimated cost:
+
+- **Join order** is the written order. A selective table written last makes every earlier join read rows the filter later drops.
+- **Index choice** takes every index that answers a term. An index on a column with few distinct values can cost more than reading another index alone, or than a scan.
+- **Index or scan**: an indexed range is read through the index even when it keeps most of the table's rows, where a scan would be cheaper on hot data.
+- **Ordered reads under LIMIT** walk the index even when the WHERE matches rows only far along it, where filtering first and sorting the few matches would be cheaper.
+
 ## Best Practices
 
 ### Keep Statistics Updated
 
-Run ANALYZE after significant data changes:
+Run `ANALYZE` after significant data changes, so zone maps and row estimates match the data:
 
 ```sql
--- After bulk insert
 INSERT INTO orders SELECT * FROM staging_orders;
 ANALYZE orders;
 ```
 
-### Create Appropriate Indexes
+### Create Indexes for Selective Columns
 
-The optimizer can only use indexes that exist:
+An index helps when its term keeps few rows. Avoid indexing a column with few distinct values that queries combine with a more selective indexed column:
 
 ```sql
--- Create index for common query patterns
-CREATE INDEX idx_orders_status ON orders(status);
+CREATE INDEX idx_orders_customer ON orders(customer_id);
 CREATE INDEX idx_orders_customer_date ON orders(customer_id, order_date);
 ```
 
+### Write the Most Selective Table First
+
+Joins run in the written order, so put the table with the most selective filter first.
+
 ### Use EXPLAIN to Understand Plans
 
-Before optimizing, understand current behavior:
-
 ```sql
--- Check what plan is being used
-EXPLAIN ANALYZE SELECT * FROM orders WHERE customer_id = 100;
+EXPLAIN SELECT * FROM orders WHERE customer_id = 100;
 ```
-
-### Consider Query Patterns
-
-Design indexes based on how queries filter and join:
-
-```sql
--- If queries often filter by status and date together
-CREATE INDEX idx_orders_status_date ON orders(status, order_date);
-```
-
-## Cost Constants
-
-The optimizer uses these tunable constants:
-
-| Constant | Description | Default |
-|----------|-------------|---------|
-| cpu_tuple_cost | Cost to process one row | 0.01 |
-| cpu_operator_cost | Cost to evaluate one predicate | 0.0025 |
-| seq_page_cost | Cost for sequential I/O | 1.0 |
-| random_page_cost | Cost for random I/O | 2.0 |
-| pk_lookup_cost | Cost for primary key lookup | 1.0 |
-
-These values are tuned for in-memory operation and may differ from disk-based databases.

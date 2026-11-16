@@ -86,13 +86,13 @@
     <rect x="0" y="14" width="800" height="12" class="layer-bar-blue" />
     <text x="400" y="18" text-anchor="middle" class="layer-title">Query Processing</text>
 
-    <!-- Cost-Based Optimizer -->
+    <!-- Planner -->
     <rect x="16" y="36" width="248" height="82" rx="5" class="comp-bg" />
-    <text x="140" y="54" text-anchor="middle" class="comp-title">Cost-Based Optimizer</text>
+    <text x="140" y="54" text-anchor="middle" class="comp-title">Planner</text>
     <rect x="26" y="62" width="68" height="20" rx="3" class="tag-bg" /><text x="60" y="76" text-anchor="middle" class="tag">Statistics</text>
-    <rect x="100" y="62" width="68" height="20" rx="3" class="tag-bg" /><text x="134" y="76" text-anchor="middle" class="tag">Join Order</text>
-    <rect x="174" y="62" width="68" height="20" rx="3" class="tag-bg" /><text x="208" y="76" text-anchor="middle" class="tag">Adaptive</text>
-    <rect x="26" y="86" width="68" height="20" rx="3" class="tag-bg" /><text x="60" y="100" text-anchor="middle" class="tag">Cardinality</text>
+    <rect x="100" y="62" width="68" height="20" rx="3" class="tag-bg" /><text x="134" y="76" text-anchor="middle" class="tag">Index Read</text>
+    <rect x="174" y="62" width="68" height="20" rx="3" class="tag-bg" /><text x="208" y="76" text-anchor="middle" class="tag">Branches</text>
+    <rect x="26" y="86" width="68" height="20" rx="3" class="tag-bg" /><text x="60" y="100" text-anchor="middle" class="tag">Zone Maps</text>
     <rect x="100" y="86" width="80" height="20" rx="3" class="tag-bg" /><text x="140" y="100" text-anchor="middle" class="tag">Bloom Filter</text>
 
     <!-- Query Executor -->
@@ -191,7 +191,7 @@
     <text x="0" y="14" class="feature-val">Key Features:</text>
     <text x="100" y="14" class="feature-label">ACID Transactions</text>
     <text x="225" y="14" class="feature-label">MVCC Isolation</text>
-    <text x="340" y="14" class="feature-label">Cost-Based Optimizer</text>
+    <text x="340" y="14" class="feature-label">Planned Execution</text>
     <text x="490" y="14" class="feature-label">Parallel Execution</text>
     <text x="625" y="14" class="feature-label">Semantic Caching</text>
     <text x="750" y="14" class="feature-label">Time-Travel (AS OF)</text>

@@ -500,7 +500,7 @@ Supported metrics: `l2` (default), `cosine`, `ip` (inner product).
 Stoolap is a full-featured embedded SQL database:
 
 - **MVCC transactions** with snapshot isolation.
-- **Cost-based query optimizer** with adaptive execution.
+- **Planned execution**: each statement planned once, the plan shown by `EXPLAIN`.
 - **Parallel execution** for filter, join, sort, and distinct operators.
 - **JOINs**: `INNER`, `LEFT`, `RIGHT`, `FULL OUTER`, `CROSS`, `NATURAL`.
 - **Subqueries**: scalar, `EXISTS`, `IN`, `NOT IN`, `ANY`/`ALL`, correlated.

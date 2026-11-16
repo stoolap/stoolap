@@ -250,21 +250,13 @@ All indexes are fully persisted:
 - Snapshots capture index definitions
 - Recovery restores all indexes automatically
 
-## Query Optimizer Integration
+## Index Use in Plans
 
-The cost-based optimizer considers indexes when planning queries:
-
-- Estimates selectivity based on index statistics
-- Chooses between index scan and sequential scan
-- Considers index type capabilities (range vs equality)
-- Uses ANALYZE statistics for better estimates
+The planner uses an index for every term of the WHERE it can answer, by what the index type supports (equality, range, `IN` lists), and intersects the reads when several indexes answer terms of one `AND`. It does not yet compare how many rows each index returns, or an index read against a scan (see [Query Planning]({% link _docs/performance/query-optimizer.md %})).
 
 ```sql
 -- View query plan including index usage
 EXPLAIN SELECT * FROM orders WHERE amount > 100;
-
--- Collect statistics for optimizer
-ANALYZE orders;
 ```
 
 ## Best Practices

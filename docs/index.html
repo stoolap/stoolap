@@ -128,21 +128,22 @@ title: High-performance embedded SQL database in Rust
     <div class="spotlight-item spotlight-reverse">
       <div class="spotlight-content">
         <div class="spotlight-tag">Performance</div>
-        <h2>Cost-Based Optimizer</h2>
-        <p>PostgreSQL-style query planning with adaptive execution. The optimizer learns from actual cardinalities and re-optimizes at runtime. Bloom filter propagation, zone map pruning, and semantic query caching reduce redundant work.</p>
-        <a href="{{ '/docs/performance/query-optimizer/' | relative_url }}" class="spotlight-link">Explore the optimizer &rarr;</a>
+        <h2>Planned Execution</h2>
+        <p>Every statement is planned once, when it is prepared, and EXPLAIN prints the plan the run reads, the reads a run can fall back to included. Index intersection, ordered reads that stop at the LIMIT, index nested loop and hash joins with bloom filters, zone map pruning, and semantic query caching reduce redundant work.</p>
+        <a href="{{ '/docs/performance/query-optimizer/' | relative_url }}" class="spotlight-link">Explore query planning &rarr;</a>
       </div>
       <div class="spotlight-visual">
-        <pre class="spotlight-code"><span class="c-cmt">-- EXPLAIN shows the optimizer at work</span>
-<span class="c-kw">EXPLAIN ANALYZE</span>
-<span class="c-kw">SELECT</span> u.name, <span class="c-fn">SUM</span>(o.amount)
-<span class="c-kw">FROM</span> users u
-<span class="c-kw">JOIN</span> orders o <span class="c-kw">ON</span> u.id = o.user_id
-<span class="c-kw">WHERE</span> o.amount > <span class="c-num">50</span>
-<span class="c-kw">GROUP BY</span> u.name;
-<span class="c-dim">-- Hash Join (cost=45.2, rows=1200)
---   Seq Scan on orders (rows=8500)
---   Hash on users (rows=1000)</span></pre>
+        <pre class="spotlight-code"><span class="c-cmt">-- EXPLAIN prints the plan the run reads</span>
+<span class="c-kw">EXPLAIN</span>
+<span class="c-kw">SELECT</span> id <span class="c-kw">FROM</span> users
+<span class="c-kw">WHERE</span> age > <span class="c-num">30</span>
+<span class="c-kw">ORDER BY</span> age <span class="c-kw">LIMIT</span> <span class="c-num">5</span>;
+<span class="c-dim">-- Limit 5
+--   Project id
+--     TopK users age ASC (age > 30)
+--     else TopN age ASC
+--       IndexScan users (age > 30)
+--         Index idx_age (age range)</span></pre>
       </div>
     </div>
 
@@ -433,8 +434,6 @@ title: High-performance embedded SQL database in Rust
         <tbody>
           <tr><td>MVCC Transactions</td><td class="hl"><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="n" aria-label="No">&#10007;</span></td><td><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="y" aria-label="Yes">&#10003;</span></td></tr>
           <tr><td>AS OF Temporal Queries</td><td class="hl"><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="n" aria-label="No">&#10007;</span></td><td><span class="n" aria-label="No">&#10007;</span></td><td><span class="n" aria-label="No">&#10007;</span></td></tr>
-          <tr><td>Cost-Based Optimizer</td><td class="hl"><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="n" aria-label="No">&#10007;</span></td><td><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="y" aria-label="Yes">&#10003;</span></td></tr>
-          <tr><td>Adaptive Query Execution</td><td class="hl"><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="n" aria-label="No">&#10007;</span></td><td><span class="n" aria-label="No">&#10007;</span></td><td><span class="n" aria-label="No">&#10007;</span></td></tr>
           <tr><td>Semantic Query Caching</td><td class="hl"><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="n" aria-label="No">&#10007;</span></td><td><span class="n" aria-label="No">&#10007;</span></td><td><span class="n" aria-label="No">&#10007;</span></td></tr>
           <tr><td>Parallel Query Execution</td><td class="hl"><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="n" aria-label="No">&#10007;</span></td><td><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="y" aria-label="Yes">&#10003;</span></td></tr>
           <tr><td>Hash Joins</td><td class="hl"><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="n" aria-label="No">&#10007;</span></td><td><span class="y" aria-label="Yes">&#10003;</span></td><td><span class="y" aria-label="Yes">&#10003;</span></td></tr>
@@ -474,7 +473,7 @@ title: High-performance embedded SQL database in Rust
         </div>
         <div>
           <h3>Optimized Query Processing</h3>
-          <p>SQL parsing, cost-based optimization, and parallel execution for exceptional performance.</p>
+          <p>SQL parsing, planned execution, and parallel execution for exceptional performance.</p>
         </div>
       </div>
       <div class="arch-item">

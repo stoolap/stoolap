@@ -806,16 +806,16 @@ For other statements:
 
 ## Cost Information
 
-EXPLAIN shows cost estimates for joins:
+A join printed in the general format carries two numbers:
 
 ```
 -> Hash Join (INNER Join) (cost=1.10 rows=1)
 ```
 
-- **cost**: Estimated total cost (relative units)
-- **rows**: Estimated number of rows
+- **cost**: a rough figure from the row counts of the two tables
+- **rows**: the estimated number of rows
 
-Lower cost generally means faster execution.
+Both are for reading only: they do not choose the join's method or order (see [Query Planning]({% link _docs/performance/query-optimizer.md %})).
 
 ## Use Cases
 
