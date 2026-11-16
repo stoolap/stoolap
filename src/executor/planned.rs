@@ -654,10 +654,11 @@ impl Executor {
             // A commit is publishing to the table: read the commits complete
             // now through a view, or at a snapshot's own point
             let view = taken.cloned().or_else(|| self.autocommit_view());
+            let deadline = ctx.map_or(Deadline::NONE, ExecutionContext::deadline_of_call);
             if let Some(view) = view.as_ref() {
                 if let Some(rows) =
                     self.engine
-                        .fetch_hot_rows_at(table_name, &[pk_value], token, view)?
+                        .fetch_hot_rows_at(table_name, &[pk_value], token, view, deadline)?
                 {
                     view.held()?;
                     return Ok(KeyRows::Many(rows));
@@ -667,7 +668,6 @@ impl Executor {
             let table = tx.get_read_table_at(table_name, view.as_ref(), TableUse::Read)?;
             check_compiled_token(&*table, token)?;
             let all = ConstBoolExpr::true_expr();
-            let deadline = ctx.map_or(Deadline::NONE, ExecutionContext::deadline_of_call);
             let rows = table.fetch_rows_by_ids(&[pk_value], &all, deadline)?;
             view.as_ref().map_or(Ok(()), StatementView::held)?;
             return Ok(KeyRows::Many(rows));

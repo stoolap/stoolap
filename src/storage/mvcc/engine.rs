@@ -9894,13 +9894,15 @@ impl MVCCEngine {
     }
 
     /// The rows `row_ids` name as `view` sees them in the hot store; None
-    /// when one is not there, so the caller reads the cold rows too
+    /// when one is not there, so the caller reads the cold rows too;
+    /// `deadline` is charged each older version a chain walk passes
     pub(crate) fn fetch_hot_rows_at(
         &self,
         table_name: &str,
         row_ids: &[i64],
         token: crate::storage::mvcc::version_store::LayoutToken,
         view: &crate::storage::mvcc::registry::StatementView,
+        deadline: crate::common::deadline::Deadline,
     ) -> Result<Option<crate::core::RowVec>> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
@@ -9911,7 +9913,12 @@ impl MVCCEngine {
             txn_id: INVALID_TRANSACTION_ID + 1,
             view: Some(view),
         };
-        let result = store.get_visible_versions_batch(row_ids, reader);
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("engine.fetch_hot_rows_at");
+        let result = match deadline.is_none() {
+            true => store.get_visible_versions_batch(row_ids, reader),
+            false => store.get_visible_versions_batch_charged(row_ids, reader, deadline)?,
+        };
         if result.len() < row_ids.len() {
             return Ok(None);
         }

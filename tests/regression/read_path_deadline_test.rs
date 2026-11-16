@@ -40,7 +40,12 @@ const SETUP: [&str; 6] = [
 enum Store {
     Hot,
     Sealed,
+    /// A view taken before row 1 was updated `HELD_UPDATES` times, held
+    /// by the statement
+    HeldView,
 }
+
+const HELD_UPDATES: usize = 5000;
 
 enum Case {
     /// The statement reaches the path, and a deadline passed after the
@@ -60,6 +65,10 @@ use DeadlineSite::{Aggregate, StorageAggregate, StorageDelete, StorageRead, Stor
 use Store::*;
 
 const CASES: &[(&str, Case)] = &[
+    (
+        "engine.fetch_hot_rows_at",
+        Stops(HeldView, false, "SELECT v FROM t WHERE id = 1", StorageRead),
+    ),
     (
         "exec.index_get",
         Bounded("the latest committed rows of one key, at most 256"),
@@ -261,11 +270,14 @@ const CASES: &[(&str, Case)] = &[
     ),
     (
         "vs.get_visible_versions_batch",
-        Bounded("the index get's latest committed rows, at most 256"),
+        Bounded(
+            "latest committed rows, at most 256; a view's read stops through \
+             engine.fetch_hot_rows_at",
+        ),
     ),
     (
         "vs.get_visible_versions_batch.arena_probe",
-        Bounded("the index get's latest committed rows, at most 256"),
+        Bounded("one version per id, read at its arena slot"),
     ),
     (
         "vs.get_visible_versions_for_update",
@@ -368,6 +380,15 @@ fn every_noted_read_path_stops_at_the_deadline_or_says_why_not() {
         .unwrap();
     let mut ctx = ExecutionContext::new();
     ctx.set_timeout_ms(3_600_000);
+    let held = Database::open("memory://read_path_deadline_held").unwrap();
+    held.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    held.execute("INSERT INTO t VALUES (1, 0)", ()).unwrap();
+    let held_ctx = ctx.with_statement_view(held.engine().registry().capture_view());
+    for _ in 0..HELD_UPDATES {
+        held.execute("UPDATE t SET v = v + 1 WHERE id = 1", ())
+            .unwrap();
+    }
 
     let mut wrong = Vec::new();
     let named: Vec<&str> = CASES.iter().map(|(name, _)| *name).collect();
@@ -395,14 +416,18 @@ fn every_noted_read_path_stops_at_the_deadline_or_says_why_not() {
         if cfg!(feature = "test-filedb") && *name == "tbl.walk_btree_groups" {
             continue;
         }
-        let db = if *store == Hot { &hot } else { &sealed };
-        let (result, paths) = run(db, *in_txn, sql, &ctx);
+        let (db, ctx) = match store {
+            Hot => (&hot, &ctx),
+            Sealed => (&sealed, &ctx),
+            HeldView => (&held, &held_ctx),
+        };
+        let (result, paths) = run(db, *in_txn, sql, ctx);
         if result.is_err() || !paths.contains(name) {
             wrong.push(format!("{name}: {sql} gave {result:?} through {paths:?}"));
         }
         let ahead = CHARGED_AHEAD.iter().find(|(path, _)| path == name);
         pass_deadline_after(*site, ahead.map_or(1, |&(_, charges)| charges));
-        let (result, paths) = run(db, *in_txn, sql, &ctx);
+        let (result, paths) = run(db, *in_txn, sql, ctx);
         keep_deadlines();
         if !matches!(result, Err(Error::QueryCancelled)) || !paths.contains(name) {
             wrong.push(format!(
