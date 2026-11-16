@@ -33,6 +33,7 @@ use crate::common::StringMap;
 use crate::storage::traits::transaction::{StatementTable, TableUse};
 
 use crate::core::{Operator, Result, Value};
+use crate::executor::pushdown::{coerce_constant, scan_compares};
 use crate::parser::ast::Expression;
 use crate::storage::mvcc::engine::MVCCEngine;
 use crate::storage::mvcc::version_store::VersionStore;
@@ -638,6 +639,9 @@ impl QueryPlanner {
                 (a + b - a * b).min(1.0)
             }
             ShareArm::Not(arm) => 1.0 - self.arm_share(arm, run),
+            ShareArm::OneRow => (run.counting)
+                .and_then(|(table_name, _)| self.engine.row_count_hint(table_name))
+                .map_or(0.0, |rows| 1.0 / rows.max(1) as f64),
             ShareArm::Compare(compared) => self.compared_share(compared, run),
         }
     }
@@ -667,15 +671,7 @@ impl QueryPlanner {
                 })
             }
             Compare::In { not, listed } => {
-                // Each member the index counts, when it counts every one
-                let indexed = listed.then(|| {
-                    (compared.values.iter())
-                        .map(|member| {
-                            let value = member.bind(run.params)?;
-                            self.counted_share(compared, run, Included(value), Included(value))
-                        })
-                        .sum::<Option<f64>>()
-                });
+                let indexed = listed.then(|| self.counted_members(compared, run));
                 let list_size = if listed {
                     compared.values.len() as f64
                 } else {
@@ -733,10 +729,12 @@ impl QueryPlanner {
         use std::ops::Bound::Included;
         let index = compared.index.as_deref()?;
         let (table_name, store) = run.counting?;
+        let (lower, upper) = (compared.read_bound(lower)?, compared.read_bound(upper)?);
         let rows = (*run.hot_rows.get_or_init(|| {
             (self.engine.row_count_hint(table_name))
                 .filter(|&rows| rows > 0 && rows == store.committed_row_count())
         }))?;
+        let (lower, upper) = (lower.as_ref().map(|v| &**v), upper.as_ref().map(|v| &**v));
         let count = match (lower, upper) {
             (Included(low), Included(high)) if low == high => {
                 let column = compared.column.as_deref()?;
@@ -753,6 +751,24 @@ impl QueryPlanner {
                 .filter(|&count| count <= RANGE_COUNT_CAP)?,
         };
         Some(count as f64 / rows as f64)
+    }
+
+    /// The share of rows an IN list's members keep, as the column's index
+    /// counts each key once the run's values are read as the column's type;
+    /// None unless it counts every one
+    fn counted_members(&self, compared: &Compared, run: &Run) -> Option<f64> {
+        use std::ops::Bound::Included;
+        compared.index.as_ref()?;
+        let mut keys: smallvec::SmallVec<[std::borrow::Cow<'_, Value>; 8]> =
+            smallvec::SmallVec::with_capacity(compared.values.len());
+        for member in &compared.values {
+            keys.push(compared.read_value(member.bind(run.params)?)?);
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        (keys.iter())
+            .map(|key| self.counted_share(compared, run, Included(key), Included(key)))
+            .sum()
     }
 
     /// Whether `a = b` compares a column of `table_name` that no two rows
@@ -799,6 +815,14 @@ impl QueryPlanner {
                     .and_then(|(c, s)| s.get_index_by_column(c)),
                 stats: (column.filter(|_| table_stats.row_count > 0))
                     .and_then(|c| self.get_column_stats(table_name, c)),
+                column_type: column.zip(store).and_then(|(c, s)| {
+                    let schema = s.schema();
+                    let found = schema
+                        .columns
+                        .iter()
+                        .find(|col| eq_names(&col.name_lower, c));
+                    found.map(|col| col.data_type).filter(|t| scan_compares(*t))
+                }),
                 column: column.map(str::to_string),
                 compare,
                 values,
@@ -848,10 +872,10 @@ impl QueryPlanner {
                 }
                 InfixOperator::Equal | InfixOperator::NotEqual => {
                     // A key no two rows share, equal to a value, keeps one
-                    // row, a share no count of rows moves
+                    // row at most
                     let equal = matches!(infix.op_type, InfixOperator::Equal);
                     if equal && self.unique_key_equality(table_name, &infix.left, &infix.right) {
-                        return ShareArm::Fixed(0.0);
+                        return ShareArm::OneRow;
                     }
                     let column = (self.extract_column_name(&infix.left))
                         .or_else(|| self.extract_column_name(&infix.right));
@@ -991,18 +1015,49 @@ enum ShareArm {
     And(Box<[ShareArm; 2]>),
     Or(Box<[ShareArm; 2]>),
     Not(Box<ShareArm>),
+    /// A key no two rows share, equal to a value: one row at most
+    OneRow,
     /// A comparison whose share a run's values or its index's count decide
     Compare(Box<Compared>),
 }
 
 /// A column compared with values, with the index and the statistics of the
-/// column; `column` names it for an index that counts
+/// column; `column` names it for an index that counts, `column_type` reads
+/// the values as the column compares them
 struct Compared {
     compare: Compare,
     values: Vec<ValueSource>,
     column: Option<String>,
+    column_type: Option<crate::core::DataType>,
     index: Option<Arc<dyn crate::storage::traits::Index>>,
     stats: Option<ColumnStatsCache>,
+}
+
+impl Compared {
+    /// `value` as the column compares it, by the rule a WHERE constant is
+    /// read with; None for a value the column does not read as its type
+    fn read_value<'v>(&self, value: &'v Value) -> Option<std::borrow::Cow<'v, Value>> {
+        use std::borrow::Cow;
+        let column_type = self.column_type?;
+        if value.data_type() == column_type {
+            return Some(Cow::Borrowed(value));
+        }
+        coerce_constant(Some(column_type), value.clone())
+            .filter(|read| !read.is_null())
+            .map(Cow::Owned)
+    }
+
+    fn read_bound<'v>(
+        &self,
+        bound: std::ops::Bound<&'v Value>,
+    ) -> Option<std::ops::Bound<std::borrow::Cow<'v, Value>>> {
+        use std::ops::Bound;
+        Some(match bound {
+            Bound::Included(value) => Bound::Included(self.read_value(value)?),
+            Bound::Excluded(value) => Bound::Excluded(self.read_value(value)?),
+            Bound::Unbounded => Bound::Unbounded,
+        })
+    }
 }
 
 #[derive(Clone, Copy)]

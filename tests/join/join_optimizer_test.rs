@@ -146,6 +146,38 @@ fn test_explain_shows_rows_and_no_cost() {
 }
 
 #[test]
+fn test_explain_estimates_one_row_for_a_primary_key_equality() {
+    let db = Database::open("memory://join_opt_pk_one_row").unwrap();
+    db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO a SELECT g.value, g.value FROM generate_series(1, 100) g",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO b SELECT g.value, g.value FROM generate_series(1, 100) g",
+        (),
+    )
+    .unwrap();
+    let line = db
+        .query(
+            "EXPLAIN SELECT * FROM a JOIN b ON a.k = b.k WHERE a.id = 1",
+            (),
+        )
+        .unwrap()
+        .map(|row| row.unwrap().get::<String>(0).unwrap())
+        .find(|line| line.contains("Join)"))
+        .unwrap();
+    assert!(
+        line.ends_with("(rows=1)"),
+        "a.id = 1 keeps the one row of a it names: {line}"
+    );
+}
+
+#[test]
 fn test_explain_analyze_shows_actual_rows() {
     let db = Database::open("memory://join_opt_analyze").unwrap();
 

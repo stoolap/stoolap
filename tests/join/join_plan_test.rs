@@ -200,6 +200,94 @@ fn a_limit_hash_join_builds_on_the_side_its_index_counts_smaller() {
     );
 }
 
+/// How many times a LIMIT hash join of `ts_s` and `ts_t` under `cond`, run
+/// with `params` after the limit and giving `rows` rows, built from the left
+fn left_builds(db: &Database, cond: &str, params: Vec<stoolap::Value>, rows: usize) -> usize {
+    let sql = format!(
+        "SELECT ts_s.id, ts_t.id FROM ts_s JOIN ts_t ON ts_t.k = ts_s.k WHERE {cond} LIMIT $1"
+    );
+    let stmt = db.prepare(&sql).unwrap();
+    let mut bound = vec![stoolap::Value::Integer(1)];
+    bound.extend(params);
+    let before = limit_hash_left_builds();
+    assert_eq!(stmt.query(bound).unwrap().count(), rows, "{sql}");
+    limit_hash_left_builds() - before
+}
+
+#[test]
+fn a_range_counted_by_its_index_reads_its_bound_as_the_column_compares_it() {
+    let _guard = serial();
+    let db = Database::open("memory://join_plan_count_bound_type").unwrap();
+    for sql in [
+        "CREATE TABLE ts_s (id INTEGER PRIMARY KEY, k INTEGER, ts TIMESTAMP)",
+        "CREATE TABLE ts_t (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO ts_s SELECT g.value, g.value % 200, '2024-01-02 00:00:00' \
+         FROM generate_series(1, 3000) g",
+        "INSERT INTO ts_t SELECT g.value, g.value % 200 FROM generate_series(1, 1500) g",
+        "CREATE INDEX ts_s_ts ON ts_s (ts)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    assert_eq!(
+        left_builds(&db, "ts_s.ts < '3000-01-01'", vec![], 1),
+        0,
+        "every one of the 3,000 rows of ts_s is before 3000-01-01, more than ts_t holds"
+    );
+    assert_eq!(
+        left_builds(&db, "ts_s.ts < $2", vec!["3000-01-01".into()], 1),
+        0,
+        "a TEXT parameter is read as a TIMESTAMP too"
+    );
+}
+
+#[test]
+fn a_range_counted_by_its_index_counts_no_null_key() {
+    let _guard = serial();
+    let db = Database::open("memory://join_plan_count_no_null").unwrap();
+    for sql in [
+        "CREATE TABLE ts_s (id INTEGER PRIMARY KEY, k INTEGER, f INTEGER)",
+        "CREATE TABLE ts_t (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO ts_s SELECT g.value, g.value % 200, \
+         CASE WHEN g.value <= 2000 THEN NULL WHEN g.value <= 2500 THEN 1 ELSE 9 END \
+         FROM generate_series(1, 3000) g",
+        "INSERT INTO ts_t SELECT g.value, g.value % 200 FROM generate_series(1, 1000) g",
+        "CREATE INDEX ts_s_f ON ts_s (f)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    assert_eq!(
+        left_builds(&db, "ts_s.f < 5", vec![], 1),
+        1,
+        "f < 5 keeps the 500 rows of 1, fewer than ts_t holds, and none of the 2,000 NULLs"
+    );
+}
+
+#[test]
+fn an_in_list_counted_by_its_index_counts_each_key_once() {
+    let _guard = serial();
+    let db = Database::open("memory://join_plan_count_in_once").unwrap();
+    for sql in [
+        "CREATE TABLE ts_s (id INTEGER PRIMARY KEY, k INTEGER, f INTEGER)",
+        "CREATE TABLE ts_t (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO ts_s SELECT g.value, g.value % 200, g.value % 20 \
+         FROM generate_series(1, 20000) g",
+        "INSERT INTO ts_t SELECT g.value, g.value % 200 FROM generate_series(1, 1500) g",
+        "CREATE INDEX ts_s_f ON ts_s (f)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    assert_eq!(
+        left_builds(&db, "ts_s.f IN ($2, $3)", vec![1.into(), 1.into()], 1),
+        1,
+        "two parameters bound to 1 keep the 1,000 rows of 1 once, fewer than ts_t holds"
+    );
+    assert_eq!(
+        left_builds(&db, "ts_s.f IN (1, 1.0)", vec![], 1),
+        1,
+        "1.0 is the key 1 of an INTEGER column"
+    );
+}
+
 #[test]
 fn an_index_created_after_a_run_counts_on_the_next() {
     let _guard = serial();

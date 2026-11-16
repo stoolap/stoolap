@@ -610,6 +610,11 @@ impl Index for BTreeIndex {
                 return Some(count.min(max.saturating_add(1)));
             }
         }
+        // NULL, the first key, compares with no bound
+        let lower = match lower {
+            Bound::Unbounded => Bound::Excluded(&NULL),
+            bound => bound,
+        };
         let mut count = 0usize;
         sorted_values.walk(lower, true, &mut |key, rows| {
             if past_end(&key, &upper) {
@@ -1418,6 +1423,21 @@ mod tests {
             one_by_one.get_grouped_row_ids()
         );
         assert_eq!(batched.entry_count(), values.len());
+    }
+
+    #[test]
+    fn a_range_count_leaves_out_the_null_key() {
+        use std::ops::Bound;
+        let index = create_test_index();
+        index.add(&[Value::Null(DataType::Integer)], 1, 1).unwrap();
+        index.add(&[Value::Null(DataType::Integer)], 2, 2).unwrap();
+        index.add(&[Value::Integer(1)], 3, 3).unwrap();
+        index.add(&[Value::Integer(9)], 4, 4).unwrap();
+        let five = Value::Integer(5);
+        let below = index.count_capped(Bound::Unbounded, Bound::Excluded(&five), 10);
+        assert_eq!(below, Some(1), "k < 5 keeps the row of 1, no NULL");
+        let all = index.count_capped(Bound::Unbounded, Bound::Unbounded, 10);
+        assert_eq!(all, Some(2), "no bound keeps the NULLs out still");
     }
 
     #[test]
