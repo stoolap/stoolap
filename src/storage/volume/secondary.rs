@@ -3464,12 +3464,13 @@ fn build_side_file_staged(
     out.write_all(&crc32fast::hash(&dir).to_le_bytes())?;
     out.write_all(&MAGIC)?;
     out.flush()?;
-    let file = out.into_inner().map_err(|e| e.into_error())?;
-    if rewound {
-        file.set_len(offset + dir_len as u64 + FOOTER_LEN)?;
+    {
+        let file = out.into_inner().map_err(|e| e.into_error())?;
+        if rewound {
+            file.set_len(offset + dir_len as u64 + FOOTER_LEN)?;
+        }
+        file.sync_all()?;
     }
-    file.sync_all()?;
-    drop(file);
     // Each owner before the charge that backs it
     drop(dir);
     drop(dir_charge);

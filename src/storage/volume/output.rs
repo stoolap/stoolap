@@ -645,12 +645,13 @@ impl VolumeFileWriter {
             super::v5::write_tail(&mut blocks, self.block_pos, &root, sections, &self.entries)
                 .map_err(|e| io_error("failed to write volume file", e))?;
         let _ = meta.file_identity.set(identity);
-        let file = blocks
-            .into_inner()
-            .map_err(|e| io_error("failed to flush volume file", e.into_error()))?;
-        super::io::sync_ordered(&file)
-            .map_err(|e| io_error("failed to fsync volume tmp file", e))?;
-        drop(file);
+        {
+            let file = blocks
+                .into_inner()
+                .map_err(|e| io_error("failed to flush volume file", e.into_error()))?;
+            super::io::sync_ordered(&file)
+                .map_err(|e| io_error("failed to fsync volume tmp file", e))?;
+        }
         std::fs::rename(&self.blocks_path, &self.final_path)
             .map_err(|e| io_error("failed to rename volume file", e))?;
         // From here the final file exists; whatever fails until the volume

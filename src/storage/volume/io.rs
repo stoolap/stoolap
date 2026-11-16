@@ -593,7 +593,6 @@ fn read_volume_v5(
         }
         None => (0..cols).map(|_| None).collect(),
     };
-    drop(file);
     meta.bloom_filters = super::writer::VolumeBlooms::in_file(&handle, places);
     let root = &opened.root;
     // One group spans every row; more tile them at one power-of-two size,
