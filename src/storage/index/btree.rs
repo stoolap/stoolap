@@ -594,6 +594,33 @@ impl Index for BTreeIndex {
         Some(CappedEqual::Copied)
     }
 
+    fn count_capped(
+        &self,
+        lower: Bound<&Value>,
+        upper: Bound<&Value>,
+        max: usize,
+    ) -> Option<usize> {
+        if self.closed.load(AtomicOrdering::Acquire) {
+            return None;
+        }
+        let sorted_values = self.sorted_values.read();
+        if let (Bound::Included(low), Bound::Included(high)) = (lower, upper) {
+            if low == high {
+                let count = sorted_values.get(low).map_or(0, Ids::len);
+                return Some(count.min(max.saturating_add(1)));
+            }
+        }
+        let mut count = 0usize;
+        sorted_values.walk(lower, true, &mut |key, rows| {
+            if past_end(&key, &upper) {
+                return false;
+            }
+            count += rows.len();
+            count <= max
+        });
+        Some(count.min(max.saturating_add(1)))
+    }
+
     fn get_row_ids_in_range_into(
         &self,
         min_value: &[Value],

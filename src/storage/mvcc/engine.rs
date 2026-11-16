@@ -9753,15 +9753,17 @@ impl MVCCEngine {
     }
 
     /// The rows of a table without sealed rows holding `value` at `column`
-    /// by the column's own index, in the latest committed state of one quiet
-    /// publish epoch, in row id order; None when the table has sealed rows,
-    /// more than `cap` rows may hold the value, the index cannot answer or
-    /// the table publishes or seals meanwhile
-    pub(crate) fn fetch_latest_equal_in(
+    /// by the column's own index, or, `INSTEAD`, a key of `instead` whose
+    /// index holds fewer ids, the fewest, in the latest committed state of one
+    /// quiet publish epoch, in row id order; None when the table has sealed
+    /// rows, more than `cap` rows may hold every key, an index cannot answer
+    /// or the table publishes or seals meanwhile
+    pub(crate) fn fetch_latest_equal_in<const INSTEAD: bool>(
         &self,
         table_name: &str,
         store: &Arc<VersionStore>,
         (column, value): (usize, &Value),
+        instead: &[(usize, &Value)],
         cap: usize,
         token: crate::storage::mvcc::version_store::LayoutToken,
     ) -> Result<Option<crate::core::RowVec>> {
@@ -9814,7 +9816,19 @@ impl MVCCEngine {
         let found = crate::storage::mvcc::table::index_equality_candidates(
             &*index, &schema, name, value, cap, &mut ids,
         )?;
-        if !matches!(found, Some(CappedEqual::Copied)) {
+        // A first key holding more than one id leaves the others asked
+        let taken = match found {
+            Some(CappedEqual::Copied) if !INSTEAD || ids.len() <= 1 => true,
+            Some(CappedEqual::Copied) => {
+                let held = ids.len();
+                Self::read_fewer_ids(store, &schema, instead, held, &mut ids)?.is_some()
+            }
+            Some(CappedEqual::OverCap) if INSTEAD => {
+                Self::read_fewer_ids(store, &schema, instead, cap + 1, &mut ids)?.unwrap_or(false)
+            }
+            _ => false,
+        };
+        if !taken {
             return Ok(None);
         }
         #[cfg(feature = "test-failpoints")]
@@ -9829,6 +9843,56 @@ impl MVCCEngine {
         }
         store.check_token(token)?;
         Ok(Some(rows))
+    }
+
+    /// Whether a key of `keys` whose index holds fewer than `held` ids, the
+    /// fewest of them, each counted in one lookup without copying one, was
+    /// read into `ids` in place of what they held: false when none holds
+    /// fewer, `ids` untouched; None when that key's read did not fit its
+    /// count, `ids` left empty
+    #[inline(never)]
+    fn read_fewer_ids(
+        store: &VersionStore,
+        schema: &crate::core::Schema,
+        keys: &[(usize, &Value)],
+        held: usize,
+        ids: &mut Vec<i64>,
+    ) -> Result<Option<bool>> {
+        use crate::storage::traits::CappedEqual;
+        let mut fewest: Option<(usize, usize, &Value)> = None;
+        for &(column, value) in keys {
+            let (Some(index), Some(name)) = (
+                store.index_on(column),
+                schema.columns.get(column).map(|c| c.name.as_str()),
+            ) else {
+                continue;
+            };
+            let below = fewest.map_or(held, |(count, ..)| count);
+            let count = crate::storage::mvcc::table::index_equality_count(
+                &*index,
+                schema,
+                name,
+                value,
+                below.saturating_sub(1),
+            );
+            if let Some(count) = count.filter(|&count| count < below) {
+                fewest = Some((count, column, value));
+            }
+        }
+        let Some((count, column, value)) = fewest else {
+            return Ok(Some(false));
+        };
+        let (Some(index), Some(name)) = (
+            store.index_on(column),
+            schema.columns.get(column).map(|c| c.name.as_str()),
+        ) else {
+            return Ok(Some(false));
+        };
+        ids.clear();
+        let found = crate::storage::mvcc::table::index_equality_candidates(
+            &*index, schema, name, value, count, ids,
+        )?;
+        Ok(matches!(found, Some(CappedEqual::Copied)).then_some(true))
     }
 
     /// The row the volumes of `table_name` hold `value` in at `column`, the

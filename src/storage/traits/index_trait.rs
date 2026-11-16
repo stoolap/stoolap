@@ -285,6 +285,19 @@ pub trait Index: Send + Sync {
         None
     }
 
+    /// How many row ids the keys from `lower` to `upper` of the first column
+    /// hold, counted without copying one and no further than `max`: past it
+    /// the answer is `max + 1`. None from an index that cannot count so
+    fn count_capped(
+        &self,
+        lower: std::ops::Bound<&Value>,
+        upper: std::ops::Bound<&Value>,
+        max: usize,
+    ) -> Option<usize> {
+        let _ = (lower, upper, max);
+        None
+    }
+
     /// Returns row IDs with values in the given range (convenience method)
     ///
     /// This is a simplified version of `find_range` that returns only row IDs.

@@ -1119,13 +1119,7 @@ impl MVCCTable {
                 );
                 row_ids
             }
-            IndexPlan::Intersect(reads) => {
-                let answers: Vec<RowIdVec> = reads
-                    .iter()
-                    .filter_map(|read| self.read_scope(read, scope, history))
-                    .collect();
-                (!answers.is_empty()).then(|| intersect_ids(answers))
-            }
+            IndexPlan::Intersect(reads) => self.read_fewest_first(reads, scope, history),
             // Any OR of the scope the reads answer, operand by operand
             IndexPlan::Union(reads) => scope
                 .iter()
@@ -1150,6 +1144,62 @@ impl MVCCTable {
         }
     }
 
+    /// The ids every read of an intersection names, read from the one whose
+    /// keys hold the fewest ids: a further key read counted at more than
+    /// `NARROWS` times the ids held so far is not read, nor a range holding
+    /// more than them, whose count walks about as far as its read; their
+    /// conjuncts are left to the WHERE every caller applies again to the
+    /// rows. A read that cannot count is read
+    fn read_fewest_first(
+        &self,
+        reads: &[IndexPlan],
+        scope: &[&dyn Expression],
+        history: Option<&HistoryProbe<'_>>,
+    ) -> Option<RowIdVec> {
+        // Equalities count in one lookup each, so they set the cap a range's
+        // walk stops at
+        let mut counted: SmallVec<[(usize, usize, bool); 4]> = SmallVec::new();
+        let mut fewest = usize::MAX;
+        for ranged in [false, true] {
+            for (at, read) in reads.iter().enumerate() {
+                let IndexPlan::Read { index, read: how } = read else {
+                    if !ranged {
+                        counted.push((usize::MAX, at, false));
+                    }
+                    continue;
+                };
+                if matches!(how, Read::Range | Read::LikePrefix) != ranged {
+                    continue;
+                }
+                let cap = if ranged { fewest } else { usize::MAX };
+                let count = count_column(&**index, *how, scope, cap).unwrap_or(usize::MAX);
+                fewest = fewest.min(count);
+                counted.push((count, at, ranged));
+            }
+        }
+        counted.sort_unstable();
+        let mut held: Option<RowIdVec> = None;
+        for (count, at, ranged) in counted {
+            if let Some(ids) = &held {
+                let most = if ranged { 1 } else { NARROWS };
+                if ids.is_empty() {
+                    break;
+                }
+                if count != usize::MAX && count > ids.len().saturating_mul(most) {
+                    continue;
+                }
+            }
+            let Some(ids) = self.read_scope(&reads[at], scope, history) else {
+                continue;
+            };
+            held = Some(match held {
+                Some(held) => intersect_ids(vec![held, ids]),
+                None => ids,
+            });
+        }
+        held
+    }
+
     /// The ids `index` gives for its column's conjuncts in `scope`, read as
     /// `read` says
     fn read_column(
@@ -1164,19 +1214,11 @@ impl MVCCTable {
         let named = |name: &str| eq_names(name, column);
         match read {
             Read::Equal => {
-                let value = scope.iter().find_map(|c| match c.get_comparison_info() {
-                    Some((name, Operator::Eq, value)) if named(name) => Some(value),
-                    _ => None,
-                })?;
+                let value = equal_value(column, scope)?;
                 self.query_index_with_operator(index, Operator::Eq, value, history)
             }
             Read::In => {
-                let list = scope.iter().find_map(|c| {
-                    c.as_any()
-                        .downcast_ref::<crate::storage::expression::InListExpr>()
-                        .filter(|list| !list.is_not() && list.get_column_name().is_some_and(named))
-                })?;
-                let values = list.get_values();
+                let values = in_members(column, scope)?;
                 let mut row_ids = index.get_row_ids_in(values);
                 let probed = row_ids.len();
                 if let Some(history) = history {
@@ -1355,6 +1397,72 @@ fn column_bounds<'a>(column: &str, scope: &[&'a dyn Expression]) -> (KeyBound<'a
         }
     }
     bounds
+}
+
+/// How many times the ids held so far a further read of an intersection may
+/// name and still be read
+const NARROWS: usize = 4;
+
+/// How many ids `index` holds for its column's conjuncts in `scope`, read as
+/// `read` says, counted no further than `max`; None when it cannot count
+fn count_column(
+    index: &dyn Index,
+    read: Read,
+    scope: &[&dyn Expression],
+    max: usize,
+) -> Option<usize> {
+    use std::ops::Bound;
+    let column = index.column_names()[0].as_str();
+    fn bound(side: KeyBound<'_>) -> std::ops::Bound<&Value> {
+        match side {
+            Some((value, true)) => std::ops::Bound::Included(value),
+            Some((value, false)) => std::ops::Bound::Excluded(value),
+            None => std::ops::Bound::Unbounded,
+        }
+    }
+    match read {
+        Read::Equal => {
+            let value = equal_value(column, scope)?;
+            index.count_capped(Bound::Included(value), Bound::Included(value), max)
+        }
+        Read::In => {
+            let mut total = 0usize;
+            for value in in_members(column, scope)? {
+                let left = max.saturating_sub(total);
+                total +=
+                    index.count_capped(Bound::Included(value), Bound::Included(value), left)?;
+                if total > max {
+                    break;
+                }
+            }
+            Some(total.min(max.saturating_add(1)))
+        }
+        Read::Range => match column_bounds(column, scope) {
+            (None, None) => None,
+            (lower, upper) => index.count_capped(bound(lower), bound(upper), max),
+        },
+        Read::LikePrefix => None,
+    }
+}
+
+/// The value `scope` compares `column` equal to
+fn equal_value<'a>(column: &str, scope: &[&'a dyn Expression]) -> Option<&'a Value> {
+    scope.iter().find_map(|c| match c.get_comparison_info() {
+        Some((name, crate::core::Operator::Eq, value)) if eq_names(name, column) => Some(value),
+        _ => None,
+    })
+}
+
+/// The members of `scope`'s IN list on `column`
+fn in_members<'a>(column: &str, scope: &[&'a dyn Expression]) -> Option<&'a [Value]> {
+    scope.iter().find_map(|c| {
+        c.as_any()
+            .downcast_ref::<crate::storage::expression::InListExpr>()
+            .filter(|list| {
+                !list.is_not() && list.get_column_name().is_some_and(|n| eq_names(n, column))
+            })
+            .map(|list| list.get_values())
+    })
 }
 
 /// The ids every answer names
@@ -3143,6 +3251,60 @@ impl MVCCTable {
     }
 }
 
+/// `key` as `index`, on `column` of `schema`, matches it: as it is for a
+/// B-tree, in the column's type for an index matching stored values
+/// exactly; `Err(())` when no stored value equals it, None when the types
+/// do not meet or the index matches no key so
+fn stored_key<'k>(
+    index: &dyn Index,
+    schema: &Schema,
+    column: &str,
+    key: &'k Value,
+) -> Option<std::result::Result<std::borrow::Cow<'k, Value>, ()>> {
+    use std::borrow::Cow;
+    match index.index_type() {
+        IndexType::BTree => Some(Ok(Cow::Borrowed(key))),
+        IndexType::Hash | IndexType::Bitmap | IndexType::PrimaryKey => {
+            let data_type = schema
+                .columns
+                .iter()
+                .find(|c| eq_names(&c.name_lower, column))
+                .map(|c| c.data_type)?;
+            Some(match (data_type, key) {
+                (DataType::Integer, Value::Float(f)) => {
+                    crate::executor::Executor::lossless_float_key(*f)
+                        .map(|i| Cow::Owned(Value::Integer(i)))
+                        .ok_or(())
+                }
+                (DataType::Float, Value::Integer(i)) => {
+                    crate::core::value::lossless_f64_from_i64(*i)
+                        .map(|f| Cow::Owned(Value::Float(f)))
+                        .ok_or(())
+                }
+                (data_type, key) if key.data_type() == data_type => Ok(Cow::Borrowed(key)),
+                _ => return None,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// How many ids `index`, on `column` of `schema`, holds for `key`, counted
+/// without copying one and no further than `max`; None when it cannot count
+pub(crate) fn index_equality_count(
+    index: &dyn Index,
+    schema: &Schema,
+    column: &str,
+    key: &Value,
+    max: usize,
+) -> Option<usize> {
+    use std::ops::Bound;
+    match stored_key(index, schema, column, key)? {
+        Ok(stored) => index.count_capped(Bound::Included(&stored), Bound::Included(&stored), max),
+        Err(()) => Some(0),
+    }
+}
+
 /// The ids `index`, on `column` of `schema`, itself holds for `key`, under
 /// `equality_candidates`'s cap
 pub(crate) fn index_equality_candidates(
@@ -3164,32 +3326,13 @@ pub(crate) fn index_equality_candidates(
         }
         IndexType::Hash | IndexType::Bitmap | IndexType::PrimaryKey => {
             // These match the stored value exactly, so the key takes the column's type
-            let Some(data_type) = schema
-                .columns
-                .iter()
-                .find(|c| eq_names(&c.name_lower, column))
-                .map(|c| c.data_type)
-            else {
-                return Ok(None);
-            };
-            let stored = match (data_type, key) {
-                (DataType::Integer, Value::Float(f)) => {
-                    match crate::executor::Executor::lossless_float_key(*f) {
-                        Some(i) => Value::Integer(i),
-                        None => return Ok(Some(crate::storage::traits::CappedEqual::Copied)),
-                    }
-                }
-                (DataType::Float, Value::Integer(i)) => {
-                    match crate::core::value::lossless_f64_from_i64(*i) {
-                        Some(f) => Value::Float(f),
-                        None => return Ok(Some(crate::storage::traits::CappedEqual::Copied)),
-                    }
-                }
-                (data_type, key) if key.data_type() == data_type => key.clone(),
-                _ => return Ok(None),
+            let stored = match stored_key(index, schema, column, key) {
+                Some(Ok(stored)) => stored,
+                Some(Err(())) => return Ok(Some(crate::storage::traits::CappedEqual::Copied)),
+                None => return Ok(None),
             };
             // An index that caps before it copies answers here
-            let stored = std::slice::from_ref(&stored);
+            let stored = std::slice::from_ref(&*stored);
             let start = out.len();
             if let Some(found) = index.get_row_ids_equal_capped_into(stored, max, out) {
                 #[cfg(feature = "test-failpoints")]

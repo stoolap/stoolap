@@ -192,6 +192,10 @@ struct SideAsk {
     keys: AskKeys,
 }
 
+/// Every index a read's comparisons bound, the one asked when no side file
+/// counts first
+type SideAsks = smallvec::SmallVec<[SideAsk; 2]>;
+
 enum AskKeys {
     /// An ordered i64 entry's keys in `[low, high]`, empty when low is above
     I64(i64, i64),
@@ -817,11 +821,7 @@ impl SegmentedTable {
                 .map(|e| e.collect_comparisons())
                 .unwrap_or_default();
             let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
-            let ask = if comparisons.is_empty() {
-                None
-            } else {
-                self.side_ask(&comparisons)
-            };
+            let asks = self.side_asks(&comparisons);
             let unique_keys = self.unique_keys_for(&comparisons)?;
 
             'outer: for (seg_id, cs) in view.volumes() {
@@ -843,7 +843,7 @@ impl SegmentedTable {
                 let (mut walk, positions) = match self.unique_decision(cs, &unique_keys) {
                     UniqueDecision::Empty => continue,
                     UniqueDecision::Positions(positions) => (None, Some(positions)),
-                    UniqueDecision::Pass => match self.side_decision(cs, ask.as_ref())? {
+                    UniqueDecision::Pass => match self.side_decision(cs, &asks)? {
                         SideDecision::Empty => continue,
                         SideDecision::Walk(plan) => (start_walk(&plan)?, None),
                         SideDecision::Scan => (None, None),
@@ -3029,20 +3029,30 @@ impl SegmentedTable {
     /// Whether a volume's side file serves the statement's comparisons, decided
     /// before the volume's data is touched, on the captured segment alone:
     /// the comparisons must bound one column the catalog indexes (one
-    /// equality, or a lower and an upper bound), the segment's side file must
-    /// cover that column under the index's current identity, a reader's
+    /// equality, or a lower and an upper bound), of the asks the one whose
+    /// side file entry counts the fewest positions, the segment's side file
+    /// must cover that column under the index's current identity, a reader's
     /// working reservation must be admitted, and the exact candidate count
     /// from the boundary pages must be a small share of the volume's rows.
     /// Everything else sends the volume through the scan, counted by why.
     fn side_decision(
         &self,
         cs: &super::manifest::ColdSegment,
-        ask: Option<&SideAsk>,
+        asks: &[SideAsk],
     ) -> Result<SideDecision> {
         use super::secondary::{is_refused, SidePlan, READS};
-        let Some(SideAsk { def, keys }) = ask else {
-            return Ok(SideDecision::Scan);
+        let ask = match asks {
+            [] => return Ok(SideDecision::Scan),
+            [only] => only,
+            _ => match self.fewest_ask(cs, asks)? {
+                Some(ask) => ask,
+                None => {
+                    READS.count(&READS.misses, 1);
+                    return Ok(SideDecision::Empty);
+                }
+            },
         };
+        let SideAsk { def, keys } = ask;
         let reserve = super::secondary::reader_bytes(super::secondary::SIDE_WINDOW);
         let keys = keys.range();
         let side = match self.side_admits(cs, def, keys, reserve)? {
@@ -3540,22 +3550,27 @@ impl SegmentedTable {
     }
 
     /// What the read's comparisons ask of the side files, taken once per
-    /// read with the cold view: the index whose key they fix furthest, an
-    /// ordered i64 one on a tie, the smaller identity among equals. The
-    /// definitions are walked in place, none collected
-    fn side_ask(&self, comparisons: &[(&str, crate::core::Operator, &Value)]) -> Option<SideAsk> {
+    /// read with the cold view, every index they bound: first the index
+    /// whose key they fix furthest, an ordered i64 one on a tie, the smaller
+    /// identity among equals; each volume reads the one of them its side
+    /// file counts the fewest positions for
+    fn side_asks(&self, comparisons: &[(&str, crate::core::Operator, &Value)]) -> SideAsks {
+        let mut asks = SideAsks::new();
+        if comparisons.is_empty() {
+            return asks;
+        }
         let schema = self.hot.schema();
-        let mut i64_best: Option<(SideIndexDef, i64, i64)> = None;
+        let mut i64_all: smallvec::SmallVec<[(SideIndexDef, i64, i64); 2]> =
+            smallvec::SmallVec::new();
         let mut bytes_best: Option<((usize, bool), SideIndexDef)> = None;
         let before = |def: &SideIndexDef, held: &SideIndexDef| def.identity < held.identity;
         self.hot.for_each_side_index_def(&mut |def| match def.kind {
             KeyKind::OrderedI64 => {
                 if let Some((low, high)) = Self::i64_bounds(schema, comparisons, &def) {
-                    if i64_best
-                        .as_ref()
-                        .is_none_or(|(held, ..)| before(&def, held))
-                    {
-                        i64_best = Some((def, low, high));
+                    let first = i64_all.first().is_none_or(|(held, ..)| before(&def, held));
+                    match first {
+                        true => i64_all.insert(0, (def, low, high)),
+                        false => i64_all.push((def, low, high)),
                     }
                 }
             }
@@ -3569,24 +3584,68 @@ impl SegmentedTable {
                 }
             }
         });
-        let i64_shape = i64_best.as_ref().map(|(_, low, high)| match low.cmp(high) {
+        let i64_shape = i64_all.first().map(|(_, low, high)| match low.cmp(high) {
             std::cmp::Ordering::Greater => (usize::MAX, false),
             std::cmp::Ordering::Equal => (1, false),
             std::cmp::Ordering::Less => (0, true),
         });
-        if let Some((_, def)) = bytes_best.filter(|(shape, _)| Some(*shape) > i64_shape) {
-            if let Some((range, capability)) = Self::byte_bounds(schema, comparisons, &def) {
-                return Some(SideAsk {
-                    def,
-                    keys: AskKeys::Bytes(range, capability),
-                });
-            }
+        let bytes = bytes_best.and_then(|(shape, def)| {
+            let (range, capability) = Self::byte_bounds(schema, comparisons, &def)?;
+            let ask = SideAsk {
+                def,
+                keys: AskKeys::Bytes(range, capability),
+            };
+            Some((Some(shape) > i64_shape, ask))
+        });
+        let bytes_first = bytes.as_ref().is_some_and(|(first, _)| *first);
+        if !bytes_first {
+            asks.extend(i64_all.drain(..).map(|(def, low, high)| SideAsk {
+                def,
+                keys: AskKeys::I64(low, high),
+            }));
         }
-        let (def, low, high) = i64_best?;
-        Some(SideAsk {
+        if let Some((_, ask)) = bytes {
+            asks.push(ask);
+        }
+        asks.extend(i64_all.into_iter().map(|(def, low, high)| SideAsk {
             def,
             keys: AskKeys::I64(low, high),
-        })
+        }));
+        asks
+    }
+
+    /// The ask of `asks` whose side file entry in `cs` the directory counts
+    /// the fewest positions for, without reading a page, the first when no
+    /// entry counts; None when one rules every row of the volume out
+    fn fewest_ask<'a>(
+        &self,
+        cs: &super::manifest::ColdSegment,
+        asks: &'a [SideAsk],
+    ) -> Result<Option<&'a SideAsk>> {
+        let mut fewest: Option<(u64, &SideAsk)> = None;
+        for ask in asks {
+            let keys = ask.keys.range();
+            let Some(side) = cs.side_for(&ask.def, keys.capability()) else {
+                continue;
+            };
+            if Self::range_misses_nan(cs, &ask.def, &keys) {
+                continue;
+            }
+            let identity = ask.def.identity;
+            let estimate = match keys {
+                KeyRange::I64(low, high) => side.candidate_estimate(identity, low, high),
+                KeyRange::Bytes { lower, upper, .. } => {
+                    side.byte_candidate_estimate(identity, lower, upper)
+                }
+            };
+            let Some(estimate) = estimate.map_err(side_error)? else {
+                return Ok(None);
+            };
+            if fewest.is_none_or(|(held, _)| estimate < held) {
+                fewest = Some((estimate, ask));
+            }
+        }
+        Ok(Some(fewest.map_or(&asks[0], |(_, ask)| ask)))
     }
 
     /// The single-column TEXT entry a key probe of `column` asks
@@ -4141,11 +4200,7 @@ impl SegmentedTable {
         let hot_skip_arc = Arc::new(hot_skip);
 
         let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
-        let ask = if comparisons.is_empty() {
-            None
-        } else {
-            self.side_ask(&comparisons)
-        };
+        let asks = self.side_asks(&comparisons);
         let unique_keys = self.unique_keys_for(&comparisons)?;
         let mut scanners_reverse: Vec<Box<dyn Scanner>> = Vec::with_capacity(view.seg_ids.len());
 
@@ -4171,7 +4226,7 @@ impl SegmentedTable {
                     if Self::range_beats_side(vol, start, end) {
                         (start, end, None, None)
                     } else {
-                        match self.side_decision(cs, ask.as_ref())? {
+                        match self.side_decision(cs, &asks)? {
                             SideDecision::Empty => continue,
                             SideDecision::Walk(plan) => (start, end, Some(plan), None),
                             SideDecision::Scan => (start, end, None, None),
@@ -4338,11 +4393,7 @@ impl SegmentedTable {
         let fallible = where_expr.is_some_and(|expr| expr.can_fail());
 
         // Per-volume row collection closure. Returns Some(vol_rows) or None if pruned.
-        let ask = if comparisons.is_empty() {
-            None
-        } else {
-            self.side_ask(&comparisons)
-        };
+        let asks = self.side_asks(&comparisons);
         let unique_keys = self.unique_keys_for(&comparisons)?;
         let process_volume =
             |(seg_id, cs): &(u64, &super::manifest::ColdSegment)| -> Result<Option<RowVec>> {
@@ -4368,7 +4419,7 @@ impl SegmentedTable {
                         if Self::range_beats_side(vol, start, end) {
                             (start, end, None, None)
                         } else {
-                            match self.side_decision(cs, ask.as_ref())? {
+                            match self.side_decision(cs, &asks)? {
                                 SideDecision::Empty => return Ok(None),
                                 SideDecision::Walk(plan) => (start, end, start_walk(&plan)?, None),
                                 SideDecision::Scan => (start, end, None, None),
@@ -5968,11 +6019,7 @@ impl Table for SegmentedTable {
                 .map(|e| e.collect_comparisons())
                 .unwrap_or_default();
             let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
-            let ask = if comparisons.is_empty() {
-                None
-            } else {
-                self.side_ask(&comparisons)
-            };
+            let asks = self.side_asks(&comparisons);
             let unique_keys = self.unique_keys_for(&comparisons)?;
 
             'done: for (nf_idx, seg_id) in view.seg_ids.iter().enumerate().rev() {
@@ -6001,7 +6048,7 @@ impl Table for SegmentedTable {
                 let side = if unique.is_some() {
                     SideDecision::Scan
                 } else {
-                    self.side_decision(cs, ask.as_ref())?
+                    self.side_decision(cs, &asks)?
                 };
                 let candidates: Option<(Vec<u32>, super::secondary::Reservation)> = match side {
                     SideDecision::Empty => continue,
@@ -8783,7 +8830,7 @@ impl Table for SegmentedTable {
             let tombstones_ref = &tombstones_arc;
             // A side file over a key the comparisons bound names the only rows
             // the calls must look at, each read from its row group
-            let walk_ask = self.side_ask(&comparisons);
+            let walk_asks = self.side_asks(&comparisons);
 
             let process_volume = |(_, cs): &(u64, super::manifest::ColdSegment)| -> Result<
                 Option<GroupedAggregates>,
@@ -8793,7 +8840,7 @@ impl Table for SegmentedTable {
                     }
                     let vol = &cs.volume;
                     let mapping = &cs.mapping;
-                    let walk = match self.side_decision(cs, walk_ask.as_ref())? {
+                    let walk = match self.side_decision(cs, &walk_asks)? {
                         SideDecision::Empty => return Ok(None),
                         SideDecision::Scan => None,
                         SideDecision::Walk(plan) => start_walk(&plan)?,

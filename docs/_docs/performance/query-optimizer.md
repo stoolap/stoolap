@@ -17,7 +17,7 @@ Stoolap does not have a cost-based optimizer yet: no choice below is made by com
 |------|------|
 | Primary key | `WHERE pk = value`, `pk IN (...)` or a range on the primary key |
 | Index | an equality, a range or an `IN` list on an indexed column, or on the leading columns of a composite index |
-| Several indexes | the `AND` of terms on different indexed columns: the reads are intersected; an `OR` of indexed terms reads each and merges them |
+| Several indexes | the `AND` of terms on different indexed columns: the read starts from the index holding the fewest rows for the run's values; an `OR` of indexed terms reads each and merges them |
 | Ordered read | `ORDER BY` an indexed column with a `LIMIT`: rows are read in index order and the read stops at the limit |
 | Sequential scan | no term an index or the primary key can answer |
 
@@ -32,14 +32,14 @@ plan
 ----
 Project id
   Filter
-    IndexGet users status = 'active'
+    IndexGet users by the fewest of status = 'active', age = 30
     else IndexScan users ((status = 'active') AND (age = 30))
-      Intersect
+      Intersect, fewest rows first
         Index idx_status (status =)
         Index idx_age (age =)
 ```
 
-The rule takes every index that answers a term. It does not compare how many rows each one returns, so an index on a column with few distinct values is read and intersected even when another index alone would return far fewer rows.
+Each run counts, from the indexes themselves, how many rows each term's key holds for the values it binds, and starts from the fewest. The count needs no `ANALYZE` and follows the parameters of a prepared statement. An index holding more than four times the rows already found is not read: its term is checked on those rows. On sealed data each volume makes the same choice from its own side file. The order the terms are written in does not matter.
 
 An ordered read names the sort it falls back to:
 
@@ -174,8 +174,7 @@ SELECT (actual time=2.5ms, rows=1500)
 These choices are made by rule, not by estimated cost:
 
 - **Join order** is the written order. A selective table written last makes every earlier join read rows the filter later drops.
-- **Index choice** takes every index that answers a term. An index on a column with few distinct values can cost more than reading another index alone, or than a scan.
-- **Index or scan**: an indexed range is read through the index even when it keeps most of the table's rows, where a scan would be cheaper on hot data.
+- **Index or scan**: an index is read even when the one holding the fewest rows holds most of the table's rows, where a scan would be cheaper on hot data.
 - **Ordered reads under LIMIT** walk the index even when the WHERE matches rows only far along it, where filtering first and sorting the few matches would be cheaper.
 
 ## Best Practices
@@ -191,7 +190,7 @@ ANALYZE orders;
 
 ### Create Indexes for Selective Columns
 
-An index helps when its term keeps few rows. Avoid indexing a column with few distinct values that queries combine with a more selective indexed column:
+An index helps when its term keeps few rows. A column with few distinct values gains little from an index of its own: when a query also tests a more selective indexed column, the read starts from that one:
 
 ```sql
 CREATE INDEX idx_orders_customer ON orders(customer_id);

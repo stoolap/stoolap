@@ -200,7 +200,7 @@ impl IndexPlan {
             }
             Self::Intersect(reads) | Self::Union(reads) => {
                 let name = match self {
-                    Self::Intersect(_) => "Intersect",
+                    Self::Intersect(_) => "Intersect, fewest rows first",
                     _ => "Union",
                 };
                 lines.push(format!("{indent}{name}"));
