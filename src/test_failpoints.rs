@@ -2869,6 +2869,7 @@ thread_local! {
     static INNER_TABLE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static MIN_MAX_INDEX_ANSWERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static EQUALITY_CANDIDATE_IDS_COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ESTIMATE_IN_KEYS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static BTREE_WALK_CHUNK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
     static GROUP_CACHE_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GROUP_COLUMN_DECODES: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
@@ -3720,6 +3721,15 @@ pub fn equality_candidate_ids_copied_count() -> usize {
 
 pub(crate) fn equality_candidate_ids_copied(count: usize) {
     EQUALITY_CANDIDATE_IDS_COPIED.with(|n| n.set(n.get() + count));
+}
+
+/// IN list keys this thread's join side estimates read to count, so far
+pub fn estimate_in_keys_read() -> usize {
+    ESTIMATE_IN_KEYS_READ.with(std::cell::Cell::get)
+}
+
+pub(crate) fn estimate_in_key_read() {
+    ESTIMATE_IN_KEYS_READ.with(|n| n.set(n.get() + 1));
 }
 
 /// Hot rows this thread's index-walking top-k scans visited, so far

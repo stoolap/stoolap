@@ -757,6 +757,8 @@ impl QueryPlanner {
         let mut keys = IN_KEYS.with(std::cell::Cell::take);
         keys.clear();
         let read = (compared.values.iter()).try_for_each(|member| {
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::estimate_in_key_read();
             keys.push(compared.read_value(member.bind(run.params)?)?.into_owned());
             Some(())
         });
@@ -831,9 +833,9 @@ impl QueryPlanner {
         // index's count decides it
         let compared = |column: Option<&str>, compare: Compare, values: Vec<ValueSource>| {
             let compared = Compared {
-                index: column
-                    .zip(store)
-                    .and_then(|(c, s)| s.get_index_by_column(c)),
+                index: (column.zip(store))
+                    .and_then(|(c, s)| s.get_index_by_column(c))
+                    .filter(|index| counts_equality(&**index)),
                 stats: (column.filter(|_| table_stats.row_count > 0))
                     .and_then(|c| self.get_column_stats(table_name, c)),
                 column_type: column.zip(store).and_then(|(c, s)| {
@@ -1012,6 +1014,15 @@ impl QueryPlanner {
 
 /// The most rows an estimate counts in a range before it estimates instead
 const RANGE_COUNT_CAP: usize = 4096;
+
+/// Whether `index` counts the rows of a key, as it answers for the NULL one
+fn counts_equality(index: &dyn crate::storage::traits::Index) -> bool {
+    use std::ops::Bound::Included;
+    let null = Value::Null(crate::core::DataType::Null);
+    index
+        .count_capped(Included(&null), Included(&null), 0)
+        .is_some()
+}
 
 thread_local! {
     /// An IN list's keys as its column reads them, one buffer a thread keeps

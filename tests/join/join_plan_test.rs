@@ -289,6 +289,39 @@ fn an_in_list_counted_by_its_index_counts_each_key_once() {
 }
 
 #[test]
+fn an_in_list_on_an_index_that_counts_nothing_reads_no_key() {
+    use stoolap::test_failpoints::estimate_in_keys_read;
+    let _guard = serial();
+    let db = Database::open("memory://join_plan_in_pk_no_keys").unwrap();
+    for sql in [
+        "CREATE TABLE ts_s (id INTEGER PRIMARY KEY, k INTEGER, f INTEGER)",
+        "CREATE TABLE ts_t (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO ts_s SELECT g.value, g.value % 200, g.value % 20 \
+         FROM generate_series(1, 2000) g",
+        "INSERT INTO ts_t SELECT g.value, g.value % 200 FROM generate_series(1, 1500) g",
+        "CREATE INDEX ts_s_f ON ts_s (f)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let list: Vec<String> = (2..42).map(|at| format!("${at}")).collect();
+    let keys = || (1..=40).map(stoolap::Value::Integer).collect::<Vec<_>>();
+    for (column, counts) in [("id", false), ("f", true)] {
+        let before = estimate_in_keys_read();
+        left_builds(
+            &db,
+            &format!("ts_s.{column} IN ({})", list.join(", ")),
+            keys(),
+            1,
+        );
+        assert_eq!(
+            estimate_in_keys_read() > before,
+            counts,
+            "{column}: the primary key's index counts no key, the index on f counts them"
+        );
+    }
+}
+
+#[test]
 fn an_index_created_after_a_run_counts_on_the_next() {
     let _guard = serial();
     let db = Database::open("memory://join_plan_index_after_run").unwrap();
