@@ -977,7 +977,7 @@ impl ScalarFunction for SleepFunction {
         #[cfg(target_arch = "wasm32")]
         {
             let _ = &args[0];
-            return Err(Error::internal("SLEEP is not supported in WASM mode"));
+            Err(Error::internal("SLEEP is not supported in WASM mode"))
         }
 
         #[cfg(not(target_arch = "wasm32"))]

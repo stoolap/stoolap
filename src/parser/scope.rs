@@ -461,7 +461,6 @@ pub(crate) fn from_shows(source: &Expression, name: &str) -> bool {
 fn visit_from_names<'a>(source: &'a Expression, visit: &mut dyn FnMut(&'a str, Option<&'a str>)) {
     let (name, alias) = match source {
         Expression::TableSource(t) => (Some(&t.name), t.alias.as_ref()),
-        Expression::CteReference(c) => (Some(&c.name), c.alias.as_ref()),
         Expression::FunctionTableSource(f) => (Some(&f.function), f.alias.as_ref()),
         Expression::SubquerySource(s) => (None, s.alias.as_ref()),
         Expression::ValuesSource(v) => (None, v.alias.as_ref()),
@@ -691,7 +690,6 @@ fn check_expr<'a>(expr: &'a Expression, scope: Option<&Scope<'a, '_>>) -> Check 
             .expressions
             .iter()
             .try_for_each(|e| check_expr(e, scope)),
-        Expression::Distinct(d) => check_expr(&d.expr, scope),
         Expression::Exists(e) => check_select(&e.subquery, scope),
         Expression::ScalarSubquery(s) => check_select(&s.subquery, scope),
         Expression::AllAny(a) => {
@@ -702,7 +700,6 @@ fn check_expr<'a>(expr: &'a Expression, scope: Option<&Scope<'a, '_>>) -> Check 
             check_expr(&i.left, scope)?;
             check_expr(&i.right, scope)
         }
-        Expression::InHashSet(i) => check_expr(&i.column, scope),
         Expression::QuantifiedSet(q) => check_expr(&q.left, scope),
         Expression::Between(b) => {
             check_expr(&b.expr, scope)?;

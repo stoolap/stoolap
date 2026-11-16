@@ -681,16 +681,6 @@ impl<'a> ExprCompiler<'a> {
                 self.compile_in(in_expr, builder)?;
             }
 
-            Expression::InHashSet(in_hash) => {
-                self.compile_expr(&in_hash.column, builder)?;
-                let set = CompactArc::clone(&in_hash.values);
-                if in_hash.not {
-                    builder.emit(Op::NotInSet(set));
-                } else {
-                    builder.emit(Op::InSet(set));
-                }
-            }
-
             Expression::QuantifiedSet(quantified) => {
                 let op = QuantifiedMembers::operator(&quantified.operator).ok_or_else(|| {
                     CompileError::UnsupportedExpression(format!(
@@ -749,11 +739,6 @@ impl<'a> ExprCompiler<'a> {
             // === ALIASED EXPRESSION ===
             Expression::Aliased(aliased) => {
                 self.compile_expr(&aliased.expression, builder)?;
-            }
-
-            // === DISTINCT ===
-            Expression::Distinct(distinct) => {
-                self.compile_expr(&distinct.expr, builder)?;
             }
 
             // === LIST ===
@@ -829,7 +814,6 @@ impl<'a> ExprCompiler<'a> {
             | Expression::JoinSource(_)
             | Expression::SubquerySource(_)
             | Expression::ValuesSource(_)
-            | Expression::CteReference(_)
             | Expression::FunctionTableSource(_)
             | Expression::Star(_)
             | Expression::QualifiedStar(_)

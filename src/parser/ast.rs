@@ -23,7 +23,6 @@ use rustc_hash::FxHashMap;
 use std::fmt;
 
 use crate::common::CompactArc;
-use crate::core::predicate::PredicateSet;
 use crate::core::ForeignKeyAction;
 
 // ============================================================================
@@ -59,17 +58,12 @@ pub enum Expression {
     Infix(InfixExpression),
     /// List of expressions (for IN clause) - Boxed to reduce enum size
     List(Box<ListExpression>),
-    /// DISTINCT expression
-    Distinct(DistinctExpression),
     /// EXISTS subquery
     Exists(ExistsExpression),
     /// ALL/ANY/SOME subquery comparison (e.g., x > ALL (SELECT ...))
     AllAny(AllAnyExpression),
     /// IN expression
     In(InExpression),
-    /// Pre-computed IN expression with HashSet (for semi-join optimization)
-    /// Uses Arc for cheap cloning in parallel execution
-    InHashSet(InHashSetExpression),
     /// `x op ANY` or `x op ALL` over a subquery's members, read once
     QuantifiedSet(Box<QuantifiedSetExpression>),
     /// BETWEEN expression
@@ -98,8 +92,6 @@ pub enum Expression {
     SubquerySource(Box<SubqueryTableSource>),
     /// VALUES table source - Boxed to reduce enum size (256 bytes unboxed)
     ValuesSource(Box<ValuesTableSource>),
-    /// CTE reference - Boxed to reduce enum size (336 bytes unboxed)
-    CteReference(Box<CteReference>),
     /// Function table source (table-valued function in FROM clause) - Boxed to reduce enum size
     FunctionTableSource(Box<FunctionTableSource>),
     /// Star (*) for SELECT *
@@ -126,11 +118,9 @@ impl fmt::Display for Expression {
             Expression::Prefix(e) => write!(f, "{}", e),
             Expression::Infix(e) => write!(f, "{}", e),
             Expression::List(e) => write!(f, "{}", e),
-            Expression::Distinct(e) => write!(f, "{}", e),
             Expression::Exists(e) => write!(f, "{}", e),
             Expression::AllAny(e) => write!(f, "{}", e),
             Expression::In(e) => write!(f, "{}", e),
-            Expression::InHashSet(e) => write!(f, "{}", e),
             Expression::QuantifiedSet(e) => write!(f, "{}", e),
             Expression::Between(e) => write!(f, "{}", e),
             Expression::Like(e) => write!(f, "{}", e),
@@ -145,7 +135,6 @@ impl fmt::Display for Expression {
             Expression::JoinSource(e) => write!(f, "{}", e),
             Expression::SubquerySource(e) => write!(f, "{}", e),
             Expression::ValuesSource(e) => write!(f, "{}", e),
-            Expression::CteReference(e) => write!(f, "{}", e),
             Expression::FunctionTableSource(e) => write!(f, "{}", e),
             Expression::Star(e) => write!(f, "{}", e),
             Expression::QualifiedStar(e) => write!(f, "{}", e),
@@ -186,10 +175,8 @@ impl Expression {
                 .expressions
                 .iter_mut()
                 .for_each(|e| e.rename_references(binds, new)),
-            Expression::Distinct(e) => e.expr.rename_references(binds, new),
             Expression::AllAny(e) => e.left.rename_references(binds, new),
             Expression::In(e) => each(&mut [&mut *e.left, &mut *e.right]),
-            Expression::InHashSet(e) => e.column.rename_references(binds, new),
             Expression::QuantifiedSet(e) => e.left.rename_references(binds, new),
             Expression::Between(e) => each(&mut [&mut *e.expr, &mut *e.lower, &mut *e.upper]),
             Expression::Like(e) => {
@@ -235,7 +222,6 @@ impl Expression {
             | Expression::JoinSource(_)
             | Expression::SubquerySource(_)
             | Expression::ValuesSource(_)
-            | Expression::CteReference(_)
             | Expression::FunctionTableSource(_)
             | Expression::Star(_)
             | Expression::QualifiedStar(_)
@@ -278,7 +264,6 @@ impl Expression {
                 } = &**list;
                 expressions.iter().try_for_each(f)
             }
-            Expression::Distinct(DistinctExpression { token: _, expr }) => f(expr),
             Expression::AllAny(AllAnyExpression {
                 token: _,
                 left,
@@ -309,12 +294,6 @@ impl Expression {
                     other => f(other),
                 }
             }
-            Expression::InHashSet(InHashSetExpression {
-                token: _,
-                column,
-                values: _,
-                not: _,
-            }) => f(column),
             Expression::QuantifiedSet(set) => {
                 let QuantifiedSetExpression {
                     token: _,
@@ -410,7 +389,6 @@ impl Expression {
             | Expression::JoinSource(_)
             | Expression::SubquerySource(_)
             | Expression::ValuesSource(_)
-            | Expression::CteReference(_)
             | Expression::FunctionTableSource(_)
             | Expression::Star(_)
             | Expression::QualifiedStar(_)
@@ -493,12 +471,6 @@ impl Expression {
                     expressions: each(f, expressions)?,
                 }))
             }
-            Expression::Distinct(DistinctExpression { token, expr }) => {
-                Expression::Distinct(DistinctExpression {
-                    token: token.clone(),
-                    expr: boxed(f, expr)?,
-                })
-            }
             Expression::AllAny(AllAnyExpression {
                 token,
                 left,
@@ -543,17 +515,6 @@ impl Expression {
                     not: *not,
                 })
             }
-            Expression::InHashSet(InHashSetExpression {
-                token,
-                column,
-                values,
-                not,
-            }) => Expression::InHashSet(InHashSetExpression {
-                token: token.clone(),
-                column: boxed(f, column)?,
-                values: values.clone(),
-                not: *not,
-            }),
             Expression::QuantifiedSet(set) => {
                 let QuantifiedSetExpression {
                     token,
@@ -716,7 +677,6 @@ impl Expression {
             | Expression::JoinSource(_)
             | Expression::SubquerySource(_)
             | Expression::ValuesSource(_)
-            | Expression::CteReference(_)
             | Expression::FunctionTableSource(_)
             | Expression::Star(_)
             | Expression::QualifiedStar(_)
@@ -740,11 +700,9 @@ impl Expression {
             Expression::Prefix(e) => e.token.position,
             Expression::Infix(e) => e.token.position,
             Expression::List(e) => e.token.position,
-            Expression::Distinct(e) => e.token.position,
             Expression::Exists(e) => e.token.position,
             Expression::AllAny(e) => e.token.position,
             Expression::In(e) => e.token.position,
-            Expression::InHashSet(e) => e.token.position,
             Expression::QuantifiedSet(e) => e.token.position,
             Expression::Between(e) => e.token.position,
             Expression::Like(e) => e.token.position,
@@ -759,7 +717,6 @@ impl Expression {
             Expression::JoinSource(e) => e.token.position,
             Expression::SubquerySource(e) => e.token.position,
             Expression::ValuesSource(e) => e.token.position,
-            Expression::CteReference(e) => e.token.position,
             Expression::FunctionTableSource(e) => e.token.position,
             Expression::Star(e) => e.token.position,
             Expression::QualifiedStar(e) => e.token.position,
@@ -1311,19 +1268,6 @@ impl fmt::Display for ListExpression {
     }
 }
 
-/// DISTINCT expression
-#[derive(Debug, Clone, PartialEq)]
-pub struct DistinctExpression {
-    pub token: Token,
-    pub expr: Box<Expression>,
-}
-
-impl fmt::Display for DistinctExpression {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "DISTINCT {}", self.expr)
-    }
-}
-
 /// EXISTS expression
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExistsExpression {
@@ -1388,42 +1332,6 @@ impl fmt::Display for InExpression {
             write!(f, "{} NOT IN {}", self.left, self.right)
         } else {
             write!(f, "{} IN {}", self.left, self.right)
-        }
-    }
-}
-
-/// Pre-computed IN expression with HashSet for O(1) lookup
-///
-/// This is used by the semi-join optimization to avoid rebuilding
-/// the HashSet on every row during parallel filtering.
-/// Arc enables cheap cloning when the expression is cloned for parallel execution.
-#[derive(Debug, Clone)]
-pub struct InHashSetExpression {
-    pub token: Token,
-    /// The column/expression to check
-    pub column: Box<Expression>,
-    /// The members, read once for what the comparison needs of them; Arc
-    /// for cheap parallel cloning
-    pub values: CompactArc<PredicateSet>,
-    /// Whether this is NOT IN
-    pub not: bool,
-}
-
-impl PartialEq for InHashSetExpression {
-    fn eq(&self, other: &Self) -> bool {
-        // Compare by CompactArc pointer for efficiency (same HashSet = same CompactArc)
-        self.not == other.not
-            && CompactArc::ptr_eq(&self.values, &other.values)
-            && self.column == other.column
-    }
-}
-
-impl fmt::Display for InHashSetExpression {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.not {
-            write!(f, "{} NOT IN (<{} values>)", self.column, self.values.len())
-        } else {
-            write!(f, "{} IN (<{} values>)", self.column, self.values.len())
         }
     }
 }
@@ -2177,24 +2085,6 @@ impl fmt::Display for FunctionTableSource {
             }
         }
         Ok(())
-    }
-}
-
-/// CTE reference
-#[derive(Debug, Clone, PartialEq)]
-pub struct CteReference {
-    pub token: Token,
-    pub name: Identifier,
-    pub alias: Option<Identifier>,
-}
-
-impl fmt::Display for CteReference {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut result = self.name.to_string();
-        if let Some(ref alias) = self.alias {
-            result.push_str(&format!(" AS {}", alias));
-        }
-        write!(f, "{}", result)
     }
 }
 

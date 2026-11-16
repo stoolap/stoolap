@@ -2407,10 +2407,6 @@ impl StatementWalk<'_> {
                 expression: Box::new(self.expr(&aliased.expression, level)?),
                 ..aliased.clone()
             })),
-            Expression::Distinct(distinct) => Ok(Expression::Distinct(DistinctExpression {
-                token: distinct.token.clone(),
-                expr: Box::new(self.expr(&distinct.expr, level)?),
-            })),
             other => rebuild(other, &mut |child| self.expr(child, level)),
         }
     }
@@ -8190,7 +8186,6 @@ fn each_nested_statement<'e>(expr: &'e Expression, f: &mut dyn FnMut(&'e SelectS
             f(&all_any.subquery);
         }
         Expression::Aliased(aliased) => each_nested_statement(&aliased.expression, f),
-        Expression::Distinct(distinct) => each_nested_statement(&distinct.expr, f),
         other => {
             let _ = for_each_child(other, &mut |child| {
                 each_nested_statement(child, f);
@@ -16951,7 +16946,10 @@ impl<'a> PreparedRunner<'a> {
         let forced = crate::test_failpoints::forced_exists_strategy();
         #[cfg(not(feature = "test-failpoints"))]
         let forced: Option<bool> = None;
-        let mut keyed = forced.unwrap_or_else(|| !self.probe_cheaper(index, plan));
+        let mut keyed = match forced {
+            Some(keyed) => keyed,
+            None => !self.probe_cheaper(index, plan),
+        };
         let table = self.tables[index].as_ref().and_then(BlockInput::table);
         if let Some(table) = table.filter(|_| !keyed && forced.is_none() && plan.asks_more()) {
             let budget = self.probe_budget(index, table);

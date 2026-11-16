@@ -65,7 +65,6 @@ impl Executor {
             }
             Expression::List(list) => list.elements.iter().any(Self::has_subqueries),
             Expression::ExpressionList(list) => list.expressions.iter().any(Self::has_subqueries),
-            Expression::Distinct(distinct) => Self::has_subqueries(&distinct.expr),
             Expression::Window(window) => window
                 .function
                 .arguments
@@ -154,7 +153,6 @@ impl Executor {
             Expression::ExpressionList(list) => {
                 list.expressions.iter().any(Self::has_correlated_subqueries)
             }
-            Expression::Distinct(distinct) => Self::has_correlated_subqueries(&distinct.expr),
             Expression::Window(window) => window
                 .function
                 .arguments
@@ -432,9 +430,6 @@ impl Executor {
                         .as_deref()
                         .is_some_and(|e| Self::references_outer_columns(e, subquery_tables))
             }
-            Expression::Distinct(distinct) => {
-                Self::references_outer_columns(&distinct.expr, subquery_tables)
-            }
             Expression::List(list) => list
                 .elements
                 .iter()
@@ -444,9 +439,6 @@ impl Executor {
                 .iter()
                 .any(|e| Self::references_outer_columns(e, subquery_tables)),
             // A subquery folded to its members keeps the side it is tested on
-            Expression::InHashSet(set) => {
-                Self::references_outer_columns(&set.column, subquery_tables)
-            }
             Expression::QuantifiedSet(set) => {
                 Self::references_outer_columns(&set.left, subquery_tables)
             }

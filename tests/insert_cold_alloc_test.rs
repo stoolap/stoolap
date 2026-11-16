@@ -23,7 +23,6 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use stoolap::core::Error;
-use stoolap::storage::traits::Engine;
 use stoolap::test_failpoints::{
     after_insert_cold_snapshot, in_recheck_fence_section, volume_loads, FailpointGuard,
 };
