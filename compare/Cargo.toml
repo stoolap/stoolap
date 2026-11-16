@@ -15,7 +15,7 @@ duckdb = ["dep:duckdb"]
 
 [dependencies]
 stoolap = { path = ".." }
-rusqlite = { version = "0.40", features = ["bundled"], optional = true }
+rusqlite = { version = "0.41", features = ["bundled"], optional = true }
 duckdb = { version = "1.20000", features = ["bundled"], optional = true }
 rand = "0.9"
 tempfile = "3.9"
