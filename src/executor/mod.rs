@@ -115,20 +115,15 @@ pub use parallel::{
     parallel_hash_build,
     parallel_hash_join,
     parallel_hash_probe,
-    parallel_order_by,
-    parallel_order_by_fn,
     verify_key_match,
     JoinType as ParallelJoinType,
     ParallelConfig,
     ParallelHashTable,
     ParallelJoinResult,
-    SortDirection,
-    SortSpec,
     DEFAULT_PARALLEL_CHUNK_SIZE,
     // Parallel threshold constants - single source of truth
     DEFAULT_PARALLEL_FILTER_THRESHOLD,
     DEFAULT_PARALLEL_JOIN_THRESHOLD,
-    DEFAULT_PARALLEL_SORT_THRESHOLD,
 };
 pub use planner::{ColumnStatsCache, QueryPlanner, StatsHealth};
 pub use query::MAX_VIEW_DEPTH;
@@ -923,11 +918,6 @@ impl Executor {
     /// Clear the query cache
     pub fn clear_cache(&self) {
         self.query_cache.clear();
-    }
-
-    /// Get the semantic cache
-    pub fn semantic_cache(&self) -> &SemanticCache {
-        &self.semantic_cache
     }
 
     /// Get semantic cache statistics

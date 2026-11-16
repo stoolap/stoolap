@@ -215,30 +215,6 @@ impl CachedResult {
         }
     }
 
-    /// Create a new cached result with pre-wrapped Arc (avoids clone)
-    ///
-    /// Use this when the caller already has an CompactArc<Vec<Row>> to avoid
-    /// an extra allocation and copy.
-    pub fn new_with_arc(
-        fingerprint: QueryFingerprint,
-        stamp: CacheStamp,
-        column_names: CompactArc<Vec<String>>,
-        rows: CompactArc<Vec<Row>>,
-        predicate: Option<Expression>,
-    ) -> Self {
-        let now = Instant::now();
-        Self {
-            fingerprint,
-            stamp,
-            column_names,
-            rows, // Use Arc directly - no additional wrapping
-            predicate,
-            cached_at: now,
-            last_accessed: now,
-            access_count: 1,
-        }
-    }
-
     /// Check if this cached result has expired, using a pre-computed `now` instant.
     /// Avoids repeated `Instant::now()` calls (each is a syscall on macOS).
     #[inline]
@@ -529,36 +505,7 @@ impl SemanticCache {
         self.insert_entry(entry, new_row_count, table_key, column_key);
     }
 
-    /// Insert a query result into the cache using a pre-wrapped Arc
-    ///
-    /// This variant allows sharing the Arc between the cache and the caller,
-    /// avoiding a full Vec clone when both need access to the same data.
-    pub fn insert_arc(
-        &self,
-        table_name: &str,
-        columns: CompactArc<Vec<String>>,
-        rows: CompactArc<Vec<Row>>,
-        predicate: Option<Expression>,
-        stamp: CacheStamp,
-    ) {
-        let new_row_count = rows.len();
-
-        // Don't cache if too many rows in this single result
-        if new_row_count > self.max_rows {
-            return;
-        }
-
-        let (table_key, column_key) = Self::cache_keys(table_name, &columns);
-        let fingerprint = match &predicate {
-            Some(p) => QueryFingerprint::with_predicate(table_name, CompactArc::clone(&columns), p),
-            None => QueryFingerprint::new(table_name, CompactArc::clone(&columns)),
-        };
-
-        let entry = CachedResult::new_with_arc(fingerprint, stamp, columns, rows, predicate);
-        self.insert_entry(entry, new_row_count, table_key, column_key);
-    }
-
-    /// Shared insert logic for both `insert` and `insert_arc`
+    /// Insert logic for `insert`
     fn insert_entry(
         &self,
         entry: CachedResult,

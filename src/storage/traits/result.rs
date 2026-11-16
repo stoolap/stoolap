@@ -197,50 +197,6 @@ impl QueryResult for MemoryResult {
     }
 }
 
-/// An empty result that returns no rows
-pub struct EmptyResult {
-    columns: Vec<String>,
-    rows_affected: i64,
-}
-
-impl EmptyResult {
-    /// Creates a new empty result
-    pub fn new() -> Self {
-        Self {
-            columns: Vec::new(),
-            rows_affected: 0,
-        }
-    }
-}
-
-impl Default for EmptyResult {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl QueryResult for EmptyResult {
-    fn columns(&self) -> &[String] {
-        &self.columns
-    }
-
-    fn next(&mut self) -> bool {
-        false
-    }
-
-    fn row(&self) -> &Row {
-        panic!("row() called on empty result")
-    }
-
-    fn close(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    fn rows_affected(&self) -> i64 {
-        self.rows_affected
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,15 +228,5 @@ mod tests {
         assert!(result.next());
         assert!(result.close().is_ok());
         assert!(!result.next()); // After close, next returns false
-    }
-
-    #[test]
-    fn test_empty_result() {
-        let mut result = EmptyResult::new();
-
-        assert!(result.columns().is_empty());
-        assert!(!result.next());
-        assert_eq!(result.rows_affected(), 0);
-        assert!(result.close().is_ok());
     }
 }

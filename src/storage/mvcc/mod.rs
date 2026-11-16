@@ -62,7 +62,6 @@ pub use engine::{CleanupHandle, MVCCEngine};
 pub use persistence::{
     deserialize_row_version, deserialize_value, serialize_row_version, serialize_value,
     serialize_value_into, IndexMetadata, PersistenceManager, PersistenceMeta,
-    DEFAULT_CHECKPOINT_INTERVAL, DEFAULT_KEEP_SNAPSHOTS,
 };
 pub use registry::{TransactionRegistry, INVALID_TRANSACTION_ID, RECOVERY_TRANSACTION_ID};
 pub use scanner::MVCCScanner;

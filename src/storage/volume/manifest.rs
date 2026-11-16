@@ -4853,11 +4853,6 @@ impl SegmentManager {
         self.manifest.write()
     }
 
-    /// Get the volume directory path.
-    pub fn volume_dir(&self) -> Option<&Path> {
-        self.volume_dir.as_deref()
-    }
-
     /// Recompute visibility bitmaps for all segments.
     /// Called after a batch of `load_volume_for_existing_segment` calls (recovery)
     /// so that the bitmaps reflect the final set of loaded volumes.

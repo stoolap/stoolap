@@ -18,7 +18,6 @@
 //!
 //! - **Parallel Scan + Filter**: Process table rows in parallel chunks with WHERE evaluation
 //! - **Parallel Aggregation**: Already implemented in aggregation.rs
-//! - **Parallel Sort**: Parallel ORDER BY using rayon's par_sort (future)
 //! - **Parallel Join**: Parallel hash join build/probe phases (future)
 //!
 //! # Architecture
@@ -64,7 +63,6 @@ pub use super::operators::hash_join::JoinType;
 // Default thresholds for parallel execution - single source of truth
 // These are used by ParallelConfig
 pub const DEFAULT_PARALLEL_FILTER_THRESHOLD: usize = 10_000;
-pub const DEFAULT_PARALLEL_SORT_THRESHOLD: usize = 50_000;
 pub const DEFAULT_PARALLEL_JOIN_THRESHOLD: usize = 10_000;
 pub const DEFAULT_PARALLEL_CHUNK_SIZE: usize = 2048;
 
@@ -75,8 +73,6 @@ pub struct ParallelConfig {
     pub enabled: bool,
     /// Minimum rows to trigger parallel scan + filter
     pub min_rows_for_parallel_filter: usize,
-    /// Minimum rows to trigger parallel sort
-    pub min_rows_for_parallel_sort: usize,
     /// Minimum build rows to trigger parallel hash join
     pub min_rows_for_parallel_join: usize,
     /// Chunk size for parallel processing (rows per thread task)
@@ -88,7 +84,6 @@ impl Default for ParallelConfig {
         Self {
             enabled: true,
             min_rows_for_parallel_filter: DEFAULT_PARALLEL_FILTER_THRESHOLD,
-            min_rows_for_parallel_sort: DEFAULT_PARALLEL_SORT_THRESHOLD,
             min_rows_for_parallel_join: DEFAULT_PARALLEL_JOIN_THRESHOLD,
             // Optimal chunk size balances:
             // - Too small: excessive task scheduling overhead
@@ -100,23 +95,6 @@ impl Default for ParallelConfig {
 }
 
 impl ParallelConfig {
-    /// Create a new parallel config with custom settings
-    pub fn new(
-        enabled: bool,
-        min_rows_for_parallel_filter: usize,
-        min_rows_for_parallel_sort: usize,
-        min_rows_for_parallel_join: usize,
-        chunk_size: usize,
-    ) -> Self {
-        Self {
-            enabled,
-            min_rows_for_parallel_filter,
-            min_rows_for_parallel_sort,
-            min_rows_for_parallel_join,
-            chunk_size,
-        }
-    }
-
     /// Create a config with parallel execution disabled
     pub fn disabled() -> Self {
         Self {
@@ -129,12 +107,6 @@ impl ParallelConfig {
     #[inline]
     pub fn should_parallel_filter(&self, row_count: usize) -> bool {
         self.enabled && row_count >= self.min_rows_for_parallel_filter
-    }
-
-    /// Check if parallel sort should be used for the given row count
-    #[inline]
-    pub fn should_parallel_sort(&self, row_count: usize) -> bool {
-        self.enabled && row_count >= self.min_rows_for_parallel_sort
     }
 
     /// Check if parallel join should be used for the given build side row count
@@ -489,14 +461,6 @@ pub fn verify_key_match(
 pub struct ParallelJoinResult {
     /// The joined rows
     pub rows: Vec<Row>,
-    /// Whether parallel execution was used
-    pub parallel_used: bool,
-    /// Number of probe rows processed
-    pub probe_rows_processed: usize,
-    /// Number of build rows
-    pub build_rows_count: usize,
-    /// Number of matches found
-    pub matches_found: usize,
 }
 
 /// Sequential probe phase for hash join (used when parallel is disabled or dataset is small)
@@ -628,15 +592,7 @@ pub(crate) fn parallel_hash_join_with_room(
     let mut result_rows = probe.slice(probe_rows)?;
     probe.unmatched_build(0, usize::MAX, &mut result_rows)?;
 
-    let matches_found = result_rows.len();
-
-    Ok(ParallelJoinResult {
-        rows: result_rows,
-        parallel_used: use_parallel,
-        probe_rows_processed: probe_count,
-        build_rows_count: build_count,
-        matches_found,
-    })
+    Ok(ParallelJoinResult { rows: result_rows })
 }
 
 /// Whether a hash join of `build_count` and `probe_count` rows probes on the
@@ -1074,84 +1030,6 @@ fn combine_build_with_nulls(
     combined
 }
 
-// ============================================================================
-// Parallel ORDER BY
-// ============================================================================
-
-/// Sort direction for ORDER BY
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SortDirection {
-    Ascending,
-    Descending,
-}
-
-/// Sort specification for a single column
-#[derive(Clone, Debug)]
-pub struct SortSpec {
-    /// Column index to sort by
-    pub column_index: usize,
-    /// Sort direction (ASC or DESC)
-    pub direction: SortDirection,
-    /// NULLS FIRST or NULLS LAST
-    pub nulls_first: bool,
-}
-
-/// Parallel ORDER BY execution
-///
-/// Sorts rows in parallel using rayon's par_sort when the dataset is large enough.
-/// Supports multi-column sorting with mixed ASC/DESC directions and NULL handling.
-///
-/// # Performance
-///
-/// For 100K rows:
-/// - Sequential: ~50ms
-/// - Parallel (8 cores): ~15ms (3x speedup)
-pub fn parallel_order_by(
-    rows: &mut [(i64, Row)],
-    sort_specs: &[SortSpec],
-    config: &ParallelConfig,
-) {
-    let compare = |(_, a): &(i64, Row), (_, b): &(i64, Row)| -> std::cmp::Ordering {
-        for spec in sort_specs {
-            let ordering = crate::core::value::compare_order_key(
-                a.get(spec.column_index),
-                b.get(spec.column_index),
-                spec.direction != SortDirection::Descending,
-                Some(spec.nulls_first),
-            );
-            if ordering != std::cmp::Ordering::Equal {
-                return ordering;
-            }
-        }
-        std::cmp::Ordering::Equal
-    };
-
-    #[cfg(feature = "parallel")]
-    if config.should_parallel_sort(rows.len()) {
-        rows.par_sort_unstable_by(compare);
-        return;
-    }
-    let _ = config; // suppress unused warning when parallel feature is disabled
-    rows.sort_unstable_by(compare);
-}
-
-/// Parallel ORDER BY with a custom comparator function
-///
-/// More flexible version that accepts any comparison function.
-/// Uses unstable sort for better performance.
-pub fn parallel_order_by_fn<F>(rows: &mut [(i64, Row)], compare: F, config: &ParallelConfig)
-where
-    F: Fn(&Row, &Row) -> std::cmp::Ordering + Sync + Send,
-{
-    #[cfg(feature = "parallel")]
-    if config.should_parallel_sort(rows.len()) {
-        rows.par_sort_unstable_by(|(_, a), (_, b)| compare(a, b));
-        return;
-    }
-    let _ = config; // suppress unused warning when parallel feature is disabled
-    rows.sort_unstable_by(|(_, a), (_, b)| compare(a, b));
-}
-
 /// Distance metric for vector search
 #[derive(Debug, Clone, Copy)]
 pub enum DistanceMetric {
@@ -1361,9 +1239,6 @@ mod tests {
         assert!(!config.should_parallel_filter(1000)); // Below threshold
         assert!(config.should_parallel_filter(20_000)); // Above threshold
 
-        assert!(!config.should_parallel_sort(10_000)); // Below threshold
-        assert!(config.should_parallel_sort(100_000)); // Above threshold
-
         let disabled = ParallelConfig::disabled();
         assert!(!disabled.should_parallel_filter(1_000_000)); // Always false when disabled
     }
@@ -1457,101 +1332,6 @@ mod tests {
 
         // Same value in column 1
         assert!(verify_key_match(&row1, &row3, &[1], &[1]));
-    }
-
-    #[test]
-    fn test_parallel_order_by() {
-        // Create rows with random-ish order
-        let mut rows: RowVec = (0..1000)
-            .map(|i| {
-                (
-                    i,
-                    Row::from_values(vec![
-                        Value::Integer((i * 7 + 13) % 1000), // Scrambled order
-                        Value::Text(format!("row_{}", i).into()),
-                    ]),
-                )
-            })
-            .collect();
-
-        let config = ParallelConfig {
-            min_rows_for_parallel_sort: 100,
-            ..Default::default()
-        };
-
-        let sort_specs = vec![SortSpec {
-            column_index: 0,
-            direction: SortDirection::Ascending,
-            nulls_first: false,
-        }];
-
-        parallel_order_by(&mut rows, &sort_specs, &config);
-
-        // Verify sorted ascending
-        for i in 1..rows.len() {
-            let prev = rows[i - 1].1.get(0).and_then(|v| v.as_int64()).unwrap();
-            let curr = rows[i].1.get(0).and_then(|v| v.as_int64()).unwrap();
-            assert!(prev <= curr, "Row {} should be <= row {}", i - 1, i);
-        }
-    }
-
-    #[test]
-    fn test_parallel_order_by_descending() {
-        let mut rows: RowVec = (0..500)
-            .map(|i| (i, Row::from_values(vec![Value::Integer(i)])))
-            .collect();
-
-        let config = ParallelConfig {
-            min_rows_for_parallel_sort: 100,
-            ..Default::default()
-        };
-
-        let sort_specs = vec![SortSpec {
-            column_index: 0,
-            direction: SortDirection::Descending,
-            nulls_first: false,
-        }];
-
-        parallel_order_by(&mut rows, &sort_specs, &config);
-
-        // Verify sorted descending
-        for i in 1..rows.len() {
-            let prev = rows[i - 1].1.get(0).and_then(|v| v.as_int64()).unwrap();
-            let curr = rows[i].1.get(0).and_then(|v| v.as_int64()).unwrap();
-            assert!(prev >= curr, "Row {} should be >= row {}", i - 1, i);
-        }
-    }
-
-    #[test]
-    fn test_parallel_order_by_with_nulls() {
-        let mut rows = RowVec::new();
-        rows.push((0, Row::from_values(vec![Value::Integer(3)])));
-        rows.push((1, Row::from_values(vec![Value::null_unknown()])));
-        rows.push((2, Row::from_values(vec![Value::Integer(1)])));
-        rows.push((3, Row::from_values(vec![Value::null_unknown()])));
-        rows.push((4, Row::from_values(vec![Value::Integer(2)])));
-
-        let config = ParallelConfig {
-            min_rows_for_parallel_sort: 1, // Force parallel for test
-            ..Default::default()
-        };
-
-        // NULLS FIRST
-        let sort_specs = vec![SortSpec {
-            column_index: 0,
-            direction: SortDirection::Ascending,
-            nulls_first: true,
-        }];
-
-        parallel_order_by(&mut rows, &sort_specs, &config);
-
-        // First two should be NULL
-        assert!(rows[0].1.get(0).map(|v| v.is_null()).unwrap_or(false));
-        assert!(rows[1].1.get(0).map(|v| v.is_null()).unwrap_or(false));
-        // Then 1, 2, 3
-        assert_eq!(rows[2].1.get(0), Some(&Value::Integer(1)));
-        assert_eq!(rows[3].1.get(0), Some(&Value::Integer(2)));
-        assert_eq!(rows[4].1.get(0), Some(&Value::Integer(3)));
     }
 
     // ========================================================================

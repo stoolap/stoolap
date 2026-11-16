@@ -106,15 +106,6 @@ impl BloomFilterOperator {
     pub fn rows_passed(&self) -> u64 {
         self.rows_passed
     }
-
-    /// Get the filter selectivity (fraction of rows that passed).
-    pub fn selectivity(&self) -> f64 {
-        if self.rows_checked == 0 {
-            1.0
-        } else {
-            self.rows_passed as f64 / self.rows_checked as f64
-        }
-    }
 }
 
 impl Operator for BloomFilterOperator {
@@ -179,10 +170,6 @@ impl Operator for BloomFilterOperator {
             let selectivity = self.bloom_filter.estimated_selectivity();
             (count as f64 * selectivity).ceil() as usize
         })
-    }
-
-    fn name(&self) -> &str {
-        "BloomFilter"
     }
 }
 

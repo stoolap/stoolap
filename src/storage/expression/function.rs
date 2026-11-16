@@ -136,13 +136,6 @@ impl FunctionExpr {
         Self::new(function, arguments, Operator::Eq, compare_value)
     }
 
-    /// Create a function expression that evaluates to boolean (no comparison)
-    ///
-    /// This is for functions that return boolean directly, like custom predicates
-    pub fn boolean(function: Arc<dyn ScalarFunction>, arguments: Vec<FunctionArg>) -> Self {
-        Self::new(function, arguments, Operator::Eq, Value::Boolean(true))
-    }
-
     /// Get the function name
     pub fn function_name(&self) -> &str {
         self.function.name()
@@ -362,60 +355,6 @@ impl Expression for FunctionExpr {
     }
 }
 
-/// Expression that wraps a closure for dynamic evaluation
-///
-/// This is useful for testing or when you need a custom predicate
-/// that doesn't fit the standard expression types.
-pub struct EvalExpr {
-    /// The evaluation function
-    eval_fn: Box<dyn Fn(&Row) -> bool + Send + Sync>,
-}
-
-impl EvalExpr {
-    /// Create a new eval expression from a closure
-    pub fn new<F>(f: F) -> Self
-    where
-        F: Fn(&Row) -> bool + Send + Sync + 'static,
-    {
-        Self {
-            eval_fn: Box::new(f),
-        }
-    }
-}
-
-impl Debug for EvalExpr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("EvalExpr").finish()
-    }
-}
-
-impl Expression for EvalExpr {
-    fn evaluate(&self, row: &Row) -> Result<bool> {
-        Ok((self.eval_fn)(row))
-    }
-
-    fn evaluate_fast(&self, row: &Row) -> bool {
-        (self.eval_fn)(row)
-    }
-
-    fn with_aliases(&self, _aliases: &FxHashMap<String, String>) -> Box<dyn Expression> {
-        // Can't modify the closure, return a clone
-        panic!("EvalExpr does not support alias resolution")
-    }
-
-    fn prepare_for_schema(&mut self, _schema: &Schema) {
-        // Nothing to prepare for closures
-    }
-
-    fn is_prepared(&self) -> bool {
-        true // Always "prepared"
-    }
-
-    fn clone_box(&self) -> Box<dyn Expression> {
-        panic!("EvalExpr cannot be cloned")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,23 +493,6 @@ mod tests {
             Value::text("bob"),
             Value::Integer(25),
         ]);
-        assert!(!expr.evaluate(&row2).unwrap());
-    }
-
-    #[test]
-    fn test_eval_expr() {
-        let expr = EvalExpr::new(|row| {
-            // Return true if first column is Integer > 5
-            match row.get(0) {
-                Some(Value::Integer(n)) => *n > 5,
-                _ => false,
-            }
-        });
-
-        let row1 = Row::from_values(vec![Value::Integer(10)]);
-        assert!(expr.evaluate(&row1).unwrap());
-
-        let row2 = Row::from_values(vec![Value::Integer(3)]);
         assert!(!expr.evaluate(&row2).unwrap());
     }
 

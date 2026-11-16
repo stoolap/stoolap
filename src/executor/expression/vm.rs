@@ -109,24 +109,6 @@ impl<'a> Stack<'a> {
         self.0.truncate(len);
     }
 
-    #[inline]
-    fn swap(&mut self, a: usize, b: usize) {
-        self.0.swap(a, b);
-    }
-
-    /// The top value pushed again; nothing on an empty stack
-    #[inline]
-    fn dup(&mut self) {
-        if let Some(top) = self.0.last().cloned() {
-            self.0.push(top);
-        }
-    }
-
-    #[inline]
-    fn clear(&mut self) {
-        self.0.clear();
-    }
-
     /// The values from `start` to the top
     #[inline]
     fn from(&self, start: usize) -> &[Cow<'a, Value>] {
@@ -1136,20 +1118,6 @@ impl ExprVM {
                     pc += 1;
                 }
 
-                Op::Coalesce(n) => {
-                    let n = *n as usize;
-                    let start = stack.len().saturating_sub(n);
-
-                    // Find first non-null using slice iteration (no intermediate buffer)
-                    let result_idx = stack
-                        .from(start)
-                        .iter()
-                        .position(|v| !v.is_null())
-                        .map(|i| start + i);
-                    stack.take_one(start, result_idx);
-                    pc += 1;
-                }
-
                 Op::NullIf => {
                     let b = stack.pop();
                     let a = stack.pop();
@@ -1247,58 +1215,9 @@ impl ExprVM {
                 // =============================================================
                 // CONTROL FLOW
                 // =============================================================
-                Op::Jump(target) => {
-                    pc = *target as usize;
-                }
-
-                Op::JumpIfTrue(target) => {
-                    let top = stack.last().unwrap_or(&Value::Null(DataType::Boolean));
-                    if Self::to_bool(top) {
-                        pc = *target as usize;
-                    } else {
-                        pc += 1;
-                    }
-                }
-
-                Op::JumpIfFalse(target) => {
-                    let top = stack.last().unwrap_or(&Value::Null(DataType::Boolean));
-                    if !Self::to_bool(top) {
-                        pc = *target as usize;
-                    } else {
-                        pc += 1;
-                    }
-                }
-
-                Op::JumpIfNull(target) => {
-                    let top = stack.last().unwrap_or(&Value::Null(DataType::Boolean));
-                    if top.is_null() {
-                        pc = *target as usize;
-                    } else {
-                        pc += 1;
-                    }
-                }
-
                 Op::JumpIfNotNull(target) => {
                     let top = stack.last().unwrap_or(&Value::Null(DataType::Boolean));
                     if !top.is_null() {
-                        pc = *target as usize;
-                    } else {
-                        pc += 1;
-                    }
-                }
-
-                Op::PopJumpIfTrue(target) => {
-                    let v = stack.pop();
-                    if Self::to_bool(&v) {
-                        pc = *target as usize;
-                    } else {
-                        pc += 1;
-                    }
-                }
-
-                Op::PopJumpIfFalse(target) => {
-                    let v = stack.pop();
-                    if !Self::to_bool(&v) {
                         pc = *target as usize;
                     } else {
                         pc += 1;
@@ -1323,24 +1242,6 @@ impl ExprVM {
                     break;
                 }
 
-                Op::ReturnTrue => {
-                    stack.clear();
-                    stack.push(Value::Boolean(true));
-                    break;
-                }
-
-                Op::ReturnFalse => {
-                    stack.clear();
-                    stack.push(Value::Boolean(false));
-                    break;
-                }
-
-                Op::ReturnNull(dt) => {
-                    stack.clear();
-                    stack.push(Value::Null(*dt));
-                    break;
-                }
-
                 op @ (Op::LoadTransactionId
                 | Op::IsDistinctFrom
                 | Op::IsNotDistinctFrom
@@ -1362,11 +1263,6 @@ impl ExprVM {
                 | Op::RegexpDynamic
                 | Op::JsonAccess
                 | Op::JsonAccessText
-                | Op::TimestampAddInterval
-                | Op::TimestampSubInterval
-                | Op::TimestampDiff
-                | Op::TimestampAddDays
-                | Op::TimestampSubDays
                 | Op::ScaleInterval(..)
                 | Op::TimestampAddScaledInterval(..)
                 | Op::TruncateToDate
@@ -1382,8 +1278,6 @@ impl ExprVM {
                 | Op::IsNotFalse
                 | Op::ReadAsColumn(_)
                 | Op::ReadAsVector
-                | Op::Dup
-                | Op::Swap
                 | Op::ExecScalarSubquery(_)
                 | Op::ExecExists(_)
                 | Op::ExecInSubquery(_)
@@ -1622,62 +1516,6 @@ impl ExprVM {
             // =================================================================
             // TIMESTAMP OPERATIONS
             // =================================================================
-            Op::TimestampAddInterval => {
-                let interval = stack.pop();
-                let ts = stack.pop();
-                let result = Self::timestamp_add_interval(&ts, &interval, false)?;
-                stack.push(result);
-            }
-
-            Op::TimestampSubInterval => {
-                let interval = stack.pop();
-                let ts = stack.pop();
-                let result = Self::timestamp_add_interval(&ts, &interval, true)?;
-                stack.push(result);
-            }
-
-            Op::TimestampDiff => {
-                let ts2 = stack.pop();
-                let ts1 = stack.pop();
-                let result = match (&*ts1, &*ts2) {
-                    (Value::Timestamp(t1), Value::Timestamp(t2)) => {
-                        let duration = t1.signed_duration_since(*t2);
-                        Value::Text(SmartString::from_string(
-                            self.format_duration_as_interval(duration),
-                        ))
-                    }
-                    _ if ts1.is_null() || ts2.is_null() => Value::Null(DataType::Text),
-                    _ => Value::Null(DataType::Text),
-                };
-                stack.push(result);
-            }
-
-            Op::TimestampAddDays => {
-                let days = stack.pop();
-                let ts = stack.pop();
-                let result = match (&*ts, &*days) {
-                    (Value::Timestamp(t), Value::Integer(d)) => {
-                        Self::timestamp_add_days(*t, *d, false)?
-                    }
-                    _ if ts.is_null() || days.is_null() => Value::Null(DataType::Timestamp),
-                    _ => Value::Null(DataType::Timestamp),
-                };
-                stack.push(result);
-            }
-
-            Op::TimestampSubDays => {
-                let days = stack.pop();
-                let ts = stack.pop();
-                let result = match (&*ts, &*days) {
-                    (Value::Timestamp(t), Value::Integer(d)) => {
-                        Self::timestamp_add_days(*t, *d, true)?
-                    }
-                    _ if ts.is_null() || days.is_null() => Value::Null(DataType::Timestamp),
-                    _ => Value::Null(DataType::Timestamp),
-                };
-                stack.push(result);
-            }
-
             Op::ScaleInterval(step, count) => {
                 let result = match Self::pop_interval_multiplier(stack, *count)? {
                     Some(k) => Value::Text(SmartString::from_string(Self::interval_text(
@@ -1900,15 +1738,6 @@ impl ExprVM {
 
             // Read when the program is bound; unbound, the function reads it
             Op::ReadAsVector => {}
-
-            Op::Dup => stack.dup(),
-
-            Op::Swap => {
-                let len = stack.len();
-                if len >= 2 {
-                    stack.swap(len - 1, len - 2);
-                }
-            }
 
             // =================================================================
             // SUBQUERY OPERATIONS
@@ -3956,21 +3785,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_coalesce() {
-        let mut vm = ExprVM::new();
-        let program = Program::new(vec![
-            Op::LoadNull(DataType::Integer),
-            Op::LoadNull(DataType::Integer),
-            Op::LoadConst(Value::Integer(42)),
-            Op::Coalesce(3),
-            Op::Return,
-        ]);
-        let row = Row::new();
-        let ctx = ExecuteContext::new(&row);
-        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(42));
-    }
-
-    #[test]
     fn test_nullif() {
         let mut vm = ExprVM::new();
         // NULLIF(5, 5) -> NULL
@@ -4029,35 +3843,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_dup() {
-        let mut vm = ExprVM::new();
-        let program = Program::new(vec![
-            Op::LoadConst(Value::Integer(42)),
-            Op::Dup,
-            Op::Add, // 42 + 42
-            Op::Return,
-        ]);
-        let row = Row::new();
-        let ctx = ExecuteContext::new(&row);
-        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(84));
-    }
-
-    #[test]
-    fn test_swap() {
-        let mut vm = ExprVM::new();
-        let program = Program::new(vec![
-            Op::LoadConst(Value::Integer(10)),
-            Op::LoadConst(Value::Integer(3)),
-            Op::Swap,
-            Op::Sub, // 3 - 10
-            Op::Return,
-        ]);
-        let row = Row::new();
-        let ctx = ExecuteContext::new(&row);
-        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(-7));
-    }
-
-    #[test]
     fn test_pop() {
         let mut vm = ExprVM::new();
         let program = Program::new(vec![
@@ -4074,68 +3859,6 @@ mod tests {
     // =========================================================================
     // Jump operations tests
     // =========================================================================
-
-    #[test]
-    fn test_jump() {
-        let mut vm = ExprVM::new();
-        let program = Program::new(vec![
-            Op::LoadConst(Value::Integer(1)),
-            Op::Jump(3),
-            Op::LoadConst(Value::Integer(2)), // Skipped
-            Op::Return,
-        ]);
-        let row = Row::new();
-        let ctx = ExecuteContext::new(&row);
-        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(1));
-    }
-
-    #[test]
-    fn test_jump_if_true() {
-        let mut vm = ExprVM::new();
-        let program = Program::new(vec![
-            Op::LoadConst(Value::Boolean(true)),
-            Op::JumpIfTrue(4),
-            Op::LoadConst(Value::Integer(0)), // Skipped
-            Op::Return,
-            Op::LoadConst(Value::Integer(1)), // Executed
-            Op::Return,
-        ]);
-        let row = Row::new();
-        let ctx = ExecuteContext::new(&row);
-        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(1));
-    }
-
-    #[test]
-    fn test_jump_if_false() {
-        let mut vm = ExprVM::new();
-        let program = Program::new(vec![
-            Op::LoadConst(Value::Boolean(false)),
-            Op::JumpIfFalse(4),
-            Op::LoadConst(Value::Integer(0)), // Skipped
-            Op::Return,
-            Op::LoadConst(Value::Integer(1)), // Executed
-            Op::Return,
-        ]);
-        let row = Row::new();
-        let ctx = ExecuteContext::new(&row);
-        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(1));
-    }
-
-    #[test]
-    fn test_jump_if_null() {
-        let mut vm = ExprVM::new();
-        let program = Program::new(vec![
-            Op::LoadNull(DataType::Integer),
-            Op::JumpIfNull(4),
-            Op::LoadConst(Value::Integer(0)), // Skipped
-            Op::Return,
-            Op::LoadConst(Value::Integer(1)), // Executed
-            Op::Return,
-        ]);
-        let row = Row::new();
-        let ctx = ExecuteContext::new(&row);
-        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(1));
-    }
 
     #[test]
     fn test_jump_if_not_null() {
@@ -4212,38 +3935,6 @@ mod tests {
             Op::Return,
         ]);
         assert_eq!(vm.execute(&program3, &ctx).unwrap(), Value::Integer(50));
-    }
-
-    // =========================================================================
-    // Return variants tests
-    // =========================================================================
-
-    #[test]
-    fn test_return_true() {
-        let mut vm = ExprVM::new();
-        let program = Program::new(vec![Op::ReturnTrue]);
-        let row = Row::new();
-        let ctx = ExecuteContext::new(&row);
-        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
-    }
-
-    #[test]
-    fn test_return_false() {
-        let mut vm = ExprVM::new();
-        let program = Program::new(vec![Op::ReturnFalse]);
-        let row = Row::new();
-        let ctx = ExecuteContext::new(&row);
-        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(false));
-    }
-
-    #[test]
-    fn test_return_null() {
-        let mut vm = ExprVM::new();
-        let program = Program::new(vec![Op::ReturnNull(DataType::Text)]);
-        let row = Row::new();
-        let ctx = ExecuteContext::new(&row);
-        let result = vm.execute(&program, &ctx).unwrap();
-        assert!(result.is_null());
     }
 
     // =========================================================================
@@ -4434,42 +4125,6 @@ mod tests {
         } else {
             panic!("Expected Timestamp result, got {:?}", result);
         }
-    }
-
-    // =========================================================================
-    // Pop/Jump combinations
-    // =========================================================================
-
-    #[test]
-    fn test_pop_jump_if_true() {
-        let mut vm = ExprVM::new();
-        let program = Program::new(vec![
-            Op::LoadConst(Value::Boolean(true)),
-            Op::PopJumpIfTrue(4),
-            Op::LoadConst(Value::Integer(0)), // Skipped
-            Op::Return,
-            Op::LoadConst(Value::Integer(1)), // Executed
-            Op::Return,
-        ]);
-        let row = Row::new();
-        let ctx = ExecuteContext::new(&row);
-        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(1));
-    }
-
-    #[test]
-    fn test_pop_jump_if_false() {
-        let mut vm = ExprVM::new();
-        let program = Program::new(vec![
-            Op::LoadConst(Value::Boolean(false)),
-            Op::PopJumpIfFalse(4),
-            Op::LoadConst(Value::Integer(0)), // Skipped
-            Op::Return,
-            Op::LoadConst(Value::Integer(1)), // Executed
-            Op::Return,
-        ]);
-        let row = Row::new();
-        let ctx = ExecuteContext::new(&row);
-        assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Integer(1));
     }
 
     // =========================================================================

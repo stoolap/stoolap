@@ -286,26 +286,6 @@ pub enum Op {
     // =========================================================================
     // TIMESTAMP OPERATIONS
     // =========================================================================
-    /// Add interval to timestamp: timestamp + interval_string
-    /// Stack: [timestamp, interval_text] -> [timestamp]
-    TimestampAddInterval,
-
-    /// Subtract interval from timestamp: timestamp - interval_string
-    /// Stack: [timestamp, interval_text] -> [timestamp]
-    TimestampSubInterval,
-
-    /// Subtract timestamps: timestamp - timestamp (returns interval text)
-    /// Stack: [timestamp1, timestamp2] -> [interval_text]
-    TimestampDiff,
-
-    /// Add days to timestamp: timestamp + integer
-    /// Stack: [timestamp, days] -> [timestamp]
-    TimestampAddDays,
-
-    /// Subtract days from timestamp: timestamp - integer
-    /// Stack: [timestamp, days] -> [timestamp]
-    TimestampSubDays,
-
     /// An INTERVAL literal times the product of `count` numbers, as interval text
     /// Stack: [number; count] -> [interval_text]
     ScaleInterval(IntervalStep, u8),
@@ -391,10 +371,6 @@ pub enum Op {
         arg_count: u8,
     },
 
-    /// Special: COALESCE - return first non-null
-    /// Stack: [arg1, ..., argN] -> [result]
-    Coalesce(u8), // arg count
-
     /// Special: NULLIF(a, b) - return NULL if a = b
     /// Stack: [a, b] -> [a or null]
     NullIf,
@@ -463,36 +439,12 @@ pub enum Op {
     // =========================================================================
     // CONTROL FLOW
     // =========================================================================
-    /// Unconditional jump
-    Jump(u32),
-
-    /// Jump if top of stack is true (doesn't pop)
-    JumpIfTrue(u32),
-
-    /// Jump if top of stack is false (doesn't pop)
-    JumpIfFalse(u32),
-
-    /// Jump if top of stack is NULL (doesn't pop)
-    JumpIfNull(u32),
-
     /// Jump if top of stack is NOT NULL (doesn't pop)
     /// Used for COALESCE short-circuit evaluation
     JumpIfNotNull(u32),
 
-    /// Pop and jump if true
-    PopJumpIfTrue(u32),
-
-    /// Pop and jump if false
-    PopJumpIfFalse(u32),
-
-    /// Duplicate top of stack
-    Dup,
-
     /// Pop top of stack (discard)
     Pop,
-
-    /// Swap top two stack elements
-    Swap,
 
     // =========================================================================
     // SUBQUERY OPERATIONS (for correlated/scalar subqueries)
@@ -540,15 +492,6 @@ pub enum Op {
 
     /// Return current top of stack as result
     Return,
-
-    /// Return true immediately
-    ReturnTrue,
-
-    /// Return false immediately
-    ReturnFalse,
-
-    /// Return NULL immediately
-    ReturnNull(DataType),
 }
 
 /// The members of `value op ANY` or `value op ALL`, each compared with the
@@ -970,11 +913,6 @@ impl std::fmt::Debug for Op {
             Op::RegexpDynamic => write!(f, "RegexpDynamic"),
             Op::JsonAccess => write!(f, "JsonAccess"),
             Op::JsonAccessText => write!(f, "JsonAccessText"),
-            Op::TimestampAddInterval => write!(f, "TimestampAddInterval"),
-            Op::TimestampSubInterval => write!(f, "TimestampSubInterval"),
-            Op::TimestampDiff => write!(f, "TimestampDiff"),
-            Op::TimestampAddDays => write!(f, "TimestampAddDays"),
-            Op::TimestampSubDays => write!(f, "TimestampSubDays"),
             Op::ScaleInterval(step, count) => write!(f, "ScaleInterval({:?}, {})", step, count),
             Op::TimestampAddScaledInterval(step, subtract, count) => write!(
                 f,
@@ -1020,7 +958,6 @@ impl std::fmt::Debug for Op {
             Op::IsFalse => write!(f, "IsFalse"),
             Op::IsNotFalse => write!(f, "IsNotFalse"),
             Op::CallScalar { arg_count, .. } => write!(f, "CallScalar(args={})", arg_count),
-            Op::Coalesce(n) => write!(f, "Coalesce({})", n),
             Op::NullIf => write!(f, "NullIf"),
             Op::Greatest(n) => write!(f, "Greatest({})", n),
             Op::Least(n) => write!(f, "Least({})", n),
@@ -1034,16 +971,8 @@ impl std::fmt::Debug for Op {
             Op::CaseElse => write!(f, "CaseElse"),
             Op::CaseEnd => write!(f, "CaseEnd"),
             Op::CaseCompare => write!(f, "CaseCompare"),
-            Op::Jump(target) => write!(f, "Jump({})", target),
-            Op::JumpIfTrue(target) => write!(f, "JumpIfTrue({})", target),
-            Op::JumpIfFalse(target) => write!(f, "JumpIfFalse({})", target),
-            Op::JumpIfNull(target) => write!(f, "JumpIfNull({})", target),
             Op::JumpIfNotNull(target) => write!(f, "JumpIfNotNull({})", target),
-            Op::PopJumpIfTrue(target) => write!(f, "PopJumpIfTrue({})", target),
-            Op::PopJumpIfFalse(target) => write!(f, "PopJumpIfFalse({})", target),
-            Op::Dup => write!(f, "Dup"),
             Op::Pop => write!(f, "Pop"),
-            Op::Swap => write!(f, "Swap"),
             Op::ExecScalarSubquery(idx) => write!(f, "ExecScalarSubquery({})", idx),
             Op::ExecExists(idx) => write!(f, "ExecExists({})", idx),
             Op::ExecInSubquery(idx) => write!(f, "ExecInSubquery({})", idx),
@@ -1055,9 +984,6 @@ impl std::fmt::Debug for Op {
             Op::LoadTransactionId => write!(f, "LoadTransactionId"),
             Op::Nop => write!(f, "Nop"),
             Op::Return => write!(f, "Return"),
-            Op::ReturnTrue => write!(f, "ReturnTrue"),
-            Op::ReturnFalse => write!(f, "ReturnFalse"),
-            Op::ReturnNull(dt) => write!(f, "ReturnNull({:?})", dt),
             Op::NativeFn1(_) => write!(f, "NativeFn1(...)"),
             Op::ConcatN(n) => write!(f, "ConcatN({})", n),
         }
@@ -1286,12 +1212,8 @@ mod tests {
         assert_eq!(format!("{:?}", Op::IsNull), "IsNull");
         assert_eq!(format!("{:?}", Op::IsNotNull), "IsNotNull");
         assert_eq!(format!("{:?}", Op::Return), "Return");
-        assert_eq!(format!("{:?}", Op::ReturnTrue), "ReturnTrue");
-        assert_eq!(format!("{:?}", Op::ReturnFalse), "ReturnFalse");
         assert_eq!(format!("{:?}", Op::Nop), "Nop");
-        assert_eq!(format!("{:?}", Op::Dup), "Dup");
         assert_eq!(format!("{:?}", Op::Pop), "Pop");
-        assert_eq!(format!("{:?}", Op::Swap), "Swap");
     }
 
     #[test]
@@ -1306,14 +1228,10 @@ mod tests {
         );
         assert_eq!(format!("{:?}", Op::And(5)), "And(jump=5)");
         assert_eq!(format!("{:?}", Op::Or(10)), "Or(jump=10)");
-        assert_eq!(format!("{:?}", Op::Jump(15)), "Jump(15)");
-        assert_eq!(format!("{:?}", Op::JumpIfTrue(20)), "JumpIfTrue(20)");
-        assert_eq!(format!("{:?}", Op::JumpIfFalse(25)), "JumpIfFalse(25)");
     }
 
     #[test]
     fn test_op_debug_format_special() {
-        assert_eq!(format!("{:?}", Op::Coalesce(3)), "Coalesce(3)");
         assert_eq!(format!("{:?}", Op::NullIf), "NullIf");
         assert_eq!(format!("{:?}", Op::Greatest(2)), "Greatest(2)");
         assert_eq!(format!("{:?}", Op::Least(4)), "Least(4)");
@@ -1342,21 +1260,6 @@ mod tests {
         assert_eq!(format!("{:?}", Op::CaseElse), "CaseElse");
         assert_eq!(format!("{:?}", Op::CaseEnd), "CaseEnd");
         assert_eq!(format!("{:?}", Op::CaseCompare), "CaseCompare");
-    }
-
-    #[test]
-    fn test_op_debug_timestamp() {
-        assert_eq!(
-            format!("{:?}", Op::TimestampAddInterval),
-            "TimestampAddInterval"
-        );
-        assert_eq!(
-            format!("{:?}", Op::TimestampSubInterval),
-            "TimestampSubInterval"
-        );
-        assert_eq!(format!("{:?}", Op::TimestampDiff), "TimestampDiff");
-        assert_eq!(format!("{:?}", Op::TimestampAddDays), "TimestampAddDays");
-        assert_eq!(format!("{:?}", Op::TimestampSubDays), "TimestampSubDays");
     }
 
     #[test]

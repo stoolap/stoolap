@@ -65,8 +65,6 @@ pub struct QueryClassification {
     pub has_window_functions: bool,
     /// Whether the query has GROUP BY clause
     pub has_group_by: bool,
-    /// Number of columns in GROUP BY
-    pub group_by_column_count: usize,
     /// Whether the query has ORDER BY clause
     pub has_order_by: bool,
     /// Whether the query has LIMIT clause
@@ -87,20 +85,10 @@ pub struct QueryClassification {
     // === SELECT clause analysis ===
     /// Whether the SELECT is `*` (all columns)
     pub is_select_star: bool,
-    /// Whether the SELECT has qualified star (table.*)
-    pub has_qualified_star: bool,
-    /// Number of columns in SELECT
-    pub select_column_count: usize,
-    /// Whether SELECT has scalar subqueries
-    pub select_has_scalar_subqueries: bool,
 
     // === JOIN analysis ===
     /// Whether the query has any joins
     pub has_joins: bool,
-    /// Whether the query has outer joins (LEFT, RIGHT, FULL)
-    pub has_outer_joins: bool,
-    /// Number of joins in the query
-    pub join_count: usize,
 
     // === WHERE clause analysis ===
     /// Whether query has a WHERE clause
@@ -109,14 +97,6 @@ pub struct QueryClassification {
     pub where_has_parameters: bool,
     /// Whether WHERE clause has any subqueries
     pub where_has_subqueries: bool,
-    /// Whether WHERE has EXISTS subqueries
-    pub where_has_exists: bool,
-    /// Whether WHERE has IN with subquery
-    pub where_has_in_subquery: bool,
-    /// Whether WHERE has scalar subqueries
-    pub where_has_scalar_subquery: bool,
-    /// Whether WHERE has ALL/ANY subqueries
-    pub where_has_all_any: bool,
     /// Whether WHERE has correlated subqueries (references outer columns)
     pub where_has_correlated_subqueries: bool,
     /// Whether WHERE or SELECT has non-deterministic functions (NOW, RANDOM, UUID, etc.)
@@ -135,14 +115,6 @@ pub struct QueryClassification {
     // === ORDER BY analysis ===
     /// Whether ORDER BY has correlated subqueries
     pub order_by_has_correlated_subqueries: bool,
-
-    // === Table source analysis ===
-    /// Whether query has derived tables (subqueries in FROM)
-    pub has_derived_tables: bool,
-
-    // === Compound classifications ===
-    /// Simple scan: no joins, no subqueries, no aggregation, no window functions
-    pub is_simple_scan: bool,
 
     /// Whether the statement, or one inside it, names `_rowid_` or the row id
     /// slot a spelled one reads
@@ -202,7 +174,6 @@ impl QueryClassification {
         let has_aggregation = Self::check_has_aggregation(stmt);
         let has_window_functions = Self::check_has_window_functions(stmt);
         let has_group_by = !stmt.group_by.columns.is_empty();
-        let group_by_column_count = stmt.group_by.columns.len();
         let has_order_by = !stmt.order_by.is_empty();
         let has_limit = stmt.limit.is_some();
         let has_offset = stmt.offset.is_some();
@@ -215,35 +186,18 @@ impl QueryClassification {
         // SELECT clause analysis
         let is_select_star =
             stmt.columns.len() == 1 && matches!(stmt.columns.first(), Some(Expression::Star(_)));
-        let has_qualified_star = stmt
-            .columns
-            .iter()
-            .any(|c| matches!(c, Expression::QualifiedStar(_)));
-        let select_column_count = stmt.columns.len();
-        let select_has_scalar_subqueries = stmt
-            .columns
-            .iter()
-            .any(Self::expression_has_scalar_subquery);
 
         // JOIN analysis
-        let (has_joins, has_outer_joins, join_count, has_derived_tables) =
-            Self::analyze_table_source(&stmt.table_expr);
+        let has_joins = stmt.table_expr.as_deref().is_some_and(Self::has_join);
 
         // WHERE clause analysis
         let has_where = stmt.where_clause.is_some();
-        let (
-            where_has_parameters,
-            where_has_subqueries,
-            where_has_exists,
-            where_has_in_subquery,
-            where_has_scalar_subquery,
-            where_has_all_any,
-            where_has_correlated_subqueries,
-        ) = if let Some(ref where_clause) = stmt.where_clause {
-            Self::analyze_where_clause(where_clause)
-        } else {
-            (false, false, false, false, false, false, false)
-        };
+        let (where_has_parameters, where_has_subqueries, where_has_correlated_subqueries) =
+            if let Some(ref where_clause) = stmt.where_clause {
+                Self::analyze_where_clause(where_clause)
+            } else {
+                (false, false, false)
+            };
 
         // Non-deterministic function detection (NOW, RANDOM, UUID, etc.)
         // Check both WHERE and SELECT columns — semantic cache must not serve stale
@@ -285,21 +239,10 @@ impl QueryClassification {
             .iter()
             .any(|ob| super::Executor::has_correlated_subqueries(&ob.expression));
 
-        // Compound classification
-        let is_simple_scan = !has_joins
-            && !has_aggregation
-            && !has_window_functions
-            && !where_has_subqueries
-            && !select_has_scalar_subqueries
-            && !has_derived_tables
-            && !has_cte
-            && !has_set_operations;
-
         QueryClassification {
             has_aggregation,
             has_window_functions,
             has_group_by,
-            group_by_column_count,
             has_order_by,
             has_limit,
             has_offset,
@@ -309,107 +252,31 @@ impl QueryClassification {
             has_set_operations,
             has_having,
             is_select_star,
-            has_qualified_star,
-            select_column_count,
-            select_has_scalar_subqueries,
             has_joins,
-            has_outer_joins,
-            join_count,
             has_where,
             where_has_parameters,
             where_has_subqueries,
-            where_has_exists,
-            where_has_in_subquery,
-            where_has_scalar_subquery,
-            where_has_all_any,
             where_has_correlated_subqueries,
             has_nondeterministic_functions,
             select_has_correlated_subqueries,
             grouped_has_subqueries,
             output_has_subqueries,
             order_by_has_correlated_subqueries,
-            has_derived_tables,
-            is_simple_scan,
             names_rowid: super::utils::names_rowid(stmt),
         }
     }
 
-    /// Analyze table source for joins and derived tables
-    fn analyze_table_source(table_expr: &Option<Box<Expression>>) -> (bool, bool, usize, bool) {
-        let mut has_joins = false;
-        let mut has_outer_joins = false;
-        let mut join_count = 0;
-        let mut has_derived_tables = false;
-
-        if let Some(ref expr) = table_expr {
-            Self::analyze_table_expr_recursive(
-                expr,
-                &mut has_joins,
-                &mut has_outer_joins,
-                &mut join_count,
-                &mut has_derived_tables,
-            );
-        }
-
-        (has_joins, has_outer_joins, join_count, has_derived_tables)
-    }
-
-    /// Recursively analyze table expression for joins and derived tables
-    fn analyze_table_expr_recursive(
-        expr: &Expression,
-        has_joins: &mut bool,
-        has_outer_joins: &mut bool,
-        join_count: &mut usize,
-        has_derived_tables: &mut bool,
-    ) {
+    /// Whether a FROM expression holds a join
+    fn has_join(expr: &Expression) -> bool {
         match expr {
-            Expression::JoinSource(join) => {
-                *has_joins = true;
-                *join_count += 1;
-
-                // Check for outer join types
-                let join_type = join.join_type.to_uppercase();
-                if join_type.contains("LEFT")
-                    || join_type.contains("RIGHT")
-                    || join_type.contains("FULL")
-                {
-                    *has_outer_joins = true;
-                }
-
-                // Recurse into left and right
-                Self::analyze_table_expr_recursive(
-                    &join.left,
-                    has_joins,
-                    has_outer_joins,
-                    join_count,
-                    has_derived_tables,
-                );
-                Self::analyze_table_expr_recursive(
-                    &join.right,
-                    has_joins,
-                    has_outer_joins,
-                    join_count,
-                    has_derived_tables,
-                );
-            }
-            Expression::SubquerySource(_) | Expression::ScalarSubquery(_) => {
-                *has_derived_tables = true;
-            }
-            Expression::Aliased(aliased) => {
-                Self::analyze_table_expr_recursive(
-                    &aliased.expression,
-                    has_joins,
-                    has_outer_joins,
-                    join_count,
-                    has_derived_tables,
-                );
-            }
-            _ => {}
+            Expression::JoinSource(_) => true,
+            Expression::Aliased(aliased) => Self::has_join(&aliased.expression),
+            _ => false,
         }
     }
 
-    /// Analyze WHERE clause for various subquery types
-    fn analyze_where_clause(expr: &Expression) -> (bool, bool, bool, bool, bool, bool, bool) {
+    /// Analyze WHERE clause for parameters, subqueries and correlated subqueries
+    fn analyze_where_clause(expr: &Expression) -> (bool, bool, bool) {
         let has_parameters = super::utils::expression_has_parameters(expr);
         let mut has_exists = false;
         let mut has_in_subquery = false;
@@ -429,15 +296,7 @@ impl QueryClassification {
         // Check for correlated subqueries (expensive AST traversal - cached here)
         let has_correlated = super::Executor::has_correlated_subqueries(expr);
 
-        (
-            has_parameters,
-            has_subqueries,
-            has_exists,
-            has_in_subquery,
-            has_scalar_subquery,
-            has_all_any,
-            has_correlated,
-        )
+        (has_parameters, has_subqueries, has_correlated)
     }
 
     /// Recursively analyze WHERE expression for subquery types
@@ -651,85 +510,6 @@ impl QueryClassification {
                 );
             }
             _ => {}
-        }
-    }
-
-    /// Check if expression contains scalar subqueries
-    fn expression_has_scalar_subquery(expr: &Expression) -> bool {
-        match expr {
-            Expression::ScalarSubquery(_) => true,
-            Expression::Aliased(aliased) => {
-                Self::expression_has_scalar_subquery(&aliased.expression)
-            }
-            Expression::Infix(infix) => {
-                Self::expression_has_scalar_subquery(&infix.left)
-                    || Self::expression_has_scalar_subquery(&infix.right)
-            }
-            Expression::Prefix(prefix) => Self::expression_has_scalar_subquery(&prefix.right),
-            Expression::FunctionCall(func) => {
-                func.arguments
-                    .iter()
-                    .any(Self::expression_has_scalar_subquery)
-                    || func
-                        .filter
-                        .as_deref()
-                        .is_some_and(Self::expression_has_scalar_subquery)
-                    || func
-                        .order_by
-                        .iter()
-                        .any(|o| Self::expression_has_scalar_subquery(&o.expression))
-            }
-            Expression::AllAny(all_any) => Self::expression_has_scalar_subquery(&all_any.left),
-            Expression::Case(case) => {
-                case.value
-                    .as_deref()
-                    .is_some_and(Self::expression_has_scalar_subquery)
-                    || case.when_clauses.iter().any(|w| {
-                        Self::expression_has_scalar_subquery(&w.condition)
-                            || Self::expression_has_scalar_subquery(&w.then_result)
-                    })
-                    || case
-                        .else_value
-                        .as_ref()
-                        .is_some_and(|e| Self::expression_has_scalar_subquery(e))
-            }
-            Expression::In(in_expr) => {
-                Self::expression_has_scalar_subquery(&in_expr.left)
-                    || Self::expression_has_scalar_subquery(&in_expr.right)
-            }
-            Expression::Between(between) => {
-                Self::expression_has_scalar_subquery(&between.expr)
-                    || Self::expression_has_scalar_subquery(&between.lower)
-                    || Self::expression_has_scalar_subquery(&between.upper)
-            }
-            Expression::Cast(cast) => Self::expression_has_scalar_subquery(&cast.expr),
-            Expression::Like(like) => {
-                Self::expression_has_scalar_subquery(&like.left)
-                    || Self::expression_has_scalar_subquery(&like.pattern)
-                    || like
-                        .escape
-                        .as_deref()
-                        .is_some_and(Self::expression_has_scalar_subquery)
-            }
-            Expression::List(list) => list
-                .elements
-                .iter()
-                .any(Self::expression_has_scalar_subquery),
-            Expression::ExpressionList(list) => list
-                .expressions
-                .iter()
-                .any(Self::expression_has_scalar_subquery),
-            Expression::Distinct(distinct) => Self::expression_has_scalar_subquery(&distinct.expr),
-            Expression::Window(window) => window
-                .function
-                .arguments
-                .iter()
-                .chain(window.function.filter.as_deref())
-                .chain(window.function.order_by.iter().map(|o| &o.expression))
-                .chain(window.partition_by.iter())
-                .chain(window.order_by.iter().map(|o| &o.expression))
-                .any(Self::expression_has_scalar_subquery),
-            _ => false,
         }
     }
 
@@ -1174,12 +954,8 @@ mod tests {
 
         // New fields
         assert!(!classification.has_joins);
-        assert!(!classification.has_outer_joins);
-        assert_eq!(classification.join_count, 0);
         assert!(!classification.has_where);
         assert!(!classification.where_has_subqueries);
-        assert!(!classification.has_derived_tables);
-        assert!(classification.is_simple_scan); // SELECT * is a simple scan
     }
 
     #[test]
@@ -1223,7 +999,6 @@ mod tests {
         let c_joined = get_classification(&joined);
         assert!(!c_plain.has_joins);
         assert!(c_joined.has_joins);
-        assert!(c_joined.join_count >= 1);
     }
 
     #[test]

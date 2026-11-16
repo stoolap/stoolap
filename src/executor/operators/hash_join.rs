@@ -134,12 +134,6 @@ impl JoinType {
         JoinType::Inner
     }
 
-    /// Alias for parse() - used by parallel.rs for compatibility.
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Self {
-        Self::parse(s)
-    }
-
     /// Check if this join needs unmatched probe rows (NULL-extended).
     /// Used by parallel hash join.
     pub fn needs_unmatched_probe(&self, swapped: bool) -> bool {
@@ -928,18 +922,6 @@ impl Operator for HashJoinOperator<'_> {
             JoinType::Semi => left_est.min(right_est), // At most all left rows
             JoinType::Anti => left_est,                // At most all left rows
         })
-    }
-
-    fn name(&self) -> &str {
-        match self.join_type {
-            JoinType::Inner => "HashJoin (INNER)",
-            JoinType::Left => "HashJoin (LEFT)",
-            JoinType::Right => "HashJoin (RIGHT)",
-            JoinType::Full => "HashJoin (FULL)",
-            JoinType::Cross => "HashJoin (CROSS)",
-            JoinType::Semi => "HashJoin (SEMI)",
-            JoinType::Anti => "HashJoin (ANTI)",
-        }
     }
 }
 

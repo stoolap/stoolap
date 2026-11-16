@@ -54,11 +54,6 @@ impl AndExpr {
         }
     }
 
-    /// Create an AND expression from two expressions
-    pub fn and(left: Box<dyn Expression>, right: Box<dyn Expression>) -> Self {
-        Self::new(vec![left, right])
-    }
-
     /// Add an expression to the AND
     pub fn push(&mut self, expr: Box<dyn Expression>) {
         self.expressions.push(expr);
@@ -184,27 +179,6 @@ impl OrExpr {
             is_prepared: false,
         }
     }
-
-    /// Create an OR expression from two expressions
-    pub fn or(left: Box<dyn Expression>, right: Box<dyn Expression>) -> Self {
-        Self::new(vec![left, right])
-    }
-
-    /// Add an expression to the OR
-    pub fn push(&mut self, expr: Box<dyn Expression>) {
-        self.expressions.push(expr);
-        self.is_prepared = false;
-    }
-
-    /// Get the number of child expressions
-    pub fn len(&self) -> usize {
-        self.expressions.len()
-    }
-
-    /// Check if empty
-    pub fn is_empty(&self) -> bool {
-        self.expressions.is_empty()
-    }
 }
 
 impl Expression for OrExpr {
@@ -302,11 +276,6 @@ impl NotExpr {
             inner,
             is_prepared: false,
         }
-    }
-
-    /// Create a NOT expression (convenience)
-    pub fn not(expr: Box<dyn Expression>) -> Self {
-        Self::new(expr)
     }
 
     /// Get the inner expression (for expression compilation)

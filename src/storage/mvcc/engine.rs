@@ -4811,11 +4811,6 @@ impl MVCCEngine {
         Ok(())
     }
 
-    /// Renames a column in a table
-    pub fn rename_column(&self, table_name: &str, old_name: &str, new_name: &str) -> Result<()> {
-        self.rename_column_inner(table_name, old_name, new_name, None)
-    }
-
     /// A RENAME COLUMN replayed from the log at `lsn`: the manifest records
     /// the rename only if it does not hold it already
     fn rename_column_from_log(

@@ -276,12 +276,6 @@ impl JoinHashTable {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
-
-    /// Get the number of buckets.
-    #[inline]
-    pub fn bucket_count(&self) -> usize {
-        self.bucket_heads.len()
-    }
 }
 
 /// Zero-allocation iterator over probe results.

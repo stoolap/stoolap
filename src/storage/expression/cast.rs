@@ -197,11 +197,6 @@ impl CompoundExpr {
             is_optimized: false,
         }
     }
-
-    /// Get the operator
-    pub fn operator(&self) -> Operator {
-        self.operator
-    }
 }
 
 impl Expression for CompoundExpr {

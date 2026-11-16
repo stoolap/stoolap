@@ -24,7 +24,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::time::Duration;
 
 use crate::common::time_compat::{SystemTime, UNIX_EPOCH};
 
@@ -33,12 +32,6 @@ use crate::core::{DataType, Error, IndexType, Result, Row, Value};
 use crate::storage::mvcc::version_store::RowVersion;
 use crate::storage::mvcc::wal_manager::{WALEntry, WALManager, WALOperationType};
 use crate::storage::PersistenceConfig;
-
-/// Default checkpoint interval (1 minute)
-pub const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
-
-/// Default number of snapshots to keep
-pub const DEFAULT_KEEP_SNAPSHOTS: usize = 3;
 
 /// Special transaction ID for DDL operations
 /// DDL operations (CREATE TABLE, DROP TABLE, etc.) are not part of a user transaction

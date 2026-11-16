@@ -32,7 +32,7 @@ pub mod volume;
 // Re-export main expression types at storage level for convenience
 pub use expression::{
     AndExpr, BetweenExpr, CastExpr, ComparisonExpr, CompoundExpr, Expression, InListExpr, NotExpr,
-    NullCheckExpr, OrExpr, RangeExpr,
+    NullCheckExpr, OrExpr,
 };
 
 // Re-export index types
@@ -46,8 +46,7 @@ pub use config::{CleanupConfig, Config, PersistenceConfig, SyncMode};
 
 // Re-export trait types
 pub use traits::{
-    EmptyResult, EmptyScanner, Engine, Index, MemoryResult, QueryResult, Scanner, Table,
-    TemporalType, Transaction, VecScanner,
+    Engine, Index, MemoryResult, QueryResult, Scanner, Table, TemporalType, Transaction,
 };
 
 // Re-export MVCC types
@@ -67,7 +66,6 @@ pub use mvcc::{
 pub use mvcc::{
     deserialize_row_version, deserialize_value, serialize_row_version, serialize_value,
     serialize_value_into, IndexMetadata, PersistenceManager, PersistenceMeta,
-    DEFAULT_CHECKPOINT_INTERVAL, DEFAULT_KEEP_SNAPSHOTS,
 };
 
 // Re-export Zone Map types

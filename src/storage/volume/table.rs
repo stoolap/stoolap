@@ -9924,8 +9924,10 @@ mod tests {
             _: Option<&dyn Expression>,
             _: Deadline,
         ) -> Result<Box<dyn Scanner>> {
-            Ok(Box::new(crate::storage::traits::VecScanner::new(
-                self.rows.iter().map(|(_, r)| r.clone()).collect(),
+            Ok(Box::new(crate::storage::mvcc::MVCCScanner::from_rows(
+                self.rows.iter().cloned().collect(),
+                CompactArc::new(self.schema.clone()),
+                Vec::new(),
             )))
         }
         fn collect_all_rows(&self, _: Option<&dyn Expression>) -> Result<RowVec> {

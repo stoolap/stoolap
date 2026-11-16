@@ -41,7 +41,7 @@ pub use maps::{
     new_cow_btree_map, new_i64_map, new_i64_map_with_capacity, CowBTreeMap, StringMap, StringSet,
 };
 pub use smart_string::SmartString;
-pub use version::{version, version_info, SemVer, BUILD_TIME, GIT_COMMIT, MAJOR, MINOR, PATCH};
+pub use version::{version, version_info, BUILD_TIME, GIT_COMMIT, MAJOR, MINOR, PATCH};
 
 #[cfg(test)]
 mod integration_tests {

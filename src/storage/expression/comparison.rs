@@ -159,21 +159,6 @@ impl ComparisonExpr {
         Self::new(column, Operator::Lte, value)
     }
 
-    /// Get the column name
-    pub fn column(&self) -> &str {
-        &self.column
-    }
-
-    /// Get the operator
-    pub fn operator(&self) -> Operator {
-        self.operator
-    }
-
-    /// Get the comparison value
-    pub fn value(&self) -> &ComparisonValue {
-        &self.value
-    }
-
     /// Compare two integers with the configured operator
     #[inline]
     fn compare_integers(&self, col_val: i64, cmp_val: i64) -> bool {

@@ -534,11 +534,6 @@ impl MVCCTable {
         }
     }
 
-    /// Returns the transaction ID
-    pub fn txn_id(&self) -> i64 {
-        self.txn_id
-    }
-
     /// Admits this handle to the transaction's rows it shares with earlier
     /// handles: they must be held in the layout this handle reads with
     pub(crate) fn admit_local_rows(&self) -> Result<()> {
@@ -622,11 +617,6 @@ impl MVCCTable {
         self.txn_versions
             .as_deref()
             .ok_or_else(|| Error::internal("a read handle of a table took a write"))
-    }
-
-    /// Returns a reference to the version store
-    pub fn version_store(&self) -> &Arc<VersionStore> {
-        &self.version_store
     }
 
     /// Returns a reference to the shared transaction version store; None
@@ -2324,13 +2314,6 @@ impl MVCCTable {
         match &self.txn_versions {
             Some(store) => store.write_store().commit(),
             None => Ok(()),
-        }
-    }
-
-    /// Rolls back the transaction's local changes
-    pub fn rollback(&mut self) {
-        if let Some(store) = &self.txn_versions {
-            store.write_store().rollback();
         }
     }
 

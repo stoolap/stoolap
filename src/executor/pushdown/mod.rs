@@ -29,8 +29,6 @@
 //! pub struct MyCustomRule;
 //!
 //! impl PushdownRule for MyCustomRule {
-//!     fn name(&self) -> &'static str { "my_custom_rule" }
-//!
 //!     fn try_convert(
 //!         &self,
 //!         expr: &ast::Expression,
@@ -199,9 +197,6 @@ pub(crate) fn coerce_constant(
 /// 1. Checking if it can handle an expression
 /// 2. Converting the expression to a storage expression
 pub trait PushdownRule: Send + Sync {
-    /// Rule name for debugging and logging
-    fn name(&self) -> &'static str;
-
     /// Try to convert an expression to a storage expression.
     ///
     /// Returns:

@@ -134,10 +134,6 @@ fn extract_in_list_values(expr: &ast::Expression, ctx: &PushdownContext<'_>) -> 
 pub struct ComparisonRule;
 
 impl PushdownRule for ComparisonRule {
-    fn name(&self) -> &'static str {
-        "comparison"
-    }
-
     fn try_convert(&self, expr: &ast::Expression, ctx: &PushdownContext<'_>) -> PushdownResult {
         let infix = match expr {
             ast::Expression::Infix(i) => i,
@@ -177,10 +173,6 @@ impl PushdownRule for ComparisonRule {
 pub struct QuantifiedSetRule;
 
 impl PushdownRule for QuantifiedSetRule {
-    fn name(&self) -> &'static str {
-        "quantified_set"
-    }
-
     fn try_convert(&self, expr: &ast::Expression, ctx: &PushdownContext<'_>) -> PushdownResult {
         use crate::executor::expression::QuantifiedMembers;
         let ast::Expression::QuantifiedSet(quantified) = expr else {
@@ -242,10 +234,6 @@ pub(crate) fn quantified_filter(
 pub struct LogicalAndRule;
 
 impl PushdownRule for LogicalAndRule {
-    fn name(&self) -> &'static str {
-        "logical_and"
-    }
-
     fn try_convert(&self, expr: &ast::Expression, ctx: &PushdownContext<'_>) -> PushdownResult {
         let infix = match expr {
             ast::Expression::Infix(i) if i.op_type == InfixOperator::And => i,
@@ -294,10 +282,6 @@ impl PushdownRule for LogicalAndRule {
 pub struct LogicalOrRule;
 
 impl PushdownRule for LogicalOrRule {
-    fn name(&self) -> &'static str {
-        "logical_or"
-    }
-
     fn try_convert(&self, expr: &ast::Expression, ctx: &PushdownContext<'_>) -> PushdownResult {
         let infix = match expr {
             ast::Expression::Infix(i) if i.op_type == InfixOperator::Or => i,
@@ -327,10 +311,6 @@ impl PushdownRule for LogicalOrRule {
 pub struct LogicalNotRule;
 
 impl PushdownRule for LogicalNotRule {
-    fn name(&self) -> &'static str {
-        "logical_not"
-    }
-
     fn try_convert(&self, expr: &ast::Expression, ctx: &PushdownContext<'_>) -> PushdownResult {
         let prefix = match expr {
             ast::Expression::Prefix(p) if p.op_type == PrefixOperator::Not => p,
@@ -356,10 +336,6 @@ impl PushdownRule for LogicalNotRule {
 pub struct LogicalXorRule;
 
 impl PushdownRule for LogicalXorRule {
-    fn name(&self) -> &'static str {
-        "logical_xor"
-    }
-
     fn try_convert(&self, expr: &ast::Expression, ctx: &PushdownContext<'_>) -> PushdownResult {
         let infix = match expr {
             ast::Expression::Infix(i) if i.op_type == InfixOperator::Xor => i,
@@ -401,10 +377,6 @@ impl PushdownRule for LogicalXorRule {
 pub struct BetweenRule;
 
 impl PushdownRule for BetweenRule {
-    fn name(&self) -> &'static str {
-        "between"
-    }
-
     fn try_convert(&self, expr: &ast::Expression, ctx: &PushdownContext<'_>) -> PushdownResult {
         let between = match expr {
             ast::Expression::Between(b) => b,
@@ -457,10 +429,6 @@ impl PushdownRule for BetweenRule {
 pub struct InListRule;
 
 impl PushdownRule for InListRule {
-    fn name(&self) -> &'static str {
-        "in_list"
-    }
-
     fn try_convert(&self, expr: &ast::Expression, ctx: &PushdownContext<'_>) -> PushdownResult {
         let in_expr = match expr {
             ast::Expression::In(i) => i,
@@ -519,10 +487,6 @@ pub(crate) fn in_list_filter(
 pub struct LikeRule;
 
 impl PushdownRule for LikeRule {
-    fn name(&self) -> &'static str {
-        "like"
-    }
-
     fn try_convert(&self, expr: &ast::Expression, ctx: &PushdownContext<'_>) -> PushdownResult {
         // Handle both ast::Like and Infix LIKE/ILIKE
         match expr {
@@ -649,10 +613,6 @@ fn extract_pattern(expr: &ast::Expression, ctx: &PushdownContext<'_>) -> Option<
 pub struct NullCheckRule;
 
 impl PushdownRule for NullCheckRule {
-    fn name(&self) -> &'static str {
-        "null_check"
-    }
-
     fn try_convert(&self, expr: &ast::Expression, ctx: &PushdownContext<'_>) -> PushdownResult {
         let infix = match expr {
             ast::Expression::Infix(i) => i,
@@ -697,10 +657,6 @@ impl PushdownRule for NullCheckRule {
 pub struct BooleanCheckRule;
 
 impl PushdownRule for BooleanCheckRule {
-    fn name(&self) -> &'static str {
-        "boolean_check"
-    }
-
     fn try_convert(&self, expr: &ast::Expression, ctx: &PushdownContext<'_>) -> PushdownResult {
         let infix = match expr {
             ast::Expression::Infix(i) => i,
@@ -769,10 +725,6 @@ impl PushdownRule for BooleanCheckRule {
 pub struct BooleanLiteralRule;
 
 impl PushdownRule for BooleanLiteralRule {
-    fn name(&self) -> &'static str {
-        "boolean_literal"
-    }
-
     fn try_convert(&self, expr: &ast::Expression, _ctx: &PushdownContext<'_>) -> PushdownResult {
         match expr {
             ast::Expression::BooleanLiteral(b) => {
@@ -790,10 +742,6 @@ impl PushdownRule for BooleanLiteralRule {
 pub struct FunctionRule;
 
 impl PushdownRule for FunctionRule {
-    fn name(&self) -> &'static str {
-        "function"
-    }
-
     fn try_convert(&self, expr: &ast::Expression, ctx: &PushdownContext<'_>) -> PushdownResult {
         // Handle: FUNC(col) op value or value op FUNC(col)
         let infix = match expr {

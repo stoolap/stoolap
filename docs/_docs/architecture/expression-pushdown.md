@@ -128,7 +128,6 @@ Stoolap implements specialized expression types for efficient pushdown:
 - **InListExpression** - Set membership tests
 - **LogicalExpression** - Combining expressions with AND/OR
 - **NullCheckExpression** - NULL checks
-- **RangeExpression** - Optimized range queries
 - **NotExpression** - Logical negation
 
 These expression types are implemented in `src/storage/expression/`.

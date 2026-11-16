@@ -362,12 +362,6 @@ pub struct Held {
     bytes: usize,
 }
 
-impl Held {
-    pub fn bytes(&self) -> usize {
-        self.bytes
-    }
-}
-
 impl Drop for Held {
     fn drop(&mut self) {
         self.ledger.charged.fetch_sub(self.bytes, Ordering::AcqRel);
@@ -2434,12 +2428,6 @@ impl Reader {
             }
         }
         Ok(count)
-    }
-
-    /// The upper bound the directory alone gives on the positions of keys
-    /// in `[low, high]`, without reading a page
-    pub fn candidate_bound(&self, low: i64, high: i64) -> std::io::Result<u64> {
-        self.file.candidate_bound(self.identity, low, high)
     }
 
     /// Starts a walk over the position index range `[start, end)`

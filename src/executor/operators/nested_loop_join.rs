@@ -369,18 +369,6 @@ impl Operator for NestedLoopJoinOperator<'_> {
             JoinType::Anti => left_est,
         })
     }
-
-    fn name(&self) -> &str {
-        match self.join_type {
-            JoinType::Inner => "NestedLoop (INNER)",
-            JoinType::Left => "NestedLoop (LEFT)",
-            JoinType::Right => "NestedLoop (RIGHT)",
-            JoinType::Full => "NestedLoop (FULL)",
-            JoinType::Cross => "NestedLoop (CROSS)",
-            JoinType::Semi => "NestedLoop (SEMI)",
-            JoinType::Anti => "NestedLoop (ANTI)",
-        }
-    }
 }
 
 #[cfg(test)]

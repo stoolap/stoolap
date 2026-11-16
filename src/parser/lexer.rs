@@ -62,15 +62,6 @@ static BYTE_CLASS: [u8; 256] = {
     classes
 };
 
-/// Lexer state saved for a peek
-#[derive(Clone, Copy)]
-struct Mark {
-    at: usize,
-    line: u32,
-    line_start: usize,
-    continuing: usize,
-}
-
 impl<'a> Lexer<'a> {
     /// Create a new lexer for the given input
     pub fn new(input: &'a str) -> Self {
@@ -143,20 +134,6 @@ impl<'a> Lexer<'a> {
         while self.at < end {
             self.step_byte();
         }
-    }
-
-    fn mark(&self) -> Mark {
-        Mark {
-            at: self.at,
-            line: self.line,
-            line_start: self.line_start,
-            continuing: self.continuing,
-        }
-    }
-
-    fn reset(&mut self, mark: Mark) {
-        (self.at, self.line, self.line_start, self.continuing) =
-            (mark.at, mark.line, mark.line_start, mark.continuing);
     }
 
     /// The byte offset just past the last token read
@@ -581,14 +558,6 @@ impl<'a> Lexer<'a> {
         }
         self.token_since(start)
     }
-
-    /// Peek at the next token without advancing
-    pub fn peek_token(&mut self) -> Token {
-        let mark = self.mark();
-        let token = self.next_token();
-        self.reset(mark);
-        token
-    }
 }
 
 #[cfg(test)]
@@ -886,23 +855,6 @@ mod tests {
             }
             assert_eq!(token.position.line, u32::MAX, "line at the end of {sql:?}");
         }
-    }
-
-    #[test]
-    fn test_peek_token() {
-        let mut lexer = Lexer::new("SELECT FROM");
-
-        let peek1 = lexer.peek_token();
-        assert_eq!(peek1.literal, "SELECT");
-
-        let peek2 = lexer.peek_token();
-        assert_eq!(peek2.literal, "SELECT"); // Same token
-
-        let actual = lexer.next_token();
-        assert_eq!(actual.literal, "SELECT");
-
-        let next = lexer.next_token();
-        assert_eq!(next.literal, "FROM");
     }
 
     #[test]
