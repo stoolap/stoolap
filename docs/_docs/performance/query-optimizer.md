@@ -94,7 +94,21 @@ SELECT * FROM _sys_column_stats WHERE table_name = 'users';
 
 `ANALYZE` without a table name analyzes every table, each one on its own. It keeps the query timeout: past it, the statement stops with a query cancelled error, the table it was reading keeps its old statistics, and the tables it finished before keep their new ones.
 
-Today the statistics are read for the row estimates `EXPLAIN` prints and, for a join under a small `LIMIT` that streams through a hash table, to build that table on the side estimated smaller. `ANALYZE` also builds zone maps: see [Expression Simplification](#expression-simplification).
+The statistics are one source of the [row estimates](#row-estimates). `ANALYZE` also builds zone maps: see [Expression Simplification](#expression-simplification).
+
+## Row Estimates
+
+Where a choice depends on how many rows a side of a join keeps under its own conditions, the planner estimates them on each run, for the values that run binds, parameters included:
+
+- A comparison of an indexed column with a value is counted by the index: an equality or an `IN` list exactly, a range while it holds at most 4,096 rows. This needs no `ANALYZE`. It is used while all of the table's rows are in memory; once some are sealed to volumes, the statistics answer instead.
+- Otherwise the statistics `ANALYZE` collected estimate it: the histogram, the distinct values, the minimum and maximum.
+- Without either, a default share: an equality keeps a tenth of the rows.
+
+`AND` multiplies the shares of its terms; `OR` adds them, less their overlap.
+
+Two choices read the estimates: a join under a small `LIMIT` that streams through a hash table builds that table on the side estimated smaller, and an `INNER JOIN` whose right side is estimated small beside its left one reads the right side first and probes the left table's index for each of its rows. `EXPLAIN` prints a join's estimate as `rows=`.
+
+`EXPLAIN ANALYZE` leaves nothing behind: what one run found changes no later estimate.
 
 ## Expression Simplification
 

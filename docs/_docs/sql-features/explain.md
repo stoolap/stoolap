@@ -479,7 +479,7 @@ plan
 ----
 SELECT
   Columns: o.id, c.name
-  -> Hash Join (INNER Join) (cost=1.10 rows=1)
+  -> Hash Join (INNER Join) (rows=1)
      Join Cond: (o.customer_id = c.id)
     -> Seq Scan on orders
        Alias: o
@@ -808,18 +808,15 @@ For other statements:
 | Alias | Table alias in query |
 | Prepared | For a WHERE with a subquery, or a join whose ON holds one: `yes` when the statement runs as a [prepared subquery]({% link _docs/sql-features/subqueries.md %}#prepared-subqueries), otherwise `no` and the reason |
 
-## Cost Information
+## Row Estimate
 
-A join printed in the general format carries two numbers:
+A join printed in the general format carries the rows it is estimated to give:
 
 ```
--> Hash Join (INNER Join) (cost=1.10 rows=1)
+-> Hash Join (INNER Join) (rows=1)
 ```
 
-- **cost**: a rough figure from the row counts of the two tables
-- **rows**: the estimated number of rows
-
-Both are for reading only: they do not choose the join's method or order (see [Query Planning]({% link _docs/performance/query-optimizer.md %})).
+It is the fewer of the rows each table side is estimated to keep under its own conditions, or their product for a join without a condition. The estimate comes from the tables' indexes, their statistics or default shares, as [Row Estimates]({% link _docs/performance/query-optimizer.md %}#row-estimates) describes. A side that is not a table has no estimate: the join prints the other side's, or none when neither side is a table or the join has no condition.
 
 ## Use Cases
 

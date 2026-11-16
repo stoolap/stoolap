@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use crate::core::Result;
+use crate::core::{Result, Value};
 use crate::parser::ast::{Expression, InfixOperator, JoinTableSource, SelectStatement};
 use crate::planner::join::{IndexProbe, JoinPlan, LimitHash, ProbeIndex};
 use crate::storage::traits::transaction::{StatementTable, TableUse};
@@ -25,12 +25,11 @@ use crate::storage::traits::Engine;
 
 use super::aggregation::grouped_item;
 use super::operators::index_nested_loop::IndexLookupStrategy;
-use super::prepared_join::PreparedJoin;
+use super::prepared_join::{PreparedJoin, SideArms};
 use super::query::{CteNames, HOT_INNER_ROWS_PER_KEY, SMALL_OUTER_ROWS};
 use super::query_classification::QueryClassification;
 use super::utils::{bare_name, eq_names, probes_by_equality, qualified, split_qualified};
 use super::Executor;
-use crate::optimizer::feedback::global_feedback_cache;
 
 /// What a join's plan is decided from: the statement, and its WHERE as the
 /// join split it over the sides
@@ -405,7 +404,7 @@ impl Executor {
     /// The rows a base table side is estimated to give: the rows its table
     /// holds now, times `share`, the share of them its conditions keep;
     /// u64::MAX for any other side
-    fn estimate_side_rows(&self, side: &Expression, share: f64) -> u64 {
+    pub(crate) fn estimate_side_rows(&self, side: &Expression, share: f64) -> u64 {
         let Some(table) = base_table_lower(side) else {
             return u64::MAX;
         };
@@ -414,28 +413,32 @@ impl Executor {
             .map_or(u64::MAX, |rows| (rows as f64 * share).ceil() as u64)
     }
 
-    /// The share of each side's rows its own conditions keep, as
-    /// `filter_share` estimates it; held by the join's `plan` for the
-    /// statistics and the learned corrections it was estimated under, since
-    /// estimating reads them anew
+    /// The share of each side's rows its own conditions keep on a run with
+    /// `params`, by the share arms the join's `plan` holds for the current
+    /// statistics, resolved anew without one
     pub(crate) fn join_side_shares(
         &self,
         plan: Option<&PreparedJoin>,
         sides: [&Expression; 2],
         filters: [Option<&Expression>; 2],
+        params: &[Value],
     ) -> [f64; 2] {
-        let estimate = || {
+        let planner = self.get_query_planner();
+        let resolve = || {
             [0, 1].map(|i| match (base_table_lower(sides[i]), filters[i]) {
-                (Some(table), Some(filter)) => self.get_query_planner().filter_share(table, filter),
-                _ => 1.0,
+                (Some(table), Some(filter)) => Some(planner.share_arms(table, filter)),
+                _ => None,
+            })
+        };
+        let shares = |arms: &SideArms| {
+            arms.each_ref().map(|arms| {
+                arms.as_ref()
+                    .map_or(1.0, |arms| planner.arms_share(arms, params))
             })
         };
         match plan {
-            Some(plan) => {
-                let epoch = (self.engine.stats_epoch(), global_feedback_cache().version());
-                plan.side_shares(epoch, estimate)
-            }
-            None => estimate(),
+            Some(plan) => shares(&plan.side_arms(self.engine.stats_epoch(), resolve)),
+            None => shares(&resolve()),
         }
     }
 

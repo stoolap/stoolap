@@ -65,12 +65,12 @@ fn plan(db: &Database, sql: &str) -> String {
         .join("\n")
 }
 
-/// How `sql`'s plan runs its join, without the cost it estimates
+/// How `sql`'s plan runs its join, without the rows it estimates
 fn join_method(db: &Database, sql: &str) -> String {
     let plan = plan(db, sql);
     let line = plan.lines().find(|line| line.contains("(INNER Join)"));
     let line = line.unwrap_or_else(|| panic!("{sql}:\n{plan}")).trim();
-    line.split(" (cost=").next().unwrap_or(line).to_string()
+    line.split(" (rows=").next().unwrap_or(line).to_string()
 }
 
 /// Each `s` row with the `t` rows its key matches
@@ -142,6 +142,29 @@ fn a_left_side_its_conditions_keep_small_is_not_probed_from_the_right() {
             "{sql}, analyzed {analyzed}: {method}"
         );
     }
+}
+
+// The file engine plans no index join on a secondary index over hot rows
+#[cfg(not(feature = "test-filedb"))]
+#[test]
+fn a_right_side_its_index_counts_small_probes_the_left_tables_index() {
+    let db = Database::open("memory://join_small_right_side_index_count").unwrap();
+    tables(&db);
+    for sql in [
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, k INTEGER, g INTEGER)",
+        "CREATE INDEX r_g ON r(g)",
+        "INSERT INTO r SELECT g.value, g.value % 1000, g.value % 1000 \
+         FROM generate_series(1, 5000) g",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let sql = "SELECT r.id, t.id FROM t JOIN r ON t.k = r.k WHERE r.g = 1";
+    let method = join_method(&db, sql);
+    assert!(
+        !method.contains("Hash Join"),
+        "the index counts 5 rows of r for g = 1, not a tenth of 5,000: {method}"
+    );
+    assert_eq!(pairs(&db, sql).len(), 25, "{sql}");
 }
 
 #[cfg(all(feature = "test-failpoints", not(feature = "test-filedb")))]

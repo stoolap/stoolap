@@ -429,7 +429,7 @@
         queryText: "EXPLAIN ANALYZE SELECT u.name, SUM(o.amount) FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.name;",
         queryHtml: '<span class="tk">EXPLAIN ANALYZE</span> <span class="tk">SELECT</span> u.name, <span class="tf">SUM</span>(o.amount) <span class="tk">FROM</span> users u <span class="tk">JOIN</span> orders o <span class="tk">ON</span> u.id = o.user_id <span class="tk">GROUP BY</span> u.name;',
         result: [
-          'Hash Join  (cost=45.2, rows=1150) (actual: 0.4ms)',
+          'Hash Join  (rows=1150) (actual: 0.4ms)',
           '  -> Parallel Seq Scan on orders  (workers=4)',
           '  -> Hash Build on users  (rows=50)',
           'Planning: 0.05ms  Execution: 0.6ms'

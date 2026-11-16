@@ -4458,7 +4458,8 @@ impl Executor {
                     || {
                         let sides = [&*join_source.left, &*join_source.right];
                         let filters = [left_filter.as_ref(), right_filter.as_ref()];
-                        let shares = self.join_side_shares(plan.as_deref(), sides, filters);
+                        let shares =
+                            self.join_side_shares(plan.as_deref(), sides, filters, ctx.params());
                         self.right_small_beside(sides, shares)
                     },
                     |(_, strategy, _, _)| matches!(strategy, IndexLookupStrategy::PrimaryKey),
@@ -5510,7 +5511,8 @@ impl Executor {
                     let limit = counts.limit.filter(|limit| *limit <= 100)?;
                     let sides = [&*join_source.left, &*join_source.right];
                     let filters = [left_filter.as_ref(), right_filter.as_ref()];
-                    let shares = self.join_side_shares(plan.as_deref(), sides, filters);
+                    let shares =
+                        self.join_side_shares(plan.as_deref(), sides, filters, ctx.params());
                     let build_left = self.limit_hash_builds_left(sides, shares);
                     #[cfg(feature = "test-failpoints")]
                     crate::test_failpoints::limit_hash_built(build_left);

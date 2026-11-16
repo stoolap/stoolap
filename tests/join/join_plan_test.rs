@@ -152,63 +152,103 @@ fn a_limit_hash_join_builds_on_the_side_estimated_smaller_under_its_conditions()
 }
 
 #[test]
-fn a_limit_hash_join_reads_the_corrections_explain_analyze_learned() {
+fn a_limit_hash_join_builds_on_the_side_its_index_counts_smaller() {
     let _guard = serial();
-    let db = Database::open("memory://join_plan_limit_hash_feedback").unwrap();
+    let db = Database::open("memory://join_plan_limit_hash_index_count").unwrap();
     for sql in [
-        "CREATE TABLE fb_s (id INTEGER PRIMARY KEY, k INTEGER)",
-        "CREATE TABLE fb_t (id INTEGER PRIMARY KEY, k INTEGER)",
-        "INSERT INTO fb_s SELECT g.value, g.value % 200 FROM generate_series(1, 20000) g",
-        "INSERT INTO fb_t SELECT g.value, g.value % 200 FROM generate_series(1, 1500) g",
+        "CREATE TABLE ic_s (id INTEGER PRIMARY KEY, k INTEGER, f INTEGER)",
+        "CREATE TABLE ic_t (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO ic_s SELECT g.value, g.value % 200, g.value % 200 \
+         FROM generate_series(1, 20000) g",
+        "INSERT INTO ic_t SELECT g.value, g.value % 200 FROM generate_series(1, 1500) g",
+        "CREATE INDEX ic_s_f ON ic_s (f)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let literal = db
+        .prepare(
+            "SELECT ic_s.id, ic_t.id FROM ic_s JOIN ic_t ON ic_t.k = ic_s.k \
+             WHERE ic_s.f = 1 LIMIT $1",
+        )
+        .unwrap();
+    let before = limit_hash_left_builds();
+    assert_eq!(literal.query((1,)).unwrap().count(), 1);
+    assert_eq!(
+        limit_hash_left_builds() - before,
+        1,
+        "the index counts 100 rows of ic_s for f = 1, fewer than ic_t holds"
+    );
+    let bound = db
+        .prepare(
+            "SELECT ic_s.id, ic_t.id FROM ic_s JOIN ic_t ON ic_t.k = ic_s.k \
+             WHERE ic_s.f = $2 LIMIT $1",
+        )
+        .unwrap();
+    let before = limit_hash_left_builds();
+    assert_eq!(bound.query((1, 1)).unwrap().count(), 1);
+    assert_eq!(
+        limit_hash_left_builds() - before,
+        1,
+        "the index counts the rows of the run's parameter"
+    );
+    let before = limit_hash_left_builds();
+    assert_eq!(bound.query((1, 1000)).unwrap().count(), 0);
+    assert_eq!(
+        limit_hash_left_builds() - before,
+        1,
+        "the index counts no row of ic_s for f = 1000"
+    );
+}
+
+#[test]
+fn an_index_created_after_a_run_counts_on_the_next() {
+    let _guard = serial();
+    let db = Database::open("memory://join_plan_index_after_run").unwrap();
+    for sql in [
+        "CREATE TABLE ia_s (id INTEGER PRIMARY KEY, k INTEGER, f INTEGER)",
+        "CREATE TABLE ia_t (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO ia_s SELECT g.value, g.value % 200, g.value % 200 \
+         FROM generate_series(1, 20000) g",
+        "INSERT INTO ia_t SELECT g.value, g.value % 200 FROM generate_series(1, 1500) g",
     ] {
         db.execute(sql, ()).unwrap();
     }
     let stmt = db
-        .prepare("SELECT fb_s.id, fb_t.id FROM fb_s JOIN fb_t ON fb_t.k = fb_s.k WHERE fb_s.k = 1 LIMIT $1")
+        .prepare(
+            "SELECT ia_s.id, ia_t.id FROM ia_s JOIN ia_t ON ia_t.k = ia_s.k \
+             WHERE ia_s.f = $2 LIMIT $1",
+        )
         .unwrap();
     let builds = || {
         let before = limit_hash_left_builds();
-        assert_eq!(stmt.query((1,)).unwrap().count(), 1);
+        assert_eq!(stmt.query((1, 1)).unwrap().count(), 1);
         limit_hash_left_builds() - before
     };
-    assert_eq!(
-        builds(),
-        0,
-        "an equality estimated to keep a tenth of fb_s keeps more rows than fb_t holds"
-    );
-    for _ in 0..2 {
-        let explained = db.query(
-            "EXPLAIN ANALYZE SELECT fb_s.id FROM fb_s WHERE fb_s.k = 1",
-            (),
-        );
-        explained.unwrap().for_each(|row| {
-            row.unwrap();
-        });
-    }
+    assert_eq!(builds(), 0, "a tenth of ia_s is more rows than ia_t holds");
+    db.execute("CREATE INDEX ia_s_f ON ia_s (f)", ()).unwrap();
     assert_eq!(
         builds(),
         1,
-        "EXPLAIN ANALYZE found the equality keeps 100 rows of fb_s"
+        "the index created after the run counts 100 rows of ia_s"
     );
 }
 
 #[test]
-fn explain_analyze_of_a_join_teaches_no_side_a_correction() {
+fn explain_analyze_leaves_no_estimate_behind() {
     let _guard = serial();
-    let db = Database::open("memory://join_plan_feedback_join").unwrap();
+    let db = Database::open("memory://join_plan_explain_analyze_stateless").unwrap();
     for sql in [
-        "CREATE TABLE fj_s (id INTEGER PRIMARY KEY, k INTEGER, f INTEGER)",
-        "CREATE TABLE fj_t (id INTEGER PRIMARY KEY, k INTEGER, f INTEGER)",
-        "INSERT INTO fj_s SELECT g.value, g.value % 200, g.value % 200 \
-         FROM generate_series(1, 20000) g",
-        "INSERT INTO fj_t SELECT g.value, g.value % 200, g.value FROM generate_series(1, 1500) g",
+        "CREATE TABLE ea_s (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE TABLE ea_t (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO ea_s SELECT g.value, g.value % 200 FROM generate_series(1, 20000) g",
+        "INSERT INTO ea_t SELECT g.value, g.value % 200 FROM generate_series(1, 1500) g",
     ] {
         db.execute(sql, ()).unwrap();
     }
     let stmt = db
         .prepare(
-            "SELECT fj_s.id, fj_t.id FROM fj_s JOIN fj_t ON fj_t.k = fj_s.k \
-             WHERE fj_s.f = 1 LIMIT $1",
+            "SELECT ea_s.id, ea_t.id FROM ea_s JOIN ea_t ON ea_t.k = ea_s.k \
+             WHERE ea_s.k = 1 LIMIT $1",
         )
         .unwrap();
     let builds = || {
@@ -216,56 +256,10 @@ fn explain_analyze_of_a_join_teaches_no_side_a_correction() {
         assert_eq!(stmt.query((1,)).unwrap().count(), 1);
         limit_hash_left_builds() - before
     };
-    assert_eq!(builds(), 0, "a tenth of fj_s is more rows than fj_t holds");
-    for _ in 0..2 {
-        for filter in ["fj_t.f = 1", "fj_s.f = 1"] {
-            let explained = db.query(
-                &format!(
-                    "EXPLAIN ANALYZE SELECT fj_s.id FROM fj_s JOIN fj_t ON fj_t.k = fj_s.k \
-                     WHERE {filter}"
-                ),
-                (),
-            );
-            explained.unwrap().for_each(|row| {
-                row.unwrap();
-            });
-        }
-    }
-    assert_eq!(
-        builds(),
-        0,
-        "a join's EXPLAIN ANALYZE counts joined rows, no scan of fj_s or fj_t"
-    );
-}
-
-#[test]
-fn explain_analyze_of_a_cte_teaches_the_table_of_its_name_no_correction() {
-    let _guard = serial();
-    let db = Database::open("memory://join_plan_feedback_cte").unwrap();
-    for sql in [
-        "CREATE TABLE fc_t (id INTEGER PRIMARY KEY, k INTEGER, f INTEGER)",
-        "CREATE TABLE fc_u (id INTEGER PRIMARY KEY, k INTEGER)",
-        "INSERT INTO fc_t SELECT g.value, g.value % 100, 1 FROM generate_series(1, 10000) g",
-        "INSERT INTO fc_u SELECT g.value, g.value % 100 FROM generate_series(1, 500) g",
-    ] {
-        db.execute(sql, ()).unwrap();
-    }
-    let stmt = db
-        .prepare(
-            "SELECT fc_t.id, fc_u.id FROM fc_t JOIN fc_u ON fc_u.k = fc_t.k \
-             WHERE fc_t.f = 1 LIMIT $1",
-        )
-        .unwrap();
-    let builds = || {
-        let before = limit_hash_left_builds();
-        assert_eq!(stmt.query((1,)).unwrap().count(), 1);
-        limit_hash_left_builds() - before
-    };
-    assert_eq!(builds(), 0, "a tenth of fc_t is more rows than fc_u holds");
+    assert_eq!(builds(), 0, "a tenth of ea_s is more rows than ea_t holds");
     for _ in 0..2 {
         let explained = db.query(
-            "EXPLAIN ANALYZE WITH fc_t AS (SELECT 1 AS id, 1 AS f) \
-             SELECT fc_t.id FROM fc_t WHERE fc_t.f = 1",
+            "EXPLAIN ANALYZE SELECT ea_s.id FROM ea_s WHERE ea_s.k = 1",
             (),
         );
         explained.unwrap().for_each(|row| {
@@ -275,6 +269,6 @@ fn explain_analyze_of_a_cte_teaches_the_table_of_its_name_no_correction() {
     assert_eq!(
         builds(),
         0,
-        "the CTE's one row is no scan of the table fc_t"
+        "the estimate after EXPLAIN ANALYZE is the estimate before it"
     );
 }
