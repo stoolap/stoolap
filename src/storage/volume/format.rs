@@ -227,6 +227,8 @@ fn write_f64_bulk(buf: &mut Vec<u8>, values: &[f64]) {
     {
         let byte_len = values.len() * 8;
         buf.reserve(byte_len);
+        // SAFETY: `values` spans exactly `byte_len` initialized bytes with no padding,
+        // u8 has alignment 1, and on a little-endian target they are the file's order
         let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, byte_len) };
         buf.extend_from_slice(bytes);
     }
@@ -246,6 +248,8 @@ fn write_u32_bulk(buf: &mut Vec<u8>, values: &[u32]) {
     {
         let byte_len = values.len() * 4;
         buf.reserve(byte_len);
+        // SAFETY: `values` spans exactly `byte_len` initialized bytes with no padding,
+        // u8 has alignment 1, and on a little-endian target they are the file's order
         let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, byte_len) };
         buf.extend_from_slice(bytes);
     }
@@ -319,6 +323,8 @@ fn read_f64_bulk(data: &[u8], pos: &mut usize, count: usize) -> io::Result<Vec<f
     #[cfg(target_endian = "little")]
     let values = {
         let mut v = vec![0f64; count];
+        // SAFETY: the source slice holds `byte_len` bytes and `v` as many, in two
+        // allocations; every bit pattern is an f64, read in the file's LE order
         unsafe {
             std::ptr::copy_nonoverlapping(
                 data[*pos..end].as_ptr(),
@@ -355,6 +361,8 @@ fn read_u32_bulk(data: &[u8], pos: &mut usize, count: usize) -> io::Result<Vec<u
     #[cfg(target_endian = "little")]
     let values = {
         let mut v = vec![0u32; count];
+        // SAFETY: the source slice holds `byte_len` bytes and `v` as many, in two
+        // allocations; every bit pattern is a u32, read in the file's LE order
         unsafe {
             std::ptr::copy_nonoverlapping(
                 data[*pos..end].as_ptr(),
@@ -758,6 +766,8 @@ pub(crate) fn read_f64_bulk_into(
     {
         let old_len = out.len();
         out.resize(old_len + count, 0f64);
+        // SAFETY: the source slice holds `byte_len` bytes and `out[old_len..]` as many,
+        // in two allocations; every bit pattern is an f64, read in the file's LE order
         unsafe {
             std::ptr::copy_nonoverlapping(
                 data[*pos..end].as_ptr(),
@@ -799,6 +809,8 @@ pub(crate) fn read_u32_bulk_into(
     {
         let old_len = out.len();
         out.resize(old_len + count, 0u32);
+        // SAFETY: the source slice holds `byte_len` bytes and `out[old_len..]` as many,
+        // in two allocations; every bit pattern is a u32, read in the file's LE order
         unsafe {
             std::ptr::copy_nonoverlapping(
                 data[*pos..end].as_ptr(),

@@ -152,8 +152,12 @@ fn acquire_lock(file: &File) -> Result<()> {
 
     let handle = file.as_raw_handle() as HANDLE;
 
+    // SAFETY: OVERLAPPED is a plain C struct of integers and a handle, for
+    // which all zero bytes is the documented initial value
     let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
 
+    // SAFETY: `handle` belongs to `file`, open for the whole call, and
+    // `overlapped` outlives this synchronous call
     let result = unsafe {
         LockFileEx(
             handle,

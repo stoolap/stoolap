@@ -290,6 +290,8 @@ pub struct SealFenceGuard {
 // that is released on drop. The guard is created and dropped on the same
 // thread (the commit thread). The raw pointer is not dereferenced.
 unsafe impl Send for SealFenceGuard {}
+// SAFETY: a shared reference reaches only the Arc, which is Sync; no method
+// reads through the raw pointer
 unsafe impl Sync for SealFenceGuard {}
 
 impl SealFenceGuard {

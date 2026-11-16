@@ -5545,6 +5545,8 @@ mod tests {
             static PEAK: Cell<usize> = const { Cell::new(0) };
         }
 
+        // SAFETY: every call is forwarded to System with the same arguments;
+        // the counters only read the layout
         unsafe impl GlobalAlloc for Counting {
             unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
                 let _ = LIVE.try_with(|live| {
@@ -5552,11 +5554,13 @@ mod tests {
                     live.set(now);
                     let _ = PEAK.try_with(|peak| peak.set(peak.get().max(now)));
                 });
+                // SAFETY: the caller's layout contract is passed on unchanged
                 unsafe { System.alloc(layout) }
             }
 
             unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
                 let _ = LIVE.try_with(|live| live.set(live.get().saturating_sub(layout.size())));
+                // SAFETY: `ptr` came from System.alloc with this layout, as the caller promises
                 unsafe { System.dealloc(ptr, layout) }
             }
         }

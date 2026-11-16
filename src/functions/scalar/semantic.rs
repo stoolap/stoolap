@@ -88,6 +88,8 @@ fn init_model() -> std::result::Result<EmbedModel, String> {
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| format!("Failed to load tokenizer: {e}"))?;
 
+    // SAFETY: the mapping is read only and assumes no other process rewrites the
+    // cached weights file in place while it is mapped; the hub client never does
     let vb = unsafe {
         VarBuilder::from_mmaped_safetensors(&[weights_path], DType::F32, &device)
             .map_err(|e| format!("Failed to load weights: {e}"))?

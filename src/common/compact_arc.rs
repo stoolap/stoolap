@@ -427,6 +427,8 @@ impl<T: CompactArcDrop> CompactArc<T> {
         // Going through Deref (&*this) creates a SharedReadOnly tag that
         // invalidates later writes to the header (e.g., refcount decrement).
         let header = this.ptr.as_ptr();
+        // SAFETY: the allocation holds the header and then T at `data_offset_for::<T>()`,
+        // so the offset stays inside it while `this` keeps it alive
         unsafe { (header as *const u8).add(data_offset_for::<T>()) as *const T }
     }
 }
@@ -858,6 +860,8 @@ impl<T> CompactArc<[T]> {
     /// Borrows and prevent subsequent mutable access to the same allocation).
     #[inline]
     pub(crate) fn data_ptr_mut(&self) -> *mut T {
+        // SAFETY: the allocation holds the header and then the elements at
+        // `data_offset_for::<T>()`, so the offset stays inside it while `self` lives
         unsafe { (self.ptr.as_ptr() as *mut u8).add(data_offset_for::<T>()) as *mut T }
     }
 }
