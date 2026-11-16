@@ -33,9 +33,10 @@ use crate::common::StringMap;
 use crate::storage::traits::transaction::{StatementTable, TableUse};
 
 use crate::core::{Operator, Result, Value};
-use crate::optimizer::feedback::{fingerprint_predicate, global_feedback_cache};
+use crate::executor::pushdown::{coerce_constant, scan_compares};
 use crate::parser::ast::Expression;
 use crate::storage::mvcc::engine::MVCCEngine;
+use crate::storage::mvcc::version_store::VersionStore;
 use crate::storage::mvcc::zonemap::TableZoneMap;
 use crate::storage::statistics::{
     Histogram, HistogramOp, TableStats, SYS_COLUMN_STATS, SYS_TABLE_STATS,
@@ -597,52 +598,200 @@ impl QueryPlanner {
     // Cardinality Estimation for Scans
     // =========================================================================
 
-    /// Estimate the number of rows that will be returned by a scan with a predicate
-    ///
-    /// This method uses table statistics and column statistics to estimate
-    /// selectivity of predicates. It also applies cardinality feedback corrections
-    /// if available from previous query executions.
-    ///
-    /// # Arguments
-    /// * `table_name` - Name of the table being scanned
-    /// * `predicate` - Optional WHERE clause predicate
-    ///
-    /// # Returns
-    /// Estimated number of rows, or None if stats are unavailable
-    pub fn estimate_scan_rows(
-        &self,
-        table_name: &str,
-        predicate: Option<&Expression>,
-    ) -> Option<u64> {
-        let table_stats = self.get_table_stats(table_name)?;
-        let base_rows = table_stats.row_count;
-
-        if base_rows == 0 {
-            return Some(0);
+    /// The arms of the share of `table_name`'s rows `predicate` keeps: a
+    /// comparison of an indexed column with a value is counted by the index on
+    /// each run, else estimated by the statistics ANALYZE collected, else by
+    /// the default selectivities
+    pub(crate) fn share_arms(&self, table_name: &str, predicate: &Expression) -> ShareArms {
+        let table_stats = self.get_table_stats(table_name).unwrap_or_default();
+        let store = self.engine.get_version_store(table_name).ok();
+        let root = self.share_arm(table_name, predicate, (&table_stats, store.as_deref()));
+        ShareArms {
+            root,
+            table_stats,
+            table_name: table_name.to_string(),
+            store,
         }
-
-        let predicate = match predicate {
-            Some(p) => p,
-            None => return Some(base_rows), // Full table scan
-        };
-
-        // Estimate selectivity from the predicate
-        let selectivity = self.estimate_predicate_selectivity(table_name, predicate, &table_stats);
-        let estimated = ((base_rows as f64) * selectivity).max(1.0) as u64;
-
-        // Apply feedback correction
-        Some(self.estimate_with_feedback(table_name, Some(predicate), estimated))
     }
 
-    /// The share of `table_name`'s rows `predicate` keeps, as its statistics
-    /// estimate it, by the default selectivities when ANALYZE has not run,
-    /// corrected by what EXPLAIN ANALYZE learned of it
-    pub(crate) fn filter_share(&self, table_name: &str, predicate: &Expression) -> f64 {
-        let table_stats = self.get_table_stats(table_name).unwrap_or_default();
-        let share = self.estimate_predicate_selectivity(table_name, predicate, &table_stats);
-        let fingerprint = fingerprint_predicate(table_name, predicate);
-        let correction = global_feedback_cache().get_correction(table_name, fingerprint);
-        (share * correction).clamp(0.0, 1.0)
+    /// The share `arms` keeps on a run with `params`
+    pub(crate) fn arms_share(&self, arms: &ShareArms, params: &[Value]) -> f64 {
+        let run = Run {
+            table_stats: &arms.table_stats,
+            params,
+            counting: (arms.store.as_deref()).map(|store| (arms.table_name.as_str(), store)),
+            hot_rows: std::cell::OnceCell::new(),
+        };
+        self.arm_share(&arms.root, &run).clamp(0.0, 1.0)
+    }
+
+    fn arm_share(&self, arm: &ShareArm, run: &Run) -> f64 {
+        match arm {
+            ShareArm::Fixed(share) => *share,
+            // AND multiplies the shares, as of independent terms
+            ShareArm::And(sides) => self.arm_share(&sides[0], run) * self.arm_share(&sides[1], run),
+            // OR adds them, less their overlap
+            ShareArm::Or(sides) => {
+                let (a, b) = (
+                    self.arm_share(&sides[0], run),
+                    self.arm_share(&sides[1], run),
+                );
+                (a + b - a * b).min(1.0)
+            }
+            ShareArm::Not(arm) => 1.0 - self.arm_share(arm, run),
+            ShareArm::OneRow => (run.counting)
+                .and_then(|(table_name, _)| self.engine.row_count_hint(table_name))
+                .map_or(0.0, |rows| 1.0 / rows.max(1) as f64),
+            ShareArm::Compare(compared) => self.compared_share(compared, run),
+        }
+    }
+
+    /// The share a comparison keeps: the index's count of the run's values,
+    /// else the estimate of its column's statistics, else the default
+    fn compared_share(&self, compared: &Compared, run: &Run) -> f64 {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        let value = |at: usize| compared.values.get(at).and_then(|v| v.bind(run.params));
+        match compared.compare {
+            Compare::Op(op) => {
+                let value = value(0);
+                let indexed = value.and_then(|v| {
+                    let (lower, upper) = match op {
+                        Operator::Eq => (Included(v), Included(v)),
+                        Operator::Lt => (Unbounded, Excluded(v)),
+                        Operator::Lte => (Unbounded, Included(v)),
+                        Operator::Gt => (Excluded(v), Unbounded),
+                        Operator::Gte => (Included(v), Unbounded),
+                        _ => return None,
+                    };
+                    self.counted_share(compared, run, lower, upper)
+                });
+                indexed.unwrap_or_else(|| {
+                    let stats = compared.stats.as_ref();
+                    self.estimate_selectivity(Some(op), value, stats, run.table_stats)
+                })
+            }
+            Compare::In { not, listed } => {
+                let indexed = listed.then(|| self.counted_members(compared, run));
+                let list_size = if listed {
+                    compared.values.len() as f64
+                } else {
+                    5.0
+                };
+                let distinct = (compared.stats.as_ref())
+                    .map(|s| s.distinct_count.max(1) as f64)
+                    .unwrap_or(100.0);
+                let share = indexed.flatten().unwrap_or(list_size / distinct).min(1.0);
+                if not {
+                    1.0 - share
+                } else {
+                    share
+                }
+            }
+            Compare::Between { not } => {
+                let (low, high) = (value(0), value(1));
+                let indexed = low.zip(high).and_then(|(low, high)| {
+                    self.counted_share(compared, run, Included(low), Included(high))
+                });
+                // Estimate as (high - low) / (max - min)
+                let share = if let Some(share) = indexed {
+                    share
+                } else if let (Some(stats), Some(low), Some(high)) = (&compared.stats, low, high) {
+                    if let (Some(min), Some(max)) = (&stats.min_value, &stats.max_value) {
+                        let low_pos = Self::estimate_value_position(low, min, max);
+                        let high_pos = Self::estimate_value_position(high, min, max);
+                        (high_pos - low_pos).abs().clamp(0.01, 0.99)
+                    } else {
+                        0.25 // Default BETWEEN selectivity
+                    }
+                } else {
+                    0.25
+                };
+                if not {
+                    1.0 - share
+                } else {
+                    share
+                }
+            }
+        }
+    }
+
+    /// The share of rows whose compared column lies from `lower` to `upper`,
+    /// as its index counts it while all of the table's rows are hot; None
+    /// otherwise, or for a range holding more than `RANGE_COUNT_CAP` rows,
+    /// whose walk would cost more than the estimate saves
+    fn counted_share(
+        &self,
+        compared: &Compared,
+        run: &Run,
+        lower: std::ops::Bound<&Value>,
+        upper: std::ops::Bound<&Value>,
+    ) -> Option<f64> {
+        use std::ops::Bound::Included;
+        let (index, store, rows) = self.counting(compared, run)?;
+        let (lower, upper) = (compared.read_bound(lower)?, compared.read_bound(upper)?);
+        let (lower, upper) = (lower.as_ref().map(|v| &**v), upper.as_ref().map(|v| &**v));
+        let count = match (lower, upper) {
+            (Included(low), Included(high)) if low == high => {
+                let column = compared.column.as_deref()?;
+                crate::storage::mvcc::table::index_equality_count(
+                    index,
+                    &store.schema(),
+                    column,
+                    low,
+                    rows,
+                )?
+            }
+            _ => index
+                .count_capped(lower, upper, RANGE_COUNT_CAP)
+                .filter(|&count| count <= RANGE_COUNT_CAP)?,
+        };
+        Some(count as f64 / rows as f64)
+    }
+
+    /// The share of rows an IN list's members keep, as the column's index
+    /// counts each key once the run's values are read as the column's type;
+    /// None unless it counts every one
+    fn counted_members(&self, compared: &Compared, run: &Run) -> Option<f64> {
+        use std::ops::Bound::Included;
+        self.counting(compared, run)?;
+        let mut keys = IN_KEYS.with(std::cell::Cell::take);
+        keys.clear();
+        let read = (compared.values.iter()).try_for_each(|member| {
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::estimate_in_key_read();
+            keys.push(compared.read_value(member.bind(run.params)?)?.into_owned());
+            Some(())
+        });
+        let share = read.and_then(|()| {
+            keys.sort_unstable();
+            keys.dedup();
+            (keys.iter())
+                .map(|key| self.counted_share(compared, run, Included(key), Included(key)))
+                .sum()
+        });
+        keys.clear();
+        IN_KEYS.with(|held| held.set(keys));
+        share
+    }
+
+    /// The compared column's index, the table's store and its rows, while
+    /// the index counts them: all of the table's rows hot
+    fn counting<'r>(
+        &self,
+        compared: &'r Compared,
+        run: &Run<'r>,
+    ) -> Option<(
+        &'r dyn crate::storage::traits::Index,
+        &'r VersionStore,
+        usize,
+    )> {
+        let index = compared.index.as_deref()?;
+        let (table_name, store) = run.counting?;
+        let rows = (*run.hot_rows.get_or_init(|| {
+            (self.engine.row_count_hint(table_name))
+                .filter(|&rows| rows > 0 && rows == store.committed_row_count())
+        }))?;
+        Some((index, store, rows))
     }
 
     /// Whether `a = b` compares a column of `table_name` that no two rows
@@ -670,279 +819,162 @@ impl QueryPlanner {
                 .get_version_store(table_name)
                 .is_ok_and(|store| {
                     store
-                        .get_index_by_column(&column)
+                        .get_index_by_column(column)
                         .is_some_and(|index| index.is_unique())
                 })
     }
 
-    /// Estimate selectivity of a predicate expression
-    fn estimate_predicate_selectivity(
-        &self,
-        table_name: &str,
-        expr: &Expression,
-        table_stats: &TableStats,
-    ) -> f64 {
+    /// The arm of `expr`'s share of `table_name`'s rows, its comparisons
+    /// resolved to their columns' indexes and statistics
+    fn share_arm(&self, table_name: &str, expr: &Expression, building: Building<'_>) -> ShareArm {
         use crate::parser::ast::{InfixOperator, PrefixOperator};
+        let (table_stats, store) = building;
+        // A comparison's share is fixed unless a run's parameter or its
+        // index's count decides it
+        let compared = |column: Option<&str>, compare: Compare, values: Vec<ValueSource>| {
+            let compared = Compared {
+                index: (column.zip(store))
+                    .and_then(|(c, s)| s.get_index_by_column(c))
+                    .filter(|index| counts_equality(&**index)),
+                stats: (column.filter(|_| table_stats.row_count > 0))
+                    .and_then(|c| self.get_column_stats(table_name, c)),
+                column_type: column.zip(store).and_then(|(c, s)| {
+                    let schema = s.schema();
+                    let found = schema
+                        .columns
+                        .iter()
+                        .find(|col| eq_names(&col.name_lower, c));
+                    found.map(|col| col.data_type).filter(|t| scan_compares(*t))
+                }),
+                column: column.map(str::to_string),
+                compare,
+                values,
+            };
+            let params = (compared.values.iter()).any(|v| matches!(v, ValueSource::Param(_)));
+            if params || (compared.index.is_some() && compare.counts()) {
+                return ShareArm::Compare(Box::new(compared));
+            }
+            let run = Run {
+                table_stats,
+                params: &[],
+                counting: None,
+                hot_rows: std::cell::OnceCell::new(),
+            };
+            ShareArm::Fixed(self.compared_share(&compared, &run))
+        };
+        let like = |pattern: &Expression, negated: bool| {
+            let share = match self.extract_string_value(pattern) {
+                Some(p) if !p.starts_with('%') => 0.1, // Prefix match is more selective
+                _ => 0.25,                             // Suffix or contains
+            };
+            ShareArm::Fixed(if negated { 1.0 - share } else { share })
+        };
 
         match expr {
-            // Infix expressions (a AND b, a OR b, a = b, a IS NULL, etc.)
-            Expression::Infix(infix) => {
-                match infix.op_type {
-                    // AND: multiply selectivities (assuming independence)
-                    InfixOperator::And => {
-                        let left_sel = self.estimate_predicate_selectivity(
-                            table_name,
-                            &infix.left,
-                            table_stats,
-                        );
-                        let right_sel = self.estimate_predicate_selectivity(
-                            table_name,
-                            &infix.right,
-                            table_stats,
-                        );
-                        left_sel * right_sel
-                    }
-                    // OR: use inclusion-exclusion principle
-                    InfixOperator::Or => {
-                        let left_sel = self.estimate_predicate_selectivity(
-                            table_name,
-                            &infix.left,
-                            table_stats,
-                        );
-                        let right_sel = self.estimate_predicate_selectivity(
-                            table_name,
-                            &infix.right,
-                            table_stats,
-                        );
-                        // P(A or B) = P(A) + P(B) - P(A and B)
-                        (left_sel + right_sel - left_sel * right_sel).min(1.0)
-                    }
-                    // IS NULL
-                    InfixOperator::Is => {
-                        // Check if right side is NULL
-                        if matches!(infix.right.as_ref(), Expression::NullLiteral(_)) {
-                            let col_name = self.extract_column_name(&infix.left);
-                            let col_stats =
-                                col_name.and_then(|name| self.get_column_stats(table_name, &name));
-                            self.estimate_selectivity(
-                                Some(Operator::IsNull),
-                                None,
-                                col_stats.as_ref(),
-                                table_stats,
-                            )
-                        } else {
-                            0.5
-                        }
-                    }
-                    // IS NOT NULL
-                    InfixOperator::IsNot => {
-                        if matches!(infix.right.as_ref(), Expression::NullLiteral(_)) {
-                            let col_name = self.extract_column_name(&infix.left);
-                            let col_stats =
-                                col_name.and_then(|name| self.get_column_stats(table_name, &name));
-                            self.estimate_selectivity(
-                                Some(Operator::IsNotNull),
-                                None,
-                                col_stats.as_ref(),
-                                table_stats,
-                            )
-                        } else {
-                            0.5
-                        }
-                    }
-                    // Comparison operators
-                    InfixOperator::Equal => {
-                        // A key no two rows share, equal to a value, keeps one
-                        // row, a share no count of rows moves
-                        if self.unique_key_equality(table_name, &infix.left, &infix.right) {
-                            return 0.0;
-                        }
-                        let col_name = self
-                            .extract_column_name(&infix.left)
-                            .or_else(|| self.extract_column_name(&infix.right));
-                        let value = self
-                            .extract_value(&infix.right)
-                            .or_else(|| self.extract_value(&infix.left));
-                        let col_stats =
-                            col_name.and_then(|name| self.get_column_stats(table_name, &name));
-                        self.estimate_selectivity(
-                            Some(Operator::Eq),
-                            value.as_ref(),
-                            col_stats.as_ref(),
-                            table_stats,
-                        )
-                    }
-                    InfixOperator::NotEqual => {
-                        let col_name = self
-                            .extract_column_name(&infix.left)
-                            .or_else(|| self.extract_column_name(&infix.right));
-                        let value = self
-                            .extract_value(&infix.right)
-                            .or_else(|| self.extract_value(&infix.left));
-                        let col_stats =
-                            col_name.and_then(|name| self.get_column_stats(table_name, &name));
-                        self.estimate_selectivity(
-                            Some(Operator::Ne),
-                            value.as_ref(),
-                            col_stats.as_ref(),
-                            table_stats,
-                        )
-                    }
-                    InfixOperator::LessThan => {
-                        let col_name = self.extract_column_name(&infix.left);
-                        let value = self.extract_value(&infix.right);
-                        let col_stats =
-                            col_name.and_then(|name| self.get_column_stats(table_name, &name));
-                        self.estimate_selectivity(
-                            Some(Operator::Lt),
-                            value.as_ref(),
-                            col_stats.as_ref(),
-                            table_stats,
-                        )
-                    }
-                    InfixOperator::LessEqual => {
-                        let col_name = self.extract_column_name(&infix.left);
-                        let value = self.extract_value(&infix.right);
-                        let col_stats =
-                            col_name.and_then(|name| self.get_column_stats(table_name, &name));
-                        self.estimate_selectivity(
-                            Some(Operator::Lte),
-                            value.as_ref(),
-                            col_stats.as_ref(),
-                            table_stats,
-                        )
-                    }
-                    InfixOperator::GreaterThan => {
-                        let col_name = self.extract_column_name(&infix.left);
-                        let value = self.extract_value(&infix.right);
-                        let col_stats =
-                            col_name.and_then(|name| self.get_column_stats(table_name, &name));
-                        self.estimate_selectivity(
-                            Some(Operator::Gt),
-                            value.as_ref(),
-                            col_stats.as_ref(),
-                            table_stats,
-                        )
-                    }
-                    InfixOperator::GreaterEqual => {
-                        let col_name = self.extract_column_name(&infix.left);
-                        let value = self.extract_value(&infix.right);
-                        let col_stats =
-                            col_name.and_then(|name| self.get_column_stats(table_name, &name));
-                        self.estimate_selectivity(
-                            Some(Operator::Gte),
-                            value.as_ref(),
-                            col_stats.as_ref(),
-                            table_stats,
-                        )
-                    }
-                    InfixOperator::Like | InfixOperator::ILike => {
-                        let pattern_str = self.extract_string_value(&infix.right);
-                        match pattern_str {
-                            Some(p) if !p.starts_with('%') => 0.1, // Prefix match is more selective
-                            Some(_) => 0.25,                       // Suffix or contains
-                            None => 0.25,
-                        }
-                    }
-                    InfixOperator::NotLike | InfixOperator::NotILike => {
-                        let pattern_str = self.extract_string_value(&infix.right);
-                        let like_sel = match pattern_str {
-                            Some(p) if !p.starts_with('%') => 0.1,
-                            Some(_) => 0.25,
-                            None => 0.25,
-                        };
-                        1.0 - like_sel
-                    }
-                    // Default for other operators
-                    _ => 0.5,
-                }
-            }
-            // IN expression
-            Expression::In(in_expr) => {
-                let col_name = self.extract_column_name(&in_expr.left);
-                let col_stats = col_name.and_then(|name| self.get_column_stats(table_name, &name));
-
-                // Get list size from the right side
-                let list_size = match in_expr.right.as_ref() {
-                    Expression::List(list) => list.elements.len() as f64,
-                    Expression::ExpressionList(list) => list.expressions.len() as f64,
-                    _ => 5.0, // Default assumption
-                };
-                let distinct = col_stats
-                    .map(|s| s.distinct_count.max(1) as f64)
-                    .unwrap_or(100.0);
-                let in_selectivity = (list_size / distinct).min(1.0);
-
-                if in_expr.not {
-                    1.0 - in_selectivity
-                } else {
-                    in_selectivity
-                }
-            }
-            // BETWEEN expression
-            Expression::Between(between) => {
-                let col_name = self.extract_column_name(&between.expr);
-                let col_stats = col_name.and_then(|name| self.get_column_stats(table_name, &name));
-                let low_val = self.extract_value(&between.lower);
-                let high_val = self.extract_value(&between.upper);
-
-                // Estimate as (high - low) / (max - min)
-                let range_sel = if let (Some(ref stats), Some(low_v), Some(high_v)) =
-                    (&col_stats, low_val, high_val)
-                {
-                    if let (Some(min), Some(max)) = (&stats.min_value, &stats.max_value) {
-                        let low_pos = Self::estimate_value_position(&low_v, min, max);
-                        let high_pos = Self::estimate_value_position(&high_v, min, max);
-                        (high_pos - low_pos).abs().clamp(0.01, 0.99)
+            Expression::Infix(infix) => match infix.op_type {
+                InfixOperator::And | InfixOperator::Or => {
+                    let sides = Box::new([
+                        self.share_arm(table_name, &infix.left, building),
+                        self.share_arm(table_name, &infix.right, building),
+                    ]);
+                    if matches!(infix.op_type, InfixOperator::And) {
+                        ShareArm::And(sides)
                     } else {
-                        0.25 // Default BETWEEN selectivity
+                        ShareArm::Or(sides)
                     }
-                } else {
-                    0.25
-                };
-
-                if between.not {
-                    1.0 - range_sel
-                } else {
-                    range_sel
                 }
-            }
-            // LIKE expression (standalone)
-            Expression::Like(like_expr) => {
-                let is_negated = like_expr.operator.to_uppercase().contains("NOT");
-                let pattern_str = self.extract_string_value(&like_expr.pattern);
-                let base_sel = match pattern_str {
-                    Some(p) if !p.starts_with('%') => 0.1,
-                    Some(_) => 0.25,
-                    None => 0.25,
-                };
-                if is_negated {
-                    1.0 - base_sel
-                } else {
-                    base_sel
+                InfixOperator::Is | InfixOperator::IsNot
+                    if matches!(infix.right.as_ref(), Expression::NullLiteral(_)) =>
+                {
+                    let op = match infix.op_type {
+                        InfixOperator::Is => Operator::IsNull,
+                        _ => Operator::IsNotNull,
+                    };
+                    let column = self.extract_column_name(&infix.left);
+                    compared(column, Compare::Op(op), Vec::new())
                 }
-            }
-            // Prefix expressions (NOT x, -x)
-            Expression::Prefix(prefix) => match prefix.op_type {
-                PrefixOperator::Not => {
-                    1.0 - self.estimate_predicate_selectivity(
-                        table_name,
-                        &prefix.right,
-                        table_stats,
+                InfixOperator::Equal | InfixOperator::NotEqual => {
+                    // A key no two rows share, equal to a value, keeps one
+                    // row at most
+                    let equal = matches!(infix.op_type, InfixOperator::Equal);
+                    if equal && self.unique_key_equality(table_name, &infix.left, &infix.right) {
+                        return ShareArm::OneRow;
+                    }
+                    let column = (self.extract_column_name(&infix.left))
+                        .or_else(|| self.extract_column_name(&infix.right));
+                    let value = match self.value_source(&infix.right) {
+                        ValueSource::Unknown => self.value_source(&infix.left),
+                        value => value,
+                    };
+                    let op = if equal { Operator::Eq } else { Operator::Ne };
+                    compared(column, Compare::Op(op), vec![value])
+                }
+                InfixOperator::LessThan
+                | InfixOperator::LessEqual
+                | InfixOperator::GreaterThan
+                | InfixOperator::GreaterEqual => {
+                    let op = match infix.op_type {
+                        InfixOperator::LessThan => Operator::Lt,
+                        InfixOperator::LessEqual => Operator::Lte,
+                        InfixOperator::GreaterThan => Operator::Gt,
+                        _ => Operator::Gte,
+                    };
+                    let column = self.extract_column_name(&infix.left);
+                    compared(
+                        column,
+                        Compare::Op(op),
+                        vec![self.value_source(&infix.right)],
                     )
                 }
-                _ => 0.5,
+                InfixOperator::Like | InfixOperator::ILike => like(&infix.right, false),
+                InfixOperator::NotLike | InfixOperator::NotILike => like(&infix.right, true),
+                // Default for other operators
+                _ => ShareArm::Fixed(0.5),
             },
+            Expression::In(in_expr) => {
+                let members = match in_expr.right.as_ref() {
+                    Expression::List(list) => Some(&list.elements[..]),
+                    Expression::ExpressionList(list) => Some(&list.expressions[..]),
+                    _ => None,
+                };
+                let values = (members.unwrap_or_default().iter())
+                    .map(|member| self.value_source(member))
+                    .collect();
+                let compare = Compare::In {
+                    not: in_expr.not,
+                    listed: members.is_some(),
+                };
+                compared(self.extract_column_name(&in_expr.left), compare, values)
+            }
+            Expression::Between(between) => {
+                let values = vec![
+                    self.value_source(&between.lower),
+                    self.value_source(&between.upper),
+                ];
+                let compare = Compare::Between { not: between.not };
+                compared(self.extract_column_name(&between.expr), compare, values)
+            }
+            Expression::Like(like_expr) => {
+                let negated = like_expr.operator.to_uppercase().contains("NOT");
+                like(&like_expr.pattern, negated)
+            }
+            Expression::Prefix(prefix) if matches!(prefix.op_type, PrefixOperator::Not) => {
+                ShareArm::Not(Box::new(self.share_arm(
+                    table_name,
+                    &prefix.right,
+                    building,
+                )))
+            }
             // Unknown expressions - conservative estimate
-            _ => 0.5,
+            _ => ShareArm::Fixed(0.5),
         }
     }
 
     /// Extract column name from an expression
-    fn extract_column_name(&self, expr: &Expression) -> Option<String> {
+    fn extract_column_name<'e>(&self, expr: &'e Expression) -> Option<&'e str> {
         match expr {
-            Expression::Identifier(id) => Some(id.value_lower.to_string()),
-            Expression::QualifiedIdentifier(qid) => Some(qid.name.value_lower.to_string()),
+            Expression::Identifier(id) => Some(id.value_lower.as_str()),
+            Expression::QualifiedIdentifier(qid) => Some(qid.name.value_lower.as_str()),
             _ => None,
         }
     }
@@ -961,6 +993,16 @@ impl QueryPlanner {
         }
     }
 
+    /// Where a run finds `expr`'s value: a literal's own, or a parameter's
+    fn value_source(&self, expr: &Expression) -> ValueSource {
+        match expr {
+            Expression::Parameter(p) => {
+                (p.index.checked_sub(1)).map_or(ValueSource::Unknown, ValueSource::Param)
+            }
+            _ => (self.extract_value(expr)).map_or(ValueSource::Unknown, ValueSource::Literal),
+        }
+    }
+
     /// Extract string value from an expression
     fn extract_string_value(&self, expr: &Expression) -> Option<String> {
         match expr {
@@ -968,91 +1010,146 @@ impl QueryPlanner {
             _ => None,
         }
     }
+}
 
-    // =========================================================================
-    // Cardinality Feedback Integration
-    // =========================================================================
+/// The most rows an estimate counts in a range before it estimates instead
+const RANGE_COUNT_CAP: usize = 4096;
 
-    /// Estimate row count with cardinality feedback correction
-    ///
-    /// This method combines statistics-based estimation with learned corrections
-    /// from previous query executions. When similar predicates have been executed
-    /// before, the correction factor improves accuracy.
-    ///
-    /// # Arguments
-    /// * `table_name` - Name of the table being scanned
-    /// * `predicate` - The WHERE clause predicate (for fingerprinting)
-    /// * `base_estimate` - Initial row count estimate from statistics
-    ///
-    /// # Returns
-    /// Corrected row count estimate
-    pub fn estimate_with_feedback(
-        &self,
-        table_name: &str,
-        predicate: Option<&Expression>,
-        base_estimate: u64,
-    ) -> u64 {
-        let predicate = match predicate {
-            Some(p) => p,
-            None => return base_estimate, // No predicate, no feedback
-        };
+/// Whether `index` counts the rows of a key, as it answers for the NULL one
+fn counts_equality(index: &dyn crate::storage::traits::Index) -> bool {
+    use std::ops::Bound::Included;
+    let null = Value::Null(crate::core::DataType::Null);
+    index
+        .count_capped(Included(&null), Included(&null), 0)
+        .is_some()
+}
 
-        // Get fingerprint for this predicate pattern
-        let fingerprint = fingerprint_predicate(table_name, predicate);
+thread_local! {
+    /// An IN list's keys as its column reads them, one buffer a thread keeps
+    /// for every list it counts, so a run allocates nothing for it
+    static IN_KEYS: std::cell::Cell<Vec<Value>> = const { std::cell::Cell::new(Vec::new()) };
+}
 
-        // Look up and apply any learned correction
-        let feedback_cache = global_feedback_cache();
-        feedback_cache.apply_correction(table_name, fingerprint, base_estimate)
+/// The share of a table's rows a predicate keeps, resolved once per
+/// statistics epoch for runs to bind and count
+pub(crate) struct ShareArms {
+    root: ShareArm,
+    table_stats: TableStats,
+    table_name: String,
+    store: Option<Arc<VersionStore>>,
+}
+
+impl std::fmt::Debug for ShareArms {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShareArms")
+            .field("table_name", &self.table_name)
+            .finish_non_exhaustive()
     }
+}
 
-    /// Record cardinality feedback after query execution
-    ///
-    /// This method stores the difference between estimated and actual row counts,
-    /// enabling future queries with similar predicates to benefit from the correction.
-    ///
-    /// # Arguments
-    /// * `table_name` - Name of the table that was scanned
-    /// * `predicate` - The WHERE clause predicate (for fingerprinting)
-    /// * `column_name` - Optional column name for more specific feedback
-    /// * `estimated_rows` - Row count estimate used during planning
-    /// * `actual_rows` - Actual row count observed during execution
-    pub fn record_feedback(
-        &self,
-        table_name: &str,
-        predicate: &Expression,
-        column_name: Option<String>,
-        estimated_rows: u64,
-        actual_rows: u64,
-    ) {
-        // Only record if there's meaningful difference (avoid noise from perfect estimates)
-        if estimated_rows == actual_rows {
-            return;
+enum ShareArm {
+    /// A share no run changes
+    Fixed(f64),
+    And(Box<[ShareArm; 2]>),
+    Or(Box<[ShareArm; 2]>),
+    Not(Box<ShareArm>),
+    /// A key no two rows share, equal to a value: one row at most
+    OneRow,
+    /// A comparison whose share a run's values or its index's count decide
+    Compare(Box<Compared>),
+}
+
+/// A column compared with values, with the index and the statistics of the
+/// column; `column` names it for an index that counts, `column_type` reads
+/// the values as the column compares them
+struct Compared {
+    compare: Compare,
+    values: Vec<ValueSource>,
+    column: Option<String>,
+    column_type: Option<crate::core::DataType>,
+    index: Option<Arc<dyn crate::storage::traits::Index>>,
+    stats: Option<ColumnStatsCache>,
+}
+
+impl Compared {
+    /// `value` as the column compares it, by the rule a WHERE constant is
+    /// read with; None for a value the column does not read as its type
+    fn read_value<'v>(&self, value: &'v Value) -> Option<std::borrow::Cow<'v, Value>> {
+        use std::borrow::Cow;
+        let column_type = self.column_type?;
+        if value.data_type() == column_type {
+            return Some(Cow::Borrowed(value));
         }
+        coerce_constant(Some(column_type), value.clone())
+            .filter(|read| !read.is_null())
+            .map(Cow::Owned)
+    }
 
-        // Only record if actual rows are significant (avoid learning from tiny results)
-        if actual_rows < 10 && estimated_rows < 10 {
-            return;
+    fn read_bound<'v>(
+        &self,
+        bound: std::ops::Bound<&'v Value>,
+    ) -> Option<std::ops::Bound<std::borrow::Cow<'v, Value>>> {
+        use std::ops::Bound;
+        Some(match bound {
+            Bound::Included(value) => Bound::Included(self.read_value(value)?),
+            Bound::Excluded(value) => Bound::Excluded(self.read_value(value)?),
+            Bound::Unbounded => Bound::Unbounded,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Compare {
+    Op(Operator),
+    Between {
+        not: bool,
+    },
+    /// `listed` when the values are the members of a list
+    In {
+        not: bool,
+        listed: bool,
+    },
+}
+
+impl Compare {
+    /// Whether an index counts the rows this comparison keeps
+    fn counts(self) -> bool {
+        !matches!(
+            self,
+            Compare::Op(Operator::Ne | Operator::IsNull | Operator::IsNotNull)
+        )
+    }
+}
+
+enum ValueSource {
+    Literal(Value),
+    /// The run's parameter at this position
+    Param(usize),
+    /// A value no estimate binds
+    Unknown,
+}
+
+impl ValueSource {
+    fn bind<'a>(&'a self, params: &'a [Value]) -> Option<&'a Value> {
+        match self {
+            ValueSource::Literal(value) => Some(value),
+            ValueSource::Param(at) => params.get(*at).filter(|value| !value.is_null()),
+            ValueSource::Unknown => None,
         }
-
-        let fingerprint = fingerprint_predicate(table_name, predicate);
-        let feedback_cache = global_feedback_cache();
-        feedback_cache.record_feedback(
-            table_name,
-            fingerprint,
-            column_name,
-            estimated_rows,
-            actual_rows,
-        );
     }
+}
 
-    /// Get the correction factor for a predicate (for debugging/EXPLAIN)
-    ///
-    /// Returns 1.0 if no feedback is available or if feedback is not yet reliable.
-    pub fn get_feedback_correction(&self, table_name: &str, predicate: &Expression) -> f64 {
-        let fingerprint = fingerprint_predicate(table_name, predicate);
-        let feedback_cache = global_feedback_cache();
-        feedback_cache.get_correction(table_name, fingerprint)
-    }
+/// What share arms are resolved from: the table's statistics and its store
+type Building<'a> = (&'a TableStats, Option<&'a VersionStore>);
+
+/// What one share is estimated with: the table's statistics, the run's
+/// parameters, and the table's store, whose indexes count while all of its
+/// rows are hot, with those rows found once
+struct Run<'a> {
+    table_stats: &'a TableStats,
+    params: &'a [Value],
+    counting: Option<(&'a str, &'a VersionStore)>,
+    hot_rows: std::cell::OnceCell<Option<usize>>,
 }
 
 /// Health status of table statistics

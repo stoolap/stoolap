@@ -170,7 +170,7 @@ src/
     operators/   Volcano join operators (hash, merge, nested loop)
     subquery.rs  Subquery execution (EXISTS, IN, scalar)
   functions/     Built-in functions (scalar/, aggregate/, window/)
-  optimizer/     Expression simplification, join bloom filters, feedback
+  optimizer/     Expression simplification, join bloom filters
   planner/       Statement plans (reads, joins, subquery blocks)
   parser/        SQL parser (lexer, AST, parser)
   storage/       Storage engine (mvcc/, index/, statistics)

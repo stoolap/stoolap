@@ -225,10 +225,6 @@ pub(crate) struct JoinFilters {
     pub cross: Option<Expression>,
 }
 
-/// The share of each side's rows its own conditions keep, with the
-/// statistics epoch and the feedback version it was estimated under
-type HeldShares = ((u64, u64), [f64; 2]);
-
 /// The programs one join statement compiled, valid while its validity holds
 #[derive(Debug)]
 pub struct PreparedJoin {
@@ -273,8 +269,15 @@ pub struct PreparedJoin {
     /// Whether the statement's CTEs are named without reading them, which
     /// keeps the join's plan over them; decided on first need
     ctes_named: std::sync::OnceLock<bool>,
-    side_shares: RwLock<Option<HeldShares>>,
+    side_arms: RwLock<Option<HeldArms>>,
 }
+
+/// The share arms of each side's conditions, with the statistics epoch they
+/// were resolved at
+type HeldArms = (u64, Arc<SideArms>);
+
+/// The share arms of each side's conditions, None for a side with none
+pub(crate) type SideArms = [Option<super::planner::ShareArms>; 2];
 
 impl PreparedJoin {
     pub fn new(validity: PlanValidity, cte_scope: CteScope) -> Self {
@@ -297,7 +300,7 @@ impl PreparedJoin {
             filters: std::sync::OnceLock::new(),
             join_plan: std::sync::OnceLock::new(),
             ctes_named: std::sync::OnceLock::new(),
-            side_shares: RwLock::new(None),
+            side_arms: RwLock::new(None),
         }
     }
 
@@ -342,24 +345,23 @@ impl PreparedJoin {
         self.sides.get_or_init(name).as_ref()
     }
 
-    /// The share of each side's rows its own conditions keep under the
-    /// statistics and the learned corrections of `epoch`, as `estimate`
-    /// finds once per epoch
-    pub(crate) fn side_shares(
+    /// The share arms of each side's conditions under the statistics of
+    /// `epoch`, as `resolve` finds them once per epoch
+    pub(crate) fn side_arms(
         &self,
-        epoch: (u64, u64),
-        estimate: impl FnOnce() -> [f64; 2],
-    ) -> [f64; 2] {
-        if let Some((held, shares)) = self.side_shares.read().ok().and_then(|held| *held) {
-            if held == epoch {
-                return shares;
+        epoch: u64,
+        resolve: impl FnOnce() -> SideArms,
+    ) -> Arc<SideArms> {
+        if let Ok(held) = self.side_arms.read() {
+            if let Some((_, arms)) = held.as_ref().filter(|(at, _)| *at == epoch) {
+                return Arc::clone(arms);
             }
         }
-        let shares = estimate();
-        if let Ok(mut held) = self.side_shares.write() {
-            *held = Some((epoch, shares));
+        let arms = Arc::new(resolve());
+        if let Ok(mut held) = self.side_arms.write() {
+            *held = Some((epoch, Arc::clone(&arms)));
         }
-        shares
+        arms
     }
 
     /// Whether the statement's CTEs are named without reading them, as

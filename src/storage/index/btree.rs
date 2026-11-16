@@ -248,8 +248,13 @@ impl BTreeIndex {
                     rows.copy_into(&mut results);
                 }
             }
-            Operator::Lt => collect(Bound::Unbounded, &|key| key.cmp(value) == Ordering::Less),
-            Operator::Lte => collect(Bound::Unbounded, &|key| key.cmp(value) != Ordering::Greater),
+            // NULL, the first key, is below no value
+            Operator::Lt => collect(Bound::Excluded(&NULL), &|key| {
+                key.cmp(value) == Ordering::Less
+            }),
+            Operator::Lte => collect(Bound::Excluded(&NULL), &|key| {
+                key.cmp(value) != Ordering::Greater
+            }),
             Operator::Gt => collect(Bound::Excluded(value), &|_| true),
             Operator::Gte => collect(Bound::Included(value), &|_| true),
             Operator::IsNull => {
@@ -610,6 +615,11 @@ impl Index for BTreeIndex {
                 return Some(count.min(max.saturating_add(1)));
             }
         }
+        // NULL, the first key, compares with no bound
+        let lower = match lower {
+            Bound::Unbounded => Bound::Excluded(&NULL),
+            bound => bound,
+        };
         let mut count = 0usize;
         sorted_values.walk(lower, true, &mut |key, rows| {
             if past_end(&key, &upper) {
@@ -1418,6 +1428,28 @@ mod tests {
             one_by_one.get_grouped_row_ids()
         );
         assert_eq!(batched.entry_count(), values.len());
+    }
+
+    #[test]
+    fn a_range_count_and_read_leave_out_the_null_key() {
+        use std::ops::Bound;
+        let index = create_test_index();
+        index.add(&[Value::Null(DataType::Integer)], 1, 1).unwrap();
+        index.add(&[Value::Null(DataType::Integer)], 2, 2).unwrap();
+        index.add(&[Value::Integer(1)], 3, 3).unwrap();
+        index.add(&[Value::Integer(9)], 4, 4).unwrap();
+        let five = Value::Integer(5);
+        let below = index.count_capped(Bound::Unbounded, Bound::Excluded(&five), 10);
+        assert_eq!(below, Some(1), "k < 5 keeps the row of 1, no NULL");
+        let all = index.count_capped(Bound::Unbounded, Bound::Unbounded, 10);
+        assert_eq!(all, Some(2), "no bound keeps the NULLs out still");
+        for op in [Operator::Lt, Operator::Lte] {
+            let read = index
+                .find_with_operator(op, std::slice::from_ref(&five))
+                .unwrap();
+            let ids: Vec<i64> = read.iter().map(|entry| entry.row_id).collect();
+            assert_eq!(ids, vec![3], "{op:?} 5 reads the row of 1, no NULL");
+        }
     }
 
     #[test]

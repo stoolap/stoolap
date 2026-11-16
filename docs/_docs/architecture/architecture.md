@@ -171,8 +171,7 @@ src/
 │   └── window/    # ROW_NUMBER, RANK, LAG, etc.
 ├── optimizer/     # Expression simplification, join bloom filters
 │   ├── simplify.rs
-│   ├── bloom.rs
-│   └── feedback.rs
+│   └── bloom.rs
 ├── parser/        # SQL parser (lexer, AST, parser)
 ├── storage/       # Storage engine
 │   ├── index/     # B-tree, Hash, Bitmap, HNSW indexes

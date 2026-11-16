@@ -12,18 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Expression simplification, the bloom filter a hash join builds over its
-//! build keys, and the row-count corrections EXPLAIN ANALYZE records
+//! Expression simplification, and the bloom filter a hash join builds over
+//! its build keys
 
 pub mod bloom;
-pub mod feedback;
 pub mod simplify;
-
-pub use feedback::{
-    extract_column_from_predicate, fingerprint_predicate, global_feedback_cache,
-    CardinalityFeedback, FeedbackCache, DEFAULT_DECAY_FACTOR, MAX_CORRECTION_FACTOR,
-    MIN_CORRECTION_FACTOR, MIN_SAMPLE_COUNT,
-};
 
 pub use bloom::{BloomFilter, BloomFilterBuilder, RuntimeBloomFilter};
 

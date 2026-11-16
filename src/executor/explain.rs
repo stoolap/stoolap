@@ -19,7 +19,6 @@
 
 use crate::common::SmartString;
 use crate::core::{Result, Row, RowVec, Value};
-use crate::optimizer::feedback::{fingerprint_predicate, global_feedback_cache};
 use crate::parser::ast::*;
 use crate::planner::join::{pair_method, PairMethod};
 use crate::planner::ScanChoice;
@@ -104,59 +103,6 @@ impl Executor {
             } else {
                 format!("{:.2}µs", duration.as_micros() as f64)
             };
-
-            // Record cardinality feedback for SELECT statements with WHERE
-            if let Statement::Select(select) = &*stmt.statement {
-                if let Some(ref where_clause) = select.where_clause {
-                    // What it corrects is a base table's scan as of now, so a
-                    // join, a CTE or a view of the name and an AS OF read record
-                    // none; its columns are fingerprinted bare, as a join side's
-                    // conditions read them
-                    let ctes: Vec<String> = (select.with.iter())
-                        .flat_map(|with| &with.ctes)
-                        .map(|cte| cte.name.value_lower.to_string())
-                        .collect();
-                    if let Some(source @ Expression::TableSource(table)) =
-                        select.table_expr.as_deref()
-                    {
-                        if table.as_of.is_none()
-                            && self
-                                .base_table_side_schema(source, CteNames::Listed(&ctes))
-                                .is_some()
-                        {
-                            let table_name = table.name.value_lower.to_string();
-                            let alias = table.alias.as_ref().unwrap_or(&table.name);
-                            let bare =
-                                super::utils::strip_table_qualifier(where_clause, &alias.value);
-                            let predicate_hash = fingerprint_predicate(&table_name, &bare);
-
-                            // Get estimated row count from planner
-                            let tx = self.begin_transaction().ok();
-                            let estimated_rows = tx
-                                .as_ref()
-                                .and_then(|tx| {
-                                    tx.get_read_table_at(&table_name, None, TableUse::Read).ok()
-                                })
-                                .map(|table| {
-                                    let stats = self
-                                        .get_query_planner()
-                                        .get_table_stats_with_fallback(&*table);
-                                    stats.row_count as usize
-                                })
-                                .unwrap_or(row_count);
-
-                            // Record feedback to global cache
-                            global_feedback_cache().record_feedback(
-                                &table_name,
-                                predicate_hash,
-                                None, // column_name for more granular tracking
-                                estimated_rows as u64,
-                                row_count as u64,
-                            );
-                        }
-                    }
-                }
-            }
 
             // A SELECT run as a parsed tree, an INSERT's or a CREATE TABLE's
             // included, held the plan its structure keys
@@ -957,70 +903,36 @@ impl Executor {
                     sides.as_ref(),
                 );
 
-                if show_join_cost {
-                    // Get cost estimate from query planner
-                    let planner = self.get_query_planner();
-                    let left_table_name = extract_table_name(&join.left);
-                    let right_table_name = extract_table_name(&join.right);
-
-                    // Get table statistics for cost estimation
-                    let left_stats = left_table_name
-                        .as_ref()
-                        .and_then(|name| planner.get_table_stats(name));
-                    let right_stats = right_table_name
-                        .as_ref()
-                        .and_then(|name| planner.get_table_stats(name));
-
-                    // Calculate estimated rows and cost
-                    let (estimated_rows, estimated_cost) = match (left_stats, right_stats) {
-                        (Some(ls), Some(rs)) => {
-                            // Hash join cost estimation
-                            let left_rows = ls.row_count.max(1);
-                            let right_rows = rs.row_count.max(1);
-                            // Simplified join cardinality estimate
-                            let rows =
-                                if join_algorithm == "Nested Loop" && join.condition.is_none() {
-                                    // Cross join: left * right
-                                    left_rows * right_rows
-                                } else {
-                                    // Equality join: estimate as smaller side (pessimistic)
-                                    left_rows.min(right_rows)
-                                };
-                            // Cost = build cost + probe cost
-                            let cost = if join_algorithm == "Hash Join" {
-                                (left_rows.min(right_rows) as f64)
-                                    + (left_rows.max(right_rows) as f64 * 0.1)
-                            } else {
-                                // Nested loop: O(n*m) but with early termination
-                                (left_rows as f64) * (right_rows as f64).sqrt()
-                            };
-                            (rows, cost)
-                        }
-                        (Some(ls), None) => {
-                            // Only left stats available
-                            (ls.row_count, ls.row_count as f64 * 10.0)
-                        }
-                        (None, Some(rs)) => {
-                            // Only right stats available
-                            (rs.row_count, rs.row_count as f64 * 10.0)
-                        }
-                        (None, None) => {
-                            // No stats - use default estimate
-                            (1000, 10000.0)
-                        }
-                    };
-
-                    // Show join algorithm, type, cost and rows
-                    lines.push(format!(
-                        "{}-> {} ({} Join) (cost={:.2} rows={})",
-                        prefix, join_algorithm, join.join_type, estimated_cost, estimated_rows
-                    ));
-                } else {
-                    // Plan-only mode (EXPLAIN ANALYZE child nodes): no cost estimates
-                    lines.push(format!(
+                // Partition WHERE predicates by which table they reference
+                let (left_where, right_where, join_filter) = match where_clause {
+                    Some(wc) => self.explain_where_split(wc, join, sides.as_ref(), ctes),
+                    None => (None, None, None),
+                };
+                // Each table side's rows as the estimator counts them under its
+                // own conditions: the smaller bounds a keyed join's rows, their
+                // product a join without a condition's
+                let estimated = show_join_cost.then(|| {
+                    let sides = [&*join.left, &*join.right];
+                    let filters = [left_where.as_ref(), right_where.as_ref()];
+                    let shares = self.join_side_shares(None, sides, filters, &[]);
+                    let rows = [0, 1].map(|i| self.estimate_side_rows(sides[i], shares[i]));
+                    let crossed = join.condition.is_none() && join.using_columns.is_empty();
+                    match rows.map(|rows| (rows != u64::MAX).then_some(rows)) {
+                        [Some(left), Some(right)] if crossed => Some(left.saturating_mul(right)),
+                        [Some(left), Some(right)] => Some(left.min(right)),
+                        [Some(rows), None] | [None, Some(rows)] if !crossed => Some(rows),
+                        _ => None,
+                    }
+                });
+                match estimated.flatten() {
+                    Some(rows) => lines.push(format!(
+                        "{}-> {} ({} Join) (rows={})",
+                        prefix, join_algorithm, join.join_type, rows
+                    )),
+                    None => lines.push(format!(
                         "{}-> {} ({} Join)",
                         prefix, join_algorithm, join.join_type
-                    ));
+                    )),
                 }
                 if let Some(ref condition) = join.condition {
                     lines.push(format!("{}   Join Cond: {}", prefix, condition));
@@ -1030,11 +942,6 @@ impl Executor {
                         join.using_columns.iter().map(|c| c.to_string()).collect();
                     lines.push(format!("{}   Using: ({})", prefix, cols.join(", ")));
                 }
-                // Partition WHERE predicates by which table they reference
-                let (left_where, right_where, join_filter) = match where_clause {
-                    Some(wc) => self.explain_where_split(wc, join, sides.as_ref(), ctes),
-                    None => (None, None, None),
-                };
                 if let Some(ref jf) = join_filter {
                     lines.push(format!("{}   Join Filter: {}", prefix, jf));
                 }
@@ -1208,7 +1115,7 @@ impl Executor {
                     || {
                         let sides = [join_left, join_right];
                         let filters = [left_filter.as_ref(), right_filter.as_ref()];
-                        let shares = self.join_side_shares(None, sides, filters);
+                        let shares = self.join_side_shares(None, sides, filters, &[]);
                         self.right_small_beside(sides, shares)
                     },
                     |(_, strategy, _, _)| matches!(strategy, IndexLookupStrategy::PrimaryKey),

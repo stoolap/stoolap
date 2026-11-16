@@ -275,3 +275,34 @@ fn explain_names_the_fewest_rows_choice() {
         "{single}"
     );
 }
+
+#[test]
+fn a_range_below_a_value_reads_and_counts_no_null_key() {
+    let db = Database::open("memory://index_fewest_rows_nulls").unwrap();
+    for sql in [
+        "CREATE TABLE n (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER)",
+        "INSERT INTO n SELECT g.value, \
+         CASE WHEN g.value <= 3500 THEN NULL WHEN g.value <= 3600 THEN 1 ELSE 9 END, \
+         CASE WHEN g.value > 3400 THEN 1 ELSE 0 END FROM generate_series(1, 4000) g",
+        "CREATE INDEX n_x ON n (x)",
+        "CREATE INDEX n_y ON n (y)",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    for sql in [
+        "SELECT id FROM n WHERE x < 5 AND y = 1",
+        "SELECT id FROM n WHERE x <= 1 AND y = 1",
+    ] {
+        let before = hot_ids();
+        assert_eq!(
+            ids(&db, sql, vec![]),
+            (3501..=3600).collect::<Vec<_>>(),
+            "{sql}"
+        );
+        let read = hot_ids() - before;
+        assert!(
+            read <= 600,
+            "{sql}: x's 100 rows below 5 or the 600 of y = 1 read, not the 3,500 NULLs: {read}"
+        );
+    }
+}

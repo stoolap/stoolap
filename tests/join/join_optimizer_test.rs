@@ -110,7 +110,7 @@ fn test_explain_shows_nested_loop_for_cross_join() {
 }
 
 #[test]
-fn test_explain_shows_cost_and_rows() {
+fn test_explain_shows_rows_and_no_cost() {
     let db = Database::open("memory://join_opt_cost").unwrap();
 
     db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", ())
@@ -141,8 +141,40 @@ fn test_explain_shows_cost_and_rows() {
         }
     }
 
-    assert!(found_cost, "EXPLAIN should show cost estimate");
+    assert!(!found_cost, "EXPLAIN prints no cost it does not plan by");
     assert!(found_rows, "EXPLAIN should show row estimate");
+}
+
+#[test]
+fn test_explain_estimates_one_row_for_a_primary_key_equality() {
+    let db = Database::open("memory://join_opt_pk_one_row").unwrap();
+    db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO a SELECT g.value, g.value FROM generate_series(1, 100) g",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO b SELECT g.value, g.value FROM generate_series(1, 100) g",
+        (),
+    )
+    .unwrap();
+    let line = db
+        .query(
+            "EXPLAIN SELECT * FROM a JOIN b ON a.k = b.k WHERE a.id = 1",
+            (),
+        )
+        .unwrap()
+        .map(|row| row.unwrap().get::<String>(0).unwrap())
+        .find(|line| line.contains("Join)"))
+        .unwrap();
+    assert!(
+        line.ends_with("(rows=1)"),
+        "a.id = 1 keeps the one row of a it names: {line}"
+    );
 }
 
 #[test]
@@ -196,57 +228,46 @@ fn test_statistics_improve_estimates() {
     )
     .unwrap();
     db.execute(
-        "INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')",
+        "INSERT INTO users SELECT g.value, 'u' FROM generate_series(1, 1000) g",
         (),
     )
     .unwrap();
-    db.execute("INSERT INTO orders VALUES (1, 1), (2, 1), (3, 2)", ())
-        .unwrap();
-
-    // Get estimate without ANALYZE
-    let result_before = db
-        .query(
-            "EXPLAIN SELECT * FROM users u INNER JOIN orders o ON u.id = o.user_id",
+    db.execute(
+        "INSERT INTO orders SELECT g.value, g.value % 2 FROM generate_series(1, 1000) g",
+        (),
+    )
+    .unwrap();
+    let join_line = || {
+        db.query(
+            "EXPLAIN SELECT * FROM users u INNER JOIN orders o ON u.id = o.user_id \
+             WHERE o.user_id = 1",
             (),
         )
-        .unwrap();
-    let mut cost_before = String::new();
-    for row in result_before {
-        let row = row.unwrap();
-        let plan_line: String = row.get(0).unwrap();
-        if plan_line.contains("Join") && plan_line.contains("cost=") {
-            cost_before = plan_line;
-            break;
-        }
-    }
+        .unwrap()
+        .map(|row| row.unwrap().get::<String>(0).unwrap())
+        .find(|line| line.contains("Join)"))
+        .unwrap()
+    };
 
-    // Run ANALYZE
+    assert!(
+        join_line().ends_with("(rows=100)"),
+        "an equality keeps a tenth of orders without statistics: {}",
+        join_line()
+    );
     db.execute("ANALYZE users", ()).unwrap();
     db.execute("ANALYZE orders", ()).unwrap();
-
-    // Get estimate after ANALYZE
-    let result_after = db
-        .query(
-            "EXPLAIN SELECT * FROM users u INNER JOIN orders o ON u.id = o.user_id",
-            (),
-        )
+    assert!(
+        join_line().ends_with("(rows=500)"),
+        "ANALYZE finds user_id takes two values: {}",
+        join_line()
+    );
+    db.execute("CREATE INDEX orders_user ON orders (user_id)", ())
         .unwrap();
-    let mut cost_after = String::new();
-    for row in result_after {
-        let row = row.unwrap();
-        let plan_line: String = row.get(0).unwrap();
-        if plan_line.contains("Join") && plan_line.contains("cost=") {
-            cost_after = plan_line;
-            break;
-        }
-    }
-
-    // After ANALYZE, the estimates should be different (more accurate)
-    assert!(!cost_before.is_empty(), "Should have cost before ANALYZE");
-    assert!(!cost_after.is_empty(), "Should have cost after ANALYZE");
-    assert_ne!(
-        cost_before, cost_after,
-        "Cost estimates should change after ANALYZE"
+    db.execute("DELETE FROM orders WHERE id > 10", ()).unwrap();
+    assert!(
+        join_line().ends_with("(rows=5)"),
+        "the index counts the rows orders holds now: {}",
+        join_line()
     );
 }
 

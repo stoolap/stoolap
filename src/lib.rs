@@ -60,7 +60,7 @@
 //! - [`parser`] - SQL parser
 //! - [`functions`] - 101+ SQL functions (scalar, aggregate, window)
 //! - [`executor`] - Query executor with parallel execution
-//! - [`optimizer`] - Cost-based query optimizer with cardinality feedback
+//! - [`optimizer`] - Expression simplification and join bloom filters
 //! - [`common`] - Utilities (I64Map, version)
 
 // stoolap-jemalloc as the global allocator, on by default, without its

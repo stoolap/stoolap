@@ -1692,9 +1692,9 @@ fn colorize_plan_line(line: &str) -> String {
 }
 
 /// Split a line into the main content and trailing stats parenthetical.
-/// Stats always start with "(actual " or "(cost=".
+/// Stats always start with "(actual " or "(rows=".
 fn split_stats(line: &str) -> (&str, Option<&str>) {
-    for marker in &["(actual ", "(cost="] {
+    for marker in &["(actual ", "(rows="] {
         if let Some(pos) = line.rfind(marker) {
             return (line[..pos].trim_end(), Some(&line[pos..]));
         }
