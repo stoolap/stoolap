@@ -411,6 +411,7 @@ impl<'a> Transfer<'a> {
     }
 
     /// The most decoded bytes the transfer's handles held at once
+    #[cfg(test)]
     pub fn peak_held_bytes(&self) -> usize {
         self.peak_held_bytes
     }

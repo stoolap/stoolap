@@ -134,6 +134,7 @@ impl JoinHashTable {
     }
 
     /// Create an empty hash table (for cases where build side is empty).
+    #[cfg(test)]
     pub fn empty() -> Self {
         Self {
             bucket_heads: vec![-1; MIN_BUCKETS],
@@ -266,12 +267,14 @@ impl JoinHashTable {
     }
 
     /// Get the number of entries in the table.
+    #[cfg(test)]
     #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
 
     /// Check if the table is empty.
+    #[cfg(test)]
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0

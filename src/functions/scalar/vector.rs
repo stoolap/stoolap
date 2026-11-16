@@ -147,6 +147,7 @@ pub fn ip_distance_bytes(a: &[u8], b: &[u8]) -> f64 {
 // Keep the &[f32] versions as public API (used by tests and as_vector_f32 callers)
 
 /// L2 (Euclidean) distance with 4-wide unrolled loop
+#[cfg(test)]
 #[inline]
 pub fn l2_distance(a: &[f32], b: &[f32]) -> f64 {
     debug_assert_eq!(a.len(), b.len());

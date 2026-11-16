@@ -949,6 +949,7 @@ impl ColumnBloomFilter {
 
     /// Check if a value MIGHT exist in the filter.
     /// Returns false only if the value is definitely not present.
+    #[cfg(test)]
     pub fn might_contain(&self, value: &Value) -> bool {
         self.might_contain_hash(Self::hash_value(value))
     }

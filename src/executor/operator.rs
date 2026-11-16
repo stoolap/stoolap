@@ -127,12 +127,14 @@ pub enum RowRef {
 
 impl RowRef {
     /// Create an owned RowRef from a Row.
+    #[cfg(test)]
     #[inline]
     pub fn owned(row: Row) -> Self {
         RowRef::Owned(row)
     }
 
     /// Create a composite RowRef from left and right rows.
+    #[cfg(test)]
     #[inline]
     pub fn composite(left: Row, right: Row) -> Self {
         RowRef::Composite(CompositeRow::new(left, right))
@@ -277,6 +279,7 @@ impl CompositeRow {
     /// This creates a single Row by copying all values from both sides.
     /// Only call this when the final result needs to be stored.
     /// Prefer `materialize_owned_with_room()` when you can consume the CompositeRow.
+    #[cfg(test)]
     pub fn materialize(&self) -> Row {
         let total = self.len();
         let mut values: CompactVec<Value> = CompactVec::with_capacity(total);

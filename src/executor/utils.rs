@@ -21,6 +21,7 @@
 //! - Value hashing and comparison
 //! - Column index map building
 
+#[cfg(test)]
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 
@@ -271,6 +272,7 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
 }
 
 /// Compare two Values for ordering, ascending with NULL last
+#[cfg(test)]
 pub fn compare_values(a: &Value, b: &Value) -> Ordering {
     crate::core::value::compare_order_key(Some(a), Some(b), true, None)
 }

@@ -316,6 +316,7 @@ impl VolumeFileWriter {
     }
 
     /// The final file's path
+    #[cfg(test)]
     pub fn path(&self) -> &Path {
         &self.final_path
     }
