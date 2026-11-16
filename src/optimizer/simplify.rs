@@ -23,7 +23,7 @@
 //! - Range predicate merging (a > 5 AND a > 3 → a > 5)
 //! - De Morgan's law application where beneficial
 //!
-//! IMPORTANT: This module uses Option<Expression> returns to avoid cloning
+//! IMPORTANT: This module uses `Option<Expression>` returns to avoid cloning
 //! expressions when no simplification is performed. This is critical for
 //! performance with heavy expressions like EXISTS subqueries.
 

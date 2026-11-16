@@ -178,7 +178,7 @@ pub struct JoinAnalysis {
 
 /// Request to execute a join operation.
 ///
-/// Uses CompactArc<Vec<Row>> to enable zero-copy sharing with CTE results.
+/// Uses `CompactArc<Vec<Row>>` to enable zero-copy sharing with CTE results.
 /// When dropping, only decrements refcount (O(1)) instead of deallocating rows.
 /// The caller should pass Arc-wrapped data for CTE sources.
 pub struct JoinRequest<'a> {

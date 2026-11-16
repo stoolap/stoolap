@@ -47,28 +47,28 @@ pub enum Op {
     // LOAD OPERATIONS - Push values onto stack
     // =========================================================================
     /// Load column value by pre-resolved index
-    /// Stack: [] -> [value]
+    /// Stack: `[] -> [value]`
     LoadColumn(u16),
 
     /// Load column from second row (for joins)
-    /// Stack: [] -> [value]
+    /// Stack: `[] -> [value]`
     LoadColumn2(u16),
 
     /// Load the row id a widened row carries at its index; an error when
     /// the row was not widened
-    /// Stack: [] -> [value]
+    /// Stack: `[] -> [value]`
     LoadRowId(u16),
 
     /// Load constant value (pre-cloned at compile time)
-    /// Stack: [] -> [value]
+    /// Stack: `[] -> [value]`
     LoadConst(Value),
 
     /// Load query parameter by index
-    /// Stack: [] -> [value]
+    /// Stack: `[] -> [value]`
     LoadParam(u32),
 
     /// Load NULL with type hint
-    /// Stack: [] -> [null]
+    /// Stack: `[] -> [null]`
     LoadNull(DataType),
 
     // =========================================================================
@@ -88,11 +88,11 @@ pub enum Op {
     Ge,
 
     /// IS NULL check
-    /// Stack: [value] -> [bool]
+    /// Stack: `[value] -> [bool]`
     IsNull,
 
     /// IS NOT NULL check
-    /// Stack: [value] -> [bool]
+    /// Stack: `[value] -> [bool]`
     IsNotNull,
 
     /// IS DISTINCT FROM (NULL-safe not equal)
@@ -211,7 +211,7 @@ pub enum Op {
     Mod,
 
     /// Unary negation
-    /// Stack: [value] -> [-value]
+    /// Stack: `[value] -> [-value]`
     Neg,
 
     // =========================================================================
@@ -237,19 +237,19 @@ pub enum Op {
     ConcatN(u8),
 
     /// LIKE pattern match (pre-compiled pattern)
-    /// Stack: [text] -> [bool]
+    /// Stack: `[text] -> [bool]`
     Like(Arc<Pattern>),
 
     /// GLOB pattern match
-    /// Stack: [text] -> [bool]
+    /// Stack: `[text] -> [bool]`
     Glob(Arc<Pattern>),
 
     /// REGEXP match (pre-compiled regex)
-    /// Stack: [text] -> [bool]
+    /// Stack: `[text] -> [bool]`
     Regexp(Arc<regex::Regex>),
 
     /// LIKE with ESCAPE character
-    /// Stack: [text] -> [bool]
+    /// Stack: `[text] -> [bool]`
     LikeEscape(Arc<Pattern>, char), // pattern, escape_char
 
     /// Dynamic LIKE: pattern is on the stack (e.g. from a parameter)
@@ -276,41 +276,41 @@ pub enum Op {
     // JSON OPERATIONS
     // =========================================================================
     /// JSON access: json -> key (returns JSON)
-    /// Stack: [json, key] -> [json_value]
+    /// Stack: `[json, key] -> [json_value]`
     JsonAccess,
 
     /// JSON access text: json ->> key (returns TEXT)
-    /// Stack: [json, key] -> [text_value]
+    /// Stack: `[json, key] -> [text_value]`
     JsonAccessText,
 
     // =========================================================================
     // TIMESTAMP OPERATIONS
     // =========================================================================
     /// An INTERVAL literal times the product of `count` numbers, as interval text
-    /// Stack: [number; count] -> [interval_text]
+    /// Stack: `[number; count] -> [interval_text]`
     ScaleInterval(IntervalStep, u8),
 
     /// Add an INTERVAL literal times the product of `count` numbers to a
     /// timestamp, or subtract it when the flag is set
-    /// Stack: [timestamp, number; count] -> [timestamp]
+    /// Stack: `[timestamp, number; count] -> [timestamp]`
     TimestampAddScaledInterval(IntervalStep, bool, u8),
 
     // =========================================================================
     // VECTOR DISTANCE OPERATIONS
     // =========================================================================
     /// `<=>`: VEC_DISTANCE_L2 of the two values, by the function's own rule
-    /// Stack: [vector1, vector2] -> [float]
+    /// Stack: `[vector1, vector2] -> [float]`
     VectorDistanceL2,
 
     // =========================================================================
     // SET OPERATIONS
     // =========================================================================
     /// IN set membership (pre-built FxHashSet for fast lookups)
-    /// Stack: [value] -> [bool]
+    /// Stack: `[value] -> [bool]`
     InSet(CompactArc<PredicateSet>),
 
     /// NOT IN set membership
-    /// Stack: [value] -> [bool]
+    /// Stack: `[value] -> [bool]`
     NotInSet(CompactArc<PredicateSet>),
 
     /// IN over items evaluated at run time; the value is judged once
@@ -318,7 +318,7 @@ pub enum Op {
     InList(u32), // item count
 
     /// `value op ANY` or `value op ALL` over members a subquery yielded
-    /// Stack: [value] -> [bool]
+    /// Stack: `[value] -> [bool]`
     QuantifiedSet(CompactArc<QuantifiedMembers>),
 
     /// BETWEEN check: value BETWEEN low AND high
@@ -346,26 +346,26 @@ pub enum Op {
     // BOOLEAN CHECKS
     // =========================================================================
     /// IS TRUE check
-    /// Stack: [value] -> [bool]
+    /// Stack: `[value] -> [bool]`
     IsTrue,
 
     /// IS NOT TRUE check
-    /// Stack: [value] -> [bool]
+    /// Stack: `[value] -> [bool]`
     IsNotTrue,
 
     /// IS FALSE check
-    /// Stack: [value] -> [bool]
+    /// Stack: `[value] -> [bool]`
     IsFalse,
 
     /// IS NOT FALSE check
-    /// Stack: [value] -> [bool]
+    /// Stack: `[value] -> [bool]`
     IsNotFalse,
 
     // =========================================================================
     // FUNCTION CALLS
     // =========================================================================
     /// Call scalar function with N arguments
-    /// Stack: [arg1, arg2, ..., argN] -> [result]
+    /// Stack: `[arg1, arg2, ..., argN] -> [result]`
     CallScalar {
         func: Arc<dyn ScalarFunction>,
         arg_count: u8,
@@ -376,40 +376,40 @@ pub enum Op {
     NullIf,
 
     /// Special: GREATEST - return max of args
-    /// Stack: [arg1, ..., argN] -> [result]
+    /// Stack: `[arg1, ..., argN] -> [result]`
     Greatest(u8),
 
     /// Special: LEAST - return min of args
-    /// Stack: [arg1, ..., argN] -> [result]
+    /// Stack: `[arg1, ..., argN] -> [result]`
     Least(u8),
 
     // =========================================================================
     // NATIVE SCALAR FUNCTIONS (function pointer, no dynamic dispatch)
     // =========================================================================
     /// Native scalar function - single argument, direct function pointer call
-    /// Stack: [value] -> [result]
+    /// Stack: `[value] -> [result]`
     NativeFn1(NativeFn1),
 
     // =========================================================================
     // TYPE OPERATIONS
     // =========================================================================
     /// Cast value to target type
-    /// Stack: [value] -> [casted_value]
+    /// Stack: `[value] -> [casted_value]`
     Cast(DataType),
 
     /// Read a value compared with a column of this type as the scan reads
     /// it; a TEXT that is no number stays TEXT for a numeric column
-    /// Stack: [value] -> [value as the column's type]
+    /// Stack: `[value] -> [value as the column's type]`
     ReadAsColumn(DataType),
 
     /// A parameter a vector function takes, which binding reads as a vector
     /// once; run unbound, it leaves the value to the function
-    /// Stack: [value] -> [value]
+    /// Stack: `[value] -> [value]`
     ReadAsVector,
 
     /// Truncate timestamp to date (midnight)
     /// Used for CAST(timestamp AS DATE) - truncates time component to 00:00:00
-    /// Stack: [value] -> [timestamp_at_midnight]
+    /// Stack: `[value] -> [timestamp_at_midnight]`
     TruncateToDate,
 
     // =========================================================================
@@ -423,7 +423,7 @@ pub enum Op {
     CaseWhen(u32), // Jump to next WHEN/ELSE/END if false
 
     /// THEN result: jump to CASE end after pushing result
-    /// Stack: [value] -> [value] (then jump)
+    /// Stack: `[value] -> [value]` (then jump)
     CaseThen(u32), // Jump to END
 
     /// ELSE clause marker
@@ -451,7 +451,7 @@ pub enum Op {
     // =========================================================================
     /// Execute scalar subquery and push result
     /// The subquery plan is stored separately and referenced by index
-    /// Stack: [] -> [value]
+    /// Stack: `[] -> [value]`
     ExecScalarSubquery(u16), // Subquery plan index
 
     /// Execute EXISTS subquery
@@ -459,11 +459,11 @@ pub enum Op {
     ExecExists(u16), // Subquery plan index
 
     /// Execute IN subquery: TRUE, FALSE or UNKNOWN
-    /// Stack: [value] -> [bool or NULL]
+    /// Stack: `[value] -> [bool or NULL]`
     ExecInSubquery(u16), // Subquery plan index
 
     /// Execute `value op ALL` (true) or `value op ANY` (false): TRUE, FALSE or UNKNOWN
-    /// Stack: [value] -> [bool or NULL]
+    /// Stack: `[value] -> [bool or NULL]`
     ExecQuantified(u16, CompareOp, bool), // Subquery index, comparison operator, ALL
 
     /// A row of N values tested against a row block's members, by the IN,
@@ -476,12 +476,12 @@ pub enum Op {
     // =========================================================================
     /// Load pre-computed aggregate result by column index
     /// Used in HAVING clauses where aggregates are already computed
-    /// Stack: [] -> [value]
+    /// Stack: `[] -> [value]`
     LoadAggregateResult(u16),
 
     /// Load current transaction ID
     /// Returns NULL if no transaction is active
-    /// Stack: [] -> [value]
+    /// Stack: `[] -> [value]`
     LoadTransactionId,
 
     // =========================================================================
@@ -719,7 +719,7 @@ fn settle_rows<'v>(
     (!unknown).then_some(all)
 }
 
-/// How two rows compare: by an operator, or IS [NOT] DISTINCT FROM
+/// How two rows compare: by an operator, or `IS [NOT] DISTINCT FROM`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowComparison {
     Eq,

@@ -22,7 +22,7 @@
 //!
 //! This design avoids per-value Arc overhead while enabling:
 //! - Row-level sharing between arena, version store, transaction store
-//! - String-level sharing via SmartString::Shared(Arc<str>)
+//! - String-level sharing via `SmartString::Shared(Arc<str>)`
 //! - Zero-copy JOINs via RowRef::Composite/DirectBuildComposite (see operator.rs)
 
 use std::fmt;
@@ -133,7 +133,7 @@ impl RowStorage {
 ///
 /// - `Shared` storage: O(1) clone (just Arc increment)
 /// - `Owned` storage: O(n) clone (copies values)
-/// - String values use SmartString with internal Arc<str> for efficient sharing
+/// - String values use SmartString with internal `Arc<str>` for efficient sharing
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Row {
     storage: RowStorage,
@@ -220,7 +220,7 @@ impl Row {
         }
     }
 
-    /// Create a row from CompactVec<Value>
+    /// Create a row from `CompactVec<Value>`
     #[inline]
     pub fn from_compact_vec(values: CompactVec<Value>) -> Self {
         Self {

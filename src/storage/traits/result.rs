@@ -90,7 +90,7 @@ pub trait QueryResult: Send {
         self.rows_affected()
     }
 
-    /// Try to extract all rows as CompactArc<Vec<Row>> for zero-copy joins
+    /// Try to extract all rows as `CompactArc<Vec<Row>>` for zero-copy joins
     ///
     /// Returns None if the result cannot provide Arc-wrapped rows.
     /// This consumes the result - after calling, iteration will yield no more rows.

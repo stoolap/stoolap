@@ -492,7 +492,7 @@ impl Operator for EmptyOperator {
 /// An operator that yields rows from a pre-materialized vector.
 ///
 /// This is useful for:
-/// - Converting existing Vec<Row> results to the operator model
+/// - Converting existing `Vec<Row>` results to the operator model
 /// - CTEs that have been pre-computed
 /// - Subquery results
 pub struct MaterializedOperator {
@@ -513,7 +513,7 @@ impl MaterializedOperator {
         }
     }
 
-    /// Create from an CompactArc<Vec<Row>>, unwrapping if sole owner or cloning if shared.
+    /// Create from an `CompactArc<Vec<Row>>`, unwrapping if sole owner or cloning if shared.
     /// This is optimal for CTE results which may have multiple references.
     pub fn from_arc(arc_rows: CompactArc<Vec<Row>>, width: usize) -> Self {
         let rows = CompactArc::try_unwrap(arc_rows).unwrap_or_else(|arc| (*arc).clone());

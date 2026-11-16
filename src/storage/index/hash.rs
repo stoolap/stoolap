@@ -80,7 +80,7 @@ fn hash_values(values: &[Value]) -> u64 {
 /// - Uses ahash - faster than SipHash
 /// - SmallVec optimization for single-match case (common for unique indexes)
 /// - Thread-safe with RwLock
-/// - Memory efficient with CompactArc<Value> for O(1) cloning
+/// - Memory efficient with `CompactArc<Value>` for O(1) cloning
 ///
 /// ## Limitations:
 /// - Does NOT support range queries (returns error)
@@ -102,8 +102,8 @@ pub struct HashData {
     closed: AtomicBool,
 
     /// Full values storage for hash collision handling and unique constraint checking
-    /// Maps hash -> (values as CompactArc<Value>, row_ids) for collision resolution
-    /// Uses CompactArc<Value> to share references with ValueArena (8 bytes per value)
+    /// Maps hash -> (values as `CompactArc<Value>`, row_ids) for collision resolution
+    /// Uses `CompactArc<Value>` to share references with ValueArena (8 bytes per value)
     #[allow(clippy::type_complexity)]
     hash_to_values: RwLock<FxHashMap<u64, Vec<(Vec<CompactArc<Value>>, IdList)>>>,
 }

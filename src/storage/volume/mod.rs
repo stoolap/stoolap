@@ -52,7 +52,7 @@
 //! - **Binary search**: Sorted columns (typically time) support O(log n) range
 //!   lookups instead of linear scan.
 //! - **Platform independent**: The format is a byte layout. Access methods
-//!   (mmap on native, buffered I/O, or Vec<u8> on WASM) are behind a trait.
+//!   (mmap on native, buffered I/O, or `Vec<u8>` on WASM) are behind a trait.
 //! - **Backward compatible**: Memory mode uses no volumes. Persistence mode
 //!   uses hot buffer + frozen volumes. The executor sees the same Table/Scanner
 //!   traits regardless.

@@ -1154,7 +1154,7 @@ impl CompiledFilter {
     /// Evaluate the filter against an Arc value slice (avoids Row allocation)
     ///
     /// This is the zero-copy hot path for storage layer filtering.
-    /// By operating directly on &[CompactArc<Value>], we avoid creating Row objects
+    /// By operating directly on `&[CompactArc<Value>]`, we avoid creating Row objects
     /// for rows that don't match the filter.
     ///
     /// # Schema Evolution Safety

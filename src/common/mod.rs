@@ -16,7 +16,7 @@
 //!
 //! This module contains shared utilities used throughout the database:
 //!
-//! - [`version`] - Version information and constants
+//! - [`version`](mod@version) - Version information and constants
 //! - [`maps`] - Fast hash maps for integer keys
 //! - [`compact_vec`] - 16-byte vector optimized for Row storage
 //! - [`compact_arc`] - Memory-efficient Arc without weak reference support
