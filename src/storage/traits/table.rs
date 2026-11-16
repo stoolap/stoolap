@@ -548,7 +548,8 @@ pub trait Table: Send + Sync {
     /// Whether a version this transaction sees here decides the row: its own
     /// change, a delete included, or a committed live version visible to it.
     /// A committed delete is not counted; tombstones decide sealed copies.
-    fn has_visible_row(&self, row_id: i64) -> Result<bool>;
+    /// `deadline` is charged each older version the read passes.
+    fn has_visible_row(&self, row_id: i64, deadline: Deadline) -> Result<bool>;
 
     /// Whether the row's sealed copy is hidden by a version here, as the ids
     /// `collect_hot_row_ids_into` adds are: a version a commit still

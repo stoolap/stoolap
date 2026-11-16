@@ -117,8 +117,9 @@ fn test_has_visible_row_counts_own_uncommitted_insert() {
             Value::text("mine"),
         ]))
         .unwrap();
-    assert!(table.has_visible_row(5).unwrap(), "own insert");
-    assert!(table.has_visible_row(1).unwrap(), "sealed row");
+    let none = stoolap::executor::Deadline::NONE;
+    assert!(table.has_visible_row(5, none).unwrap(), "own insert");
+    assert!(table.has_visible_row(1, none).unwrap(), "sealed row");
 }
 
 #[test]
@@ -133,9 +134,13 @@ fn test_has_visible_row_skips_rows_committed_after_snapshot() {
     db.execute("UPDATE t SET val = 'new' WHERE id = 1", ())
         .unwrap();
     let table = tx.get_table("t").unwrap();
-    assert!(!table.has_visible_row(7).unwrap(), "insert after begin");
+    let none = stoolap::executor::Deadline::NONE;
     assert!(
-        table.has_visible_row(1).unwrap(),
+        !table.has_visible_row(7, none).unwrap(),
+        "insert after begin"
+    );
+    assert!(
+        table.has_visible_row(1, none).unwrap(),
         "sealed copy under a later update"
     );
 }

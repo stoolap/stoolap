@@ -44,6 +44,8 @@ fn test_has_visible_row_holds_across_an_update_after_the_hot_check() {
             .unwrap();
         hook_fired.set(true);
     });
-    assert!(table.has_visible_row(1).unwrap());
+    assert!(table
+        .has_visible_row(1, stoolap::executor::Deadline::NONE)
+        .unwrap());
     assert!(fired.get(), "the update landed after the hot check");
 }

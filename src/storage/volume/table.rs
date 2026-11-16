@@ -5033,18 +5033,18 @@ impl SegmentedTable {
 
     /// The sealed rows of `row_ids` that `filter` keeps, added to `buffer`;
     /// the ids no volume holds go to `hot_ids`, `cached` keeps the reader of
-    /// the last volume read
+    /// the last volume read. The hot check of each id charges `deadline`
     #[inline(always)]
     fn sealed_rows_into(
         &self,
         row_ids: &[i64],
-        (filter, fallible): (&dyn Expression, bool),
+        (filter, fallible, deadline): (&dyn Expression, bool, Deadline),
         buffer: &mut RowVec,
         hot_ids: &mut Vec<i64>,
         cached: &mut Option<(super::writer::RowReader, super::writer::ColumnMapping)>,
     ) -> Result<()> {
         for &row_id in row_ids {
-            if let Some(found) = self.find_segment_row(row_id)? {
+            if let Some(found) = self.find_segment_row(row_id, deadline)? {
                 let idx = found.idx;
                 if !cached
                     .as_ref()
@@ -5083,13 +5083,14 @@ impl SegmentedTable {
     ) -> Result<()> {
         let mut hot_ids = Vec::new();
         let mut cached = None;
+        let sealed = (read.0, read.1, deadline);
         if TIMED {
             for ids in row_ids.chunks(CHARGE_BEAT) {
                 deadline.charge(DeadlineSite::StorageRead, ids.len())?;
-                self.sealed_rows_into(ids, read, buffer, &mut hot_ids, &mut cached)?;
+                self.sealed_rows_into(ids, sealed, buffer, &mut hot_ids, &mut cached)?;
             }
         } else {
-            self.sealed_rows_into(row_ids, read, buffer, &mut hot_ids, &mut cached)?;
+            self.sealed_rows_into(row_ids, sealed, buffer, &mut hot_ids, &mut cached)?;
         }
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::row_ids_classified();
@@ -5114,11 +5115,11 @@ impl SegmentedTable {
         self.fetch_round::<true>(row_ids, read, buffer, deadline)
     }
 
-    fn find_segment_row(&self, row_id: i64) -> Result<Option<SegmentRow>> {
+    fn find_segment_row(&self, row_id: i64, deadline: Deadline) -> Result<Option<SegmentRow>> {
         let cut = self.read_cut();
         // A hot version this transaction sees decides the row; a newer one it
         // does not see leaves the sealed copy to the tombstones below
-        if self.hot.has_visible_row(row_id)? {
+        if self.hot.has_visible_row(row_id, deadline)? {
             return Ok(None);
         }
         #[cfg(feature = "test-failpoints")]
@@ -5788,7 +5789,7 @@ impl Table for SegmentedTable {
             let mut cached: Option<(super::writer::RowReader, super::writer::ColumnMapping)> = None;
 
             for &row_id in row_ids {
-                if let Some(found) = self.find_segment_row(row_id)? {
+                if let Some(found) = self.find_segment_row(row_id, Deadline::NONE)? {
                     let idx = found.idx;
                     if !cached
                         .as_ref()
@@ -6141,17 +6142,17 @@ impl Table for SegmentedTable {
         self.segment_mgr.row_exists(row_id)
     }
 
-    fn has_visible_row(&self, row_id: i64) -> Result<bool> {
-        if let Some(result) = self.unsealed(|hot| hot.has_visible_row(row_id)) {
+    fn has_visible_row(&self, row_id: i64, deadline: Deadline) -> Result<bool> {
+        if let Some(result) = self.unsealed(|hot| hot.has_visible_row(row_id, deadline)) {
             return result;
         }
         // A row no volume answers for is the hot store's, as in a fetch: an
         // update committed after the volume lookup's hot check lands there
         self.settled_across_seals(|| {
-            if self.find_segment_row(row_id)?.is_some() {
+            if self.find_segment_row(row_id, deadline)?.is_some() {
                 return Ok(true);
             }
-            self.hot.has_visible_row(row_id)
+            self.hot.has_visible_row(row_id, deadline)
         })
     }
 
@@ -9880,7 +9881,7 @@ mod tests {
                 dest.insert(*id);
             }
         }
-        fn has_visible_row(&self, row_id: i64) -> Result<bool> {
+        fn has_visible_row(&self, row_id: i64, _: Deadline) -> Result<bool> {
             Ok(self.rows.iter().any(|(id, _)| *id == row_id))
         }
         fn delete(
@@ -10275,7 +10276,7 @@ mod tests {
 
         for id in 1..=3 {
             assert!(mgr.row_exists(id).unwrap(), "row {id} not found");
-            let found = table.find_segment_row(id).unwrap().unwrap();
+            let found = table.find_segment_row(id, Deadline::NONE).unwrap().unwrap();
             let row = found.volume.get_row(found.idx).unwrap();
             assert_eq!(
                 row.get(0),

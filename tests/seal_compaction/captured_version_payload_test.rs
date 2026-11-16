@@ -114,7 +114,9 @@ captured_rows_test!(captured_cached_rows, |store, id| store
 captured_rows_test!(captured_unsorted_rows, |store, id| store
     .get_all_visible_rows_unsorted(id.into()));
 captured_rows_test!(captured_update_versions, |store, id| update_rows(
-    store.get_visible_versions_for_update(&[1], id)
+    store
+        .get_visible_versions_for_update(&[1], id, stoolap::executor::Deadline::NONE)
+        .unwrap()
 ));
 captured_rows_test!(captured_update_rows, |store, id| update_rows(
     store
