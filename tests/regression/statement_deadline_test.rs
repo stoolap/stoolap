@@ -126,6 +126,7 @@ fn statement(site: DeadlineSite, csv: &str) -> String {
         DeadlineSite::StorageUpdate => "UPDATE u SET k = k + 0 WHERE k >= 0",
         DeadlineSite::StorageRead => "SELECT id, ROW_NUMBER() OVER (ORDER BY v) AS n FROM big",
         DeadlineSite::StorageAggregate => "SELECT k, SUM(v) FROM big GROUP BY k",
+        DeadlineSite::Analyze => "ANALYZE big",
     };
     sql.to_string()
 }
@@ -1346,4 +1347,82 @@ fn a_read_past_a_long_history_of_one_row_charges_its_versions() {
     read(&hot, "ROLLBACK", &ctx).unwrap();
     read(&cold, "ROLLBACK", &ctx).unwrap();
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn an_analyze_stopped_at_its_deadline_fails_and_keeps_the_tables_before() {
+    let _guard = FailpointGuard::new();
+    let db = Database::open("memory://statement_deadline_analyze").unwrap();
+    for name in ["a1", "a2", "a3"] {
+        db.execute(
+            &format!("CREATE TABLE {name} (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)"),
+            (),
+        )
+        .unwrap();
+        db.execute(
+            &format!(
+                "INSERT INTO {name} SELECT value, value % 7, value FROM generate_series(1, 5000)"
+            ),
+            (),
+        )
+        .unwrap();
+    }
+    let executor = Executor::new(std::sync::Arc::clone(db.engine()));
+    let mut ctx = ExecutionContext::new();
+    ctx.set_timeout_ms(3_600_000);
+    let one_table = charges_of(&executor, &ctx, DeadlineSite::Analyze, "ANALYZE a1");
+    read(&executor, "DELETE FROM _sys_table_stats", &ctx).unwrap();
+    pass_deadline_after(DeadlineSite::Analyze, one_table + 1);
+    let stopped = read(&executor, "ANALYZE", &ctx);
+    keep_deadlines();
+    assert!(
+        matches!(stopped, Err(Error::QueryCancelled)),
+        "ANALYZE past its deadline gave {stopped:?}"
+    );
+    let mut rows = executor
+        .execute_with_context("SELECT COUNT(*) FROM _sys_table_stats", &ctx)
+        .unwrap();
+    assert!(rows.next());
+    assert_eq!(
+        rows.row().get(0),
+        Some(&stoolap::Value::Integer(1)),
+        "the table analyzed before the deadline keeps its statistics"
+    );
+}
+
+#[test]
+fn an_analyze_past_its_deadline_after_its_last_charge_stores_nothing() {
+    let _guard = FailpointGuard::new();
+    let db = Database::open("memory://statement_deadline_analyze_last").unwrap();
+    db.execute(
+        "CREATE TABLE a1 (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO a1 SELECT value, value % 7, value FROM generate_series(1, 5000)",
+        (),
+    )
+    .unwrap();
+    let executor = Executor::new(std::sync::Arc::clone(db.engine()));
+    let mut ctx = ExecutionContext::new();
+    ctx.set_timeout_ms(3_600_000);
+    let all = charges_of(&executor, &ctx, DeadlineSite::Analyze, "ANALYZE a1");
+    read(&executor, "DELETE FROM _sys_table_stats", &ctx).unwrap();
+    pass_deadline_after(DeadlineSite::Analyze, all);
+    let stopped = read(&executor, "ANALYZE a1", &ctx);
+    keep_deadlines();
+    assert!(
+        matches!(stopped, Err(Error::QueryCancelled)),
+        "ANALYZE past its deadline after its last charge gave {stopped:?}"
+    );
+    let mut rows = executor
+        .execute_with_context("SELECT COUNT(*) FROM _sys_table_stats", &ctx)
+        .unwrap();
+    assert!(rows.next());
+    assert_eq!(
+        rows.row().get(0),
+        Some(&stoolap::Value::Integer(0)),
+        "a table stopped after its last charge stores no statistics"
+    );
 }

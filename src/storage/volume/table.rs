@@ -991,6 +991,8 @@ impl SegmentedTable {
     /// How many rows `collect_cold_and_hot(None, Seq)` returns: the hot
     /// rows, and the sealed rows counted by their ids, no row built for them
     fn count_cold_and_hot(&self, deadline: Deadline) -> Result<usize> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("seg.count_cold_and_hot");
         if let Some(result) = self.unsealed(|hot| {
             hot.collect_access_rows(ScanAccess::Seq, None, deadline)
                 .map(|r| r.len())
@@ -1386,6 +1388,8 @@ impl SegmentedTable {
         if self.snapshot_seq.is_some() || self.segment_mgr.seal_overlap() > 0 {
             return Ok(None);
         }
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("seg.distinct_column");
         self.newest_across_seals(|generation| {
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::merged_read_began();
@@ -8511,6 +8515,8 @@ impl Table for SegmentedTable {
         authority: Option<&mut FxHashSet<i64>>,
         deadline: Deadline,
     ) -> Result<RowVec> {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::note_read("seg.rows_at");
         // A table without volumes answers from the hot store; a truncate
         // that refused this attempt is waited out, not taken for a volume
         let mut authority = authority;

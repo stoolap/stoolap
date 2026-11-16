@@ -184,6 +184,14 @@ A connection can also carry a timeout for every statement whose call sets none, 
 - An `INSERT`, `UPDATE`, `DELETE` or `COPY` that the deadline stops changes no row, the rows its foreign key actions reach included. Inside a transaction the statement is undone and the transaction stays open.
 - Cancellation is cooperative. A query stops at its next check, which its loops make every few thousand rows they read, and returns `Error::QueryCancelled`. A wait for a lock, file I/O and a user function are not interrupted, and a table-valued function such as `generate_series` makes all its rows before they are checked. A sort that has started runs to its end; the deadline is checked before and after it.
 
+What a timeout does not stop:
+
+- Schema changes: `CREATE INDEX` building its index, `ALTER TABLE`, `TRUNCATE` and `DROP`. `CREATE TABLE ... AS SELECT` stops during its `SELECT`, but writes every row once the `SELECT` has returned them.
+- Maintenance: `VACUUM`, `PRAGMA CHECKPOINT` and the other maintenance pragmas, and the sealing and compaction that run in the background.
+- Waits: for a table lock, for a seal moving rows to a volume, and for another call on the same connection, which runs one statement at a time.
+- Work inside one value: a function over a large text or vector value runs to its end.
+- The checks a write makes per key: a unique or foreign key lookup, and the conflict check at commit. Each reads one key's latest state.
+
 ```rust
 // Execute with 5 second timeout
 db.execute_with_timeout("DELETE FROM large_table WHERE old = true", (), 5000)?;

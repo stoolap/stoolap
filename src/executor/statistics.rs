@@ -17,6 +17,7 @@
 //! This module implements the ANALYZE command which collects statistics
 //! about tables and stores them in system tables for query optimization.
 
+use crate::common::deadline::{Deadline, DeadlineSite, CHARGE_BEAT};
 use crate::common::time_compat::SystemTime;
 use crate::storage::traits::transaction::StatementTable;
 
@@ -30,7 +31,7 @@ use crate::storage::statistics::{
     is_stats_table, Histogram, DEFAULT_HISTOGRAM_BUCKETS, DEFAULT_SAMPLE_SIZE, SYS_COLUMN_STATS,
     SYS_TABLE_STATS,
 };
-use crate::storage::traits::{QueryResult, Transaction};
+use crate::storage::traits::{QueryResult, ScanAccess, Transaction};
 
 use super::context::ExecutionContext;
 use super::result::ExecutorResult;
@@ -44,8 +45,9 @@ impl Executor {
     pub(crate) fn execute_analyze(
         &self,
         stmt: &AnalyzeStatement,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        let deadline = ctx.deadline_of_call();
         // Ensure system tables exist
         self.ensure_stats_tables_exist()?;
 
@@ -74,11 +76,17 @@ impl Executor {
             // Begin a transaction for this table's analysis
             let mut tx = self.begin_transaction()?;
 
-            let success = match self.analyze_table(&mut *tx, table_name) {
+            let success = match self.analyze_table(&mut *tx, table_name, deadline) {
                 Ok(_) => {
                     tx.commit()?;
                     analyzed_count += 1;
                     true
+                }
+                // The deadline stops the statement; tables analyzed before keep
+                // their statistics
+                Err(Error::QueryCancelled) => {
+                    let _ = tx.rollback();
+                    return Err(Error::QueryCancelled);
                 }
                 Err(e) => {
                     let _ = tx.rollback();
@@ -151,12 +159,17 @@ impl Executor {
     }
 
     /// Analyze a single table and update statistics
-    fn analyze_table(&self, tx: &mut dyn Transaction, table_name: &str) -> Result<()> {
+    fn analyze_table(
+        &self,
+        tx: &mut dyn Transaction,
+        table_name: &str,
+        deadline: Deadline,
+    ) -> Result<()> {
         let table = tx.get_statement_table(table_name)?;
         let schema = table.schema().clone();
 
         // Get row count
-        let row_count = table.row_count(crate::common::deadline::Deadline::NONE)?;
+        let row_count = table.row_count(deadline)?;
 
         // The committed state the zone maps describe: one publish epoch, read
         // as the newest with no writes of this transaction mixed in
@@ -165,7 +178,7 @@ impl Executor {
             .filter(|_| table.sees_newest() && !table.has_local_changes());
 
         // Collect all rows for zone map building (zone maps need complete data)
-        let mut all_rows = table.collect_all_rows(None)?;
+        let mut all_rows = table.collect_access_rows(ScanAccess::Seq, None, deadline)?;
 
         // Extract rows without IDs for statistics computation (these APIs expect Row, not (i64, Row))
         let rows_vec: Vec<Row> = all_rows.drain_rows().collect();
@@ -174,16 +187,13 @@ impl Executor {
 
         // Build zone maps from all rows; a commit published across the read
         // leaves them describing no one state
-        let mut zone_maps = self.build_zone_maps(&rows_vec, &schema);
+        let mut zone_maps = self.build_zone_maps(&rows_vec, &schema, deadline)?;
         zone_maps.epoch = epoch.filter(|&epoch| table.publish_epoch_if_quiet() == Some(epoch));
-
-        // Store zone maps in the table
-        table.set_zone_maps(zone_maps);
 
         // For statistics, use sampling for large tables
         let rows = if rows_vec.len() > DEFAULT_SAMPLE_SIZE {
             // Sample from collected rows for statistics
-            self.sample_from_rows(rows_vec, DEFAULT_SAMPLE_SIZE)
+            self.sample_from_rows(rows_vec, DEFAULT_SAMPLE_SIZE, deadline)?
         } else {
             rows_vec
         };
@@ -200,9 +210,14 @@ impl Executor {
         // Collect column statistics before dropping table
         let mut column_stats_list = Vec::new();
         for (col_idx, col_def) in schema.columns.iter().enumerate() {
+            deadline.charge(DeadlineSite::Analyze, rows.len())?;
             let col_stats = self.collect_column_stats(&rows, col_idx);
             column_stats_list.push((col_def.name.clone(), col_stats));
         }
+
+        // Store zone maps in the table once the deadline can stop nothing more
+        deadline.check()?;
+        table.set_zone_maps(zone_maps);
 
         // Drop the table reference before using tx again
         drop(table);
@@ -240,26 +255,35 @@ impl Executor {
         &self,
         rows: &[Row],
         schema: &crate::core::Schema,
-    ) -> crate::storage::mvcc::zonemap::TableZoneMap {
+        deadline: Deadline,
+    ) -> Result<crate::storage::mvcc::zonemap::TableZoneMap> {
         let mut builder = ZoneMapBuilder::new(DEFAULT_SEGMENT_SIZE);
 
-        for row in rows {
-            let mut col_values = Vec::with_capacity(schema.columns.len());
-            for (col_idx, col_def) in schema.columns.iter().enumerate() {
-                if let Some(value) = row.get(col_idx) {
-                    col_values.push((col_def.name.clone(), value.clone()));
+        for run in rows.chunks(CHARGE_BEAT) {
+            deadline.charge(DeadlineSite::Analyze, run.len())?;
+            for row in run {
+                let mut col_values = Vec::with_capacity(schema.columns.len());
+                for (col_idx, col_def) in schema.columns.iter().enumerate() {
+                    if let Some(value) = row.get(col_idx) {
+                        col_values.push((col_def.name.clone(), value.clone()));
+                    }
                 }
+                builder.add_row(&col_values);
             }
-            builder.add_row(&col_values);
         }
 
-        builder.build()
+        Ok(builder.build())
     }
 
     /// Sample from already-collected rows using reservoir sampling
-    fn sample_from_rows(&self, rows: Vec<Row>, sample_size: usize) -> Vec<Row> {
+    fn sample_from_rows(
+        &self,
+        rows: Vec<Row>,
+        sample_size: usize,
+        deadline: Deadline,
+    ) -> Result<Vec<Row>> {
         if rows.len() <= sample_size {
-            return rows;
+            return Ok(rows);
         }
 
         let mut rng = rand::rng();
@@ -267,13 +291,16 @@ impl Executor {
 
         // Reservoir sampling
         for (i, row) in rows.into_iter().enumerate().skip(sample_size) {
+            if (i - sample_size).is_multiple_of(CHARGE_BEAT) {
+                deadline.charge(DeadlineSite::Analyze, CHARGE_BEAT)?;
+            }
             let j = rng.random_range(0..=i);
             if j < sample_size {
                 reservoir[j] = row;
             }
         }
 
-        reservoir
+        Ok(reservoir)
     }
 
     /// Estimate size of a row in bytes
