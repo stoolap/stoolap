@@ -198,7 +198,7 @@ impl Executor {
             (&schema, true),
             scope,
             param_count,
-            epoch,
+            (epoch, true),
             keyed_branch,
         )?;
         // A LIMIT or OFFSET read per run leaves the statement to a scan, and

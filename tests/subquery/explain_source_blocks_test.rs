@@ -183,3 +183,53 @@ fn a_statement_asking_blocks_over_a_source_explains_the_plan_its_run_reads() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
 }
+
+#[test]
+fn explain_runs_no_view_whose_names_were_not_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open("unnamed_view", &dir, false);
+    let mut wrong = Vec::new();
+    for (at, sql) in [
+        "SELECT (SELECT MAX(n) FROM rv)",
+        "SELECT id FROM t WHERE v > (SELECT MAX(n) FROM rv)",
+        "SELECT d.id FROM (SELECT id FROM t) d WHERE d.id IN (SELECT n FROM rv)",
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM rv JOIN m ON rv.n = m.x WHERE m.x = t.v)",
+        "SELECT id FROM t ORDER BY (SELECT MAX(n) FROM rv), id LIMIT 1",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // A view run once records its names, so each statement reads its own
+        let view = format!("rv{at}");
+        db.engine()
+            .create_view(&view, "SELECT x AS n FROM m".to_string(), None, false)
+            .unwrap();
+        let sql = sql.replace("rv", &view);
+        test_failpoints::take_scan_accesses();
+        let plan = explain(&db, &sql);
+        let ran = test_failpoints::take_scan_accesses();
+        if !ran.is_empty() {
+            wrong.push(format!("{sql}: EXPLAIN ran {ran:?}\n{plan}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n\n"));
+}
+
+#[test]
+fn an_inner_with_keeps_the_outer_ctes_a_table_shares_a_name_with() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open("inner_with", &dir, false);
+    db.execute("CREATE TABLE c (id INTEGER PRIMARY KEY, x INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE INDEX c_x ON c (x)", ()).unwrap();
+    db.execute("INSERT INTO c VALUES (1, 1), (2, 2)", ())
+        .unwrap();
+    let sql = "WITH c(x) AS (SELECT v FROM t WHERE v > 1995) SELECT d.x FROM \
+               (WITH e(y) AS (SELECT 1997) SELECT x FROM c WHERE x > (SELECT y FROM e)) d";
+    assert_eq!(firsts(&db, sql), [1998, 1999, 2000]);
+    let plan = explain(&db, sql);
+    assert!(
+        !plan.contains("c_x") && plan.contains("Cte c (x > (SELECT y FROM e))"),
+        "the plan reads the outer CTE c, not the table c\n{plan}"
+    );
+}

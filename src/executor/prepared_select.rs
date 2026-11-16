@@ -5986,6 +5986,9 @@ struct Builder<'e> {
     /// The CTEs of the statement block being bound and of those around it,
     /// with their columns, which a block's FROM reads ahead of the context
     ctes: Vec<(SmartString, Vec<String>)>,
+    /// Whether a view whose query only its run can name may run here; an
+    /// EXPLAIN runs nothing
+    runs: bool,
 }
 
 /// A value a block reads from a scope beyond its parent: its slot, the
@@ -6230,7 +6233,7 @@ impl Builder<'_> {
                 }
                 Reach::Param(_) => Ok(None),
             },
-            runs: true,
+            runs: self.runs,
             visible: Vec::new(),
             ctes: self.ctes.clone(),
         }
@@ -6309,7 +6312,7 @@ impl Builder<'_> {
             executor: self.executor,
             ctx: self.ctx,
             on: &mut on,
-            runs: true,
+            runs: self.runs,
             visible: Vec::new(),
             ctes: self.ctes.clone(),
         };
@@ -6499,7 +6502,7 @@ impl Builder<'_> {
         // The parameters it reads key its kept answer; one not positional
         // leaves it every parameter
         let mut params = SmallVec::<[usize; 2]>::new();
-        let around = self.ctes.clone();
+        let (around, runs) = (self.ctes.clone(), self.runs);
         let mut walk = StatementWalk {
             executor,
             ctx,
@@ -6519,7 +6522,7 @@ impl Builder<'_> {
                     Ok(None)
                 }
             },
-            runs: true,
+            runs,
             visible: Vec::new(),
             ctes: around,
         };
@@ -7030,7 +7033,7 @@ impl Builder<'_> {
             Named::View(view) => view,
             Named::Table => return Ok(None),
         };
-        let named = view_names(self.executor, &view, self.ctx, true)?;
+        let named = view_names(self.executor, &view, self.ctx, self.runs)?;
         let source = BlockSource::View(name.into(), view.query.clone());
         Ok(Some((source, named)))
     }
@@ -9006,7 +9009,8 @@ impl PreparedSelect {
     /// `columns`, for executions with `param_count` positional parameters;
     /// `keyed_branch` when it is a set operation's first branch whose rows
     /// the whole one's DISTINCT ON reads by the layout. A `stored` table's
-    /// rows have row ids
+    /// rows have row ids. A view only its run names runs when the caller
+    /// `runs`
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare(
         executor: &Executor,
@@ -9015,7 +9019,7 @@ impl PreparedSelect {
         (schema, stored): (&Schema, bool),
         scope_name: &SmartString,
         param_count: usize,
-        epoch: u64,
+        (epoch, runs): (u64, bool),
         keyed_branch: bool,
     ) -> Result<Self> {
         let registry = global_registry();
@@ -9059,6 +9063,7 @@ impl PreparedSelect {
             projected_from: None,
             projected_reads: SmallVec::new(),
             ctes: Vec::new(),
+            runs,
         };
         let mut work = Rewritten::default();
         let mut run_slots = Vec::new();
@@ -9666,6 +9671,7 @@ impl PreparedGrouped {
             projected_from: None,
             projected_reads: SmallVec::new(),
             ctes: Vec::new(),
+            runs: true,
         };
         let mut run_slots = Vec::new();
         fn rewrite(
@@ -10691,6 +10697,7 @@ impl PreparedDml {
             projected_from: None,
             projected_reads: SmallVec::new(),
             ctes: Vec::new(),
+            runs: true,
         };
         let mut work = Rewritten::default();
         // A value that reads no row is computed once per run, as a run slot
@@ -11250,6 +11257,7 @@ impl JoinBlocks {
             projected_from: None,
             projected_reads: SmallVec::new(),
             ctes: Vec::new(),
+            runs: true,
         };
         // A side read as rows from a source the blocks read, as a block's
         // FROM, or streamed; one they cannot read keeps its own conditions
@@ -12908,8 +12916,9 @@ impl Executor {
         if let Some(inlined) = self.try_inline_ctes(stmt, with) {
             return Some(self.explain_lines(&inlined, ctx));
         }
-        // Each CTE named before the statement runs, its rows left empty
-        let mut registry = super::cte::CteRegistry::new();
+        // Each CTE named before the statement runs, its rows left empty,
+        // beside the CTEs of the WITH clauses around it as the run holds them
+        let mut registry = super::cte::CteRegistry::within(ctx);
         let mut bodies = Vec::with_capacity(with.ctes.len());
         for cte in &with.ctes {
             if cte.is_recursive {
@@ -12983,7 +12992,7 @@ impl Executor {
                 let columns = schema.column_names_arc();
                 let held = || (std::borrow::Cow::Borrowed(&*schema), true);
                 let prepared = self
-                    .prepared_for(None, stmt, &columns, held, scope, ctx, false)
+                    .prepared_for(None, stmt, &columns, held, scope, ctx, (false, false))
                     .ok()?;
                 let first = prepared.explain(
                     &first_branch_of(stmt),
@@ -13059,7 +13068,7 @@ impl Executor {
             )
         };
         let prepared = self
-            .prepared_for(None, stmt, &columns, schema, &scope, ctx, false)
+            .prepared_for(None, stmt, &columns, schema, &scope, ctx, (false, false))
             .ok()?;
         let lines = prepared.explain(stmt, (&scope, global_registry()), body, false)?;
         Some(asked(&prepared, lines))
@@ -13284,7 +13293,7 @@ impl Executor {
     /// The plan's prepared statement, prepared now over the source `schema`
     /// gives, with whether it is a stored table's, when the plan holds none
     /// for this schema, these `columns` and
-    /// this parameter count
+    /// this parameter count; a view only its run names runs when it `runs`
     #[allow(clippy::too_many_arguments)]
     fn prepared_for<'s>(
         &self,
@@ -13294,7 +13303,7 @@ impl Executor {
         schema: impl FnOnce() -> (std::borrow::Cow<'s, Schema>, bool),
         scope_name: &SmartString,
         ctx: &ExecutionContext,
-        fresh: bool,
+        (fresh, runs): (bool, bool),
     ) -> Result<Arc<PreparedSelect>> {
         let epoch = self.engine.schema_epoch();
         let fits = |p: &PreparedSelect| {
@@ -13324,7 +13333,7 @@ impl Executor {
             (&schema, stored),
             scope_name,
             ctx.params().len(),
-            epoch,
+            (epoch, runs),
             keyed_branch,
         )?);
         #[cfg(feature = "test-failpoints")]
@@ -14295,8 +14304,15 @@ impl Executor {
         // table prepares again, against the table as it now is
         let mut fresh = false;
         let (prepared, tables) = loop {
-            let prepared =
-                self.prepared_for(compiled, stmt, columns, schema, scope_name, ctx, fresh)?;
+            let prepared = self.prepared_for(
+                compiled,
+                stmt,
+                columns,
+                schema,
+                scope_name,
+                ctx,
+                (fresh, true),
+            )?;
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::prepared_plan_taken();
             if let Some(tables) =
