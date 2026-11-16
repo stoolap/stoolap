@@ -279,47 +279,6 @@ fn test_is_null() {
 }
 
 #[test]
-fn test_coalesce() {
-    let mut vm = ExprVM::new();
-
-    // COALESCE(col[0], col[1], 'default')
-    let program = Program::new(vec![
-        Op::LoadColumn(0),
-        Op::LoadColumn(1),
-        Op::LoadConst(Value::Text(SmartString::from("default"))),
-        Op::Coalesce(3),
-        Op::Return,
-    ]);
-
-    // First non-null
-    let row = Row::from_values(vec![
-        Value::Text(SmartString::from("first")),
-        Value::Text(SmartString::from("second")),
-    ]);
-    let ctx = ExecuteContext::new(&row);
-    let result = vm.execute(&program, &ctx).unwrap();
-    assert_eq!(result, Value::Text(SmartString::from("first")));
-
-    // Second non-null
-    let row = Row::from_values(vec![
-        Value::Null(crate::core::DataType::Text),
-        Value::Text(SmartString::from("second")),
-    ]);
-    let ctx = ExecuteContext::new(&row);
-    let result = vm.execute(&program, &ctx).unwrap();
-    assert_eq!(result, Value::Text(SmartString::from("second")));
-
-    // Default
-    let row = Row::from_values(vec![
-        Value::Null(crate::core::DataType::Text),
-        Value::Null(crate::core::DataType::Text),
-    ]);
-    let ctx = ExecuteContext::new(&row);
-    let result = vm.execute(&program, &ctx).unwrap();
-    assert_eq!(result, Value::Text(SmartString::from("default")));
-}
-
-#[test]
 fn test_join_context() {
     let mut vm = ExprVM::new();
 

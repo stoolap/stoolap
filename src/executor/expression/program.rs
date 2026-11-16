@@ -484,17 +484,6 @@ impl Program {
         result
     }
 
-    /// Apply peephole optimizations to fuse common instruction patterns.
-    /// This is called automatically when creating a program via `new()`.
-    pub fn optimize(mut self) -> Self {
-        let mut folds = self.binding.take().map(|b| b.folds).unwrap_or_default();
-        self.ops = Self::peephole_optimize(self.ops, &mut folds);
-        self.binding = Binding::of(&self.ops, folds);
-        self.predicate_chain = ExprVM::is_predicate_chain(&self.ops);
-        self.chain_params = ExprVM::chain_params(&self.ops);
-        self
-    }
-
     /// Peephole optimizer: fuse common instruction patterns into single ops
     fn peephole_optimize(mut ops: Vec<Op>, folds: &mut Vec<(u32, u32)>) -> Vec<Op> {
         if ops.len() < 2 {
@@ -842,17 +831,9 @@ impl JumpTargets {
 /// The position `op` jumps to, when it jumps
 fn jump_target(op: &mut Op) -> Option<&mut u32> {
     match op {
-        Op::And(t)
-        | Op::Or(t)
-        | Op::Jump(t)
-        | Op::JumpIfTrue(t)
-        | Op::JumpIfFalse(t)
-        | Op::JumpIfNull(t)
-        | Op::JumpIfNotNull(t)
-        | Op::PopJumpIfTrue(t)
-        | Op::PopJumpIfFalse(t)
-        | Op::CaseWhen(t)
-        | Op::CaseThen(t) => Some(t),
+        Op::And(t) | Op::Or(t) | Op::JumpIfNotNull(t) | Op::CaseWhen(t) | Op::CaseThen(t) => {
+            Some(t)
+        }
         _ => None,
     }
 }
@@ -955,13 +936,7 @@ impl ProgramBuilder {
             match &mut self.ops[pos] {
                 Op::And(t)
                 | Op::Or(t)
-                | Op::Jump(t)
-                | Op::JumpIfTrue(t)
-                | Op::JumpIfFalse(t)
-                | Op::JumpIfNull(t)
                 | Op::JumpIfNotNull(t)
-                | Op::PopJumpIfTrue(t)
-                | Op::PopJumpIfFalse(t)
                 | Op::CaseWhen(t)
                 | Op::CaseThen(t) => *t = target,
                 _ => {}
@@ -1113,7 +1088,7 @@ mod tests {
         // Ensure jump targets aren't fused over
         let ops = vec![
             Op::LoadColumn(0),
-            Op::JumpIfFalse(3), // Jump to position 3
+            Op::JumpIfNotNull(3), // Jump to position 3
             Op::LoadConst(Value::Integer(5)),
             Op::Eq, // This is position 3 - a jump target
             Op::Return,
@@ -1153,7 +1128,7 @@ mod tests {
     fn test_builder_patch_jump() {
         let mut builder = ProgramBuilder::new();
         builder.emit(Op::LoadColumn(0));
-        builder.emit(Op::JumpIfFalse(0)); // Placeholder target
+        builder.emit(Op::JumpIfNotNull(0)); // Placeholder target
         let jump_pos = 1;
         builder.emit(Op::LoadConst(Value::Integer(1)));
         builder.emit(Op::Return);
@@ -1163,7 +1138,10 @@ mod tests {
 
         let prog = builder.build();
         // After optimization, check that jump exists
-        let has_jump = prog.ops().iter().any(|op| matches!(op, Op::JumpIfFalse(_)));
+        let has_jump = prog
+            .ops()
+            .iter()
+            .any(|op| matches!(op, Op::JumpIfNotNull(_)));
         assert!(has_jump || prog.len() < 4); // Either has jump or was optimized away
     }
 

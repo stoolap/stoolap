@@ -34,8 +34,8 @@ pub mod transaction;
 // Re-export main traits
 pub use engine::Engine;
 pub use index_trait::{CappedEqual, Index, RemovalBuffers};
-pub use result::{EmptyResult, MemoryResult, QueryResult};
-pub use scanner::{EmptyScanner, Scanner, VecScanner};
+pub use result::{MemoryResult, QueryResult};
+pub use scanner::Scanner;
 pub use table::{
     CapturedGroups, ColdChange, FoundVersions, PlannedUpdate, ProbeScratch, ScanAccess, ScanPlan,
     Table, VersionMark,

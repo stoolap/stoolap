@@ -992,14 +992,6 @@ impl Operator for IndexNestedLoopJoinOperator<'_> {
             _ => outer_est,
         })
     }
-
-    fn name(&self) -> &str {
-        match self.join_type {
-            JoinType::Inner => "IndexNL (INNER)",
-            JoinType::Left => "IndexNL (LEFT)",
-            _ => "IndexNL",
-        }
-    }
 }
 
 /// The rows a batch index join fetched in `open`: each inner row pairs with
@@ -1508,9 +1500,5 @@ impl Operator for BatchIndexNestedLoopJoinOperator<'_> {
 
     fn estimated_rows(&self) -> Option<usize> {
         self.outer.estimated_rows()
-    }
-
-    fn name(&self) -> &str {
-        "BatchIndexNL"
     }
 }

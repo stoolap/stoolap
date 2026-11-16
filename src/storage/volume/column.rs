@@ -947,12 +947,6 @@ impl ColumnBloomFilter {
         }
     }
 
-    /// Add a value to the bloom filter.
-    pub fn add(&mut self, value: &Value) {
-        let h = Self::hash_value(value);
-        self.insert_hash(h);
-    }
-
     /// Check if a value MIGHT exist in the filter.
     /// Returns false only if the value is definitely not present.
     pub fn might_contain(&self, value: &Value) -> bool {

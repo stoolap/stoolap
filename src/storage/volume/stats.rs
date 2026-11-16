@@ -194,12 +194,6 @@ impl VolumeAggregateStats {
     pub fn max(&self, col_idx: usize) -> &Value {
         &self.columns[col_idx].max
     }
-
-    /// Get AVG(col) for a specific column.
-    #[inline]
-    pub fn avg(&self, col_idx: usize) -> Option<f64> {
-        self.columns[col_idx].avg()
-    }
 }
 
 #[cfg(test)]

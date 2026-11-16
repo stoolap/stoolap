@@ -251,11 +251,6 @@ impl CompiledAggregate {
         CompiledAggregate::MaxInteger { max_value: None }
     }
 
-    /// Create from an aggregate call's state (fallback)
-    pub fn dynamic(state: AggregateState) -> Self {
-        CompiledAggregate::Dynamic(state)
-    }
-
     /// Compile from a function name and configuration
     ///
     /// Returns a compiled aggregate for common functions, or wraps the

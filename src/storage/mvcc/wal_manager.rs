@@ -2148,11 +2148,6 @@ impl WALManager {
         closed
     }
 
-    /// Get the WAL directory path
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     /// Clean up old rotated WAL files fully covered by a snapshot.
     ///
     /// A WAL file named `lsn-N` contains entries with LSN > N. The file's upper
@@ -2225,11 +2220,6 @@ impl WALManager {
         let lsn_str = &name[lsn_start + 4..];
         let dot_pos = lsn_str.find('.')?;
         lsn_str[..dot_pos].parse::<u64>().ok()
-    }
-
-    /// Get maximum WAL file size before rotation
-    pub fn max_wal_size(&self) -> u64 {
-        self.max_wal_size
     }
 
     /// Get current WAL file name

@@ -42,25 +42,6 @@ pub struct MVCCScanner {
 }
 
 impl MVCCScanner {
-    /// Creates a new MVCC scanner with filtering (legacy method)
-    pub fn new(
-        rows: RowVec,
-        schema: CompactArc<Schema>,
-        column_indices: Vec<usize>,
-        filter: Option<Box<dyn Expression>>,
-    ) -> Self {
-        // Filter rows if needed
-        let filtered_rows: RowVec = if let Some(ref expr) = filter {
-            rows.into_iter()
-                .filter(|(_, row)| expr.evaluate(row).unwrap_or_default())
-                .collect()
-        } else {
-            rows
-        };
-
-        Self::from_rows(filtered_rows, schema, column_indices)
-    }
-
     /// Creates scanner from RowVec
     #[inline]
     pub fn from_rows(rows: RowVec, schema: CompactArc<Schema>, column_indices: Vec<usize>) -> Self {

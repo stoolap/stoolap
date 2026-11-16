@@ -105,11 +105,6 @@ impl JoinFilter {
             crate::core::Error::internal("a join condition failed without an error")
         })
     }
-
-    /// Get the underlying program.
-    pub fn program(&self) -> &SharedProgram {
-        &self.bound.program
-    }
 }
 
 thread_local! {

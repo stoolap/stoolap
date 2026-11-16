@@ -288,17 +288,6 @@ impl TableZoneMap {
         }
     }
 
-    /// Get segments to scan for a single-column predicate
-    pub fn get_segments_to_scan(
-        &self,
-        column: &str,
-        operator: Operator,
-        value: &Value,
-    ) -> Option<Vec<u32>> {
-        let col_map = self.columns.get(column)?;
-        Some(col_map.get_unpruned_segments(operator, value))
-    }
-
     /// Whether a segment of `column` may hold a row the predicate keeps;
     /// None when the column has no zone map
     pub fn may_match(&self, column: &str, operator: Operator, value: &Value) -> Option<bool> {

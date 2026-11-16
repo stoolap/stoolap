@@ -27,18 +27,6 @@ use crate::core::predicate::PredicateSet;
 use crate::core::ForeignKeyAction;
 
 // ============================================================================
-// Core Traits
-// ============================================================================
-
-/// Node trait - base for all AST nodes
-pub trait Node: fmt::Display + fmt::Debug {
-    /// Returns the literal string of the first token
-    fn token_literal(&self) -> &str;
-    /// Returns the position of the node in source code
-    fn position(&self) -> Position;
-}
-
-// ============================================================================
 // Expressions
 // ============================================================================
 

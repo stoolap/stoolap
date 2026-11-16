@@ -23,7 +23,6 @@
 //! - [`BetweenExpr`] - Range check (column BETWEEN low AND high)
 //! - [`InListExpr`] - List membership (column IN (v1, v2, ...))
 //! - [`NullCheckExpr`] - NULL check (column IS NULL / IS NOT NULL)
-//! - [`RangeExpr`] - Optimized range check with custom inclusivity
 //! - [`CastExpr`] - Type cast expression
 //! - [`LikeExpr`] - Pattern matching (LIKE/ILIKE with % and _ wildcards)
 //! - [`FunctionExpr`] - Scalar function evaluation (e.g., UPPER(col) = 'X')
@@ -37,7 +36,6 @@ pub mod in_list;
 pub mod like;
 pub mod logical;
 pub mod null_check;
-pub mod range;
 
 use std::any::Any;
 use std::fmt::Debug;
@@ -51,12 +49,11 @@ pub use between::BetweenExpr;
 pub use cast::{CastExpr, CompoundExpr};
 pub use comparison::ComparisonExpr;
 pub use compiled::CompiledFilter;
-pub use function::{EvalExpr, FunctionArg, FunctionExpr};
+pub use function::{FunctionArg, FunctionExpr};
 pub use in_list::InListExpr;
 pub use like::LikeExpr;
 pub use logical::{AndExpr, ConstBoolExpr, NotExpr, OrExpr};
 pub use null_check::NullCheckExpr;
-pub use range::RangeExpr;
 
 /// Expression trait for boolean expressions used in WHERE clauses
 ///

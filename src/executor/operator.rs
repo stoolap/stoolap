@@ -96,9 +96,6 @@ pub trait Operator {
     fn estimated_rows(&self) -> Option<usize> {
         None
     }
-
-    /// Get a descriptive name for this operator (for EXPLAIN).
-    fn name(&self) -> &str;
 }
 
 /// A row reference that can be borrowed, owned, or composite.
@@ -186,20 +183,8 @@ impl RowRef {
                 }
                 row
             }
-            // Use materialize_owned to move values instead of cloning
             RowRef::Composite(comp) => comp.materialize_owned_with_room(room),
             RowRef::DirectBuildComposite(direct) => direct.materialize_owned_with_room(room),
-        }
-    }
-
-    /// Clone to an owned Row.
-    ///
-    /// Use `into_owned()` when possible to avoid cloning.
-    pub fn to_owned(&self) -> Row {
-        match self {
-            RowRef::Owned(row) => row.clone(),
-            RowRef::Composite(comp) => comp.materialize(),
-            RowRef::DirectBuildComposite(direct) => direct.materialize(),
         }
     }
 
@@ -287,23 +272,11 @@ impl CompositeRow {
         }
     }
 
-    /// Get a reference to the left row.
-    #[inline]
-    pub fn left(&self) -> &Row {
-        &self.left
-    }
-
-    /// Get a reference to the right row.
-    #[inline]
-    pub fn right(&self) -> &Row {
-        &self.right
-    }
-
     /// Materialize into an owned Row (cloning version).
     ///
     /// This creates a single Row by copying all values from both sides.
     /// Only call this when the final result needs to be stored.
-    /// Prefer `materialize_owned()` when you can consume the CompositeRow.
+    /// Prefer `materialize_owned_with_room()` when you can consume the CompositeRow.
     pub fn materialize(&self) -> Row {
         let total = self.len();
         let mut values: CompactVec<Value> = CompactVec::with_capacity(total);
@@ -317,25 +290,11 @@ impl CompositeRow {
         Row::from_compact_vec(values)
     }
 
-    /// Materialize into an owned Row by moving values (zero-copy).
-    ///
-    /// This consumes the CompositeRow and moves all values without cloning.
-    /// Use this instead of `materialize()` when you no longer need the CompositeRow.
-    #[inline]
-    pub fn materialize_owned(self) -> Row {
-        self.materialize_owned_with_room(0)
-    }
-
-    /// [`Self::materialize_owned`], with room for `room` values more
+    /// Materialize into an owned Row by moving values, with room for
+    /// `room` values more
     #[inline]
     pub(crate) fn materialize_owned_with_room(self, room: usize) -> Row {
         Row::from_combined_owned_with_room(self.left, self.right, room)
-    }
-
-    /// Decompose into the left and right rows.
-    #[inline]
-    pub fn into_parts(self) -> (Row, Row) {
-        (self.left, self.right)
     }
 }
 
@@ -434,34 +393,8 @@ impl DirectBuildCompositeRow {
         }
     }
 
-    /// Materialize into an owned Row (cloning version).
-    pub fn materialize(&self) -> Row {
-        let build_row = &self.build_rows[self.build_idx];
-        let total = self.probe_cols + build_row.len();
-        let mut values: CompactVec<Value> = CompactVec::with_capacity(total);
-
-        if self.probe_is_left {
-            values.extend_clone(self.probe.as_slice());
-            values.extend_clone(build_row.as_slice());
-        } else {
-            values.extend_clone(build_row.as_slice());
-            values.extend_clone(self.probe.as_slice());
-        }
-
-        Row::from_compact_vec(values)
-    }
-
-    /// Materialize into an owned Row by moving probe values.
-    ///
-    /// Combines probe and build rows efficiently:
-    /// - Moves probe values (owned) - uses extend_into_compact_vec to avoid Vec allocation
-    /// - Clones build values (shared reference)
-    #[inline]
-    pub fn materialize_owned(self) -> Row {
-        self.materialize_owned_with_room(0)
-    }
-
-    /// [`Self::materialize_owned`], with room for `room` values more
+    /// Materialize into an owned Row by moving the probe values and cloning
+    /// the build values, with room for `room` values more
     #[inline]
     pub(crate) fn materialize_owned_with_room(self, room: usize) -> Row {
         let build_row = &self.build_rows[self.build_idx];
@@ -551,10 +484,6 @@ impl Operator for EmptyOperator {
     fn width(&self) -> usize {
         0
     }
-
-    fn name(&self) -> &str {
-        "Empty"
-    }
 }
 
 /// An operator that yields rows from a pre-materialized vector.
@@ -619,10 +548,6 @@ impl Operator for MaterializedOperator {
 
     fn estimated_rows(&self) -> Option<usize> {
         Some(self.rows.len())
-    }
-
-    fn name(&self) -> &str {
-        "Materialized"
     }
 }
 
@@ -693,10 +618,6 @@ impl Operator for QueryResultOperator {
     fn estimated_rows(&self) -> Option<usize> {
         // QueryResult doesn't expose count, return None
         None
-    }
-
-    fn name(&self) -> &str {
-        "QueryResultScan"
     }
 }
 

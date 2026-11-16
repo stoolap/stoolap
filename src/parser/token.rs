@@ -210,11 +210,6 @@ impl Token {
         self.token_type == TokenType::Eof
     }
 
-    /// Check if this is an operator with the given value
-    pub fn is_operator(&self, op: &str) -> bool {
-        self.token_type == TokenType::Operator && self.literal == op
-    }
-
     /// Check if this is a punctuator with the given value
     pub fn is_punctuator(&self, punct: &str) -> bool {
         self.token_type == TokenType::Punctuator && self.literal == punct

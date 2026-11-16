@@ -586,11 +586,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Get collected errors
-    pub fn errors(&self) -> &[ParseError] {
-        &self.errors
-    }
-
     /// Get the next parameter index
     pub(crate) fn next_parameter_index(&mut self) -> usize {
         let idx = self.parameter_counter;

@@ -145,11 +145,6 @@ impl Default for PersistenceConfig {
 }
 
 impl PersistenceConfig {
-    /// Creates a new PersistenceConfig with default values
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Creates a PersistenceConfig optimized for maximum durability
     pub fn durable() -> Self {
         Self {

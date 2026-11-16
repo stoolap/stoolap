@@ -100,12 +100,12 @@ pub use core::{
 };
 
 // Re-export common utilities
-pub use common::{I64Map, I64Set, SemVer, SmartString};
+pub use common::{I64Map, I64Set, SmartString};
 
 // Re-export storage/expression types
 pub use storage::{
     AndExpr, BetweenExpr, CastExpr, ComparisonExpr, CompoundExpr, Expression, InListExpr, NotExpr,
-    NullCheckExpr, OrExpr, RangeExpr,
+    NullCheckExpr, OrExpr,
 };
 
 // Re-export config types
@@ -113,8 +113,7 @@ pub use storage::{Config, PersistenceConfig, SyncMode};
 
 // Re-export storage traits
 pub use storage::{
-    EmptyResult, EmptyScanner, Engine, Index, MemoryResult, QueryResult, Scanner, Table,
-    TemporalType, Transaction, VecScanner,
+    Engine, Index, MemoryResult, QueryResult, Scanner, Table, TemporalType, Transaction,
 };
 
 // Re-export MVCC types
@@ -135,7 +134,6 @@ pub use storage::{
 pub use storage::{
     deserialize_row_version, deserialize_value, serialize_row_version, serialize_value,
     serialize_value_into, IndexMetadata, PersistenceManager, PersistenceMeta,
-    DEFAULT_CHECKPOINT_INTERVAL, DEFAULT_KEEP_SNAPSHOTS,
 };
 
 // Re-export function types

@@ -28,8 +28,7 @@ use crate::storage::mvcc::registry::StatementView;
 use crate::storage::mvcc::txn_gate::{GateRef, TxnGate};
 use crate::storage::mvcc::TransactionRegistry;
 use crate::storage::traits::transaction::{StatementAccess, TableUse};
-use crate::storage::traits::{NewIndex, QueryResult, Table, Transaction};
-use crate::storage::Expression;
+use crate::storage::traits::{NewIndex, Table, Transaction};
 
 /// A table change of the transaction; the changes are undone in reverse order
 #[derive(Debug, Clone)]
@@ -1020,20 +1019,6 @@ impl Transaction for MvccTransaction {
             nullable: column.nullable,
             vector_dimensions: column.vector_dimensions,
         })
-    }
-
-    fn select(
-        &self,
-        table_name: &str,
-        columns_to_fetch: &[String],
-        expr: Option<&dyn Expression>,
-        _original_columns: Option<&[String]>,
-    ) -> Result<Box<dyn QueryResult>> {
-        self.check_active()?;
-
-        let table = self.get_table(table_name)?;
-        let col_refs: Vec<&str> = columns_to_fetch.iter().map(|s| s.as_str()).collect();
-        table.select(&col_refs, expr)
     }
 
     fn rows_at(

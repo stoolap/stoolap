@@ -993,13 +993,6 @@ impl ExecutionContext {
         self.cte_data.as_ref().and_then(|data| data.get(name_lower))
     }
 
-    /// Check if context has CTE data
-    pub fn has_cte(&self, name: &str) -> bool {
-        self.cte_data
-            .as_ref()
-            .is_some_and(|data| data.contains_key(&name.to_lowercase()))
-    }
-
     /// Whether this context brings CTEs a statement run in it may read
     #[inline]
     pub(crate) fn brings_ctes(&self) -> bool {
