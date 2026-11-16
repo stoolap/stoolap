@@ -32,6 +32,7 @@ mod derived_table_blocks_test;
 mod exists_few_outer_rows_test;
 mod exists_subquery_test;
 mod explain_blocks_read_test;
+mod explain_source_blocks_test;
 mod from_source_sites_test;
 mod fromless_statement_blocks_test;
 mod in_subquery_cache_test;

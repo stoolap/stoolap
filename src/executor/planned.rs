@@ -243,7 +243,6 @@ impl Executor {
         ctx: &ExecutionContext,
     ) -> Option<Vec<String>> {
         self.explain_planned(stmt, ctx, true)
-            .or_else(|| self.explain_with_blocks(stmt, ctx))
             .or_else(|| self.explain_over_source(stmt, ctx))
     }
 

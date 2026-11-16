@@ -12884,72 +12884,26 @@ impl Executor {
         }))
     }
 
-    /// The plan of `stmt` over one table, which asks blocks, as EXPLAIN shows
-    /// it: the plan its run reads, prepared as the run prepares it, then its
-    /// blocks; None for any other statement
-    pub(crate) fn explain_with_blocks(
-        &self,
-        stmt: &SelectStatement,
-        ctx: &ExecutionContext,
-    ) -> Option<Vec<String>> {
-        let shape = get_classification(stmt);
-        if !(shape.where_has_subqueries || shape.output_has_subqueries)
-            || stmt.with.is_some()
-            || self.prepared_family(stmt, &shape).is_err()
-        {
-            return None;
-        }
-        let Some(Expression::TableSource(ts)) = stmt.table_expr.as_deref() else {
-            return None;
-        };
-        let name = &ts.name.value_lower;
-        if ts.as_of.is_some() || !matches!(self.named(ctx, name).ok()?, Named::Table) {
-            return None;
-        }
-        let scope = ts.alias.as_ref().map_or(name, |alias| &alias.value_lower);
-        let schema = self.engine.get_table_schema(name).ok()?;
-        let columns = schema.column_names_arc();
-        let held = || (std::borrow::Cow::Borrowed(&*schema), true);
-        let prepared = self
-            .prepared_for(None, stmt, &columns, held, scope, ctx, false)
-            .ok()?;
-        let first = prepared.explain(
-            &first_branch_of(stmt),
-            (name, global_registry()),
-            Vec::new(),
-            true,
-        )?;
-        let mut lines = self.explain_set_operations(stmt, first, ctx);
-        lines.push("Prepared: yes".to_string());
-        let mut blocks = Vec::new();
-        prepared.blocks.explain("  ", ("", 0), &mut blocks);
-        if !blocks.is_empty() {
-            lines.push("Subqueries:".to_string());
-            lines.extend(blocks);
-        }
-        Some(lines)
-    }
-
-    /// The plan of `stmt`, which the runner reads over a source or after its
-    /// WITH, as EXPLAIN shows it; None for a statement the plan cannot show
+    /// The plan of `stmt`, which the runner reads over one source, a table
+    /// when it asks blocks, or after its WITH, as EXPLAIN shows it, then its
+    /// blocks; None for a statement the plan cannot show
     pub(crate) fn explain_over_source(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Option<Vec<String>> {
-        // A statement with a subquery prints as a table's does, with its blocks
         let shape = get_classification(stmt);
-        if shape.where_has_subqueries
-            || shape.output_has_subqueries
-            || self.planned_family(stmt, &shape).is_err()
-            || stmt.distinct
-            || !stmt.distinct_on.is_empty()
-            || !stmt.set_operations.is_empty()
+        let blocks = shape.where_has_subqueries || shape.output_has_subqueries;
+        let family = match blocks {
+            true => self.prepared_family(stmt, &shape),
+            false => self.planned_family(stmt, &shape),
+        };
+        if family.is_err() || matches!(stmt.table_expr.as_deref(), Some(Expression::JoinSource(_)))
         {
             return None;
         }
         let Some(with) = stmt.with.as_ref() else {
-            return self.explain_source(stmt, ctx, &[]);
+            return self.explain_source(stmt, ctx, &[], blocks);
         };
         if let Some(inlined) = self.try_inline_ctes(stmt, with) {
             return Some(self.explain_lines(&inlined, ctx));
@@ -12977,17 +12931,75 @@ impl Executor {
             bodies.push((cte.name.value_lower.clone(), body));
             registry.store(&cte.name.value, names, RowVec::new());
         }
-        self.explain_source(stmt, &ctx.with_cte_data(registry.data()), &bodies)
+        self.explain_source(stmt, &ctx.with_cte_data(registry.data()), &bodies, blocks)
     }
 
     /// The plan of `stmt` over its one source, the CTEs of its WITH planned
-    /// as `bodies`
+    /// as `bodies`, prepared as its run prepares it, then, when it asks
+    /// `blocks`, those blocks and the CTEs its source line does not show
     fn explain_source(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         bodies: &[(SmartString, Vec<String>)],
+        blocks: bool,
     ) -> Option<Vec<String>> {
+        let source = match stmt.table_expr.as_deref() {
+            Some(Expression::TableSource(ts)) => Some(&ts.name.value_lower),
+            _ => None,
+        };
+        let asked = |prepared: &PreparedSelect, mut lines: Vec<String>| {
+            if blocks {
+                lines.push("Prepared: yes".to_string());
+                let mut listed = Vec::new();
+                prepared.blocks.explain("  ", ("", 0), &mut listed);
+                if !listed.is_empty() {
+                    lines.push("Subqueries:".to_string());
+                    lines.extend(listed);
+                }
+                let mut ctes = bodies
+                    .iter()
+                    .filter(|(cte, _)| Some(cte) != source)
+                    .peekable();
+                if ctes.peek().is_some() {
+                    lines.push("Ctes:".to_string());
+                }
+                for (cte, body) in ctes {
+                    lines.push(format!("  {cte}"));
+                    lines.extend(body.iter().map(|line| format!("    {line}")));
+                }
+            }
+            lines
+        };
+        // A table read is the planner's own unless a block asks for it
+        if let Some(Expression::TableSource(ts)) = stmt.table_expr.as_deref() {
+            let name = &ts.name.value_lower;
+            if ts.as_of.is_none() && matches!(self.named(ctx, name).ok()?, Named::Table) {
+                if !blocks {
+                    return None;
+                }
+                let scope = ts.alias.as_ref().map_or(name, |alias| &alias.value_lower);
+                let schema = self.engine.get_table_schema(name).ok()?;
+                let columns = schema.column_names_arc();
+                let held = || (std::borrow::Cow::Borrowed(&*schema), true);
+                let prepared = self
+                    .prepared_for(None, stmt, &columns, held, scope, ctx, false)
+                    .ok()?;
+                let first = prepared.explain(
+                    &first_branch_of(stmt),
+                    (name, global_registry()),
+                    Vec::new(),
+                    true,
+                )?;
+                return Some(asked(
+                    &prepared,
+                    self.explain_set_operations(stmt, first, ctx),
+                ));
+            }
+        }
+        if stmt.distinct || !stmt.distinct_on.is_empty() || !stmt.set_operations.is_empty() {
+            return None;
+        }
         let inner_ctx = ctx.with_incremented_query_depth();
         let scope = |alias: &Option<Identifier>| {
             alias
@@ -13040,21 +13052,17 @@ impl Executor {
             None => (Vec::new(), SmartString::new(""), Vec::new()),
             Some(_) => return None,
         };
-        let schema = untyped_schema(&scope, &columns);
-        let epoch = self.engine.schema_epoch();
-        let params = ctx.params().len();
-        let prepared = PreparedSelect::prepare(
-            self,
-            ctx,
-            stmt,
-            (&schema, false),
-            &scope,
-            params,
-            epoch,
-            false,
-        )
-        .ok()?;
-        prepared.explain(stmt, (&scope, global_registry()), body, false)
+        let schema = || {
+            (
+                std::borrow::Cow::Owned(untyped_schema(&scope, &columns)),
+                false,
+            )
+        };
+        let prepared = self
+            .prepared_for(None, stmt, &columns, schema, &scope, ctx, false)
+            .ok()?;
+        let lines = prepared.explain(stmt, (&scope, global_registry()), body, false)?;
+        Some(asked(&prepared, lines))
     }
 
     /// The plan of `stmt`, run by a statement over it, as EXPLAIN shows it:
@@ -13066,10 +13074,15 @@ impl Executor {
         ctx: &ExecutionContext,
     ) -> Vec<String> {
         // A body over a table runs as the planner plans it into its slot,
-        // reading no key itself
+        // reading no key itself, and one asking blocks as the runner reads it
         let planned = match self.reads_source(stmt, ctx) {
             true => self.explain_over_source(stmt, ctx),
-            false => self.explain_planned(stmt, ctx, false),
+            false => self.explain_planned(stmt, ctx, false).or_else(|| {
+                let shape = get_classification(stmt);
+                (shape.where_has_subqueries || shape.output_has_subqueries)
+                    .then(|| self.explain_over_source(stmt, ctx))
+                    .flatten()
+            }),
         };
         planned.unwrap_or_else(|| self.general_explain(stmt))
     }
