@@ -918,13 +918,11 @@ impl SchemaBuilder {
     }
 
     /// Add a simple non-nullable column
-    #[cfg(test)]
     pub fn add(self, name: impl Into<String>, data_type: DataType) -> Self {
         self.column(name, data_type, false, false)
     }
 
     /// Add a primary key column
-    #[cfg(test)]
     pub fn add_primary_key(self, name: impl Into<String>, data_type: DataType) -> Self {
         self.column(name, data_type, false, true)
     }
