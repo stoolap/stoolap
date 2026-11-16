@@ -434,16 +434,6 @@ impl Program {
         Self::new(vec![Op::LoadConst(value), Op::Return])
     }
 
-    /// Create a program that returns true
-    pub fn always_true() -> Self {
-        Self::new(vec![Op::ReturnTrue])
-    }
-
-    /// Create a program that returns false
-    pub fn always_false() -> Self {
-        Self::new(vec![Op::ReturnFalse])
-    }
-
     /// Get the operations
     #[inline]
     pub fn ops(&self) -> &[Op] {
@@ -1017,20 +1007,6 @@ mod tests {
         let prog = Program::constant(Value::Integer(42));
         assert!(!prog.is_empty());
         assert!(!prog.needs_second_row());
-    }
-
-    #[test]
-    fn test_program_always_true() {
-        let prog = Program::always_true();
-        assert_eq!(prog.len(), 1);
-        assert!(matches!(prog.ops()[0], Op::ReturnTrue));
-    }
-
-    #[test]
-    fn test_program_always_false() {
-        let prog = Program::always_false();
-        assert_eq!(prog.len(), 1);
-        assert!(matches!(prog.ops()[0], Op::ReturnFalse));
     }
 
     // =========================================================================

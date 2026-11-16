@@ -28,13 +28,11 @@
 //! `list_indexes` display and to block redundant CREATE INDEX on the PK column.
 
 use parking_lot::RwLock;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::common::deadline::{Deadline, DeadlineSite, CHARGE_BEAT};
-use crate::common::{I64Map, I64Set};
-use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
-use crate::storage::expression::Expression;
+use crate::common::I64Set;
+use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, Value};
 use crate::storage::index::id_list::GroupIds;
 use crate::storage::traits::RemovalBuffers;
 use crate::storage::Index;
@@ -311,7 +309,6 @@ pub struct PkIndex {
 /// A primary key index's data and the state that changes with it
 pub struct PkData {
     data: RwLock<PkIndexInner>,
-    closed: AtomicBool,
 }
 
 impl std::ops::Deref for PkIndex {
@@ -331,7 +328,6 @@ impl PkIndex {
             column_name,
             shared: Arc::new(PkData {
                 data: RwLock::new(PkIndexInner::new()),
-                closed: AtomicBool::new(false),
             }),
         }
     }
@@ -376,26 +372,10 @@ impl Index for PkIndex {
         &self.name
     }
 
-    fn table_name(&self) -> &str {
-        &self.table_name
-    }
-
-    fn build(&mut self) -> Result<()> {
-        Ok(())
-    }
-
     fn add(&self, values: &[Value], row_id: i64, _ref_id: i64) -> Result<()> {
         let _ = values;
         let mut inner = self.data.write();
         inner.insert(row_id);
-        Ok(())
-    }
-
-    fn add_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
-        let mut inner = self.data.write();
-        for (row_id, _) in entries.iter() {
-            inner.insert(row_id);
-        }
         Ok(())
     }
 
@@ -410,14 +390,6 @@ impl Index for PkIndex {
     fn remove(&self, _values: &[Value], row_id: i64, _ref_id: i64) -> Result<()> {
         let mut inner = self.data.write();
         inner.remove(row_id);
-        Ok(())
-    }
-
-    fn remove_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
-        let mut inner = self.data.write();
-        for (row_id, _) in entries.iter() {
-            inner.remove(row_id);
-        }
         Ok(())
     }
 
@@ -615,87 +587,6 @@ impl Index for PkIndex {
         super::each_entry_once(&found, |row_id| buffer.push(row_id));
     }
 
-    fn get_filtered_row_ids(&self, expr: &dyn Expression) -> RowIdVec {
-        // Try to get comparison info from expression
-        if let Some((col_name, operator, value)) = expr.get_comparison_info() {
-            if col_name == self.column_name {
-                match operator {
-                    Operator::Eq => {
-                        return self.get_row_ids_equal(std::slice::from_ref(value));
-                    }
-                    Operator::Gt | Operator::Gte | Operator::Lt | Operator::Lte => {
-                        let value_slice = std::slice::from_ref(value);
-                        let empty_slice: &[Value] = &[];
-                        let (min_vals, max_vals, include_min, include_max) = match operator {
-                            Operator::Gt => (value_slice, empty_slice, false, false),
-                            Operator::Gte => (value_slice, empty_slice, true, false),
-                            Operator::Lt => (empty_slice, value_slice, false, false),
-                            Operator::Lte => (empty_slice, value_slice, false, true),
-                            _ => return RowIdVec::new(),
-                        };
-                        return self.get_row_ids_in_range(
-                            min_vals,
-                            max_vals,
-                            include_min,
-                            include_max,
-                        );
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // Try to extract range from collect_comparisons (for AND expressions)
-        let comparisons = expr.collect_comparisons();
-        if !comparisons.is_empty() {
-            let mut min_val: Option<&Value> = None;
-            let mut max_val: Option<&Value> = None;
-            let mut include_min = false;
-            let mut include_max = false;
-            let mut eq_val: Option<&Value> = None;
-
-            for (col_name, op, val) in &comparisons {
-                if *col_name != self.column_name {
-                    continue;
-                }
-                match op {
-                    Operator::Eq => {
-                        eq_val = Some(val);
-                    }
-                    Operator::Gt => {
-                        min_val = Some(val);
-                        include_min = false;
-                    }
-                    Operator::Gte => {
-                        min_val = Some(val);
-                        include_min = true;
-                    }
-                    Operator::Lt => {
-                        max_val = Some(val);
-                        include_max = false;
-                    }
-                    Operator::Lte => {
-                        max_val = Some(val);
-                        include_max = true;
-                    }
-                    _ => {}
-                }
-            }
-
-            if let Some(eq) = eq_val {
-                return self.get_row_ids_equal(std::slice::from_ref(eq));
-            }
-
-            if min_val.is_some() || max_val.is_some() {
-                let min_slice: &[Value] = min_val.map(std::slice::from_ref).unwrap_or(&[]);
-                let max_slice: &[Value] = max_val.map(std::slice::from_ref).unwrap_or(&[]);
-                return self.get_row_ids_in_range(min_slice, max_slice, include_min, include_max);
-            }
-        }
-
-        RowIdVec::new()
-    }
-
     fn get_min_value(&self) -> Option<Value> {
         let inner = self.data.read();
         let b_min = bitset_min(&inner.words);
@@ -883,19 +774,6 @@ impl Index for PkIndex {
         Some(result)
     }
 
-    fn get_grouped_row_ids(&self) -> Option<Vec<(Value, Vec<i64>)>> {
-        let inner = self.data.read();
-        let mut result = Vec::with_capacity(inner.count);
-        for_each_set_bit(&inner.words, |rid| {
-            result.push((Value::Integer(rid), vec![rid]));
-            true
-        });
-        for id in inner.overflow.iter() {
-            result.push((Value::Integer(id), vec![id]));
-        }
-        Some(result)
-    }
-
     fn for_each_group(
         &self,
         callback: &mut dyn FnMut(&Value, GroupIds<'_>) -> Result<bool>,
@@ -988,11 +866,6 @@ impl Index for PkIndex {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
-    }
-
-    fn close(&mut self) -> Result<()> {
-        self.closed.store(true, Ordering::Release);
-        self.clear()
     }
 }
 

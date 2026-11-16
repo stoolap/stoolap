@@ -42,9 +42,7 @@ use std::sync::Arc;
 use rustc_hash::FxHashMap;
 
 use super::id_list::IdList;
-use crate::common::I64Map;
-use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
-use crate::storage::expression::Expression;
+use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, Value};
 use crate::storage::traits::Index;
 
 // ============================================================================
@@ -585,14 +583,6 @@ impl Index for MultiColumnIndex {
         &self.name
     }
 
-    fn table_name(&self) -> &str {
-        &self.table_name
-    }
-
-    fn build(&mut self) -> Result<()> {
-        Ok(())
-    }
-
     fn add(&self, values: &[Value], row_id: i64, _ref_id: i64) -> Result<()> {
         if self.closed.load(AtomicOrdering::Acquire) {
             return Err(Error::IndexClosed);
@@ -654,13 +644,6 @@ impl Index for MultiColumnIndex {
         Ok(())
     }
 
-    fn add_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
-        for (row_id, values) in entries.iter() {
-            self.add(values, row_id, 0)?;
-        }
-        Ok(())
-    }
-
     fn remove(&self, values: &[Value], row_id: i64, _ref_id: i64) -> Result<()> {
         if self.closed.load(AtomicOrdering::Acquire) {
             return Err(Error::IndexClosed);
@@ -711,13 +694,6 @@ impl Index for MultiColumnIndex {
             self.order_remove(values, row_id);
         }
 
-        Ok(())
-    }
-
-    fn remove_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
-        for (row_id, values) in entries.iter() {
-            self.remove(values, row_id, 0)?;
-        }
         Ok(())
     }
 
@@ -1161,10 +1137,6 @@ impl Index for MultiColumnIndex {
 
     // Uses default trait implementation: get_row_ids_in_range delegates to get_row_ids_in_range_into
 
-    fn get_filtered_row_ids(&self, _expr: &dyn Expression) -> RowIdVec {
-        RowIdVec::new()
-    }
-
     fn clear(&self) -> Result<()> {
         self.walk_orders.write().clear();
         self.sorted_values.write().clear();
@@ -1179,11 +1151,6 @@ impl Index for MultiColumnIndex {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
-    }
-
-    fn close(&mut self) -> Result<()> {
-        self.closed.store(true, AtomicOrdering::Release);
-        self.clear()
     }
 }
 

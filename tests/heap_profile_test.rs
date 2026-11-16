@@ -13,12 +13,11 @@
 // limitations under the License.
 
 //! PRAGMA heap_profile writes a gzipped pprof heap profile with
-//! heap-profile, unless dhat-heap takes the allocator, and refuses in every
-//! other build
+//! heap-profile, and refuses in every other build
 
 use stoolap::Database;
 
-#[cfg(all(feature = "heap-profile", not(feature = "dhat-heap")))]
+#[cfg(feature = "heap-profile")]
 #[test]
 fn a_heap_profile_is_written_in_pprof_format() {
     use std::io::Read;
@@ -45,7 +44,7 @@ fn a_heap_profile_is_written_in_pprof_format() {
     assert!(text.contains("inuse_space"), "a pprof heap profile");
 }
 
-#[cfg(not(all(feature = "heap-profile", not(feature = "dhat-heap"))))]
+#[cfg(not(feature = "heap-profile"))]
 #[test]
 fn a_heap_profile_needs_the_heap_profile_feature() {
     let db = Database::open("memory://heap_profile_refused").unwrap();

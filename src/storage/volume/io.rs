@@ -859,26 +859,6 @@ pub fn list_volumes(dir: &Path, table_name: &str) -> Vec<PathBuf> {
     volumes
 }
 
-/// Load all volumes for a table from disk.
-pub fn load_all_volumes(dir: &Path, table_name: &str) -> Result<Vec<Arc<FrozenVolume>>> {
-    let paths = list_volumes(dir, table_name);
-    let mut volumes = Vec::with_capacity(paths.len());
-    for path in paths {
-        let vol = read_volume_from_disk(&path)?;
-        volumes.push(Arc::new(vol));
-    }
-    Ok(volumes)
-}
-
-/// Delete a specific volume file from disk.
-pub fn delete_volume(path: &Path) -> Result<()> {
-    super::writer::VolumeFile::retire_path(path).map_err(|e| {
-        crate::core::Error::internal(format!("failed to delete volume {:?}: {}", path, e))
-    })?;
-    super::secondary::retire_side_of(path);
-    Ok(())
-}
-
 /// Delete all volumes for a table, and the side files beside them.
 pub fn delete_all_volumes(dir: &Path, table_name: &str) -> Result<()> {
     let paths = list_volumes(dir, table_name);
@@ -1231,25 +1211,6 @@ mod tests {
 
         let paths = list_volumes(dir.path(), "my_table");
         assert_eq!(paths.len(), 3);
-    }
-
-    #[test]
-    fn test_load_all_volumes() {
-        let dir = tempfile::tempdir().unwrap();
-        let schema = SchemaBuilder::new("test")
-            .column("id", DataType::Integer, false, true)
-            .build();
-
-        for i in 1..=3 {
-            let mut builder = VolumeBuilder::new(&schema);
-            builder.add_row(i, &Row::from_values(vec![Value::Integer(i)]));
-            let vol = builder.finish().unwrap();
-            write_volume_to_disk(dir.path(), "t", i as u64, &vol).unwrap();
-        }
-
-        let volumes = load_all_volumes(dir.path(), "t").unwrap();
-        assert_eq!(volumes.len(), 3);
-        assert_eq!(volumes[0].meta.row_count, 1);
     }
 
     #[test]

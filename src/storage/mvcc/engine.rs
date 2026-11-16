@@ -3309,11 +3309,6 @@ impl MVCCEngine {
         result
     }
 
-    /// Returns the database path
-    pub fn get_path(&self) -> &str {
-        &self.path
-    }
-
     /// Returns a copy of the configuration
     pub fn config(&self) -> Config {
         self.config.read().unwrap().clone()
@@ -3803,16 +3798,6 @@ impl MVCCEngine {
         buf
     }
 
-    /// Returns all table names (lowercase) currently in the engine
-    pub fn get_all_table_names(&self) -> Vec<String> {
-        self.schemas.read().unwrap().keys().cloned().collect()
-    }
-
-    /// Returns all schemas currently in the engine (CompactArc ref-count bump only)
-    pub fn get_all_schemas(&self) -> Vec<crate::common::CompactArc<Schema>> {
-        self.schemas.read().unwrap().values().cloned().collect()
-    }
-
     /// Get a table handle for an existing transaction by txn_id.
     /// This allows FK enforcement to participate in the caller's transaction,
     /// ensuring CASCADE effects are atomic and uncommitted rows are visible.
@@ -4114,77 +4099,6 @@ impl MVCCEngine {
             Some(mgr) => mgr.total_row_count() + hot.saturating_sub(mgr.seal_overlap()),
             None => hot,
         })
-    }
-
-    /// Creates a column in a table
-    pub fn create_column(
-        &self,
-        table_name: &str,
-        column_name: &str,
-        data_type: DataType,
-        nullable: bool,
-    ) -> Result<()> {
-        if !self.is_open() {
-            return Err(Error::EngineNotOpen);
-        }
-
-        let table_name_lower = table_name.to_lowercase();
-        let mut change = self.begin_column_change(table_name)?;
-
-        // Validate under read lock first
-        {
-            let schemas = self.schemas.read().unwrap();
-            let schema_arc = schemas
-                .get(&table_name_lower)
-                .ok_or_else(|| Error::TableNotFound(table_name_lower.to_string()))?;
-            if schema_arc.has_column(column_name) {
-                return Err(Error::DuplicateColumn);
-            }
-            self.check_added_column(
-                &table_name_lower,
-                schema_arc,
-                column_name,
-                data_type,
-                nullable,
-            )?;
-        }
-
-        // Update version store schema first (source of truth) — if this fails,
-        // engine schema is still consistent
-        {
-            let stores = self.version_stores.read().unwrap();
-            if let Some(store) = stores.get(&table_name_lower) {
-                let col = crate::core::SchemaColumn::new(
-                    store.schema().columns.len(),
-                    column_name,
-                    data_type,
-                    nullable,
-                    false,
-                );
-                store.add_column(col)?;
-                store.lay_out_rows();
-            }
-        }
-        change.mark_changed();
-
-        // Sync engine schema cache from version store
-        {
-            let vs_schema = {
-                let stores = self.version_stores.read().unwrap();
-                stores
-                    .get(&table_name_lower)
-                    .map(|store| store.schema().clone())
-            };
-            if let Some(schema) = vs_schema {
-                let mut schemas = self.schemas.write().unwrap();
-                schemas.insert(table_name_lower.clone(), schema);
-                self.ddl.changed_table(&schemas, &table_name_lower);
-            }
-        }
-
-        self.refresh_column_mappings(table_name)?;
-        change.finish();
-        Ok(())
     }
 
     /// Whether the volumes of `table_name` still map once `column_name` is
@@ -5661,13 +5575,6 @@ impl MVCCEngine {
         Ok(views.values().map(|v| v.original_name.clone()).collect())
     }
 
-    /// No-op: in the new tombstone design, deduplication is handled at scan
-    /// time via skip sets. Newer volumes shadow older volumes by row_id.
-    /// Returns 0 (no explicit dedup performed).
-    fn dedup_segments(&self) -> usize {
-        0
-    }
-
     /// Creates a full backup snapshot of all tables to .bin files.
     ///
     /// Writes all committed data (hot buffer + cold volumes) to snapshot .bin files
@@ -6804,28 +6711,9 @@ impl MVCCEngine {
         ))
     }
 
-    /// Checkpoint-to-volume cycle: replaces the old snapshot-based persistence.
-    ///
-    /// Instead of serializing the entire hot buffer to a snapshot .bin file,
-    /// this cycle seals committed hot rows into frozen volumes, re-records all DDL
-    /// to WAL (so recovery can recreate schemas after WAL truncation), persists
-    /// manifests, and optionally truncates the WAL.
-    ///
-    /// Recovery loads manifests + volumes from disk, replays WAL from 0 (skipping
-    /// INSERT entries for rows already in volumes), and rebuilds hot state.
-    ///
-    /// WAL truncation is only safe when ALL committed hot rows have been sealed.
-    /// Otherwise, unsealed rows' INSERT entries must survive in the WAL.
-    fn checkpoint_cycle(&self) -> Result<()> {
-        self.checkpoint_cycle_inner(false)?;
-        // Run compaction synchronously so direct callers (Rust API,
-        // trait users) get the full seal + compact behavior.
-        // The background thread bypasses this by calling
-        // checkpoint_cycle_inner + spawn_compaction directly.
-        self.compact_after_checkpoint_forced()
-    }
-
-    /// Inner checkpoint implementation. When `force` is true, seals ALL hot rows
+    /// Checkpoint-to-volume cycle: seals committed hot rows into frozen
+    /// volumes, re-records all DDL to WAL, persists manifests, and optionally
+    /// truncates the WAL. When `force` is true, seals ALL hot rows
     /// regardless of threshold (used by PRAGMA CHECKPOINT and close_engine).
     /// When false, respects the normal seal thresholds (used by background thread).
     fn checkpoint_cycle_inner(&self, force: bool) -> Result<()> {
@@ -9099,14 +8987,6 @@ impl MVCCEngine {
 }
 
 impl Engine for MVCCEngine {
-    fn open(&mut self) -> Result<()> {
-        MVCCEngine::open_engine(self)
-    }
-
-    fn close(&mut self) -> Result<()> {
-        MVCCEngine::close_engine(self)
-    }
-
     fn begin_transaction(&self) -> Result<Box<dyn Transaction>> {
         self.begin_transaction_with_level(self.get_isolation_level())
     }
@@ -9138,14 +9018,6 @@ impl Engine for MVCCEngine {
         Ok(Box::new(txn))
     }
 
-    fn path(&self) -> Option<&str> {
-        if self.path == "memory://" {
-            None
-        } else {
-            Some(&self.path)
-        }
-    }
-
     fn table_exists(&self, table_name: &str) -> Result<bool> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
@@ -9154,36 +9026,6 @@ impl Engine for MVCCEngine {
         let name = to_lowercase_cow(table_name);
         let schemas = self.schemas.read().unwrap();
         Ok(schemas.contains_key(name.as_ref()))
-    }
-
-    fn index_exists(&self, index_name: &str, table_name: &str) -> Result<bool> {
-        if !self.is_open() {
-            return Err(Error::EngineNotOpen);
-        }
-
-        let store = self.get_version_store(table_name)?;
-        Ok(store.index_exists(index_name))
-    }
-
-    fn get_index(&self, table_name: &str, index_name: &str) -> Result<Box<dyn Index>> {
-        if !self.is_open() {
-            return Err(Error::EngineNotOpen);
-        }
-
-        let store = self.get_version_store(table_name)?;
-        if store.index_exists(index_name) {
-            // Index exists but we can't clone Arc<dyn Index> into Box<dyn Index>
-            // This will be properly implemented in Phase 6.6
-            return Err(Error::internal(format!(
-                "index retrieval not yet implemented: {}.{}",
-                table_name, index_name
-            )));
-        }
-
-        Err(Error::internal(format!(
-            "index not found: {}.{}",
-            table_name, index_name
-        )))
     }
 
     fn get_table_schema(&self, table_name: &str) -> Result<CompactArc<Schema>> {
@@ -9234,31 +9076,6 @@ impl Engine for MVCCEngine {
 
     fn get_isolation_level(&self) -> IsolationLevel {
         self.registry.get_global_isolation_level()
-    }
-
-    fn set_isolation_level(&mut self, level: IsolationLevel) -> Result<()> {
-        if !self.is_open() {
-            return Err(Error::EngineNotOpen);
-        }
-
-        self.registry.set_global_isolation_level(level);
-        Ok(())
-    }
-
-    fn get_config(&self) -> Config {
-        self.config.read().expect("config lock poisoned").clone()
-    }
-
-    fn update_config(&mut self, config: Config) -> Result<()> {
-        self.update_engine_config(config)
-    }
-
-    fn dedup_segments(&self) -> usize {
-        MVCCEngine::dedup_segments(self)
-    }
-
-    fn checkpoint_cycle(&self) -> Result<()> {
-        MVCCEngine::checkpoint_cycle(self)
     }
 
     fn force_checkpoint_cycle(&self) -> Result<()> {
@@ -10065,12 +9882,6 @@ impl MVCCEngine {
         total_cleaned
     }
 
-    /// No-op: in the new tombstone design, cold deletes are not tracked
-    /// per-transaction. Kept for API compatibility.
-    pub fn cleanup_abandoned_cold_deletes(&self) {
-        // Intentionally empty.
-    }
-
     /// Manual VACUUM: cleanup deleted rows, old versions, and stale transactions.
     ///
     /// Get the oldest snapshot timestamp that was loaded during startup.
@@ -10116,49 +9927,6 @@ impl MVCCEngine {
         drop(stores);
 
         Ok((rows_cleaned, versions_cleaned, txn_cleaned))
-    }
-
-    /// Start periodic cleanup of old transactions and deleted rows
-    ///
-    /// Returns a handle that can be used to stop the cleanup thread.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn start_periodic_cleanup(
-        self: &Arc<Self>,
-        interval: std::time::Duration,
-        max_age: std::time::Duration,
-    ) -> CleanupHandle {
-        use std::sync::atomic::AtomicBool;
-        use std::thread;
-
-        let stop_flag = Arc::new(AtomicBool::new(false));
-        let stop_flag_clone = Arc::clone(&stop_flag);
-        let engine = Arc::clone(self);
-
-        let handle = thread::spawn(move || {
-            while !stop_flag_clone.load(Ordering::Acquire) {
-                // Sleep for the interval (check stop flag periodically)
-                let check_interval = std::time::Duration::from_millis(100);
-                let mut elapsed = std::time::Duration::ZERO;
-                while elapsed < interval && !stop_flag_clone.load(Ordering::Acquire) {
-                    thread::sleep(check_interval);
-                    elapsed += check_interval;
-                }
-
-                if stop_flag_clone.load(Ordering::Acquire) {
-                    break;
-                }
-
-                // Perform cleanup
-                let _txn_count = engine.cleanup_old_transactions(max_age);
-                let _row_count = engine.cleanup_deleted_rows(max_age);
-                let _prev_version_count = engine.cleanup_old_previous_versions();
-            }
-        });
-
-        CleanupHandle {
-            stop_flag,
-            thread: Some(handle),
-        }
     }
 }
 
@@ -11107,45 +10875,6 @@ impl TransactionEngineOperations for EngineOperations {
         Ok(())
     }
 
-    fn commit_table(&self, txn_id: i64, table: &dyn Table) -> Result<()> {
-        // Skip WAL writes during recovery replay
-        if self.should_skip_wal() {
-            return Ok(());
-        }
-
-        // Record DML operations to WAL before the table commits
-        if let Some(ref pm) = self.persistence() {
-            if pm.is_enabled() {
-                let table_name = table.name();
-                let pending = table.get_pending_versions();
-
-                for (row_id, row_data, is_deleted, version_txn_id) in pending {
-                    // Create a RowVersion for serialization
-                    let version = RowVersion {
-                        txn_id: version_txn_id,
-                        deleted_at_txn_id: if is_deleted { version_txn_id } else { 0 },
-                        data: row_data,
-                        create_time: 0, // Not needed for persistence
-                    };
-
-                    // Determine operation type
-                    let op = if is_deleted {
-                        WALOperationType::Delete
-                    } else {
-                        // Check if this is an update vs insert by looking at global store
-                        // For simplicity, we record everything as Insert
-                        // (at replay time, the version store handles deduplication)
-                        WALOperationType::Insert
-                    };
-
-                    pm.record_dml_operation(txn_id, table_name, row_id, op, &version)?;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     fn rollback_table(&self, _txn_id: i64, table: &dyn Table) {
         // The Table trait now has a rollback method.
         // This callback is for any engine-level rollback actions.
@@ -11587,22 +11316,6 @@ impl TransactionEngineOperations for EngineOperations {
         }
     }
 
-    fn change_column_type(&self, change: &ColumnTypeChange<'_>) -> Result<()> {
-        let _ddl = self.ddl.guard();
-        retype::change_column_type(
-            &retype::Shared {
-                version_stores: &self.version_stores,
-                segment_managers: &self.segment_managers,
-                persistence: &self.persistence,
-                registry: &self.registry,
-                schemas: &self.schemas,
-                ddl: &self.ddl,
-                replaying: self.loading_from_disk.load(Ordering::Acquire),
-            },
-            change,
-        )
-    }
-
     fn rollback_dml_after(&self, txn_id: i64, timestamp: i64) {
         let cache = self.txn_version_stores().read().unwrap();
         let touched: smallvec::SmallVec<[(crate::common::SmartString, Arc<TxnTableStore>); 4]> =
@@ -11645,6 +11358,22 @@ impl TransactionEngineOperations for EngineOperations {
         for (_, store) in cache.get(txn_id).into_iter().flatten() {
             store.write_store().track_keys();
         }
+    }
+
+    fn change_column_type(&self, change: &ColumnTypeChange<'_>) -> Result<()> {
+        let _ddl = self.ddl.guard();
+        retype::change_column_type(
+            &retype::Shared {
+                version_stores: &self.version_stores,
+                segment_managers: &self.segment_managers,
+                persistence: &self.persistence,
+                registry: &self.registry,
+                schemas: &self.schemas,
+                ddl: &self.ddl,
+                replaying: self.loading_from_disk.load(Ordering::Acquire),
+            },
+            change,
+        )
     }
 
     fn check_statement_keys(&self, txn_id: i64) -> Result<()> {
@@ -12467,7 +12196,6 @@ mod tests {
     fn test_engine_creation() {
         let engine = MVCCEngine::in_memory();
         assert!(!engine.is_open());
-        assert_eq!(engine.get_path(), "memory://");
     }
 
     #[test]
@@ -12526,14 +12254,14 @@ mod tests {
             .build();
         engine.create_table(schema).unwrap();
         engine
-            .create_column("t", "v", DataType::Integer, true)
+            .create_column_with_default("t", "v", DataType::Integer, true, (None, None), 0)
             .unwrap();
         assert!(engine.segment_managers.read().unwrap().is_empty());
 
         let mgr = engine.get_or_create_segment_manager("t");
         let before = mgr.schema_generation();
         engine
-            .create_column("t", "w", DataType::Integer, true)
+            .create_column_with_default("t", "w", DataType::Integer, true, (None, None), 0)
             .unwrap();
         assert_eq!(mgr.schema_generation(), before + 2);
         engine.close_engine().unwrap();
@@ -12635,8 +12363,8 @@ mod tests {
 
     #[test]
     fn test_engine_begin_transaction() {
-        let mut engine = MVCCEngine::in_memory();
-        engine.open().unwrap();
+        let engine = MVCCEngine::in_memory();
+        engine.open_engine().unwrap();
 
         let txn = engine.begin_transaction();
         assert!(txn.is_ok());
@@ -12645,13 +12373,13 @@ mod tests {
         assert!(txn.id() > 0);
 
         txn.rollback().unwrap();
-        engine.close().unwrap();
+        engine.close_engine().unwrap();
     }
 
     #[test]
     fn test_engine_transaction_create_table() {
-        let mut engine = MVCCEngine::in_memory();
-        engine.open().unwrap();
+        let engine = MVCCEngine::in_memory();
+        engine.open_engine().unwrap();
 
         let mut txn = engine.begin_transaction().unwrap();
 
@@ -12661,17 +12389,19 @@ mod tests {
             .column("value", DataType::Text, true, false)
             .build();
 
-        let table = txn.create_table("txn_table", schema).unwrap();
+        let table = txn
+            .create_table_with_indexes("txn_table", schema, &[])
+            .unwrap();
         assert_eq!(table.name(), "txn_table");
 
         txn.commit().unwrap();
-        engine.close().unwrap();
+        engine.close_engine().unwrap();
     }
 
     #[test]
     fn test_engine_transaction_insert_and_select() {
-        let mut engine = MVCCEngine::in_memory();
-        engine.open().unwrap();
+        let engine = MVCCEngine::in_memory();
+        engine.open_engine().unwrap();
 
         // Create table
         let schema = SchemaBuilder::new("data")
@@ -12709,27 +12439,18 @@ mod tests {
         assert_eq!(count, 2);
 
         txn.commit().unwrap();
-        engine.close().unwrap();
+        engine.close_engine().unwrap();
     }
 
     #[test]
     fn test_engine_isolation_level() {
-        let mut engine = MVCCEngine::in_memory();
-        engine.open().unwrap();
+        let engine = MVCCEngine::in_memory();
+        engine.open_engine().unwrap();
 
         // Default should be ReadCommitted
         assert_eq!(engine.get_isolation_level(), IsolationLevel::ReadCommitted);
 
-        // Set to Snapshot
-        engine
-            .set_isolation_level(IsolationLevel::SnapshotIsolation)
-            .unwrap();
-        assert_eq!(
-            engine.get_isolation_level(),
-            IsolationLevel::SnapshotIsolation
-        );
-
-        engine.close().unwrap();
+        engine.close_engine().unwrap();
     }
 
     #[test]
@@ -12753,8 +12474,8 @@ mod tests {
 
     #[test]
     fn test_engine_get_table_schema() {
-        let mut engine = MVCCEngine::in_memory();
-        engine.open().unwrap();
+        let engine = MVCCEngine::in_memory();
+        engine.open_engine().unwrap();
 
         let schema = SchemaBuilder::new("test_schema")
             .column("id", DataType::Integer, false, true)
@@ -12769,13 +12490,13 @@ mod tests {
         // Non-existent table
         assert!(engine.get_table_schema("nonexistent").is_err());
 
-        engine.close().unwrap();
+        engine.close_engine().unwrap();
     }
 
     #[test]
     fn test_engine_transaction_with_isolation_level() {
-        let mut engine = MVCCEngine::in_memory();
-        engine.open().unwrap();
+        let engine = MVCCEngine::in_memory();
+        engine.open_engine().unwrap();
 
         let txn = engine.begin_transaction_with_level(IsolationLevel::SnapshotIsolation);
         assert!(txn.is_ok());
@@ -12783,28 +12504,18 @@ mod tests {
         let mut txn = txn.unwrap();
         txn.rollback().unwrap();
 
-        engine.close().unwrap();
-    }
-
-    #[test]
-    fn test_engine_path() {
-        let engine = MVCCEngine::in_memory();
-        assert!(engine.path().is_none());
-
-        let config = Config::with_path("/tmp/test.db");
-        let engine = MVCCEngine::new(config);
-        assert_eq!(engine.path(), Some("/tmp/test.db"));
+        engine.close_engine().unwrap();
     }
 
     #[test]
     fn test_engine_create_snapshot() {
-        let mut engine = MVCCEngine::in_memory();
-        engine.open().unwrap();
+        let engine = MVCCEngine::in_memory();
+        engine.open_engine().unwrap();
 
         // Should succeed (no-op for now)
         assert!(engine.create_snapshot().is_ok());
 
-        engine.close().unwrap();
+        engine.close_engine().unwrap();
     }
 
     #[test]
@@ -12863,7 +12574,7 @@ mod tests {
         }
 
         // Checkpoint cycle: seals hot rows into frozen volumes and persists manifests.
-        engine.checkpoint_cycle().unwrap();
+        engine.force_checkpoint_cycle().unwrap();
         let vol_dir = db_path.join("volumes");
         assert!(
             !crate::storage::volume::io::list_volumes(&vol_dir, "items").is_empty(),
@@ -12914,7 +12625,9 @@ mod tests {
 
         let tx = engine.begin_transaction().unwrap();
         let table = tx.get_table("items").unwrap();
-        table.create_btree_index("age", false, None).unwrap();
+        table
+            .create_index("idx_items_age", &["age"], false)
+            .unwrap();
 
         // Hot index should be empty (no hot rows)
         let index = table
@@ -13066,8 +12779,8 @@ mod tests {
 
     #[test]
     fn test_engine_list_table_indexes() {
-        let mut engine = MVCCEngine::in_memory();
-        engine.open().unwrap();
+        let engine = MVCCEngine::in_memory();
+        engine.open_engine().unwrap();
 
         let schema = SchemaBuilder::new("indexed")
             .column("id", DataType::Integer, false, true)
@@ -13078,7 +12791,7 @@ mod tests {
         let indexes = engine.list_table_indexes("indexed").unwrap();
         assert!(indexes.is_empty());
 
-        engine.close().unwrap();
+        engine.close_engine().unwrap();
     }
 
     #[test]

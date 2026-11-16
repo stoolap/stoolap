@@ -15,8 +15,6 @@
 //! Transaction trait for database transactions
 //!
 
-use rustc_hash::FxHashMap;
-
 use crate::core::{IsolationLevel, Result, RowVec, Schema, SchemaColumn};
 use crate::storage::expression::Expression;
 use crate::storage::mvcc::commit_log::ReadPoint;
@@ -42,10 +40,6 @@ pub struct NewIndex {
 /// ```ignore
 /// let tx = engine.begin_transaction()?;
 ///
-/// // Create a table
-/// let schema = Schema::new("users").with_column("id", DataType::Integer, false);
-/// tx.create_table("users", schema)?;
-///
 /// // Insert data
 /// let table = tx.get_table("users")?;
 /// table.insert(Row::from_values(vec![Value::Integer(1)]))?;
@@ -56,9 +50,6 @@ pub struct NewIndex {
 /// tx.commit()?;
 /// ```
 pub trait Transaction: Send {
-    /// Begins the transaction
-    fn begin(&mut self) -> Result<()>;
-
     /// Commits the transaction
     fn commit(&mut self) -> Result<()>;
 
@@ -80,11 +71,6 @@ pub trait Transaction: Send {
     ///
     /// The savepoint itself is also removed after rollback.
     fn rollback_to_savepoint(&mut self, name: &str) -> Result<()>;
-
-    /// Gets the timestamp associated with a savepoint
-    ///
-    /// Returns None if the savepoint doesn't exist.
-    fn get_savepoint_timestamp(&self, name: &str) -> Option<i64>;
 
     /// Returns the transaction ID
     fn id(&self) -> i64;
@@ -178,44 +164,6 @@ pub trait Transaction: Send {
     /// Renames a table
     fn rename_table(&mut self, old_name: &str, new_name: &str) -> Result<()>;
 
-    // ---- Index Operations ----
-
-    /// Creates an index on a table
-    ///
-    /// # Arguments
-    /// * `table_name` - Name of the table
-    /// * `index_name` - Name for the new index
-    /// * `columns` - Column names to include in the index
-    /// * `is_unique` - Whether this is a unique index
-    fn create_table_index(
-        &mut self,
-        table_name: &str,
-        index_name: &str,
-        columns: &[String],
-        is_unique: bool,
-    ) -> Result<()>;
-
-    /// Drops an index from a table
-    fn drop_table_index(&mut self, table_name: &str, index_name: &str) -> Result<()>;
-
-    /// Creates a btree index on a table column
-    ///
-    /// # Arguments
-    /// * `table_name` - Name of the table
-    /// * `column_name` - Name of the column to index
-    /// * `is_unique` - Whether this is a unique index
-    /// * `custom_name` - Optional custom name for the index
-    fn create_table_btree_index(
-        &mut self,
-        table_name: &str,
-        column_name: &str,
-        is_unique: bool,
-        custom_name: Option<&str>,
-    ) -> Result<()>;
-
-    /// Drops a btree index from a table
-    fn drop_table_btree_index(&mut self, table_name: &str, column_name: &str) -> Result<()>;
-
     // ---- Column Operations (ALTER TABLE) ----
 
     /// Adds a column to a table
@@ -249,23 +197,6 @@ pub trait Transaction: Send {
         table_name: &str,
         columns_to_fetch: &[String],
         expr: Option<&dyn Expression>,
-        original_columns: Option<&[String]>,
-    ) -> Result<Box<dyn QueryResult>>;
-
-    /// Executes a SELECT query with column aliases
-    ///
-    /// # Arguments
-    /// * `table_name` - Name of the table to query
-    /// * `columns_to_fetch` - Column names to include in the result
-    /// * `expr` - Optional filter expression
-    /// * `aliases` - Map from alias names to original column names
-    /// * `original_columns` - Optional original column names
-    fn select_with_aliases(
-        &self,
-        table_name: &str,
-        columns_to_fetch: &[String],
-        expr: Option<&dyn Expression>,
-        aliases: &FxHashMap<String, String>,
         original_columns: Option<&[String]>,
     ) -> Result<Box<dyn QueryResult>>;
 

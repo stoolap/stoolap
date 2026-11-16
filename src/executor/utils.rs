@@ -2131,20 +2131,6 @@ pub fn extract_join_keys_and_residual_keeping(
     (left_indices, right_indices, residual)
 }
 
-/// Whether a join key pair can meet, in any rows, as a TEXT the comparison
-/// reads as the other side's type, which no key equality follows, so the
-/// pair cannot be a key.
-pub fn crossing_key_pair(
-    left_rows: &[Row],
-    left_idx: usize,
-    right_rows: &[Row],
-    right_idx: usize,
-) -> bool {
-    let left = key_kinds(left_rows, left_idx);
-    left & (kind::TEXT | kind::READ_FROM_TEXT) != 0
-        && kind::crosses(left, key_kinds(right_rows, right_idx))
-}
-
 /// The kinds a key column holds: by the schema of a side that reads a base
 /// table, else by its rows
 pub fn column_kinds(rows: &[Row], columns: &[String], schema: Option<&Schema>, idx: usize) -> u8 {

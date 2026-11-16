@@ -240,14 +240,6 @@ impl ColumnZoneMap {
                 .iter()
                 .any(|entry| !entry.can_prune(operator, value))
     }
-
-    /// Count how many segments can be pruned
-    pub fn count_pruned_segments(&self, operator: Operator, value: &Value) -> usize {
-        self.segments
-            .iter()
-            .filter(|entry| entry.can_prune(operator, value))
-            .count()
-    }
 }
 
 /// Zone map for an entire table
@@ -296,24 +288,6 @@ impl TableZoneMap {
         }
     }
 
-    /// Get pruned segment count for a single-column predicate
-    pub fn get_prune_stats(
-        &self,
-        column: &str,
-        operator: Operator,
-        value: &Value,
-    ) -> Option<PruneStats> {
-        let col_map = self.columns.get(column)?;
-        let total = col_map.segments.len();
-        let pruned = col_map.count_pruned_segments(operator, value);
-
-        Some(PruneStats {
-            total_segments: total,
-            pruned_segments: pruned,
-            scanned_segments: total - pruned,
-        })
-    }
-
     /// Get segments to scan for a single-column predicate
     pub fn get_segments_to_scan(
         &self,
@@ -329,32 +303,6 @@ impl TableZoneMap {
     /// None when the column has no zone map
     pub fn may_match(&self, column: &str, operator: Operator, value: &Value) -> Option<bool> {
         Some(self.columns.get(column)?.may_match(operator, value))
-    }
-}
-
-/// Statistics about segment pruning
-#[derive(Debug, Clone)]
-pub struct PruneStats {
-    /// Total number of segments
-    pub total_segments: usize,
-    /// Number of pruned segments
-    pub pruned_segments: usize,
-    /// Number of segments that need scanning
-    pub scanned_segments: usize,
-}
-
-impl std::fmt::Display for PruneStats {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let pct = if self.total_segments > 0 {
-            (self.pruned_segments as f64 / self.total_segments as f64) * 100.0
-        } else {
-            0.0
-        };
-        write!(
-            f,
-            "{}/{} segments scanned ({:.0}% pruned)",
-            self.scanned_segments, self.total_segments, pct
-        )
     }
 }
 
@@ -535,14 +483,6 @@ mod tests {
         }
 
         assert_eq!(table_map.segment_count, 3);
-
-        // Check prune stats
-        let stats = table_map
-            .get_prune_stats("id", Operator::Gt, &Value::Integer(25))
-            .unwrap();
-        assert_eq!(stats.total_segments, 3);
-        assert_eq!(stats.pruned_segments, 2);
-        assert_eq!(stats.scanned_segments, 1);
     }
 
     #[test]

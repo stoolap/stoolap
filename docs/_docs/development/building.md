@@ -58,7 +58,6 @@ Stoolap uses Cargo features to enable optional functionality. The default featur
 |---------|-------------|
 | `stress-tests` | Enable stress tests: crash soak, metamorphic, concurrency |
 | `test-failpoints` | Enable I/O fault injection testing |
-| `dhat-heap` | Enable heap allocation profiling via dhat |
 | `ann-benchmark` | Enable ANN (vector search) benchmarks with dataset downloading |
 
 The SQLite and DuckDB comparisons (benchmarks and the differential oracle) are a separate, unpublished crate, `stoolap-compare` in `compare/`, so `--all-features` on the library never builds either database. See `BENCHMARKS.md` for its commands.

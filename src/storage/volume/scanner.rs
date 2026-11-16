@@ -633,13 +633,6 @@ impl VolumeScanner {
         Ok(s)
     }
 
-    /// Set per-transaction pending cold deletes. The owning transaction
-    /// sees these row_ids as deleted even though the shared DV hasn't
-    /// been updated yet (deferred to commit).
-    pub fn set_pending_cold_deletes(&mut self, pending: Arc<rustc_hash::FxHashSet<i64>>) {
-        self.pending_cold_deletes = Some(pending);
-    }
-
     /// Set both committed tombstones (shared Arc, no clone) and dynamic
     /// skip set (hot row_ids + pending tombstones + per-volume dedup IDs).
     /// This avoids cloning the potentially large committed tombstone set.

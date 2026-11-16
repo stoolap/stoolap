@@ -18,7 +18,7 @@
 use crate::core::{Error, Result};
 
 /// Writes the live heap profile to `path`; returns its size in bytes
-#[cfg(all(feature = "heap-profile", not(feature = "dhat-heap")))]
+#[cfg(feature = "heap-profile")]
 pub(crate) fn write_heap_profile(path: &str) -> Result<usize> {
     use std::io::Write;
 
@@ -34,7 +34,7 @@ pub(crate) fn write_heap_profile(path: &str) -> Result<usize> {
     Ok(gzipped.len())
 }
 
-#[cfg(not(all(feature = "heap-profile", not(feature = "dhat-heap"))))]
+#[cfg(not(feature = "heap-profile"))]
 pub(crate) fn write_heap_profile(_path: &str) -> Result<usize> {
     Err(Error::internal(
         "heap profiles need a build with the heap-profile feature",

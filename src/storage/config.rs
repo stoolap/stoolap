@@ -195,63 +195,6 @@ impl PersistenceConfig {
             hot_max_bytes: 0,
         }
     }
-
-    /// Builder method to set sync mode
-    pub fn with_sync_mode(mut self, mode: SyncMode) -> Self {
-        self.sync_mode = mode;
-        self
-    }
-
-    /// Builder method to set checkpoint interval.
-    /// A value of 0 disables periodic checkpoints (data stays in hot buffer).
-    /// Non-zero values are clamped to a minimum of 5 seconds.
-    pub fn with_checkpoint_interval(mut self, seconds: u32) -> Self {
-        self.checkpoint_interval = if seconds == 0 { 0 } else { seconds.max(5) };
-        self
-    }
-
-    /// Builder method to set compaction threshold (number of segments)
-    pub fn with_compact_threshold(mut self, count: u32) -> Self {
-        self.compact_threshold = count;
-        self
-    }
-
-    /// Builder method to enable/disable WAL compression
-    pub fn with_wal_compression(mut self, enabled: bool) -> Self {
-        self.wal_compression = enabled;
-        self
-    }
-
-    /// Builder method to enable/disable volume LZ4 compression
-    pub fn with_volume_compression(mut self, enabled: bool) -> Self {
-        self.volume_compression = enabled;
-        self
-    }
-
-    /// Builder method to enable/disable all compression (WAL + volume)
-    pub fn with_compression(mut self, enabled: bool) -> Self {
-        self.wal_compression = enabled;
-        self.volume_compression = enabled;
-        self
-    }
-
-    /// Builder method to set compression threshold
-    pub fn with_compression_threshold(mut self, bytes: usize) -> Self {
-        self.compression_threshold = bytes;
-        self
-    }
-
-    /// Builder method to set keep count for backup snapshots
-    pub fn with_keep_snapshots(mut self, count: u32) -> Self {
-        self.keep_snapshots = count;
-        self
-    }
-
-    /// Builder method to set target rows per volume (minimum: 65,536 = one row group)
-    pub fn with_target_volume_rows(mut self, rows: usize) -> Self {
-        self.target_volume_rows = rows.max(65_536);
-        self
-    }
 }
 
 /// Configuration for background cleanup operations
@@ -297,18 +240,21 @@ impl CleanupConfig {
     }
 
     /// Builder method to set cleanup interval
+    #[cfg(test)]
     pub fn with_interval_secs(mut self, secs: u64) -> Self {
         self.interval_secs = secs;
         self
     }
 
     /// Builder method to set deleted row retention
+    #[cfg(test)]
     pub fn with_deleted_row_retention_secs(mut self, secs: u64) -> Self {
         self.deleted_row_retention_secs = secs;
         self
     }
 
     /// Builder method to set transaction retention
+    #[cfg(test)]
     pub fn with_transaction_retention_secs(mut self, secs: u64) -> Self {
         self.transaction_retention_secs = secs;
         self
@@ -352,18 +298,8 @@ impl Config {
         }
     }
 
-    /// Returns true if persistence is enabled
-    pub fn is_persistent(&self) -> bool {
-        self.path.is_some() && self.persistence.enabled
-    }
-
-    /// Builder method to set persistence config
-    pub fn with_persistence(mut self, config: PersistenceConfig) -> Self {
-        self.persistence = config;
-        self
-    }
-
     /// Builder method to set cleanup config
+    #[cfg(test)]
     pub fn with_cleanup(mut self, config: CleanupConfig) -> Self {
         self.cleanup = config;
         self
@@ -420,44 +356,10 @@ mod tests {
     }
 
     #[test]
-    fn test_persistence_config_builder() {
-        let config = PersistenceConfig::new()
-            .with_sync_mode(SyncMode::Full)
-            .with_checkpoint_interval(120)
-            .with_compact_threshold(8);
-
-        assert_eq!(config.sync_mode, SyncMode::Full);
-        assert_eq!(config.checkpoint_interval, 120);
-        assert_eq!(config.compact_threshold, 8);
-    }
-
-    #[test]
-    fn test_persistence_config_compression() {
-        // Test disabling all compression
-        let config = PersistenceConfig::new().with_compression(false);
-        assert!(!config.wal_compression);
-        assert!(!config.volume_compression);
-
-        // Test individual compression settings
-        let config = PersistenceConfig::new().with_wal_compression(false);
-        assert!(!config.wal_compression);
-        assert!(config.volume_compression); // volume unaffected
-
-        let config = PersistenceConfig::new().with_volume_compression(false);
-        assert!(config.wal_compression); // WAL unaffected
-        assert!(!config.volume_compression);
-
-        // Test compression threshold
-        let config = PersistenceConfig::new().with_compression_threshold(128);
-        assert_eq!(config.compression_threshold, 128);
-    }
-
-    #[test]
     fn test_config_in_memory() {
         let config = Config::in_memory();
         assert!(config.path.is_none());
         assert!(!config.persistence.enabled);
-        assert!(!config.is_persistent());
     }
 
     #[test]
@@ -465,15 +367,5 @@ mod tests {
         let config = Config::with_path("/tmp/test.db");
         assert_eq!(config.path, Some("/tmp/test.db".to_string()));
         assert!(config.persistence.enabled);
-        assert!(config.is_persistent());
-    }
-
-    #[test]
-    fn test_config_builder() {
-        let config =
-            Config::with_path("/tmp/test.db").with_persistence(PersistenceConfig::durable());
-
-        assert!(config.is_persistent());
-        assert_eq!(config.persistence.sync_mode, SyncMode::Full);
     }
 }

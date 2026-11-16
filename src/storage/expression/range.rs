@@ -131,21 +131,6 @@ impl RangeExpr {
         Self::new(column, min_value, max_value, false, false)
     }
 
-    /// Create a half-open range (>= min AND < max)
-    pub fn half_open(column: impl Into<String>, min_value: Value, max_value: Value) -> Self {
-        Self::new(column, min_value, max_value, true, false)
-    }
-
-    /// Get whether min is included
-    pub fn includes_min(&self) -> bool {
-        self.include_min
-    }
-
-    /// Get whether max is included
-    pub fn includes_max(&self) -> bool {
-        self.include_max
-    }
-
     /// Pre-compute type-specific bounds for faster evaluation
     fn compute_typed_bounds(&mut self) {
         // Process minimum bound
@@ -547,7 +532,7 @@ mod tests {
         let schema = test_schema();
 
         // >= 1 AND < 10 (half-open)
-        let mut expr = RangeExpr::half_open("id", Value::integer(1), Value::integer(10));
+        let mut expr = RangeExpr::new("id", Value::integer(1), Value::integer(10), true, false);
         expr.prepare_for_schema(&schema);
 
         // On lower boundary (should pass)
@@ -679,8 +664,8 @@ mod tests {
         expr.prepare_for_schema(&schema);
 
         assert!(expr.evaluate(&row).unwrap());
-        assert!(!expr.includes_min());
-        assert!(expr.includes_max());
+        assert!(!expr.include_min);
+        assert!(expr.include_max);
     }
 
     #[test]

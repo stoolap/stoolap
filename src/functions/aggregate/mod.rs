@@ -118,15 +118,6 @@ impl DistinctTracker {
         self.seen.len() > before
     }
 
-    /// Check if a value has been seen before, with null handling (returns true if new)
-    #[inline]
-    pub fn check_and_add_with_null_check(&mut self, value: &Value) -> bool {
-        if value.is_null() {
-            return false;
-        }
-        self.check_and_add(value)
-    }
-
     /// Whether `value` with the later arguments `args` of its row is the
     /// first such row; NULLs are equal here, as DISTINCT reads them
     pub fn check_and_add_row(&mut self, value: &Value, args: &[Value]) -> bool {
@@ -271,15 +262,5 @@ mod tests {
 
         tracker.reset();
         assert_eq!(tracker.count(), 0);
-    }
-
-    #[test]
-    fn test_null_handling() {
-        let mut tracker = DistinctTracker::default();
-
-        // Using the with_null_check variant for null handling
-        assert!(!tracker.check_and_add_with_null_check(&Value::null_unknown())); // NULL returns false
-        assert!(!tracker.check_and_add_with_null_check(&Value::null_unknown())); // NULL again
-        assert_eq!(tracker.count(), 0); // NULLs not counted
     }
 }

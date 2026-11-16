@@ -61,47 +61,6 @@ mod integration_tests {
     use super::*;
     use chrono::Datelike;
 
-    /// Integration test: Create a schema, build rows, validate
-    #[test]
-    fn test_schema_row_integration() {
-        // Create a schema
-        let schema = SchemaBuilder::new("users")
-            .add_primary_key("id", DataType::Integer)
-            .add("name", DataType::Text)
-            .add_nullable("email", DataType::Text)
-            .add("active", DataType::Boolean)
-            .build();
-
-        // Create a valid row
-        let row = Row::from_values(vec![
-            Value::integer(1),
-            Value::text("Alice"),
-            Value::text("alice@example.com"),
-            Value::boolean(true),
-        ]);
-
-        // Validate the row
-        assert!(row.validate(&schema).is_ok());
-
-        // Create a row with NULL in nullable column
-        let row = Row::from_values(vec![
-            Value::integer(2),
-            Value::text("Bob"),
-            Value::null(DataType::Text),
-            Value::boolean(false),
-        ]);
-        assert!(row.validate(&schema).is_ok());
-
-        // Create a row with NULL in non-nullable column (should fail)
-        let row = Row::from_values(vec![
-            Value::integer(3),
-            Value::null(DataType::Text), // name is not nullable
-            Value::null(DataType::Text),
-            Value::boolean(true),
-        ]);
-        assert!(row.validate(&schema).is_err());
-    }
-
     /// Integration test: Value comparisons across types
     #[test]
     fn test_value_comparison_integration() {
@@ -205,9 +164,15 @@ mod integration_tests {
 
         // Add column
         schema
-            .add_column(SchemaColumn::nullable(2, "description", DataType::Text))
+            .add_column(SchemaColumn::new(
+                2,
+                "description",
+                DataType::Text,
+                true,
+                false,
+            ))
             .unwrap();
-        assert_eq!(schema.column_count(), 3);
+        assert_eq!(schema.columns.len(), 3);
 
         // Rename column
         schema.rename_column("name", "product_name").unwrap();
@@ -222,7 +187,7 @@ mod integration_tests {
 
         // Remove column
         schema.remove_column("description").unwrap();
-        assert_eq!(schema.column_count(), 2);
+        assert_eq!(schema.columns.len(), 2);
     }
 
     /// Integration test: Row creation

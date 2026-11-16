@@ -169,28 +169,6 @@ pub fn l2_distance(a: &[f32], b: &[f32]) -> f64 {
     sum.sqrt()
 }
 
-/// Cosine distance (1 - cosine_similarity)
-#[inline]
-pub fn cosine_distance(a: &[f32], b: &[f32]) -> f64 {
-    debug_assert_eq!(a.len(), b.len());
-    let mut dot = 0.0f64;
-    let mut norm_a = 0.0f64;
-    let mut norm_b = 0.0f64;
-    for i in 0..a.len() {
-        let ai = a[i] as f64;
-        let bi = b[i] as f64;
-        dot += ai * bi;
-        norm_a += ai * ai;
-        norm_b += bi * bi;
-    }
-    let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom == 0.0 {
-        1.0 // Zero vector: maximum dissimilarity (consistent with HNSW)
-    } else {
-        (1.0 - (dot / denom)).max(0.0)
-    }
-}
-
 // ============================================================================
 // SQL scalar functions
 // ============================================================================
@@ -517,21 +495,6 @@ mod tests {
         let db = extract_vector_bytes(&b, &mut bb).unwrap();
         let dist = l2_distance_bytes(da, db);
         assert!((dist - std::f64::consts::SQRT_2).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_cosine_distance_orthogonal() {
-        let a = vec![1.0f32, 0.0];
-        let b = vec![0.0f32, 1.0];
-        let dist = cosine_distance(&a, &b);
-        assert!((dist - 1.0).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_cosine_distance_same() {
-        let a = vec![1.0f32, 2.0, 3.0];
-        let dist = cosine_distance(&a, &a);
-        assert!(dist.abs() < 1e-10);
     }
 
     #[test]

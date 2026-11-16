@@ -1518,8 +1518,8 @@ mod registered_volatile {
 
     /// Calls of `function` in one run that finds the third of five inner rows
     fn calls_per_run(function: &str) -> usize {
-        let mut engine = MVCCEngine::in_memory();
-        stoolap::storage::traits::Engine::open(&mut engine).unwrap();
+        let engine = MVCCEngine::in_memory();
+        engine.open_engine().unwrap();
         let executor = Executor::new(Arc::new(engine));
         for sql in [
             "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)",

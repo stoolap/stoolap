@@ -23,7 +23,7 @@
 use std::fs::{self, File, OpenOptions};
 #[cfg(not(target_os = "wasi"))]
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::core::{Error, Result};
 
@@ -35,8 +35,6 @@ pub struct FileLock {
     /// The lock file handle (kept open to maintain the lock)
     #[allow(dead_code)]
     file: File,
-    /// Path to the lock file
-    path: PathBuf,
 }
 
 impl FileLock {
@@ -95,15 +93,7 @@ impl FileLock {
             file.sync_all().ok();
         }
 
-        Ok(Self {
-            file,
-            path: lock_file_path,
-        })
-    }
-
-    /// Get the path to the lock file
-    pub fn path(&self) -> &Path {
-        &self.path
+        Ok(Self { file })
     }
 }
 

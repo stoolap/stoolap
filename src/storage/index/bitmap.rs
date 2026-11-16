@@ -50,13 +50,9 @@ use ahash::AHashMap;
 use roaring::RoaringTreemap;
 
 use crate::common::deadline::{Deadline, DeadlineSite, CHARGE_BEAT};
-use crate::common::{CompactArc, I64Map};
-use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
-use crate::storage::expression::Expression;
+use crate::common::CompactArc;
+use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, Value};
 use crate::storage::traits::Index;
-
-/// Warning threshold for cardinality
-const HIGH_CARDINALITY_WARNING_THRESHOLD: usize = 1000;
 
 /// Bitmap Index for low-cardinality columns
 ///
@@ -123,15 +119,6 @@ fn row_of(bit: u64) -> i64 {
     (bit ^ (1 << 63)) as i64
 }
 
-/// The row ids of `bits`, each as `row_id as u64`: what the public set
-/// operations hand out. The flip only touches the partition number.
-fn row_ids_of(bits: &RoaringTreemap) -> RoaringTreemap {
-    RoaringTreemap::from_bitmaps(
-        bits.bitmaps()
-            .map(|(partition, bitmap)| (partition ^ (1 << 31), bitmap.clone())),
-    )
-}
-
 impl std::fmt::Debug for BitmapIndex {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BitmapIndex")
@@ -177,83 +164,6 @@ impl BitmapIndex {
     /// Get the current cardinality (number of distinct values)
     pub fn cardinality(&self) -> usize {
         self.distinct_count.load(AtomicOrdering::Relaxed)
-    }
-
-    /// Check if cardinality is too high for efficient bitmap operations
-    pub fn is_high_cardinality(&self) -> bool {
-        self.cardinality() > HIGH_CARDINALITY_WARNING_THRESHOLD
-    }
-
-    /// Get the bitmap for a specific value (for AND/OR operations)
-    pub fn get_bitmap(&self, value: &Value) -> Option<RoaringTreemap> {
-        // Intern value to get Arc for lookup
-        let arc_key = self.value_to_arc_key(std::slice::from_ref(value));
-        let bitmaps = self.bitmaps.read();
-        bitmaps.get(&arc_key).map(row_ids_of)
-    }
-
-    /// Perform AND operation on multiple values (for multi-predicate queries)
-    /// Returns row IDs that match ALL values
-    pub fn and_values(&self, values: &[Value]) -> RoaringTreemap {
-        let bitmaps = self.bitmaps.read();
-        let mut result: Option<RoaringTreemap> = None;
-
-        for value in values {
-            let arc_key = self.value_to_arc_key(std::slice::from_ref(value));
-            if let Some(bitmap) = bitmaps.get(&arc_key) {
-                result = Some(match result {
-                    Some(r) => r & bitmap,
-                    None => bitmap.clone(),
-                });
-            } else {
-                // Value not found - result is empty
-                return RoaringTreemap::new();
-            }
-        }
-
-        result.as_ref().map(row_ids_of).unwrap_or_default()
-    }
-
-    /// Perform OR operation on multiple values
-    /// Returns row IDs that match ANY value
-    pub fn or_values(&self, values: &[Value]) -> RoaringTreemap {
-        let bitmaps = self.bitmaps.read();
-        let mut result = RoaringTreemap::new();
-
-        for value in values {
-            let arc_key = self.value_to_arc_key(std::slice::from_ref(value));
-            if let Some(bitmap) = bitmaps.get(&arc_key) {
-                result |= bitmap;
-            }
-        }
-
-        row_ids_of(&result)
-    }
-
-    /// Perform NOT operation on a value
-    /// Returns row IDs that do NOT match the value
-    /// Note: Requires knowing all row IDs in the table
-    pub fn not_value(&self, value: &Value) -> RoaringTreemap {
-        row_ids_of(&self.not_bits(value))
-    }
-
-    /// The bits of the rows that do not hold `value`
-    fn not_bits(&self, value: &Value) -> RoaringTreemap {
-        let arc_key = self.value_to_arc_key(std::slice::from_ref(value));
-        let bitmaps = self.bitmaps.read();
-
-        // Get all row IDs (union of all bitmaps)
-        let mut all_rows = RoaringTreemap::new();
-        for bitmap in bitmaps.values() {
-            all_rows |= bitmap;
-        }
-
-        // Subtract the matching bitmap
-        if let Some(bitmap) = bitmaps.get(&arc_key) {
-            all_rows - bitmap
-        } else {
-            all_rows
-        }
     }
 
     /// Convert values to an CompactArc<Value> key
@@ -333,14 +243,6 @@ impl Index for BitmapIndex {
         &self.name
     }
 
-    fn table_name(&self) -> &str {
-        &self.table_name
-    }
-
-    fn build(&mut self) -> Result<()> {
-        Ok(())
-    }
-
     fn add(&self, values: &[Value], row_id: i64, _ref_id: i64) -> Result<()> {
         if self.closed.load(AtomicOrdering::Acquire) {
             return Err(Error::IndexClosed);
@@ -403,13 +305,6 @@ impl Index for BitmapIndex {
         Ok(())
     }
 
-    fn add_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
-        for (row_id, values) in entries.iter() {
-            self.add(values, row_id, 0)?;
-        }
-        Ok(())
-    }
-
     fn remove(&self, values: &[Value], row_id: i64, _ref_id: i64) -> Result<()> {
         if self.closed.load(AtomicOrdering::Acquire) {
             return Err(Error::IndexClosed);
@@ -430,13 +325,6 @@ impl Index for BitmapIndex {
             }
         }
 
-        Ok(())
-    }
-
-    fn remove_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
-        for (row_id, values) in entries.iter() {
-            self.remove(values, row_id, 0)?;
-        }
         Ok(())
     }
 
@@ -741,18 +629,6 @@ impl Index for BitmapIndex {
         // Bitmap index doesn't support range queries efficiently - do nothing
     }
 
-    fn get_filtered_row_ids(&self, expr: &dyn Expression) -> RowIdVec {
-        // For complex expressions, return all row IDs and let caller filter
-        let bitmaps = self.bitmaps.read();
-        let mut all_rows = RoaringTreemap::new();
-        for bitmap in bitmaps.values() {
-            all_rows |= bitmap;
-        }
-        let _ = expr;
-        let collected: Vec<i64> = all_rows.iter().map(row_of).collect();
-        RowIdVec::from_vec(collected)
-    }
-
     fn get_all_values(&self, deadline: Deadline) -> Result<Option<Vec<Value>>> {
         let bitmaps = self.bitmaps.read();
         let mut values = Vec::with_capacity(bitmaps.len());
@@ -781,11 +657,6 @@ impl Index for BitmapIndex {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
-    }
-
-    fn close(&mut self) -> Result<()> {
-        self.closed.store(true, AtomicOrdering::Release);
-        self.clear()
     }
 }
 
@@ -851,75 +722,6 @@ mod tests {
 
         let inactive = index.find(&[Value::Boolean(false)]).unwrap();
         assert_eq!(inactive.len(), 2);
-    }
-
-    #[test]
-    fn test_bitmap_index_and_operation() {
-        // Note: AND operation is for combining multiple bitmap indexes
-        // Here we test the single-index AND which isn't as useful
-        let index = BitmapIndex::new(
-            "idx_status".to_string(),
-            "orders".to_string(),
-            vec!["status".to_string()],
-            vec![1],
-            vec![DataType::Text],
-            false,
-        );
-
-        index.add(&[Value::Text("pending".into())], 1, 0).unwrap();
-        index.add(&[Value::Text("shipped".into())], 2, 0).unwrap();
-
-        // AND of different values in same column = empty (row can't have two values)
-        let result =
-            index.and_values(&[Value::Text("pending".into()), Value::Text("shipped".into())]);
-        assert!(result.is_empty());
-        let result = index.and_values(&[Value::Text("shipped".into())]);
-        assert_eq!(result.iter().collect::<Vec<u64>>(), vec![2]);
-    }
-
-    #[test]
-    fn test_bitmap_index_or_operation() {
-        let index = BitmapIndex::new(
-            "idx_status".to_string(),
-            "orders".to_string(),
-            vec!["status".to_string()],
-            vec![1],
-            vec![DataType::Text],
-            false,
-        );
-
-        index.add(&[Value::Text("pending".into())], 1, 0).unwrap();
-        index.add(&[Value::Text("pending".into())], 2, 0).unwrap();
-        index.add(&[Value::Text("shipped".into())], 3, 0).unwrap();
-        index.add(&[Value::Text("delivered".into())], 4, 0).unwrap();
-
-        // OR of pending and shipped
-        let result =
-            index.or_values(&[Value::Text("pending".into()), Value::Text("shipped".into())]);
-        assert_eq!(result.iter().collect::<Vec<u64>>(), vec![1, 2, 3]);
-        let bitmap = index.get_bitmap(&Value::Text("pending".into())).unwrap();
-        assert_eq!(bitmap.iter().collect::<Vec<u64>>(), vec![1, 2]);
-    }
-
-    #[test]
-    fn test_bitmap_index_not_operation() {
-        let index = BitmapIndex::new(
-            "idx_status".to_string(),
-            "orders".to_string(),
-            vec!["status".to_string()],
-            vec![1],
-            vec![DataType::Text],
-            false,
-        );
-
-        index.add(&[Value::Text("pending".into())], 1, 0).unwrap();
-        index.add(&[Value::Text("pending".into())], 2, 0).unwrap();
-        index.add(&[Value::Text("shipped".into())], 3, 0).unwrap();
-        index.add(&[Value::Text("delivered".into())], 4, 0).unwrap();
-
-        // NOT pending = shipped + delivered
-        let result = index.not_value(&Value::Text("pending".into()));
-        assert_eq!(result.iter().collect::<Vec<u64>>(), vec![3, 4]);
     }
 
     #[test]
@@ -1004,25 +806,6 @@ mod tests {
         assert!(index
             .find_with_operator(Operator::Ne, &[Value::Text("pending".into())])
             .is_err());
-    }
-
-    #[test]
-    fn test_bitmap_index_high_cardinality_check() {
-        let index = BitmapIndex::new(
-            "idx_id".to_string(),
-            "items".to_string(),
-            vec!["id".to_string()],
-            vec![1],
-            vec![DataType::Integer],
-            false,
-        );
-
-        // Add many distinct values
-        for i in 0..HIGH_CARDINALITY_WARNING_THRESHOLD + 100 {
-            index.add(&[Value::Integer(i as i64)], i as i64, 0).unwrap();
-        }
-
-        assert!(index.is_high_cardinality());
     }
 
     #[test]
@@ -1142,14 +925,5 @@ mod tests {
         let mut left = Vec::new();
         index.get_row_ids_equal_into(&pending, &mut left);
         assert_eq!(left, vec![i64::MIN + 1, 0, i64::MAX]);
-
-        // The set operations hand out each id as `row_id as u64`
-        let expected: Vec<u64> = vec![0, i64::MAX as u64, (i64::MIN + 1) as u64];
-        let got = |bits: RoaringTreemap| bits.iter().collect::<Vec<u64>>();
-        assert_eq!(got(index.get_bitmap(&pending[0]).unwrap()), expected);
-        assert_eq!(got(index.and_values(&pending)), expected);
-        assert_eq!(got(index.or_values(&pending)), expected);
-        index.add(&[Value::Text("done".into())], -3, 0).unwrap();
-        assert_eq!(got(index.not_value(&pending[0])), vec![-3i64 as u64]);
     }
 }

@@ -100,29 +100,6 @@ impl MVCCScanner {
             closed: false,
         }
     }
-
-    /// Creates a scanner with a single row
-    pub fn single(row: Row, column_indices: Vec<usize>) -> Self {
-        let mut rows = RowVec::new();
-        rows.push((0, row));
-        Self {
-            rows,
-            current_index: -1,
-            column_indices,
-            error: None,
-            closed: false,
-        }
-    }
-
-    /// Returns the number of rows in the scanner
-    pub fn len(&self) -> usize {
-        self.rows.len()
-    }
-
-    /// Returns true if the scanner has no rows
-    pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
-    }
 }
 
 impl Scanner for MVCCScanner {
@@ -391,41 +368,6 @@ fn projected(row: &Row, projection: &[usize]) -> Row {
     )
 }
 
-/// Empty scanner that returns no rows
-pub struct EmptyScanner;
-
-impl EmptyScanner {
-    /// Creates a new empty scanner
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for EmptyScanner {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Scanner for EmptyScanner {
-    fn next(&mut self) -> bool {
-        false
-    }
-
-    fn row(&self) -> &Row {
-        static EMPTY_ROW: std::sync::OnceLock<Row> = std::sync::OnceLock::new();
-        EMPTY_ROW.get_or_init(|| Row::from_values(vec![]))
-    }
-
-    fn err(&self) -> Option<&crate::core::Error> {
-        None
-    }
-
-    fn close(&mut self) -> Result<()> {
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,21 +386,6 @@ mod tests {
         let mut scanner = MVCCScanner::empty(vec![0]);
 
         assert!(!scanner.next());
-        assert!(scanner.is_empty());
-    }
-
-    #[test]
-    fn test_mvcc_scanner_single() {
-        let row = Row::from_values(vec![Value::Integer(42)]);
-        let mut scanner = MVCCScanner::single(row, vec![0]);
-
-        assert_eq!(scanner.len(), 1);
-        assert!(!scanner.is_empty());
-
-        assert!(scanner.next());
-        assert_eq!(scanner.row().get(0), Some(&Value::Integer(42)));
-
-        assert!(!scanner.next());
     }
 
     #[test]
@@ -471,8 +398,6 @@ mod tests {
         rows.push((3, Row::from_values(vec![Value::Integer(3)])));
 
         let mut scanner = MVCCScanner::from_rows(rows, schema, vec![0]);
-
-        assert_eq!(scanner.len(), 3);
 
         // Check all rows
         assert!(scanner.next());
@@ -501,14 +426,5 @@ mod tests {
 
         // After close, next should return false
         assert!(!scanner.next());
-    }
-
-    #[test]
-    fn test_empty_scanner() {
-        let mut scanner = EmptyScanner::new();
-
-        assert!(!scanner.next());
-        assert!(scanner.err().is_none());
-        assert!(scanner.close().is_ok());
     }
 }

@@ -164,9 +164,6 @@ pub trait TransactionEngineOperations: Send + Sync {
     /// Rename a table
     fn rename_table(&self, old_name: &str, new_name: &str) -> Result<()>;
 
-    /// Commit table changes
-    fn commit_table(&self, txn_id: i64, table: &dyn Table) -> Result<()>;
-
     /// Rollback table changes
     fn rollback_table(&self, txn_id: i64, table: &dyn Table);
 
@@ -270,12 +267,6 @@ pub trait TransactionEngineOperations: Send + Sync {
         ))
     }
 
-    /// Defer table cleanup to background thread (avoids synchronous deallocation)
-    /// Default implementation drops synchronously
-    fn defer_table_cleanup(&self, _tables: Vec<Box<dyn Table>>) {
-        // Default: just drop synchronously (tables dropped when _tables goes out of scope)
-    }
-
     /// Acquire the seal fence shared lock. Commits hold this to signal they
     /// are in-flight. The checkpoint micro-seal acquires the exclusive lock,
     /// waiting for all in-flight commits to complete before draining hot rows.
@@ -352,16 +343,6 @@ impl MvccTransaction {
     /// Sets the engine operations callback
     pub fn set_engine_operations(&mut self, ops: Arc<dyn TransactionEngineOperations>) {
         self.engine_operations = Some(ops);
-    }
-
-    /// Returns the begin sequence number
-    pub fn begin_seq(&self) -> i64 {
-        self.begin_seq
-    }
-
-    /// Returns the current transaction state
-    pub fn state(&self) -> TransactionState {
-        self.state
     }
 
     /// Returns the isolation level for this transaction
@@ -601,27 +582,11 @@ impl MvccTransaction {
 
         undone
     }
-
-    /// Check if a savepoint exists
-    pub fn has_savepoint(&self, name: &str) -> bool {
-        self.savepoint_position(name).is_ok()
-    }
-
-    /// Gets the timestamp of the most recent savepoint with this name
-    pub fn get_savepoint_ts(&self, name: &str) -> Option<i64> {
-        let position = self.savepoint_position(name).ok()?;
-        Some(self.savepoints[position].1.timestamp)
-    }
 }
 
 impl Transaction for MvccTransaction {
     fn id(&self) -> i64 {
         self.id
-    }
-
-    fn begin(&mut self) -> Result<()> {
-        // No-op for compatibility - transaction is initialized in new()
-        self.check_active()
     }
 
     fn commit(&mut self) -> Result<()> {
@@ -832,11 +797,6 @@ impl Transaction for MvccTransaction {
         MvccTransaction::rollback_to_savepoint(self, name)
     }
 
-    fn get_savepoint_timestamp(&self, name: &str) -> Option<i64> {
-        // Delegate to the inherent method
-        MvccTransaction::get_savepoint_ts(self, name)
-    }
-
     fn set_isolation_level(&mut self, level: IsolationLevel) -> Result<()> {
         self.check_active()?;
 
@@ -1021,47 +981,6 @@ impl Transaction for MvccTransaction {
         Ok(())
     }
 
-    fn create_table_index(
-        &mut self,
-        table_name: &str,
-        index_name: &str,
-        columns: &[String],
-        is_unique: bool,
-    ) -> Result<()> {
-        self.check_active()?;
-
-        let table = self.get_table(table_name)?;
-        let col_refs: Vec<&str> = columns.iter().map(|s| s.as_str()).collect();
-        table.create_index(index_name, &col_refs, is_unique)
-    }
-
-    fn drop_table_index(&mut self, table_name: &str, index_name: &str) -> Result<()> {
-        self.check_active()?;
-
-        let table = self.get_table(table_name)?;
-        table.drop_index(index_name)
-    }
-
-    fn create_table_btree_index(
-        &mut self,
-        table_name: &str,
-        column_name: &str,
-        is_unique: bool,
-        custom_name: Option<&str>,
-    ) -> Result<()> {
-        self.check_active()?;
-
-        let table = self.get_table(table_name)?;
-        table.create_btree_index(column_name, is_unique, custom_name)
-    }
-
-    fn drop_table_btree_index(&mut self, table_name: &str, column_name: &str) -> Result<()> {
-        self.check_active()?;
-
-        let table = self.get_table(table_name)?;
-        table.drop_btree_index(column_name)
-    }
-
     fn add_table_column(&mut self, table_name: &str, column: SchemaColumn) -> Result<()> {
         self.check_active()?;
 
@@ -1115,21 +1034,6 @@ impl Transaction for MvccTransaction {
         let table = self.get_table(table_name)?;
         let col_refs: Vec<&str> = columns_to_fetch.iter().map(|s| s.as_str()).collect();
         table.select(&col_refs, expr)
-    }
-
-    fn select_with_aliases(
-        &self,
-        table_name: &str,
-        columns_to_fetch: &[String],
-        expr: Option<&dyn Expression>,
-        aliases: &FxHashMap<String, String>,
-        _original_columns: Option<&[String]>,
-    ) -> Result<Box<dyn QueryResult>> {
-        self.check_active()?;
-
-        let table = self.get_table(table_name)?;
-        let col_refs: Vec<&str> = columns_to_fetch.iter().map(|s| s.as_str()).collect();
-        table.select_with_aliases(&col_refs, expr, aliases)
     }
 
     fn rows_at(
@@ -1207,8 +1111,8 @@ mod tests {
         let txn = MvccTransaction::new(txn_id, begin_seq, Arc::clone(&registry));
 
         assert_eq!(txn.id(), txn_id);
-        assert_eq!(txn.begin_seq(), begin_seq);
-        assert_eq!(txn.state(), TransactionState::Active);
+        assert_eq!(txn.begin_seq, begin_seq);
+        assert_eq!(txn.state, TransactionState::Active);
     }
 
     #[test]
@@ -1217,18 +1121,11 @@ mod tests {
         let (txn_id, begin_seq) = registry.begin_transaction();
         let mut txn = MvccTransaction::new(txn_id, begin_seq, Arc::clone(&registry));
 
-        assert_eq!(txn.state(), TransactionState::Active);
-
-        // Begin should be no-op
-        txn.begin().unwrap();
-        assert_eq!(txn.state(), TransactionState::Active);
+        assert_eq!(txn.state, TransactionState::Active);
 
         // Commit
         txn.commit().unwrap();
-        assert_eq!(txn.state(), TransactionState::Committed);
-
-        // Should fail to begin after commit
-        assert!(txn.begin().is_err());
+        assert_eq!(txn.state, TransactionState::Committed);
     }
 
     #[test]
@@ -1237,14 +1134,11 @@ mod tests {
         let (txn_id, begin_seq) = registry.begin_transaction();
         let mut txn = MvccTransaction::new(txn_id, begin_seq, Arc::clone(&registry));
 
-        assert_eq!(txn.state(), TransactionState::Active);
+        assert_eq!(txn.state, TransactionState::Active);
 
         // Rollback
         txn.rollback().unwrap();
-        assert_eq!(txn.state(), TransactionState::RolledBack);
-
-        // Should fail to begin after rollback
-        assert!(txn.begin().is_err());
+        assert_eq!(txn.state, TransactionState::RolledBack);
     }
 
     #[test]

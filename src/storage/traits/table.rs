@@ -194,11 +194,6 @@ impl CapturedGroups {
             .map(|(key, (start, end))| (key, &self.ids[*start..*end]))
     }
 
-    /// The rows captured, which bounds the group prefix the caller may use.
-    pub fn rows(&self) -> usize {
-        self.ids.len()
-    }
-
     /// Whether the capture holds every group the index held.
     pub fn is_complete(&self) -> bool {
         self.complete
@@ -321,58 +316,9 @@ pub trait Table: Send + Sync {
     fn schema_arc(&self) -> CompactArc<Schema>;
 
     /// Creates a new column in the table
-    ///
-    /// # Arguments
-    /// * `name` - The name of the column
-    /// * `column_type` - The data type of the column
-    /// * `nullable` - Whether the column can contain NULL values
     fn create_column(&mut self, name: &str, column_type: DataType, nullable: bool) -> Result<()>;
 
-    /// Creates a new column in the table with default expression
-    ///
-    /// # Arguments
-    /// * `name` - The name of the column
-    /// * `column_type` - The data type of the column
-    /// * `nullable` - Whether the column can contain NULL values
-    /// * `default_expr` - Default value expression as string (to be evaluated during INSERT)
-    fn create_column_with_default(
-        &mut self,
-        name: &str,
-        column_type: DataType,
-        nullable: bool,
-        _default_expr: Option<String>,
-    ) -> Result<()> {
-        // Default implementation ignores default_expr for backwards compatibility
-        self.create_column(name, column_type, nullable)
-    }
-
-    /// Creates a new column with both expression and pre-computed default value
-    ///
-    /// The pre-computed default value is used for schema evolution (backfilling existing rows)
-    /// while the expression string is used for new inserts.
-    ///
-    /// # Arguments
-    /// * `name` - The name of the column
-    /// * `column_type` - The data type of the column
-    /// * `nullable` - Whether the column can contain NULL values
-    /// * `default_expr` - Default value expression as string (for INSERT)
-    /// * `default_value` - Pre-computed default value (for schema evolution)
-    fn create_column_with_default_value(
-        &mut self,
-        name: &str,
-        column_type: DataType,
-        nullable: bool,
-        default_expr: Option<String>,
-        _default_value: Option<crate::core::Value>,
-    ) -> Result<()> {
-        // Default implementation ignores default_value for backwards compatibility
-        self.create_column_with_default(name, column_type, nullable, default_expr)
-    }
-
     /// Drops a column from the table
-    ///
-    /// # Arguments
-    /// * `name` - The name of the column to drop
     fn drop_column(&mut self, name: &str) -> Result<()>;
 
     /// Inserts a single row into the table
@@ -774,18 +720,6 @@ pub trait Table: Send + Sync {
         Ok(rows)
     }
 
-    /// Collects all rows WITHOUT guaranteeing deterministic order.
-    ///
-    /// This is an optimization for GROUP BY queries where row order doesn't matter.
-    /// By skipping the O(n log n) sort, this provides significant speedup for large tables.
-    ///
-    /// # Returns
-    /// Cached row vector in arbitrary (storage iteration) order
-    fn collect_all_rows_unsorted(&self) -> Result<RowVec> {
-        // Default implementation: delegate to ordered version
-        self.collect_all_rows(None)
-    }
-
     /// Collects rows for specific row IDs.
     ///
     /// Used by HNSW index search to fetch rows after approximate nearest neighbor lookup.
@@ -1043,42 +977,14 @@ pub trait Table: Send + Sync {
     /// * `name` - The name of the index to drop
     fn drop_index(&self, name: &str) -> Result<()>;
 
-    /// Creates a btree index on a column
-    ///
-    /// # Arguments
-    /// * `column_name` - The column to index
-    /// * `is_unique` - Whether this is a unique index
-    /// * `custom_name` - Optional custom name for the index
+    /// Creates a btree index on a column, named `custom_name` or after the
+    /// table and the column
     fn create_btree_index(
         &self,
         column_name: &str,
         is_unique: bool,
         custom_name: Option<&str>,
     ) -> Result<()>;
-
-    /// Drops a btree index from the table
-    ///
-    /// # Arguments
-    /// * `column_name` - The column whose index to drop
-    fn drop_btree_index(&self, column_name: &str) -> Result<()>;
-
-    /// Creates a multi-column index on the table
-    ///
-    /// # Arguments
-    /// * `name` - The name of the index
-    /// * `columns` - The column names to include in the index
-    /// * `is_unique` - Whether this is a unique index
-    fn create_multi_column_index(
-        &self,
-        name: &str,
-        columns: &[&str],
-        is_unique: bool,
-    ) -> Result<()> {
-        let _ = (name, columns, is_unique);
-        Err(Error::NotSupported(
-            "Multi-column indexes not supported by this table type".to_string(),
-        ))
-    }
 
     /// Checks if an index exists on a specific column
     ///
@@ -1208,14 +1114,6 @@ pub trait Table: Send + Sync {
     ) -> Result<usize> {
         let _ = epoch;
         count_equal_by_reading(self, row_ids, column, key, limit)
-    }
-
-    /// Gets all unique indexes on the table (for constraint checking).
-    ///
-    /// Returns a list of (index_name, column_names) for each unique index.
-    /// Used by SegmentedTable to check volume data during inserts.
-    fn get_unique_indexes(&self) -> Vec<(String, Vec<String>)> {
-        Vec::new() // Default: no unique indexes
     }
 
     /// Finds a conflicting row ID for a unique-key lookup.
@@ -1579,22 +1477,6 @@ pub trait Table: Send + Sync {
         expr: Option<&dyn Expression>,
     ) -> Result<Box<dyn QueryResult>>;
 
-    /// Executes a SELECT query with column aliases
-    ///
-    /// # Arguments
-    /// * `columns` - Column names to include in the result
-    /// * `expr` - Optional filter expression
-    /// * `aliases` - Map from alias names to original column names
-    ///
-    /// # Returns
-    /// A QueryResult with the matching rows and aliased column names
-    fn select_with_aliases(
-        &self,
-        columns: &[&str],
-        expr: Option<&dyn Expression>,
-        aliases: &FxHashMap<String, String>,
-    ) -> Result<Box<dyn QueryResult>>;
-
     /// Every row as it stood at `point`, every column in the table's order.
     /// `authority` collects the rows whose hot chain decides them at the
     /// point, a delete included. Fails when the table no longer holds what
@@ -1633,27 +1515,6 @@ pub trait Table: Send + Sync {
     /// Returns None if zone maps have not been built (ANALYZE not run)
     /// Uses Arc to avoid expensive cloning on high QPS workloads
     fn get_zone_maps(&self) -> Option<std::sync::Arc<crate::storage::mvcc::zonemap::TableZoneMap>> {
-        None // Default implementation - override in concrete tables
-    }
-
-    /// Gets the segments that need to be scanned for a given predicate
-    ///
-    /// Uses zone maps to determine which segments can be pruned (skipped)
-    /// based on the predicate's column, operator, and value.
-    ///
-    /// # Arguments
-    /// * `column` - The column name in the predicate
-    /// * `operator` - The comparison operator
-    /// * `value` - The value being compared against
-    ///
-    /// # Returns
-    /// Some(Vec<segment_ids>) if zone maps exist, None otherwise
-    fn get_segments_to_scan(
-        &self,
-        _column: &str,
-        _operator: crate::core::Operator,
-        _value: &Value,
-    ) -> Option<Vec<u32>> {
         None // Default implementation - override in concrete tables
     }
 

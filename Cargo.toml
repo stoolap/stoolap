@@ -116,7 +116,6 @@ anyhow = "1.0"
 criterion = { version = "0.8", features = ["html_reports"] }
 proptest = "1.4"
 tempfile = "3.9"
-dhat = "0.3"
 sqllogictest = "0.29"
 
 [features]
@@ -125,7 +124,6 @@ parallel = ["dep:rayon"]
 wasm = []  # Excludes parallel + persistence; for wasm32 builds
 ffi = []   # C FFI layer - enables extern "C" functions for language bindings
 cli = ["clap", "rustyline", "comfy-table", "dirs"]
-dhat-heap = []
 jemalloc = ["dep:stoolap-jemalloc"]
 heap-profile = ["jemalloc", "dep:flate2"]
 semantic = ["candle-core", "candle-nn", "candle-transformers", "tokenizers", "hf-hub"]

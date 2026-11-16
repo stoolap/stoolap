@@ -37,8 +37,6 @@ pub struct ExecResult {
     affected: i64,
     /// Of those, the rows an UPDATE changed
     changed: i64,
-    /// Last insert ID (for auto-increment)
-    insert_id: i64,
 }
 
 /// Static empty columns for ExecResult (avoids Vec allocation)
@@ -55,11 +53,10 @@ fn get_empty_row() -> &'static Row {
 impl ExecResult {
     /// Create a new execution result
     #[inline]
-    pub fn new(rows_affected: i64, last_insert_id: i64) -> Self {
+    pub fn new(rows_affected: i64) -> Self {
         Self {
             affected: rows_affected,
             changed: rows_affected,
-            insert_id: last_insert_id,
         }
     }
 
@@ -68,26 +65,20 @@ impl ExecResult {
     pub fn with_rows_changed(rows_affected: i64, changed: i64) -> Self {
         Self {
             changed,
-            ..Self::new(rows_affected, 0)
+            ..Self::new(rows_affected)
         }
     }
 
     /// Create an empty result (for DDL statements)
     #[inline]
     pub fn empty() -> Self {
-        Self::new(0, 0)
+        Self::new(0)
     }
 
     /// Create a result with just rows affected
     #[inline]
     pub fn with_rows_affected(rows_affected: i64) -> Self {
-        Self::new(rows_affected, 0)
-    }
-
-    /// Create a result with rows affected and last insert ID
-    #[inline]
-    pub fn with_last_insert_id(rows_affected: i64, last_insert_id: i64) -> Self {
-        Self::new(rows_affected, last_insert_id)
+        Self::new(rows_affected)
     }
 }
 
@@ -99,10 +90,6 @@ impl QueryResult for ExecResult {
     fn next(&mut self) -> bool {
         // DML results have no rows
         false
-    }
-
-    fn scan(&self, _dest: &mut [Value]) -> Result<()> {
-        Err(crate::core::Error::internal("scan() called on exec result"))
     }
 
     fn row(&self) -> &Row {
@@ -119,14 +106,6 @@ impl QueryResult for ExecResult {
 
     fn rows_changed(&self) -> i64 {
         self.changed
-    }
-
-    fn last_insert_id(&self) -> i64 {
-        self.insert_id
-    }
-
-    fn with_aliases(self: Box<Self>, _aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
-        self
     }
 }
 
@@ -182,8 +161,6 @@ pub struct ExecutorResult {
     closed: bool,
     /// Rows affected (0 for SELECT)
     affected: i64,
-    /// Last insert ID (0 for SELECT)
-    insert_id: i64,
 }
 
 impl ExecutorResult {
@@ -197,7 +174,6 @@ impl ExecutorResult {
             current_index: None,
             closed: false,
             affected: 0,
-            insert_id: 0,
         }
     }
 
@@ -211,22 +187,6 @@ impl ExecutorResult {
             current_index: None,
             closed: false,
             affected: 0,
-            insert_id: 0,
-        }
-    }
-
-    /// Create a new memory result with shared rows from cache (zero-copy for rows)
-    /// This avoids cloning the entire Vec<Row> when reading from semantic cache
-    pub fn with_shared_rows(columns: Vec<String>, rows: CompactArc<Vec<Row>>) -> Self {
-        let len = rows.len();
-        Self {
-            columns: CompactArc::new(columns),
-            rows: RowStorage::Shared(rows),
-            len,
-            current_index: None,
-            closed: false,
-            affected: 0,
-            insert_id: 0,
         }
     }
 
@@ -243,101 +203,12 @@ impl ExecutorResult {
             current_index: None,
             closed: false,
             affected: 0,
-            insert_id: 0,
         }
-    }
-
-    /// Create a new memory result with both Arc columns and Arc rows (fully zero-copy)
-    /// This is the most efficient constructor for cached/shared results
-    pub fn with_arc_all(columns: CompactArc<Vec<String>>, rows: CompactArc<Vec<Row>>) -> Self {
-        let len = rows.len();
-        Self {
-            columns,
-            rows: RowStorage::Shared(rows),
-            len,
-            current_index: None,
-            closed: false,
-            affected: 0,
-            insert_id: 0,
-        }
-    }
-
-    /// Create an empty memory result
-    pub fn empty() -> Self {
-        Self::new(Vec::new(), RowVec::new())
     }
 
     /// Create with columns only (no rows yet)
     pub fn with_columns(columns: Vec<String>) -> Self {
         Self::new(columns, RowVec::new())
-    }
-
-    /// Create with schema
-    pub fn with_schema(columns: Vec<String>, rows: RowVec, _schema: crate::core::Schema) -> Self {
-        Self::new(columns, rows)
-    }
-
-    /// Add a row to the result
-    pub fn add_row(&mut self, row: Row) {
-        // Convert from shared to owned if needed
-        if let RowStorage::Shared(arc_rows) = &self.rows {
-            let mut rv = RowVec::with_capacity(arc_rows.len() + 1);
-            for (idx, r) in arc_rows.iter().enumerate() {
-                rv.push((idx as i64, r.clone()));
-            }
-            self.rows = RowStorage::Owned(rv);
-        }
-        if let RowStorage::Owned(rv) = &mut self.rows {
-            rv.push((self.len as i64, row));
-            self.len += 1;
-        }
-    }
-
-    /// Get the number of rows
-    #[inline]
-    pub fn row_count(&self) -> usize {
-        self.len
-    }
-
-    /// Get row by index
-    #[inline]
-    pub fn get_row(&self, index: usize) -> Option<&Row> {
-        self.rows.get(index)
-    }
-
-    /// Take ownership of all rows (extracts Row from RowVec)
-    pub fn into_rows(self) -> Vec<Row> {
-        match self.rows {
-            RowStorage::Owned(mut rv) => rv.drain_rows().collect(),
-            RowStorage::Shared(rows) => {
-                // Must clone if shared
-                CompactArc::try_unwrap(rows).unwrap_or_else(|arc| (*arc).clone())
-            }
-        }
-    }
-
-    /// Take rows as CompactArc for zero-copy sharing with joins
-    /// Returns CompactArc<Vec<Row>> - wraps owned rows or clones CompactArc for shared
-    pub fn into_arc_rows(self) -> CompactArc<Vec<Row>> {
-        match self.rows {
-            RowStorage::Owned(mut rv) => CompactArc::new(rv.drain_rows().collect()),
-            RowStorage::Shared(rows) => rows,
-        }
-    }
-
-    /// Reset the cursor to the beginning
-    pub fn reset(&mut self) {
-        self.current_index = None;
-    }
-
-    /// Set rows affected (for modification results)
-    pub fn set_rows_affected(&mut self, count: i64) {
-        self.affected = count;
-    }
-
-    /// Set last insert ID
-    pub fn set_last_insert_id(&mut self, id: i64) {
-        self.insert_id = id;
     }
 }
 
@@ -369,24 +240,6 @@ impl QueryResult for ExecutorResult {
         }
     }
 
-    fn scan(&self, dest: &mut [Value]) -> Result<()> {
-        let row = self.row();
-
-        if dest.len() != row.len() {
-            return Err(crate::core::Error::internal(format!(
-                "scan destination has {} values but row has {} columns",
-                dest.len(),
-                row.len()
-            )));
-        }
-
-        for (i, value) in row.iter().enumerate() {
-            dest[i] = value.clone();
-        }
-
-        Ok(())
-    }
-
     fn row(&self) -> &Row {
         match self.current_index {
             Some(i) => self
@@ -413,10 +266,6 @@ impl QueryResult for ExecutorResult {
         self.affected
     }
 
-    fn last_insert_id(&self) -> i64 {
-        self.insert_id
-    }
-
     fn exact_len(&self) -> Option<usize> {
         self.current_index.is_none().then_some(self.len)
     }
@@ -429,24 +278,6 @@ impl QueryResult for ExecutorResult {
             RowStorage::Owned(mut rv) => Some(CompactArc::new(rv.drain_rows().collect())),
             RowStorage::Shared(arc) => Some(arc),
         }
-    }
-
-    fn with_aliases(
-        mut self: Box<Self>,
-        aliases: FxHashMap<String, String>,
-    ) -> Box<dyn QueryResult> {
-        // Apply aliases to column names (use CompactArc::make_mut for copy-on-write)
-        let columns = CompactArc::make_mut(&mut self.columns);
-        for col in columns {
-            // Find if this column has an alias (reverse lookup)
-            for (alias, original) in &aliases {
-                if col == original {
-                    *col = alias.clone();
-                    break;
-                }
-            }
-        }
-        self
     }
 }
 
@@ -517,26 +348,6 @@ impl QueryResult for FilteredResult {
         false
     }
 
-    fn scan(&self, dest: &mut [Value]) -> Result<()> {
-        if let Some(ref row) = self.current_row {
-            if dest.len() != row.len() {
-                return Err(crate::core::Error::internal(format!(
-                    "scan destination has {} values but row has {} columns",
-                    dest.len(),
-                    row.len()
-                )));
-            }
-            for (i, value) in row.iter().enumerate() {
-                dest[i] = value.clone();
-            }
-            Ok(())
-        } else {
-            Err(crate::core::Error::internal(
-                "scan() called without successful next()",
-            ))
-        }
-    }
-
     fn row(&self) -> &Row {
         self.current_row
             .as_ref()
@@ -561,19 +372,11 @@ impl QueryResult for FilteredResult {
         self.inner.rows_changed()
     }
 
-    fn last_insert_id(&self) -> i64 {
-        self.inner.last_insert_id()
-    }
-
     fn last_error(&mut self) -> Option<crate::core::Error> {
         // Return own error first, then check inner for nested FilteredResult chains
         self.pending_error
             .take()
             .or_else(|| self.inner.last_error())
-    }
-
-    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
-        Box::new(AliasedResult::new(self, aliases))
     }
 }
 
@@ -648,20 +451,6 @@ impl QueryResult for ProjectionResult {
         }
     }
 
-    fn scan(&self, dest: &mut [Value]) -> Result<()> {
-        if dest.len() != self.current_row.len() {
-            return Err(crate::core::Error::internal(format!(
-                "scan destination has {} values but row has {} columns",
-                dest.len(),
-                self.current_row.len()
-            )));
-        }
-        for (i, value) in self.current_row.iter().enumerate() {
-            dest[i] = value.clone();
-        }
-        Ok(())
-    }
-
     fn row(&self) -> &Row {
         &self.current_row
     }
@@ -680,18 +469,10 @@ impl QueryResult for ProjectionResult {
         0
     }
 
-    fn last_insert_id(&self) -> i64 {
-        0
-    }
-
     fn last_error(&mut self) -> Option<crate::core::Error> {
         self.pending_error
             .take()
             .or_else(|| self.inner.last_error())
-    }
-
-    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
-        Box::new(AliasedResult::new(self, aliases))
     }
 }
 
@@ -777,10 +558,6 @@ impl QueryResult for LimitedResult {
         }
     }
 
-    fn scan(&self, dest: &mut [Value]) -> Result<()> {
-        self.inner.scan(dest)
-    }
-
     fn row(&self) -> &Row {
         self.inner.row()
     }
@@ -801,16 +578,8 @@ impl QueryResult for LimitedResult {
         self.inner.rows_changed()
     }
 
-    fn last_insert_id(&self) -> i64 {
-        self.inner.last_insert_id()
-    }
-
     fn last_error(&mut self) -> Option<crate::core::Error> {
         self.inner.last_error()
-    }
-
-    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
-        Box::new(AliasedResult::new(self, aliases))
     }
 }
 
@@ -1033,10 +802,6 @@ impl QueryResult for OrderedResult {
         self.inner.next()
     }
 
-    fn scan(&self, dest: &mut [Value]) -> Result<()> {
-        self.inner.scan(dest)
-    }
-
     fn row(&self) -> &Row {
         self.inner.row()
     }
@@ -1051,14 +816,6 @@ impl QueryResult for OrderedResult {
 
     fn rows_affected(&self) -> i64 {
         0
-    }
-
-    fn last_insert_id(&self) -> i64 {
-        0
-    }
-
-    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
-        Box::new(AliasedResult::new(self, aliases))
     }
 }
 
@@ -1303,10 +1060,6 @@ impl QueryResult for TopNResult {
         self.inner.next()
     }
 
-    fn scan(&self, dest: &mut [Value]) -> Result<()> {
-        self.inner.scan(dest)
-    }
-
     fn row(&self) -> &Row {
         self.inner.row()
     }
@@ -1321,14 +1074,6 @@ impl QueryResult for TopNResult {
 
     fn rows_affected(&self) -> i64 {
         0
-    }
-
-    fn last_insert_id(&self) -> i64 {
-        0
-    }
-
-    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
-        Box::new(AliasedResult::new(self, aliases))
     }
 }
 
@@ -1484,17 +1229,6 @@ impl QueryResult for DistinctResult {
         false
     }
 
-    fn scan(&self, dest: &mut [Value]) -> Result<()> {
-        if !self.has_current {
-            return Ok(());
-        }
-        let len = dest.len().min(self.current_row.len());
-        for (i, v) in self.current_row.iter().take(len).enumerate() {
-            dest[i] = v.clone();
-        }
-        Ok(())
-    }
-
     fn row(&self) -> &Row {
         &self.current_row
     }
@@ -1512,16 +1246,8 @@ impl QueryResult for DistinctResult {
         0
     }
 
-    fn last_insert_id(&self) -> i64 {
-        0
-    }
-
     fn last_error(&mut self) -> Option<crate::core::Error> {
         self.inner.last_error()
-    }
-
-    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
-        Box::new(AliasedResult::new(self, aliases))
     }
 }
 
@@ -1620,17 +1346,6 @@ impl QueryResult for DistinctOnResult {
         false
     }
 
-    fn scan(&self, dest: &mut [Value]) -> Result<()> {
-        if !self.has_current {
-            return Ok(());
-        }
-        let len = dest.len().min(self.current_row.len());
-        for (i, v) in self.current_row.iter().take(len).enumerate() {
-            dest[i] = v.clone();
-        }
-        Ok(())
-    }
-
     fn row(&self) -> &Row {
         &self.current_row
     }
@@ -1649,16 +1364,8 @@ impl QueryResult for DistinctOnResult {
         0
     }
 
-    fn last_insert_id(&self) -> i64 {
-        0
-    }
-
     fn last_error(&mut self) -> Option<crate::core::Error> {
         self.inner.last_error()
-    }
-
-    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
-        Box::new(AliasedResult::new(self, aliases))
     }
 }
 
@@ -1711,10 +1418,6 @@ impl QueryResult for AliasedResult {
         self.inner.next()
     }
 
-    fn scan(&self, dest: &mut [Value]) -> Result<()> {
-        self.inner.scan(dest)
-    }
-
     fn row(&self) -> &Row {
         self.inner.row()
     }
@@ -1735,10 +1438,6 @@ impl QueryResult for AliasedResult {
         self.inner.rows_changed()
     }
 
-    fn last_insert_id(&self) -> i64 {
-        self.inner.last_insert_id()
-    }
-
     fn last_error(&mut self) -> Option<crate::core::Error> {
         self.inner.last_error()
     }
@@ -1753,11 +1452,6 @@ impl QueryResult for AliasedResult {
 
     fn exact_len(&self) -> Option<usize> {
         self.inner.exact_len()
-    }
-
-    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
-        // Apply additional aliases
-        Box::new(AliasedResult::new(self, aliases))
     }
 }
 
@@ -1820,17 +1514,6 @@ impl QueryResult for ProjectedResult {
         }
     }
 
-    fn scan(&self, dest: &mut [Value]) -> Result<()> {
-        for (i, val) in dest.iter_mut().enumerate().take(self.keep_columns) {
-            *val = self
-                .current_row
-                .get(i)
-                .cloned()
-                .unwrap_or(Value::null_unknown());
-        }
-        Ok(())
-    }
-
     fn row(&self) -> &Row {
         &self.current_row
     }
@@ -1847,16 +1530,8 @@ impl QueryResult for ProjectedResult {
         0
     }
 
-    fn last_insert_id(&self) -> i64 {
-        0
-    }
-
     fn last_error(&mut self) -> Option<crate::core::Error> {
         self.inner.last_error()
-    }
-
-    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
-        Box::new(AliasedResult::new(self, aliases))
     }
 }
 
@@ -1925,25 +1600,6 @@ impl QueryResult for ScannerResult {
         true
     }
 
-    fn scan(&self, dest: &mut [Value]) -> Result<()> {
-        if !self.has_current {
-            return Err(crate::core::Error::internal(
-                "scan() called without successful next()",
-            ));
-        }
-        if dest.len() != self.current_row.len() {
-            return Err(crate::core::Error::internal(format!(
-                "scan destination has {} values but row has {} columns",
-                dest.len(),
-                self.current_row.len()
-            )));
-        }
-        for (i, value) in self.current_row.iter().enumerate() {
-            dest[i] = value.clone();
-        }
-        Ok(())
-    }
-
     fn row(&self) -> &Row {
         if !self.has_current {
             panic!("row() called without successful next()");
@@ -1974,16 +1630,8 @@ impl QueryResult for ScannerResult {
         0
     }
 
-    fn last_insert_id(&self) -> i64 {
-        0
-    }
-
     fn estimated_count(&self) -> Option<usize> {
         self.scanner.estimated_count()
-    }
-
-    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
-        Box::new(AliasedResult::new(self, aliases))
     }
 }
 
@@ -2127,20 +1775,6 @@ impl QueryResult for ColumnarResult {
         true
     }
 
-    fn scan(&self, dest: &mut [Value]) -> Result<()> {
-        if dest.len() != self.current_row.len() {
-            return Err(crate::core::Error::internal(format!(
-                "scan destination has {} values but row has {} columns",
-                dest.len(),
-                self.current_row.len()
-            )));
-        }
-        for (i, value) in self.current_row.iter().enumerate() {
-            dest[i] = value.clone();
-        }
-        Ok(())
-    }
-
     #[inline]
     fn row(&self) -> &Row {
         &self.current_row
@@ -2163,16 +1797,8 @@ impl QueryResult for ColumnarResult {
         0
     }
 
-    fn last_insert_id(&self) -> i64 {
-        0
-    }
-
     fn estimated_count(&self) -> Option<usize> {
         Some(self.num_rows)
-    }
-
-    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
-        Box::new(AliasedResult::new(self, aliases))
     }
 }
 
@@ -2192,9 +1818,8 @@ mod tests {
 
     #[test]
     fn test_exec_result() {
-        let result = ExecResult::new(5, 10);
+        let result = ExecResult::new(5);
         assert_eq!(result.rows_affected(), 5);
-        assert_eq!(result.last_insert_id(), 10);
         assert_eq!(result.columns().len(), 0);
     }
 
@@ -2202,7 +1827,6 @@ mod tests {
     fn test_exec_result_empty() {
         let result = ExecResult::empty();
         assert_eq!(result.rows_affected(), 0);
-        assert_eq!(result.last_insert_id(), 0);
     }
 
     #[test]
@@ -2215,7 +1839,7 @@ mod tests {
 
         let mut result = ExecutorResult::new(columns, rows);
         assert_eq!(result.columns().len(), 2);
-        assert_eq!(result.row_count(), 2);
+        assert_eq!(result.exact_len(), Some(2));
 
         // First row
         assert!(result.next());
@@ -2393,7 +2017,10 @@ mod tests {
     #[test]
     fn a_renamed_result_hands_on_its_shared_rows_and_length() {
         let rows = CompactArc::new(vec![Row::from_values(vec![Value::Integer(1)])]);
-        let inner = ExecutorResult::with_shared_rows(vec!["a".to_string()], rows.clone());
+        let inner = ExecutorResult::with_arc_columns_shared_rows(
+            CompactArc::new(vec!["a".to_string()]),
+            rows.clone(),
+        );
         let mut result = AliasedResult::renamed(Box::new(inner), vec!["b".to_string()]);
         assert_eq!(result.columns(), &["b"]);
         assert_eq!(result.exact_len(), Some(1));

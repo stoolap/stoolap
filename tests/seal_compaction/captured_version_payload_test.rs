@@ -104,15 +104,9 @@ macro_rules! captured_rows_test {
     };
 }
 
-captured_rows_test!(captured_all_rows, |store, id| store
-    .get_all_visible_rows(id.into()));
-captured_rows_test!(captured_arena_rows, |store, id| store
-    .get_all_visible_rows_arena(id.into()));
 captured_rows_test!(captured_cached_rows, |store, id| store
     .get_all_visible_rows_cached(id.into(), stoolap::executor::Deadline::NONE)
     .unwrap());
-captured_rows_test!(captured_unsorted_rows, |store, id| store
-    .get_all_visible_rows_unsorted(id.into()));
 captured_rows_test!(captured_update_versions, |store, id| update_rows(
     store
         .get_visible_versions_for_update(&[1], id, stoolap::executor::Deadline::NONE)
@@ -137,14 +131,6 @@ captured_rows_test!(captured_filtered_update, |store, id| update_rows(
 captured_rows_test!(captured_limited_rows, |store, id| store
     .get_visible_rows_with_limit(id.into(), 1, 0, stoolap::executor::Deadline::NONE)
     .unwrap());
-captured_rows_test!(captured_batch, |store, id| store
-    .get_visible_rows_batch(id.into(), 0, 1)
-    .0);
-captured_rows_test!(captured_batch_into, |store, id| {
-    let mut rows = RowVec::new();
-    assert!(!store.get_visible_rows_batch_into(id.into(), 0, 1, &mut rows));
-    rows
-});
 captured_rows_test!(captured_pk_ordered, |store, id| store
     .collect_rows_pk_ordered(id.into(), true, 1, 0)
     .unwrap());

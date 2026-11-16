@@ -23,9 +23,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
 
-use crate::common::I64Set;
 use crate::core::{DataType, Error, Result, Schema, SchemaColumn};
 use crate::storage::mvcc::persistence::{deserialize_row_version, serialize_row_version};
 use crate::storage::mvcc::version_store::RowVersion;
@@ -51,9 +49,6 @@ const INDEX_ENTRY_SIZE: usize = 16;
 
 /// Footer size in bytes (64-byte extensible footer)
 const FOOTER_SIZE: usize = 64;
-
-/// Default batch size for processing rows
-const DEFAULT_BATCH_SIZE: usize = 1000;
 
 /// Default block size for buffered I/O
 const DEFAULT_BLOCK_SIZE: usize = 64 * 1024; // 64KB
@@ -775,8 +770,6 @@ pub struct SnapshotWriter {
     committed_txn_ids: BTreeMap<i64, i64>,
     /// Whether the writer has failed
     failed: bool,
-    /// Source LSN (WAL position at snapshot time)
-    source_lsn: u64,
     /// Hasher for computing row data checksum (stored in footer)
     data_hasher: crc32fast::Hasher,
     /// Hasher for computing full-file CRC (incremental, avoids read-back)
@@ -832,7 +825,6 @@ impl SnapshotWriter {
             row_index: BTreeMap::new(),
             committed_txn_ids: BTreeMap::new(),
             failed: false,
-            source_lsn,
             data_hasher: crc32fast::Hasher::new(),
             file_hasher,
             row_data_start: 0, // Will be set after schema is written
@@ -842,11 +834,6 @@ impl SnapshotWriter {
     /// Mark the writer as failed (will delete file on close)
     pub fn fail(&mut self) {
         self.failed = true;
-    }
-
-    /// Get the source LSN
-    pub fn source_lsn(&self) -> u64 {
-        self.source_lsn
     }
 
     /// Write the table schema to the file
@@ -1040,11 +1027,6 @@ impl SnapshotWriter {
 
         Ok(())
     }
-
-    /// Get the file path
-    pub fn path(&self) -> &Path {
-        &self.file_path
-    }
 }
 
 impl Drop for SnapshotWriter {
@@ -1067,8 +1049,6 @@ impl Drop for SnapshotWriter {
 pub struct SnapshotReader {
     /// Input file
     file: File,
-    /// File path
-    file_path: PathBuf,
     /// File header (kept for version info and future compatibility)
     header: FileHeader,
     /// File footer
@@ -1077,8 +1057,6 @@ pub struct SnapshotReader {
     schema: Schema,
     /// Index mapping row_id -> file offset (BTreeMap for ordered access)
     index: BTreeMap<i64, u64>,
-    /// Track which row_ids have been loaded to memory
-    loaded_row_ids: RwLock<I64Set>,
     /// Length buffer for reuse
     len_buffer: [u8; 4],
 }
@@ -1222,12 +1200,10 @@ impl SnapshotReader {
 
         Ok(Self {
             file,
-            file_path,
             header,
             footer,
             schema,
             index,
-            loaded_row_ids: RwLock::new(I64Set::new()),
             len_buffer: [0u8; 4],
         })
     }
@@ -1242,78 +1218,13 @@ impl SnapshotReader {
         self.footer.row_count
     }
 
-    /// Get the file path
-    pub fn path(&self) -> &Path {
-        &self.file_path
-    }
-
     /// Get the source WAL LSN at the time this snapshot was created
     /// Returns 0 for v2 files that don't have this field
     pub fn source_lsn(&self) -> u64 {
         self.header.source_lsn
     }
 
-    /// Get the creation timestamp (Unix timestamp in milliseconds)
-    /// Returns 0 for v2 files that don't have this field
-    pub fn creation_time(&self) -> i64 {
-        self.header.creation_time
-    }
-
-    /// Check if a row_id exists in this snapshot AND has not been loaded to memory yet.
-    ///
-    /// This is used to determine if a row should be fetched from disk during queries.
-    /// Returns `false` if:
-    /// - The row doesn't exist in this snapshot, OR
-    /// - The row exists but has already been loaded to memory (marked by `get_row`)
-    ///
-    /// For checking if a row exists in the snapshot regardless of load status,
-    /// use `row_exists_in_index()` instead.
-    pub fn has_unloaded_row(&self, row_id: i64) -> bool {
-        // Check if already loaded to memory
-        if self
-            .loaded_row_ids
-            .read()
-            .map(|s| s.contains(row_id))
-            .unwrap_or(false)
-        {
-            return false; // Already in memory
-        }
-        self.index.contains_key(&row_id)
-    }
-
-    /// Check if a row_id exists in this snapshot's index (regardless of load status)
-    ///
-    /// This simply checks if the row is present in the snapshot file,
-    /// without considering whether it has been loaded to memory.
-    pub fn row_exists_in_index(&self, row_id: i64) -> bool {
-        self.index.contains_key(&row_id)
-    }
-
-    /// Get a single row by row_id
-    pub fn get_row(&mut self, row_id: i64) -> Option<RowVersion> {
-        // Check if already loaded
-        {
-            let loaded = self.loaded_row_ids.read().ok()?;
-            if loaded.contains(row_id) {
-                return None; // Already loaded
-            }
-        }
-
-        // Look up offset
-        let &offset = self.index.get(&row_id)?;
-
-        // Read the row
-        let version = self.read_row_at_offset(offset).ok()?;
-
-        // Mark as loaded
-        if let Ok(mut loaded) = self.loaded_row_ids.write() {
-            loaded.insert(row_id);
-        }
-
-        Some(version)
-    }
-
-    /// Iterate over all rows (without loading tracking)
+    /// Iterate over all rows
     pub fn for_each<F>(&mut self, mut callback: F) -> Result<()>
     where
         F: FnMut(i64, RowVersion) -> bool,
@@ -1370,11 +1281,6 @@ impl SnapshotReader {
 
         // Deserialize
         deserialize_row_version(&row_bytes)
-    }
-
-    /// Get the index for external iteration
-    pub fn index(&self) -> &BTreeMap<i64, u64> {
-        &self.index
     }
 }
 
@@ -1484,8 +1390,6 @@ pub struct DiskVersionStore {
     base_dir: PathBuf,
     /// Table name
     table_name: String,
-    /// Active snapshot readers
-    readers: RwLock<Vec<SnapshotReader>>,
 }
 
 impl DiskVersionStore {
@@ -1505,142 +1409,12 @@ impl DiskVersionStore {
         Ok(Self {
             base_dir,
             table_name: table_name.to_string(),
-            readers: RwLock::new(Vec::new()),
         })
     }
 
     /// Get the snapshot directory for this table
     pub fn snapshot_dir(&self) -> PathBuf {
         self.base_dir.join(&self.table_name)
-    }
-
-    /// Create a new snapshot from version data
-    pub fn create_snapshot<F>(&self, row_iterator: F, schema: &Schema) -> Result<PathBuf>
-    where
-        F: FnMut(&mut dyn FnMut(i64, &RowVersion) -> bool),
-    {
-        let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S%.3f");
-        let file_path = self
-            .snapshot_dir()
-            .join(format!("snapshot-{}.bin", timestamp));
-
-        let mut writer = SnapshotWriter::new(&file_path)?;
-
-        // Write schema
-        writer.write_schema(schema)?;
-
-        // Write rows from iterator
-        let mut row_iterator = row_iterator;
-        let mut batch: Vec<(i64, RowVersion)> = Vec::with_capacity(DEFAULT_BATCH_SIZE);
-
-        row_iterator(&mut |row_id, version| {
-            if !version.is_deleted() {
-                // Clone with snapshot TxnID (-1)
-                let mut snapshot_version = version.clone();
-                snapshot_version.txn_id = -1;
-                batch.push((row_id, snapshot_version));
-
-                if batch.len() >= DEFAULT_BATCH_SIZE {
-                    if writer.append_batch(&batch).is_err() {
-                        return false;
-                    }
-                    batch.clear();
-                }
-            }
-            true
-        });
-
-        // Write remaining rows
-        if !batch.is_empty() {
-            writer.append_batch(&batch)?;
-        }
-
-        // Finalize
-        writer.finalize()?;
-
-        Ok(file_path)
-    }
-
-    /// Load the most recent snapshot
-    pub fn load_snapshots(&self) -> Result<()> {
-        let snapshot_dir = self.snapshot_dir();
-
-        if !snapshot_dir.exists() {
-            return Ok(()); // No snapshots yet
-        }
-
-        // Find snapshot files
-        let mut snapshot_files: Vec<PathBuf> = fs::read_dir(&snapshot_dir)
-            .map_err(|e| Error::internal(format!("failed to read snapshot directory: {}", e)))?
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with("snapshot-") && n.ends_with(".bin"))
-                    .unwrap_or(false)
-            })
-            .collect();
-
-        // Sort by name (which includes timestamp)
-        snapshot_files.sort();
-
-        if snapshot_files.is_empty() {
-            return Ok(()); // No snapshots
-        }
-
-        // Try to load the newest snapshot
-        let newest = snapshot_files.last().unwrap();
-        match SnapshotReader::open(newest) {
-            Ok(reader) => {
-                let mut readers = self
-                    .readers
-                    .write()
-                    .expect("snapshot readers lock poisoned in load_snapshots");
-                readers.push(reader);
-                Ok(())
-            }
-            Err(e) => {
-                // Try older snapshots as fallback
-                for path in snapshot_files.iter().rev().skip(1) {
-                    if let Ok(reader) = SnapshotReader::open(path) {
-                        let mut readers = self
-                            .readers
-                            .write()
-                            .expect("snapshot readers lock poisoned in load_snapshots fallback");
-                        readers.push(reader);
-                        return Ok(());
-                    }
-                }
-                Err(e)
-            }
-        }
-    }
-
-    /// Get a row from disk snapshots
-    pub fn get_row(&self, row_id: i64) -> Option<RowVersion> {
-        let mut readers = self.readers.write().ok()?;
-        if readers.is_empty() {
-            return None;
-        }
-
-        // Check newest reader
-        let reader = readers.last_mut()?;
-        reader.get_row(row_id)
-    }
-
-    /// Check if a row exists in disk snapshots AND has not been loaded to memory.
-    ///
-    /// This is used to determine if a row should be fetched from disk.
-    /// Returns `false` if the row doesn't exist or has already been loaded.
-    pub fn has_unloaded_row(&self, row_id: i64) -> bool {
-        let readers = self.readers.read().ok();
-        if let Some(readers) = readers {
-            if let Some(reader) = readers.last() {
-                return reader.has_unloaded_row(row_id);
-            }
-        }
-        false
     }
 
     /// Cleanup old snapshots, keeping only the most recent `keep_count` files
@@ -1727,16 +1501,6 @@ impl DiskVersionStore {
             }
         }
 
-        Ok(())
-    }
-
-    /// Close all readers
-    pub fn close(&self) -> Result<()> {
-        let mut readers = self
-            .readers
-            .write()
-            .expect("snapshot readers lock poisoned in close");
-        readers.clear();
         Ok(())
     }
 }
@@ -1834,21 +1598,10 @@ mod tests {
 
         // Read snapshot
         {
-            let mut reader = SnapshotReader::open(&snapshot_path).unwrap();
+            let reader = SnapshotReader::open(&snapshot_path).unwrap();
 
             assert_eq!(reader.row_count(), 100);
             assert_eq!(reader.schema().table_name, "test_table");
-
-            // Get specific row - row_id is known from the call parameter
-            let row = reader.get_row(50).unwrap();
-            assert_eq!(row.data.len(), 3); // Verify data was read correctly
-
-            // Already loaded, should return None
-            assert!(reader.get_row(50).is_none());
-
-            // Get another row
-            let row = reader.get_row(75).unwrap();
-            assert_eq!(row.data.len(), 3); // Verify data was read correctly
         }
     }
 
@@ -1897,16 +1650,5 @@ mod tests {
             assert_eq!(count, 50);
             assert_eq!(sum, (1..=50).sum::<i64>());
         }
-    }
-
-    #[test]
-    fn test_disk_version_store() {
-        let dir = tempdir().unwrap();
-
-        let dvs = DiskVersionStore::new(dir.path(), "test_table").unwrap();
-
-        // Initially no snapshots
-        assert!(dvs.load_snapshots().is_ok());
-        assert!(dvs.get_row(1).is_none());
     }
 }

@@ -838,27 +838,6 @@ impl TransactionRegistry {
         false
     }
 
-    /// Get transaction IDs of all active snapshot-isolation transactions.
-    pub fn get_snapshot_transaction_ids(&self) -> Vec<i64> {
-        let global = self.global_isolation_level.load(Ordering::Relaxed);
-        let transactions = self.transactions.lock();
-
-        if global == 1 {
-            // All active transactions use snapshot isolation
-            return transactions.keys().collect();
-        }
-
-        if self.override_count.load(Ordering::Relaxed) > 0 {
-            let overrides = self.isolation_overrides.lock();
-            return transactions
-                .keys()
-                .filter(|txn_id| overrides.get(*txn_id) == Some(&1))
-                .collect();
-        }
-
-        Vec::new()
-    }
-
     /// The minimum begin_seq among active snapshot isolation transactions,
     /// None with none, for a caller holding the lock
     fn min_snapshot_begin(&self, transactions: &TxnTable) -> Option<i64> {
@@ -1125,6 +1104,7 @@ impl TransactionRegistry {
     }
 
     /// Records an aborted transaction during recovery.
+    #[cfg(test)]
     pub fn recover_aborted_transaction(&self, txn_id: i64) {
         {
             let mut txns = self.transactions.lock();
@@ -1208,7 +1188,6 @@ impl TransactionRegistry {
     }
 
     /// Checks if a version is directly visible (for READ COMMITTED).
-    #[inline(always)]
     pub fn is_directly_visible(&self, version_txn_id: i64) -> bool {
         if version_txn_id == RECOVERY_TRANSACTION_ID {
             return true;
@@ -1280,6 +1259,7 @@ impl TransactionRegistry {
     }
 
     /// Gets the commit sequence for a transaction.
+    #[cfg(test)]
     pub fn get_commit_sequence(&self, txn_id: i64) -> Option<i64> {
         // Check snapshot_seqs first
         if let Some(&seq) = self.snapshot_seqs.lock().get(txn_id) {
@@ -1762,12 +1742,8 @@ impl TransactionRegistry {
         self.accepting.store(true, Ordering::Release);
     }
 
-    /// Shuts down the registry.
-    pub fn shutdown(&self) {
-        self.stop_accepting_transactions();
-    }
-
     /// Checks if the registry is accepting new transactions.
+    #[cfg(test)]
     pub fn is_accepting(&self) -> bool {
         self.accepting.load(Ordering::Acquire)
     }
@@ -1808,6 +1784,7 @@ impl TransactionRegistry {
     }
 
     /// Checks if a transaction is committed.
+    #[cfg(test)]
     pub fn is_committed(&self, txn_id: i64) -> bool {
         // Check if in transactions map
         if self.transactions.lock().contains_key(txn_id) {

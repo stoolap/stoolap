@@ -64,19 +64,15 @@
 //! - [`common`] - Utilities (I64Map, version)
 
 // stoolap-jemalloc as the global allocator, on by default, without its
-// profiler unless heap-profile is on; dhat-heap needs its own allocator
-#[cfg(all(
-    feature = "jemalloc",
-    not(feature = "heap-profile"),
-    not(feature = "dhat-heap")
-))]
+// profiler unless heap-profile is on
+#[cfg(all(feature = "jemalloc", not(feature = "heap-profile")))]
 #[global_allocator]
 static GLOBAL: stoolap_jemalloc::Jemalloc = stoolap_jemalloc::Jemalloc::new();
 
 // stoolap-jemalloc with its sampling heap profiler on from the first
 // allocation, a sample every 512 KiB allocated on average, for PRAGMA
 // HEAP_PROFILE
-#[cfg(all(feature = "heap-profile", not(feature = "dhat-heap")))]
+#[cfg(feature = "heap-profile")]
 #[global_allocator]
 static GLOBAL: stoolap_jemalloc::Jemalloc = stoolap_jemalloc::Jemalloc::new().with_profiling();
 

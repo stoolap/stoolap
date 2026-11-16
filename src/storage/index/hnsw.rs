@@ -27,8 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use crate::common::{I64Map, I64Set};
-use crate::core::{DataType, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
-use crate::storage::expression::Expression;
+use crate::core::{DataType, IndexEntry, IndexType, Operator, Result, Value};
 use crate::storage::traits::index_trait::Index;
 
 // ─────────────────────────────────────────────────────────────
@@ -2655,11 +2654,6 @@ impl HnswIndex {
         self.is_unique.load(AtomicOrdering::Acquire)
     }
 
-    /// Get the distance metric used by this index
-    pub fn distance_metric(&self) -> HnswDistanceMetric {
-        self.metric
-    }
-
     /// Get the HNSW tuning parameters (m, ef_construction, ef_search, metric).
     pub fn params(&self) -> (usize, usize, usize, HnswDistanceMetric) {
         (self.m, self.ef_construction, self.ef_search, self.metric)
@@ -2864,12 +2858,6 @@ impl HnswIndex {
         }
     }
 
-    /// Serialize the graph to bytes (for use by snapshot code).
-    pub fn serialize_graph_bytes(&self) -> Vec<u8> {
-        let inner = self.inner.read();
-        inner.serialize_graph()
-    }
-
     /// Returns the number of nodes in the graph (for checking if graph is non-empty).
     pub fn node_count(&self) -> usize {
         let inner = self.inner.read();
@@ -2880,14 +2868,6 @@ impl HnswIndex {
 impl Index for HnswIndex {
     fn name(&self) -> &str {
         &self.name
-    }
-
-    fn table_name(&self) -> &str {
-        &self.table_name
-    }
-
-    fn build(&mut self) -> Result<()> {
-        Ok(())
     }
 
     fn add(&self, values: &[Value], row_id: i64, _ref_id: i64) -> Result<()> {
@@ -2928,97 +2908,8 @@ impl Index for HnswIndex {
         Ok(())
     }
 
-    fn add_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
-        let mut inner = self.inner.write();
-        let dims_bytes = inner.dims_bytes;
-        let expected_vec_len = self.dims * 4;
-
-        // Collect valid entries for parallel path; a value with no graph
-        // entry takes the row's live node out, once the whole batch is
-        // validated, so a refused batch leaves the graph as it was
-        let mut prepared: Vec<(&[u8], i64)> = Vec::with_capacity(entries.len());
-        let mut leaving: Vec<i64> = Vec::new();
-        for (row_id, values) in entries.iter() {
-            if values.is_empty() {
-                continue;
-            }
-            match Self::extract_vector_bytes(&values[0]) {
-                Some(vec_bytes) if vec_bytes.len() == expected_vec_len => {
-                    prepared.push((vec_bytes, row_id));
-                }
-                _ => leaving.push(row_id),
-            }
-        }
-
-        // The rows the batch takes out no longer stand in a newcomer's way;
-        // the set is built only for a unique index with rows leaving
-        let departing: Option<I64Set> =
-            (self.unique() && !leaving.is_empty()).then(|| leaving.iter().copied().collect());
-        if self.unique() {
-            // Pre-validate full batch before mutating the graph so add_batch is atomic.
-            let mut seen: ahash::AHashMap<&[u8], i64> =
-                ahash::AHashMap::with_capacity(prepared.len());
-            for &(vec_bytes, row_id) in &prepared {
-                if let Some(&existing_row_id) = seen.get(vec_bytes) {
-                    if existing_row_id != row_id {
-                        return Err(crate::core::Error::unique_constraint(
-                            &self.name,
-                            self.column_names.join(", "),
-                            crate::core::ConflictValues::Vector {
-                                dims: self.dims,
-                                holder: None,
-                            },
-                        ));
-                    }
-                } else {
-                    seen.insert(vec_bytes, row_id);
-                }
-
-                if Self::find_exact_duplicate_in_inner(
-                    &inner,
-                    vec_bytes,
-                    row_id,
-                    departing.as_ref(),
-                )
-                .is_some()
-                {
-                    return Err(crate::core::Error::unique_constraint(
-                        &self.name,
-                        self.column_names.join(", "),
-                        crate::core::ConflictValues::Vector {
-                            dims: self.dims,
-                            holder: None,
-                        },
-                    ));
-                }
-            }
-        }
-
-        inner.vectors.reserve(prepared.len() * dims_bytes);
-        inner.nodes.reserve(prepared.len());
-        inner.node_to_row_id.reserve(prepared.len());
-        inner.row_id_to_node.reserve(prepared.len());
-
-        for row_id in leaving {
-            inner.tombstone_row(row_id);
-        }
-        self.insert_prepared(&mut inner, &prepared);
-        Ok(())
-    }
-
     fn remove(&self, _values: &[Value], row_id: i64, _ref_id: i64) -> Result<()> {
         self.inner.write().tombstone_row(row_id);
-        Ok(())
-    }
-
-    fn remove_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
-        let mut inner = self.inner.write();
-        for row_id in entries.keys() {
-            if let Some(&node_id) = inner.row_id_to_node.get(row_id) {
-                inner.unique_map_remove(node_id);
-                inner.set_deleted(node_id);
-            }
-        }
         Ok(())
     }
 
@@ -3173,11 +3064,6 @@ impl Index for HnswIndex {
         )))
     }
 
-    fn get_filtered_row_ids(&self, _expr: &dyn Expression) -> RowIdVec {
-        // HNSW does not support expression-based filtering
-        RowIdVec::new()
-    }
-
     fn search_nearest(&self, query: &Value, k: usize, ef_search: usize) -> Option<Vec<(i64, f64)>> {
         let query_bytes = Self::extract_vector_bytes(query)?;
         if query_bytes.len() != self.dims * 4 {
@@ -3294,10 +3180,6 @@ impl Index for HnswIndex {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-
-    fn close(&mut self) -> Result<()> {
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -3317,11 +3199,10 @@ mod tests {
     }
 
     /// A batch the unique check refuses leaves the graph as it was: the
-    /// rows whose value has no graph entry stay, and their vectors stay
-    /// unique, on both batch entry points
+    /// rows whose value has no graph entry stay, and their vectors stay unique
     #[test]
     fn a_refused_batch_leaves_the_rows_it_would_take_out() {
-        for slice in [false, true] {
+        {
             let mut index = HnswIndex::new(
                 "test_idx".to_string(),
                 "test_table".to_string(),
@@ -3334,67 +3215,49 @@ mod tests {
                 HnswDistanceMetric::L2,
             );
             index.set_unique(true);
-            index.build().unwrap();
             index.add(&[make_vector_value(&[1.0, 0.0])], 1, 1).unwrap();
             index.add(&[make_vector_value(&[2.0, 0.0])], 2, 2).unwrap();
             // Row 1 leaves, row 3 repeats row 2's vector: refused whole
             let null = Value::Null(crate::core::DataType::Null);
             let repeated = make_vector_value(&[2.0, 0.0]);
-            let refused = if slice {
-                index.add_batch_slice(&[
-                    (1, std::slice::from_ref(&null)),
-                    (3, std::slice::from_ref(&repeated)),
-                ])
-            } else {
-                let mut entries: I64Map<Vec<Value>> = I64Map::new();
-                entries.insert(1, vec![null.clone()]);
-                entries.insert(3, vec![repeated.clone()]);
-                index.add_batch(&entries)
-            };
-            assert!(refused.is_err(), "slice {slice}");
+            let refused = index.add_batch_slice(&[
+                (1, std::slice::from_ref(&null)),
+                (3, std::slice::from_ref(&repeated)),
+            ]);
+            assert!(refused.is_err());
             let query = make_vector_value(&[1.0, 0.0]);
             let query = HnswIndex::extract_vector_bytes(&query).unwrap();
             let nearest = index.search_nearest(query, 1, 64);
-            assert_eq!(
-                nearest.first().map(|(id, _)| *id),
-                Some(1),
-                "slice {slice}: row 1 stays"
-            );
+            assert_eq!(nearest.first().map(|(id, _)| *id), Some(1), "row 1 stays");
             assert!(
                 index.add(&[make_vector_value(&[1.0, 0.0])], 4, 4).is_err(),
-                "slice {slice}: row 1's vector stays unique"
+                "row 1's vector stays unique"
             );
             // An accepted batch does take the row out, and a newcomer may
             // take the departing row's vector in the same batch
             let reused = make_vector_value(&[1.0, 0.0]);
-            let accepted = if slice {
-                index.add_batch_slice(&[
+            index
+                .add_batch_slice(&[
                     (1, std::slice::from_ref(&null)),
                     (5, std::slice::from_ref(&reused)),
                 ])
-            } else {
-                let mut entries: I64Map<Vec<Value>> = I64Map::new();
-                entries.insert(1, vec![null.clone()]);
-                entries.insert(5, vec![reused.clone()]);
-                index.add_batch(&entries)
-            };
-            accepted.unwrap_or_else(|e| panic!("slice {slice}: the reuse is accepted: {e}"));
+                .unwrap_or_else(|e| panic!("the reuse is accepted: {e}"));
             let nearest = index.search_nearest(query, 1, 64);
             assert_eq!(
                 nearest.first().map(|(id, _)| *id),
                 Some(5),
-                "slice {slice}: row 5 took the vector"
+                "row 5 took the vector"
             );
             assert!(
                 index.add(&[make_vector_value(&[1.0, 0.0])], 6, 6).is_err(),
-                "slice {slice}: the vector is row 5's now"
+                "the vector is row 5's now"
             );
         }
     }
 
     #[test]
     fn test_hnsw_basic_search() {
-        let mut index = HnswIndex::new(
+        let index = HnswIndex::new(
             "test_idx".to_string(),
             "test_table".to_string(),
             "embedding".to_string(),
@@ -3405,7 +3268,6 @@ mod tests {
             64,  // ef_search
             HnswDistanceMetric::L2,
         );
-        index.build().unwrap();
 
         // Insert 100 vectors with known pattern
         for i in 0..100i64 {
@@ -3435,7 +3297,7 @@ mod tests {
 
     #[test]
     fn test_hnsw_delete() {
-        let mut index = HnswIndex::new(
+        let index = HnswIndex::new(
             "test_idx".to_string(),
             "test_table".to_string(),
             "embedding".to_string(),
@@ -3446,7 +3308,6 @@ mod tests {
             64,
             HnswDistanceMetric::L2,
         );
-        index.build().unwrap();
 
         for i in 0..50i64 {
             let v = make_vector_value(&[i as f32, 0.0, 0.0]);
@@ -3474,7 +3335,7 @@ mod tests {
         let n = 1000;
         let k = 10;
 
-        let mut index = HnswIndex::new(
+        let index = HnswIndex::new(
             "test_idx".to_string(),
             "test_table".to_string(),
             "embedding".to_string(),
@@ -3485,7 +3346,6 @@ mod tests {
             128, // higher ef_search for recall test
             HnswDistanceMetric::L2,
         );
-        index.build().unwrap();
 
         // Generate vectors with deterministic pattern
         let vectors: Vec<Vec<f32>> = (0..n)
@@ -3546,7 +3406,7 @@ mod tests {
         let num_queries = 50;
         let num_clusters = 50;
 
-        let mut index = HnswIndex::new(
+        let index = HnswIndex::new(
             "test_idx_batch".to_string(),
             "test_table".to_string(),
             "embedding".to_string(),
@@ -3557,7 +3417,6 @@ mod tests {
             200,
             HnswDistanceMetric::L2,
         );
-        index.build().unwrap();
 
         // Deterministic LCG PRNG
         let mut rng: u64 = 42;

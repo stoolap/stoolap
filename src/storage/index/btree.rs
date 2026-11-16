@@ -30,9 +30,7 @@ use std::sync::Arc;
 
 use super::value_tree::{Ids, ValueTree};
 use crate::common::deadline::{Deadline, DeadlineSite, CHARGE_BEAT};
-use crate::common::I64Map;
-use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
-use crate::storage::expression::Expression;
+use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, Value};
 use crate::storage::index::id_list::GroupIds;
 use crate::storage::traits::Index;
 
@@ -73,9 +71,6 @@ pub struct BTreeData {
 
     /// Sorted value to row IDs mapping (main index for range and equality queries)
     sorted_values: RwLock<ValueTree>,
-
-    /// Reference ID counter
-    next_ref_id: RwLock<i64>,
 }
 
 impl std::ops::Deref for BTreeIndex {
@@ -131,25 +126,8 @@ impl BTreeIndex {
             data: Arc::new(BTreeData {
                 closed: AtomicBool::new(false),
                 sorted_values: RwLock::new(ValueTree::new()),
-                next_ref_id: RwLock::new(0),
             }),
         }
-    }
-
-    /// Creates a B-tree index with a custom name
-    pub fn with_custom_name(
-        table_name: String,
-        column_id: i32,
-        column_name: String,
-        data_type: DataType,
-        unique: bool,
-        custom_name: Option<&str>,
-    ) -> Self {
-        let name = custom_name
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("idx_{}_{}_btree", table_name, column_name));
-
-        Self::new(name, table_name, column_id, column_name, data_type, unique)
     }
 
     /// Check if the index is closed
@@ -160,17 +138,23 @@ impl BTreeIndex {
         Ok(())
     }
 
-    /// Gets the next reference ID
-    fn next_ref(&self) -> i64 {
-        let mut ref_id = self.next_ref_id.write();
-        *ref_id += 1;
-        *ref_id
+    /// The number of distinct values in the index
+    #[cfg(test)]
+    fn unique_value_count(&self) -> usize {
+        self.sorted_values.read().len()
     }
 
-    /// Returns the number of unique values in the index
-    pub fn unique_value_count(&self) -> usize {
-        let sorted_values = self.sorted_values.read();
-        sorted_values.len()
+    /// Every value with its row ids, in value order
+    #[cfg(test)]
+    fn grouped_row_ids(&self) -> Vec<(Value, Vec<i64>)> {
+        let mut result = Vec::new();
+        self.sorted_values
+            .read()
+            .walk(Bound::Unbounded, true, &mut |value, row_ids| {
+                result.push((value.clone(), row_ids.iter().collect()));
+                true
+            });
+        result
     }
 
     /// Returns the total number of entries (row IDs) in the index
@@ -211,21 +195,6 @@ impl BTreeIndex {
         }
         deadline.charge(DeadlineSite::StorageRead, values.len() % CHARGE_BEAT)?;
         Ok(values)
-    }
-
-    /// Gets all row IDs for a specific value
-    pub fn get_row_ids_for_value(&self, value: &Value) -> Vec<i64> {
-        let sorted_values = self.sorted_values.read();
-        sorted_values
-            .get(value)
-            .map(|set| set.iter().collect())
-            .unwrap_or_default()
-    }
-
-    /// Checks if a value exists in the index
-    pub fn contains_value(&self, value: &Value) -> bool {
-        let sorted_values = self.sorted_values.read();
-        sorted_values.get(value).is_some()
     }
 
     /// Internal method to find row IDs matching an operator
@@ -269,16 +238,6 @@ impl Index for BTreeIndex {
         &self.name
     }
 
-    fn table_name(&self) -> &str {
-        &self.table_name
-    }
-
-    fn build(&mut self) -> Result<()> {
-        self.check_closed()?;
-        // Index is built incrementally via add() calls
-        Ok(())
-    }
-
     fn add(&self, values: &[Value], row_id: i64, _ref_id: i64) -> Result<()> {
         self.check_closed()?;
 
@@ -303,15 +262,6 @@ impl Index for BTreeIndex {
         }
     }
 
-    fn add_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
-        self.check_closed()?;
-
-        for (row_id, values) in entries.iter() {
-            self.add(values, row_id, self.next_ref())?;
-        }
-        Ok(())
-    }
-
     fn remove(&self, values: &[Value], row_id: i64, _ref_id: i64) -> Result<()> {
         self.check_closed()?;
 
@@ -319,15 +269,6 @@ impl Index for BTreeIndex {
             return Ok(());
         };
         self.sorted_values.write().remove(value, row_id);
-        Ok(())
-    }
-
-    fn remove_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
-        self.check_closed()?;
-
-        for (row_id, values) in entries.iter() {
-            self.remove(values, row_id, 0)?;
-        }
         Ok(())
     }
 
@@ -664,107 +605,6 @@ impl Index for BTreeIndex {
         });
     }
 
-    fn get_filtered_row_ids(&self, expr: &dyn Expression) -> RowIdVec {
-        if self.closed.load(AtomicOrdering::Acquire) {
-            return RowIdVec::new();
-        }
-
-        // Try to get comparison info from expression
-        if let Some((col_name, operator, value)) = expr.get_comparison_info() {
-            // Only handle expressions for this column
-            if col_name == self.column_name {
-                match operator {
-                    Operator::Eq => {
-                        // OPTIMIZATION: Use from_ref to avoid clone
-                        return self.get_row_ids_equal(std::slice::from_ref(value));
-                    }
-                    Operator::Gt | Operator::Gte | Operator::Lt | Operator::Lte => {
-                        // OPTIMIZATION: Use from_ref to avoid clone
-                        let value_slice = std::slice::from_ref(value);
-                        let empty_slice: &[Value] = &[];
-                        let (min_vals, max_vals, include_min, include_max) = match operator {
-                            Operator::Gt => (value_slice, empty_slice, false, false),
-                            Operator::Gte => (value_slice, empty_slice, true, false),
-                            Operator::Lt => (empty_slice, value_slice, false, false),
-                            Operator::Lte => (empty_slice, value_slice, false, true),
-                            _ => return RowIdVec::new(),
-                        };
-
-                        return self.get_row_ids_in_range(
-                            min_vals,
-                            max_vals,
-                            include_min,
-                            include_max,
-                        );
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // Try to extract range from collect_comparisons (for AND expressions)
-        let comparisons = expr.collect_comparisons();
-        if !comparisons.is_empty() {
-            // OPTIMIZATION: Use references instead of cloning values
-            let mut min_val: Option<&Value> = None;
-            let mut max_val: Option<&Value> = None;
-            let mut include_min = false;
-            let mut include_max = false;
-            let mut eq_val: Option<&Value> = None;
-
-            for (col_name, op, val) in &comparisons {
-                if *col_name != self.column_name {
-                    continue;
-                }
-                match op {
-                    Operator::Eq => eq_val = Some(*val),
-                    Operator::Gt => {
-                        min_val = Some(*val);
-                        include_min = false;
-                    }
-                    Operator::Gte => {
-                        min_val = Some(*val);
-                        include_min = true;
-                    }
-                    Operator::Lt => {
-                        max_val = Some(*val);
-                        include_max = false;
-                    }
-                    Operator::Lte => {
-                        max_val = Some(*val);
-                        include_max = true;
-                    }
-                    _ => {}
-                }
-            }
-
-            // Equality takes precedence
-            if let Some(val) = eq_val {
-                return self.get_row_ids_equal(std::slice::from_ref(val));
-            }
-
-            // Range query - use from_ref to avoid cloning
-            let empty_slice: &[Value] = &[];
-            if min_val.is_some() || max_val.is_some() {
-                let min_vals = min_val.map(std::slice::from_ref).unwrap_or(empty_slice);
-                let max_vals = max_val.map(std::slice::from_ref).unwrap_or(empty_slice);
-                return self.get_row_ids_in_range(min_vals, max_vals, include_min, include_max);
-            }
-        }
-
-        // Fallback: evaluate the expression once per value, taking its rows
-        let sorted_values = self.sorted_values.read();
-        let mut results = RowIdVec::new();
-        sorted_values.walk(Bound::Unbounded, true, &mut |value, rows| {
-            let row = crate::core::Row::from_values(vec![value.clone()]);
-            if expr.evaluate(&row).unwrap_or(false) {
-                results.extend(rows.iter());
-            }
-            true
-        });
-        results
-    }
-
     /// Returns the minimum value in the index; NULL, one key, sorts first
     fn get_min_value(&self) -> Option<Value> {
         if self.closed.load(AtomicOrdering::Acquire) {
@@ -939,20 +779,6 @@ impl Index for BTreeIndex {
         }
     }
 
-    fn get_grouped_row_ids(&self) -> Option<Vec<(Value, Vec<i64>)>> {
-        if self.closed.load(AtomicOrdering::Acquire) {
-            return None;
-        }
-
-        let sorted_values = self.sorted_values.read();
-        let mut result: Vec<(Value, Vec<i64>)> = Vec::with_capacity(sorted_values.len());
-        sorted_values.walk(Bound::Unbounded, true, &mut |value, row_ids| {
-            result.push((value.clone(), row_ids.iter().collect()));
-            true
-        });
-        Some(result)
-    }
-
     fn for_each_group(
         &self,
         callback: &mut dyn FnMut(&Value, GroupIds<'_>) -> Result<bool>,
@@ -986,11 +812,6 @@ impl Index for BTreeIndex {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
-    }
-
-    fn close(&mut self) -> Result<()> {
-        self.closed.store(true, AtomicOrdering::Release);
-        self.clear()
     }
 }
 
@@ -1047,124 +868,6 @@ pub(crate) fn before_start<K: Ord>(key: &K, start: &Bound<K>) -> bool {
         Bound::Excluded(start) => Ord::cmp(key, start) != std::cmp::Ordering::Greater,
         Bound::Unbounded => false,
     }
-}
-
-/// Intersects two sorted slices of i64 and returns the common elements
-///
-/// This is an O(n) algorithm when both slices are sorted.
-/// Returns a pooled RowIdVec for efficient memory reuse.
-pub fn intersect_sorted_ids(a: &[i64], b: &[i64]) -> RowIdVec {
-    if a.is_empty() || b.is_empty() {
-        return RowIdVec::new();
-    }
-
-    // Fast path: check if ranges don't overlap at all
-    let (a_min, a_max) = (a[0], a[a.len() - 1]);
-    let (b_min, b_max) = (b[0], b[b.len() - 1]);
-    if a_max < b_min || b_max < a_min {
-        return RowIdVec::new();
-    }
-
-    // Use the smaller slice for the outer loop (binary search approach)
-    let (smaller, larger) = if a.len() <= b.len() { (a, b) } else { (b, a) };
-
-    let mut result = RowIdVec::with_capacity(smaller.len());
-
-    for &val in smaller {
-        if larger.binary_search(&val).is_ok() {
-            result.push(val);
-        }
-    }
-
-    result
-}
-
-/// Intersects multiple sorted slices and returns common elements
-/// Returns a pooled RowIdVec for efficient memory reuse.
-pub fn intersect_multiple_sorted_ids(slices: &[&[i64]]) -> RowIdVec {
-    if slices.is_empty() {
-        return RowIdVec::new();
-    }
-    if slices.len() == 1 {
-        let mut result = RowIdVec::with_capacity(slices[0].len());
-        result.extend_from_slice(slices[0]);
-        return result;
-    }
-
-    let mut result = intersect_sorted_ids(slices[0], slices[1]);
-    for slice in &slices[2..] {
-        if result.is_empty() {
-            break;
-        }
-        result = intersect_sorted_ids(&result, slice);
-    }
-    result
-}
-
-/// Union two sorted slices of row IDs
-///
-/// Returns a sorted slice containing all unique elements from both input slices.
-/// This is an O(n+m) algorithm when both slices are sorted.
-/// Used for OR expression index optimization.
-/// Returns a pooled RowIdVec for efficient memory reuse.
-pub fn union_sorted_ids(a: &[i64], b: &[i64]) -> RowIdVec {
-    if a.is_empty() {
-        let mut result = RowIdVec::with_capacity(b.len());
-        result.extend_from_slice(b);
-        return result;
-    }
-    if b.is_empty() {
-        let mut result = RowIdVec::with_capacity(a.len());
-        result.extend_from_slice(a);
-        return result;
-    }
-
-    let mut result = RowIdVec::with_capacity(a.len() + b.len());
-    let mut i = 0;
-    let mut j = 0;
-
-    while i < a.len() && j < b.len() {
-        match a[i].cmp(&b[j]) {
-            std::cmp::Ordering::Less => {
-                result.push(a[i]);
-                i += 1;
-            }
-            std::cmp::Ordering::Greater => {
-                result.push(b[j]);
-                j += 1;
-            }
-            std::cmp::Ordering::Equal => {
-                result.push(a[i]);
-                i += 1;
-                j += 1;
-            }
-        }
-    }
-
-    // Append remaining elements
-    result.extend_from_slice(&a[i..]);
-    result.extend_from_slice(&b[j..]);
-
-    result
-}
-
-/// Union multiple sorted slices and returns all unique elements
-/// Returns a pooled RowIdVec for efficient memory reuse.
-pub fn union_multiple_sorted_ids(slices: &[&[i64]]) -> RowIdVec {
-    if slices.is_empty() {
-        return RowIdVec::new();
-    }
-    if slices.len() == 1 {
-        let mut result = RowIdVec::with_capacity(slices[0].len());
-        result.extend_from_slice(slices[0]);
-        return result;
-    }
-
-    let mut result = union_sorted_ids(slices[0], slices[1]);
-    for slice in &slices[2..] {
-        result = union_sorted_ids(&result, slice);
-    }
-    result
 }
 
 #[cfg(test)]
@@ -1231,24 +934,9 @@ mod tests {
     fn test_btree_index_creation() {
         let index = create_test_index();
         assert_eq!(index.name(), "idx_test");
-        assert_eq!(index.table_name(), "test_table");
         assert_eq!(index.column_names()[0], "id");
         assert_eq!(index.index_type(), IndexType::BTree);
         assert!(!index.is_unique());
-    }
-
-    #[test]
-    fn test_btree_index_with_custom_name() {
-        let index = BTreeIndex::with_custom_name(
-            "users".to_string(),
-            1,
-            "email".to_string(),
-            DataType::Text,
-            true,
-            Some("custom_email_idx"),
-        );
-        assert_eq!(index.name(), "custom_email_idx");
-        assert!(index.is_unique());
     }
 
     #[test]
@@ -1316,7 +1004,7 @@ mod tests {
 
         // Remove the last entry with value 100
         index.remove(&[Value::Integer(100)], 2, 2).unwrap();
-        assert!(!index.contains_value(&Value::Integer(100)));
+        assert!(index.find(&[Value::Integer(100)]).unwrap().is_empty());
     }
 
     #[test]
@@ -1369,27 +1057,6 @@ mod tests {
     }
 
     #[test]
-    fn test_btree_index_batch_operations() {
-        let index = create_test_index();
-
-        let mut entries = I64Map::new();
-        entries.insert(1, vec![Value::Integer(100)]);
-        entries.insert(2, vec![Value::Integer(200)]);
-        entries.insert(3, vec![Value::Integer(100)]);
-
-        index.add_batch(&entries).unwrap();
-        assert_eq!(index.entry_count(), 3);
-
-        // Remove batch
-        let mut to_remove = I64Map::new();
-        to_remove.insert(1, vec![Value::Integer(100)]);
-        to_remove.insert(2, vec![Value::Integer(200)]);
-
-        index.remove_batch(&to_remove).unwrap();
-        assert_eq!(index.entry_count(), 1);
-    }
-
-    #[test]
     fn a_batch_built_into_an_empty_index_holds_what_one_by_one_adds_hold() {
         // NULLs, repeated keys, INTEGER and FLOAT keys that compare equal,
         // and words FLOAT values share
@@ -1413,10 +1080,7 @@ mod tests {
         for &(id, v) in &entries {
             one_by_one.add(v, id, id).unwrap();
         }
-        assert_eq!(
-            batched.get_grouped_row_ids(),
-            one_by_one.get_grouped_row_ids()
-        );
+        assert_eq!(batched.grouped_row_ids(), one_by_one.grouped_row_ids());
         assert_eq!(batched.entry_count(), values.len());
     }
 
@@ -1491,20 +1155,6 @@ mod tests {
             .find_range(&[Value::text("Alice")], &[Value::text("Bob")], true, true)
             .unwrap();
         assert_eq!(entries.len(), 2); // Alice, Bob
-    }
-
-    #[test]
-    fn test_btree_index_close() {
-        let mut index = create_test_index();
-
-        index.add(&[Value::Integer(100)], 1, 1).unwrap();
-        assert_eq!(index.entry_count(), 1);
-
-        index.close().unwrap();
-
-        // Operations should fail after close
-        assert!(index.add(&[Value::Integer(200)], 2, 2).is_err());
-        assert!(index.find(&[Value::Integer(100)]).is_err());
     }
 
     #[test]

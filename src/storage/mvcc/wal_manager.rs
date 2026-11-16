@@ -118,13 +118,8 @@ impl WalFlags {
     /// This is an abort record marker
     pub const ABORT_MARKER: WalFlags = WalFlags(1 << 2);
     /// This is a checkpoint record
+    #[cfg(test)]
     pub const CHECKPOINT_MARKER: WalFlags = WalFlags(1 << 3);
-    /// This is a snapshot start marker
-    pub const SNAPSHOT_START: WalFlags = WalFlags(1 << 4);
-    /// This is a snapshot complete marker
-    pub const SNAPSHOT_COMPLETE: WalFlags = WalFlags(1 << 5);
-    /// This is a WAL rotation marker
-    pub const ROTATION_MARKER: WalFlags = WalFlags(1 << 6);
 
     /// Create flags from raw byte
     pub fn from_byte(byte: u8) -> Self {
@@ -147,11 +142,13 @@ impl WalFlags {
     }
 
     /// Clear a flag
+    #[cfg(test)]
     pub fn clear(&mut self, flag: WalFlags) {
         self.0 &= !flag.0;
     }
 
     /// Combine two flags
+    #[cfg(test)]
     pub fn union(self, other: WalFlags) -> WalFlags {
         WalFlags(self.0 | other.0)
     }
@@ -599,8 +596,6 @@ pub struct CheckpointMetadata {
 /// Information returned from two-phase WAL recovery
 #[derive(Debug, Clone)]
 pub struct TwoPhaseRecoveryInfo {
-    /// Last LSN processed
-    pub last_lsn: u64,
     /// Number of committed transactions found
     pub committed_transactions: usize,
     /// Number of aborted transactions found
@@ -1299,6 +1294,7 @@ impl WALManager {
     }
 
     /// Check if running
+    #[cfg(test)]
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Acquire)
     }
@@ -1638,6 +1634,7 @@ impl WALManager {
     }
 
     /// Get previous LSN (last written entry's LSN)
+    #[cfg(test)]
     pub fn previous_lsn(&self) -> u64 {
         self.previous_lsn.load(Ordering::Acquire)
     }
@@ -1717,11 +1714,13 @@ impl WALManager {
     }
 
     /// Get maximum WAL file size
+    #[cfg(test)]
     pub fn max_file_size(&self) -> u64 {
         self.max_wal_size
     }
 
     /// Get current WAL sequence number
+    #[cfg(test)]
     pub fn current_sequence(&self) -> u64 {
         self.wal_sequence.load(Ordering::Relaxed)
     }
@@ -1939,7 +1938,6 @@ impl WALManager {
         }
 
         Ok(TwoPhaseRecoveryInfo {
-            last_lsn,
             committed_transactions: committed_txns.len(),
             aborted_transactions: aborted_txns.len(),
             applied_entries: applied_count,
@@ -2232,11 +2230,6 @@ impl WALManager {
     /// Get maximum WAL file size before rotation
     pub fn max_wal_size(&self) -> u64 {
         self.max_wal_size
-    }
-
-    /// Get last checkpoint LSN
-    pub fn last_checkpoint_lsn(&self) -> u64 {
-        self.last_checkpoint.load(Ordering::Acquire)
     }
 
     /// Get current WAL file name

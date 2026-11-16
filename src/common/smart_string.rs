@@ -150,7 +150,7 @@ pub enum StringTag {
 
 impl StringTag {
     /// Returns true if the string is stored inline
-    #[inline]
+    #[cfg(test)]
     pub const fn is_inline(self) -> bool {
         (self as u8) <= 15
     }
@@ -340,19 +340,6 @@ impl SmartString {
         Self::new(s)
     }
 
-    /// Alias for new() - for API compatibility
-    #[inline]
-    pub fn new_text(s: &str) -> Self {
-        Self::new(s)
-    }
-
-    /// The capacity is not reserved: a `SmartString` decides between its
-    /// inline buffer and the heap on each write, so this is `default()`.
-    #[inline]
-    pub fn with_capacity(_capacity: usize) -> Self {
-        Self::default()
-    }
-
     /// Create from owned String
     #[inline]
     pub fn from_string(s: String) -> Self {
@@ -393,6 +380,12 @@ impl SmartString {
         }
     }
 
+    /// Whether the string is stored inline
+    #[cfg(test)]
+    pub fn is_inline(&self) -> bool {
+        self.tag.is_inline()
+    }
+
     /// Bytes a heap string's block holds beyond the SmartString itself: its
     /// count and the string. Zero when inline.
     #[inline]
@@ -420,25 +413,8 @@ impl SmartString {
     }
 
     #[inline]
-    pub fn is_inline(&self) -> bool {
-        self.tag.is_inline()
-    }
-
-    #[inline]
     pub fn is_heap(&self) -> bool {
         self.tag.is_heap()
-    }
-
-    /// Convert to a version that will use Arc for future clones (no-op now, kept for API compat)
-    #[inline]
-    pub fn into_shared(self) -> Self {
-        self
-    }
-
-    /// Convert self to shared in place (no-op now, kept for API compat)
-    #[inline]
-    pub fn make_shared(&mut self) {
-        // No-op: we always use Arc for heap strings now
     }
 
     /// Appends a character to the string.
@@ -557,22 +533,6 @@ impl SmartString {
     }
 
     #[inline]
-    pub fn concat(a: &str, b: &str) -> SmartString {
-        let total_len = a.len() + b.len();
-        if total_len <= MAX_INLINE_LEN {
-            let mut data = [0u8; 15];
-            data[..a.len()].copy_from_slice(a.as_bytes());
-            data[a.len()..total_len].copy_from_slice(b.as_bytes());
-            SmartString {
-                tag: StringTag::inline(total_len),
-                data,
-            }
-        } else {
-            Self::heap_from(&[a, b])
-        }
-    }
-
-    #[inline]
     pub fn concat_many(strings: &[&str]) -> SmartString {
         let total_len: usize = strings.iter().map(|s| s.len()).sum();
         if total_len <= MAX_INLINE_LEN {
@@ -588,34 +548,6 @@ impl SmartString {
             }
         } else {
             Self::heap_from(strings)
-        }
-    }
-
-    #[inline]
-    pub fn from_string_heap(s: String) -> Self {
-        debug_assert!(s.len() > MAX_INLINE_LEN);
-        Self::new_heap(&s)
-    }
-
-    /// Build an inline SmartString by writing bytes directly.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that the bytes written by `builder` form valid UTF-8.
-    #[inline]
-    pub unsafe fn build_inline<F>(total_len: usize, builder: F) -> Option<SmartString>
-    where
-        F: FnOnce(&mut [u8]),
-    {
-        if total_len <= MAX_INLINE_LEN {
-            let mut data = [0u8; 15];
-            builder(&mut data[..total_len]);
-            Some(SmartString {
-                tag: StringTag::inline(total_len),
-                data,
-            })
-        } else {
-            None
         }
     }
 }
@@ -1029,17 +961,6 @@ mod tests {
     }
 
     #[test]
-    fn test_concat() {
-        let s = SmartString::concat("hello", " world");
-        assert_eq!(s.as_str(), "hello world");
-        assert!(s.is_inline());
-
-        let s = SmartString::concat("hello", " world, this is a very long string");
-        assert_eq!(s.as_str(), "hello world, this is a very long string");
-        assert!(s.is_heap());
-    }
-
-    #[test]
     fn test_concat_many() {
         let s = SmartString::concat_many(&["a", "b", "c"]);
         assert_eq!(s.as_str(), "abc");
@@ -1147,26 +1068,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_inline() {
-        // SAFETY: Callback writes exactly 5 valid UTF-8 bytes ("hello")
-        let s = unsafe {
-            SmartString::build_inline(5, |buf| {
-                buf.copy_from_slice(b"hello");
-            })
-        };
-        assert!(s.is_some());
-        assert_eq!(s.unwrap().as_str(), "hello");
-
-        // SAFETY: Length 20 exceeds inline capacity, callback won't be invoked
-        let s = unsafe {
-            SmartString::build_inline(20, |_| {
-                // Too long, won't be called
-            })
-        };
-        assert!(s.is_none());
-    }
-
-    #[test]
     fn a_string_goes_to_the_heap_past_fifteen_bytes() {
         for (text, heap) in [
             ("", false),
@@ -1204,11 +1105,6 @@ mod tests {
 
     #[test]
     fn a_concatenation_past_fifteen_bytes_is_built_on_the_heap() {
-        let joined = SmartString::concat("abcdefgh", "ijklmnop");
-        assert_eq!(
-            (joined.as_str(), joined.is_heap()),
-            ("abcdefghijklmnop", true)
-        );
         let many = SmartString::concat_many(&["abc", "", "defgh\u{e9}", "ijklmnop"]);
         assert_eq!(many.as_str(), "abcdefgh\u{e9}ijklmnop");
         let mut pushed = SmartString::new("abcdefghijklmno");

@@ -346,8 +346,8 @@ fn an_uncorrelated_subquery_answers_once_for_the_rows_it_chooses_and_writes() {
     stoolap::functions::global_registry()
         .register_scalar::<Tick>()
         .unwrap();
-    let mut engine = stoolap::storage::mvcc::engine::MVCCEngine::in_memory();
-    stoolap::storage::traits::Engine::open(&mut engine).unwrap();
+    let engine = stoolap::storage::mvcc::engine::MVCCEngine::in_memory();
+    engine.open_engine().unwrap();
     let executor = stoolap::executor::Executor::new(Arc::new(engine));
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, b INTEGER)",
@@ -379,8 +379,8 @@ fn a_correlated_volatile_where_answers_once_for_the_row_it_writes() {
     stoolap::functions::global_registry()
         .register_scalar::<Tick>()
         .unwrap();
-    let mut engine = stoolap::storage::mvcc::engine::MVCCEngine::in_memory();
-    stoolap::storage::traits::Engine::open(&mut engine).unwrap();
+    let engine = stoolap::storage::mvcc::engine::MVCCEngine::in_memory();
+    engine.open_engine().unwrap();
     let executor = stoolap::executor::Executor::new(Arc::new(engine));
     for sql in [
         "CREATE TABLE t (id INTEGER PRIMARY KEY, b INTEGER)",
