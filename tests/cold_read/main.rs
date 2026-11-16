@@ -56,5 +56,6 @@ mod storage_aggregate_admission_test;
 mod storage_filter_error_test;
 mod targeted_cold_load_test;
 mod upsert_cold_dupe_test;
+mod zone_map_any_segment_test;
 mod zone_map_visibility_test;
 mod zonemap_test;

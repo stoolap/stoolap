@@ -2296,6 +2296,20 @@ pub(crate) fn zone_map_pruned() {
 }
 
 thread_local! {
+    static ZONE_MAP_ENTRIES_CHECKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Zone map segment entries this thread asked whether a predicate prunes
+/// them, so far
+pub fn zone_map_entries_checked() -> usize {
+    ZONE_MAP_ENTRIES_CHECKED.with(std::cell::Cell::get)
+}
+
+pub(crate) fn zone_map_entry_checked() {
+    ZONE_MAP_ENTRIES_CHECKED.with(|checked| checked.set(checked.get() + 1));
+}
+
+thread_local! {
     /// Rows table-valued functions generated on this thread: a statement
     /// generates on the thread that runs it, so tests in parallel never meet
     static TVF_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

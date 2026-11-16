@@ -563,14 +563,11 @@ impl QueryPlanner {
         }
 
         // For AND expressions: ALL comparisons must show no possible match
-        // For a single comparison: check if any segment could match
+        // For a single comparison: check if any segment could match; a
+        // comparison no zone map answers keeps the scan
         for (column, op, value) in comparisons {
-            if let Some(segments) = zone_maps.get_segments_to_scan(column, op, value) {
-                if !segments.is_empty() {
-                    return false; // At least one segment might match
-                }
-            } else {
-                return false; // Cannot evaluate this comparison
+            if zone_maps.may_match(column, op, value) != Some(false) {
+                return false;
             }
         }
 

@@ -109,6 +109,8 @@ impl ZoneMapEntry {
     ///
     /// Returns true if the entire segment can be skipped (no rows will match)
     pub fn can_prune(&self, operator: Operator, value: &Value) -> bool {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::zone_map_entry_checked();
         // If predicate is NULL comparison, check null_count
         if value.is_null() {
             return match operator {
@@ -217,6 +219,28 @@ impl ColumnZoneMap {
             .collect()
     }
 
+    /// Whether a segment may hold a row the predicate keeps, the segments
+    /// asked only until one may. A range bound the column's global minimum
+    /// or maximum passes is kept by the segment holding that value, which no
+    /// segment check is needed to find
+    pub fn may_match(&self, operator: Operator, value: &Value) -> bool {
+        let kept = |global: &Option<Value>, keeps: fn(&Value, &Value) -> bool| {
+            !value.is_null() && global.as_ref().is_some_and(|bound| keeps(bound, value))
+        };
+        let by_bound = match operator {
+            Operator::Gt => kept(&self.global_max, |max, value| max > value),
+            Operator::Gte => kept(&self.global_max, |max, value| max >= value),
+            Operator::Lt => kept(&self.global_min, |min, value| min < value),
+            Operator::Lte => kept(&self.global_min, |min, value| min <= value),
+            _ => false,
+        };
+        by_bound
+            || self
+                .segments
+                .iter()
+                .any(|entry| !entry.can_prune(operator, value))
+    }
+
     /// Count how many segments can be pruned
     pub fn count_pruned_segments(&self, operator: Operator, value: &Value) -> usize {
         self.segments
@@ -300,6 +324,12 @@ impl TableZoneMap {
         let col_map = self.columns.get(column)?;
         Some(col_map.get_unpruned_segments(operator, value))
     }
+
+    /// Whether a segment of `column` may hold a row the predicate keeps;
+    /// None when the column has no zone map
+    pub fn may_match(&self, column: &str, operator: Operator, value: &Value) -> Option<bool> {
+        Some(self.columns.get(column)?.may_match(operator, value))
+    }
 }
 
 /// Statistics about segment pruning
@@ -358,6 +388,51 @@ impl ZoneMapBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn may_match_answers_as_the_segments_do() {
+        use crate::core::DataType;
+        // Segments of 10 values from 0, one of NULLs only, one of a single text
+        let mut map = ColumnZoneMap::new("c");
+        for id in 0..40 {
+            map.update_segment(id / 10, &Value::Integer(id as i64));
+        }
+        map.update_segment(4, &Value::Null(DataType::Integer));
+        let mut alone = ColumnZoneMap::new("c");
+        alone.update_segment(0, &Value::Null(DataType::Integer));
+        let mut text = ColumnZoneMap::new("c");
+        text.update_segment(0, &Value::text("m"));
+        let values = [
+            Value::Integer(-1),
+            Value::Integer(0),
+            Value::Integer(15),
+            Value::Integer(39),
+            Value::Integer(40),
+            Value::Null(DataType::Integer),
+            Value::text("m"),
+        ];
+        let operators = [
+            Operator::Eq,
+            Operator::Ne,
+            Operator::Lt,
+            Operator::Lte,
+            Operator::Gt,
+            Operator::Gte,
+            Operator::IsNull,
+        ];
+        for map in [&map, &alone, &text, &ColumnZoneMap::new("c")] {
+            for value in &values {
+                for operator in operators {
+                    let segments = !map.get_unpruned_segments(operator, value).is_empty();
+                    assert_eq!(
+                        map.may_match(operator, value),
+                        segments,
+                        "{operator:?} {value:?} over {map:?}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_zone_map_entry_basic() {
