@@ -4550,6 +4550,7 @@ impl PreparedSelect {
             return;
         };
         // An index read is asked the whole WHERE, its own equality too
+        let mut instead = Vec::new();
         let (key, filter, by) = match self.where_.point.clone() {
             Some((key, filter)) => (key, filter, KeyReadBy::Pk),
             None if self.asks_blocks() => return,
@@ -4559,21 +4560,22 @@ impl PreparedSelect {
                     .iter()
                     .find(|key| store.has_unique_index_on(key.index))
                     .map(|key| (key, KeyReadBy::Unique));
+                let readable = |key: &&PreparedComparison| {
+                    store.index_on(key.index).is_some_and(|index| {
+                        matches!(
+                            index.index_type(),
+                            crate::core::IndexType::BTree
+                                | crate::core::IndexType::Hash
+                                | crate::core::IndexType::Bitmap
+                        )
+                    })
+                };
                 let indexed = || {
-                    equalities
-                        .iter()
-                        .find(|key| {
-                            store.index_on(key.index).is_some_and(|index| {
-                                matches!(
-                                    index.index_type(),
-                                    crate::core::IndexType::BTree
-                                        | crate::core::IndexType::Hash
-                                        | crate::core::IndexType::Bitmap
-                                )
-                            })
-                        })
-                        .filter(|_| !ordered)
-                        .map(|key| (key, KeyReadBy::Index))
+                    let mut keys = equalities.iter().filter(readable).filter(|_| !ordered);
+                    let first = keys.next()?;
+                    // Each run reads the key whose index holds the fewest ids
+                    instead = keys.cloned().collect();
+                    Some((first, KeyReadBy::Index))
                 };
                 match unique.or_else(indexed) {
                     Some((key, by)) => (key.clone(), Some(self.where_.whole.program.clone()), by),
@@ -4594,6 +4596,7 @@ impl PreparedSelect {
         let projection_binds = projection.binds_params();
         let read = KeyRead {
             key,
+            instead,
             otherwise,
             filter,
             whole_row: projection.is_columns_in_order(schema.columns.len()),

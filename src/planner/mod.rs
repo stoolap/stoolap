@@ -272,6 +272,9 @@ impl WindowRead {
 #[derive(Debug)]
 pub struct KeyRead {
     pub(crate) key: PreparedComparison,
+    /// The WHERE's other indexed equalities a non-unique read may take its
+    /// rows by instead, the one whose index holds the fewest ids winning
+    pub(crate) instead: Vec<PreparedComparison>,
     /// The read of a run whose key names no row id
     pub(crate) otherwise: Box<Read>,
     /// The WHERE's other conjuncts
@@ -390,10 +393,15 @@ fn read_lines(read: &Read, text: &PlanText<'_>, lines: &mut Vec<String>) {
         }
         (Read::IndexGet(key), _) => {
             if text.keyed {
-                alternative(
-                    lines,
-                    format!("IndexGet {} {}", text.table, key.key.describe()),
-                );
+                let keys = match key.instead.is_empty() {
+                    true => key.key.describe(),
+                    false => {
+                        let keys = std::iter::once(&key.key).chain(&key.instead);
+                        let keys: Vec<String> = keys.map(|key| key.describe()).collect();
+                        format!("by the fewest of {}", keys.join(", "))
+                    }
+                };
+                alternative(lines, format!("IndexGet {} {keys}", text.table));
             }
             read_lines(&key.otherwise, text, lines);
         }

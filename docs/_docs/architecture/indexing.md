@@ -191,12 +191,12 @@ When multiple indexes exist on different columns, Stoolap can combine them:
 ```sql
 -- If idx_category and idx_price exist:
 SELECT * FROM products WHERE category = 'Electronics' AND price > 500;
--- Both indexes used, results intersected
+-- Read from the index holding fewer rows for these values
 ```
 
 The query executor:
-1. Looks up row IDs from each applicable index
-2. Intersects the results for AND conditions
+1. Counts the row IDs each applicable index holds for the run's values, without copying them
+2. For AND conditions, reads the index holding the fewest and intersects the others that narrow it (an index holding more than four times the rows already found is left to the filter)
 3. Unions the results for OR conditions
 
 ## Creating Indexes

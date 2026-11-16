@@ -507,9 +507,11 @@ impl Executor {
         Ok(rows)
     }
 
-    /// The rows `plan`'s non-unique index holds for its key's value, read as
-    /// the latest committed state; None outside an autocommit read committed
-    /// statement without a view, or when the index or the read declines
+    /// The rows a non-unique index of `plan` holds for its key's value, the
+    /// index of the fewest ids among its key and the keys it may read
+    /// instead, read as the latest committed state; None outside an
+    /// autocommit read committed statement without a view, or when the index
+    /// or the read declines
     #[inline(never)]
     fn fetch_index_rows(
         &self,
@@ -530,18 +532,47 @@ impl Executor {
         let Some(store) = plan.store.upgrade().filter(|store| !store.is_closed()) else {
             return Ok(None);
         };
-        let rows = self.engine.fetch_latest_equal_in(
-            &plan.table,
-            &store,
-            (plan.key.column(), &value),
-            INDEX_GET_ROWS,
-            plan.token,
-        )?;
+        let rows = match plan.instead.is_empty() {
+            true => self.engine.fetch_latest_equal_in::<false>(
+                &plan.table,
+                &store,
+                (plan.key.column(), &value),
+                (0, &|_| None),
+                INDEX_GET_ROWS,
+                plan.token,
+            )?,
+            false => self.fetch_rows_by_fewest(plan, params, &store, &value)?,
+        };
         #[cfg(feature = "test-failpoints")]
         if rows.is_some() {
             crate::test_failpoints::note_read("exec.index_get");
         }
         Ok(rows.map(KeyRows::Many))
+    }
+
+    /// `fetch_index_rows`'s read of a key read with other keys to take its
+    /// rows by, `value` its own key's; each other key's value is bound only
+    /// when the read asks for it, one that binds NULL left out
+    #[inline(never)]
+    fn fetch_rows_by_fewest(
+        &self,
+        plan: &KeyRead,
+        params: &[Value],
+        store: &Arc<VersionStore>,
+        value: &Value,
+    ) -> Result<Option<RowVec>> {
+        let key_at = |at: usize| {
+            let key = plan.instead.get(at)?;
+            Some((key.column(), key.value(params).filter(|v| !v.is_null())?))
+        };
+        self.engine.fetch_latest_equal_in::<true>(
+            &plan.table,
+            store,
+            (plan.key.column(), value),
+            (plan.instead.len(), &key_at),
+            INDEX_GET_ROWS,
+            plan.token,
+        )
     }
 
     #[inline(always)]

@@ -708,6 +708,28 @@ impl Index for BitmapIndex {
         Some(CappedEqual::Copied)
     }
 
+    fn count_capped(
+        &self,
+        lower: std::ops::Bound<&Value>,
+        upper: std::ops::Bound<&Value>,
+        max: usize,
+    ) -> Option<usize> {
+        use std::ops::Bound;
+        let (Bound::Included(key), Bound::Included(high)) = (lower, upper) else {
+            return None;
+        };
+        if key != high || self.closed.load(AtomicOrdering::Acquire) || self.column_ids.len() != 1 {
+            return None;
+        }
+        let bitmaps = self.bitmaps.read();
+        let count = bitmaps.get(key).map_or(0, |bitmap| bitmap.len());
+        Some(
+            usize::try_from(count)
+                .unwrap_or(usize::MAX)
+                .min(max.saturating_add(1)),
+        )
+    }
+
     fn get_row_ids_in_range_into(
         &self,
         _min_value: &[Value],

@@ -3408,6 +3408,30 @@ pub(crate) fn side_file_read() {
 }
 
 thread_local! {
+    static SIDE_DECISIONS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// The candidate positions this thread's side file walks named, and the
+/// volumes its side file decisions left to the scan as too many
+pub fn side_decisions() -> (usize, usize) {
+    SIDE_DECISIONS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn side_walk_decided(candidates: u64) {
+    SIDE_DECISIONS.with(|c| {
+        let (named, scans) = c.get();
+        c.set((named + candidates as usize, scans));
+    });
+}
+
+pub(crate) fn side_scan_decided() {
+    SIDE_DECISIONS.with(|c| {
+        let (named, scans) = c.get();
+        c.set((named, scans + 1));
+    });
+}
+
+thread_local! {
     static COLD_CLAIM_TAKEN_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static COLD_ONLY_CLAIMED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }

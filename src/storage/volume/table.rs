@@ -192,6 +192,19 @@ struct SideAsk {
     keys: AskKeys,
 }
 
+/// Every index a read's comparisons bound, the one asked when no side file
+/// counts first
+type SideAsks = smallvec::SmallVec<[SideAsk; 2]>;
+
+thread_local! {
+    /// Each ask's estimated positions in the volume being decided, with its
+    /// place among the asks: one buffer a thread keeps for every volume it
+    /// decides, so the ordering allocates nothing per volume
+    static COUNTED_ASKS: std::cell::Cell<Vec<(u64, usize)>> = const {
+        std::cell::Cell::new(Vec::new())
+    };
+}
+
 enum AskKeys {
     /// An ordered i64 entry's keys in `[low, high]`, empty when low is above
     I64(i64, i64),
@@ -817,11 +830,7 @@ impl SegmentedTable {
                 .map(|e| e.collect_comparisons())
                 .unwrap_or_default();
             let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
-            let ask = if comparisons.is_empty() {
-                None
-            } else {
-                self.side_ask(&comparisons)
-            };
+            let asks = self.side_asks(&comparisons);
             let unique_keys = self.unique_keys_for(&comparisons)?;
 
             'outer: for (seg_id, cs) in view.volumes() {
@@ -843,7 +852,7 @@ impl SegmentedTable {
                 let (mut walk, positions) = match self.unique_decision(cs, &unique_keys) {
                     UniqueDecision::Empty => continue,
                     UniqueDecision::Positions(positions) => (None, Some(positions)),
-                    UniqueDecision::Pass => match self.side_decision(cs, ask.as_ref())? {
+                    UniqueDecision::Pass => match self.side_decision(cs, &asks)? {
                         SideDecision::Empty => continue,
                         SideDecision::Walk(plan) => (start_walk(&plan)?, None),
                         SideDecision::Scan => (None, None),
@@ -3029,23 +3038,66 @@ impl SegmentedTable {
     /// Whether a volume's side file serves the statement's comparisons, decided
     /// before the volume's data is touched, on the captured segment alone:
     /// the comparisons must bound one column the catalog indexes (one
-    /// equality, or a lower and an upper bound), the segment's side file must
-    /// cover that column under the index's current identity, a reader's
+    /// equality, or a lower and an upper bound), of the asks the one whose
+    /// side file entry counts the fewest positions, the segment's side file
+    /// must cover that column under the index's current identity, a reader's
     /// working reservation must be admitted, and the exact candidate count
     /// from the boundary pages must be a small share of the volume's rows.
     /// Everything else sends the volume through the scan, counted by why.
     fn side_decision(
         &self,
         cs: &super::manifest::ColdSegment,
-        ask: Option<&SideAsk>,
+        asks: &[SideAsk],
+    ) -> Result<SideDecision> {
+        match asks {
+            [] => Ok(SideDecision::Scan),
+            [only] => self.ask_decision(cs, only, true),
+            _ => {
+                let mut counted = COUNTED_ASKS.with(std::cell::Cell::take);
+                let decided = self.decide_fewest_first(cs, asks, &mut counted);
+                COUNTED_ASKS.with(|held| held.set(counted));
+                decided
+            }
+        }
+    }
+
+    /// [`Self::side_decision`] for several asks, tried in the order
+    /// `fewest_first` gives them in `counted`: a count the directory
+    /// misjudged sends the volume on to the next
+    fn decide_fewest_first(
+        &self,
+        cs: &super::manifest::ColdSegment,
+        asks: &[SideAsk],
+        counted: &mut Vec<(u64, usize)>,
+    ) -> Result<SideDecision> {
+        use super::secondary::READS;
+        if !self.fewest_first(cs, asks, counted)? {
+            READS.count(&READS.misses, 1);
+            return Ok(SideDecision::Empty);
+        }
+        let last = counted.len() - 1;
+        for (tried, &(_, at)) in counted.iter().enumerate() {
+            match self.ask_decision(cs, &asks[at], tried == last)? {
+                SideDecision::Scan => {}
+                decided => return Ok(decided),
+            }
+        }
+        Ok(SideDecision::Scan)
+    }
+
+    /// [`Self::side_decision`] for the one ask `ask`, its scans counted when
+    /// it is the `last` the volume tries
+    fn ask_decision(
+        &self,
+        cs: &super::manifest::ColdSegment,
+        ask: &SideAsk,
+        last: bool,
     ) -> Result<SideDecision> {
         use super::secondary::{is_refused, SidePlan, READS};
-        let Some(SideAsk { def, keys }) = ask else {
-            return Ok(SideDecision::Scan);
-        };
+        let SideAsk { def, keys } = ask;
         let reserve = super::secondary::reader_bytes(super::secondary::SIDE_WINDOW);
         let keys = keys.range();
-        let side = match self.side_admits(cs, def, keys, reserve)? {
+        let side = match self.side_admits(cs, def, keys, reserve, last)? {
             SideAdmission::Empty => return Ok(SideDecision::Empty),
             SideAdmission::Scan => return Ok(SideDecision::Scan),
             SideAdmission::Probe(side) => side,
@@ -3054,12 +3106,15 @@ impl SegmentedTable {
         // The probe reads the boundary pages through a reader of its own,
         // let go before the decision is handed on: the walk takes its
         // reservation when it starts
+        let scanned = |counter| {
+            if last {
+                READS.count(counter, 1);
+            }
+            Ok(SideDecision::Scan)
+        };
         let reader = match side.reader(def.identity, 1) {
             Ok(reader) => reader,
-            Err(error) if is_refused(&error) => {
-                READS.count(&READS.refused, 1);
-                return Ok(SideDecision::Scan);
-            }
+            Err(error) if is_refused(&error) => return scanned(&READS.refused),
             Err(error) => return Err(side_error(error)),
         };
         READS.count(&READS.probes, 1);
@@ -3070,10 +3125,15 @@ impl SegmentedTable {
             return Ok(SideDecision::Empty);
         }
         if count * SIDE_SCAN_SHARE > rows.max(1) {
-            READS.count(&READS.cost_scans, 1);
-            return Ok(SideDecision::Scan);
+            #[cfg(feature = "test-failpoints")]
+            if last {
+                crate::test_failpoints::side_scan_decided();
+            }
+            return scanned(&READS.cost_scans);
         }
         READS.count(&READS.candidates, count);
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::side_walk_decided(count);
         drop(reader);
         Ok(SideDecision::Walk(Box::new(SidePlan::new(
             Arc::clone(&side),
@@ -3490,23 +3550,28 @@ impl SegmentedTable {
     /// volume one position page holds must have its pages admissible beside
     /// `reserve`, the working space the reader will still take, since it is
     /// scanned about as fast as its pages are read from the file. Counted
-    /// by why when not.
+    /// by why when not, a scan only when it is the `last` the volume tries.
     fn side_admits(
         &self,
         cs: &super::manifest::ColdSegment,
         def: &SideIndexDef,
         keys: KeyRange<'_>,
         reserve: usize,
+        last: bool,
     ) -> Result<SideAdmission> {
         use super::secondary::READS;
+        let scanned = |counter| {
+            if last {
+                READS.count(counter, 1);
+            }
+            Ok(SideAdmission::Scan)
+        };
         let capability = keys.capability();
         let Some(side) = cs.side_for(def, capability) else {
-            READS.count(&READS.ineligible, 1);
-            return Ok(SideAdmission::Scan);
+            return scanned(&READS.ineligible);
         };
         if Self::range_misses_nan(cs, def, &keys) {
-            READS.count(&READS.ineligible, 1);
-            return Ok(SideAdmission::Scan);
+            return scanned(&READS.ineligible);
         }
         let identity = def.identity;
         let rows = cs.volume.meta.row_count as u64;
@@ -3521,8 +3586,11 @@ impl SegmentedTable {
             return Ok(SideAdmission::Empty);
         };
         if estimate * SIDE_SCAN_SHARE > rows.max(1) {
-            READS.count(&READS.cost_scans, 1);
-            return Ok(SideAdmission::Scan);
+            #[cfg(feature = "test-failpoints")]
+            if last {
+                crate::test_failpoints::side_scan_decided();
+            }
+            return scanned(&READS.cost_scans);
         }
         if rows <= super::secondary::POSITIONS_PER_PAGE as u64
             && !match keys {
@@ -3533,60 +3601,116 @@ impl SegmentedTable {
             }
             .map_err(side_error)?
         {
-            READS.count(&READS.page_scans, 1);
-            return Ok(SideAdmission::Scan);
+            return scanned(&READS.page_scans);
         }
         Ok(SideAdmission::Probe(Arc::clone(side)))
     }
 
     /// What the read's comparisons ask of the side files, taken once per
-    /// read with the cold view: the index whose key they fix furthest, an
-    /// ordered i64 one on a tie, the smaller identity among equals. The
-    /// definitions are walked in place, none collected
-    fn side_ask(&self, comparisons: &[(&str, crate::core::Operator, &Value)]) -> Option<SideAsk> {
+    /// read with the cold view, every index they bound: first the index
+    /// whose key they fix furthest, an ordered i64 one on a tie, the smaller
+    /// identity among equals; each volume reads the one of them its side
+    /// file counts the fewest positions for
+    fn side_asks(&self, comparisons: &[(&str, crate::core::Operator, &Value)]) -> SideAsks {
+        let mut asks = SideAsks::new();
+        if comparisons.is_empty() {
+            return asks;
+        }
         let schema = self.hot.schema();
-        let mut i64_best: Option<(SideIndexDef, i64, i64)> = None;
-        let mut bytes_best: Option<((usize, bool), SideIndexDef)> = None;
+        let mut i64_all: smallvec::SmallVec<[(SideIndexDef, i64, i64); 2]> =
+            smallvec::SmallVec::new();
+        let mut bytes_all: smallvec::SmallVec<[((usize, bool), SideIndexDef); 2]> =
+            smallvec::SmallVec::new();
         let before = |def: &SideIndexDef, held: &SideIndexDef| def.identity < held.identity;
         self.hot.for_each_side_index_def(&mut |def| match def.kind {
             KeyKind::OrderedI64 => {
                 if let Some((low, high)) = Self::i64_bounds(schema, comparisons, &def) {
-                    if i64_best
-                        .as_ref()
-                        .is_none_or(|(held, ..)| before(&def, held))
-                    {
-                        i64_best = Some((def, low, high));
+                    let first = i64_all.first().is_none_or(|(held, ..)| before(&def, held));
+                    match first {
+                        true => i64_all.insert(0, (def, low, high)),
+                        false => i64_all.push((def, low, high)),
                     }
                 }
             }
             KeyKind::OrderedBytes => {
                 let shape = Self::key_shape(schema, comparisons, &def);
-                let better = bytes_best.as_ref().is_none_or(|(held_shape, held)| {
-                    shape > *held_shape || (shape == *held_shape && before(&def, held))
-                });
-                if shape > (0, false) && better {
-                    bytes_best = Some((shape, def));
+                if shape > (0, false) {
+                    let first = bytes_all.first().is_none_or(|(held_shape, held)| {
+                        shape > *held_shape || (shape == *held_shape && before(&def, held))
+                    });
+                    match first {
+                        true => bytes_all.insert(0, (shape, def)),
+                        false => bytes_all.push((shape, def)),
+                    }
                 }
             }
         });
-        let i64_shape = i64_best.as_ref().map(|(_, low, high)| match low.cmp(high) {
+        let i64_shape = i64_all.first().map(|(_, low, high)| match low.cmp(high) {
             std::cmp::Ordering::Greater => (usize::MAX, false),
             std::cmp::Ordering::Equal => (1, false),
             std::cmp::Ordering::Less => (0, true),
         });
-        if let Some((_, def)) = bytes_best.filter(|(shape, _)| Some(*shape) > i64_shape) {
-            if let Some((range, capability)) = Self::byte_bounds(schema, comparisons, &def) {
-                return Some(SideAsk {
+        let mut bytes_first = None;
+        let bytes: SideAsks = bytes_all
+            .into_iter()
+            .filter_map(|(shape, def)| {
+                let (range, capability) = Self::byte_bounds(schema, comparisons, &def)?;
+                bytes_first.get_or_insert(Some(shape) > i64_shape);
+                Some(SideAsk {
                     def,
                     keys: AskKeys::Bytes(range, capability),
-                });
-            }
-        }
-        let (def, low, high) = i64_best?;
-        Some(SideAsk {
+                })
+            })
+            .collect();
+        let i64_asks = i64_all.into_iter().map(|(def, low, high)| SideAsk {
             def,
             keys: AskKeys::I64(low, high),
-        })
+        });
+        match bytes_first == Some(true) {
+            true => {
+                asks.extend(bytes);
+                asks.extend(i64_asks);
+            }
+            false => {
+                asks.extend(i64_asks);
+                asks.extend(bytes);
+            }
+        }
+        asks
+    }
+
+    /// Fills `counted` with the places in `asks` by the positions the
+    /// directory counts for their side file entry in `cs`, fewest first,
+    /// without reading a page; those the directory cannot count after them,
+    /// in their order. False when one rules every row of the volume out
+    fn fewest_first(
+        &self,
+        cs: &super::manifest::ColdSegment,
+        asks: &[SideAsk],
+        counted: &mut Vec<(u64, usize)>,
+    ) -> Result<bool> {
+        counted.clear();
+        for (at, ask) in asks.iter().enumerate() {
+            let keys = ask.keys.range();
+            let side = cs.side_for(&ask.def, keys.capability());
+            let Some(side) = side.filter(|_| !Self::range_misses_nan(cs, &ask.def, &keys)) else {
+                counted.push((u64::MAX, at));
+                continue;
+            };
+            let identity = ask.def.identity;
+            let estimate = match keys {
+                KeyRange::I64(low, high) => side.candidate_estimate(identity, low, high),
+                KeyRange::Bytes { lower, upper, .. } => {
+                    side.byte_candidate_estimate(identity, lower, upper)
+                }
+            };
+            let Some(estimate) = estimate.map_err(side_error)? else {
+                return Ok(false);
+            };
+            counted.push((estimate, at));
+        }
+        counted.sort_unstable();
+        Ok(true)
     }
 
     /// The single-column TEXT entry a key probe of `column` asks
@@ -3778,7 +3902,7 @@ impl SegmentedTable {
                 },
                 None => KeyRange::I64(low, high),
             };
-            let side = match self.side_admits(cs, def, keys, reserve)? {
+            let side = match self.side_admits(cs, def, keys, reserve, true)? {
                 SideAdmission::Empty => continue,
                 SideAdmission::Scan => return Ok(None),
                 SideAdmission::Probe(side) => side,
@@ -4141,11 +4265,7 @@ impl SegmentedTable {
         let hot_skip_arc = Arc::new(hot_skip);
 
         let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
-        let ask = if comparisons.is_empty() {
-            None
-        } else {
-            self.side_ask(&comparisons)
-        };
+        let asks = self.side_asks(&comparisons);
         let unique_keys = self.unique_keys_for(&comparisons)?;
         let mut scanners_reverse: Vec<Box<dyn Scanner>> = Vec::with_capacity(view.seg_ids.len());
 
@@ -4171,7 +4291,7 @@ impl SegmentedTable {
                     if Self::range_beats_side(vol, start, end) {
                         (start, end, None, None)
                     } else {
-                        match self.side_decision(cs, ask.as_ref())? {
+                        match self.side_decision(cs, &asks)? {
                             SideDecision::Empty => continue,
                             SideDecision::Walk(plan) => (start, end, Some(plan), None),
                             SideDecision::Scan => (start, end, None, None),
@@ -4338,11 +4458,7 @@ impl SegmentedTable {
         let fallible = where_expr.is_some_and(|expr| expr.can_fail());
 
         // Per-volume row collection closure. Returns Some(vol_rows) or None if pruned.
-        let ask = if comparisons.is_empty() {
-            None
-        } else {
-            self.side_ask(&comparisons)
-        };
+        let asks = self.side_asks(&comparisons);
         let unique_keys = self.unique_keys_for(&comparisons)?;
         let process_volume =
             |(seg_id, cs): &(u64, &super::manifest::ColdSegment)| -> Result<Option<RowVec>> {
@@ -4368,7 +4484,7 @@ impl SegmentedTable {
                         if Self::range_beats_side(vol, start, end) {
                             (start, end, None, None)
                         } else {
-                            match self.side_decision(cs, ask.as_ref())? {
+                            match self.side_decision(cs, &asks)? {
                                 SideDecision::Empty => return Ok(None),
                                 SideDecision::Walk(plan) => (start, end, start_walk(&plan)?, None),
                                 SideDecision::Scan => (start, end, None, None),
@@ -5968,11 +6084,7 @@ impl Table for SegmentedTable {
                 .map(|e| e.collect_comparisons())
                 .unwrap_or_default();
             let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
-            let ask = if comparisons.is_empty() {
-                None
-            } else {
-                self.side_ask(&comparisons)
-            };
+            let asks = self.side_asks(&comparisons);
             let unique_keys = self.unique_keys_for(&comparisons)?;
 
             'done: for (nf_idx, seg_id) in view.seg_ids.iter().enumerate().rev() {
@@ -6001,7 +6113,7 @@ impl Table for SegmentedTable {
                 let side = if unique.is_some() {
                     SideDecision::Scan
                 } else {
-                    self.side_decision(cs, ask.as_ref())?
+                    self.side_decision(cs, &asks)?
                 };
                 let candidates: Option<(Vec<u32>, super::secondary::Reservation)> = match side {
                     SideDecision::Empty => continue,
@@ -8783,7 +8895,7 @@ impl Table for SegmentedTable {
             let tombstones_ref = &tombstones_arc;
             // A side file over a key the comparisons bound names the only rows
             // the calls must look at, each read from its row group
-            let walk_ask = self.side_ask(&comparisons);
+            let walk_asks = self.side_asks(&comparisons);
 
             let process_volume = |(_, cs): &(u64, super::manifest::ColdSegment)| -> Result<
                 Option<GroupedAggregates>,
@@ -8793,7 +8905,7 @@ impl Table for SegmentedTable {
                     }
                     let vol = &cs.volume;
                     let mapping = &cs.mapping;
-                    let walk = match self.side_decision(cs, walk_ask.as_ref())? {
+                    let walk = match self.side_decision(cs, &walk_asks)? {
                         SideDecision::Empty => return Ok(None),
                         SideDecision::Scan => None,
                         SideDecision::Walk(plan) => start_walk(&plan)?,

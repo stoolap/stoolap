@@ -600,6 +600,32 @@ impl Index for HashIndex {
         Some(CappedEqual::Copied)
     }
 
+    fn count_capped(
+        &self,
+        lower: std::ops::Bound<&Value>,
+        upper: std::ops::Bound<&Value>,
+        max: usize,
+    ) -> Option<usize> {
+        use std::ops::Bound;
+        let (Bound::Included(key), Bound::Included(high)) = (lower, upper) else {
+            return None;
+        };
+        if key != high || self.closed.load(AtomicOrdering::Acquire) || self.column_ids.len() != 1 {
+            return None;
+        }
+        let values = std::slice::from_ref(key);
+        let hash_to_values = self.hash_to_values.read();
+        let count = hash_to_values
+            .get(&hash_values(values))
+            .map_or(0, |entries| {
+                entries
+                    .iter()
+                    .find(|(stored, _)| Self::values_match(stored, values))
+                    .map_or(0, |(_, row_ids)| row_ids.len())
+            });
+        Some(count.min(max.saturating_add(1)))
+    }
+
     /// Optimized IN list lookup - acquires lock once for all values
     fn get_row_ids_in_into(
         &self,

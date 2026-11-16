@@ -167,7 +167,9 @@ Project id, name, category, value
 
 ### Several Indexes
 
-Conditions on several indexed columns joined by AND read the rows every index names; joined by OR, the rows any index names. An OR with a branch no index answers is scanned:
+Conditions on several indexed columns joined by AND read the rows every index names; joined by OR, the rows any index names. An OR with a branch no index answers is scanned.
+
+An AND starts from the index whose key holds the fewest rows, counted at each run from the indexes themselves, whatever order the conditions are written in: `Intersect, fewest rows first`. An index holding more than four times the rows already found is not read; its condition is checked on those rows. Several equalities that a key read can take show as `IndexGet t by the fewest of ...`, the read taking the one whose index holds the fewest rows:
 
 ```sql
 EXPLAIN SELECT name FROM products WHERE category = 'Electronics' AND value > 15;
@@ -179,10 +181,12 @@ Output:
 plan
 ----
 Project name
-  IndexScan products ((category = 'Electronics') AND (value > 15))
-    Intersect
-      Index idx_category (category =)
-      Index idx_value (value range)
+  Filter
+    IndexGet products category = 'Electronics'
+    else IndexScan products ((category = 'Electronics') AND (value > 15))
+      Intersect, fewest rows first
+        Index idx_category (category =)
+        Index idx_value (value range)
 
 plan
 ----
@@ -751,7 +755,7 @@ For a planned single-table SELECT:
 | Index | One index and what it reads: an equality (`=`), an `IN` list, a `LIKE prefix` or a `range` |
 | CompositeIndex | A multi-column index: equalities on its leading columns, a range on the next one |
 | PkKey, PkKeys | Rows a primary key equality or IN list names, inside an IndexScan |
-| Intersect, Union | The rows every index under it names, or any of them names |
+| Intersect, Union | The rows every index under it names, read from the index holding the fewest rows, or the rows any of them names |
 | MixedOr | A read that stops at a LIMIT, of a WHERE that is one OR: the rows its indexed operands name, then a scan asking the others (`Scan`) |
 | IndexOrder, Keyset, TopK | Rows read in ORDER BY order under a LIMIT, with no sort of every row; for window functions, rows in their ORDER BY column's order |
 | DistinctValues | The distinct values the table keeps for one column, for a DISTINCT of that column with no WHERE |
