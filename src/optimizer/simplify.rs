@@ -55,6 +55,7 @@ impl ExpressionSimplifier {
     }
 
     /// Check if any simplifications were made in the last run
+    #[cfg(test)]
     pub fn was_simplified(&self) -> bool {
         self.simplified
     }
@@ -74,6 +75,7 @@ impl ExpressionSimplifier {
 
     /// Simplify an expression, always returning an Expression.
     /// Use try_simplify() when you want to avoid cloning unchanged expressions.
+    #[cfg(test)]
     pub fn simplify(&mut self, expr: &Expression) -> Expression {
         self.simplified = false;
         self.simplify_recursive(expr)
@@ -593,28 +595,10 @@ impl ExpressionSimplifier {
 }
 
 /// Convenience function to simplify an expression
+#[cfg(test)]
 pub fn simplify_expression(expr: &Expression) -> Expression {
     let mut simplifier = ExpressionSimplifier::new();
     simplifier.simplify(expr)
-}
-
-/// Repeatedly simplify until no more changes
-pub fn simplify_expression_fixed_point(expr: &Expression) -> Expression {
-    let mut simplifier = ExpressionSimplifier::new();
-    let mut current = expr.clone();
-    let mut iterations = 0;
-    const MAX_ITERATIONS: usize = 10;
-
-    loop {
-        let simplified = simplifier.try_simplify(&current);
-        if simplified.is_none() || iterations >= MAX_ITERATIONS {
-            break;
-        }
-        current = simplified.unwrap();
-        iterations += 1;
-    }
-
-    current
 }
 
 #[cfg(test)]

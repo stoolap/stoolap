@@ -18,6 +18,4 @@
 pub mod bloom;
 pub mod simplify;
 
-pub use bloom::{BloomFilter, BloomFilterBuilder, RuntimeBloomFilter};
-
-pub use simplify::{simplify_expression, simplify_expression_fixed_point, ExpressionSimplifier};
+pub use simplify::ExpressionSimplifier;

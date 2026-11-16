@@ -60,7 +60,6 @@
 //! - [`parser`] - SQL parser
 //! - [`functions`] - 101+ SQL functions (scalar, aggregate, window)
 //! - [`executor`] - Query executor with parallel execution
-//! - [`optimizer`] - Expression simplification and join bloom filters
 //! - [`common`] - Utilities (I64Map, version)
 
 // stoolap-jemalloc as the global allocator, on by default, without its
@@ -82,9 +81,9 @@ pub mod core;
 pub mod executor;
 pub mod functions;
 mod heap_profile;
-pub mod optimizer;
+pub(crate) mod optimizer;
 pub mod parser;
-pub mod planner;
+pub(crate) mod planner;
 pub mod storage;
 
 #[cfg(target_arch = "wasm32")]
