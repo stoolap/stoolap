@@ -1777,6 +1777,7 @@ impl MVCCTable {
         }
         drop(txn_versions);
 
+        read_by(true);
         // Phase 1: Fetch rows matching indexed branches
         // Build a bitset/set of indexed row IDs for dedup
         const MAX_BITSET_WORDS: usize = 131_072;
@@ -1871,6 +1872,7 @@ impl MVCCTable {
             return Ok(Some(result));
         }
 
+        read_by(false);
         // Phase 2: Scan for rows matching non-indexed branches (skip already-found rows)
         // Build filter from non-indexed operands only
         let mut unindexed_filter: Box<dyn Expression> = if unindexed_operands.len() == 1 {
@@ -2604,11 +2606,10 @@ impl MVCCTable {
         offset: usize,
     ) -> Result<RowVec> {
         let none = Deadline::NONE;
-        let read = self.access_rows_with_limit(access, filter, limit, offset, none)?;
-        read_by(read.is_some());
-        if let Some(rows) = read {
+        if let Some(rows) = self.access_rows_with_limit(access, filter, limit, offset, none)? {
             return Ok(rows);
         }
+        read_by(false);
         self.visible_rows_with_limit(filter, limit, offset, none)
     }
 
@@ -2781,11 +2782,10 @@ impl MVCCTable {
         offset: usize,
         deadline: Deadline,
     ) -> Result<RowVec> {
-        let read = self.access_rows_with_limit(access, filter, limit, offset, deadline)?;
-        read_by(read.is_some());
-        if let Some(rows) = read {
+        if let Some(rows) = self.access_rows_with_limit(access, filter, limit, offset, deadline)? {
             return Ok(rows);
         }
+        read_by(false);
         self.limited_rows_unordered(filter, limit, offset, deadline)
     }
 
@@ -2810,6 +2810,9 @@ impl MVCCTable {
             // The one row a key names is past an offset or under no limit
             IndexPlan::Key => {
                 let mut rows = self.key_rows(filter, deadline)?;
+                if rows.is_some() {
+                    read_by(true);
+                }
                 if offset > 0 || limit == 0 {
                     rows.iter_mut().for_each(|rows| rows.clear());
                 }
@@ -2822,11 +2825,16 @@ impl MVCCTable {
         };
         // A key list names the transaction's own rows, read by their ids
         if plan.names_keys() && self.local().has_local_changes() {
+            read_by(true);
             let rows = self.fetch_rows_by_ids(&row_ids, filter, deadline)?;
             return Ok(Some(rows.into_iter().skip(offset).take(limit).collect()));
         }
         let schema = &self.cached_schema;
-        self.try_fetch_from_index(row_ids, filter, schema, limit, offset, deadline)
+        let rows = self.try_fetch_from_index(row_ids, filter, schema, limit, offset, deadline)?;
+        if rows.is_some() {
+            read_by(true);
+        }
+        Ok(rows)
     }
 
     /// Up to `limit` visible rows past `offset` that `filter` keeps, read
@@ -3392,11 +3400,15 @@ impl MVCCTable {
         if let IndexPlan::Key = plan {
             let rows = self.key_rows(filter, deadline)?;
             self.check_read()?;
+            if rows.is_some() {
+                read_by(true);
+            }
             return Ok(rows);
         }
         let Some(mut row_ids) = self.read_indexes(plan, filter) else {
             return Ok(None);
         };
+        read_by(true);
         if !plan.names_keys() {
             row_ids.extend(self.local_ids_missing_from(plan, filter, &row_ids));
         }
@@ -4270,12 +4282,11 @@ impl Table for MVCCTable {
         deadline: Deadline,
     ) -> Result<Box<dyn Scanner>> {
         let schema = self.cached_schema.clone();
-        let read = self.access_rows(access, where_expr, deadline)?;
-        read_by(read.is_some());
-        if let Some(rows) = read {
+        if let Some(rows) = self.access_rows(access, where_expr, deadline)? {
             let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
             return Ok(Box::new(scanner));
         }
+        read_by(false);
         self.scan_every(schema, column_indices, where_expr, deadline)
     }
 
@@ -4285,11 +4296,10 @@ impl Table for MVCCTable {
         where_expr: Option<&dyn Expression>,
         deadline: Deadline,
     ) -> Result<RowVec> {
-        let read = self.access_rows(access, where_expr, deadline)?;
-        read_by(read.is_some());
-        let rows = match read {
+        let rows = match self.access_rows(access, where_expr, deadline)? {
             Some(rows) => rows,
             None => {
+                read_by(false);
                 let rows = self.collect_visible_rows(where_expr, deadline)?;
                 self.check_read()?;
                 rows

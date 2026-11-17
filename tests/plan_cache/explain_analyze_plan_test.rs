@@ -74,6 +74,11 @@ fn explain_analyze_prints_the_plan_explain_prints_with_the_rows_and_paths_of_the
         ("SELECT id FROM t WHERE k = 2", "286", "scan.seq"),
         ("SELECT id + 0, x FROM t WHERE id = 1.5", "0", "scan.seq"),
         (
+            "SELECT id FROM t WHERE x = 3 OR k = 2 LIMIT 1000",
+            "457",
+            "scan.index, scan.seq",
+        ),
+        (
             "SELECT x, COUNT(*) FROM t GROUP BY x",
             "10",
             "aggregate.storage_grouped",
