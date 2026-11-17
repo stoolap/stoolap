@@ -6777,70 +6777,39 @@ impl MVCCEngine {
         }
         seal_result?;
 
-        // Step 3: Brief fence — block commits just long enough to check if all
-        // hot buffers are empty and take the cut. NO disk I/O inside the
-        // fence: the WAL sync and the checkpoint.meta write follow outside it.
-        // If hot buffers aren't empty after steps 1-2, we skip WAL truncation
-        // this cycle and let the next cycle's bulk seal drain them.
-        let checkpoint_lsn = match self
-            .seal_fence
-            .try_write_for(std::time::Duration::from_secs(15))
-        {
-            Some(_fence) => {
-                // Fence acquired — no new commits can start. In-flight commits
-                // finished (they held the read lock, which is now released).
-                // Just check if bulk seal (steps 1-2) drained everything.
-                // A table missing a listed volume keeps the log its replay read:
-                // a DELETE of a row only that volume holds is recorded nowhere else
-                let (all_hot_empty, any_unavailable) = {
-                    let stores = self.version_stores.read().unwrap();
-                    (
-                        stores
-                            .values()
-                            .all(|store| store.committed_row_count() == 0),
-                        stores.values().any(|store| store.is_cold_unavailable()),
-                    )
-                };
-
-                if all_hot_empty && !any_unavailable && !self.has_incomplete_change() {
-                    // All data is in volumes: the cut is the boundary to
-                    // publish once the catalog copies are durable
-                    if let Some(ref pm) = *self.persistence {
-                        pm.checkpoint_cut()?
-                    } else {
-                        0
-                    }
-                } else {
-                    // Continuous writes kept hot buffers non-empty.
-                    // Skip WAL truncation — next cycle's bulk seal will drain them.
-                    0
-                }
-                // _fence dropped here — commits resume
-            }
-            None => {
-                eprintln!("Warning: seal_fence timeout, skipping WAL truncation");
-                0
-            }
+        // Step 3: the catalog copies go into the WAL, one sync making them
+        // and every record before them durable. The boundary is the LSN just
+        // before them, so a recovery knows every table before any record
+        // that names it. A failure leaves the boundary where it was.
+        let copied_before = if self.may_cut() {
+            self.rerecord_ddl_to_wal()?
+        } else {
+            None
         };
 
-        // Outside the fence: the catalog copies go into the WAL and one sync
-        // makes them, and every record up to the cut, durable. Only then is
-        // the cut published as the boundary recovery starts from, so a
-        // failure here leaves the boundary where it was.
-        let mut checkpoint_lsn = checkpoint_lsn;
+        // Then a brief fence: block commits just long enough to check that
+        // all hot buffers are still empty. NO disk I/O inside the fence.
+        // If they aren't, we skip WAL truncation this cycle and let the next
+        // cycle's bulk seal drain them.
+        let checkpoint_lsn = match copied_before {
+            None => 0,
+            Some(boundary) => match self
+                .seal_fence
+                .try_write_for(std::time::Duration::from_secs(15))
+            {
+                // In-flight commits finished (they held the read lock)
+                Some(_fence) if self.may_cut() => boundary,
+                Some(_fence) => 0,
+                None => {
+                    eprintln!("Warning: seal_fence timeout, skipping WAL truncation");
+                    0
+                }
+            },
+        };
+
         #[cfg(feature = "test-failpoints")]
         if checkpoint_lsn > 0 {
             crate::test_failpoints::checkpoint_cut_taken();
-        }
-        if checkpoint_lsn > 0 {
-            // The boundary stays where it was, and the caller learns why
-            let copied = self.rerecord_ddl_to_wal()?;
-            // A type change taken past its record while the cut was held
-            // and left without its manifest keeps the boundary before it;
-            // the re-recording waited out any change in progress
-            if !copied || self.has_incomplete_change() {
-                checkpoint_lsn = 0;
-            }
         }
         if checkpoint_lsn > 0 {
             if let Some(ref pm) = *self.persistence {
@@ -6932,6 +6901,20 @@ impl MVCCEngine {
             retype::repair_retyped_volumes(&shared, &table)?;
         }
         Ok(())
+    }
+
+    /// Whether the log up to now may go once the manifests are written:
+    /// every committed row is in a volume, no table misses a listed volume
+    /// (a DELETE of a row only it holds is recorded nowhere else), and no
+    /// column type change is left without its manifest
+    fn may_cut(&self) -> bool {
+        let sealed = {
+            let stores = self.version_stores.read().unwrap();
+            stores
+                .values()
+                .all(|store| store.committed_row_count() == 0 && !store.is_cold_unavailable())
+        };
+        sealed && !self.has_incomplete_change()
     }
 
     /// Whether a table holds a column type change durable in the log whose
@@ -7366,9 +7349,10 @@ impl MVCCEngine {
     /// Order matters: CreateTable must come before CreateIndex for the same table,
     /// because index replay needs the version store to exist.
     ///
-    /// False, with nothing written, while an open transaction has created a
-    /// table: a copy of it would commit it.
-    fn rerecord_ddl_to_wal(&self) -> Result<bool> {
+    /// Returns the LSN just before the copies, from which a recovery replays
+    /// them ahead of every later record. None, with nothing written, while
+    /// an open transaction has created a table: a copy of it would commit it.
+    fn rerecord_ddl_to_wal(&self) -> Result<Option<u64>> {
         // One DDL statement at a time between the read of the catalog and
         // the records written from it: a statement landing in between
         // would replay before the records that carry the state it changed
@@ -7377,7 +7361,7 @@ impl MVCCEngine {
         let (table_entries, table_names_for_indexes): (Vec<(String, Vec<u8>)>, Vec<String>) = {
             let schemas = self.schemas.read().unwrap();
             if !self.creating_txns.lock().is_empty() {
-                return Ok(false);
+                return Ok(None);
             }
             // Each copy ends with the table's id counter: the rows that
             // raised it may be deleted, and the log before the cut goes
@@ -7445,7 +7429,7 @@ impl MVCCEngine {
         crate::test_failpoints::catalog_copies_taken();
 
         if self.should_skip_wal() {
-            return Ok(true);
+            return Ok(None);
         }
         let Some(pm) = self
             .persistence
@@ -7453,7 +7437,7 @@ impl MVCCEngine {
             .as_ref()
             .filter(|pm| pm.is_enabled())
         else {
-            return Ok(true);
+            return Ok(None);
         };
 
         // Tables first (schemas must exist before indexes), then indexes,
@@ -7476,7 +7460,9 @@ impl MVCCEngine {
                 .into_iter()
                 .map(|(name, data)| (name, WALOperationType::CreateView, data)),
         );
+        let before = pm.checkpoint_cut()?;
         let lsns = pm.record_catalog_copies(copies)?;
+        let boundary = lsns.first().map_or(before, |&lsn| lsn.saturating_sub(1));
 
         // An index that reached here without an identity (a record or a
         // restore from before identities) takes its copy's LSN, the copy
@@ -7489,7 +7475,7 @@ impl MVCCEngine {
             }
         }
         drop(ddl);
-        Ok(true)
+        Ok(Some(boundary))
     }
 
     fn compact_volumes(&self) -> Result<()> {

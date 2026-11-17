@@ -144,3 +144,51 @@ fn a_crash_after_a_checkpoint_whose_manifests_failed_keeps_the_rows() {
     db.close().unwrap();
     assert_rows(&crashed);
 }
+
+/// The rows of `t` after a crash that followed a checkpoint during which
+/// another handle ran `sql` once the checkpoint had taken its cut
+fn rows_after_a_write_during_the_checkpoint(sql: &'static str) -> Vec<(i64, i64)> {
+    let _guard = test_failpoints::FailpointGuard::new();
+    let root = tempfile::tempdir().unwrap();
+    let (first, crashed) = (root.path().join("0"), root.path().join("1"));
+    let db = Database::open(&dsn(&first)).unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)",
+        "INSERT INTO t VALUES (1, 1), (3, 3)",
+    ] {
+        db.execute(sql, ()).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    db.close().unwrap();
+    let db = Database::open(&dsn(&first)).unwrap();
+    let other = db.clone();
+    test_failpoints::after_checkpoint_cut_taken(move || {
+        other.execute(sql, ()).map(drop).unwrap();
+    });
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    crash_image(&first, &crashed);
+    db.close().unwrap();
+    let db = Database::open(&dsn(&crashed)).unwrap();
+    db.query("SELECT id, n FROM t ORDER BY id", ())
+        .unwrap()
+        .map(|row| {
+            let row = row.unwrap();
+            (row.get(0).unwrap(), row.get(1).unwrap())
+        })
+        .collect()
+}
+
+#[test]
+fn an_insert_committed_during_a_checkpoint_survives_a_crash() {
+    assert_eq!(
+        rows_after_a_write_during_the_checkpoint("INSERT INTO t VALUES (2, 2)"),
+        [(1, 1), (2, 2), (3, 3)]
+    );
+}
+
+#[test]
+fn an_update_of_a_sealed_row_committed_during_a_checkpoint_survives_a_crash() {
+    assert_eq!(
+        rows_after_a_write_during_the_checkpoint("UPDATE t SET n = 10 WHERE id = 1"),
+        [(1, 10), (3, 3)]
+    );
+}
