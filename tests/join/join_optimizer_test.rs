@@ -250,7 +250,6 @@ fn test_explain_does_not_count_across_a_seal_after_its_cold_view() {
         other.execute("PRAGMA CHECKPOINT", ()).unwrap();
     });
     let line = join_line(&db, "a.x = 1");
-    stoolap::test_failpoints::reset_all();
     assert!(
         line.ends_with("(rows=2000)"),
         "the 20,000 rows of x = 1 left the hot index for a volume the view \

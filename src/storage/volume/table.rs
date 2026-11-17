@@ -215,9 +215,10 @@ pub(crate) struct SealedView {
 }
 
 /// The view `sealed_equal_count` counts `volumes` in; None while one of
-/// them hides rows behind another's, which a side file cannot tell apart
+/// them hides rows behind another's, which a side file cannot tell apart,
+/// or while the seal fence cannot be read without waiting
 pub(crate) fn sealed_view(volumes: Arc<SegmentManager>) -> Option<SealedView> {
-    let generation = volumes.settled_seal_generation();
+    let generation = volumes.try_settled_seal_generation()?;
     let cold = volumes.cold_snapshot();
     #[cfg(feature = "test-failpoints")]
     crate::test_failpoints::estimate_cold_view_taken();
@@ -10428,5 +10429,32 @@ mod tests {
         assert!(!mgr.row_exists(2).unwrap());
         assert!(mgr.row_exists(1).unwrap());
         assert!(mgr.row_exists(3).unwrap());
+    }
+
+    #[test]
+    fn sealed_view_does_not_wait_behind_a_queued_seal() {
+        let mgr = Arc::new(SegmentManager::new("test", None));
+        let held = mgr.acquire_seal_read();
+        let writer = {
+            let mgr = Arc::clone(&mgr);
+            std::thread::spawn(move || drop(mgr.acquire_seal_write()))
+        };
+        while mgr.try_settled_seal_generation().is_some() {
+            std::thread::yield_now();
+        }
+        let (sent, view) = std::sync::mpsc::channel();
+        let estimate = {
+            let mgr = Arc::clone(&mgr);
+            std::thread::spawn(move || sent.send(sealed_view(mgr).is_some()).unwrap())
+        };
+        let answer = view.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        writer.join().unwrap();
+        estimate.join().unwrap();
+        assert_eq!(
+            answer,
+            Ok(false),
+            "a seal queued behind a held read leaves the estimate no view"
+        );
     }
 }
