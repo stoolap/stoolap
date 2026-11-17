@@ -83,12 +83,14 @@ struct SharedEngine {
 
 impl Drop for SharedEngine {
     fn drop(&mut self) {
-        let mut registry = DATABASE_REGISTRY.write();
-        if registry
-            .get(&self.dsn)
-            .is_some_and(|entry| std::ptr::eq(entry.as_ptr(), self))
         {
-            registry.remove(&self.dsn);
+            let mut registry = DATABASE_REGISTRY.write();
+            if registry
+                .get(&self.dsn)
+                .is_some_and(|entry| std::ptr::eq(entry.as_ptr(), self))
+            {
+                registry.remove(&self.dsn);
+            }
         }
         let _ = self.engine.close_engine();
     }

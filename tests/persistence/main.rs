@@ -39,6 +39,7 @@ mod persistence_wal_dump2_test;
 mod persistence_wal_dump_test;
 mod pragma_restore_test;
 mod recovery_reseal_test;
+mod registry_close_test;
 mod retype_fixture_test;
 mod rowid_fixture_test;
 mod snapshot_recovery_test;
