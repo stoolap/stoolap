@@ -1915,12 +1915,12 @@ impl WALManager {
                             skipped_count += 1;
                         }
                     }
+                    // Its checksum held: what it says is unknown, not torn
                     Err(e) => {
-                        eprintln!(
-                            "Warning: WAL entry decode failed at LSN {}: {} (entry skipped)",
-                            record.lsn, e
-                        );
-                        skipped_count += 1;
+                        return Err(Error::internal(format!(
+                            "cannot decode the WAL record at LSN {} in {:?}: {}",
+                            record.lsn, wal_path, e
+                        )));
                     }
                 }
             }
