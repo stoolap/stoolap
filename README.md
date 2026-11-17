@@ -202,7 +202,7 @@ ORDER BY dist
 LIMIT 10;
 ```
 
-For built-in semantic text embeddings, enable the `semantic` feature:
+For built-in semantic text embeddings, enable the `semantic` feature (it needs Rust 1.94 or newer; the rest of the crate builds on 1.88):
 
 ```toml
 [dependencies]

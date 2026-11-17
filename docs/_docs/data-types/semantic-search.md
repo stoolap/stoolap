@@ -9,7 +9,7 @@ order: 5
 
 Stoolap provides built-in semantic search powered by a sentence-transformer model running entirely in Rust. The `EMBED()` function converts text into 384-dimensional vector embeddings. No external APIs, no Python, no Docker. Just SQL.
 
-> **Feature flag required:** Semantic search requires the `semantic` feature flag. Build with `cargo build --features semantic` or add `features = ["semantic"]` to your Cargo.toml dependency.
+> **Feature flag required:** Semantic search requires the `semantic` feature flag. Build with `cargo build --features semantic` or add `features = ["semantic"]` to your Cargo.toml dependency. The feature needs Rust 1.94 or newer; the rest of the crate builds on 1.88.
 
 ## The EMBED() Function
 
@@ -224,7 +224,7 @@ SELECT EMBED('warmup');
 
 ```toml
 [dependencies]
-stoolap = { version = "0.3", features = ["semantic"] }
+stoolap = { version = "0.5", features = ["semantic"] }
 ```
 
 ### From Source

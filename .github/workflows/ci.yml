@@ -40,21 +40,39 @@ jobs:
       run: cargo clippy --all-targets --all-features -- -D warnings
 
   msrv:
-    name: MSRV (1.89)
+    name: MSRV (1.88)
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install Rust 1.89
+    - name: Install Rust 1.88
       uses: dtolnay/rust-toolchain@master
       with:
-        toolchain: "1.89"
+        toolchain: "1.88"
 
     - name: Cache
       uses: Swatinem/rust-cache@v2
 
-    - name: Check all features on MSRV
-      run: cargo check --all-features
+    # Every feature but semantic, whose candle 0.11 needs Rust 1.94 on x86_64
+    - name: Check all features but semantic on MSRV
+      run: cargo check --features parallel,wasm,ffi,cli,jemalloc,heap-profile,ann-benchmark,test-failpoints,stress-tests,test-filedb
+
+  msrv-semantic:
+    name: MSRV semantic (1.94)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust 1.94
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: "1.94"
+
+    - name: Cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Check the semantic feature on its minimum Rust
+      run: cargo check --features semantic
 
   wasm:
     name: WASM builds (WASI C API, browser)

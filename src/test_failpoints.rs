@@ -188,7 +188,7 @@ pub(crate) fn restore_load_fails() -> bool {
 }
 
 /// Whether this call is the one `counter` counts down to, zero for none
-// fetch_update is deprecated in 1.99; try_update is stable only from 1.95, above the 1.89 MSRV
+// fetch_update is deprecated in 1.99; try_update is stable only from 1.95, above the 1.88 MSRV
 #[allow(deprecated)]
 fn counted_down(counter: &std::sync::atomic::AtomicUsize) -> bool {
     use std::sync::atomic::Ordering::AcqRel;
@@ -212,7 +212,7 @@ fn counted_down(counter: &std::sync::atomic::AtomicUsize) -> bool {
 pub static SEAL_REGISTRATION_STALE_ROUNDS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-// fetch_update is deprecated in 1.99; try_update is stable only from 1.95, above the 1.89 MSRV
+// fetch_update is deprecated in 1.99; try_update is stable only from 1.95, above the 1.88 MSRV
 #[allow(deprecated)]
 pub(crate) fn seal_registration_forced_stale() -> bool {
     SEAL_REGISTRATION_STALE_ROUNDS
