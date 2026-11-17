@@ -69,6 +69,7 @@ mod foreign_key;
 pub(crate) mod grouped_aggregate;
 mod index_optimizer;
 mod join_order;
+pub(crate) mod path_trace;
 mod plan_reads;
 pub(crate) mod planned;
 pub(crate) mod planned_aggregate;

@@ -1,0 +1,6 @@
+401	b9334d9ebce8b1a4	hot: SELECT id FROM s WHERE g + 0 > 97 ORDER BY b
+401	b9334d9ebce8b1a4	hot: SELECT id FROM s WHERE g > 97
+201	dc35cbb077c80c25	hot: SELECT id, b FROM s WHERE g + 0 = 3
+401	b9334d9ebce8b1a4	sealed: SELECT id FROM s WHERE g + 0 > 97 ORDER BY b
+401	b9334d9ebce8b1a4	sealed: SELECT id FROM s WHERE g > 97
+201	dc35cbb077c80c25	sealed: SELECT id, b FROM s WHERE g + 0 = 3

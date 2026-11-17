@@ -848,7 +848,7 @@ impl<F: Fn(&Row, &Row) -> std::cmp::Ordering> Ord for HeapRow<F> {
 
 /// Every path that chooses the rows an ORDER BY with a LIMIT or OFFSET
 /// keeps. Each notes, under test-failpoints, that it chose them, for the
-/// equivalence test against the whole sort
+/// equivalence test against the whole sort, and for an EXPLAIN ANALYZE run
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OrderLimitPath {
     /// `TopNResult` over the statement's rows, keys read from columns
@@ -883,6 +883,24 @@ impl OrderLimitPath {
     pub(crate) fn taken(self) {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::order_limit_path_taken(self as usize);
+        super::path_trace::note("order_limit", self.name());
+    }
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            OrderLimitPath::TopN => "top_n",
+            OrderLimitPath::ComputedKeys => "computed_keys",
+            OrderLimitPath::VectorSearch => "vector_search",
+            OrderLimitPath::JoinIndexSort => "join_index_sort",
+            OrderLimitPath::CteOrderLimitPushdown => "cte_order_limit_pushdown",
+            OrderLimitPath::PreparedIndexOrdered => "prepared_index_ordered",
+            OrderLimitPath::PreparedKeyset => "prepared_keyset",
+            OrderLimitPath::PreparedTopK => "prepared_top_k",
+            OrderLimitPath::PreparedTopRows => "prepared_top_rows",
+            OrderLimitPath::PreparedProjectFirst => "prepared_project_first",
+            OrderLimitPath::PreparedBlockCut => "prepared_block_cut",
+            OrderLimitPath::PreparedIndexKeys => "prepared_index_keys",
+        }
     }
 }
 
@@ -902,23 +920,6 @@ impl OrderLimitPath {
         OrderLimitPath::PreparedBlockCut,
         OrderLimitPath::PreparedIndexKeys,
     ];
-
-    pub(crate) const fn name(self) -> &'static str {
-        match self {
-            OrderLimitPath::TopN => "top_n",
-            OrderLimitPath::ComputedKeys => "computed_keys",
-            OrderLimitPath::VectorSearch => "vector_search",
-            OrderLimitPath::JoinIndexSort => "join_index_sort",
-            OrderLimitPath::CteOrderLimitPushdown => "cte_order_limit_pushdown",
-            OrderLimitPath::PreparedIndexOrdered => "prepared_index_ordered",
-            OrderLimitPath::PreparedKeyset => "prepared_keyset",
-            OrderLimitPath::PreparedTopK => "prepared_top_k",
-            OrderLimitPath::PreparedTopRows => "prepared_top_rows",
-            OrderLimitPath::PreparedProjectFirst => "prepared_project_first",
-            OrderLimitPath::PreparedBlockCut => "prepared_block_cut",
-            OrderLimitPath::PreparedIndexKeys => "prepared_index_keys",
-        }
-    }
 }
 
 /// The first `limit + offset` rows by `compare` of the rows pushed, in a
@@ -1094,13 +1095,8 @@ impl DistinctPath {
     pub(crate) fn taken(self) {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::distinct_path_taken(self as usize);
+        super::path_trace::note("distinct", self.name());
     }
-}
-
-#[cfg(any(test, feature = "test-failpoints"))]
-impl DistinctPath {
-    pub(crate) const ALL: [DistinctPath; 3] =
-        [DistinctPath::Rows, DistinctPath::Values, DistinctPath::Scan];
 
     pub(crate) const fn name(self) -> &'static str {
         match self {
@@ -1109,6 +1105,12 @@ impl DistinctPath {
             DistinctPath::Scan => "scan",
         }
     }
+}
+
+#[cfg(any(test, feature = "test-failpoints"))]
+impl DistinctPath {
+    pub(crate) const ALL: [DistinctPath; 3] =
+        [DistinctPath::Rows, DistinctPath::Values, DistinctPath::Scan];
 }
 
 /// The rows a DISTINCT has passed, by the values of their first columns: the

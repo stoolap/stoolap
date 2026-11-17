@@ -2873,6 +2873,7 @@ impl Executor {
                         };
                         #[cfg(feature = "test-failpoints")]
                         crate::test_failpoints::scan_access_taken(&access);
+                        super::prepared_select::ScanPath::of(&access).taken();
                         table.update(
                             access,
                             expr.as_deref(),
@@ -3461,6 +3462,7 @@ impl Executor {
             };
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::scan_access_taken(&access);
+            super::prepared_select::ScanPath::of(&access).taken();
             table.delete(access, where_expr.as_deref(), ctx.deadline_of_call())?
         };
 

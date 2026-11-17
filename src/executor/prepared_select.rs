@@ -5661,7 +5661,8 @@ pub(crate) enum KeyReadBy {
 
 /// Every path that reads a statement's rows by the keys or row ids it
 /// names instead of a scan. Each notes, under test-failpoints, that it read
-/// them, for the equivalence test against recorded answers
+/// them, for the equivalence test against recorded answers, and for an
+/// EXPLAIN ANALYZE run
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KeyReadPath {
     /// A planned statement's row read by its primary key
@@ -5685,7 +5686,66 @@ impl KeyReadPath {
     pub(crate) fn taken(self) {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::key_read_path_taken(self as usize);
+        super::path_trace::note("key_read", self.name());
     }
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            KeyReadPath::PkGet => "pk_get",
+            KeyReadPath::UniqueGet => "unique_get",
+            KeyReadPath::KeyMembers => "key_members",
+            KeyReadPath::RowIds => "row_ids",
+            KeyReadPath::BlockPointRows => "block_point_rows",
+            KeyReadPath::BlockPointValue => "block_point_value",
+            KeyReadPath::IndexGet => "index_get",
+        }
+    }
+}
+
+/// Every read a statement's scan takes of its table, and the thread pool
+/// judging its WHERE on the rows read. Each notes, under test-failpoints,
+/// that it read them, for the equivalence test against recorded answers,
+/// and for an EXPLAIN ANALYZE run
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScanPath {
+    /// Every row of the table
+    Seq,
+    /// The rows an index plan names
+    Index,
+    /// The rows read judged by the WHERE on the thread pool
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    ParallelFilter,
+}
+
+impl ScanPath {
+    /// The path of a scan read by `access`
+    pub(crate) fn of(access: &crate::storage::traits::ScanAccess<'_>) -> Self {
+        match access {
+            crate::storage::traits::ScanAccess::Seq => Self::Seq,
+            crate::storage::traits::ScanAccess::Index(_) => Self::Index,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn taken(self) {
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::scan_path_taken(self as usize);
+        super::path_trace::note("scan", self.name());
+    }
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            ScanPath::Seq => "seq",
+            ScanPath::Index => "index",
+            ScanPath::ParallelFilter => "parallel_filter",
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-failpoints"))]
+impl ScanPath {
+    pub(crate) const ALL: [ScanPath; 3] =
+        [ScanPath::Seq, ScanPath::Index, ScanPath::ParallelFilter];
 }
 
 #[cfg(any(test, feature = "test-failpoints"))]
@@ -5699,18 +5759,6 @@ impl KeyReadPath {
         KeyReadPath::BlockPointValue,
         KeyReadPath::IndexGet,
     ];
-
-    pub(crate) const fn name(self) -> &'static str {
-        match self {
-            KeyReadPath::PkGet => "pk_get",
-            KeyReadPath::UniqueGet => "unique_get",
-            KeyReadPath::KeyMembers => "key_members",
-            KeyReadPath::RowIds => "row_ids",
-            KeyReadPath::BlockPointRows => "block_point_rows",
-            KeyReadPath::BlockPointValue => "block_point_value",
-            KeyReadPath::IndexGet => "index_get",
-        }
-    }
 }
 
 /// The rows the members of `filter`'s IN list name, read by the members:
@@ -15829,6 +15877,7 @@ impl<'a> PreparedRunner<'a> {
             if self.base.len() > self.ctx.params().len() {
                 filter = filter.with_params(CompactArc::new(self.base.clone()));
             }
+            ScanPath::ParallelFilter.taken();
             return super::parallel::filter_in_parallel(rows, &filter);
         }
         let mut vm = ExprVM::new();
@@ -16489,6 +16538,7 @@ impl<'a> PreparedRunner<'a> {
                     };
                     #[cfg(feature = "test-failpoints")]
                     crate::test_failpoints::scan_access_taken(&access);
+                    ScanPath::of(&access).taken();
                     match limited {
                         Some(target) => {
                             let answers = table.collect_access_rows_with_limit_unordered(

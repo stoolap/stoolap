@@ -115,6 +115,7 @@ impl Executor {
             let holds = super::statement_holds_as_of(&stmt.statement);
             let ctx =
                 self.with_statement_cut(&stmt.statement, std::borrow::Cow::Borrowed(ctx), holds)?;
+            let trace = super::path_trace::Trace::open();
             let mut result = self.execute_statement_inner(
                 &stmt.statement,
                 ctx,
@@ -135,6 +136,8 @@ impl Executor {
                 row_count = result.rows_affected().max(0) as usize;
             }
             let duration = start.elapsed();
+            let paths = trace.paths();
+            drop(trace);
 
             // Format duration nicely
             let time_str = if duration.as_secs() > 0 {
@@ -174,6 +177,9 @@ impl Executor {
             // The subqueries as the plan the run held prepared and ran them
             if let Some(ran) = ran {
                 splice_held_blocks(&mut plan_lines, explain_held_blocks(ran, 0));
+            }
+            if !paths.is_empty() {
+                plan_lines.push(format!("Paths: {}", paths.join(", ")));
             }
         } else {
             plan_lines = plan_of(&order_of(None));

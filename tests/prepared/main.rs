@@ -58,4 +58,5 @@ mod projection_paths_test;
 mod projection_rules_test;
 mod pushdown_parameter_expression_test;
 mod runner_held_programs_test;
+mod scan_path_equivalence_test;
 mod shared_literals_test;
