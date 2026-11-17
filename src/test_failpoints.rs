@@ -2869,6 +2869,7 @@ thread_local! {
     static INNER_TABLE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static MIN_MAX_INDEX_ANSWERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static EQUALITY_CANDIDATE_IDS_COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ESTIMATE_COLD_VIEWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ESTIMATE_IN_KEYS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static BTREE_WALK_CHUNK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
     static GROUP_CACHE_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -3721,6 +3722,15 @@ pub fn equality_candidate_ids_copied_count() -> usize {
 
 pub(crate) fn equality_candidate_ids_copied(count: usize) {
     EQUALITY_CANDIDATE_IDS_COPIED.with(|n| n.set(n.get() + count));
+}
+
+/// Cold views this thread's row estimates took to count sealed rows, so far
+pub fn estimate_cold_views() -> usize {
+    ESTIMATE_COLD_VIEWS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn estimate_cold_view_taken() {
+    ESTIMATE_COLD_VIEWS.with(|n| n.set(n.get() + 1));
 }
 
 /// IN list keys this thread's join side estimates read to count, so far

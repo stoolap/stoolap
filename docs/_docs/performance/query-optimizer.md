@@ -112,7 +112,7 @@ The statistics are one source of the [row estimates](#row-estimates). `ANALYZE` 
 
 Where a choice depends on how many rows a side of a join keeps under its own conditions, the planner estimates them on each run, for the values that run binds, parameters included:
 
-- A comparison of an indexed column with a value is counted by the index: an equality or an `IN` list exactly, a range while it holds at most 4,096 rows. This needs no `ANALYZE`. Once some rows are sealed to volumes, an equality or an `IN` list still counts them through each volume's side file for the index, exactly where its key pages are cached or can be read in, else by the side file's directory; a range over sealed rows is estimated from the statistics instead.
+- A comparison of an indexed column with a value is counted by the index: an equality or an `IN` list exactly, a range while it holds at most 4,096 rows. This needs no `ANALYZE`. Once some rows are sealed to volumes, an equality or an `IN` list still counts them through each volume's side file for the index, exactly where its key pages are cached or can be read in, else by the side file's directory. The side files also hold rows since deleted or updated: when those could make up half of a count, or volumes overlap, or an estimate would read more than 256 side file keys, the statistics estimate it instead. A range over sealed rows is estimated from the statistics.
 - Otherwise the statistics `ANALYZE` collected estimate it: the histogram, the distinct values, the minimum and maximum.
 - Without either, a default share: an equality keeps a tenth of the rows.
 

@@ -199,17 +199,48 @@ type SideAsks = smallvec::SmallVec<[SideAsk; 2]>;
 /// A visit of each side index definition a table holds
 type SideDefs<'a> = &'a dyn Fn(&mut dyn FnMut(SideIndexDef));
 
-/// How many positions of the volumes `volumes` holds for a table of
-/// `schema` and the side index definitions `side_defs` have `column` equal
-/// to `value`, as each volume's side file counts them by its key pages,
-/// read through the page cache with no lock held, or estimates them by its
-/// directory where the cache refuses a page; None when a volume holds no
-/// side file entry that counts them
+/// The side file probes one estimate takes over all its counts before it
+/// leaves the rest to the statistics
+pub(crate) const SEALED_PROBES: usize = 256;
+
+/// A table's volumes as an estimate counts them, captured once for all its
+/// counts, with the rows they hold that no statement sees: the deleted ones
+/// and the copies a seal left without authority
+pub(crate) struct SealedView {
+    cold: super::manifest::ColdSnapshot,
+    hidden: u64,
+}
+
+/// The view `sealed_equal_count` counts `volumes` in; None while one of
+/// them hides rows behind another's, which a side file cannot tell apart
+pub(crate) fn sealed_view(volumes: &SegmentManager) -> Option<SealedView> {
+    #[cfg(feature = "test-failpoints")]
+    crate::test_failpoints::estimate_cold_view_taken();
+    let cold = volumes.cold_snapshot();
+    let mut held = 0u64;
+    for (_, cs) in cold.volumes() {
+        if cs.visible.is_some() {
+            return None;
+        }
+        held += cs.volume.meta.row_count as u64;
+    }
+    let hidden = held.saturating_sub(volumes.total_row_count() as u64);
+    Some(SealedView { cold, hidden })
+}
+
+/// How many sealed rows of `view`, of a table of `schema` and the side
+/// index definitions `side_defs`, have `column` equal to `value`, as each
+/// volume's side file counts them by its key pages, read through the page
+/// cache with no lock held, or estimates them by its directory where the
+/// cache refuses a page. None when a volume holds no side file entry that
+/// counts them, when the rows the view hides could be half the count, or
+/// when `probes` runs out
 pub(crate) fn sealed_equal_count(
     (schema, side_defs): (&Schema, &[SideIndexDef]),
-    volumes: &SegmentManager,
+    view: &SealedView,
     column: &str,
     value: &Value,
+    probes: &std::cell::Cell<usize>,
 ) -> Option<u64> {
     let defs = |each: &mut dyn FnMut(SideIndexDef)| side_defs.iter().cloned().for_each(each);
     let comparison = [(column, crate::core::Operator::Eq, value)];
@@ -218,8 +249,8 @@ pub(crate) fn sealed_equal_count(
     let keys = ask.keys.range();
     let identity = ask.def.identity;
     let mut total = 0u64;
-    let cold = volumes.cold_snapshot();
-    for (_, cs) in cold.volumes() {
+    for (_, cs) in view.cold.volumes() {
+        probes.set(probes.get().checked_sub(1)?);
         let side = cs.side_for(&ask.def, keys.capability())?;
         if SegmentedTable::range_misses_nan(cs, &ask.def, &keys) {
             return None;
@@ -242,7 +273,8 @@ pub(crate) fn sealed_equal_count(
             Err(_) => estimate().ok()?.unwrap_or(0),
         };
     }
-    Some(total)
+    // The live matches lie between the count and the count less the hidden
+    (total == 0 || view.hidden.saturating_mul(2) < total).then_some(total)
 }
 
 thread_local! {

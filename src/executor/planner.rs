@@ -762,15 +762,16 @@ impl QueryPlanner {
                 )?;
                 // The sealed rows' side files count them by their key pages
                 let sealed = match (&table.sealed, run.counting) {
-                    (Some(volumes), Some((_, _, side_defs))) => {
+                    (Some(Some(view)), Some((_, _, side_defs))) => {
                         crate::storage::volume::table::sealed_equal_count(
                             (&store.schema(), side_defs),
-                            volumes,
+                            view,
                             column,
                             low,
+                            &table.probes,
                         )?
                     }
-                    (Some(_), None) => return None,
+                    (Some(_), _) => return None,
                     (None, _) => 0,
                 };
                 hot + sealed as usize
@@ -825,8 +826,14 @@ impl QueryPlanner {
         let rows = run.rows.get_or_init(|| {
             let (rows, sealed) = self.engine.rows_with_volumes(table_name, store)?;
             // Volumes whose rows all came back hot leave the hot index to count
-            let sealed = sealed.filter(|_| rows != store.committed_row_count());
-            (rows > 0).then_some(TableRows { rows, sealed })
+            let sealed = (sealed.filter(|_| rows != store.committed_row_count()))
+                .map(|volumes| crate::storage::volume::table::sealed_view(&volumes));
+            let probes = std::cell::Cell::new(crate::storage::volume::table::SEALED_PROBES);
+            (rows > 0).then_some(TableRows {
+                rows,
+                sealed,
+                probes,
+            })
         });
         Some((index, store, rows.as_ref()?))
     }
@@ -1192,11 +1199,14 @@ struct Run<'a> {
     rows: std::cell::OnceCell<Option<TableRows>>,
 }
 
-/// A table's rows, and its volumes when it has sealed some, whose side
-/// files count an equality over the sealed rows
+/// A table's rows, and when it has sealed some the view its volumes' side
+/// files count an equality over the sealed rows in, None inside where no
+/// count can see past the volumes' overlap
 struct TableRows {
     rows: usize,
-    sealed: Option<Arc<crate::storage::volume::manifest::SegmentManager>>,
+    sealed: Option<Option<crate::storage::volume::table::SealedView>>,
+    /// The side file probes the run's counts may still take
+    probes: std::cell::Cell<usize>,
 }
 
 /// Health status of table statistics
