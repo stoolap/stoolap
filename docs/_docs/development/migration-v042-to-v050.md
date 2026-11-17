@@ -83,10 +83,13 @@ Each item below was accepted by v0.4.2, usually with a silently wrong answer. Th
 
 Names are compared by one rule everywhere, Unicode lowercasing. A table created as `"äö"` is found as `"ÄÖ"`, and savepoint names are no longer case-sensitive. See [Names]({{ '/docs/sql-features/names/' | relative_url }}).
 
+A double-quoted `"true"` or `"false"` is a column name; only the unquoted words are boolean literals. With a column named `true` holding 5, `SELECT "true" + 1` gives 6, where v0.4.2 gave NULL.
+
 ### Statement Shape
 
 - **Text after a complete statement** that is not `;` is a parse error. v0.4.2 ran the statement and ignored the rest: `UPDATE t SET v = 1 WHERE id = 1 2` wrote the row.
 - **A statement that writes one column more than once** is refused: `UPDATE t SET v = 5, v = 6`, a repeated column in an INSERT or COPY column list, or in an upsert's assignments.
+- **`ON CONFLICT ... DO UPDATE` meeting a row the same statement already inserted or updated** fails with `ON CONFLICT DO UPDATE cannot affect a row a second time in one statement` and writes nothing. `INSERT INTO t VALUES (1, 'a'), (1, 'b') ON CONFLICT (id) DO UPDATE SET v = EXCLUDED.v` left `v = 'b'` in v0.4.2. Remove duplicate keys from the input, or use `ON DUPLICATE KEY UPDATE`, which still updates such a row again.
 - **Statements nested too deeply** are refused when parsed: more than 32 nested SELECTs (subqueries, derived tables, CTE bodies) or 64 nested expressions in a release build. Deeper statements used to crash the process.
 - **DISTINCT, an inner ORDER BY and FILTER** are allowed only on aggregate calls: `ABS(DISTINCT a)` is an error.
 - **A subquery must return as many values as its place takes**, with `*` counting every column: `a IN (SELECT x, y FROM u)` is an error. A row compared with a row of another width, `(1, 2) = (1, 2, 3)`, is an error (v0.4.2 answered true), and `SELECT (1, 2)` is an error (v0.4.2 answered 1).
@@ -134,6 +137,7 @@ A runtime error in an expression now fails the statement wherever the expression
 - **A statement that overlaps a concurrent ADD, DROP or RENAME COLUMN** fails with `SchemaChanged` (v0.4.2 could read wrong positions).
 - **A READ COMMITTED write** that a TRUNCATE or DROP overtakes fails with `ViewOvertaken`; a SELECT retries up to 3 times.
 - **A query timeout stops every kind of work**: writes, joins, sorts, windows, aggregation, recursive CTEs, storage scans and ANALYZE, with `QueryCancelled`. A stopped write leaves no row changed. v0.4.2 timed only part of a SELECT, so an UPDATE with a 20 ms timeout committed all of its rows.
+- **The rows a timed query returns keep its deadline** while you read them, and the time between two reads counts toward it. An application that reads a timed query's rows slowly can get `QueryCancelled` part way through.
 
 ## Queries Whose Answers Change
 
@@ -158,7 +162,7 @@ v0.5.0 compares and orders values by one rule on every plan, in memory or on dis
 - **GROUP BY treats 1 and 1.0 as one group.**
 - **HAVING alone** (no GROUP BY, no aggregate in the SELECT list) aggregates the statement into one group.
 - **Window functions over ROLLUP, CUBE or GROUPING SETS** see every group, subtotal rows included.
-- **STRING_AGG**: the separator may be any expression that reads no column. A NULL separator adds nothing (v0.4.2 used `,`), and `STRING_AGG(s, '-' || '')` joins with `-` (v0.4.2 answered NULL).
+- **STRING_AGG**: the separator may be any expression, and one that reads the row is read for each row: `STRING_AGG(s, s)` over `'p'`, `'q'`, `'r'` gives `pqqrr` (v0.4.2 answered NULL). A NULL separator adds nothing (v0.4.2 used `,`), and `STRING_AGG(s, '-' || '')` joins with `-` (v0.4.2 answered NULL).
 - **A grouped column is read from its GROUP BY item** even when an aggregate's alias has the same name.
 - **COUNT(DISTINCT)** and DISTINCT keep NULLs held by sealed rows and count re-inserted rows correctly.
 
@@ -177,6 +181,30 @@ Many join answers are fixed. If your application relied on any of these, check i
 - A large merge of nearly sorted inputs no longer loses matches (merge join is gone).
 - Joins with LIMIT, DISTINCT or DISTINCT ON return the full number of rows.
 - Without ORDER BY, the row order of a join may differ, because INNER joins of three or more tables may now be reordered. Add ORDER BY where order matters.
+
+### Set Operations, Recursive CTEs and Queries Without FROM
+
+| Statement | v0.4.2 | v0.5.0 |
+|-----------|--------|--------|
+| `SELECT 2 UNION SELECT 1 EXCEPT SELECT 2` | 2, 1 | 1 |
+| `SELECT 1 UNION SELECT 2 EXCEPT SELECT 2 INTERSECT SELECT 3` | 1 | 1, 2 |
+| `SELECT DISTINCT 1 UNION ALL SELECT 1` | one row | two rows |
+| `WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT 100 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT COUNT(*) FROM r` | 10003 | 4 |
+| `SELECT COUNT(*) WHERE FALSE` | no row | one row, 0 |
+| `SELECT 1 WHERE 0` | one row | no row |
+
+- INTERSECT binds tighter than UNION and EXCEPT, which bind equally and apply left to right. Group with derived tables where a chain meant another order.
+- A leading `SELECT DISTINCT` removes duplicates from its own SELECT only, before the rows are combined.
+- In `WITH RECURSIVE`, every branch that does not read the CTE is an anchor and runs once. v0.4.2 added a later non-recursive branch again on every pass.
+- A statement without FROM reads one row with no columns, so an aggregate answers one row, and a WHERE keeps that row only for TRUE or a non-zero integer.
+
+### Functions
+
+| Statement | v0.4.2 | v0.5.0 |
+|-----------|--------|--------|
+| `SELECT MOD(-7.5, 2)` | -1 | -1.5 |
+| `SELECT SPLIT_PART('abc', '', 1)` | `''` | `'abc'` |
+| `SELECT TO_CHAR(TIMESTAMP '2024-01-02 00:00:00', 'Day')` | `Tuestuesday` | `Tuesday` |
 
 ### Dates, Times and Intervals
 
@@ -238,16 +266,19 @@ The engine internals are public modules, so this list names what an embedder is 
 - `Transaction::execute_prepared_named` and `query_prepared_named`: use `Statement::execute_named_in` and `query_named_in`.
 - `Executor::with_function_registry` and `function_registry`: every path uses one global registry.
 - `TimeoutGuard`, `CancellationHandle` and the `ExecutionContext` cancellation methods: use `ExecutionContext::deadline()` and `set_deadline()`.
+- The name-based expression compiler and the subquery caches in `stoolap::executor`: `compile_expression`, `CompiledEvaluator`, `clear_scalar_subquery_cache` and the other `clear_*` cache functions. Every statement runs from its prepared plan.
+- `MVCCEngine::get_table_for_txn` is crate-private: use `Transaction::get_table`.
 - AST variants `Expression::Distinct`, `InHashSet` and `CteReference`; `TokenType::Date`, `Time` and `Timestamp`; parser `KEYWORDS` and `is_keyword(&str)` (use the `Keyword` enum).
 
 ### Changed
 
-- `Error`: `LockAcquisitionFailed` is removed. New variants: `TableCheckViolation`, `TableHasOpenTransactionRows`, `ViewOvertaken`, `WalOutcomeUnknown`. `Error::UniqueConstraint` carries `ConflictValues`. A `match` that lists every variant needs updating.
+- `Error`: `LockAcquisitionFailed` is removed. New variants: `TableCheckViolation`, `TableHasOpenTransactionRows`, `ViewOvertaken`, `WalOutcomeUnknown`. `Error::UniqueConstraint` carries `ConflictValues`, and its `row_id` is `i64::MIN` when no row holds the key (it was -1). A `match` that lists every variant needs updating.
 - `FunctionRegistry::register_scalar`, `register_aggregate`, `register_window` and `register_tvf` return `Result<()>` and refuse a built-in function's name, so built-ins can no longer be overridden.
 - `FunctionInfo` carries `Volatility` (`Fixed`, `PerStatement`, `PerCall`) instead of a deterministic flag.
 - Custom aggregates: `AggregateFunction::result` returns `Result<Value>`, and `accumulate` loses its `distinct` parameter.
 - `set_default_isolation_level` takes `&self`.
-- The storage `Table` and `Index` traits changed: several methods take a `Deadline`; `delete` takes the access the caller decides; `select_as_of` is replaced by `rows_at`; `has_visible_row` and `for_each_unique_non_pk_index` must be implemented; `Index::find_with_operator` returns an error for an operator it cannot answer.
+- The storage `Table` and `Index` traits changed: several methods take a `Deadline`; `delete` takes the access the caller decides; `select_as_of` is replaced by `rows_at`; `insert_with_id`, `has_visible_row` and `for_each_unique_non_pk_index` must be implemented; update setters are `FnMut(i64, Row)`, given each row's id; `sum_column` returns a `SumAccumulator`; `scan_top_k` takes NULL placement and the columns to read; `Index::find_with_operator` returns an error for an operator it cannot answer.
+- `Table::commit` on a handle from a transaction publishes nothing: the transaction's own commit publishes the handle's rows with their WAL records. Code that called `Table::commit` to make a transaction's rows visible commits the transaction instead.
 - Library locks no longer poison after a panic.
 
 ### Added
@@ -267,6 +298,7 @@ Changed behaviour:
 - A runtime error part way through a fetch-all is returned as an error, not a partial result.
 - A non-UTF-8 text parameter or invalid JSON parameter fails the call (v0.4.2 bound NULL).
 - `stoolap_stmt_exec_batch` refuses a negative `params_per_row` or NULL params.
+- A transaction handle passed with a database handle of another database is refused with `transaction belongs to another database`.
 - Functions returning the packed result format return `STOOLAP_ERROR` for a column name longer than 65,535 bytes.
 - `stoolap_rows_next` and the batch fetch return an error for a TIMESTAMP outside the stored range.
 
@@ -276,6 +308,7 @@ Changed behaviour:
 - The `heap-profile` feature enables `PRAGMA heap_profile`.
 - The two comparison-benchmark features and `dhat-heap` are removed; the comparison benchmarks live in the unpublished `stoolap-compare` crate.
 - The minimum Rust version stays 1.88, except for the optional `semantic` feature, which needs **Rust 1.94** or newer: it moved to candle 0.11 (for zip 9, which fixes zip 7's advisories), and candle's x86_64 code needs intrinsics that are stable or safe only from 1.94.
+- `ahash` must be 0.8.12 or newer. A `--locked` build whose lock file holds an older 0.8 release needs `cargo update -p ahash` first.
 - The browser WASM build has its own size-optimized profile: `wasm-pack build --target web --profile wasm -- --no-default-features --features wasm`.
 
 ## Drivers
