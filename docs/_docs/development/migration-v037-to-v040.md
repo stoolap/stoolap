@@ -7,6 +7,8 @@ order: 1
 
 # Migration Guide: v0.3.7 to v0.4.0
 
+Upgrading from v0.4.x? See [Migration Guide: v0.4.2 to v0.5.0]({{ '/docs/development/migration-v042-to-v050/' | relative_url }}).
+
 This guide covers everything you need to know when upgrading from Stoolap v0.3.7 (snapshot-based storage) to v0.4.0 (volume-based storage). The migration is automatic and requires no manual steps, but understanding the changes will help you operate your database effectively.
 
 ## Architecture Change Summary
