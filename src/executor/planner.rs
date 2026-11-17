@@ -827,7 +827,7 @@ impl QueryPlanner {
             let (rows, sealed) = self.engine.rows_with_volumes(table_name, store)?;
             // Volumes whose rows all came back hot leave the hot index to count
             let sealed = (sealed.filter(|_| rows != store.committed_row_count()))
-                .map(|volumes| crate::storage::volume::table::sealed_view(&volumes));
+                .map(crate::storage::volume::table::sealed_view);
             let probes = std::cell::Cell::new(crate::storage::volume::table::SEALED_PROBES);
             (rows > 0).then_some(TableRows {
                 rows,

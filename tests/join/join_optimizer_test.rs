@@ -235,6 +235,29 @@ fn test_explain_takes_one_cold_view_for_an_in_list() {
     );
 }
 
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_explain_does_not_count_across_a_seal_after_its_cold_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = sealed_pair(&dir, "0");
+    db.execute(
+        "INSERT INTO a SELECT g.value, 1 FROM generate_series(20001, 40000) g",
+        (),
+    )
+    .unwrap();
+    let other = db.clone();
+    stoolap::test_failpoints::after_estimate_cold_view(move || {
+        other.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    });
+    let line = join_line(&db, "a.x = 1");
+    stoolap::test_failpoints::reset_all();
+    assert!(
+        line.ends_with("(rows=2000)"),
+        "the 20,000 rows of x = 1 left the hot index for a volume the view \
+         did not capture: the default tenth, not a count of 0: {line}"
+    );
+}
+
 #[test]
 fn test_explain_estimates_one_row_for_a_primary_key_equality() {
     let db = Database::open("memory://join_opt_pk_one_row").unwrap();

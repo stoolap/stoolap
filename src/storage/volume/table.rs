@@ -209,14 +209,18 @@ pub(crate) const SEALED_PROBES: usize = 256;
 pub(crate) struct SealedView {
     cold: super::manifest::ColdSnapshot,
     hidden: u64,
+    volumes: Arc<SegmentManager>,
+    /// The settled seal generation taken before the capture
+    generation: u64,
 }
 
 /// The view `sealed_equal_count` counts `volumes` in; None while one of
 /// them hides rows behind another's, which a side file cannot tell apart
-pub(crate) fn sealed_view(volumes: &SegmentManager) -> Option<SealedView> {
+pub(crate) fn sealed_view(volumes: Arc<SegmentManager>) -> Option<SealedView> {
+    let generation = volumes.settled_seal_generation();
+    let cold = volumes.cold_snapshot();
     #[cfg(feature = "test-failpoints")]
     crate::test_failpoints::estimate_cold_view_taken();
-    let cold = volumes.cold_snapshot();
     // Tombstones and dead copies as the snapshot captured them with its volumes
     let mut hidden = cold.ts.len() as u64;
     for (_, cs) in cold.volumes() {
@@ -225,7 +229,12 @@ pub(crate) fn sealed_view(volumes: &SegmentManager) -> Option<SealedView> {
         }
         hidden += cs.dead.as_ref().map_or(0, |dead| dead.len() as u64);
     }
-    Some(SealedView { cold, hidden })
+    Some(SealedView {
+        cold,
+        hidden,
+        volumes,
+        generation,
+    })
 }
 
 /// How many sealed rows of `view`, of a table of `schema` and the side
@@ -272,6 +281,10 @@ pub(crate) fn sealed_equal_count(
             Ok(found) => found.map_or(0, |(start, end)| end.saturating_sub(start)),
             Err(_) => estimate().ok()?.unwrap_or(0),
         };
+    }
+    // A seal since the capture may have moved rows the hot count read before
+    if view.volumes.seal_generation() != view.generation {
+        return None;
     }
     // The live matches lie between the count and the count less the hidden
     (total == 0 || view.hidden.saturating_mul(2) < total).then_some(total)
