@@ -217,14 +217,14 @@ pub(crate) fn sealed_view(volumes: &SegmentManager) -> Option<SealedView> {
     #[cfg(feature = "test-failpoints")]
     crate::test_failpoints::estimate_cold_view_taken();
     let cold = volumes.cold_snapshot();
-    let mut held = 0u64;
+    // Tombstones and dead copies as the snapshot captured them with its volumes
+    let mut hidden = cold.ts.len() as u64;
     for (_, cs) in cold.volumes() {
         if cs.visible.is_some() {
             return None;
         }
-        held += cs.volume.meta.row_count as u64;
+        hidden += cs.dead.as_ref().map_or(0, |dead| dead.len() as u64);
     }
-    let hidden = held.saturating_sub(volumes.total_row_count() as u64);
     Some(SealedView { cold, hidden })
 }
 
