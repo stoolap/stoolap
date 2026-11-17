@@ -72,12 +72,12 @@ const TIME_FORMATS: &[&str] = &[
 /// ## Extension Variant
 ///
 /// The Extension variant is a catch-all for all complex types (JSON, Vector, Blob, etc.)
-/// It stores a single `CompactArc<[u8]>` (8 bytes) where byte[0] is the DataType tag
+/// It stores a single `CompactArc<[u8]>` (8 bytes) where `byte[0]` is the DataType tag
 /// and byte[1..] is the payload. This keeps Value at exactly 7 variants forever —
 /// new types are added by extending DataType (a 1-byte `#[repr(u8)]` enum).
 ///
 /// Note: Text uses SmartString for inline storage of strings up to 15 bytes.
-/// Longer strings use Arc<String> for O(1) clone and sharing.
+/// Longer strings use `Arc<String>` for O(1) clone and sharing.
 #[derive(Debug, Clone)]
 pub enum Value {
     /// NULL value with optional type hint
@@ -98,9 +98,9 @@ pub enum Value {
     /// Timestamp (UTC)
     Timestamp(DateTime<Utc>),
 
-    /// Extension type: byte[0] = DataType tag, byte[1..] = payload
-    /// - Json: byte[0]=6, byte[1..]=UTF-8 bytes (access via `as_json()`)
-    /// - Vector: byte[0]=7, byte[1..]=packed LE f32 bytes (access via `as_vector_f32()`)
+    /// Extension type: `byte[0]` = DataType tag, `byte[1..]` = payload
+    /// - Json: `byte[0]=6`, `byte[1..]`=UTF-8 bytes (access via `as_json()`)
+    /// - Vector: `byte[0]=7`, `byte[1..]`=packed LE f32 bytes (access via `as_vector_f32()`)
     /// - Future types (Blob, Array, etc.) add DataType variants, not Value variants
     Extension(CompactArc<[u8]>),
 }
@@ -359,7 +359,7 @@ impl Value {
         }
     }
 
-    /// Extract as DateTime<Utc>
+    /// Extract as `DateTime<Utc>`
     pub fn as_timestamp(&self) -> Option<DateTime<Utc>> {
         match self {
             Value::Null(_) => None,
@@ -400,7 +400,7 @@ impl Value {
         }
     }
 
-    /// Extract vector as Vec<f32> (reads packed LE f32 bytes from Extension payload)
+    /// Extract vector as `Vec<f32>` (reads packed LE f32 bytes from Extension payload)
     pub fn as_vector_f32(&self) -> Option<Vec<f32>> {
         self.vector_f32_iter().map(Iterator::collect)
     }

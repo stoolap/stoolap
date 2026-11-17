@@ -90,8 +90,8 @@ pub struct BitmapData {
     closed: AtomicBool,
 
     /// One bitmap per distinct value
-    /// Maps CompactArc<Value> -> RoaringTreemap of row IDs (supports full u64 range)
-    /// Uses CompactArc<Value> keys for memory efficiency (8 bytes per key)
+    /// Maps `CompactArc<Value>` -> RoaringTreemap of row IDs (supports full u64 range)
+    /// Uses `CompactArc<Value>` keys for memory efficiency (8 bytes per key)
     /// AHash for HashDoS resistance (user-controlled indexed values)
     bitmaps: RwLock<AHashMap<CompactArc<Value>, RoaringTreemap>>,
 

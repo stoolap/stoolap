@@ -465,7 +465,7 @@ pub fn clear_row_id_vec_pool() {
 
 /// Cached row ID vector that returns to thread-local cache on drop.
 ///
-/// Use this for index lookups to reuse Vec<i64> allocations across queries.
+/// Use this for index lookups to reuse `Vec<i64>` allocations across queries.
 /// Derefs to `Vec<i64>` for transparent access.
 #[derive(Debug)]
 pub struct RowIdVec {

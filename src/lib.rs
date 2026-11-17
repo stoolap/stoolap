@@ -63,6 +63,8 @@
 //! - [`executor`] - Query executor with parallel execution
 //! - [`common`] - Utilities (I64Map, version)
 
+#![deny(clippy::undocumented_unsafe_blocks)]
+
 // stoolap-jemalloc as the global allocator, on by default, without its
 // profiler unless heap-profile is on
 #[cfg(all(feature = "jemalloc", not(feature = "heap-profile")))]

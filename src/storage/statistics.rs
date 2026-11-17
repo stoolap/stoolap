@@ -80,7 +80,7 @@ pub const DEFAULT_HISTOGRAM_BUCKETS: usize = 32;
 #[derive(Debug, Clone)]
 pub struct Histogram {
     /// Bucket boundaries (n+1 values for n buckets)
-    /// boundaries[i] is the inclusive lower bound for bucket i
+    /// `boundaries[i]` is the inclusive lower bound for bucket i
     /// boundaries[i+1] is the exclusive upper bound for bucket i
     pub boundaries: Vec<Value>,
     /// Number of values per bucket (approximately equal for equi-depth)

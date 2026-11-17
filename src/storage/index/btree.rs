@@ -15,7 +15,7 @@
 //! B-tree Index implementation for range queries and ordered access
 //!
 //! Provides a B-tree based index optimized for:
-//! - Range queries (O(log n + k) with a [`ValueTree`])
+//! - Range queries (O(log n + k) with a `ValueTree`)
 //! - Ordered access (ORDER BY, MIN, MAX)
 //! - Efficient column scans
 //! - Aggregation operations (min/max from the tree's ends)
@@ -39,7 +39,7 @@ const NULL: Value = Value::Null(DataType::Null);
 
 /// B-tree index for efficient range queries and ordered access
 ///
-/// This index stores column values in sorted order in a [`ValueTree`] for:
+/// This index stores column values in sorted order in a `ValueTree` for:
 /// - O(log n + k) range queries (k = number of matching values)
 /// - O(log n) point lookups
 /// - O(log n) MIN/MAX queries from the tree's ends

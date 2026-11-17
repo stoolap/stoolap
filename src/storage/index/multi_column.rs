@@ -59,7 +59,7 @@ thread_local! {
 }
 
 /// Composite key for BTreeMap ordering
-/// Wraps Vec<Value> with proper Ord implementation
+/// Wraps `Vec<Value>` with proper Ord implementation
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompositeKey(pub Vec<Value>);
 

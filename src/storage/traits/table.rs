@@ -1376,7 +1376,7 @@ pub trait Table: Send + Sync {
     /// * `column_name` - The indexed column to get partition values from
     ///
     /// # Returns
-    /// Some(Vec<Value>) with distinct values, or None if column has no index
+    /// `Some(Vec<Value>)` with distinct values, or None if column has no index
     fn get_partition_values(
         &self,
         column_name: &str,

@@ -259,7 +259,7 @@ impl PushdownRegistry {
 
     /// Try to push down an expression to storage layer
     ///
-    /// Returns (Option<StorageExpr>, needs_memory_filter)
+    /// Returns `(Option<StorageExpr>, needs_memory_filter)`
     pub fn try_pushdown(
         &self,
         expr: &ast::Expression,

@@ -1600,7 +1600,7 @@ impl Default for RemovalHistory {
 
 /// VersionStore tracks the latest committed version of each row for a table
 ///
-/// Uses CowBTreeMap (RwLock<CowBTree>) for the version store because:
+/// Uses CowBTreeMap (`RwLock<CowBTree>`) for the version store because:
 /// - O(1) snapshot cloning for lock-free reads (critical for MVCC)
 /// - Ordered iteration is free (B+ tree is sorted by key)
 /// - MVCC has single-writer semantics per transaction, so concurrent map sharding is overhead

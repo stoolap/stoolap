@@ -130,9 +130,9 @@ pub(crate) unsafe fn ffi_value_of<'a>(
     } else {
         std::slice::from_raw_parts(params, len as usize)
     };
-    // SAFETY: the caller keeps every name valid for `name_len` bytes and
-    // every value valid while the statement binds
     let name_of = |p: &'a StoolapNamedParam| -> Option<&'a [u8]> {
+        // SAFETY: the caller keeps every name valid for `name_len` bytes and
+        // every value valid while the statement binds
         (!p.name.is_null() && p.name_len > 0).then(|| unsafe {
             std::slice::from_raw_parts(p.name as *const u8, p.name_len as usize)
         })

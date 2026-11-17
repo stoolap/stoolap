@@ -248,7 +248,7 @@ pub enum SubsumptionResult {
 /// Intelligently caches query results and detects when new queries
 /// can be answered by filtering cached results.
 pub struct SemanticCache {
-    /// Cached results: table_name -> (hash of the column names in order -> Vec<CachedResult>)
+    /// Cached results: table_name -> (hash of the column names in order -> `Vec<CachedResult>`)
     /// Nested structure enables O(1) table invalidation
     cache: RwLock<StringMap<FxHashMap<u64, Vec<CachedResult>>>>,
     /// Maximum cache size per table+column combination

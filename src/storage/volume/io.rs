@@ -46,6 +46,8 @@ pub(crate) fn sync_ordered(file: &std::fs::File) -> std::io::Result<()> {
     #[cfg(target_os = "macos")]
     {
         use std::os::unix::io::AsRawFd;
+        // SAFETY: the descriptor belongs to `file`, open for the whole call, and
+        // F_BARRIERFSYNC takes no argument and touches no memory of ours
         if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) } == 0 {
             return Ok(());
         }
@@ -591,7 +593,6 @@ fn read_volume_v5(
         }
         None => (0..cols).map(|_| None).collect(),
     };
-    drop(file);
     meta.bloom_filters = super::writer::VolumeBlooms::in_file(&handle, places);
     let root = &opened.root;
     // One group spans every row; more tile them at one power-of-two size,

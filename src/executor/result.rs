@@ -380,7 +380,7 @@ impl QueryResult for FilteredResult {
     }
 }
 
-/// A streaming SELECT list over another result, see [`Projection`]
+/// A streaming SELECT list over another result, see `Projection`
 pub struct ProjectionResult {
     inner: Box<dyn QueryResult>,
     projection: Projection,
@@ -1191,7 +1191,7 @@ impl DistinctResult {
     ///
     /// For example: SELECT DISTINCT a FROM t ORDER BY b
     /// - The result has columns [a, b] for sorting
-    /// - But distinctness should only compare column [a]
+    /// - But distinctness should only compare column `[a]`
     pub fn with_column_count(inner: Box<dyn QueryResult>, distinct_columns: Option<usize>) -> Self {
         let columns = inner.columns().to_vec();
         let distinct_column_count = distinct_columns.unwrap_or(columns.len());
@@ -1639,7 +1639,7 @@ impl QueryResult for ScannerResult {
 ///
 /// This is optimized for window functions and other operations that naturally
 /// produce column-major output. Instead of allocating millions of Row objects
-/// upfront, it stores data as Vec<Value> per column and materializes rows
+/// upfront, it stores data as `Vec<Value>` per column and materializes rows
 /// on-demand during iteration.
 ///
 /// Key benefits:
@@ -1668,7 +1668,7 @@ impl ColumnarResult {
     ///
     /// # Arguments
     /// * `columns` - Column names (must match data.len())
-    /// * `data` - Column-major data where data[col_idx] contains all values for that column
+    /// * `data` - Column-major data where `data[col_idx]` contains all values for that column
     ///
     /// # Panics
     /// Panics if columns.len() != data.len() or if columns have different lengths

@@ -14,8 +14,8 @@
 
 //! CompactVec - A 16-byte vector optimized for Row storage
 //!
-//! Standard Vec<T> is 24 bytes (ptr + len + cap as usize).
-//! CompactVec<T> is 16 bytes (ptr + packed len/cap as u32).
+//! Standard `Vec<T>` is 24 bytes (ptr + len + cap as usize).
+//! `CompactVec<T>` is 16 bytes (ptr + packed len/cap as u32).
 //!
 //! Benefits:
 //! - 33% smaller than Vec (16 vs 24 bytes)
@@ -215,7 +215,7 @@ impl<T> CompactVec<T> {
     ///
     /// Grows geometrically like `Vec::reserve`, so a sequence of small
     /// reservations costs O(log n) reallocations rather than one per call.
-    /// Use [`CompactVec::reserve_exact`] when the final size is known.
+    /// Use [`CompactVec::with_capacity`] when the final size is known.
     #[inline]
     pub fn reserve(&mut self, additional: usize) {
         // Unpack once
