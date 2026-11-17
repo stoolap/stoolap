@@ -53,11 +53,12 @@
 //! checks it, and a cache key carries it, so a file replaced under a
 //! reader never mixes the reader's directory with the new file's pages.
 
+use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 
 use super::side_index::{
     float_key, float_of_key, Capability, Domain, KeyKind, Outcome, SideTarget,
@@ -479,7 +480,7 @@ impl IndexPages {
 
     pub fn stats(&self) -> IndexStats {
         let (cached_bytes, cached_pages) = {
-            let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            let cache = self.cache.lock();
             (
                 cache.pages.values().map(|p| p.bytes).sum(),
                 cache.pages.len(),
@@ -508,7 +509,7 @@ impl IndexPages {
     /// Drops every cached page nobody holds; held pages stay charged.
     pub fn clear(&self) {
         let dropped: Vec<Arc<Page>> = {
-            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cache = self.cache.lock();
             let PageCache { pages, order } = &mut *cache;
             let mut dropped = Vec::new();
             pages.retain(|_, page| {
@@ -588,7 +589,7 @@ impl IndexPages {
     ) -> std::io::Result<bool> {
         let mut parsed = 0usize;
         let mut raw = 0usize;
-        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = self.cache.lock();
         for (kind, number) in pages {
             let key = PageKey {
                 file_id: file.file_id,
@@ -632,7 +633,7 @@ impl IndexPages {
             }
             // The oldest page nobody holds, dropped outside the lock
             let victim = {
-                let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+                let mut cache = self.cache.lock();
                 let at = cache.order.iter().position(|k| {
                     cache
                         .pages
@@ -671,7 +672,7 @@ impl IndexPages {
             number: number as u32,
         };
         {
-            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cache = self.cache.lock();
             if let Some(page) = cache.pages.get(&key) {
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 let page = Arc::clone(page);
@@ -686,7 +687,7 @@ impl IndexPages {
         let page = Arc::new(Page::read(file, kind, ordered_bytes, offset, len)?);
         self.loads.fetch_add(1, Ordering::Relaxed);
         let replaced = {
-            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            let mut cache = self.cache.lock();
             if let Some(existing) = cache.pages.get(&key) {
                 // Another reader loaded it meanwhile; ours goes, and its
                 // reservation with it, outside the lock
@@ -5493,7 +5494,7 @@ mod tests {
 
     #[test]
     fn ordered_bytes_runs_merge_level_by_level() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bytes.sidx");
         let rows = 50_000u32;
@@ -5658,7 +5659,7 @@ mod tests {
 
     #[test]
     fn an_entry_the_budget_refuses_midway_is_left_out_and_the_others_are_kept() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sidx");
         // The first entry has written pages when the refusal comes
@@ -5727,7 +5728,7 @@ mod tests {
 
     #[test]
     fn an_entry_copied_from_an_earlier_file_reads_as_it_did() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let (first, second) = (dir.path().join("a.sidx"), dir.path().join("b.sidx"));
         build_side_file(&first, next_generation(), two_columns(), WORKSPACE).unwrap();
@@ -5756,7 +5757,7 @@ mod tests {
 
     #[test]
     fn a_copy_that_reads_a_damaged_page_fails_the_build() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let (first, second) = (dir.path().join("a.sidx"), dir.path().join("b.sidx"));
         build_side_file(&first, next_generation(), two_columns(), WORKSPACE).unwrap();
@@ -5779,7 +5780,7 @@ mod tests {
 
     #[test]
     fn a_rebuild_advances_only_keeping_every_entry_and_adding_one() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let target = |identity, column| SideTarget {
             identity,
@@ -5804,7 +5805,7 @@ mod tests {
 
     #[test]
     fn a_rebuild_in_the_current_format_advances_over_an_older_one() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let (legacy, fresh) = (dir.path().join("a.sidx"), dir.path().join("b.sidx"));
         build_side_file(&legacy, next_generation(), two_columns(), WORKSPACE).unwrap();
@@ -5836,7 +5837,7 @@ mod tests {
 
     #[test]
     fn a_build_whose_every_entry_is_refused_is_refused() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sidx");
         let mut columns = two_columns();
@@ -5851,7 +5852,7 @@ mod tests {
 
     #[test]
     fn keys_map_to_their_positions_through_pages() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sidx");
         // 50,000 rows, key = row % 977 so every key has about 51 positions
@@ -5890,7 +5891,7 @@ mod tests {
 
     #[test]
     fn a_column_lists_the_keys_past_the_scan_share() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("heavy.sidx");
         // 50,000 rows: 5,000 of key 5000, after every lighter key, and
@@ -5997,7 +5998,7 @@ mod tests {
 
     #[test]
     fn a_key_with_a_million_positions_spans_pages_and_a_window_holds_a_bounded_slice() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sidx");
         let n = 1_000_000u32;
@@ -6046,7 +6047,7 @@ mod tests {
 
     #[test]
     fn a_reader_space_keeps_its_charge_while_it_holds_the_buffers() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sidx");
         let pairs: Vec<(u32, i64)> = (0..1000u32).map(|p| (p, p as i64)).collect();
@@ -6102,7 +6103,7 @@ mod tests {
     #[test]
     fn a_key_buffer_is_charged_while_it_holds_its_bytes() {
         use super::super::side_index::text_key_len;
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         INDEX_PAGES.clear();
         let baseline = INDEX_PAGES.stats().charged_bytes;
         let long = "k".repeat(MAX_BYTE_KEY - 3);
@@ -6138,7 +6139,7 @@ mod tests {
 
     #[test]
     fn a_page_is_charged_at_the_capacity_of_its_vectors_and_its_raw_bytes_only_while_parsed() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sidx");
         let pairs: Vec<(u32, i64)> = (0..100_000u32).map(|p| (p, p as i64)).collect();
@@ -6188,7 +6189,7 @@ mod tests {
 
     #[test]
     fn a_build_beyond_its_workspace_spills_runs_merges_them_upward_and_answers_the_same() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let small = dir.path().join("small.sidx");
         let large = dir.path().join("large.sidx");
@@ -6238,7 +6239,7 @@ mod tests {
     /// by the build's own ledger and checked against the allocator.
     #[test]
     fn a_workspace_bounds_the_whole_build_for_every_input_shape() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
 
         // 1. One column of 1.2 million unique keys under the minimum: more
@@ -6380,7 +6381,7 @@ mod tests {
 
     #[test]
     fn a_failed_build_touches_nothing_but_its_own_directory() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("alpha.sidx");
         // A published file whose name looks like a build's leftovers, and
@@ -6453,7 +6454,7 @@ mod tests {
 
     #[test]
     fn a_relative_target_without_a_parent_builds_beside_itself_and_cleans_up() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         // A bare name resolves to the current directory; the build is
         // refused after its directory was created, and nothing stays
         let name = format!("relative-{}.sidx", std::process::id());
@@ -6492,7 +6493,7 @@ mod tests {
 
     #[test]
     fn the_directory_s_columns_are_taken_from_the_budget_before_they_are_allocated() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("many-columns.sidx");
         let empty = || {
@@ -6540,7 +6541,7 @@ mod tests {
 
     #[test]
     fn a_fixed_workspace_holds_while_the_input_grows() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let workspace = 512 * 1024;
         for rows in [50_000u32, 200_000, 800_000] {
@@ -6567,7 +6568,7 @@ mod tests {
 
     #[test]
     fn a_failed_spill_and_a_failed_finish_leave_no_temporary_file() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sidx");
         build(
@@ -6629,7 +6630,7 @@ mod tests {
 
     #[test]
     fn a_corrupt_page_fails_alone_and_a_corrupt_directory_fails_the_open() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sidx");
         let pairs: Vec<(u32, i64)> = (0..30_000u32).map(|p| (p, (p % 5000) as i64)).collect();
@@ -6671,7 +6672,7 @@ mod tests {
     /// the same walk yields every position once
     #[test]
     fn a_failed_window_is_retried_without_repeating_positions() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sidx");
         build(
@@ -6713,7 +6714,7 @@ mod tests {
     /// remainder from the window's end and, repaired, yields the rest once
     #[test]
     fn a_failed_refill_after_a_served_window_keeps_the_remainder() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sidx");
         build(
@@ -6761,7 +6762,7 @@ mod tests {
     /// that opens is attached and a newer one that does not open stays
     #[test]
     fn side_files_are_grouped_by_volume_and_an_unreadable_newer_one_stays() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let volume = dir.path().join("vol_1.vol");
         let other = dir.path().join("vol_2.vol");
@@ -6814,7 +6815,7 @@ mod tests {
 
     #[test]
     fn a_replacement_is_a_new_file_and_the_old_holder_keeps_its_own() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sidx");
         build(
@@ -6856,7 +6857,7 @@ mod tests {
 
     #[test]
     fn a_held_page_stays_charged_after_its_eviction_and_the_budget_is_honoured_otherwise() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sidx");
         let pairs: Vec<(u32, i64)> = (0..200_000u32).map(|p| (p, (p % 40_000) as i64)).collect();
@@ -6925,7 +6926,7 @@ mod tests {
 
     #[test]
     fn a_shown_key_walk_charges_its_key_copies_and_a_refusal_hands_on_no_key() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sidx");
         let pairs: Vec<(u32, i64)> = (0..200_000u32).map(|p| (p, (p % 40_000) as i64)).collect();
@@ -6972,7 +6973,7 @@ mod tests {
 
     #[test]
     fn statistics_reservations_and_evictions_do_not_wait_on_each_other() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sidx");
         let pairs: Vec<(u32, i64)> = (0..200_000u32).map(|p| (p, (p % 40_000) as i64)).collect();
@@ -7026,7 +7027,7 @@ mod tests {
 
     #[test]
     fn a_build_is_refused_while_the_others_hold_the_builds_budget() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sidx");
         let baseline = INDEX_BUILDS.stats();
@@ -7065,7 +7066,7 @@ mod tests {
 
     #[test]
     fn a_column_records_the_identity_it_was_built_for() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sidx");
         build_side_file(
@@ -7120,7 +7121,7 @@ mod tests {
 
     #[test]
     fn a_version_5_file_is_still_served() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sidx");
         build(&path, scattered(20_000, 977).collect(), WORKSPACE);
@@ -7141,7 +7142,7 @@ mod tests {
 
     #[test]
     fn two_indexes_on_one_column_are_read_apart() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sidx");
         build_side_file(
@@ -7244,7 +7245,7 @@ mod tests {
 
     #[test]
     fn a_legacy_entry_is_copied_with_its_components_and_heavy_keys() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         for version in [VERSION_WITHOUT_HEAVY_KEYS, VERSION_WITH_HEAVY_KEYS] {
             let dir = tempfile::tempdir().unwrap();
             let (first, second) = (dir.path().join("a.sidx"), dir.path().join("b.sidx"));
@@ -7331,7 +7332,7 @@ mod tests {
 
     #[test]
     fn a_legacy_entry_the_budget_cannot_rebuild_is_kept_while_another_is_added() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         for version in [VERSION_WITHOUT_HEAVY_KEYS, VERSION_WITH_HEAVY_KEYS] {
             let dir = tempfile::tempdir().unwrap();
             let rows = 131_072;
@@ -7379,7 +7380,7 @@ mod tests {
 
     #[test]
     fn the_input_s_decode_is_admitted_with_the_build_and_the_allocation_stays_within_it() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let (volume, path) = file_backed(dir.path(), 131_072);
         let identity = 41u64;
@@ -7437,7 +7438,7 @@ mod tests {
 
     #[test]
     fn a_volume_that_cannot_be_read_fails_its_side_build_as_the_caller_s_error() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let (volume, path) = file_backed(dir.path(), 1_000);
         let identity = 41u64;
@@ -7464,7 +7465,7 @@ mod tests {
 
     #[test]
     fn a_side_file_that_does_not_open_at_reopen_is_left_in_place() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let volume_path = dir.path().join("vol_0000000000000001.vol");
         let side = side_path(&volume_path);
@@ -7484,7 +7485,7 @@ mod tests {
 
     #[test]
     fn a_reader_refused_its_working_reservation_is_refused_before_any_row() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sidx");
         build(
@@ -7507,7 +7508,7 @@ mod tests {
 
     #[test]
     fn an_admitted_reader_completes_through_its_own_buffers_when_the_cache_admits_nothing() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sidx");
         let pairs: Vec<(u32, i64)> = (0..200_000u32).map(|p| (p, (p % 40_000) as i64)).collect();
@@ -7550,7 +7551,7 @@ mod tests {
 
     #[test]
     fn a_checksum_failure_mid_walk_is_the_reader_s_error_and_it_does_not_advance_past_it() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sidx");
         let pairs: Vec<(u32, i64)> = (0..30_000u32).map(|p| (p, (p % 5000) as i64)).collect();
@@ -7582,7 +7583,7 @@ mod tests {
 
     #[test]
     fn a_window_that_fails_on_its_second_page_returns_nothing_and_keeps_its_place() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sidx");
         // One key over three position pages
@@ -7623,7 +7624,7 @@ mod tests {
 
     #[test]
     fn a_range_bound_from_the_directory_is_never_below_the_exact_count() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = SERIAL.lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sidx");
         let pairs: Vec<(u32, i64)> = (0..100_000u32).map(|p| (p, (p % 30_000) as i64)).collect();

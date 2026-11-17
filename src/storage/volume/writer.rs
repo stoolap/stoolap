@@ -4905,11 +4905,11 @@ mod tests {
         let file = VolumeFile::shared(&old_dir.join("v.vol"));
         let reader = Arc::clone(&file);
         let (tx, rx) = std::sync::mpsc::channel();
-        let read = std::sync::Mutex::new(None);
+        let read = parking_lot::Mutex::new(None);
         VolumeFile::relocate(&old_dir, &new_dir, || {
             let reader = Arc::clone(&reader);
             let tx = tx.clone();
-            *read.lock().unwrap() = Some(std::thread::spawn(move || {
+            *read.lock() = Some(std::thread::spawn(move || {
                 let opened = reader.open().map(|_| reader.path());
                 tx.send(()).unwrap();
                 opened
@@ -4921,7 +4921,7 @@ mod tests {
             std::fs::rename(&old_dir, &new_dir)
         })
         .unwrap();
-        let opened = read.lock().unwrap().take().unwrap().join().unwrap();
+        let opened = read.lock().take().unwrap().join().unwrap();
         assert_eq!(opened.unwrap(), new_dir.join("v.vol"));
         assert_eq!(file.path(), new_dir.join("v.vol"));
     }

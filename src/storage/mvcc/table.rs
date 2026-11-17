@@ -85,7 +85,7 @@ pub struct MVCCTable {
 /// read handle, which has no store, and those written by the cut through a
 /// handle that reads at one
 struct LocalRows<'a>(
-    Option<std::sync::RwLockReadGuard<'a, TransactionVersionStore>>,
+    Option<parking_lot::RwLockReadGuard<'a, TransactionVersionStore>>,
     i64,
 );
 
@@ -555,11 +555,7 @@ impl MVCCTable {
 
     /// The transaction's rows of this table, held for reading
     fn local(&self) -> LocalRows<'_> {
-        let rows = self.txn_versions.as_ref().map(|store| {
-            store
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        });
+        let rows = self.txn_versions.as_ref().map(|store| store.read());
         LocalRows(rows, self.cut)
     }
 
@@ -2069,9 +2065,7 @@ impl MVCCTable {
             return Ok(());
         }
         let tracks = self.version_store.may_hold_unique_beside_key()
-            && (self.local_store()?.read())
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .tracks_keys();
+            && (self.local_store()?.read()).tracks_keys();
         if tracks {
             let key = self.cached_schema.pk_column_index();
             let mut store = self.writes()?;
@@ -2210,9 +2204,7 @@ impl MVCCTable {
     fn prepare_insert(&mut self, row: &mut Row) -> Result<i64> {
         // Before any id is taken: a lowering of the counter waits or sees it
         if !self.inserting {
-            (self.local_store()?.read())
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .note_inserting();
+            (self.local_store()?.read()).note_inserting();
             self.inserting = true;
         }
         // Handle auto-increment for primary key BEFORE validation
@@ -2278,10 +2270,7 @@ impl MVCCTable {
         // transaction has deleted is gone for it, whatever the global
         // store still holds, so the key may be taken again
         let deleted_locally = {
-            let txn_versions = self
-                .local_store()?
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let txn_versions = self.local_store()?.read();
             if txn_versions.has_locally_seen(row_id) && txn_versions.get(row_id).is_some() {
                 return Err(Error::primary_key_constraint(row_id));
             }
@@ -3734,10 +3723,9 @@ impl Table for MVCCTable {
         deleted: &dyn Fn() -> bool,
     ) -> bool {
         match &self.txn_versions {
-            Some(store) => (store
+            Some(store) => store
                 .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner))
-            .cold_row_holds(row_id, columns, values, deleted),
+                .cold_row_holds(row_id, columns, values, deleted),
             None => !deleted(),
         }
     }

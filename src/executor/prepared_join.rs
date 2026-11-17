@@ -16,7 +16,8 @@
 //! operator's choice they were compiled for, the join's analysis and its
 //! output, each by the columns it reads
 
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 use smallvec::SmallVec;
 
@@ -141,7 +142,7 @@ impl<K, T: ?Sized> Shelf<K, T> {
     }
 
     pub(crate) fn find(&self, wanted: impl Fn(&K) -> bool) -> Option<Arc<T>> {
-        let held = self.held.read().ok()?;
+        let held = self.held.read();
         held.iter()
             .find(|(key, _)| wanted(key))
             .map(|(_, value)| Arc::clone(value))
@@ -154,10 +155,9 @@ impl<K, T: ?Sized> Shelf<K, T> {
         key: impl FnOnce() -> K,
         value: impl FnOnce() -> Arc<T>,
     ) {
-        if let Ok(mut held) = self.held.write() {
-            if held.len() < MAX_HELD && !held.iter().any(|(k, _)| wanted(k)) {
-                held.push((key(), value()));
-            }
+        let mut held = self.held.write();
+        if held.len() < MAX_HELD && !held.iter().any(|(k, _)| wanted(k)) {
+            held.push((key(), value()));
         }
     }
 }
@@ -352,15 +352,16 @@ impl PreparedJoin {
         epoch: u64,
         resolve: impl FnOnce() -> SideArms,
     ) -> Arc<SideArms> {
-        if let Ok(held) = self.side_arms.read() {
-            if let Some((_, arms)) = held.as_ref().filter(|(at, _)| *at == epoch) {
-                return Arc::clone(arms);
-            }
+        if let Some((_, arms)) = self
+            .side_arms
+            .read()
+            .as_ref()
+            .filter(|(at, _)| *at == epoch)
+        {
+            return Arc::clone(arms);
         }
         let arms = Arc::new(resolve());
-        if let Ok(mut held) = self.side_arms.write() {
-            *held = Some((epoch, Arc::clone(&arms)));
-        }
+        *self.side_arms.write() = Some((epoch, Arc::clone(&arms)));
         arms
     }
 
@@ -539,16 +540,17 @@ impl PreparedJoin {
         &self,
         build: impl FnOnce() -> Result<Option<JoinBlocks>>,
     ) -> Result<Option<Arc<JoinBlocks>>> {
-        if let Some(held) = self.join_blocks.read().ok().and_then(|held| held.clone()) {
+        let held = self.join_blocks.read().clone();
+        if let Some(held) = held {
             return Ok(Some(held));
         }
         let Some(built) = build()? else {
             return Ok(None);
         };
         let built = Arc::new(built);
-        if let Ok(mut held) = self.join_blocks.write() {
-            held.get_or_insert_with(|| Arc::clone(&built));
-        }
+        self.join_blocks
+            .write()
+            .get_or_insert_with(|| Arc::clone(&built));
         Ok(Some(built))
     }
 
@@ -559,7 +561,7 @@ impl PreparedJoin {
         Option<Arc<JoinBlocks>>,
         Option<Arc<Option<PreparedGrouped>>>,
     ) {
-        let join = self.join_blocks.read().ok().and_then(|held| held.clone());
+        let join = self.join_blocks.read().clone();
         (join, self.grouped_blocks.find(|_| true))
     }
 }

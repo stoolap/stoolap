@@ -5750,7 +5750,7 @@ mod tests {
         assert!(mgr.tombstone_set_arc().is_empty());
     }
 
-    static EVICTION_EPOCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static EVICTION_EPOCH_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     /// A hot volume of `ids` with a compressed store attached
     fn volume_of(ids: &[i64]) -> Arc<FrozenVolume> {
@@ -6345,9 +6345,7 @@ mod tests {
         // GLOBAL_EVICTION_EPOCH is process-global: epoch-driving tests
         // must serialize and use base-relative epochs or they corrupt
         // each other's idle-cycle accounting under parallel test runs.
-        let _epoch_guard = EVICTION_EPOCH_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let _epoch_guard = EVICTION_EPOCH_LOCK.lock();
         let base =
             super::super::writer::GLOBAL_EVICTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
 
@@ -6605,9 +6603,7 @@ mod tests {
         )
         .unwrap();
 
-        let _epoch_guard = EVICTION_EPOCH_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let _epoch_guard = EVICTION_EPOCH_LOCK.lock();
         let base =
             super::super::writer::GLOBAL_EVICTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
         let run_eviction = |mgr: &SegmentManager, epoch: u64| {
@@ -6763,9 +6759,7 @@ mod tests {
 
         let snap = mgr.statement_snapshot();
 
-        let _epoch_guard = EVICTION_EPOCH_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let _epoch_guard = EVICTION_EPOCH_LOCK.lock();
         let base =
             super::super::writer::GLOBAL_EVICTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
         for e in 0..=10u64 {

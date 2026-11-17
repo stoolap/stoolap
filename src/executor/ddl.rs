@@ -538,7 +538,7 @@ impl Executor {
             columns: vec![c.clone()],
             unique: false,
         }));
-        let mut active_tx = self.active_transaction.lock().unwrap();
+        let mut active_tx = self.active_transaction.lock();
         match active_tx.as_mut() {
             // The active transaction's rollback drops the table
             Some(tx_state) => {
@@ -659,7 +659,7 @@ impl Executor {
         }
 
         // Check if there's an active transaction
-        let mut active_tx = self.active_transaction.lock().unwrap();
+        let mut active_tx = self.active_transaction.lock();
         match active_tx.as_mut() {
             Some(tx_state) => {
                 // WARNING: DROP TABLE within a transaction has limited rollback support.

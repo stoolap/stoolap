@@ -155,7 +155,7 @@ pub(crate) fn filter_in_parallel(rows: RowVec, filter: &RowFilter) -> Result<Row
 fn filter_by_workers(rows: &[(i64, Row)], filter: &RowFilter) -> Result<Vec<bool>> {
     use std::sync::atomic::{AtomicBool, Ordering};
     let stopped = AtomicBool::new(false);
-    let failed = std::sync::Mutex::new(None);
+    let failed = parking_lot::Mutex::new(None);
     let keep: Vec<bool> = rows
         .par_iter()
         .with_min_len(rows.len().div_ceil(rayon::current_num_threads()))
@@ -171,15 +171,14 @@ fn filter_by_workers(rows: &[(i64, Row)], filter: &RowFilter) -> Result<Vec<bool
                     Ok(keep) => keep,
                     Err(error) => {
                         stopped.store(true, Ordering::Relaxed);
-                        let mut failed = failed.lock().unwrap_or_else(|e| e.into_inner());
-                        failed.get_or_insert(error);
+                        failed.lock().get_or_insert(error);
                         false
                     }
                 }
             },
         )
         .collect();
-    match failed.into_inner().unwrap_or_else(|e| e.into_inner()) {
+    match failed.into_inner() {
         Some(error) => Err(error),
         None => Ok(keep),
     }

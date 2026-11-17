@@ -14,7 +14,8 @@
 
 //! Runs a statement the planner planned: its access, then its steps
 
-use std::sync::{Arc, OnceLock, RwLock, Weak};
+use parking_lot::RwLock;
+use std::sync::{Arc, OnceLock, Weak};
 
 use smallvec::SmallVec;
 
@@ -75,7 +76,7 @@ impl Executor {
         error: &mut Option<Error>,
     ) -> Option<R> {
         let epoch = self.engine.schema_epoch();
-        let held = match &*compiled.read().ok()? {
+        let held = match &*compiled.read() {
             // A context of other CTEs than it was planned in may hide its
             // table, or show one: the statement is planned again for it
             CompiledExecution::PreparedSelect(p)
@@ -221,9 +222,7 @@ impl Executor {
         }
         prepared.quiet = quiet;
         let prepared = Arc::new(prepared);
-        let Ok(mut slot) = compiled.write() else {
-            return Ok(None);
-        };
+        let mut slot = compiled.write();
         if matches!(
             &*slot,
             CompiledExecution::Unknown
@@ -257,7 +256,7 @@ impl Executor {
     ) -> Option<Vec<String>> {
         let slot = RwLock::new(CompiledExecution::Unknown);
         self.with_planned(stmt, &slot, None, Some(ctx), |_| ());
-        if let CompiledExecution::PreparedSelect(prepared) = &*slot.read().ok()? {
+        if let CompiledExecution::PreparedSelect(prepared) = &*slot.read() {
             let Some(Expression::TableSource(source)) = stmt.table_expr.as_deref() else {
                 return None;
             };
@@ -703,10 +702,7 @@ impl Executor {
             return Ok(KeyRows::Many(rows));
         }
         let (table, view) = {
-            let active = self
-                .active_transaction
-                .lock()
-                .map_err(|_| Error::internal("active transaction lock poisoned"))?;
+            let active = self.active_transaction.lock();
             // A missing transaction or table is the normal path's to report
             let found = active.as_ref().and_then(|tx| {
                 let level = self

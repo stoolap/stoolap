@@ -75,11 +75,11 @@
 //! Future enhancement: Per-transaction cache scoping with timestamp-based invalidation
 
 use crate::common::time_compat::Instant;
+use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHasher};
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
 use std::time::Duration;
 
 use crate::common::{CompactArc, StringMap};
@@ -280,9 +280,6 @@ pub struct SemanticCacheStats {
     pub ttl_evictions: AtomicU64,
     /// Entries evicted due to size limit
     pub size_evictions: AtomicU64,
-    /// Lock acquisition failures (poisoned lock from panics)
-    /// If this is non-zero, a previous operation panicked while holding the lock
-    pub lock_failures: AtomicU64,
 }
 
 /// Snapshot of cache statistics (plain values for reading)
@@ -300,8 +297,6 @@ pub struct SemanticCacheStatsSnapshot {
     pub ttl_evictions: u64,
     /// Entries evicted due to size limit
     pub size_evictions: u64,
-    /// Lock acquisition failures (indicates previous panic)
-    pub lock_failures: u64,
 }
 
 /// Result of a cache lookup
@@ -368,13 +363,7 @@ impl SemanticCache {
 
         // First pass: read-only search
         let hit_info = {
-            let cache = match self.cache.read() {
-                Ok(c) => c,
-                Err(_) => {
-                    self.stats.lock_failures.fetch_add(1, Ordering::Relaxed);
-                    return CacheLookupResult::Miss;
-                }
-            };
+            let cache = self.cache.read();
 
             // Navigate nested structure: table -> columns -> entries
             let table_cache = match cache.get(table_key.as_ref()) {
@@ -452,7 +441,8 @@ impl SemanticCache {
                 // Update access time with write lock
                 // TOCTOU safety: verify the entry's fingerprint hash matches
                 // If entry was evicted/replaced, skip update (benign miss)
-                if let Ok(mut cache) = self.cache.write() {
+                {
+                    let mut cache = self.cache.write();
                     if let Some(table_cache) = cache.get_mut(table_key.as_ref()) {
                         if let Some(entries) = table_cache.get_mut(&column_key) {
                             if let Some(entry) = entries.get_mut(idx) {
@@ -513,13 +503,7 @@ impl SemanticCache {
         table_key: Cow<'_, str>,
         column_key: u64,
     ) {
-        let mut cache = match self.cache.write() {
-            Ok(c) => c,
-            Err(_) => {
-                self.stats.lock_failures.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-        };
+        let mut cache = self.cache.write();
 
         // Check global limit and evict across other tables first if needed
         let current_global = self.global_row_count.load(Ordering::Relaxed) as usize;
@@ -644,40 +628,30 @@ impl SemanticCache {
     /// Invalidate all cache entries for a table (O(1) operation)
     pub fn invalidate_table(&self, table_name: &str) {
         let table_key = to_lowercase_cow(table_name);
-        match self.cache.write() {
-            Ok(mut cache) => {
-                // Count rows being removed for global tracking
-                if let Some(table_cache) = cache.get(table_key.as_ref()) {
-                    let rows_removed: usize = table_cache
-                        .values()
-                        .flat_map(|entries| entries.iter())
-                        .map(|e| e.rows.len())
-                        .sum();
-                    if rows_removed > 0 {
-                        self.global_row_count
-                            .fetch_sub(rows_removed as u64, Ordering::Relaxed);
-                    }
-                }
-                // O(1) removal: just remove the entire table entry
-                cache.remove(table_key.as_ref());
-            }
-            Err(_) => {
-                self.stats.lock_failures.fetch_add(1, Ordering::Relaxed);
+        let mut cache = self.cache.write();
+        // Count rows being removed for global tracking
+        if let Some(table_cache) = cache.get(table_key.as_ref()) {
+            let rows_removed: usize = table_cache
+                .values()
+                .flat_map(|entries| entries.iter())
+                .map(|e| e.rows.len())
+                .sum();
+            if rows_removed > 0 {
+                self.global_row_count
+                    .fetch_sub(rows_removed as u64, Ordering::Relaxed);
             }
         }
+        // O(1) removal: just remove the entire table entry
+        cache.remove(table_key.as_ref());
     }
 
     /// Clear the entire cache and reset statistics
     pub fn clear(&self) {
-        match self.cache.write() {
-            Ok(mut cache) => {
-                cache.clear();
-                // Under the lock, so an insert after it counts its rows
-                self.global_row_count.store(0, Ordering::Relaxed);
-            }
-            Err(_) => {
-                self.stats.lock_failures.fetch_add(1, Ordering::Relaxed);
-            }
+        {
+            let mut cache = self.cache.write();
+            cache.clear();
+            // Under the lock, so an insert after it counts its rows
+            self.global_row_count.store(0, Ordering::Relaxed);
         }
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::semantic_cache_cleared();
@@ -688,7 +662,6 @@ impl SemanticCache {
         self.stats.misses.store(0, Ordering::Relaxed);
         self.stats.ttl_evictions.store(0, Ordering::Relaxed);
         self.stats.size_evictions.store(0, Ordering::Relaxed);
-        // Note: lock_failures is NOT reset - it indicates historical panics
     }
 
     /// Get cache statistics as a snapshot
@@ -700,21 +673,17 @@ impl SemanticCache {
             misses: self.stats.misses.load(Ordering::Relaxed),
             ttl_evictions: self.stats.ttl_evictions.load(Ordering::Relaxed),
             size_evictions: self.stats.size_evictions.load(Ordering::Relaxed),
-            lock_failures: self.stats.lock_failures.load(Ordering::Relaxed),
         }
     }
 
     /// Get the number of cached entries
     pub fn size(&self) -> usize {
+        // Sum entries across all tables and column combinations
         self.cache
             .read()
-            .map(|c| {
-                // Sum entries across all tables and column combinations
-                c.values()
-                    .map(|table_cache| table_cache.values().map(|v| v.len()).sum::<usize>())
-                    .sum()
-            })
-            .unwrap_or(0)
+            .values()
+            .map(|table_cache| table_cache.values().map(|v| v.len()).sum::<usize>())
+            .sum()
     }
 
     /// Filter cached rows using a predicate
