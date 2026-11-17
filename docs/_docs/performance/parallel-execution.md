@@ -95,14 +95,7 @@ Parallel execution provides significant benefits for analytical queries. Typical
 
 ## EXPLAIN ANALYZE Output
 
-Use `EXPLAIN ANALYZE` to see parallel execution in action:
-
-```sql
-EXPLAIN ANALYZE SELECT * FROM large_table WHERE value > 100;
--- Output shows: Parallel Seq Scan on large_table (workers=N)
-```
-
-The output indicates how many worker threads were used for each operation.
+A run decides from the rows it read whether its filter runs on the thread pool, so `EXPLAIN` and `EXPLAIN ANALYZE` print the same scan line either way.
 
 ## Query Types That Benefit Most
 

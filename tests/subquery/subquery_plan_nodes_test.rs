@@ -41,9 +41,10 @@ fn block_lines(db: &Database, sql: &str) -> Vec<String> {
         .collect();
     lines
         .iter()
-        .skip_while(|line| line.as_str() != "  Subqueries:")
+        .skip_while(|line| line.as_str() != "Subqueries:")
         .skip(1)
-        .map(|line| line.strip_prefix("    ").unwrap_or(line).to_string())
+        .take_while(|line| line.starts_with("  "))
+        .map(|line| line.strip_prefix("  ").unwrap_or(line).to_string())
         .collect()
 }
 
@@ -179,6 +180,33 @@ fn explain_analyze_says_how_each_block_answers() {
         }
     }
     assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+#[test]
+fn explain_analyze_lists_a_derived_table_s_subquery_once() {
+    let db = setup("subquery_plan_nodes_derived_once");
+    let sql = "SELECT q.id FROM (SELECT id FROM t WHERE EXISTS \
+               (SELECT 1 FROM w WHERE w.k = t.k AND w.v > 0)) AS q \
+               WHERE q.id IN (SELECT rid FROM r)";
+    let lines: Vec<String> = db
+        .query(&format!("EXPLAIN ANALYZE {sql}"), ())
+        .unwrap()
+        .map(|row| row.unwrap().get::<String>(0).unwrap())
+        .collect();
+    let headings = lines.iter().filter(|l| l.trim() == "Subqueries:").count();
+    let exists = lines.iter().filter(|l| l.contains("EXISTS over w")).count();
+    assert_eq!(
+        (headings, exists),
+        (1, 1),
+        "one section lists the derived table's EXISTS once: {lines:#?}"
+    );
+    assert_eq!(
+        block_lines(&db, sql),
+        [
+            "1: IN over r, once per run",
+            "2: EXISTS over w, per call: a keyed set, or where the index on k makes probing cheaper: its pushed conditions",
+        ]
+    );
 }
 
 #[test]

@@ -18,6 +18,7 @@ mod adaptive_execution_test;
 mod bug_now_stale_cache_test;
 mod cardinality_feedback_test;
 mod constant_false_where_test;
+mod explain_analyze_plan_test;
 mod explain_plan_test;
 mod explain_test;
 mod expression_pushdown_test;

@@ -57,17 +57,11 @@ fn test_explain_analyze_shows_estimates_and_actuals() {
         .collect::<Result<Vec<_>, _>>()
         .expect("Failed to collect");
 
-    let mut found_actual_rows = false;
-    for row in &result {
-        let plan_line: String = row.get(0).expect("Failed to get plan line");
-        // Check for both formats: "actual rows=" or "actual_rows="
-        if plan_line.contains("actual rows=") || plan_line.contains("actual_rows=") {
-            found_actual_rows = true;
-            break;
-        }
-    }
-
-    assert!(found_actual_rows, "EXPLAIN ANALYZE should show actual rows");
+    let top: String = result[0].get(0).expect("Failed to get plan line");
+    assert!(
+        top.ends_with(", rows=49)"),
+        "EXPLAIN ANALYZE should show the 49 rows it returned: {top}"
+    );
 }
 
 /// Test that repeated queries benefit from feedback
@@ -227,18 +221,11 @@ fn test_selective_predicate_feedback() {
         .collect::<Result<Vec<_>, _>>()
         .expect("Failed to collect");
 
-    // Verify actual rows is shown
-    let mut found_actual = false;
-    for row in &result {
-        let plan_line: String = row.get(0).expect("Failed to get plan line");
-        // Check for both formats: "actual rows=" or "actual_rows="
-        if plan_line.contains("actual rows=") || plan_line.contains("actual_rows=") {
-            found_actual = true;
-            // The actual rows should be around 10 (1% of 1000)
-        }
-    }
-
-    assert!(found_actual, "Should show actual row count");
+    let top: String = result[0].get(0).expect("Failed to get plan line");
+    assert!(
+        top.ends_with(", rows=10)"),
+        "Should show the 10 rows out of stock: {top}"
+    );
 }
 
 /// Test feedback with compound predicates

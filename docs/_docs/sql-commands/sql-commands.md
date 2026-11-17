@@ -947,20 +947,18 @@ Project id, name, email
 
 ### EXPLAIN ANALYZE
 
-Shows the execution plan with actual runtime statistics.
+Runs the statement and shows the plan EXPLAIN shows, with the time and rows of the run on its top line.
 
 ```sql
-EXPLAIN ANALYZE SELECT * FROM products WHERE price > 100;
+EXPLAIN ANALYZE SELECT id FROM products WHERE price > 100;
 ```
 
 Output:
 ```
 plan
 ----
-SELECT (actual time=1.2ms, rows=150)
-  Columns: *
-  -> Seq Scan on products (actual rows=150)
-       Filter: (price > 100)
+Project id (actual time=1.2ms, rows=150)
+  SeqScan products (price > 100)
 ```
 
 See [EXPLAIN]({% link _docs/sql-features/explain.md %}) for detailed documentation.

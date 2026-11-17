@@ -182,19 +182,17 @@ See [EXPLAIN]({% link _docs/sql-features/explain.md %}) for every plan line.
 
 ### EXPLAIN ANALYZE
 
-Runs the statement and shows the plan with the time and rows of the run:
+Runs the statement and shows the plan EXPLAIN shows, with the time and rows of the run on its top line:
 
 ```sql
-EXPLAIN ANALYZE SELECT * FROM users WHERE status = 'active';
+EXPLAIN ANALYZE SELECT id FROM users WHERE status = 'active';
 ```
 
 ```
 plan
 ----
-SELECT (actual time=2.5ms, rows=1500)
-  Columns: *
-  -> Seq Scan on users (actual rows=1500)
-       Filter: (status = 'active')
+Project id (actual time=2.5ms, rows=1500)
+  SeqScan users (status = 'active')
 ```
 
 ## Limitations
