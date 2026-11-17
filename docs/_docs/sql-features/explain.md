@@ -7,7 +7,7 @@ order: 13
 
 # EXPLAIN
 
-The EXPLAIN command shows the query execution plan that Stoolap will use to execute a query. EXPLAIN ANALYZE additionally shows actual runtime statistics after executing the query.
+The EXPLAIN command shows the query execution plan that Stoolap will use to execute a query. EXPLAIN ANALYZE runs the query and shows the same plan with the time the run took and the rows it returned.
 
 ## Basic Syntax
 
@@ -15,7 +15,7 @@ The EXPLAIN command shows the query execution plan that Stoolap will use to exec
 -- Show planned execution strategy
 EXPLAIN query;
 
--- Show plan with actual runtime statistics
+-- Run the query and show the plan with its time and rows
 EXPLAIN ANALYZE query;
 ```
 
@@ -23,7 +23,7 @@ EXPLAIN ANALYZE query;
 
 Shows the execution plan without running the query.
 
-A SELECT over one table, view, CTE, derived table, VALUES list or table function is planned once, when it is prepared, and EXPLAIN prints that plan: the steps the rows go through, outermost first, each indented under the step it feeds. The access at the bottom is the one the run takes, and the indexes it names are the ones it reads. A SELECT over one of these sources whose WHERE or select list holds a subquery prints its plan the same way, as [Subqueries Over One Source](#subqueries-over-one-source) shows. Other statements (joins, window functions, DISTINCT or a set operation over anything but a table, an aggregate that reads its rows with no source of its own, EXPLAIN ANALYZE) print the format shown in their own sections below.
+A SELECT over one table, view, CTE, derived table, VALUES list or table function is planned once, when it is prepared, and EXPLAIN prints that plan: the steps the rows go through, outermost first, each indented under the step it feeds. The access at the bottom is the one the run takes, and the indexes it names are the ones it reads. A SELECT over one of these sources whose WHERE or select list holds a subquery prints its plan the same way, as [Subqueries Over One Source](#subqueries-over-one-source) shows. Other statements (joins, window functions, DISTINCT or a set operation over anything but a table, an aggregate that reads its rows with no source of its own) print the format shown in their own sections below. EXPLAIN ANALYZE prints the same lines EXPLAIN prints.
 
 ### Sequential Scan
 
@@ -675,46 +675,43 @@ A UNION ALL without ORDER BY or DISTINCT needs at most LIMIT + OFFSET rows from 
 
 ## EXPLAIN ANALYZE
 
-Executes the query and shows actual runtime statistics.
+Runs the statement and prints the plan EXPLAIN prints, line for line, with the time the run took and the rows it returned on the top line.
 
 ```sql
-EXPLAIN ANALYZE SELECT * FROM products WHERE value > 15;
+EXPLAIN ANALYZE SELECT id FROM products WHERE value > 15;
 ```
 
 Output:
 ```
 plan
 ----
-SELECT (actual time=1.53ms, rows=2)
-  Columns: *
-  -> Seq Scan on products (actual rows=2)
-       Filter: (value > 15)
+Project id (actual time=1.53ms, rows=2)
+  SeqScan products (value > 15)
 ```
-
-### Understanding EXPLAIN ANALYZE Output
 
 | Field | Description |
 |-------|-------------|
-| actual time | Total execution time |
-| rows | Number of rows returned |
-| actual rows | Rows processed at each step |
-| Filter | WHERE condition applied |
+| actual time | The time the statement took to run, its rows read to the end |
+| rows | The rows the statement returned; for an `INSERT`, `UPDATE` or `DELETE` without `RETURNING`, the rows it wrote |
+
+The other lines are the plan's. Where the plan names alternatives (a line starting with `else`), it does not say which one the run took, and `rows=` on a join line is the estimate. EXPLAIN ANALYZE of an `INSERT`, `UPDATE` or `DELETE` performs the write.
 
 ### Subqueries
 
-For a statement that runs its subqueries as [prepared subqueries]({% link _docs/sql-features/subqueries.md %}#prepared-subqueries), EXPLAIN ANALYZE ends with a `Subqueries:` section: one line per subquery, numbered from 1, nested ones included, and so are the subqueries of its `LIMIT` and `OFFSET` and of its derived tables, set operation branches, CTEs and join sides that the run prepared. A view keeps its subqueries in its own plan, which EXPLAIN ANALYZE of the view's query lists. A subquery that runs as a statement of its own lists that statement's subqueries under its line, numbered after it, such as `1.1`. Each line says what the subquery tests, what it reads and how it answers:
+For a statement that runs its subqueries as [prepared subqueries]({% link _docs/sql-features/subqueries.md %}#prepared-subqueries), EXPLAIN ANALYZE ends with the `Subqueries:` section the run held: one line per subquery, numbered from 1, nested ones included, and so are the subqueries of its `LIMIT` and `OFFSET` and of its derived tables, set operation branches, CTEs and join sides that the run prepared. A view keeps its subqueries in its own plan, which EXPLAIN ANALYZE of the view's query lists. A subquery that runs as a statement of its own lists that statement's subqueries under its line, numbered after it, such as `1.1`. Each line says what the subquery tests, what it reads and how it answers:
 
 ```sql
 EXPLAIN ANALYZE SELECT id FROM t WHERE EXISTS (SELECT 1 FROM w WHERE w.k = t.k);
 ```
 
 ```
-SELECT (actual time=1.58ms, rows=2)
-  Columns: id
-  -> Seq Scan on t (actual rows=2)
-       Filter: EXISTS (SELECT 1 FROM w WHERE (w.k = t.k))
-  Subqueries:
-    1: EXISTS over w, per call: a keyed set, or where the index on k makes probing cheaper: its pushed conditions
+Project id (actual time=1.58ms, rows=2)
+  Filter
+    Scan t
+      read chosen per run, over its sets
+Prepared: yes
+Subqueries:
+  1: EXISTS over w, per call: a keyed set, or where the index on k makes probing cheaper: its pushed conditions
 ```
 
 | Answer | Meaning |
@@ -730,13 +727,13 @@ SELECT (actual time=1.58ms, rows=2)
 
 ### Comparing Estimated vs Actual
 
-EXPLAIN ANALYZE helps identify inaccurate estimates:
+A join line's `rows=` is the estimate the join's choices read, and the top line's `rows=` what the statement returned. A join of two filtered tables shows both:
 
 ```sql
-EXPLAIN ANALYZE SELECT * FROM large_table WHERE rare_condition = true;
+EXPLAIN ANALYZE SELECT t.id FROM t JOIN u ON u.tid = t.id WHERE t.x = 1;
 ```
 
-If estimated rows differs significantly from actual rows:
+If the estimate differs much from the rows returned:
 - Run `ANALYZE table_name` to update statistics
 - Consider adding an index for the condition
 
@@ -855,9 +852,8 @@ WHERE o.amount > 1000;
 ```
 
 Look for:
-- Large "actual rows" values
-- Operations taking significant time
-- Mismatch between estimated and actual rows
+- A long actual time
+- A join estimate (`rows=` on a join line) far from the rows returned
 
 ### Index Effectiveness
 

@@ -2066,19 +2066,10 @@ fn test_explain_analyze_vector_hnsw() {
         &db,
         "EXPLAIN ANALYZE SELECT id, VEC_DISTANCE_L2(emb, '[1.0, 0.0, 0.0]') AS dist FROM docs ORDER BY dist LIMIT 2",
     );
+    let top = plan.lines().next().unwrap_or_default();
     assert!(
-        plan.contains("rows=2"),
-        "Expected the two nearest rows, got:\n{}",
-        plan
-    );
-    assert!(
-        plan.contains("actual time="),
-        "Expected actual time in ANALYZE, got:\n{}",
-        plan
-    );
-    assert!(
-        plan.contains("actual rows="),
-        "Expected actual rows in ANALYZE, got:\n{}",
+        top.contains("(actual time=") && top.ends_with(", rows=2)"),
+        "Expected the two nearest rows on the top line, got:\n{}",
         plan
     );
 }

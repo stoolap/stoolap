@@ -201,13 +201,13 @@ fn test_explain_analyze_seq_scan() {
         plan
     );
     assert!(
-        plan.contains("actual rows="),
-        "Expected actual rows, got:\n{}",
+        lines[0].ends_with(", rows=5)"),
+        "Expected the 5 rows on the top line, got:\n{}",
         plan
     );
     assert!(
-        plan.contains("Seq Scan"),
-        "Expected Seq Scan, got:\n{}",
+        plan.contains("SeqScan orders (amount > 50)"),
+        "Expected SeqScan, got:\n{}",
         plan
     );
 }
@@ -229,8 +229,8 @@ fn test_explain_analyze_index_scan() {
         plan
     );
     assert!(
-        plan.contains("actual rows="),
-        "Expected actual rows, got:\n{}",
+        lines[0].ends_with(", rows=4)"),
+        "Expected the 4 rows on the top line, got:\n{}",
         plan
     );
     assert!(

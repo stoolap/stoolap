@@ -29,7 +29,6 @@ use std::sync::Weak;
 use super::context::ExecutionContext;
 use super::join_order::JoinOrder;
 use super::operators::index_nested_loop::IndexLookupStrategy;
-use super::parallel;
 use super::planned_dml::DmlStatement;
 use super::planned_join::pick_index_join_side;
 use super::prepared_join::JoinSides;
@@ -51,7 +50,7 @@ impl Executor {
         ctx: &ExecutionContext,
         plan: Option<&NestedPlan>,
     ) -> Result<Box<dyn QueryResult>> {
-        let mut plan_lines: Vec<String> = Vec::new();
+        let mut plan_lines: Vec<String>;
 
         // For SELECT statements with CTEs, try to get the inlined version for accurate EXPLAIN
         let inlined_statement: Option<Box<Statement>> =
@@ -91,6 +90,24 @@ impl Executor {
         let ordered_statement = |ordered: &Option<JoinOrder>| {
             (ordered.as_ref()).map(|o| Box::new(Statement::Select(o.stmt.clone())))
         };
+        // The plan EXPLAIN prints, joined in the order `ordered` names
+        let plan_of = |ordered: &Option<JoinOrder>| {
+            let reordered = ordered_statement(ordered);
+            let explain_stmt = reordered.as_ref().unwrap_or(explain_stmt);
+            let planned = match &**explain_stmt {
+                Statement::Select(select) => self.explain_plan(select, ctx),
+                Statement::Update(update) => self.explain_dml(DmlStatement::Update(update)),
+                Statement::Delete(delete) => self.explain_dml(DmlStatement::Delete(delete)),
+                _ => None,
+            };
+            let mut lines = planned.unwrap_or_else(|| {
+                let mut lines = Vec::new();
+                self.explain_statement(explain_stmt, &mut lines, 0);
+                lines
+            });
+            note_order(&mut lines, ordered);
+            lines
+        };
 
         if stmt.analyze {
             // EXPLAIN ANALYZE: Execute the query and collect statistics
@@ -106,13 +123,16 @@ impl Executor {
                 plan.and_then(NestedPlan::source),
             )?;
 
-            // Count rows by iterating through the result
+            // The rows it returned, else the rows a write affected
             let mut row_count = 0usize;
             while result.next() {
                 row_count += 1;
             }
             if let Some(err) = result.last_error() {
                 return Err(err);
+            }
+            if row_count == 0 {
+                row_count = result.rows_affected().max(0) as usize;
             }
             let duration = start.elapsed();
 
@@ -144,417 +164,33 @@ impl Executor {
                     .and_then(|select| self.query_cache.statement_plan(select)),
                 _ => None,
             };
-            let held = plan.is_some() || statement_plan.is_some();
             let ran = plan
                 .and_then(NestedPlan::source)
                 .or(statement_plan.as_deref());
-            let ordered = order_of(ran);
-            let reordered = ordered_statement(&ordered);
-            // Generate plan with actual statistics (using inlined version if available)
-            self.explain_statement_with_stats(
-                reordered.as_ref().unwrap_or(explain_stmt),
-                &mut plan_lines,
-                0,
-                (row_count, &time_str),
-                held,
-            );
-            // The blocks as the plan the run held prepared them
+            plan_lines = plan_of(&order_of(ran));
+            if let Some(top) = plan_lines.first_mut() {
+                top.push_str(&format!(" (actual time={time_str}, rows={row_count})"));
+            }
+            // The subqueries as the plan the run held prepared and ran them
             if let Some(ran) = ran {
-                plan_lines.extend(explain_held_blocks(ran, 1));
+                splice_held_blocks(&mut plan_lines, explain_held_blocks(ran, 0));
             }
-            note_order(&mut plan_lines, &ordered);
-
-            // Return the plan as a result
-            let columns = vec!["plan".to_string()];
-            let rows: RowVec = plan_lines
-                .into_iter()
-                .enumerate()
-                .map(|(i, line)| {
-                    (
-                        i as i64,
-                        Row::from_values(vec![Value::Text(SmartString::from_string(line))]),
-                    )
-                })
-                .collect();
-
-            Ok(Box::new(ExecutorResult::new(columns, rows)))
         } else {
-            // Regular EXPLAIN: Just show the plan without executing (using inlined version if available)
-            let ordered = order_of(None);
-            let reordered = ordered_statement(&ordered);
-            let explain_stmt = reordered.as_ref().unwrap_or(explain_stmt);
-            let planned = match &**explain_stmt {
-                Statement::Select(select) => self.explain_plan(select, ctx),
-                Statement::Update(update) => self.explain_dml(DmlStatement::Update(update)),
-                Statement::Delete(delete) => self.explain_dml(DmlStatement::Delete(delete)),
-                _ => None,
-            };
-            match planned {
-                Some(lines) => plan_lines = lines,
-                None => self.explain_statement(explain_stmt, &mut plan_lines, 0),
-            }
-            note_order(&mut plan_lines, &ordered);
-
-            // Return as a single-column result
-            let columns = vec!["plan".to_string()];
-            let rows: RowVec = plan_lines
-                .into_iter()
-                .enumerate()
-                .map(|(i, line)| {
-                    (
-                        i as i64,
-                        Row::from_values(vec![Value::Text(SmartString::from_string(line))]),
-                    )
-                })
-                .collect();
-
-            Ok(Box::new(ExecutorResult::new(columns, rows)))
+            plan_lines = plan_of(&order_of(None));
         }
-    }
 
-    /// Generate EXPLAIN output with actual execution statistics, `held`
-    /// when `stmt` ran under a plan
-    fn explain_statement_with_stats(
-        &self,
-        stmt: &Statement,
-        lines: &mut Vec<String>,
-        indent: usize,
-        (row_count, time_str): (usize, &str),
-        held: bool,
-    ) {
-        let prefix = "  ".repeat(indent);
-
-        match stmt {
-            Statement::Select(select) => {
-                let distinct_str = if select.distinct { " DISTINCT" } else { "" };
-                lines.push(format!(
-                    "{}SELECT{} (actual time={}, rows={})",
-                    prefix, distinct_str, time_str, row_count
-                ));
-                self.explain_select_columns(select, lines, indent);
-
-                // FROM clause with access plan
-                if let Some(ref table_expr) = select.table_expr {
-                    let from_plan = held;
-                    self.explain_table_expr_with_where_and_stats(
-                        table_expr,
-                        select.where_clause.as_deref(),
-                        lines,
-                        indent + 1,
-                        row_count,
-                        self.join_index_use(select, self.join_runs_blocks(select, held)),
-                        &cte_names(select),
-                        (from_plan, select.with.as_ref()),
-                    );
-                }
-
-                // GROUP BY (including ROLLUP, CUBE, GROUPING SETS)
-                {
-                    let gb_str = format!("{}", select.group_by);
-                    if !gb_str.is_empty() {
-                        lines.push(format!("{}  Group By: {}", prefix, gb_str));
-                    }
-                }
-
-                // HAVING
-                if let Some(ref having) = select.having {
-                    lines.push(format!("{}  Having: {}", prefix, having));
-                }
-
-                // ORDER BY
-                if !select.order_by.is_empty() {
-                    let orders: Vec<String> =
-                        select.order_by.iter().map(|o| format!("{}", o)).collect();
-                    lines.push(format!("{}  Order By: {}", prefix, orders.join(", ")));
-                }
-
-                // LIMIT/OFFSET
-                if let Some(ref limit) = select.limit {
-                    lines.push(format!("{}  Limit: {}", prefix, limit));
-                }
-                if let Some(ref offset) = select.offset {
-                    lines.push(format!("{}  Offset: {}", prefix, offset));
-                }
-            }
-            Statement::Insert(insert) => {
-                lines.push(format!(
-                    "{}INSERT INTO {} (actual time={}, rows={})",
-                    prefix, insert.table_name, time_str, row_count
-                ));
-                if let Some(ref select) = insert.select {
-                    lines.push(format!("{}  Source:", prefix));
-                    self.explain_select(select, lines, indent + 2, held);
-                } else {
-                    lines.push(format!(
-                        "{}  Values: {} row(s)",
-                        prefix,
-                        insert.values.len()
-                    ));
-                }
-            }
-            Statement::Update(update) => {
-                lines.push(format!(
-                    "{}UPDATE {} (actual time={}, rows={})",
-                    prefix, update.table_name, time_str, row_count
-                ));
-                lines.push(format!(
-                    "{}  Set: {} column(s)",
-                    prefix,
-                    update.updates.len()
-                ));
-                if let Some(ref where_clause) = update.where_clause {
-                    lines.push(format!("{}  Filter: {}", prefix, where_clause));
-                }
-            }
-            Statement::Delete(delete) => {
-                lines.push(format!(
-                    "{}DELETE FROM {} (actual time={}, rows={})",
-                    prefix, delete.table_name, time_str, row_count
-                ));
-                if let Some(ref where_clause) = delete.where_clause {
-                    lines.push(format!("{}  Filter: {}", prefix, where_clause));
-                }
-            }
-            _ => {
-                lines.push(format!(
-                    "{}Statement: {} (actual time={}, rows={})",
-                    prefix, stmt, time_str, row_count
-                ));
-            }
-        }
-    }
-
-    /// Helper to show just the SELECT columns
-    fn explain_select_columns(
-        &self,
-        select: &SelectStatement,
-        lines: &mut Vec<String>,
-        indent: usize,
-    ) {
-        let prefix = "  ".repeat(indent);
-
-        // Show columns
-        let col_count = select.columns.len();
-        if col_count <= 5 {
-            let cols: Vec<String> = select.columns.iter().map(|c| format!("{}", c)).collect();
-            lines.push(format!("{}  Columns: {}", prefix, cols.join(", ")));
-        } else {
-            lines.push(format!("{}  Columns: {} column(s)", prefix, col_count));
-        }
-    }
-
-    /// Generate EXPLAIN output for a table expression with WHERE clause analysis and stats,
-    /// `plans` as `explain_table_expr_with_where` takes them
-    #[allow(clippy::too_many_arguments)]
-    fn explain_table_expr_with_where_and_stats(
-        &self,
-        expr: &Expression,
-        where_clause: Option<&Expression>,
-        lines: &mut Vec<String>,
-        indent: usize,
-        row_count: usize,
-        index_use: JoinIndexUse,
-        ctes: &[String],
-        plans: (bool, Option<&WithClause>),
-    ) {
-        let prefix = "  ".repeat(indent);
-
-        match expr {
-            Expression::TableSource(simple) => {
-                // Try to get the table and analyze access plan
-                if let Ok(tx) = self.begin_transaction() {
-                    if let Ok(table) =
-                        tx.get_read_table_at(&simple.name.value, None, TableUse::Read)
-                    {
-                        // Build storage expression from WHERE clause for analysis
-                        let storage_expr = if let Some(where_expr) = where_clause {
-                            let schema = table.schema();
-                            let (expr, _) = pushdown::try_pushdown(where_expr, schema, None);
-                            expr
-                        } else {
-                            None
-                        };
-
-                        // The access the rule decides, shown as the runner shows it
-                        let plan = storage_expr.as_deref().and_then(|e| table.index_plan(e));
-
-                        // For SeqScan, use the AST expression's Display format instead of storage expr Debug
-                        // Check if parallel execution would be used based on TABLE's row count (not output rows)
-                        // Parallel decision is based on input size, not filtered output
-                        let parallel_config = parallel::ParallelConfig::default();
-                        let table_row_count = table.row_count_hint();
-                        let would_use_parallel = where_clause.is_some()
-                            && parallel_config.should_parallel_filter(table_row_count);
-
-                        let tbl = table.schema().table_name.clone();
-                        let plan_str = match where_clause {
-                            Some(where_clause) if plan.is_none() => {
-                                let filter_str = Some(format!("{}", where_clause));
-                                if would_use_parallel {
-                                    ScanPlan::ParallelSeqScan {
-                                        table: tbl,
-                                        filter: filter_str,
-                                        workers: {
-                                            #[cfg(feature = "parallel")]
-                                            {
-                                                rayon::current_num_threads()
-                                            }
-                                            #[cfg(not(feature = "parallel"))]
-                                            {
-                                                1
-                                            }
-                                        },
-                                    }
-                                } else {
-                                    ScanPlan::SeqScan {
-                                        table: tbl,
-                                        filter: filter_str,
-                                    }
-                                }
-                                .to_string()
-                            }
-                            _ => match plan {
-                                Some(plan) => ScanChoice::Index(plan, Weak::new())
-                                    .explain(&tbl, where_clause)
-                                    .join("\n"),
-                                None => ScanPlan::SeqScan {
-                                    table: tbl,
-                                    filter: None,
-                                }
-                                .to_string(),
-                            },
-                        };
-
-                        // Format the scan plan with actual stats
-                        for (i, line) in plan_str.lines().enumerate() {
-                            if i == 0 {
-                                lines.push(format!(
-                                    "{}-> {} (actual rows={})",
-                                    prefix, line, row_count
-                                ));
-                            } else {
-                                lines.push(format!("{}   {}", prefix, line));
-                            }
-                        }
-
-                        // Add alias if present
-                        if let Some(ref alias) = simple.alias {
-                            lines.push(format!("{}   Alias: {}", prefix, alias));
-                        }
-
-                        return;
-                    }
-                }
-
-                // Fallback if table not found
-                let mut table_info = format!(
-                    "{}-> Seq Scan on {} (actual rows={})",
-                    prefix, simple.name, row_count
-                );
-                if let Some(ref alias) = simple.alias {
-                    table_info.push_str(&format!(" AS {}", alias));
-                }
-                lines.push(table_info);
-                if let Some(ref where_expr) = where_clause {
-                    lines.push(format!("{}   Filter: {}", prefix, where_expr));
-                }
-            }
-            Expression::SubquerySource(subquery) => {
-                let mut sub_info =
-                    format!("{}-> Subquery Scan (actual rows={})", prefix, row_count);
-                if let Some(ref alias) = subquery.alias {
-                    sub_info.push_str(&format!(" AS {}", alias));
-                }
-                lines.push(sub_info);
-                if let Some(wc) = where_clause {
-                    lines.push(format!("{}     Filter: {}", prefix, wc));
-                }
-                self.explain_select(&subquery.subquery, lines, indent + 1, plans.0);
-            }
-            Expression::JoinSource(join) => {
-                let sides = self.unrun_join_sides(join, plans.1);
-                // Determine join algorithm including INLJ check
-                let (join_algorithm, _) = self.determine_join_algorithm_for_explain(
-                    &join.left,
-                    &join.right,
-                    join.condition.as_deref(),
-                    join.join_type.as_ref(),
-                    &join.using_columns,
-                    where_clause,
-                    index_use,
-                    ctes,
-                    sides.as_ref(),
-                );
-
-                lines.push(format!(
-                    "{}-> {} ({} Join) (actual rows={})",
-                    prefix, join_algorithm, join.join_type, row_count
-                ));
-                if let Some(ref condition) = join.condition {
-                    lines.push(format!("{}   Join Cond: {}", prefix, condition));
-                }
-                if !join.using_columns.is_empty() {
-                    let cols: Vec<String> =
-                        join.using_columns.iter().map(|c| c.to_string()).collect();
-                    lines.push(format!("{}   Using: ({})", prefix, cols.join(", ")));
-                }
-                // Partition WHERE predicates by which table they reference
-                let (left_where, right_where, join_filter) = match where_clause {
-                    Some(wc) => self.explain_where_split(wc, join, sides.as_ref(), ctes),
-                    None => (None, None, None),
-                };
-                if let Some(ref jf) = join_filter {
-                    lines.push(format!("{}   Join Filter: {}", prefix, jf));
-                }
-                self.explain_table_expr_plan_only(
-                    &join.left,
-                    left_where.as_ref(),
-                    lines,
-                    indent + 1,
-                    index_use,
-                    ctes,
-                    plans,
-                );
-                self.explain_table_expr_plan_only(
-                    &join.right,
-                    right_where.as_ref(),
-                    lines,
-                    indent + 1,
-                    index_use,
-                    ctes,
-                    plans,
-                );
-            }
-            Expression::FunctionTableSource(fs) => {
-                let mut info = format!(
-                    "{}-> Function Scan on {} (actual rows={})",
-                    prefix, fs.function.value, row_count
-                );
-                if let Some(ref alias) = fs.alias {
-                    info.push_str(&format!(" AS {}", alias.value));
-                }
-                lines.push(info);
-                if let Some(wc) = where_clause {
-                    lines.push(format!("{}     Filter: {}", prefix, wc));
-                }
-            }
-            Expression::ValuesSource(vs) => {
-                let mut info = format!("{}-> Values Scan (actual rows={})", prefix, row_count);
-                if let Some(ref alias) = vs.alias {
-                    info.push_str(&format!(" AS {}", alias));
-                }
-                lines.push(info);
-                if let Some(wc) = where_clause {
-                    lines.push(format!("{}     Filter: {}", prefix, wc));
-                }
-            }
-            _ => {
-                lines.push(format!(
-                    "{}-> Scan: {} (actual rows={})",
-                    prefix, expr, row_count
-                ));
-            }
-        }
+        let columns = vec!["plan".to_string()];
+        let rows: RowVec = plan_lines
+            .into_iter()
+            .enumerate()
+            .map(|(i, line)| {
+                (
+                    i as i64,
+                    Row::from_values(vec![Value::Text(SmartString::from_string(line))]),
+                )
+            })
+            .collect();
+        Ok(Box::new(ExecutorResult::new(columns, rows)))
     }
 
     /// Generate EXPLAIN output for a statement
@@ -775,31 +411,6 @@ impl Executor {
         }
     }
 
-    /// Generate EXPLAIN output for a table expression with WHERE clause analysis
-    /// Show plan structure without join cost estimates (for EXPLAIN ANALYZE child nodes)
-    #[allow(clippy::too_many_arguments)]
-    fn explain_table_expr_plan_only(
-        &self,
-        expr: &Expression,
-        where_clause: Option<&Expression>,
-        lines: &mut Vec<String>,
-        indent: usize,
-        index_use: JoinIndexUse,
-        ctes: &[String],
-        plans: (bool, Option<&WithClause>),
-    ) {
-        self.explain_table_expr_inner(
-            expr,
-            where_clause,
-            lines,
-            indent,
-            false,
-            index_use,
-            ctes,
-            plans,
-        )
-    }
-
     /// `plans`: whether `expr`, a derived table or a join of them, holds a
     /// plan for each, and the WITH clause naming the statement's CTEs
     #[allow(clippy::too_many_arguments)]
@@ -813,16 +424,7 @@ impl Executor {
         ctes: &[String],
         plans: (bool, Option<&WithClause>),
     ) {
-        self.explain_table_expr_inner(
-            expr,
-            where_clause,
-            lines,
-            indent,
-            true,
-            index_use,
-            ctes,
-            plans,
-        )
+        self.explain_table_expr_inner(expr, where_clause, lines, indent, index_use, ctes, plans)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -832,7 +434,6 @@ impl Executor {
         where_clause: Option<&Expression>,
         lines: &mut Vec<String>,
         indent: usize,
-        show_join_cost: bool,
         index_use: JoinIndexUse,
         ctes: &[String],
         (from_plan, with): (bool, Option<&WithClause>),
@@ -932,7 +533,7 @@ impl Executor {
                 // Each table side's rows as the estimator counts them under its
                 // own conditions: the smaller bounds a keyed join's rows, their
                 // product a join without a condition's
-                let estimated = show_join_cost.then(|| {
+                let estimated = || {
                     let sides = [&*join.left, &*join.right];
                     let filters = [left_where.as_ref(), right_where.as_ref()];
                     let shares = self.join_side_shares(None, sides, filters, &[]);
@@ -955,8 +556,8 @@ impl Executor {
                         _ => 0.0,
                     };
                     Some(inner.max(kept_side).ceil() as u64)
-                });
-                match estimated.flatten() {
+                };
+                match estimated() {
                     Some(rows) => lines.push(format!(
                         "{}-> {} ({} Join) (rows={})",
                         prefix, join_algorithm, join.join_type, rows
@@ -982,7 +583,6 @@ impl Executor {
                     left_where.as_ref(),
                     lines,
                     indent + 1,
-                    show_join_cost,
                     index_use,
                     ctes,
                     (from_plan, with),
@@ -992,7 +592,6 @@ impl Executor {
                     right_where.as_ref(),
                     lines,
                     indent + 1,
-                    show_join_cost,
                     index_use,
                     ctes,
                     (from_plan, with),
@@ -1189,6 +788,27 @@ impl Executor {
 
         (algo_name, None)
     }
+}
+
+/// `lines` with its top level `Subqueries:` section replaced by `held`, the
+/// one the run held, or `held` put before its `Ctes:` or at its end; as it
+/// is when the run held no subquery
+fn splice_held_blocks(lines: &mut Vec<String>, held: Vec<String>) {
+    if held.is_empty() {
+        return;
+    }
+    let at = lines.iter().position(|line| line == "Subqueries:");
+    let end = at.map_or_else(
+        || (lines.iter().position(|line| line == "Ctes:")).unwrap_or(lines.len()),
+        |at| {
+            at + 1
+                + lines[at + 1..]
+                    .iter()
+                    .take_while(|l| l.starts_with(' '))
+                    .count()
+        },
+    );
+    lines.splice(at.unwrap_or(end)..end, held);
 }
 
 /// Extract table alias from a table expression

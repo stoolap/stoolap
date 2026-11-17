@@ -41,9 +41,10 @@ fn block_lines(db: &Database, sql: &str) -> Vec<String> {
         .collect();
     lines
         .iter()
-        .skip_while(|line| line.as_str() != "  Subqueries:")
+        .skip_while(|line| line.as_str() != "Subqueries:")
         .skip(1)
-        .map(|line| line.strip_prefix("    ").unwrap_or(line).to_string())
+        .take_while(|line| line.starts_with("  "))
+        .map(|line| line.strip_prefix("  ").unwrap_or(line).to_string())
         .collect()
 }
 

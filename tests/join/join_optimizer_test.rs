@@ -200,19 +200,10 @@ fn test_explain_analyze_shows_actual_rows() {
         )
         .unwrap();
 
-    let mut found_actual_rows = false;
-    for row in result {
-        let row = row.unwrap();
-        let plan_line: String = row.get(0).unwrap();
-        if plan_line.contains("actual rows=") {
-            found_actual_rows = true;
-            break;
-        }
-    }
-
+    let top: String = result.into_iter().next().unwrap().unwrap().get(0).unwrap();
     assert!(
-        found_actual_rows,
-        "EXPLAIN ANALYZE should show actual row count"
+        top.ends_with(", rows=3)"),
+        "EXPLAIN ANALYZE should show the 3 joined rows: {top}"
     );
 }
 

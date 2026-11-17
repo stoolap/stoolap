@@ -152,7 +152,7 @@ INSERT INTO products (name, price, category_id) VALUES
 Stoolap provides several performance monitoring features:
 
 - **EXPLAIN** - Shows the query execution plan
-- **EXPLAIN ANALYZE** - Shows the plan with actual runtime statistics
+- **EXPLAIN ANALYZE** - Runs the query and shows the plan with its time and rows
 - **Query timing** - The CLI displays execution time for each query
 - **Row counts** - Result sets show the number of rows affected/returned
 
@@ -160,7 +160,7 @@ Stoolap provides several performance monitoring features:
 -- View query plan
 EXPLAIN SELECT * FROM orders WHERE amount > 1000;
 
--- View plan with actual execution statistics
+-- Run it and view the plan with its time and rows
 EXPLAIN ANALYZE SELECT * FROM products WHERE category = 'Electronics';
 ```
 
