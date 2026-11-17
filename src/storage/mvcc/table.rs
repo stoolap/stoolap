@@ -366,6 +366,16 @@ enum WriteAccess<'a> {
     Scan,
 }
 
+/// Notes the read the table's rows took: the keys or an index, or every row
+#[inline]
+fn read_by(index: bool) {
+    use crate::executor::prepared_select::ScanPath;
+    match index {
+        true => ScanPath::Index.taken(),
+        false => ScanPath::Seq.taken(),
+    }
+}
+
 /// `access`, decided for `where_expr` over a table of `schema`, with the
 /// keys a key plan or a primary key range names taken from the WHERE; a
 /// plan whose keys it does not hold, or a mixed one, reads every row
@@ -1767,6 +1777,7 @@ impl MVCCTable {
         }
         drop(txn_versions);
 
+        read_by(true);
         // Phase 1: Fetch rows matching indexed branches
         // Build a bitset/set of indexed row IDs for dedup
         const MAX_BITSET_WORDS: usize = 131_072;
@@ -1861,6 +1872,7 @@ impl MVCCTable {
             return Ok(Some(result));
         }
 
+        read_by(false);
         // Phase 2: Scan for rows matching non-indexed branches (skip already-found rows)
         // Build filter from non-indexed operands only
         let mut unindexed_filter: Box<dyn Expression> = if unindexed_operands.len() == 1 {
@@ -2597,6 +2609,7 @@ impl MVCCTable {
         if let Some(rows) = self.access_rows_with_limit(access, filter, limit, offset, none)? {
             return Ok(rows);
         }
+        read_by(false);
         self.visible_rows_with_limit(filter, limit, offset, none)
     }
 
@@ -2772,6 +2785,7 @@ impl MVCCTable {
         if let Some(rows) = self.access_rows_with_limit(access, filter, limit, offset, deadline)? {
             return Ok(rows);
         }
+        read_by(false);
         self.limited_rows_unordered(filter, limit, offset, deadline)
     }
 
@@ -2796,6 +2810,9 @@ impl MVCCTable {
             // The one row a key names is past an offset or under no limit
             IndexPlan::Key => {
                 let mut rows = self.key_rows(filter, deadline)?;
+                if rows.is_some() {
+                    read_by(true);
+                }
                 if offset > 0 || limit == 0 {
                     rows.iter_mut().for_each(|rows| rows.clear());
                 }
@@ -2808,11 +2825,16 @@ impl MVCCTable {
         };
         // A key list names the transaction's own rows, read by their ids
         if plan.names_keys() && self.local().has_local_changes() {
+            read_by(true);
             let rows = self.fetch_rows_by_ids(&row_ids, filter, deadline)?;
             return Ok(Some(rows.into_iter().skip(offset).take(limit).collect()));
         }
         let schema = &self.cached_schema;
-        self.try_fetch_from_index(row_ids, filter, schema, limit, offset, deadline)
+        let rows = self.try_fetch_from_index(row_ids, filter, schema, limit, offset, deadline)?;
+        if rows.is_some() {
+            read_by(true);
+        }
+        Ok(rows)
     }
 
     /// Up to `limit` visible rows past `offset` that `filter` keeps, read
@@ -2922,6 +2944,9 @@ impl MVCCTable {
 
         if let Some(expr) = where_expr {
             let access = write_access(schema, access, Some(expr));
+            if matches!(access, WriteAccess::Key(_) | WriteAccess::KeyRange(..)) {
+                read_by(true);
+            }
             // The row the key names
             if let WriteAccess::Key(pk_id) = access {
                 if skipped(pk_id) {
@@ -3007,6 +3032,7 @@ impl MVCCTable {
                 _ => None,
             };
             if let Some((mut filtered_row_ids, index)) = indexed {
+                read_by(true);
                 filtered_row_ids.extend(self.local_ids_missing_from(
                     index,
                     expr,
@@ -3061,6 +3087,7 @@ impl MVCCTable {
             }
         }
 
+        read_by(false);
         // Full scan: the filter is applied before rows are cloned. One that
         // can fail is not asked of a row already planned, and an error on
         // the committed copy of a row the transaction wrote is not the
@@ -3373,11 +3400,15 @@ impl MVCCTable {
         if let IndexPlan::Key = plan {
             let rows = self.key_rows(filter, deadline)?;
             self.check_read()?;
+            if rows.is_some() {
+                read_by(true);
+            }
             return Ok(rows);
         }
         let Some(mut row_ids) = self.read_indexes(plan, filter) else {
             return Ok(None);
         };
+        read_by(true);
         if !plan.names_keys() {
             row_ids.extend(self.local_ids_missing_from(plan, filter, &row_ids));
         }
@@ -3965,6 +3996,9 @@ impl Table for MVCCTable {
 
         if let Some(expr) = where_expr {
             let access = write_access(schema, access, Some(expr));
+            if matches!(access, WriteAccess::Key(_) | WriteAccess::KeyRange(..)) {
+                read_by(true);
+            }
             if let WriteAccess::Key(pk_id) = access {
                 return match deadline.is_none() {
                     true => self.delete_key::<false>(pk_id, expr, fallible, deadline),
@@ -4033,6 +4067,7 @@ impl Table for MVCCTable {
                 _ => None,
             };
             if let Some((mut filtered_row_ids, index)) = indexed {
+                read_by(true);
                 filtered_row_ids.extend(self.local_ids_missing_from(
                     index,
                     expr,
@@ -4105,6 +4140,7 @@ impl Table for MVCCTable {
             }
         }
 
+        read_by(false);
         // Fall back to full scan
         let mut delete_count = 0;
 
@@ -4250,6 +4286,7 @@ impl Table for MVCCTable {
             let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
             return Ok(Box::new(scanner));
         }
+        read_by(false);
         self.scan_every(schema, column_indices, where_expr, deadline)
     }
 
@@ -4262,6 +4299,7 @@ impl Table for MVCCTable {
         let rows = match self.access_rows(access, where_expr, deadline)? {
             Some(rows) => rows,
             None => {
+                read_by(false);
                 let rows = self.collect_visible_rows(where_expr, deadline)?;
                 self.check_read()?;
                 rows

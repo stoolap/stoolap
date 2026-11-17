@@ -95,7 +95,13 @@ Parallel execution provides significant benefits for analytical queries. Typical
 
 ## EXPLAIN ANALYZE Output
 
-A run decides from the rows it read whether its filter runs on the thread pool, so `EXPLAIN` and `EXPLAIN ANALYZE` print the same scan line either way.
+A run decides from the rows it read whether its filter runs on the thread pool, so the plan's scan line is the same either way. `EXPLAIN ANALYZE` says what the run did on its [`Paths:` line]({% link _docs/sql-features/explain.md %}#paths): `scan.parallel_filter` for a filter judged on the pool, `join.parallel_hash` for a hash join built across threads.
+
+```sql
+EXPLAIN ANALYZE SELECT id FROM large_table WHERE value + 0 > 100 ORDER BY value;
+-- ...
+-- Paths: scan.seq, scan.parallel_filter
+```
 
 ## Query Types That Benefit Most
 

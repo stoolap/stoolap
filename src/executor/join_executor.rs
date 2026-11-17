@@ -102,7 +102,8 @@ use crate::parser::ast::Expression;
 use crate::planner::join::{pair_method, PairMethod};
 
 /// Every operator that produces a join's rows. Each notes, under
-/// test-failpoints, that it ran, for the join path equivalence test
+/// test-failpoints, that it ran, for the join path equivalence test, and
+/// for an EXPLAIN ANALYZE run
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum JoinPath {
     /// Index nested loop, outer rows fetched in chunks
@@ -124,6 +125,19 @@ impl JoinPath {
     pub(crate) fn taken(self) {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::join_path_taken(self as usize);
+        super::path_trace::note("join", self.name());
+    }
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            JoinPath::IndexNestedLoop => "index_nested_loop",
+            JoinPath::BatchIndexNestedLoop => "batch_index_nested_loop",
+            JoinPath::GroupedIndexJoin => "grouped_index_join",
+            JoinPath::LimitHash => "limit_hash",
+            JoinPath::ParallelHash => "parallel_hash",
+            JoinPath::Hash => "hash",
+            JoinPath::NestedLoop => "nested_loop",
+        }
     }
 }
 
@@ -138,18 +152,6 @@ impl JoinPath {
         JoinPath::Hash,
         JoinPath::NestedLoop,
     ];
-
-    pub(crate) const fn name(self) -> &'static str {
-        match self {
-            JoinPath::IndexNestedLoop => "index_nested_loop",
-            JoinPath::BatchIndexNestedLoop => "batch_index_nested_loop",
-            JoinPath::GroupedIndexJoin => "grouped_index_join",
-            JoinPath::LimitHash => "limit_hash",
-            JoinPath::ParallelHash => "parallel_hash",
-            JoinPath::Hash => "hash",
-            JoinPath::NestedLoop => "nested_loop",
-        }
-    }
 }
 
 /// Result of a streaming join execution.

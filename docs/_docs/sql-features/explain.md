@@ -694,7 +694,31 @@ Project id (actual time=1.53ms, rows=2)
 | actual time | The time the statement took to run, its rows read to the end |
 | rows | The rows the statement returned; for an `INSERT`, `UPDATE` or `DELETE` without `RETURNING`, the rows it affected: those inserted or deleted, and every row an `UPDATE` matched, a row its `SET` left unchanged included |
 
-The other lines are the plan's. Where the plan names alternatives (a line starting with `else`), it does not say which one the run took, and `rows=` on a join line is the estimate. EXPLAIN ANALYZE of an `INSERT`, `UPDATE` or `DELETE` performs the write.
+The other lines are the plan's, and `rows=` on a join line is the estimate. EXPLAIN ANALYZE of an `INSERT`, `UPDATE` or `DELETE` performs the write.
+
+### Paths
+
+Where the plan names alternatives (a line starting with `else`), or a join or an aggregate is chosen per run, the last line says what the run took: `Paths:`, each path it took in the order first taken, as `family.name`, with `xN` after one taken more than once.
+
+```sql
+EXPLAIN ANALYZE SELECT t.id FROM t JOIN u ON u.tid = t.id WHERE t.x = 1;
+```
+
+```
+...
+Paths: scan.index, join.index_nested_loop
+```
+
+| Family | Paths |
+|--------|-------|
+| `scan` | the read of a table's rows in memory, as the table took it: `seq` every row, `index` the rows the keys or an index name, `parallel_filter` the rows read judged by the WHERE on the thread pool. A key or index the table cannot use for the values given, such as `id = 1.5` on an INTEGER key, is read as `seq` |
+| `key_read` | `pk_get`, `unique_get`, `index_get`, `key_members` (an `IN` list on the primary key), `row_ids` (`_rowid_`), `block_point_rows`, `block_point_value` (a subquery's primary key equality) |
+| `order_limit` | `prepared_index_ordered`, `prepared_keyset`, `prepared_top_k`, `prepared_top_rows`, `prepared_project_first`, `prepared_index_keys`, `prepared_block_cut`, `top_n`, `computed_keys`, `vector_search`, `join_index_sort`, `cte_order_limit_pushdown` |
+| `aggregate` | `stats`, `index_bound`, `index_count`, `storage_filtered`, `storage_grouped`, `streaming_group_by`, `hash_groups`, `global_scan`, `prepared_block`, `general` |
+| `join` | `index_nested_loop`, `batch_index_nested_loop`, `grouped_index_join`, `limit_hash`, `parallel_hash`, `hash`, `nested_loop` |
+| `distinct` | `rows`, `values`, `scan` |
+
+A run's first execution of a statement can take another path than the runs after it, which read the plan the first one held. The line lists the paths taken on the thread that runs the statement, a subquery's reads included, and a statement none of whose reads is named prints no `Paths:` line. Rows sealed to volumes are read by their zone maps, bloom filters and side files, which no path names: on a table whose rows are all sealed, `scan.seq` is the read of its empty in-memory part.
 
 ### Subqueries
 

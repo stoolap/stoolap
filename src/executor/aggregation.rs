@@ -74,12 +74,29 @@ pub(crate) enum AggregatePath {
 }
 
 impl AggregatePath {
-    /// Notes, under test-failpoints, that this path answered; the shortcuts
-    /// that do not end in `finish_aggregation` call it themselves
+    /// Notes, under test-failpoints and for an EXPLAIN ANALYZE run, that this
+    /// path answered; the shortcuts that do not end in `finish_aggregation`
+    /// call it themselves
     #[inline]
     pub(crate) fn taken(self) {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::aggregate_path_taken(self as usize);
+        super::path_trace::note("aggregate", self.name());
+    }
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            AggregatePath::General => "general",
+            AggregatePath::Stats => "stats",
+            AggregatePath::StorageFiltered => "storage_filtered",
+            AggregatePath::GlobalScan => "global_scan",
+            AggregatePath::StorageGrouped => "storage_grouped",
+            AggregatePath::StreamingGroupBy => "streaming_group_by",
+            AggregatePath::IndexBound => "index_bound",
+            AggregatePath::PreparedBlock => "prepared_block",
+            AggregatePath::IndexCount => "index_count",
+            AggregatePath::HashGroups => "hash_groups",
+        }
     }
 }
 
@@ -97,21 +114,6 @@ impl AggregatePath {
         AggregatePath::IndexCount,
         AggregatePath::HashGroups,
     ];
-
-    pub(crate) const fn name(self) -> &'static str {
-        match self {
-            AggregatePath::General => "general",
-            AggregatePath::Stats => "stats",
-            AggregatePath::StorageFiltered => "storage_filtered",
-            AggregatePath::GlobalScan => "global_scan",
-            AggregatePath::StorageGrouped => "storage_grouped",
-            AggregatePath::StreamingGroupBy => "streaming_group_by",
-            AggregatePath::IndexBound => "index_bound",
-            AggregatePath::PreparedBlock => "prepared_block",
-            AggregatePath::IndexCount => "index_count",
-            AggregatePath::HashGroups => "hash_groups",
-        }
-    }
 }
 
 /// What the slot rows of an aggregate result stand for
