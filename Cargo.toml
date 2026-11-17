@@ -1,6 +1,6 @@
 [package]
 name = "stoolap"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.88"
 authors = ["Stoolap Contributors"]
@@ -90,9 +90,9 @@ flate2 = { version = "1", optional = true }
 stoolap-jemalloc = { version = "0.1.5", optional = true }
 
 # Semantic embedding (optional — enables EMBED() SQL function)
-candle-core = { version = "0.9", optional = true }
-candle-nn = { version = "0.9", optional = true }
-candle-transformers = { version = "0.9", optional = true }
+candle-core = { version = "0.11", optional = true }
+candle-nn = { version = "0.11", optional = true }
+candle-transformers = { version = "0.11", optional = true }
 tokenizers = { version = "0.22", default-features = false, features = ["progressbar", "fancy-regex"], optional = true }
 hf-hub = { version = "0.4", optional = true }
 
@@ -165,6 +165,13 @@ debug = "limited"  # Backtraces with file:line, skip variable info
 [profile.max]
 inherits = "release"
 lto = true            # Fat LTO for maximum runtime performance
+debug = false
+
+# Browser build (wasm-pack --profile wasm): optimized for size
+[profile.wasm]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
 debug = false
 
 [[bench]]
