@@ -7296,11 +7296,13 @@ impl MVCCEngine {
     /// Returns the LSN just before the copies, from which a recovery replays
     /// them ahead of every later record. None, with nothing written, while
     /// an open transaction has created a table: a copy of it would commit it.
+    /// None too when an id counter moved while the copies were written.
     fn rerecord_ddl_to_wal(&self) -> Result<Option<u64>> {
         // One DDL statement at a time between the read of the catalog and
         // the records written from it: a statement landing in between
         // would replay before the records that carry the state it changed
         let ddl = self.ddl_guard();
+        let mut counters: Vec<(Arc<VersionStore>, i64)> = Vec::new();
         // Collect CreateTable entries and table names in a single schemas lock
         let (table_entries, table_names_for_indexes): (Vec<(String, Vec<u8>)>, Vec<String>) = {
             let schemas = self.schemas.read();
@@ -7315,7 +7317,9 @@ impl MVCCEngine {
                 .map(|(name, schema)| {
                     let mut data = Self::serialize_schema(schema);
                     if let Some(store) = stores.get(name) {
-                        data.extend_from_slice(&store.get_auto_increment_counter().to_le_bytes());
+                        let counter = store.get_auto_increment_counter();
+                        data.extend_from_slice(&counter.to_le_bytes());
+                        counters.push((Arc::clone(store), counter));
                     }
                     (schema.table_name.clone(), data)
                 })
@@ -7418,8 +7422,13 @@ impl MVCCEngine {
                 }
             }
         }
+        // An id taken after its counter was read may belong to a write
+        // recorded before the copies, whose counter is then below it
+        let moved = counters
+            .iter()
+            .any(|(store, counter)| store.get_auto_increment_counter() != *counter);
         drop(ddl);
-        Ok(Some(boundary))
+        Ok((!moved).then_some(boundary))
     }
 
     fn compact_volumes(&self) -> Result<()> {

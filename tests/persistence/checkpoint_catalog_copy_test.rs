@@ -192,3 +192,53 @@ fn an_update_of_a_sealed_row_committed_during_a_checkpoint_survives_a_crash() {
         [(1, 10), (3, 3)]
     );
 }
+
+/// The id the first INSERT after a crash takes, the crash following a
+/// checkpoint during which another handle ran `sql` once the checkpoint
+/// had read the id counters for its catalog copies
+fn next_id_after_writes_while_the_copies_are_taken(sql: &'static [&'static str]) -> i64 {
+    let _guard = test_failpoints::FailpointGuard::new();
+    let root = tempfile::tempdir().unwrap();
+    let (first, crashed) = (root.path().join("0"), root.path().join("1"));
+    let db = Database::open(&dsn(&first)).unwrap();
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY AUTO_INCREMENT, n INTEGER)",
+        "INSERT INTO t (n) VALUES (1), (2), (3)",
+    ] {
+        db.execute(sql, ()).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    db.close().unwrap();
+    let db = Database::open(&dsn(&first)).unwrap();
+    let other = db.clone();
+    test_failpoints::after_catalog_copies_taken(move || {
+        for sql in sql {
+            other
+                .execute(sql, ())
+                .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        }
+    });
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    crash_image(&first, &crashed);
+    db.close().unwrap();
+    let db = Database::open(&dsn(&crashed)).unwrap();
+    db.execute("INSERT INTO t (n) VALUES (50)", ()).unwrap();
+    db.query_one("SELECT id FROM t WHERE n = 50", ()).unwrap()
+}
+
+#[test]
+fn an_id_taken_and_deleted_while_the_copies_are_taken_is_not_given_again_after_a_crash() {
+    let next = next_id_after_writes_while_the_copies_are_taken(&[
+        "INSERT INTO t (n) VALUES (4)",
+        "DELETE FROM t WHERE n = 4",
+    ]);
+    assert_eq!(next, 5, "id 4 was given once");
+}
+
+#[test]
+fn an_explicit_id_deleted_while_the_copies_are_taken_keeps_the_counter_after_a_crash() {
+    let next = next_id_after_writes_while_the_copies_are_taken(&[
+        "INSERT INTO t (id, n) VALUES (100, 4)",
+        "DELETE FROM t WHERE n = 4",
+    ]);
+    assert_eq!(next, 101, "the counter passed 100");
+}
