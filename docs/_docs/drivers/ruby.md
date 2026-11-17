@@ -24,7 +24,7 @@ gem "stoolap"
 
 Requires Ruby `>= 3.3` and a stable [Rust toolchain](https://rustup.rs) at install time. The native extension is compiled from source on your machine via rake-compiler + rb-sys.
 
-The 0.5.0 driver, built on the Stoolap 0.5.0 engine, is in beta. Until the final release, install it with `gem install stoolap --pre`, or pin it in your `Gemfile` with `gem "stoolap", "0.5.0.beta.1"`. The beta pulls the engine from GitHub at install time, so `git` and network access are needed while it compiles.
+The Stoolap engine is compiled into the extension, so no separate library is needed. Driver 0.5.0 ships the Stoolap 0.5.0 engine.
 
 ## Quick Start
 
