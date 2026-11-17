@@ -42,6 +42,7 @@ use crate::storage::statistics::{
     Histogram, HistogramOp, TableStats, SYS_COLUMN_STATS, SYS_TABLE_STATS,
 };
 use crate::storage::traits::{Engine, Table, Transaction};
+use crate::storage::volume::side_index::SideIndexDef;
 
 /// Query planner that integrates statistics-based optimization
 pub struct QueryPlanner {
@@ -619,11 +620,16 @@ impl QueryPlanner {
         let table_stats = self.get_table_stats(table_name).unwrap_or_default();
         let store = self.engine.get_version_store(table_name).ok();
         let root = self.share_arm(table_name, predicate, (&table_stats, store.as_deref()));
+        let mut side_defs = Vec::new();
+        if let Some(store) = &store {
+            store.side_index_defs_into(&mut side_defs);
+        }
         ShareArms {
             root,
             table_stats,
             table_name: table_name.to_string(),
             store,
+            side_defs,
         }
     }
 
@@ -632,8 +638,9 @@ impl QueryPlanner {
         let run = Run {
             table_stats: &arms.table_stats,
             params,
-            counting: (arms.store.as_deref()).map(|store| (arms.table_name.as_str(), store)),
-            hot_rows: std::cell::OnceCell::new(),
+            counting: (arms.store.as_deref())
+                .map(|store| (arms.table_name.as_str(), store, &arms.side_defs[..])),
+            rows: std::cell::OnceCell::new(),
         };
         self.arm_share(&arms.root, &run).clamp(0.0, 1.0)
     }
@@ -653,7 +660,7 @@ impl QueryPlanner {
             }
             ShareArm::Not(arm) => 1.0 - self.arm_share(arm, run),
             ShareArm::OneRow => (run.counting)
-                .and_then(|(table_name, _)| self.engine.row_count_hint(table_name))
+                .and_then(|(table_name, ..)| self.engine.row_count_hint(table_name))
                 .map_or(0.0, |rows| 1.0 / rows.max(1) as f64),
             ShareArm::Compare(compared) => self.compared_share(compared, run),
         }
@@ -740,25 +747,40 @@ impl QueryPlanner {
         upper: std::ops::Bound<&Value>,
     ) -> Option<f64> {
         use std::ops::Bound::Included;
-        let (index, store, rows) = self.counting(compared, run)?;
+        let (index, store, table) = self.counting(compared, run)?;
         let (lower, upper) = (compared.read_bound(lower)?, compared.read_bound(upper)?);
         let (lower, upper) = (lower.as_ref().map(|v| &**v), upper.as_ref().map(|v| &**v));
         let count = match (lower, upper) {
             (Included(low), Included(high)) if low == high => {
                 let column = compared.column.as_deref()?;
-                crate::storage::mvcc::table::index_equality_count(
+                let hot = crate::storage::mvcc::table::index_equality_count(
                     index,
                     &store.schema(),
                     column,
                     low,
-                    rows,
-                )?
+                    table.rows,
+                )?;
+                // The sealed rows' side files count them by their key pages
+                let sealed = match (&table.sealed, run.counting) {
+                    (Some(volumes), Some((_, _, side_defs))) => {
+                        crate::storage::volume::table::sealed_equal_count(
+                            (&store.schema(), side_defs),
+                            volumes,
+                            column,
+                            low,
+                        )?
+                    }
+                    (Some(_), None) => return None,
+                    (None, _) => 0,
+                };
+                hot + sealed as usize
             }
+            _ if table.sealed.is_some() => return None,
             _ => index
                 .count_capped(lower, upper, RANGE_COUNT_CAP)
                 .filter(|&count| count <= RANGE_COUNT_CAP)?,
         };
-        Some(count as f64 / rows as f64)
+        Some(count as f64 / table.rows as f64)
     }
 
     /// The share of rows an IN list's members keep, as the column's index
@@ -787,24 +809,26 @@ impl QueryPlanner {
         share
     }
 
-    /// The compared column's index, the table's store and its rows, while
-    /// the index counts them: all of the table's rows hot
+    /// The compared column's index, the table's store and its rows, with
+    /// its volumes when it has sealed some
     fn counting<'r>(
         &self,
         compared: &'r Compared,
-        run: &Run<'r>,
+        run: &'r Run<'r>,
     ) -> Option<(
         &'r dyn crate::storage::traits::Index,
         &'r VersionStore,
-        usize,
+        &'r TableRows,
     )> {
         let index = compared.index.as_deref()?;
-        let (table_name, store) = run.counting?;
-        let rows = (*run.hot_rows.get_or_init(|| {
-            (self.engine.row_count_hint(table_name))
-                .filter(|&rows| rows > 0 && rows == store.committed_row_count())
-        }))?;
-        Some((index, store, rows))
+        let (table_name, store, _) = run.counting?;
+        let rows = run.rows.get_or_init(|| {
+            let (rows, sealed) = self.engine.rows_with_volumes(table_name, store)?;
+            // Volumes whose rows all came back hot leave the hot index to count
+            let sealed = sealed.filter(|_| rows != store.committed_row_count());
+            (rows > 0).then_some(TableRows { rows, sealed })
+        });
+        Some((index, store, rows.as_ref()?))
     }
 
     /// Whether `a = b` compares a column of `table_name` that no two rows
@@ -871,7 +895,7 @@ impl QueryPlanner {
                 table_stats,
                 params: &[],
                 counting: None,
-                hot_rows: std::cell::OnceCell::new(),
+                rows: std::cell::OnceCell::new(),
             };
             ShareArm::Fixed(self.compared_share(&compared, &run))
         };
@@ -1050,6 +1074,8 @@ pub(crate) struct ShareArms {
     table_stats: TableStats,
     table_name: String,
     store: Option<Arc<VersionStore>>,
+    /// The table's side index definitions, which count its sealed rows
+    side_defs: Vec<SideIndexDef>,
 }
 
 impl std::fmt::Debug for ShareArms {
@@ -1156,13 +1182,21 @@ impl ValueSource {
 type Building<'a> = (&'a TableStats, Option<&'a VersionStore>);
 
 /// What one share is estimated with: the table's statistics, the run's
-/// parameters, and the table's store, whose indexes count while all of its
-/// rows are hot, with those rows found once
+/// parameters, and the table's store, whose indexes count its hot rows and
+/// whose side index definitions its sealed ones, with the table's rows
+/// found once
 struct Run<'a> {
     table_stats: &'a TableStats,
     params: &'a [Value],
-    counting: Option<(&'a str, &'a VersionStore)>,
-    hot_rows: std::cell::OnceCell<Option<usize>>,
+    counting: Option<(&'a str, &'a VersionStore, &'a [SideIndexDef])>,
+    rows: std::cell::OnceCell<Option<TableRows>>,
+}
+
+/// A table's rows, and its volumes when it has sealed some, whose side
+/// files count an equality over the sealed rows
+struct TableRows {
+    rows: usize,
+    sealed: Option<Arc<crate::storage::volume::manifest::SegmentManager>>,
 }
 
 /// Health status of table statistics

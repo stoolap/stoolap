@@ -146,6 +146,40 @@ fn test_explain_shows_rows_and_no_cost() {
 }
 
 #[test]
+fn test_explain_counts_an_equality_over_sealed_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?sync_mode=none&checkpoint_on_close=off&checkpoint_interval=0",
+        dir.path().display()
+    ))
+    .unwrap();
+    for sql in [
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER)",
+        "CREATE TABLE b (id INTEGER PRIMARY KEY)",
+        "INSERT INTO a SELECT g.value, CASE WHEN g.value <= 10 THEN 1 ELSE 0 END \
+         FROM generate_series(1, 20000) g",
+        "INSERT INTO b SELECT g.value FROM generate_series(1, 20000) g",
+        "CREATE INDEX a_x ON a (x)",
+        "PRAGMA CHECKPOINT",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    let line = db
+        .query(
+            "EXPLAIN SELECT * FROM a JOIN b ON b.id = a.id WHERE a.x = 1",
+            (),
+        )
+        .unwrap()
+        .map(|row| row.unwrap().get::<String>(0).unwrap())
+        .find(|line| line.contains("Join)"))
+        .unwrap();
+    assert!(
+        line.ends_with("(rows=10)"),
+        "the side file counts the 10 sealed rows of x = 1: {line}"
+    );
+}
+
+#[test]
 fn test_explain_estimates_one_row_for_a_primary_key_equality() {
     let db = Database::open("memory://join_opt_pk_one_row").unwrap();
     db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)", ())

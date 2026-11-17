@@ -196,6 +196,55 @@ struct SideAsk {
 /// counts first
 type SideAsks = smallvec::SmallVec<[SideAsk; 2]>;
 
+/// A visit of each side index definition a table holds
+type SideDefs<'a> = &'a dyn Fn(&mut dyn FnMut(SideIndexDef));
+
+/// How many positions of the volumes `volumes` holds for a table of
+/// `schema` and the side index definitions `side_defs` have `column` equal
+/// to `value`, as each volume's side file counts them by its key pages,
+/// read through the page cache with no lock held, or estimates them by its
+/// directory where the cache refuses a page; None when a volume holds no
+/// side file entry that counts them
+pub(crate) fn sealed_equal_count(
+    (schema, side_defs): (&Schema, &[SideIndexDef]),
+    volumes: &SegmentManager,
+    column: &str,
+    value: &Value,
+) -> Option<u64> {
+    let defs = |each: &mut dyn FnMut(SideIndexDef)| side_defs.iter().cloned().for_each(each);
+    let comparison = [(column, crate::core::Operator::Eq, value)];
+    let asks = SegmentedTable::side_asks_of(schema, &defs, &comparison);
+    let ask = asks.first()?;
+    let keys = ask.keys.range();
+    let identity = ask.def.identity;
+    let mut total = 0u64;
+    let cold = volumes.cold_snapshot();
+    for (_, cs) in cold.volumes() {
+        let side = cs.side_for(&ask.def, keys.capability())?;
+        if SegmentedTable::range_misses_nan(cs, &ask.def, &keys) {
+            return None;
+        }
+        let exact = match keys {
+            KeyRange::I64(low, high) if low == high => side.equal(identity, low),
+            KeyRange::I64(..) => return None,
+            KeyRange::Bytes { lower, upper, .. } => {
+                side.range_bytes(identity, lower, upper).map(Some)
+            }
+        };
+        let estimate = || match keys {
+            KeyRange::I64(low, high) => side.candidate_estimate(identity, low, high),
+            KeyRange::Bytes { lower, upper, .. } => {
+                side.byte_candidate_estimate(identity, lower, upper)
+            }
+        };
+        total += match exact {
+            Ok(found) => found.map_or(0, |(start, end)| end.saturating_sub(start)),
+            Err(_) => estimate().ok()?.unwrap_or(0),
+        };
+    }
+    Some(total)
+}
+
 thread_local! {
     /// Each ask's estimated positions in the volume being decided, with its
     /// place among the asks: one buffer a thread keeps for every volume it
@@ -3614,17 +3663,27 @@ impl SegmentedTable {
     /// identity among equals; each volume reads the one of them its side
     /// file counts the fewest positions for
     fn side_asks(&self, comparisons: &[(&str, crate::core::Operator, &Value)]) -> SideAsks {
+        let defs = |each: &mut dyn FnMut(SideIndexDef)| self.hot.for_each_side_index_def(each);
+        Self::side_asks_of(self.hot.schema(), &defs, comparisons)
+    }
+
+    /// `side_asks` over the side index definitions `defs` visits, the
+    /// columns of `schema`
+    fn side_asks_of(
+        schema: &Schema,
+        defs: SideDefs<'_>,
+        comparisons: &[(&str, crate::core::Operator, &Value)],
+    ) -> SideAsks {
         let mut asks = SideAsks::new();
         if comparisons.is_empty() {
             return asks;
         }
-        let schema = self.hot.schema();
         let mut i64_all: smallvec::SmallVec<[(SideIndexDef, i64, i64); 2]> =
             smallvec::SmallVec::new();
         let mut bytes_all: smallvec::SmallVec<[((usize, bool), SideIndexDef); 2]> =
             smallvec::SmallVec::new();
         let before = |def: &SideIndexDef, held: &SideIndexDef| def.identity < held.identity;
-        self.hot.for_each_side_index_def(&mut |def| match def.kind {
+        defs(&mut |def| match def.kind {
             KeyKind::OrderedI64 => {
                 if let Some((low, high)) = Self::i64_bounds(schema, comparisons, &def) {
                     let first = i64_all.first().is_none_or(|(held, ..)| before(&def, held));
