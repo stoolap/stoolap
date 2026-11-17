@@ -72,6 +72,14 @@ fn renamed_to(data: &[u8]) -> Option<String> {
     String::from_utf8(new.to_vec()).ok()
 }
 
+/// The error that stops a recovery at a committed record it cannot apply
+fn unreplayable(entry: &crate::storage::mvcc::wal_manager::WALEntry, e: Error) -> Error {
+    Error::internal(format!(
+        "cannot replay the {:?} record of table '{}' at LSN {}: {}",
+        entry.operation, entry.table_name, entry.lsn, e
+    ))
+}
+
 /// What a replay settles once the whole log is read
 #[derive(Default)]
 struct ReplayLog {
@@ -2582,41 +2590,41 @@ impl MVCCEngine {
         use crate::storage::mvcc::persistence::{deserialize_row_version, IndexMetadata};
         use crate::storage::mvcc::wal_manager::WALOperationType;
 
+        let fail = |e| unreplayable(&entry, e);
         match entry.operation {
             WALOperationType::CreateTable => {
-                // Deserialize schema from entry data
-                if let Ok((schema, auto_increment)) = self.deserialize_schema(&entry.data) {
-                    let table_name = schema.table_name_lower.clone();
-                    log.settle_renames_to(&table_name);
-                    // A table that has a store is a checkpoint's catalog copy: its rows stay
-                    if let Ok(store) = self.get_version_store(&table_name) {
-                        if let Some(counter) = auto_increment {
-                            store.set_auto_increment_counter(counter);
-                        }
-                        return Ok(());
-                    }
-
-                    // Create the table (version store)
-                    let version_store = Arc::new(VersionStore::with_visibility_checker(
-                        schema.table_name.clone(),
-                        schema.clone(),
-                        registry_as_visibility_checker(&self.registry),
-                    ));
-
-                    // Register virtual PkIndex for INTEGER PRIMARY KEY
-                    register_pk_index(&schema, &version_store);
+                let (schema, auto_increment) =
+                    self.deserialize_schema(&entry.data).map_err(fail)?;
+                let table_name = schema.table_name_lower.clone();
+                log.settle_renames_to(&table_name);
+                // A table that has a store is a checkpoint's catalog copy: its rows stay
+                if let Ok(store) = self.get_version_store(&table_name) {
                     if let Some(counter) = auto_increment {
-                        version_store.set_auto_increment_counter(counter);
+                        store.set_auto_increment_counter(counter);
                     }
+                    return Ok(());
+                }
 
-                    {
-                        let mut schemas = self.schemas.write().unwrap();
-                        schemas.insert(table_name.clone(), CompactArc::new(schema));
-                    }
-                    {
-                        let mut stores = self.version_stores.write().unwrap();
-                        stores.insert(table_name, version_store);
-                    }
+                // Create the table (version store)
+                let version_store = Arc::new(VersionStore::with_visibility_checker(
+                    schema.table_name.clone(),
+                    schema.clone(),
+                    registry_as_visibility_checker(&self.registry),
+                ));
+
+                // Register virtual PkIndex for INTEGER PRIMARY KEY
+                register_pk_index(&schema, &version_store);
+                if let Some(counter) = auto_increment {
+                    version_store.set_auto_increment_counter(counter);
+                }
+
+                {
+                    let mut schemas = self.schemas.write().unwrap();
+                    schemas.insert(table_name.clone(), CompactArc::new(schema));
+                }
+                {
+                    let mut stores = self.version_stores.write().unwrap();
+                    stores.insert(table_name, version_store);
                 }
             }
             WALOperationType::DropTable => {
@@ -2649,134 +2657,128 @@ impl MVCCEngine {
             WALOperationType::CreateIndex => {
                 // Deserialize index metadata
                 // Use skip_population=true for deferred single-pass population
-                if let Ok(index_meta) = IndexMetadata::deserialize(&entry.data) {
-                    let table_name = entry.table_name.to_lowercase();
-                    if let Ok(store) = self.get_version_store(&table_name) {
-                        // For HNSW indexes, try loading saved graph from snapshot dir.
-                        // Use the timestamped graph file matching the loaded data snapshot
-                        // to avoid row_id mismatches on fallback recovery.
-                        let hnsw_graph_path = if index_meta.index_type
-                            == crate::core::IndexType::Hnsw
-                        {
-                            if let Some(ref pm) = *self.persistence {
-                                let dir = pm.path().join("snapshots").join(&table_name);
-                                if dir.exists() {
-                                    // Look up the timestamp of the loaded snapshot
-                                    let ts = self
-                                        .snapshot_timestamps
-                                        .read()
-                                        .unwrap()
-                                        .get(&table_name)
-                                        .cloned();
-                                    if let Some(ts) = ts {
-                                        // Try timestamped file first (new format)
-                                        let timestamped = dir
-                                            .join(format!("hnsw_{}-{}.bin", index_meta.name, ts));
-                                        if timestamped.exists() {
-                                            Some(timestamped)
-                                        } else {
-                                            // Backwards compat: try old non-timestamped format
-                                            let old =
-                                                dir.join(format!("hnsw_{}.bin", index_meta.name));
-                                            if old.exists() {
-                                                Some(old)
-                                            } else {
-                                                None
-                                            }
-                                        }
+                let index_meta = IndexMetadata::deserialize(&entry.data).map_err(fail)?;
+                let table_name = entry.table_name.to_lowercase();
+                // A table created in a transaction that never committed leaves these
+                let Ok(store) = self.get_version_store(&table_name) else {
+                    return Ok(());
+                };
+                // For HNSW indexes, try loading saved graph from snapshot dir.
+                // Use the timestamped graph file matching the loaded data snapshot
+                // to avoid row_id mismatches on fallback recovery.
+                let hnsw_graph_path = if index_meta.index_type == crate::core::IndexType::Hnsw {
+                    if let Some(ref pm) = *self.persistence {
+                        let dir = pm.path().join("snapshots").join(&table_name);
+                        if dir.exists() {
+                            // Look up the timestamp of the loaded snapshot
+                            let ts = self
+                                .snapshot_timestamps
+                                .read()
+                                .unwrap()
+                                .get(&table_name)
+                                .cloned();
+                            if let Some(ts) = ts {
+                                // Try timestamped file first (new format)
+                                let timestamped =
+                                    dir.join(format!("hnsw_{}-{}.bin", index_meta.name, ts));
+                                if timestamped.exists() {
+                                    Some(timestamped)
+                                } else {
+                                    // Backwards compat: try old non-timestamped format
+                                    let old = dir.join(format!("hnsw_{}.bin", index_meta.name));
+                                    if old.exists() {
+                                        Some(old)
                                     } else {
-                                        // No snapshot loaded (pure WAL replay), try old format
-                                        let old = dir.join(format!("hnsw_{}.bin", index_meta.name));
-                                        if old.exists() {
-                                            Some(old)
-                                        } else {
-                                            None
-                                        }
+                                        None
                                     }
+                                }
+                            } else {
+                                // No snapshot loaded (pure WAL replay), try old format
+                                let old = dir.join(format!("hnsw_{}.bin", index_meta.name));
+                                if old.exists() {
+                                    Some(old)
                                 } else {
                                     None
                                 }
-                            } else {
-                                None
                             }
                         } else {
                             None
-                        };
-                        let _ = store.create_index_from_metadata_with_graph(
-                            &index_meta,
-                            true,
-                            hnsw_graph_path.as_deref(),
-                        );
-                        // An explicit identity is kept; a record without one
-                        // means its own LSN
-                        store.set_index_identity(
-                            &index_meta.name,
-                            index_meta.identity.unwrap_or(entry.lsn),
-                        );
+                        }
+                    } else {
+                        None
                     }
-                }
+                } else {
+                    None
+                };
+                store
+                    .create_index_from_metadata_with_graph(
+                        &index_meta,
+                        true,
+                        hnsw_graph_path.as_deref(),
+                    )
+                    .map_err(fail)?;
+                // An explicit identity is kept; a record without one
+                // means its own LSN
+                store
+                    .set_index_identity(&index_meta.name, index_meta.identity.unwrap_or(entry.lsn));
             }
             WALOperationType::DropIndex => {
                 // Index name is stored in entry.data as simple string
-                if let Ok(index_name) = String::from_utf8(entry.data.clone()) {
-                    let table_name = entry.table_name.to_lowercase();
-                    if let Ok(store) = self.get_version_store(&table_name) {
-                        let _ = store.drop_index(&index_name);
-                    }
+                let index_name = String::from_utf8(entry.data.clone())
+                    .map_err(|e| fail(Error::internal(e.to_string())))?;
+                let table_name = entry.table_name.to_lowercase();
+                // The index or its table may be gone already
+                if let Ok(store) = self.get_version_store(&table_name) {
+                    let _ = store.drop_index(&index_name);
                 }
             }
             WALOperationType::Insert | WALOperationType::Update => {
                 // Deserialize row version and apply to version store.
-                if let Ok(row_version) = deserialize_row_version(&entry.data) {
-                    let table_name = entry.table_name.to_lowercase();
-                    let mgr = self.get_or_create_segment_manager(&table_name);
-                    let in_volume = mgr.is_row_id_in_volume(entry.row_id)?;
+                let row_version = deserialize_row_version(&entry.data).map_err(fail)?;
+                let table_name = entry.table_name.to_lowercase();
+                let store = self.get_version_store(&table_name).map_err(fail)?;
+                let mgr = self.get_or_create_segment_manager(&table_name);
+                let in_volume = mgr.is_row_id_in_volume(entry.row_id)?;
 
-                    if in_volume {
-                        // Row exists in a cold volume. Two cases:
-                        // 1. Sealed INSERT: original data, already in volume → skip
-                        // 2. Post-seal UPDATE: new data supersedes cold → apply + tombstone
-                        //
-                        // Distinguish by checking if the row_id is already tombstoned.
-                        // If tombstoned, a previous WAL entry already marked it as
-                        // superseded (UPDATE or DELETE), so this entry is a later
-                        // version that should be applied. If not tombstoned, this is
-                        // the first (original sealed) INSERT → skip.
-                        //
-                        // ORDERING INVARIANT: commit_all_tables writes tombstone
-                        // DELETE entries BEFORE the corresponding INSERT entries.
-                        // This guarantees `already_tombstoned` is true for post-seal
-                        // UPDATEs (which are recorded as Insert in the WAL).
-                        // The `WALOperationType::Update` arm is a safety net for
-                        // any future code path that records with the Update op type.
-                        let already_tombstoned = mgr.is_tombstoned(entry.row_id);
+                if in_volume {
+                    // Row exists in a cold volume. Two cases:
+                    // 1. Sealed INSERT: original data, already in volume → skip
+                    // 2. Post-seal UPDATE: new data supersedes cold → apply + tombstone
+                    //
+                    // Distinguish by checking if the row_id is already tombstoned.
+                    // If tombstoned, a previous WAL entry already marked it as
+                    // superseded (UPDATE or DELETE), so this entry is a later
+                    // version that should be applied. If not tombstoned, this is
+                    // the first (original sealed) INSERT → skip.
+                    //
+                    // ORDERING INVARIANT: commit_all_tables writes tombstone
+                    // DELETE entries BEFORE the corresponding INSERT entries.
+                    // This guarantees `already_tombstoned` is true for post-seal
+                    // UPDATEs (which are recorded as Insert in the WAL).
+                    // The `WALOperationType::Update` arm is a safety net for
+                    // any future code path that records with the Update op type.
+                    let already_tombstoned = mgr.is_tombstoned(entry.row_id);
 
-                        if already_tombstoned || entry.operation == WALOperationType::Update {
-                            // Post-seal change: apply to hot. The hot version
-                            // shadows the cold version via skip set (hot_row_ids
-                            // in the cumulative skip set at scan time). No tombstone
-                            // needed here — the hot version IS the dedup mechanism.
-                            if let Ok(store) = self.get_version_store(&table_name) {
-                                store.apply_recovered_version(entry.row_id, row_version);
-                            }
-                        }
-                        // else: sealed INSERT, volume has authoritative data → skip
-                    } else {
-                        // Row not in any volume: standard hot insert
-                        if let Ok(store) = self.get_version_store(&table_name) {
-                            store.apply_recovered_version(entry.row_id, row_version);
-                        }
+                    if already_tombstoned || entry.operation == WALOperationType::Update {
+                        // Post-seal change: apply to hot. The hot version
+                        // shadows the cold version via skip set (hot_row_ids
+                        // in the cumulative skip set at scan time). No tombstone
+                        // needed here — the hot version IS the dedup mechanism.
+                        store.apply_recovered_version(entry.row_id, row_version);
                     }
+                    // else: sealed INSERT, volume has authoritative data → skip
+                } else {
+                    // Row not in any volume: standard hot insert
+                    store.apply_recovered_version(entry.row_id, row_version);
                 }
             }
             WALOperationType::Delete => {
                 // For deletes, mark the row as deleted in the hot store.
                 let table_name = entry.table_name.to_lowercase();
+                let store = self.get_version_store(&table_name).map_err(fail)?;
                 let mgr = self.get_or_create_segment_manager(&table_name);
                 let in_volume = mgr.is_row_id_in_volume(entry.row_id)?;
-                if let Ok(store) = self.get_version_store(&table_name) {
-                    store.mark_deleted(entry.row_id, entry.txn_id);
-                }
+                store.mark_deleted(entry.row_id, entry.txn_id);
                 // If the deleted row_id lives in a cold segment, add a tombstone
                 // so it is excluded from scans and point lookups.
                 if in_volume {
@@ -2827,27 +2829,24 @@ impl MVCCEngine {
             }
             WALOperationType::CreateView => {
                 // Deserialize view definition and recreate the view
-                if let Ok(view_def) = ViewDefinition::deserialize(&entry.data) {
-                    let name_lower = view_def.name.clone();
-                    let mut views = self.views.write().unwrap();
-                    views.insert(name_lower, Arc::new(view_def));
-                }
+                let view_def = ViewDefinition::deserialize(&entry.data).map_err(fail)?;
+                let name_lower = view_def.name.clone();
+                let mut views = self.views.write().unwrap();
+                views.insert(name_lower, Arc::new(view_def));
             }
             WALOperationType::DropView => {
                 // Remove the view
-                if let Ok(view_name) = String::from_utf8(entry.data.clone()) {
-                    let name_lower = view_name.to_lowercase();
-                    let mut views = self.views.write().unwrap();
-                    views.remove(&name_lower);
-                }
+                let view_name = String::from_utf8(entry.data.clone())
+                    .map_err(|e| fail(Error::internal(e.to_string())))?;
+                let name_lower = view_name.to_lowercase();
+                let mut views = self.views.write().unwrap();
+                views.remove(&name_lower);
             }
             WALOperationType::TruncateTable => {
                 // Clear all data from the table
-                // During WAL recovery there are no concurrent transactions,
-                // so truncate_all() will always succeed.
                 let table_name = entry.table_name.to_lowercase();
                 if let Ok(store) = self.get_version_store(&table_name) {
-                    let _ = store.truncate_all();
+                    store.truncate_all().map_err(fail)?;
                 }
                 // Clear segments (truncate removes everything)
                 {
@@ -2927,7 +2926,8 @@ impl MVCCEngine {
             }
             let dt_tag = data[pos];
             pos += 1;
-            let data_type = DataType::from_u8(dt_tag).unwrap_or(DataType::Null);
+            let data_type = DataType::from_u8(dt_tag)
+                .ok_or_else(|| Error::internal("invalid schema: unknown data type"))?;
             let mut vector_dimensions: u16 = 0;
             if dt_tag == 7 {
                 // Vector type: read 2 bytes for dimension
@@ -3034,8 +3034,8 @@ impl MVCCEngine {
                         "corrupted schema: truncated foreign key constraint data",
                     ));
                 }
-                let col_name =
-                    String::from_utf8(data[pos..pos + col_name_len].to_vec()).unwrap_or_default();
+                let col_name = String::from_utf8(data[pos..pos + col_name_len].to_vec())
+                    .map_err(|_| Error::internal("corrupted schema: invalid foreign key name"))?;
                 pos += col_name_len;
 
                 if pos + 2 > data.len() {
@@ -3051,8 +3051,8 @@ impl MVCCEngine {
                         "corrupted schema: truncated foreign key constraint data",
                     ));
                 }
-                let ref_table =
-                    String::from_utf8(data[pos..pos + ref_table_len].to_vec()).unwrap_or_default();
+                let ref_table = String::from_utf8(data[pos..pos + ref_table_len].to_vec())
+                    .map_err(|_| Error::internal("corrupted schema: invalid foreign key name"))?;
                 pos += ref_table_len;
 
                 if pos + 2 > data.len() {
@@ -3068,8 +3068,8 @@ impl MVCCEngine {
                         "corrupted schema: truncated foreign key constraint data",
                     ));
                 }
-                let ref_col =
-                    String::from_utf8(data[pos..pos + ref_col_len].to_vec()).unwrap_or_default();
+                let ref_col = String::from_utf8(data[pos..pos + ref_col_len].to_vec())
+                    .map_err(|_| Error::internal("corrupted schema: invalid foreign key name"))?;
                 pos += ref_col_len;
 
                 if pos + 2 > data.len() {

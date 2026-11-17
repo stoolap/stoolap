@@ -4318,7 +4318,7 @@ fn test_crash_leftover_tmp_volume_file() {
 #[test]
 fn test_crash_after_volume_write_before_manifest() {
     // Simulate crash after volume file was written but before manifest was updated.
-    // Delete manifest.bin after checkpoint. Recovery should handle this gracefully.
+    // Delete manifest.bin after checkpoint. Recovery refuses to open.
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
     let dsn = format!("file://{}?checkpoint_on_close=off", db_path.display());
@@ -4364,16 +4364,11 @@ fn test_crash_after_volume_write_before_manifest() {
         fs::remove_file(&manifest_path).unwrap();
     }
 
-    let db = Database::open(&dsn).unwrap();
-    let result: Result<i64, _> = db.query_one("SELECT COUNT(*) FROM crash_manifest", ());
-    match result {
-        Ok(count) => {
-            // Without manifest, volumes are orphaned. Recovery depends on WAL.
-            assert!(count >= 0, "Should have non-negative count, got {}", count);
-        }
-        Err(_) => {
-            // Table may not exist if DDL was in truncated WAL
-        }
+    // The log the checkpoints truncated no longer names the table its
+    // remaining rows belong to
+    match Database::open(&dsn) {
+        Ok(_) => panic!("the open passed over rows of a table it does not know"),
+        Err(e) => assert!(e.to_string().contains("'crash_manifest'"), "{e}"),
     }
 }
 

@@ -50,6 +50,7 @@ mod volume_checkpoint_test;
 mod volume_format_test;
 mod wal_acknowledged_commit_test;
 mod wal_path_test;
+mod wal_replay_unapplied_test;
 mod wal_torn_tail_test;
 mod wal_truncation_rotation_test;
 mod wal_truncation_test;
