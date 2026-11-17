@@ -196,6 +196,101 @@ struct SideAsk {
 /// counts first
 type SideAsks = smallvec::SmallVec<[SideAsk; 2]>;
 
+/// A visit of each side index definition a table holds
+type SideDefs<'a> = &'a dyn Fn(&mut dyn FnMut(SideIndexDef));
+
+/// The side file probes one estimate takes over all its counts before it
+/// leaves the rest to the statistics
+pub(crate) const SEALED_PROBES: usize = 256;
+
+/// A table's volumes as an estimate counts them, captured once for all its
+/// counts, with the rows they hold that no statement sees: the deleted ones
+/// and the copies a seal left without authority
+pub(crate) struct SealedView {
+    cold: super::manifest::ColdSnapshot,
+    hidden: u64,
+    volumes: Arc<SegmentManager>,
+    /// The settled seal generation taken before the capture
+    generation: u64,
+}
+
+/// The view `sealed_equal_count` counts `volumes` in; None while one of
+/// them hides rows behind another's, which a side file cannot tell apart,
+/// or while the seal fence cannot be read without waiting
+pub(crate) fn sealed_view(volumes: Arc<SegmentManager>) -> Option<SealedView> {
+    let generation = volumes.try_settled_seal_generation()?;
+    let cold = volumes.cold_snapshot();
+    #[cfg(feature = "test-failpoints")]
+    crate::test_failpoints::estimate_cold_view_taken();
+    // Tombstones and dead copies as the snapshot captured them with its volumes
+    let mut hidden = cold.ts.len() as u64;
+    for (_, cs) in cold.volumes() {
+        if cs.visible.is_some() {
+            return None;
+        }
+        hidden += cs.dead.as_ref().map_or(0, |dead| dead.len() as u64);
+    }
+    Some(SealedView {
+        cold,
+        hidden,
+        volumes,
+        generation,
+    })
+}
+
+/// How many sealed rows of `view`, of a table of `schema` and the side
+/// index definitions `side_defs`, have `column` equal to `value`, as each
+/// volume's side file counts them by its key pages, read through the page
+/// cache with no lock held, or estimates them by its directory where the
+/// cache refuses a page. None when a volume holds no side file entry that
+/// counts them, when the rows the view hides could be half the count, or
+/// when `probes` runs out
+pub(crate) fn sealed_equal_count(
+    (schema, side_defs): (&Schema, &[SideIndexDef]),
+    view: &SealedView,
+    column: &str,
+    value: &Value,
+    probes: &std::cell::Cell<usize>,
+) -> Option<u64> {
+    let defs = |each: &mut dyn FnMut(SideIndexDef)| side_defs.iter().cloned().for_each(each);
+    let comparison = [(column, crate::core::Operator::Eq, value)];
+    let asks = SegmentedTable::side_asks_of(schema, &defs, &comparison);
+    let ask = asks.first()?;
+    let keys = ask.keys.range();
+    let identity = ask.def.identity;
+    let mut total = 0u64;
+    for (_, cs) in view.cold.volumes() {
+        probes.set(probes.get().checked_sub(1)?);
+        let side = cs.side_for(&ask.def, keys.capability())?;
+        if SegmentedTable::range_misses_nan(cs, &ask.def, &keys) {
+            return None;
+        }
+        let exact = match keys {
+            KeyRange::I64(low, high) if low == high => side.equal(identity, low),
+            KeyRange::I64(..) => return None,
+            KeyRange::Bytes { lower, upper, .. } => {
+                side.range_bytes(identity, lower, upper).map(Some)
+            }
+        };
+        let estimate = || match keys {
+            KeyRange::I64(low, high) => side.candidate_estimate(identity, low, high),
+            KeyRange::Bytes { lower, upper, .. } => {
+                side.byte_candidate_estimate(identity, lower, upper)
+            }
+        };
+        total += match exact {
+            Ok(found) => found.map_or(0, |(start, end)| end.saturating_sub(start)),
+            Err(_) => estimate().ok()?.unwrap_or(0),
+        };
+    }
+    // A seal since the capture may have moved rows the hot count read before
+    if view.volumes.seal_generation() != view.generation {
+        return None;
+    }
+    // The live matches lie between the count and the count less the hidden
+    (total == 0 || view.hidden.saturating_mul(2) < total).then_some(total)
+}
+
 thread_local! {
     /// Each ask's estimated positions in the volume being decided, with its
     /// place among the asks: one buffer a thread keeps for every volume it
@@ -3614,17 +3709,27 @@ impl SegmentedTable {
     /// identity among equals; each volume reads the one of them its side
     /// file counts the fewest positions for
     fn side_asks(&self, comparisons: &[(&str, crate::core::Operator, &Value)]) -> SideAsks {
+        let defs = |each: &mut dyn FnMut(SideIndexDef)| self.hot.for_each_side_index_def(each);
+        Self::side_asks_of(self.hot.schema(), &defs, comparisons)
+    }
+
+    /// `side_asks` over the side index definitions `defs` visits, the
+    /// columns of `schema`
+    fn side_asks_of(
+        schema: &Schema,
+        defs: SideDefs<'_>,
+        comparisons: &[(&str, crate::core::Operator, &Value)],
+    ) -> SideAsks {
         let mut asks = SideAsks::new();
         if comparisons.is_empty() {
             return asks;
         }
-        let schema = self.hot.schema();
         let mut i64_all: smallvec::SmallVec<[(SideIndexDef, i64, i64); 2]> =
             smallvec::SmallVec::new();
         let mut bytes_all: smallvec::SmallVec<[((usize, bool), SideIndexDef); 2]> =
             smallvec::SmallVec::new();
         let before = |def: &SideIndexDef, held: &SideIndexDef| def.identity < held.identity;
-        self.hot.for_each_side_index_def(&mut |def| match def.kind {
+        defs(&mut |def| match def.kind {
             KeyKind::OrderedI64 => {
                 if let Some((low, high)) = Self::i64_bounds(schema, comparisons, &def) {
                     let first = i64_all.first().is_none_or(|(held, ..)| before(&def, held));
@@ -10324,5 +10429,32 @@ mod tests {
         assert!(!mgr.row_exists(2).unwrap());
         assert!(mgr.row_exists(1).unwrap());
         assert!(mgr.row_exists(3).unwrap());
+    }
+
+    #[test]
+    fn sealed_view_does_not_wait_behind_a_queued_seal() {
+        let mgr = Arc::new(SegmentManager::new("test", None));
+        let held = mgr.acquire_seal_read();
+        let writer = {
+            let mgr = Arc::clone(&mgr);
+            std::thread::spawn(move || drop(mgr.acquire_seal_write()))
+        };
+        while mgr.try_settled_seal_generation().is_some() {
+            std::thread::yield_now();
+        }
+        let (sent, view) = std::sync::mpsc::channel();
+        let estimate = {
+            let mgr = Arc::clone(&mgr);
+            std::thread::spawn(move || sent.send(sealed_view(mgr).is_some()).unwrap())
+        };
+        let answer = view.recv_timeout(std::time::Duration::from_secs(2));
+        drop(held);
+        writer.join().unwrap();
+        estimate.join().unwrap();
+        assert_eq!(
+            answer,
+            Ok(false),
+            "a seal queued behind a held read leaves the estimate no view"
+        );
     }
 }

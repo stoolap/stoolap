@@ -145,6 +145,118 @@ fn test_explain_shows_rows_and_no_cost() {
     assert!(found_rows, "EXPLAIN should show row estimate");
 }
 
+/// a of 20,000 rows, x as `x` gives it, indexed, and b of 20,000 rows,
+/// both sealed
+fn sealed_pair(dir: &tempfile::TempDir, x: &str) -> Database {
+    let db = Database::open(&format!(
+        "file://{}?sync_mode=none&checkpoint_on_close=off&checkpoint_interval=0",
+        dir.path().display()
+    ))
+    .unwrap();
+    for sql in [
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER)".to_string(),
+        "CREATE TABLE b (id INTEGER PRIMARY KEY)".to_string(),
+        format!("INSERT INTO a SELECT g.value, {x} FROM generate_series(1, 20000) g"),
+        "INSERT INTO b SELECT g.value FROM generate_series(1, 20000) g".to_string(),
+        "CREATE INDEX a_x ON a (x)".to_string(),
+        "PRAGMA CHECKPOINT".to_string(),
+    ] {
+        db.execute(&sql, ()).unwrap();
+    }
+    db
+}
+
+/// The join line EXPLAIN prints for a join of a and b under `filter` on a
+fn join_line(db: &Database, filter: &str) -> String {
+    db.query(
+        &format!("EXPLAIN SELECT * FROM a JOIN b ON b.id = a.id WHERE {filter}"),
+        (),
+    )
+    .unwrap()
+    .map(|row| row.unwrap().get::<String>(0).unwrap())
+    .find(|line| line.contains("Join)"))
+    .unwrap()
+}
+
+#[test]
+fn test_explain_counts_an_equality_over_sealed_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = sealed_pair(&dir, "CASE WHEN g.value <= 10 THEN 1 ELSE 0 END");
+    let line = join_line(&db, "a.x = 1");
+    assert!(
+        line.ends_with("(rows=10)"),
+        "the side file counts the 10 sealed rows of x = 1: {line}"
+    );
+}
+
+#[test]
+fn test_explain_does_not_count_sealed_rows_most_of_which_are_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = sealed_pair(&dir, "CASE WHEN g.value <= 10000 THEN 1 ELSE 0 END");
+    db.execute("UPDATE a SET x = 0 WHERE id BETWEEN 2 AND 10000", ())
+        .unwrap();
+    let line = join_line(&db, "a.x = 1");
+    assert!(
+        line.ends_with("(rows=2000)"),
+        "one row keeps x = 1, the side file still holds 10,000: the default \
+         tenth, not the stale count: {line}"
+    );
+}
+
+#[test]
+fn test_explain_counts_no_more_sealed_keys_than_its_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = sealed_pair(&dir, "g.value % 1000");
+    let members: Vec<String> = (0..300).map(|x| x.to_string()).collect();
+    let line = join_line(&db, &format!("a.x IN ({})", members.join(", ")));
+    assert!(
+        line.ends_with("(rows=20000)"),
+        "300 keys pass the 256 probes the estimate takes: the default share \
+         of an IN list, not a count: {line}"
+    );
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_explain_takes_one_cold_view_for_an_in_list() {
+    use stoolap::test_failpoints::estimate_cold_views;
+    let dir = tempfile::tempdir().unwrap();
+    let db = sealed_pair(&dir, "g.value % 1000");
+    let views = |filter: &str| {
+        let before = estimate_cold_views();
+        join_line(&db, filter);
+        estimate_cold_views() - before
+    };
+    let one = views("a.x = 1");
+    assert_eq!(
+        views("a.x IN (1, 2, 3, 4, 5)"),
+        one,
+        "the five keys share the view the one key takes"
+    );
+}
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_explain_does_not_count_across_a_seal_after_its_cold_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = sealed_pair(&dir, "0");
+    db.execute(
+        "INSERT INTO a SELECT g.value, 1 FROM generate_series(20001, 40000) g",
+        (),
+    )
+    .unwrap();
+    let other = db.clone();
+    stoolap::test_failpoints::after_estimate_cold_view(move || {
+        other.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    });
+    let line = join_line(&db, "a.x = 1");
+    assert!(
+        line.ends_with("(rows=2000)"),
+        "the 20,000 rows of x = 1 left the hot index for a volume the view \
+         did not capture: the default tenth, not a count of 0: {line}"
+    );
+}
+
 #[test]
 fn test_explain_estimates_one_row_for_a_primary_key_equality() {
     let db = Database::open("memory://join_opt_pk_one_row").unwrap();

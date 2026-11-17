@@ -4093,11 +4093,28 @@ impl MVCCEngine {
     /// About how many committed rows table `name` holds, hot and sealed,
     /// read without a transaction or a table; None for a table it does not hold
     pub(crate) fn row_count_hint(&self, name: &str) -> Option<usize> {
-        let hot = self.get_version_store(name).ok()?.committed_row_count();
+        let store = self.get_version_store(name).ok()?;
+        Some(self.rows_with_volumes(name, &store)?.0)
+    }
+
+    /// `row_count_hint` of table `name`, whose hot rows `store` holds, with
+    /// the volumes it has sealed when it has any
+    pub(crate) fn rows_with_volumes(
+        &self,
+        name: &str,
+        store: &VersionStore,
+    ) -> Option<(
+        usize,
+        Option<Arc<crate::storage::volume::manifest::SegmentManager>>,
+    )> {
+        let hot = store.committed_row_count();
         let sealed = self.segment_managers.read().ok()?.get(name).cloned();
         Some(match sealed.filter(|mgr| mgr.has_segments()) {
-            Some(mgr) => mgr.total_row_count() + hot.saturating_sub(mgr.seal_overlap()),
-            None => hot,
+            Some(mgr) => (
+                mgr.total_row_count() + hot.saturating_sub(mgr.seal_overlap()),
+                Some(mgr),
+            ),
+            None => (hot, None),
         })
     }
 

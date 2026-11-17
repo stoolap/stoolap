@@ -1957,7 +1957,6 @@ impl IndexFile {
 
     /// The exact position index range of an ordered-bytes entry's keys in
     /// `[lower, upper)`; reads the boundary key pages through the cache alone
-    #[cfg(test)]
     pub fn range_bytes(
         &self,
         identity: u64,

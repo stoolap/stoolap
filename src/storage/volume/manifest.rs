@@ -3885,6 +3885,13 @@ impl SegmentManager {
         self.seal_generation()
     }
 
+    /// `settled_seal_generation` when the fence is free to read now; None
+    /// rather than waiting, for a caller that may already hold it
+    pub(crate) fn try_settled_seal_generation(&self) -> Option<u64> {
+        let _fence = self.seal_fence.try_read()?;
+        Some(self.seal_generation())
+    }
+
     /// Record the current seal generation for a transaction. Called under
     /// the seal read fence during INSERT so the value is consistent.
     /// Stores the minimum (earliest) generation seen by this txn, so that

@@ -2869,6 +2869,8 @@ thread_local! {
     static INNER_TABLE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static MIN_MAX_INDEX_ANSWERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static EQUALITY_CANDIDATE_IDS_COPIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ESTIMATE_COLD_VIEWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static ESTIMATE_COLD_VIEW_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
     static ESTIMATE_IN_KEYS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static BTREE_WALK_CHUNK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
     static GROUP_CACHE_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -3723,6 +3725,25 @@ pub(crate) fn equality_candidate_ids_copied(count: usize) {
     EQUALITY_CANDIDATE_IDS_COPIED.with(|n| n.set(n.get() + count));
 }
 
+/// Cold views this thread's row estimates took to count sealed rows, so far
+pub fn estimate_cold_views() -> usize {
+    ESTIMATE_COLD_VIEWS.with(std::cell::Cell::get)
+}
+
+/// Run once on this thread when a row estimate next has captured a table's
+/// volumes to count sealed rows, before it counts the hot ones.
+pub fn after_estimate_cold_view(hook: impl FnOnce() + 'static) {
+    ESTIMATE_COLD_VIEW_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn estimate_cold_view_taken() {
+    ESTIMATE_COLD_VIEWS.with(|n| n.set(n.get() + 1));
+    let hook = ESTIMATE_COLD_VIEW_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// IN list keys this thread's join side estimates read to count, so far
 pub fn estimate_in_keys_read() -> usize {
     ESTIMATE_IN_KEYS_READ.with(std::cell::Cell::get)
@@ -4026,6 +4047,7 @@ pub fn reset_all() {
     STATEMENT_CAPTURED_HOOK.with(|slot| *slot.borrow_mut() = None);
     STATEMENT_INDEXES_HOOK.with(|slot| *slot.borrow_mut() = None);
     STATEMENT_VOLUMES_HOOK.with(|slot| *slot.borrow_mut() = None);
+    ESTIMATE_COLD_VIEW_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_ROUND_PREPARED_HOOK.with(|slot| *slot.borrow_mut() = None);
     IN_MEMBER_PROBED_HOOK.with(|slot| *slot.borrow_mut() = None);
     HOT_TOP_K_VISIT_HOOK.with(|slot| *slot.borrow_mut() = None);
