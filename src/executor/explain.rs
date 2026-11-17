@@ -790,25 +790,33 @@ impl Executor {
     }
 }
 
-/// `lines` with its top level `Subqueries:` section replaced by `held`, the
-/// one the run held, or `held` put before its `Ctes:` or at its end; as it
-/// is when the run held no subquery
+/// `lines` with every `Subqueries:` section of its plans, nested ones too,
+/// replaced by `held`, the run's list of them all, at the top level section's
+/// place, else before its `Ctes:` or at its end; as it is when `held` is empty
 fn splice_held_blocks(lines: &mut Vec<String>, held: Vec<String>) {
     if held.is_empty() {
         return;
     }
-    let at = lines.iter().position(|line| line == "Subqueries:");
-    let end = at.map_or_else(
-        || (lines.iter().position(|line| line == "Ctes:")).unwrap_or(lines.len()),
-        |at| {
-            at + 1
-                + lines[at + 1..]
-                    .iter()
-                    .take_while(|l| l.starts_with(' '))
-                    .count()
-        },
-    );
-    lines.splice(at.unwrap_or(end)..end, held);
+    let indent = |line: &str| line.len() - line.trim_start().len();
+    let mut top = None;
+    let mut at = 0;
+    while at < lines.len() {
+        if lines[at].trim_start() != "Subqueries:" {
+            at += 1;
+            continue;
+        }
+        let depth = indent(&lines[at]);
+        let under = (lines[at + 1..].iter())
+            .take_while(|line| indent(line) > depth)
+            .count();
+        lines.drain(at..at + 1 + under);
+        if depth == 0 {
+            top = Some(at);
+        }
+    }
+    let at = top
+        .unwrap_or_else(|| (lines.iter().position(|line| line == "Ctes:")).unwrap_or(lines.len()));
+    lines.splice(at..at, held);
 }
 
 /// Extract table alias from a table expression

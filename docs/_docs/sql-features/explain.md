@@ -675,7 +675,7 @@ A UNION ALL without ORDER BY or DISTINCT needs at most LIMIT + OFFSET rows from 
 
 ## EXPLAIN ANALYZE
 
-Runs the statement and prints the plan EXPLAIN prints, line for line, with the time the run took and the rows it returned on the top line.
+Runs the statement and prints the plan EXPLAIN prints, line for line, with the time the run took and the rows it returned on the top line; only its subqueries are listed as the run held them, as [Subqueries](#subqueries) below says.
 
 ```sql
 EXPLAIN ANALYZE SELECT id FROM products WHERE value > 15;
@@ -692,13 +692,13 @@ Project id (actual time=1.53ms, rows=2)
 | Field | Description |
 |-------|-------------|
 | actual time | The time the statement took to run, its rows read to the end |
-| rows | The rows the statement returned; for an `INSERT`, `UPDATE` or `DELETE` without `RETURNING`, the rows it wrote |
+| rows | The rows the statement returned; for an `INSERT`, `UPDATE` or `DELETE` without `RETURNING`, the rows it affected: those inserted or deleted, and every row an `UPDATE` matched, a row its `SET` left unchanged included |
 
 The other lines are the plan's. Where the plan names alternatives (a line starting with `else`), it does not say which one the run took, and `rows=` on a join line is the estimate. EXPLAIN ANALYZE of an `INSERT`, `UPDATE` or `DELETE` performs the write.
 
 ### Subqueries
 
-For a statement that runs its subqueries as [prepared subqueries]({% link _docs/sql-features/subqueries.md %}#prepared-subqueries), EXPLAIN ANALYZE ends with the `Subqueries:` section the run held: one line per subquery, numbered from 1, nested ones included, and so are the subqueries of its `LIMIT` and `OFFSET` and of its derived tables, set operation branches, CTEs and join sides that the run prepared. A view keeps its subqueries in its own plan, which EXPLAIN ANALYZE of the view's query lists. A subquery that runs as a statement of its own lists that statement's subqueries under its line, numbered after it, such as `1.1`. Each line says what the subquery tests, what it reads and how it answers:
+For a statement that runs its subqueries as [prepared subqueries]({% link _docs/sql-features/subqueries.md %}#prepared-subqueries), EXPLAIN ANALYZE ends with the `Subqueries:` section the run held, in place of every `Subqueries:` section EXPLAIN prints, a derived table's included: one line per subquery, numbered from 1, nested ones included, and so are the subqueries of its `LIMIT` and `OFFSET` and of its derived tables, set operation branches, CTEs and join sides that the run prepared. A view keeps its subqueries in its own plan, which EXPLAIN ANALYZE of the view's query lists. A subquery that runs as a statement of its own lists that statement's subqueries under its line, numbered after it, such as `1.1`. Each line says what the subquery tests, what it reads and how it answers:
 
 ```sql
 EXPLAIN ANALYZE SELECT id FROM t WHERE EXISTS (SELECT 1 FROM w WHERE w.k = t.k);
