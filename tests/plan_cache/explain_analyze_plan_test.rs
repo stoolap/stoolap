@@ -60,6 +60,7 @@ fn both(db: &Database, sql: &str) -> (Vec<String>, Vec<String>, String, String) 
     (planned, analyzed, rows, paths)
 }
 
+#[cfg(not(feature = "test-filedb"))]
 #[test]
 fn explain_analyze_prints_the_plan_explain_prints_with_the_rows_and_paths_of_the_run() {
     let db = setup("memory://explain_analyze_plan_lines");
@@ -71,6 +72,7 @@ fn explain_analyze_prints_the_plan_explain_prints_with_the_rows_and_paths_of_the
             "order_limit.prepared_top_k",
         ),
         ("SELECT id FROM t WHERE k = 2", "286", "scan.seq"),
+        ("SELECT id + 0, x FROM t WHERE id = 1.5", "0", "scan.seq"),
         (
             "SELECT x, COUNT(*) FROM t GROUP BY x",
             "10",
@@ -94,7 +96,7 @@ fn explain_analyze_prints_the_plan_explain_prints_with_the_rows_and_paths_of_the
         (
             "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM w WHERE w.k = t.k)",
             "1429",
-            "",
+            "scan.seq x2",
         ),
         ("SELECT DISTINCT k FROM t", "7", "scan.seq, distinct.rows"),
         ("UPDATE t SET k = 1 WHERE x = 3", "200", "scan.index"),

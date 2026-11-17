@@ -711,14 +711,14 @@ Paths: scan.index, join.index_nested_loop
 
 | Family | Paths |
 |--------|-------|
-| `scan` | `seq` every row, `index` the rows an index plan names, `parallel_filter` the rows read judged by the WHERE on the thread pool |
+| `scan` | the read of a table's rows in memory, as the table took it: `seq` every row, `index` the rows the keys or an index name, `parallel_filter` the rows read judged by the WHERE on the thread pool. A key or index the table cannot use for the values given, such as `id = 1.5` on an INTEGER key, is read as `seq` |
 | `key_read` | `pk_get`, `unique_get`, `index_get`, `key_members` (an `IN` list on the primary key), `row_ids` (`_rowid_`), `block_point_rows`, `block_point_value` (a subquery's primary key equality) |
 | `order_limit` | `prepared_index_ordered`, `prepared_keyset`, `prepared_top_k`, `prepared_top_rows`, `prepared_project_first`, `prepared_index_keys`, `prepared_block_cut`, `top_n`, `computed_keys`, `vector_search`, `join_index_sort`, `cte_order_limit_pushdown` |
 | `aggregate` | `stats`, `index_bound`, `index_count`, `storage_filtered`, `storage_grouped`, `streaming_group_by`, `hash_groups`, `global_scan`, `prepared_block`, `general` |
 | `join` | `index_nested_loop`, `batch_index_nested_loop`, `grouped_index_join`, `limit_hash`, `parallel_hash`, `hash`, `nested_loop` |
 | `distinct` | `rows`, `values`, `scan` |
 
-A run's first execution of a statement can take another path than the runs after it, which read the plan the first one held. The line lists the paths taken on the thread that runs the statement; a read no path names, such as the scan of a statement whose subqueries choose its read over their sets, adds nothing to it, and a statement none of whose reads is named prints no `Paths:` line.
+A run's first execution of a statement can take another path than the runs after it, which read the plan the first one held. The line lists the paths taken on the thread that runs the statement, a subquery's reads included, and a statement none of whose reads is named prints no `Paths:` line. Rows sealed to volumes are read by their zone maps, bloom filters and side files, which no path names: on a table whose rows are all sealed, `scan.seq` is the read of its empty in-memory part.
 
 ### Subqueries
 

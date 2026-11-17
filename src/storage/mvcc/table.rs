@@ -366,6 +366,16 @@ enum WriteAccess<'a> {
     Scan,
 }
 
+/// Notes the read the table's rows took: the keys or an index, or every row
+#[inline]
+fn read_by(index: bool) {
+    use crate::executor::prepared_select::ScanPath;
+    match index {
+        true => ScanPath::Index.taken(),
+        false => ScanPath::Seq.taken(),
+    }
+}
+
 /// `access`, decided for `where_expr` over a table of `schema`, with the
 /// keys a key plan or a primary key range names taken from the WHERE; a
 /// plan whose keys it does not hold, or a mixed one, reads every row
@@ -2594,7 +2604,9 @@ impl MVCCTable {
         offset: usize,
     ) -> Result<RowVec> {
         let none = Deadline::NONE;
-        if let Some(rows) = self.access_rows_with_limit(access, filter, limit, offset, none)? {
+        let read = self.access_rows_with_limit(access, filter, limit, offset, none)?;
+        read_by(read.is_some());
+        if let Some(rows) = read {
             return Ok(rows);
         }
         self.visible_rows_with_limit(filter, limit, offset, none)
@@ -2769,7 +2781,9 @@ impl MVCCTable {
         offset: usize,
         deadline: Deadline,
     ) -> Result<RowVec> {
-        if let Some(rows) = self.access_rows_with_limit(access, filter, limit, offset, deadline)? {
+        let read = self.access_rows_with_limit(access, filter, limit, offset, deadline)?;
+        read_by(read.is_some());
+        if let Some(rows) = read {
             return Ok(rows);
         }
         self.limited_rows_unordered(filter, limit, offset, deadline)
@@ -2922,6 +2936,9 @@ impl MVCCTable {
 
         if let Some(expr) = where_expr {
             let access = write_access(schema, access, Some(expr));
+            if matches!(access, WriteAccess::Key(_) | WriteAccess::KeyRange(..)) {
+                read_by(true);
+            }
             // The row the key names
             if let WriteAccess::Key(pk_id) = access {
                 if skipped(pk_id) {
@@ -3007,6 +3024,7 @@ impl MVCCTable {
                 _ => None,
             };
             if let Some((mut filtered_row_ids, index)) = indexed {
+                read_by(true);
                 filtered_row_ids.extend(self.local_ids_missing_from(
                     index,
                     expr,
@@ -3061,6 +3079,7 @@ impl MVCCTable {
             }
         }
 
+        read_by(false);
         // Full scan: the filter is applied before rows are cloned. One that
         // can fail is not asked of a row already planned, and an error on
         // the committed copy of a row the transaction wrote is not the
@@ -3965,6 +3984,9 @@ impl Table for MVCCTable {
 
         if let Some(expr) = where_expr {
             let access = write_access(schema, access, Some(expr));
+            if matches!(access, WriteAccess::Key(_) | WriteAccess::KeyRange(..)) {
+                read_by(true);
+            }
             if let WriteAccess::Key(pk_id) = access {
                 return match deadline.is_none() {
                     true => self.delete_key::<false>(pk_id, expr, fallible, deadline),
@@ -4033,6 +4055,7 @@ impl Table for MVCCTable {
                 _ => None,
             };
             if let Some((mut filtered_row_ids, index)) = indexed {
+                read_by(true);
                 filtered_row_ids.extend(self.local_ids_missing_from(
                     index,
                     expr,
@@ -4105,6 +4128,7 @@ impl Table for MVCCTable {
             }
         }
 
+        read_by(false);
         // Fall back to full scan
         let mut delete_count = 0;
 
@@ -4246,7 +4270,9 @@ impl Table for MVCCTable {
         deadline: Deadline,
     ) -> Result<Box<dyn Scanner>> {
         let schema = self.cached_schema.clone();
-        if let Some(rows) = self.access_rows(access, where_expr, deadline)? {
+        let read = self.access_rows(access, where_expr, deadline)?;
+        read_by(read.is_some());
+        if let Some(rows) = read {
             let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
             return Ok(Box::new(scanner));
         }
@@ -4259,7 +4285,9 @@ impl Table for MVCCTable {
         where_expr: Option<&dyn Expression>,
         deadline: Deadline,
     ) -> Result<RowVec> {
-        let rows = match self.access_rows(access, where_expr, deadline)? {
+        let read = self.access_rows(access, where_expr, deadline)?;
+        read_by(read.is_some());
+        let rows = match read {
             Some(rows) => rows,
             None => {
                 let rows = self.collect_visible_rows(where_expr, deadline)?;

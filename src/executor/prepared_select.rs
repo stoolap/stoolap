@@ -5708,9 +5708,9 @@ impl KeyReadPath {
 /// and for an EXPLAIN ANALYZE run
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ScanPath {
-    /// Every row of the table
+    /// Every row of the table's in-memory store, as the store read them
     Seq,
-    /// The rows an index plan names
+    /// The rows the keys or an index plan name, where the store took the plan
     Index,
     /// The rows read judged by the WHERE on the thread pool
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
@@ -5718,14 +5718,6 @@ pub(crate) enum ScanPath {
 }
 
 impl ScanPath {
-    /// The path of a scan read by `access`
-    pub(crate) fn of(access: &crate::storage::traits::ScanAccess<'_>) -> Self {
-        match access {
-            crate::storage::traits::ScanAccess::Seq => Self::Seq,
-            crate::storage::traits::ScanAccess::Index(_) => Self::Index,
-        }
-    }
-
     #[inline]
     pub(crate) fn taken(self) {
         #[cfg(feature = "test-failpoints")]
@@ -16538,7 +16530,6 @@ impl<'a> PreparedRunner<'a> {
                     };
                     #[cfg(feature = "test-failpoints")]
                     crate::test_failpoints::scan_access_taken(&access);
-                    ScanPath::of(&access).taken();
                     match limited {
                         Some(target) => {
                             let answers = table.collect_access_rows_with_limit_unordered(

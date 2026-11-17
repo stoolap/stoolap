@@ -44,6 +44,10 @@ const CASES: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// The paths of the in-memory store's index reads: a table whose rows are
+/// all sealed reads its empty store whole, and its volumes as no path names
+const HOT_ONLY: &[&str] = &["index"];
+
 fn open(dsn: &str, sealed: bool) -> Database {
     let db = Database::open(dsn).unwrap();
     for sql in [
@@ -95,7 +99,8 @@ fn every_scan_path_answers_as_its_twin_does() {
             for run in ["first", "held"] {
                 reset_scan_paths();
                 let got = answer(db, sql);
-                if !scan_paths_taken().contains(path) {
+                let expected = *layout == "hot" || !HOT_ONLY.contains(path);
+                if scan_paths_taken().contains(path) != expected {
                     wrong.push(format!(
                         "{layout} {run}: {sql} took {:?}",
                         scan_paths_taken()
