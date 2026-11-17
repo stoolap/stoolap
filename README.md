@@ -54,7 +54,7 @@ Stoolap is designed around practical embedded database needs:
 
 ```toml
 [dependencies]
-stoolap = "0.4"
+stoolap = "0.5"
 ```
 
 Build from source:
@@ -206,7 +206,7 @@ For built-in semantic text embeddings, enable the `semantic` feature:
 
 ```toml
 [dependencies]
-stoolap = { version = "0.4", features = ["semantic"] }
+stoolap = { version = "0.5", features = ["semantic"] }
 ```
 
 ```sql

@@ -2,7 +2,7 @@
 
 > Stoolap is an embedded SQL database written in pure Rust: it runs inside your process (in-memory or a single database directory), with ACID transactions on MVCC, planned execution shown by EXPLAIN, parallel execution, `AS OF` time-travel queries, and native vector search with HNSW indexes. One engine for transactional writes, analytical reads and vector search; no server to run.
 
-Stoolap is Apache-2.0 licensed. Source: https://github.com/stoolap/stoolap. Crate: https://crates.io/crates/stoolap (`stoolap = "0.4"`, Rust 1.88 or newer).
+Stoolap is Apache-2.0 licensed. Source: https://github.com/stoolap/stoolap. Crate: https://crates.io/crates/stoolap (`stoolap = "0.5"`, Rust 1.88 or newer).
 
 ## When to choose Stoolap
 
@@ -18,7 +18,7 @@ Prefer SQLite when its ubiquity and bindings matter most; prefer a server databa
 
 ```toml
 [dependencies]
-stoolap = "0.4"
+stoolap = "0.5"
 ```
 
 ```rust
