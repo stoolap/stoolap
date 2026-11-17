@@ -65,7 +65,7 @@ pub(crate) fn taken_join_order(
     if join_run(stmt).is_some_and(|run| ctes_hide(run, ctx)) {
         return Some(None);
     }
-    match &*plan.join_order().read().ok()? {
+    match &*plan.join_order().read() {
         HeldOrder::Decided(_, ordered) => Some(ordered.as_ref().map(|o| o.order.clone())),
         _ => None,
     }
@@ -147,14 +147,14 @@ impl Executor {
             crate::test_failpoints::join_order_decided();
             let order = self.reorder_joins(stmt, CteNames::Context(ctx))?;
             let plan = NestedPlan::default();
-            *plan.join_order().write().ok()? = HeldOrder::Fixed;
+            *plan.join_order().write() = HeldOrder::Fixed;
             Some(Arc::new(OrderedPlan { order, plan }))
         };
         let Some(compiled) = compiled else {
             return decide();
         };
         {
-            let held = compiled.join_order().read().ok()?;
+            let held = compiled.join_order().read();
             match &*held {
                 HeldOrder::Fixed => return None,
                 _ if ctes_hide(run, ctx) => return None,
@@ -164,7 +164,7 @@ impl Executor {
         }
         let key = self.join_order_key(run)?;
         let plan = decide();
-        *compiled.join_order().write().ok()? = HeldOrder::Decided(key, plan.clone());
+        *compiled.join_order().write() = HeldOrder::Decided(key, plan.clone());
         plan
     }
 

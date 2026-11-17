@@ -19,11 +19,11 @@
 //!
 
 use crate::common::time_compat::{SystemTime, UNIX_EPOCH};
+use parking_lot::Mutex;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::Mutex;
 
 use crate::common::I64Set;
 use crate::core::{Error, Result};
@@ -1340,7 +1340,7 @@ impl WALManager {
                 return Err(poisoned_error());
             }
             let (lsns, full) = {
-                let mut buffer = self.buffer.lock().unwrap();
+                let mut buffer = self.buffer.lock();
                 let lsns = self.stamp_unit(&mut buffer, &mut entries)?;
                 (lsns, buffer.len() >= self.flush_trigger as usize)
             };
@@ -1352,13 +1352,13 @@ impl WALManager {
         }
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::wal_sync_starting();
-        let mut wal_file = self.wal_file.lock().unwrap();
-        let name = self.current_wal_file.lock().unwrap().clone();
+        let mut wal_file = self.wal_file.lock();
+        let name = self.current_wal_file.lock().clone();
         if self.poisoned.load(Ordering::Acquire) {
             self.clean_failure(&wal_file, &name, Cut::Keep);
             return Err(self.failure_error(poisoned_error()));
         }
-        let mut buffer = self.buffer.lock().unwrap();
+        let mut buffer = self.buffer.lock();
         if let Err(e) = self.drain_locked(&mut wal_file, &mut buffer) {
             self.clean_failure(&wal_file, &name, self.failed_write_cut());
             return Err(self.failure_error(e));
@@ -1437,7 +1437,7 @@ impl WALManager {
         // recovery discards uncommitted transactions either way.
         let mut encoded = entry.encode();
         let do_flush = {
-            let mut buffer = self.buffer.lock().unwrap();
+            let mut buffer = self.buffer.lock();
             entry.previous_lsn = self.previous_lsn.load(Ordering::Acquire);
             let current = self.current_lsn.load(Ordering::Acquire);
             if current == u64::MAX {
@@ -1488,15 +1488,15 @@ impl WALManager {
         if sync {
             crate::test_failpoints::wal_sync_starting();
         }
-        let mut wal_file = self.wal_file.lock().unwrap();
+        let mut wal_file = self.wal_file.lock();
         // Read only on a failure: a commit's flush allocates nothing for it
-        let name = || self.current_wal_file.lock().unwrap().clone();
+        let name = || self.current_wal_file.lock().clone();
         if self.poisoned.load(Ordering::Acquire) {
             self.clean_failure(&wal_file, &name(), Cut::Keep);
             return self.outcome(lsn, need, poisoned_error());
         }
         let drained = {
-            let mut buffer = self.buffer.lock().unwrap();
+            let mut buffer = self.buffer.lock();
             self.drain_locked(&mut wal_file, &mut buffer)
         };
         if let Err(e) = drained {
@@ -1583,7 +1583,7 @@ impl WALManager {
 
     /// `error`, or an unknown outcome when a cut of the cleanup failed
     fn failure_error(&self, error: Error) -> Error {
-        match *self.failure_cleaned.lock().unwrap() {
+        match *self.failure_cleaned.lock() {
             Some(false) => unknown_outcome(&error),
             _ => error,
         }
@@ -1596,7 +1596,7 @@ impl WALManager {
     /// never move the completion record forward
     fn clean_failure(&self, wal_file: &Option<File>, name: &str, cut: Cut) {
         self.poisoned.store(true, Ordering::Release);
-        let mut cleaned = self.failure_cleaned.lock().unwrap();
+        let mut cleaned = self.failure_cleaned.lock();
         if cleaned.is_some() {
             return;
         }
@@ -1604,7 +1604,7 @@ impl WALManager {
         crate::test_failpoints::wal_failure_cleanup_starting();
         let full = self.sync_mode == SyncMode::Full;
         let mut held = true;
-        let owed = self.retired.lock().unwrap().take();
+        let owed = self.retired.lock().take();
         if let Some(Retired {
             file: Some(file),
             path,
@@ -1703,7 +1703,7 @@ impl WALManager {
             return Ok(false);
         }
 
-        let seen = self.current_wal_file.lock().unwrap().clone();
+        let seen = self.current_wal_file.lock().clone();
         self.start_new_wal_file(&seen)?;
         Ok(true)
     }
@@ -1997,15 +1997,8 @@ impl WALManager {
     /// the WAL is replayed or written. A file that cannot be read through
     /// is an error, and nothing is cut then
     pub fn cut_torn_tail(&self) -> Result<()> {
-        let name = self
-            .current_wal_file
-            .lock()
-            .map_err(|_| Error::internal("WAL file name lock poisoned"))?
-            .clone();
-        let mut guard = self
-            .wal_file
-            .lock()
-            .map_err(|_| Error::internal("WAL file lock poisoned"))?;
+        let name = self.current_wal_file.lock().clone();
+        let mut guard = self.wal_file.lock();
         let Some(file) = guard.as_mut() else {
             return Ok(());
         };
@@ -2060,7 +2053,7 @@ impl WALManager {
         if !self.running.load(Ordering::Acquire) {
             return Err(Error::WalNotRunning);
         }
-        let _buffer = self.buffer.lock().unwrap();
+        let _buffer = self.buffer.lock();
         Ok(self.current_lsn.load(Ordering::Acquire))
     }
 
@@ -2085,8 +2078,8 @@ impl WALManager {
         checkpoint_lsn: u64,
         active_transactions: Vec<i64>,
     ) -> Result<()> {
-        let _meta = self.checkpoint_meta.lock().unwrap();
-        let wal_file = self.current_wal_file.lock().unwrap().clone();
+        let _meta = self.checkpoint_meta.lock();
+        let wal_file = self.current_wal_file.lock().clone();
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2144,7 +2137,7 @@ impl WALManager {
             });
 
         self.running.store(false, Ordering::SeqCst);
-        *self.wal_file.lock().unwrap() = None;
+        *self.wal_file.lock() = None;
         closed
     }
 
@@ -2224,7 +2217,7 @@ impl WALManager {
 
     /// Get current WAL file name
     pub fn current_wal_file(&self) -> String {
-        self.current_wal_file.lock().unwrap().clone()
+        self.current_wal_file.lock().clone()
     }
 
     /// Truncate the WAL up to the given LSN. The current file is left as
@@ -2249,7 +2242,7 @@ impl WALManager {
             )));
         }
 
-        let current_wal_name = self.current_wal_file.lock().unwrap().clone();
+        let current_wal_name = self.current_wal_file.lock().clone();
         Self::cleanup_old_wal_files(&self.path, &current_wal_name, up_to_lsn);
 
         // A file starting at or after the LSN holds nothing to leave behind
@@ -2289,8 +2282,8 @@ impl WALManager {
         crate::test_failpoints::wal_swap_starting();
 
         {
-            let mut wal_file = self.wal_file.lock().unwrap();
-            let mut current_name = self.current_wal_file.lock().unwrap();
+            let mut wal_file = self.wal_file.lock();
+            let mut current_name = self.current_wal_file.lock();
             if *current_name != seen {
                 let _ = fs::remove_file(&prepared_path);
                 return Ok(false);
@@ -2317,7 +2310,7 @@ impl WALManager {
             // Drained under the buffer lock, so the LSN read after it is
             // the last record the old file holds
             let last_lsn = {
-                let mut buffer = self.buffer.lock().unwrap();
+                let mut buffer = self.buffer.lock();
                 if let Err(e) = self.drain_locked(&mut wal_file, &mut buffer) {
                     let _ = fs::remove_file(&prepared_path);
                     self.clean_failure(&wal_file, &current_name, self.failed_write_cut());
@@ -2339,7 +2332,7 @@ impl WALManager {
             let unsynced = self.current_file_position.load(Ordering::Relaxed) != durable_len;
             let old_file = wal_file.replace(new_file);
             let old_name = std::mem::replace(&mut *current_name, new_name);
-            *self.retired.lock().unwrap() = Some(Retired {
+            *self.retired.lock() = Some(Retired {
                 file: old_file.filter(|_| unsynced),
                 path: self.path.join(old_name),
                 durable_len,
@@ -2358,8 +2351,8 @@ impl WALManager {
         crate::test_failpoints::wal_swapped();
 
         if let Err(e) = self.settle_retired() {
-            let wal_file = self.wal_file.lock().unwrap();
-            let name = self.current_wal_file.lock().unwrap().clone();
+            let wal_file = self.wal_file.lock();
+            let name = self.current_wal_file.lock().clone();
             self.clean_failure(&wal_file, &name, Cut::Keep);
             return Err(e);
         }
@@ -2374,7 +2367,7 @@ impl WALManager {
     /// the name. A failed sync leaves the old file's durability
     /// unknowable, as for the current file: the WAL is poisoned.
     fn settle_retired(&self) -> Result<()> {
-        let mut retired = self.retired.lock().unwrap();
+        let mut retired = self.retired.lock();
         // A settlement that failed while this one waited poisoned the WAL
         // and left nothing to take: its failure is this caller's too
         if self.poisoned.load(Ordering::Acquire) {

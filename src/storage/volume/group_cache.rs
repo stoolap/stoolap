@@ -22,9 +22,10 @@
 //! and the map lock is never held while decoding. The budget is a process
 //! total; the least recently used entries leave when a new one crosses it.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use super::column::ColumnData;
 
@@ -239,8 +240,8 @@ impl DecodedGroupCache {
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock(&self) -> parking_lot::MutexGuard<'_, Inner> {
+        self.inner.lock()
     }
 }
 
@@ -249,14 +250,14 @@ impl DecodedGroupCache {
 /// drops, on a panic too.
 #[cfg(test)]
 pub(crate) mod test_budget {
-    static CACHE_BUDGET: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static CACHE_BUDGET: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     pub(crate) struct BudgetHeld {
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: parking_lot::MutexGuard<'static, ()>,
     }
 
     pub(crate) fn hold(bytes: usize) -> BudgetHeld {
-        let lock = CACHE_BUDGET.lock().unwrap_or_else(|e| e.into_inner());
+        let lock = CACHE_BUDGET.lock();
         super::DECODED_GROUPS.set_budget_bytes(0);
         super::DECODED_GROUPS.set_budget_bytes(bytes);
         BudgetHeld { _lock: lock }

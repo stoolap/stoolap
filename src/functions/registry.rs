@@ -17,8 +17,9 @@
 //! This module provides the function registry for looking up and managing
 //! SQL functions (aggregate, scalar, and window functions).
 
+use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
 
 use crate::common::{StringMap, StringSet};
 use crate::core::{Error, Result};
@@ -293,7 +294,7 @@ impl FunctionRegistry {
         registry.built_in_names = registry.list_all().into_iter().collect();
         registry
             .built_in_names
-            .extend(registry.tvf_functions.read().unwrap().keys().cloned());
+            .extend(registry.tvf_functions.read().keys().cloned());
         registry
             .built_in_names
             .extend(ENGINE_FUNCTIONS.map(String::from));
@@ -349,14 +350,13 @@ impl FunctionRegistry {
         self.note_registration();
         self.aggregate_functions
             .write()
-            .unwrap()
             .insert(name.clone(), factory);
         self.note_volatility(&name, AGGREGATE, info.volatility);
-        self.function_info.write().unwrap().insert(name, info);
+        self.function_info.write().insert(name, info);
     }
 
     fn note_volatility(&self, name: &str, kind: usize, volatility: Volatility) {
-        let mut volatilities = self.volatilities.write().unwrap();
+        let mut volatilities = self.volatilities.write();
         match volatilities.get_mut(name) {
             Some(kinds) => kinds[kind] = Some(volatility),
             None => {
@@ -386,12 +386,9 @@ impl FunctionRegistry {
 
     fn register_scalar_inner(&self, name: String, info: FunctionInfo, factory: ScalarFnFactory) {
         self.note_registration();
-        self.scalar_functions
-            .write()
-            .unwrap()
-            .insert(name.clone(), factory);
+        self.scalar_functions.write().insert(name.clone(), factory);
         self.note_volatility(&name, SCALAR, info.volatility);
-        self.function_info.write().unwrap().insert(name, info);
+        self.function_info.write().insert(name, info);
     }
 
     /// Register a window function under a name no built-in holds
@@ -413,18 +410,15 @@ impl FunctionRegistry {
 
     fn register_window_inner(&self, name: String, info: FunctionInfo, factory: WindowFnFactory) {
         self.note_registration();
-        self.window_functions
-            .write()
-            .unwrap()
-            .insert(name.clone(), factory);
+        self.window_functions.write().insert(name.clone(), factory);
         self.note_volatility(&name, WINDOW, info.volatility);
-        self.function_info.write().unwrap().insert(name, info);
+        self.function_info.write().insert(name, info);
     }
 
     /// Get a new instance of an aggregate function by name
     pub fn get_aggregate(&self, name: &str) -> Option<Box<dyn AggregateFunction>> {
         // OPTIMIZATION: Fast path - if name is already uppercase, avoid allocation
-        let funcs = self.aggregate_functions.read().unwrap();
+        let funcs = self.aggregate_functions.read();
         if let Some(f) = funcs.get(name) {
             return Some(f());
         }
@@ -436,7 +430,7 @@ impl FunctionRegistry {
     /// Get a new instance of a scalar function by name
     pub fn get_scalar(&self, name: &str) -> Option<Box<dyn ScalarFunction>> {
         // OPTIMIZATION: Fast path - if name is already uppercase, avoid allocation
-        let funcs = self.scalar_functions.read().unwrap();
+        let funcs = self.scalar_functions.read();
         if let Some(f) = funcs.get(name) {
             return Some(f());
         }
@@ -448,7 +442,7 @@ impl FunctionRegistry {
     /// Get a new instance of a window function by name
     pub fn get_window(&self, name: &str) -> Option<Box<dyn WindowFunction>> {
         // OPTIMIZATION: Fast path - if name is already uppercase, avoid allocation
-        let funcs = self.window_functions.read().unwrap();
+        let funcs = self.window_functions.read();
         if let Some(f) = funcs.get(name) {
             return Some(f());
         }
@@ -460,7 +454,7 @@ impl FunctionRegistry {
     /// Check if a function name is an aggregate function
     pub fn is_aggregate(&self, name: &str) -> bool {
         // OPTIMIZATION: Fast path - if name is already uppercase, avoid allocation
-        let funcs = self.aggregate_functions.read().unwrap();
+        let funcs = self.aggregate_functions.read();
         if funcs.contains_key(name) {
             return true;
         }
@@ -472,7 +466,7 @@ impl FunctionRegistry {
     /// Check if a function name is a scalar function
     pub fn is_scalar(&self, name: &str) -> bool {
         // OPTIMIZATION: Fast path - if name is already uppercase, avoid allocation
-        let funcs = self.scalar_functions.read().unwrap();
+        let funcs = self.scalar_functions.read();
         if funcs.contains_key(name) {
             return true;
         }
@@ -484,7 +478,7 @@ impl FunctionRegistry {
     /// Check if a function name is a window function
     pub fn is_window(&self, name: &str) -> bool {
         // OPTIMIZATION: Fast path - if name is already uppercase, avoid allocation
-        let funcs = self.window_functions.read().unwrap();
+        let funcs = self.window_functions.read();
         if funcs.contains_key(name) {
             return true;
         }
@@ -502,13 +496,13 @@ impl FunctionRegistry {
 
     fn add_tvf(&self, name: &str, factory: TvfFactory) {
         self.note_registration();
-        let mut funcs = self.tvf_functions.write().unwrap();
+        let mut funcs = self.tvf_functions.write();
         funcs.insert(name.to_string(), factory);
     }
 
     /// Get a new instance of a table-valued function by name
     pub fn get_tvf(&self, name: &str) -> Option<Box<dyn TableValuedFunction>> {
-        let funcs = self.tvf_functions.read().unwrap();
+        let funcs = self.tvf_functions.read();
         if let Some(f) = funcs.get(name) {
             return Some(f());
         }
@@ -518,7 +512,7 @@ impl FunctionRegistry {
 
     /// Check if a function name is a table-valued function
     pub fn is_tvf(&self, name: &str) -> bool {
-        let funcs = self.tvf_functions.read().unwrap();
+        let funcs = self.tvf_functions.read();
         if funcs.contains_key(name) {
             return true;
         }
@@ -539,7 +533,7 @@ impl FunctionRegistry {
         if name.eq_ignore_ascii_case("CURRENT_TRANSACTION_ID") {
             return Volatility::PerStatement;
         }
-        let volatilities = self.volatilities.read().unwrap();
+        let volatilities = self.volatilities.read();
         let kinds = match volatilities.get(name) {
             Some(kinds) => Some(kinds),
             None => volatilities.get(&name.to_uppercase()),
@@ -551,19 +545,19 @@ impl FunctionRegistry {
 
     /// List all aggregate function names
     pub fn list_aggregates(&self) -> Vec<String> {
-        let funcs = self.aggregate_functions.read().unwrap();
+        let funcs = self.aggregate_functions.read();
         funcs.keys().cloned().collect()
     }
 
     /// List all scalar function names
     pub fn list_scalars(&self) -> Vec<String> {
-        let funcs = self.scalar_functions.read().unwrap();
+        let funcs = self.scalar_functions.read();
         funcs.keys().cloned().collect()
     }
 
     /// List all window function names
     pub fn list_windows(&self) -> Vec<String> {
-        let funcs = self.window_functions.read().unwrap();
+        let funcs = self.window_functions.read();
         funcs.keys().cloned().collect()
     }
 

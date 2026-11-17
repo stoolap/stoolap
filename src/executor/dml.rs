@@ -43,7 +43,7 @@ use super::result::{ExecResult, ExecutorResult};
 use super::utils::qualified;
 use super::Executor;
 use crate::common::deadline::{Deadline, DeadlineSite};
-use std::sync::RwLock;
+use parking_lot::RwLock;
 
 pub(super) struct StatementRollback<'a> {
     engine: &'a crate::storage::mvcc::MVCCEngine,
@@ -466,7 +466,7 @@ impl<'a> InsertPlan<'a> {
         stmt: &InsertStatement,
         prepared: Option<Arc<CompiledUpsert>>,
     ) -> Result<Self> {
-        let cached = cache.and_then(|cache| match &*cache.read().ok()? {
+        let cached = cache.and_then(|cache| match &*cache.read() {
             CompiledExecution::ConflictInsert(plan)
                 if plan.validity.holds(&*executor.engine, epoch)
                     && plan.token == token
@@ -531,7 +531,7 @@ impl<'a> InsertPlan<'a> {
         let Some(validity) = &self.validity else {
             return;
         };
-        if let Some(Ok(mut slot)) = self.cache.map(|cache| cache.write()) {
+        if let Some(mut slot) = self.cache.map(|cache| cache.write()) {
             *slot = CompiledExecution::ConflictInsert(CompiledConflictInsert {
                 checks: Arc::clone(&self.checks),
                 programs: Arc::clone(&self.programs),
@@ -827,7 +827,7 @@ impl Executor {
             reads_through_view && self.insert_reads_prepared(stmt, ctx, plan_cache);
 
         // Check if there's an active explicit transaction
-        let mut active_tx = self.active_transaction.lock().unwrap();
+        let mut active_tx = self.active_transaction.lock();
 
         // INSERT is dispatched before the dispatcher puts the transaction
         // id in the context, so the expressions are given it here
@@ -1830,7 +1830,7 @@ impl Executor {
         // The plan is read before the transaction begins, which a snapshot
         // for prepared subqueries must precede
         let current_epoch = self.engine.schema_epoch();
-        let cached_insert = match &*compiled_cache.read().unwrap() {
+        let cached_insert = match &*compiled_cache.read() {
             CompiledExecution::Insert(cached)
                 if cached.validity.holds(&*self.engine, current_epoch)
                     && *cached.table_name == *table_name =>
@@ -1850,7 +1850,7 @@ impl Executor {
         };
 
         // Check if there's an active explicit transaction
-        let mut active_tx = self.active_transaction.lock().unwrap();
+        let mut active_tx = self.active_transaction.lock();
         let statement_rollback = StatementRollback::new(&self.engine, active_tx.as_ref());
         let active_txn_id = (*active_tx).as_ref().map(|t| t.transaction.id());
 
@@ -2010,9 +2010,7 @@ impl Executor {
             };
 
             // Update the cache
-            if let Ok(mut cache_write) = compiled_cache.write() {
-                *cache_write = CompiledExecution::Insert(compiled);
-            }
+            *compiled_cache.write() = CompiledExecution::Insert(compiled);
 
             (
                 Arc::new(column_indices),
@@ -2355,7 +2353,7 @@ impl Executor {
         let table_name = &stmt.table_name.value_lower;
 
         // Check if there's an active explicit transaction
-        let mut active_tx = self.active_transaction.lock().unwrap();
+        let mut active_tx = self.active_transaction.lock();
         let statement_rollback = StatementRollback::new(&self.engine, active_tx.as_ref());
 
         // Without a view the prepared subqueries read a snapshot taken before the write
@@ -3020,7 +3018,7 @@ impl Executor {
             .unwrap_or(table_name.as_str());
 
         // Check if there's an active explicit transaction
-        let mut active_tx = self.active_transaction.lock().unwrap();
+        let mut active_tx = self.active_transaction.lock();
         let statement_rollback = StatementRollback::new(&self.engine, active_tx.as_ref());
 
         // A statement of the prepared family runs through one runner, whose
@@ -3523,7 +3521,7 @@ impl Executor {
         let _ddl = self.engine.ddl_statement_guard()?;
 
         // Check if there's an active explicit transaction
-        let mut active_tx = self.active_transaction.lock().unwrap();
+        let mut active_tx = self.active_transaction.lock();
 
         let (mut table, should_auto_commit, standalone_tx) =
             if let Some(ref mut tx_state) = *active_tx {

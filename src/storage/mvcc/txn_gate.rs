@@ -16,10 +16,11 @@
 //! once, a commit, rollback or drop closes the gate and waits for those in
 //! flight, and a savepoint holds new ones off while it waits
 
+use parking_lot::Mutex;
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
 use crate::core::{Error, Result};
 
@@ -148,10 +149,7 @@ impl Drop for GateRef {
         let Some(free) = Arc::get_mut(&mut gate) else {
             return;
         };
-        let finish = free
-            .finish
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner);
+        let finish = free.finish.get_mut();
         if finish.is_some() {
             return;
         }
@@ -269,7 +267,7 @@ impl TxnGate {
     /// Closes the gate and leaves `finish` to the last of its statements
     /// out: the transaction is dropped from inside one of them
     pub(crate) fn finish_after_statements(&self, finish: Finish) {
-        *self.finish.lock().unwrap_or_else(PoisonError::into_inner) = Some(finish);
+        *self.finish.lock() = Some(finish);
         self.state
             .fetch_or(CLOSED | FINISH_PENDING, Ordering::AcqRel);
     }
@@ -277,11 +275,7 @@ impl TxnGate {
     fn leave(&self) {
         let before = self.state.fetch_sub(1, Ordering::AcqRel);
         if before & FINISH_PENDING != 0 && before & IN_FLIGHT == 1 {
-            let finish = self
-                .finish
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take();
+            let finish = self.finish.lock().take();
             if let Some(finish) = finish {
                 finish();
             }

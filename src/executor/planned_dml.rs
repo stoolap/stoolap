@@ -15,7 +15,8 @@
 //! An UPDATE or DELETE whose WHERE is its table's primary key equality: the
 //! plan that reads the row the key names and writes it, decided once
 
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 use crate::common::deadline::Deadline;
 use crate::common::names::eq_names;
@@ -122,7 +123,7 @@ impl Executor {
     ) -> Option<Result<Box<dyn QueryResult>>> {
         let epoch = self.engine.schema_epoch();
         {
-            let held = compiled.read().ok()?;
+            let held = compiled.read();
             match &*held {
                 CompiledExecution::PlannedDml(plan)
                     if plan.validity.holds(&*self.engine, epoch) =>
@@ -149,7 +150,7 @@ impl Executor {
         }
         // Only a run with its context plans
         let ctx = ctx?;
-        let mut slot = compiled.write().ok()?;
+        let mut slot = compiled.write();
         match &*slot {
             CompiledExecution::PlannedDml(plan) if plan.validity.holds(&*self.engine, epoch) => {
                 return self.run_planned_dml(plan, params, Some(ctx), in_txn);
@@ -458,10 +459,7 @@ impl Executor {
     /// transaction's, handed back to commit after the write
     fn pk_write_table(&self, table_name: &str, in_txn: bool) -> Result<PkWriteTable<'_>> {
         if in_txn {
-            let mut active_tx = self
-                .active_transaction
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut active_tx = self.active_transaction.lock();
             let rollback = StatementRollback::new(&self.engine, active_tx.as_ref());
             if let Some(tx_state) = active_tx.as_mut() {
                 let table = tx_state.transaction.get_statement_table(table_name)?;

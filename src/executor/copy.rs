@@ -105,7 +105,7 @@ impl Executor {
 
         // COPY is not allowed inside explicit transactions (like PRAGMA CHECKPOINT)
         {
-            let active_tx = self.active_transaction.lock().unwrap();
+            let active_tx = self.active_transaction.lock();
             if active_tx.is_some() {
                 return Err(Error::InvalidArgument(
                     "COPY FROM cannot be used inside an explicit transaction".to_string(),

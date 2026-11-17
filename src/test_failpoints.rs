@@ -16,9 +16,9 @@
 //! Flags and hooks are enabled by unit tests or the `test-failpoints` feature.
 //! Normal builds without that feature compile out the failpoints and their calls.
 
+use parking_lot::{Mutex, MutexGuard};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicI64};
-use std::sync::{Mutex, MutexGuard};
 
 /// Fail WAL `write_to_file()` with an I/O error
 pub static WAL_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
@@ -126,15 +126,12 @@ static WAL_SYNC_FAIL_UNDER: Mutex<Option<std::path::PathBuf>> = Mutex::new(None)
 
 /// Fail the WAL syncs of the databases under `dir` from now on; None stops it
 pub fn fail_wal_syncs_under(dir: Option<&std::path::Path>) {
-    *WAL_SYNC_FAIL_UNDER
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = dir.map(std::path::Path::to_path_buf);
+    *WAL_SYNC_FAIL_UNDER.lock() = dir.map(std::path::Path::to_path_buf);
 }
 
 pub(crate) fn wal_sync_fails_at(wal: &std::path::Path) -> bool {
     WAL_SYNC_FAIL_UNDER
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
         .as_deref()
         .is_some_and(|dir| wal.starts_with(dir))
 }
@@ -1202,14 +1199,11 @@ static PROGRAMS_RAN: Mutex<Vec<(String, usize)>> = Mutex::new(Vec::new());
 /// its listing with how many times the VM was entered for it (a boolean
 /// entry that falls back counts twice), in the order first run
 pub fn programs_ran(run: impl FnOnce()) -> Vec<(String, usize)> {
-    PROGRAMS_RAN
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clear();
+    PROGRAMS_RAN.lock().clear();
     RECORDING_PROGRAMS.store(true, std::sync::atomic::Ordering::SeqCst);
     run();
     RECORDING_PROGRAMS.store(false, std::sync::atomic::Ordering::SeqCst);
-    std::mem::take(&mut *PROGRAMS_RAN.lock().unwrap_or_else(|e| e.into_inner()))
+    std::mem::take(&mut *PROGRAMS_RAN.lock())
 }
 
 pub(crate) fn program_ran(program: &crate::executor::expression::Program) {
@@ -1217,7 +1211,7 @@ pub(crate) fn program_ran(program: &crate::executor::expression::Program) {
         return;
     }
     let listing = program.disassemble();
-    let mut ran = PROGRAMS_RAN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = PROGRAMS_RAN.lock();
     match ran.iter_mut().find(|(seen, _)| *seen == listing) {
         Some((_, times)) => *times += 1,
         None => ran.push((listing, 1)),
@@ -3177,17 +3171,11 @@ static DESCRIPTORS_CLOSED_AT_DROP: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 
 /// Whether the drop of volume file `id` has closed its kept descriptor
 pub fn descriptor_closed_at_drop(id: u64) -> bool {
-    DESCRIPTORS_CLOSED_AT_DROP
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .contains(&id)
+    DESCRIPTORS_CLOSED_AT_DROP.lock().contains(&id)
 }
 
 pub(crate) fn volume_file_descriptor_closed(id: u64) {
-    DESCRIPTORS_CLOSED_AT_DROP
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(id);
+    DESCRIPTORS_CLOSED_AT_DROP.lock().push(id);
 }
 
 /// Volumes this thread loaded through the live segment map, not through a
@@ -4261,7 +4249,7 @@ impl FailpointGuard {
         // If a previous test panicked while holding the lock, the Mutex is
         // poisoned. Recover by accepting the poisoned guard; reset_all()
         // below will clean up the stale flags.
-        let lock = FAILPOINT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let lock = FAILPOINT_LOCK.lock();
         reset_all();
         FailpointGuard { _lock: lock }
     }

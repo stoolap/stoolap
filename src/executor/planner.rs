@@ -49,7 +49,7 @@ pub struct QueryPlanner {
     /// Reference to the storage engine for reading statistics
     engine: Arc<MVCCEngine>,
     /// Cache of table statistics to avoid repeated lookups
-    stats_cache: std::sync::RwLock<StringMap<CachedStats>>,
+    stats_cache: parking_lot::RwLock<StringMap<CachedStats>>,
     /// Monotonic base for the LRU access stamps
     base: crate::common::time_compat::Instant,
 }
@@ -114,7 +114,7 @@ impl QueryPlanner {
     pub fn new(engine: Arc<MVCCEngine>) -> Self {
         Self {
             engine,
-            stats_cache: std::sync::RwLock::new(StringMap::new()),
+            stats_cache: parking_lot::RwLock::new(StringMap::new()),
             base: crate::common::time_compat::Instant::now(),
         }
     }
@@ -128,13 +128,13 @@ impl QueryPlanner {
     ///
     /// Call this after ANALYZE to ensure fresh statistics are used.
     pub fn invalidate_stats_cache(&self, table_name: &str) {
-        let mut cache = self.stats_cache.write().unwrap();
+        let mut cache = self.stats_cache.write();
         cache.remove(&table_name.to_lowercase());
     }
 
     /// Clear all cached statistics
     pub fn clear_stats_cache(&self) {
-        let mut cache = self.stats_cache.write().unwrap();
+        let mut cache = self.stats_cache.write();
         cache.clear();
     }
 
@@ -151,7 +151,7 @@ impl QueryPlanner {
 
         {
             let current_epoch = self.engine.stats_epoch();
-            let cache = self.stats_cache.read().unwrap();
+            let cache = self.stats_cache.read();
             if let Some(cached) = cache.get(&key) {
                 // A fresh entry is authoritative either way: row_count == 0
                 // is the cached "no stats collected" verdict, kept so every
@@ -210,7 +210,7 @@ impl QueryPlanner {
         // Check cache first
         let should_reload = {
             let current_epoch = self.engine.stats_epoch();
-            let cache = self.stats_cache.read().unwrap();
+            let cache = self.stats_cache.read();
             if let Some(cached) = cache.get(&table_key) {
                 if !cached.is_stale(current_epoch) {
                     cached.touch(self.now_secs());
@@ -228,7 +228,7 @@ impl QueryPlanner {
         }
 
         // Try cache again
-        let cache = self.stats_cache.read().unwrap();
+        let cache = self.stats_cache.read();
         cache.get(&table_key).and_then(|c| {
             c.touch(self.now_secs());
             c.column_stats.get(&col_key).cloned()
@@ -277,7 +277,7 @@ impl QueryPlanner {
 
         // Cache the stats with current timestamp
         {
-            let mut cache = self.stats_cache.write().unwrap();
+            let mut cache = self.stats_cache.write();
 
             // LRU eviction: if cache is full, remove least recently used entries
             if cache.len() >= MAX_STATS_CACHE_SIZE {

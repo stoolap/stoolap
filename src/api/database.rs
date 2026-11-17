@@ -43,8 +43,9 @@
 //! let count: i64 = db.query_one("SELECT COUNT(*) FROM users", ())?;
 //! ```
 
+use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, Weak};
 
 use crate::core::{DataType, Error, IsolationLevel, Result, Value};
 use crate::executor::context::ExecutionContextBuilder;
@@ -82,7 +83,8 @@ struct SharedEngine {
 
 impl Drop for SharedEngine {
     fn drop(&mut self) {
-        if let Ok(mut registry) = DATABASE_REGISTRY.write() {
+        {
+            let mut registry = DATABASE_REGISTRY.write();
             if registry
                 .get(&self.dsn)
                 .is_some_and(|entry| std::ptr::eq(entry.as_ptr(), self))
@@ -215,18 +217,14 @@ impl Database {
                 })
         };
         {
-            let registry = DATABASE_REGISTRY
-                .read()
-                .map_err(|_| Error::LockAcquisitionFailed("registry read".to_string()))?;
+            let registry = DATABASE_REGISTRY.read();
             if let Some(db) = open_engine(&registry) {
                 return Ok(db);
             }
         }
 
         // Need to create a new engine - acquire write lock
-        let mut registry = DATABASE_REGISTRY
-            .write()
-            .map_err(|_| Error::LockAcquisitionFailed("registry write".to_string()))?;
+        let mut registry = DATABASE_REGISTRY.write();
 
         // Double-check after acquiring write lock
         if let Some(db) = open_engine(&registry) {
@@ -1041,9 +1039,7 @@ impl Database {
     /// are dropped.
     pub fn close(&self) -> Result<()> {
         // Remove from registry
-        let mut registry = DATABASE_REGISTRY
-            .write()
-            .map_err(|_| Error::LockAcquisitionFailed("registry write".to_string()))?;
+        let mut registry = DATABASE_REGISTRY.write();
 
         registry.remove(&self.inner.shared.dsn);
 

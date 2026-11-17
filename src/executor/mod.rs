@@ -89,9 +89,10 @@ pub mod utils;
 mod volatility;
 mod window;
 
+use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::Arc;
 
 use crate::api::params::ParamVec;
 use crate::common::CompactArc;
@@ -173,16 +174,10 @@ impl TransactionSlot {
         }
     }
 
-    fn lock(&self) -> std::sync::LockResult<SlotGuard<'_>> {
-        match self.slot.lock() {
-            Ok(guard) => Ok(SlotGuard {
-                guard,
-                open: &self.open,
-            }),
-            Err(poisoned) => Err(PoisonError::new(SlotGuard {
-                guard: poisoned.into_inner(),
-                open: &self.open,
-            })),
+    fn lock(&self) -> SlotGuard<'_> {
+        SlotGuard {
+            guard: self.slot.lock(),
+            open: &self.open,
         }
     }
 
@@ -193,7 +188,7 @@ impl TransactionSlot {
 }
 
 struct SlotGuard<'a> {
-    guard: std::sync::MutexGuard<'a, Option<ActiveTransaction>>,
+    guard: parking_lot::MutexGuard<'a, Option<ActiveTransaction>>,
     open: &'a std::sync::atomic::AtomicBool,
 }
 
@@ -505,27 +500,21 @@ impl Executor {
             }
         }
         #[cfg(feature = "test-failpoints")]
-        if let Err(std::sync::TryLockError::WouldBlock) = self.statement_gate.try_write() {
+        if self.statement_gate.try_write().is_none() {
             crate::test_failpoints::statement_gate_blocked();
         }
         StatementGate::Exclusive {
-            _write: self
-                .statement_gate
-                .write()
-                .unwrap_or_else(PoisonError::into_inner),
+            _write: self.statement_gate.write(),
         }
     }
 
     /// The shared gate, or None while an explicit transaction is open
     fn enter_shared(&self) -> Option<RwLockReadGuard<'_, ()>> {
         #[cfg(feature = "test-failpoints")]
-        if let Err(std::sync::TryLockError::WouldBlock) = self.statement_gate.try_read() {
+        if self.statement_gate.try_read().is_none() {
             crate::test_failpoints::statement_gate_blocked();
         }
-        let read = self
-            .statement_gate
-            .read()
-            .unwrap_or_else(PoisonError::into_inner);
+        let read = self.statement_gate.read();
         (!self.active_transaction.is_open()).then_some(read)
     }
 
@@ -775,7 +764,6 @@ impl Executor {
     pub(crate) fn active_txn_id(&self) -> Option<i64> {
         self.active_transaction
             .lock()
-            .unwrap()
             .as_ref()
             .map(|t| t.transaction.id())
     }
@@ -824,7 +812,7 @@ impl Executor {
         &self,
         statement: &Statement,
         ctx: &ExecutionContext,
-        compiled: &std::sync::RwLock<query_cache::CompiledExecution>,
+        compiled: &RwLock<query_cache::CompiledExecution>,
         classification: &std::sync::OnceLock<Arc<query_classification::QueryClassification>>,
         in_txn: bool,
     ) -> Option<Result<Box<dyn QueryResult>>> {
@@ -887,7 +875,7 @@ impl Executor {
         &self,
         statement: &Statement,
         ctx: &ExecutionContext,
-        compiled: &std::sync::RwLock<query_cache::CompiledExecution>,
+        compiled: &RwLock<query_cache::CompiledExecution>,
         classification: &std::sync::OnceLock<Arc<query_classification::QueryClassification>>,
         in_txn: bool,
     ) -> Option<Result<Box<dyn QueryResult>>> {
@@ -1331,7 +1319,7 @@ impl Executor {
         if self.engine.registry().is_active(tx.id()) {
             self.engine.track_keys(tx.id());
         }
-        let mut active_tx = self.active_transaction.lock().unwrap();
+        let mut active_tx = self.active_transaction.lock();
         *active_tx = Some(ActiveTransaction {
             transaction: tx,
             tables: FxHashMap::default(),
@@ -1344,7 +1332,7 @@ impl Executor {
     /// further DML operations after the SELECT delegation completes.
     pub fn take_transaction(&self) -> Option<Box<dyn Transaction>> {
         let _gate = self.enter(true);
-        let mut active_tx = self.active_transaction.lock().unwrap();
+        let mut active_tx = self.active_transaction.lock();
         active_tx.take().map(|at| at.transaction)
     }
 

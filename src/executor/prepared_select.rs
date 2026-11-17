@@ -17,9 +17,10 @@
 //! and run with each subquery as a block whose outer reads fill parameter
 //! slots.
 
+use parking_lot::RwLock;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
@@ -4957,7 +4958,7 @@ fn held_blocks(
         blocks.explain(prefix, (label, next), lines);
         next += blocks.subqueries.len();
     };
-    let held = plan.slot().read().ok();
+    let held = Some(plan.slot().read());
     let mut sides: SmallVec<[&NestedPlan; 2]> = SmallVec::new();
     match held.as_deref() {
         Some(CompiledExecution::PreparedSelect(p)) => list(&p.blocks, lines),
@@ -10410,7 +10411,7 @@ impl Executor {
         let epoch = self.engine.schema_epoch();
         let compiled = plan.map(NestedPlan::slot);
         let held = compiled
-            .and_then(|slot| slot.read().ok())
+            .map(|slot| slot.read())
             .and_then(|guard| match &*guard {
                 CompiledExecution::PreparedGrouped(p)
                     if p.validity.holds(&*self.engine, epoch)
@@ -10481,7 +10482,7 @@ impl Executor {
             ctx.params().len(),
             epoch,
         )?);
-        if let Some(mut guard) = compiled.and_then(|slot| slot.write().ok()) {
+        if let Some(mut guard) = compiled.map(|slot| slot.write()) {
             if matches!(
                 &*guard,
                 CompiledExecution::Unknown
@@ -10549,7 +10550,7 @@ impl Executor {
         ctx: &ExecutionContext,
     ) -> bool {
         compiled
-            .and_then(|slot| slot.read().ok())
+            .map(|slot| slot.read())
             .is_some_and(|guard| match &*guard {
                 CompiledExecution::PreparedGrouped(p) => {
                     p.validity.holds(&*self.engine, self.engine.schema_epoch())
@@ -13298,10 +13299,7 @@ impl Executor {
         let table = match through {
             Some(tx) => tx.get_read_table_at(name, ctx.statement_view(), ctx.table_use()),
             None => {
-                let active = self
-                    .active_transaction
-                    .lock()
-                    .map_err(|_| Error::internal("active transaction lock poisoned"))?;
+                let active = self.active_transaction.lock();
                 match active.as_ref() {
                     Some(tx) => tx.transaction.get_read_table_at(
                         name,
@@ -13351,7 +13349,8 @@ impl Executor {
                 && (std::ptr::eq(p.columns.as_slice(), columns) || p.columns.as_slice() == columns)
         };
         if let Some(slot) = compiled.filter(|_| !fresh) {
-            if let Ok(guard) = slot.read() {
+            {
+                let guard = slot.read();
                 let held = match &*guard {
                     CompiledExecution::PreparedSelect(p) => Some(p),
                     _ => None,
@@ -13377,7 +13376,8 @@ impl Executor {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::prepared_select_built();
         if let Some(slot) = compiled {
-            if let Ok(mut guard) = slot.write() {
+            {
+                let mut guard = slot.write();
                 // A key read's plan is the planner's to replace
                 let open = match &*guard {
                     CompiledExecution::Unknown | CompiledExecution::NotOptimizable(_) => true,
@@ -13399,16 +13399,14 @@ impl Executor {
         compiled: Option<&RwLock<CompiledExecution>>,
         ctx: &ExecutionContext,
     ) -> bool {
-        compiled
-            .and_then(|slot| slot.read().ok())
-            .is_some_and(|guard| {
-                let CompiledExecution::PreparedSelect(p) = &*guard else {
-                    return false;
-                };
-                p.validity.holds(&*self.engine, self.engine.schema_epoch())
-                    && p.cte_scope.holds(ctx)
-                    && p.blocks.param_count == ctx.params().len()
-            })
+        compiled.map(|slot| slot.read()).is_some_and(|guard| {
+            let CompiledExecution::PreparedSelect(p) = &*guard else {
+                return false;
+            };
+            p.validity.holds(&*self.engine, self.engine.schema_epoch())
+                && p.cte_scope.holds(ctx)
+                && p.blocks.param_count == ctx.params().len()
+        })
     }
 
     /// Whether the plan holds a DML statement prepared for the current
@@ -13419,7 +13417,7 @@ impl Executor {
         ctx: &ExecutionContext,
     ) -> bool {
         compiled
-            .and_then(|slot| slot.read().ok())
+            .map(|slot| slot.read())
             .is_some_and(|guard| match &*guard {
                 CompiledExecution::PreparedDml(p) => {
                     p.validity.holds(&*self.engine, self.engine.schema_epoch())
@@ -13479,7 +13477,7 @@ impl Executor {
                     _ => false,
                 }
         };
-        let guard = slot.read().ok()?;
+        let guard = slot.read();
         match &*guard {
             CompiledExecution::PreparedDml(p) if fits(p) => Some(Arc::clone(p)),
             CompiledExecution::Insert(insert) => {
@@ -13547,7 +13545,7 @@ impl Executor {
                     )?);
                     #[cfg(feature = "test-failpoints")]
                     crate::test_failpoints::prepared_dml_was_built();
-                    if let Some(mut guard) = compiled.and_then(|slot| slot.write().ok()) {
+                    if let Some(mut guard) = compiled.map(|slot| slot.write()) {
                         match &mut *guard {
                             CompiledExecution::Insert(insert) => {
                                 insert.prepared = Some(Arc::clone(&prepared));

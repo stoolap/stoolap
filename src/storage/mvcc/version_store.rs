@@ -1388,11 +1388,10 @@ impl PublishHold {
     /// commit is visible, so the seal it requests can extract the rows
     pub fn any_table_at(&self, max_rows: usize, max_bytes: usize) -> bool {
         self.stores.iter().any(|store| {
-            store.read().is_ok_and(|s| {
-                let parent = &s.parent_store;
-                (max_rows > 0 && parent.committed_row_count() >= max_rows)
-                    || (max_bytes > 0 && parent.hot_bytes() >= max_bytes)
-            })
+            let s = store.read();
+            let parent = &s.parent_store;
+            (max_rows > 0 && parent.committed_row_count() >= max_rows)
+                || (max_bytes > 0 && parent.hot_bytes() >= max_bytes)
         })
     }
 
@@ -1402,9 +1401,7 @@ impl PublishHold {
     /// claimed, whatever handles to its stores are still held
     pub fn undo_publication(&self) {
         for store in &self.stores {
-            if let Ok(store) = store.read() {
-                store.undo_publication();
-            }
+            store.read().undo_publication();
         }
     }
 
@@ -1412,9 +1409,7 @@ impl PublishHold {
     /// each store kept for the undo goes
     pub fn release_publication(&self) {
         for store in &self.stores {
-            if let Ok(store) = store.read() {
-                store.release_applied();
-            }
+            store.read().release_applied();
         }
     }
 }
@@ -7882,7 +7877,7 @@ pub const EVERY_WRITE: i64 = i64::MAX;
 /// A transaction's local store for one table, with the admission of the
 /// handles that read it, which takes no lock of the store
 pub struct TxnTableStore {
-    store: std::sync::RwLock<TransactionVersionStore>,
+    store: RwLock<TransactionVersionStore>,
     /// The newest layout a handle was admitted under
     newest: AtomicU64,
     /// The layout the transaction's rows are written under, or `NO_ROWS`
@@ -7901,15 +7896,13 @@ impl TxnTableStore {
         Self {
             parent: store.parent_store.store_id,
             rows: AtomicU64::new(store.layout_bound().unwrap_or(NO_ROWS)),
-            store: std::sync::RwLock::new(store),
+            store: RwLock::new(store),
             newest: AtomicU64::new(layout),
         }
     }
 
     /// The store held for reading
-    pub fn read(
-        &self,
-    ) -> std::sync::LockResult<std::sync::RwLockReadGuard<'_, TransactionVersionStore>> {
+    pub fn read(&self) -> parking_lot::RwLockReadGuard<'_, TransactionVersionStore> {
         self.store.read()
     }
 
@@ -7932,10 +7925,7 @@ impl TxnTableStore {
     /// rollback; the layout of the rows it holds is published when let go
     pub fn write_store(&self) -> TxnStoreWrite<'_> {
         TxnStoreWrite {
-            guard: self
-                .store
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            guard: self.store.write(),
             rows: &self.rows,
         }
     }
@@ -7962,7 +7952,7 @@ impl TxnTableStore {
 
 /// A transaction's store held for writing through `TxnTableStore`
 pub struct TxnStoreWrite<'a> {
-    guard: std::sync::RwLockWriteGuard<'a, TransactionVersionStore>,
+    guard: parking_lot::RwLockWriteGuard<'a, TransactionVersionStore>,
     rows: &'a AtomicU64,
 }
 

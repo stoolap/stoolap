@@ -1638,11 +1638,7 @@ impl Executor {
     #[cold]
     #[inline(never)]
     fn with_counts_snapshot(&self, ctx: &ExecutionContext) -> Result<Option<ExecutionContext>> {
-        let in_transaction = self
-            .active_transaction
-            .lock()
-            .map_err(|_| Error::internal("active transaction lock poisoned"))?
-            .is_some();
+        let in_transaction = self.active_transaction.lock().is_some();
         if in_transaction {
             return Ok(None);
         }
@@ -3475,7 +3471,7 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
-        compiled: Option<&std::sync::RwLock<CompiledExecution>>,
+        compiled: Option<&parking_lot::RwLock<CompiledExecution>>,
         apart: bool,
     ) -> SelectResult {
         let reduction = std::cell::Cell::new(None);
@@ -3506,7 +3502,7 @@ impl Executor {
             };
             if pass.moved {
                 let all = fetched.saturating_add(asked);
-                let in_transaction = self.active_transaction.lock().is_ok_and(|tx| tx.is_some());
+                let in_transaction = self.active_transaction.lock().is_some();
                 let cap = match in_transaction {
                     true => i64::MAX as usize,
                     false => {
@@ -3572,7 +3568,7 @@ impl Executor {
     /// for them holds an empty set from now on
     fn prepared_join(
         &self,
-        slot: &std::sync::RwLock<CompiledExecution>,
+        slot: &parking_lot::RwLock<CompiledExecution>,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Option<std::sync::Arc<PreparedJoin>> {
@@ -3585,10 +3581,11 @@ impl Executor {
             }
             _ => None,
         };
-        if let Some(held) = slot.read().ok().and_then(|guard| current(&guard)) {
+        let held = current(&slot.read());
+        if let Some(held) = held {
             return Some(held);
         }
-        let mut guard = slot.write().ok()?;
+        let mut guard = slot.write();
         if let Some(held) = current(&guard) {
             return Some(held);
         }
@@ -3676,14 +3673,14 @@ impl Executor {
     /// this context
     fn run_keeps_join_plan(
         &self,
-        slot: Option<&std::sync::RwLock<CompiledExecution>>,
+        slot: Option<&parking_lot::RwLock<CompiledExecution>>,
         stmt: &SelectStatement,
         with: &WithClause,
         ctx: &ExecutionContext,
     ) -> bool {
         let epoch = self.engine.schema_epoch();
         let held = slot
-            .and_then(|slot| slot.read().ok())
+            .map(|slot| slot.read())
             .and_then(|guard| match &*guard {
                 CompiledExecution::PreparedJoin(held)
                     if held.validity.holds(&*self.engine, epoch) && held.cte_scope.holds(ctx) =>
@@ -4037,7 +4034,7 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
-        compiled: Option<&std::sync::RwLock<CompiledExecution>>,
+        compiled: Option<&parking_lot::RwLock<CompiledExecution>>,
         (left_window, apart): (Option<(LeftWindow, bool)>, bool),
         reduction: &std::cell::Cell<Option<ReductionPass>>,
     ) -> SelectResult {
@@ -4083,7 +4080,7 @@ impl Executor {
         let snapshot_ctx;
         let ctx = if blocks_where
             && ctx.statement_snapshot().is_none()
-            && self.active_transaction.lock().is_ok_and(|tx| tx.is_none())
+            && self.active_transaction.lock().is_none()
         {
             let snapshot =
                 self.new_statement_snapshot(self.isolation_level(), ctx.statement_view())?;
@@ -4705,7 +4702,7 @@ impl Executor {
                 // An explicit transaction reads through its own transaction, whose
                 // isolation may let a commit move rows between two fetches, so
                 // the outer side is fetched whole there
-                let in_explicit_transaction = self.active_transaction.lock().unwrap().is_some();
+                let in_explicit_transaction = self.active_transaction.lock().is_some();
                 let mut outer_limit = if in_explicit_transaction {
                     None
                 } else {
@@ -6329,7 +6326,7 @@ impl Executor {
         join: &JoinTableSource,
         ctx: &ExecutionContext,
         filter: Option<&Expression>,
-        compiled: Option<&std::sync::RwLock<CompiledExecution>>,
+        compiled: Option<&parking_lot::RwLock<CompiledExecution>>,
         apart: bool,
     ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
         let select_all = Self::joined_side_statement(join, filter);
@@ -6829,7 +6826,7 @@ impl Executor {
         view: Option<&crate::storage::mvcc::registry::StatementView>,
         table_use: TableUse,
     ) -> Result<Box<dyn crate::storage::traits::Table>> {
-        if let Some(active) = self.active_transaction.lock().unwrap().as_ref() {
+        if let Some(active) = self.active_transaction.lock().as_ref() {
             return active.transaction.get_read_table_at(name, view, table_use);
         }
         snapshot.statement_table_at(name, view)
@@ -7515,7 +7512,7 @@ impl Executor {
                 }
             }
         }
-        let in_explicit_transaction = self.active_transaction.lock().unwrap().is_some();
+        let in_explicit_transaction = self.active_transaction.lock().is_some();
         let mut outer_limit = if in_explicit_transaction {
             None
         } else {
@@ -9115,7 +9112,7 @@ impl Executor {
     ) -> Result<Box<dyn QueryResult>> {
         use super::ActiveTransaction;
 
-        let mut active_tx = self.active_transaction.lock().unwrap();
+        let mut active_tx = self.active_transaction.lock();
 
         // If there's already an active transaction, treat as no-op
         if active_tx.is_some() {
@@ -9146,7 +9143,7 @@ impl Executor {
         _stmt: &CommitStatement,
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        let mut active_tx = self.active_transaction.lock().unwrap();
+        let mut active_tx = self.active_transaction.lock();
 
         if let Some(mut tx_state) = active_tx.take() {
             // Commit the transaction - it will commit all tables via commit_all_tables()
@@ -9164,7 +9161,7 @@ impl Executor {
         stmt: &RollbackStatement,
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        let mut active_tx = self.active_transaction.lock().unwrap();
+        let mut active_tx = self.active_transaction.lock();
 
         // Check if this is a ROLLBACK TO SAVEPOINT
         if let Some(ref savepoint_name) = stmt.savepoint_name {
@@ -9189,11 +9186,7 @@ impl Executor {
     /// Rolls back and ends the open transaction, its tables first; a no-op
     /// when none is open
     pub(crate) fn rollback_active(&self) -> Result<()> {
-        let taken = self
-            .active_transaction
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
+        let taken = self.active_transaction.lock().take();
         if let Some(mut tx_state) = taken {
             for (_name, mut table) in tx_state.tables.drain() {
                 table.rollback();
@@ -9227,7 +9220,7 @@ impl Executor {
                 let isolation = Self::parse_isolation_level(&level_str)?;
 
                 // If there's an active transaction, set on the transaction
-                let mut active_tx = self.active_transaction.lock().unwrap();
+                let mut active_tx = self.active_transaction.lock();
                 if let Some(ref mut tx_state) = *active_tx {
                     tx_state.transaction.set_isolation_level(isolation)?;
                 } else {
@@ -9279,7 +9272,7 @@ impl Executor {
                 }
 
                 {
-                    let active_tx = self.active_transaction.lock().unwrap();
+                    let active_tx = self.active_transaction.lock();
                     if active_tx.is_some() {
                         return Err(Error::internal(
                             "PRAGMA SNAPSHOT cannot run inside a transaction. \
@@ -9306,7 +9299,7 @@ impl Executor {
                 }
 
                 {
-                    let active_tx = self.active_transaction.lock().unwrap();
+                    let active_tx = self.active_transaction.lock();
                     if active_tx.is_some() {
                         return Err(Error::internal(
                             "PRAGMA CHECKPOINT cannot run inside a transaction. \
@@ -9329,7 +9322,7 @@ impl Executor {
                 // PRAGMA RESTORE: Restore database from latest backup snapshot.
                 // PRAGMA RESTORE = 'YYYYMMDD-HHMMSS.fff': Restore from specific snapshot.
                 {
-                    let active_tx = self.active_transaction.lock().unwrap();
+                    let active_tx = self.active_transaction.lock();
                     if active_tx.is_some() {
                         return Err(Error::internal(
                             "PRAGMA RESTORE cannot run inside a transaction. \
@@ -9962,7 +9955,7 @@ impl Executor {
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
         // VACUUM must not run inside an explicit transaction
-        let active_tx = self.active_transaction.lock().unwrap();
+        let active_tx = self.active_transaction.lock();
         if active_tx.is_some() {
             return Err(Error::internal(
                 "VACUUM cannot be executed within an active transaction",
@@ -10016,7 +10009,7 @@ impl Executor {
         stmt: &SavepointStatement,
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        let mut active_tx = self.active_transaction.lock().unwrap();
+        let mut active_tx = self.active_transaction.lock();
 
         if let Some(ref mut tx_state) = *active_tx {
             // Create savepoint in the transaction
@@ -10038,7 +10031,7 @@ impl Executor {
         stmt: &ReleaseSavepointStatement,
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        let mut active_tx = self.active_transaction.lock().unwrap();
+        let mut active_tx = self.active_transaction.lock();
 
         if let Some(ref mut tx_state) = *active_tx {
             tx_state
@@ -10085,10 +10078,7 @@ impl Executor {
             })?
             .column_names_owned()
             .to_vec();
-        let active = self
-            .active_transaction
-            .lock()
-            .map_err(|_| Error::internal("active transaction lock poisoned"))?;
+        let active = self.active_transaction.lock();
         let deadline = ctx.deadline_of_call();
         let rows = match (active.as_ref(), ctx.statement_snapshot()) {
             (Some(tx), _) => tx.transaction.rows_at(name, &point, deadline)?,

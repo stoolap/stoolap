@@ -37,7 +37,8 @@
 //! ```
 
 use crate::common::time_compat::Instant;
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 use crate::api::params::ParamVec;
 use crate::common::{CompactArc, SmartString};
@@ -589,7 +590,7 @@ impl QueryCache {
     /// the values of its shared literals
     pub(crate) fn lookup(&self, query: &str) -> Option<CachedText> {
         // Only use read lock - skip stats update for performance
-        let plans = self.plans.read().ok()?;
+        let plans = self.plans.read();
         let plan = match plans.get(normalize_query(query))? {
             TextPlan::Own(plan) => plan,
             TextPlan::Shared(plan, values, _) => {
@@ -618,7 +619,8 @@ impl QueryCache {
         // Create the compiled state upfront - shared between stored plan and returned ref
         let plan = CachedPlanRef::new(statement, params);
 
-        if let Ok(mut plans) = self.plans.write() {
+        {
+            let mut plans = self.plans.write();
             // Check if we need to prune the cache
             if plans.len() >= self.max_size {
                 self.prune_cache(&mut plans);
@@ -677,7 +679,8 @@ impl QueryCache {
         values: &SharedValues,
     ) {
         let key = SmartString::new(normalize_query(query));
-        if let Ok(mut plans) = self.plans.write() {
+        {
+            let mut plans = self.plans.write();
             if plans.len() >= self.max_size {
                 self.prune_cache(&mut plans);
             }
@@ -688,9 +691,7 @@ impl QueryCache {
 
     /// Clear the cache
     pub fn clear(&self) {
-        if let Ok(mut plans) = self.plans.write() {
-            plans.clear();
-        }
+        self.plans.write().clear();
         let mut statements = self.statements.lock();
         statements.by_address.clear();
         statements.by_structure.clear();
@@ -699,23 +700,13 @@ impl QueryCache {
 
     /// Get the number of plans in the cache
     pub fn size(&self) -> usize {
-        self.plans.read().map(|p| p.len()).unwrap_or(0)
+        self.plans.read().len()
     }
 
     /// Get cache statistics
     #[cfg(test)]
     pub fn stats(&self) -> CacheStats {
-        let plans = match self.plans.read() {
-            Ok(p) => p,
-            Err(_) => {
-                return CacheStats {
-                    size: 0,
-                    max_size: self.max_size,
-                    total_usage: 0,
-                    avg_usage: 0.0,
-                }
-            }
-        };
+        let plans = self.plans.read();
 
         let size = plans.len();
         let total_usage: u64 = plans.values().map(|p| p.age().1).sum();

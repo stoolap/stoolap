@@ -18,10 +18,11 @@
 //!
 
 use crate::common::{CompactArc, I64Map, SmartString, StringMap};
+use parking_lot::{Condvar, Mutex, RwLock};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
 
 use std::path::Path;
 
@@ -159,12 +160,11 @@ impl RecheckKeys {
     ) -> Result<()> {
         self.checks.clear();
         self.values.clear();
-        let poisoned = |_| Error::internal("transaction store lock poisoned");
-        let rows = txn_store.read().map_err(poisoned)?.local_count();
+        let rows = txn_store.read().local_count();
         let columns: usize = unique_indexes.iter().map(|(cols, ..)| cols.len()).sum();
         self.checks.reserve(rows * (1 + unique_indexes.len()));
         self.values.reserve(rows * (1 + columns));
-        let store = txn_store.read().map_err(poisoned)?;
+        let store = txn_store.read();
         #[cfg(feature = "test-failpoints")]
         let _held = crate::test_failpoints::RecheckStoreLock::enter();
         let Some(local) = store.local_versions_ref() else {
@@ -1311,13 +1311,13 @@ fn get_or_create_segment_manager(
 ) -> Arc<crate::storage::volume::manifest::SegmentManager> {
     // Fast path: read lock (common case during WAL replay — manager already exists)
     {
-        let mgrs = segment_managers.read().unwrap();
+        let mgrs = segment_managers.read();
         if let Some(mgr) = mgrs.get(table_name) {
             return Arc::clone(mgr);
         }
     }
     // Slow path: write lock (first access, creates new manager)
-    let mut mgrs = segment_managers.write().unwrap();
+    let mut mgrs = segment_managers.write();
     mgrs.entry(table_name.to_string())
         .or_insert_with(|| {
             let vol_dir = persistence.as_ref().map(|pm| pm.path().join("volumes"));
@@ -1364,11 +1364,7 @@ fn column_change_manager(
             table_name,
         )));
     }
-    Ok(segment_managers
-        .read()
-        .map_err(|_| Error::internal("segment managers lock poisoned"))?
-        .get(table_name)
-        .cloned())
+    Ok(segment_managers.read().get(table_name).cloned())
 }
 
 fn begin_column_change(
@@ -1399,7 +1395,7 @@ fn refresh_schema(
     // LOCK ORDERING: Release version_stores(R) before acquiring schemas(W)
     // to maintain consistent ordering with column DDL (schemas(W) -> version_stores(R))
     let vs_schema = {
-        let stores = version_stores.read().unwrap();
+        let stores = version_stores.read();
         let store = stores
             .get(&table_name_lower)
             .ok_or_else(|| Error::TableNotFound(table_name_lower.to_string()))?;
@@ -1407,7 +1403,7 @@ fn refresh_schema(
     };
 
     // Update the engine's schema cache
-    let mut schemas = schemas.write().unwrap();
+    let mut schemas = schemas.write();
     schemas.insert(table_name_lower.clone(), vs_schema);
     ddl.changed_table(&schemas, &table_name_lower);
     // The epoch moves under the same lock the schema does, so a reader
@@ -1510,7 +1506,7 @@ impl MVCCEngine {
         // Acquire file lock for disk-based databases to prevent concurrent access
         if self.path != "memory://" {
             let lock = FileLock::acquire(&self.path)?;
-            let mut file_lock = self.file_lock.lock().unwrap();
+            let mut file_lock = self.file_lock.lock();
             *file_lock = Some(lock);
         }
 
@@ -1538,7 +1534,7 @@ impl MVCCEngine {
                 // replayed or made from now on orders after the seals and
                 // changes made before the open
                 let persisted = {
-                    let mgrs = self.segment_managers.read().unwrap();
+                    let mgrs = self.segment_managers.read();
                     mgrs.values().map(|mgr| mgr.max_schema_version()).max()
                 };
                 if let Some(persisted) = persisted {
@@ -1609,8 +1605,8 @@ impl MVCCEngine {
                 // default_value populated. Volumes loaded from disk had identity
                 // mappings; after ALTER TABLE ADD COLUMN, the schema differs.
                 {
-                    let schemas = self.schemas.read().unwrap();
-                    let mgrs = self.segment_managers.read().unwrap();
+                    let schemas = self.schemas.read();
+                    let mgrs = self.segment_managers.read();
                     for (table_name, schema) in schemas.iter() {
                         if let Some(mgr) = mgrs.get(table_name.as_str()) {
                             mgr.invalidate_mappings(schema)?;
@@ -1675,7 +1671,7 @@ impl MVCCEngine {
                 {
                     self.loading_from_disk.store(false, Ordering::Release);
                     let has_hot_rows = {
-                        let stores = self.version_stores.read().unwrap();
+                        let stores = self.version_stores.read();
                         stores.values().any(|s| s.committed_row_count() > 0)
                     };
                     if has_hot_rows {
@@ -1705,11 +1701,11 @@ impl MVCCEngine {
     /// - Old transaction metadata (in Snapshot Isolation mode only)
     pub fn start_cleanup(self: &Arc<Self>) {
         // A second start would stop the running thread, which clears seal_worker
-        let mut cleanup_handle = self.cleanup_handle.lock().unwrap();
+        let mut cleanup_handle = self.cleanup_handle.lock();
         if cleanup_handle.is_some() {
             return;
         }
-        let config = self.config.read().unwrap();
+        let config = self.config.read();
         if !config.cleanup.enabled {
             return;
         }
@@ -1748,7 +1744,7 @@ impl MVCCEngine {
             while !stop_flag_clone.load(Ordering::Acquire) {
                 // Read config once per outer iteration (not per 100ms tick)
                 let current_checkpoint_interval = {
-                    let cfg = engine.config.read().unwrap();
+                    let cfg = engine.config.read();
                     if cfg.persistence.checkpoint_interval > 0 {
                         std::time::Duration::from_secs(cfg.persistence.checkpoint_interval as u64)
                     } else {
@@ -1926,7 +1922,6 @@ impl MVCCEngine {
                             {
                                 self.snapshot_timestamps
                                     .write()
-                                    .unwrap()
                                     .insert(table_name.clone(), ts.to_string());
                             }
                         }
@@ -2031,11 +2026,11 @@ impl MVCCEngine {
 
         // Store the schema and version store
         {
-            let mut schemas = self.schemas.write().unwrap();
+            let mut schemas = self.schemas.write();
             schemas.insert(table_name_lower.clone(), CompactArc::new(schema));
         }
         {
-            let mut stores = self.version_stores.write().unwrap();
+            let mut stores = self.version_stores.write();
             stores.insert(table_name_lower, version_store);
         }
 
@@ -2083,11 +2078,11 @@ impl MVCCEngine {
 
             // Store schema and version store
             {
-                let mut schemas = self.schemas.write().unwrap();
+                let mut schemas = self.schemas.write();
                 schemas.insert(table_name_lower.clone(), CompactArc::new(schema));
             }
             {
-                let mut stores = self.version_stores.write().unwrap();
+                let mut stores = self.version_stores.write();
                 stores.insert(table_name_lower.clone(), version_store);
             }
 
@@ -2152,11 +2147,11 @@ impl MVCCEngine {
 
         // Store schema and empty version store
         {
-            let mut schemas = self.schemas.write().unwrap();
+            let mut schemas = self.schemas.write();
             schemas.insert(table_name_lower.clone(), CompactArc::new(schema));
         }
         {
-            let mut stores = self.version_stores.write().unwrap();
+            let mut stores = self.version_stores.write();
             stores.insert(table_name_lower.clone(), version_store);
         }
 
@@ -2330,7 +2325,7 @@ impl MVCCEngine {
                 }
                 // A table the log dropped and nothing named again leaves no files
                 for (name, mgr) in &log.dropped {
-                    if !self.schemas.read().unwrap().contains_key(name) {
+                    if !self.schemas.read().contains_key(name) {
                         if let Err(e) =
                             remove_dropped_table_files(&self.persistence, name, Some(mgr))
                         {
@@ -2361,7 +2356,7 @@ impl MVCCEngine {
 
     /// Populate all indexes across all version stores in a single pass per table
     fn populate_all_indexes(&self) {
-        let stores = self.version_stores.read().unwrap();
+        let stores = self.version_stores.read();
         for store in stores.values() {
             store.populate_all_indexes();
         }
@@ -2378,8 +2373,8 @@ impl MVCCEngine {
     /// added to the HNSW graph. Also skips row_ids that are in the hot buffer
     /// (already indexed by populate_all_indexes).
     fn populate_hnsw_from_segments(&self) -> Result<()> {
-        let stores = self.version_stores.read().unwrap();
-        let mgrs = self.segment_managers.read().unwrap();
+        let stores = self.version_stores.read();
+        let mgrs = self.segment_managers.read();
         let tables: Vec<_> = stores
             .iter()
             .filter_map(|(name, store)| {
@@ -2547,7 +2542,7 @@ impl MVCCEngine {
     /// `default_value` for schema-evolved rows (ALTER TABLE ADD COLUMN). Without this,
     /// old rows would get NULL instead of the configured DEFAULT.
     fn populate_schema_defaults(&self) {
-        let stores = self.version_stores.read().unwrap();
+        let stores = self.version_stores.read();
         for store in stores.values() {
             let mut schema_guard = store.schema_mut();
             let needs_update = schema_guard
@@ -2574,8 +2569,8 @@ impl MVCCEngine {
         drop(stores);
 
         // Sync engine schema cache from version stores
-        let stores = self.version_stores.read().unwrap();
-        let mut schemas = self.schemas.write().unwrap();
+        let stores = self.version_stores.read();
+        let mut schemas = self.schemas.write();
         for (name, store) in stores.iter() {
             schemas.insert(name.clone(), store.schema().clone());
         }
@@ -2619,11 +2614,11 @@ impl MVCCEngine {
                 }
 
                 {
-                    let mut schemas = self.schemas.write().unwrap();
+                    let mut schemas = self.schemas.write();
                     schemas.insert(table_name.clone(), CompactArc::new(schema));
                 }
                 {
-                    let mut stores = self.version_stores.write().unwrap();
+                    let mut stores = self.version_stores.write();
                     stores.insert(table_name, version_store);
                 }
             }
@@ -2634,20 +2629,20 @@ impl MVCCEngine {
                 // Remove schema, strip FK references from child tables, and remove version store.
                 // Must strip FK references before removing schema, same as drop_table_internal.
                 {
-                    let mut schemas = self.schemas.write().unwrap();
+                    let mut schemas = self.schemas.write();
                     schemas.remove(&table_name);
-                    let stores = self.version_stores.read().unwrap();
+                    let stores = self.version_stores.read();
                     strip_fk_references(&mut schemas, &stores, &table_name);
                 }
                 {
-                    let mut stores = self.version_stores.write().unwrap();
+                    let mut stores = self.version_stores.write();
                     if let Some(store) = stores.remove(&table_name) {
                         store.close();
                     }
                 }
                 // The segments are set aside: a later rename to this name
                 // takes them back, else they go once the log is read
-                if let Some(mgr) = self.segment_managers.write().unwrap().remove(&table_name) {
+                if let Some(mgr) = self.segment_managers.write().remove(&table_name) {
                     // A name the open gave moved files leaves them to their own
                     if mgr.table_name().as_str() == table_name {
                         log.dropped.push((table_name, mgr));
@@ -2671,12 +2666,7 @@ impl MVCCEngine {
                         let dir = pm.path().join("snapshots").join(&table_name);
                         if dir.exists() {
                             // Look up the timestamp of the loaded snapshot
-                            let ts = self
-                                .snapshot_timestamps
-                                .read()
-                                .unwrap()
-                                .get(&table_name)
-                                .cloned();
+                            let ts = self.snapshot_timestamps.read().get(&table_name).cloned();
                             if let Some(ts) = ts {
                                 // Try timestamped file first (new format)
                                 let timestamped =
@@ -2805,7 +2795,7 @@ impl MVCCEngine {
                     let new = renamed_to(&entry.data).unwrap_or_default().to_lowercase();
                     if let Some(at) = log.dropped.iter().position(|(name, _)| *name == new) {
                         let (_, mgr) = log.dropped.swap_remove(at);
-                        let mut mgrs = self.segment_managers.write().unwrap();
+                        let mut mgrs = self.segment_managers.write();
                         mgrs.entry(new).or_insert(mgr);
                     }
                 }
@@ -2831,7 +2821,7 @@ impl MVCCEngine {
                 // Deserialize view definition and recreate the view
                 let view_def = ViewDefinition::deserialize(&entry.data).map_err(fail)?;
                 let name_lower = view_def.name.clone();
-                let mut views = self.views.write().unwrap();
+                let mut views = self.views.write();
                 views.insert(name_lower, Arc::new(view_def));
             }
             WALOperationType::DropView => {
@@ -2839,7 +2829,7 @@ impl MVCCEngine {
                 let view_name = String::from_utf8(entry.data.clone())
                     .map_err(|e| fail(Error::internal(e.to_string())))?;
                 let name_lower = view_name.to_lowercase();
-                let mut views = self.views.write().unwrap();
+                let mut views = self.views.write();
                 views.remove(&name_lower);
             }
             WALOperationType::TruncateTable => {
@@ -2850,7 +2840,7 @@ impl MVCCEngine {
                 }
                 // Clear segments (truncate removes everything)
                 {
-                    let mgrs = self.segment_managers.read().unwrap();
+                    let mgrs = self.segment_managers.read();
                     if let Some(mgr) = mgrs.get(&table_name) {
                         mgr.clear();
                     }
@@ -3161,7 +3151,7 @@ impl MVCCEngine {
 
         // Stop the cleanup thread first (before stopping transactions)
         {
-            let mut cleanup_handle = self.cleanup_handle.lock().unwrap();
+            let mut cleanup_handle = self.cleanup_handle.lock();
             if let Some(mut handle) = cleanup_handle.take() {
                 handle.stop();
             }
@@ -3177,7 +3167,7 @@ impl MVCCEngine {
         // Use force_seal=true to bypass thresholds — on close, we want all data
         // in volumes so startup is fast and doesn't depend on WAL replay.
         // Skipped when checkpoint_on_close is false (crash simulation in tests).
-        let checkpoint_on_close = self.config.read().unwrap().persistence.checkpoint_on_close;
+        let checkpoint_on_close = self.config.read().persistence.checkpoint_on_close;
         if checkpoint_on_close {
             if let Some(ref pm) = *self.persistence {
                 if pm.is_enabled() {
@@ -3193,7 +3183,6 @@ impl MVCCEngine {
                         let all_empty = self
                             .version_stores
                             .read()
-                            .unwrap()
                             .values()
                             .all(|s| s.committed_row_count() == 0);
                         if all_empty {
@@ -3230,7 +3219,7 @@ impl MVCCEngine {
         }
 
         // Close all version stores
-        let stores = self.version_stores.read().unwrap();
+        let stores = self.version_stores.read();
         for store in stores.values() {
             store.close();
         }
@@ -3247,7 +3236,7 @@ impl MVCCEngine {
 
         // Release file lock (drops the lock, allowing other processes to access)
         {
-            let mut file_lock = self.file_lock.lock().unwrap();
+            let mut file_lock = self.file_lock.lock();
             *file_lock = None;
         }
 
@@ -3264,7 +3253,7 @@ impl MVCCEngine {
     /// the first read
     pub fn verify_volumes(&self) -> Vec<(String, u64, crate::storage::volume::io::VolumeCheck)> {
         let targets: Vec<(String, Vec<_>)> = {
-            let mgrs = self.segment_managers.read().unwrap();
+            let mgrs = self.segment_managers.read();
             let mut tables: Vec<(String, Vec<_>)> = mgrs
                 .iter()
                 .map(|(name, mgr)| (name.clone(), mgr.verify_targets()))
@@ -3286,7 +3275,7 @@ impl MVCCEngine {
     /// Per-table, per-volume statistics for PRAGMA VOLUME_STATS.
     /// Returns (table_name, segment_id, tier, row_count, memory_bytes, idle_cycles, tombstones).
     pub fn volume_stats(&self) -> Vec<(String, u64, &'static str, usize, usize, u64, usize)> {
-        let mgrs = self.segment_managers.read().unwrap();
+        let mgrs = self.segment_managers.read();
         let mut result = Vec::new();
         let mut table_names: Vec<&String> = mgrs.keys().collect();
         table_names.sort();
@@ -3311,12 +3300,12 @@ impl MVCCEngine {
 
     /// Returns a copy of the configuration
     pub fn config(&self) -> Config {
-        self.config.read().unwrap().clone()
+        self.config.read().clone()
     }
 
     /// Updates the engine configuration
     pub fn update_engine_config(&self, config: Config) -> Result<()> {
-        let current = self.config.read().unwrap();
+        let current = self.config.read();
         if config.path != current.path {
             return Err(Error::internal("cannot change database path after opening"));
         }
@@ -3328,7 +3317,7 @@ impl MVCCEngine {
         self.hot_limits
             .max_bytes
             .store(config.persistence.hot_max_bytes, Ordering::Relaxed);
-        *self.config.write().unwrap() = config;
+        *self.config.write() = config;
         Ok(())
     }
 
@@ -3340,7 +3329,7 @@ impl MVCCEngine {
             *volume_bytes.entry(table).or_default() += mem;
         }
         let stores: Vec<(String, Arc<VersionStore>)> = {
-            let stores = self.version_stores.read().unwrap();
+            let stores = self.version_stores.read();
             let mut names: Vec<&String> = stores.keys().collect();
             names.sort();
             names
@@ -3392,7 +3381,7 @@ impl MVCCEngine {
     /// The transactions holding an entry in the store cache
     #[cfg(feature = "test-failpoints")]
     pub fn txn_store_entries(&self) -> usize {
-        self.txn_version_stores.read().unwrap().len()
+        self.txn_version_stores.read().len()
     }
 
     /// Replay an ALTER TABLE operation from WAL
@@ -3882,7 +3871,7 @@ impl MVCCEngine {
 
         // Fast path: check if cache is valid (read lock only)
         {
-            let cache = self.fk_reverse_cache.read().unwrap();
+            let cache = self.fk_reverse_cache.read();
             if cache.0 == current_epoch {
                 return cache
                     .1
@@ -3893,7 +3882,7 @@ impl MVCCEngine {
         }
 
         // Cache miss: rebuild under write lock
-        let mut cache = self.fk_reverse_cache.write().unwrap();
+        let mut cache = self.fk_reverse_cache.write();
         // Double-check after acquiring write lock (another thread may have rebuilt)
         if cache.0 == current_epoch {
             return cache
@@ -3904,7 +3893,7 @@ impl MVCCEngine {
         }
 
         // Rebuild the full reverse mapping
-        let schemas = self.schemas.read().unwrap();
+        let schemas = self.schemas.read();
         let mut map: StringMap<Vec<(String, ForeignKeyConstraint)>> = StringMap::default();
         for schema in schemas.values() {
             for fk in &schema.foreign_keys {
@@ -3954,14 +3943,14 @@ impl MVCCEngine {
         // Atomically check-and-insert under write lock to prevent TOCTOU race
         let return_schema = schema.clone();
         {
-            let mut schemas = self.schemas.write().unwrap();
+            let mut schemas = self.schemas.write();
             if schemas.contains_key(&table_name) {
                 return Err(Error::TableAlreadyExists(table_name.to_string()));
             }
             schemas.insert(table_name.clone(), CompactArc::new(schema));
         }
         {
-            let mut stores = self.version_stores.write().unwrap();
+            let mut stores = self.version_stores.write();
             stores.insert(table_name, version_store);
         }
 
@@ -3975,7 +3964,7 @@ impl MVCCEngine {
 
         // Increment schema epoch for cache invalidation
         self.ddl.changed_table(
-            &self.schemas.read().unwrap(),
+            &self.schemas.read(),
             &return_schema.table_name.to_lowercase(),
         );
 
@@ -4026,7 +4015,7 @@ impl MVCCEngine {
         // This prevents a race where find_referencing_fks reads stale state between
         // schema removal and FK stripping.
         let mut neighbors = {
-            let mut schemas = self.schemas.write().unwrap();
+            let mut schemas = self.schemas.write();
             if !schemas.contains_key(&table_name) {
                 return Err(Error::TableNotFound(table_name.to_string()));
             }
@@ -4035,14 +4024,14 @@ impl MVCCEngine {
 
             // Strip FK constraints from child tables that referenced the dropped table.
             // Done under the same schemas write lock for atomicity.
-            let version_stores = self.version_stores.read().unwrap();
+            let version_stores = self.version_stores.read();
             strip_fk_references(&mut schemas, &version_stores, &table_name);
             neighbors
         };
 
         // Close and remove version store
         {
-            let mut stores = self.version_stores.write().unwrap();
+            let mut stores = self.version_stores.write();
             if let Some(store) = stores.remove(&table_name) {
                 store.close();
             }
@@ -4054,17 +4043,12 @@ impl MVCCEngine {
         self.record_ddl(name, WALOperationType::DropTable, &[])?;
 
         // Clear in-memory segment state
-        let mgr = self
-            .segment_managers
-            .read()
-            .unwrap()
-            .get(&table_name)
-            .cloned();
+        let mgr = self.segment_managers.read().get(&table_name).cloned();
         if let Some(mgr) = &mgr {
             mgr.clear();
             mgr.persist()?;
         }
-        self.segment_managers.write().unwrap().remove(&table_name);
+        self.segment_managers.write().remove(&table_name);
         remove_dropped_table_files(&self.persistence, &table_name, mgr.as_deref())?;
 
         // Increment schema epoch for cache invalidation
@@ -4083,7 +4067,7 @@ impl MVCCEngine {
 
         let table_name = to_lowercase_cow(name);
 
-        let stores = self.version_stores.read().unwrap();
+        let stores = self.version_stores.read();
         stores
             .get(table_name.as_ref())
             .cloned()
@@ -4108,7 +4092,7 @@ impl MVCCEngine {
         Option<Arc<crate::storage::volume::manifest::SegmentManager>>,
     )> {
         let hot = store.committed_row_count();
-        let sealed = self.segment_managers.read().ok()?.get(name).cloned();
+        let sealed = self.segment_managers.read().get(name).cloned();
         Some(match sealed.filter(|mgr| mgr.has_segments()) {
             Some(mgr) => (
                 mgr.total_row_count() + hot.saturating_sub(mgr.seal_overlap()),
@@ -4162,7 +4146,7 @@ impl MVCCEngine {
 
         // Validate under read lock first
         {
-            let schemas = self.schemas.read().unwrap();
+            let schemas = self.schemas.read();
             let schema_arc = schemas
                 .get(&table_name_lower)
                 .ok_or_else(|| Error::TableNotFound(table_name_lower.to_string()))?;
@@ -4181,7 +4165,7 @@ impl MVCCEngine {
         // Update version store schema first (source of truth) — if this fails,
         // engine schema is still consistent
         {
-            let stores = self.version_stores.read().unwrap();
+            let stores = self.version_stores.read();
             if let Some(store) = stores.get(&table_name_lower) {
                 let mut col = crate::core::SchemaColumn::new(
                     store.schema().columns.len(),
@@ -4214,13 +4198,13 @@ impl MVCCEngine {
         // Sync engine schema cache from version store
         {
             let vs_schema = {
-                let stores = self.version_stores.read().unwrap();
+                let stores = self.version_stores.read();
                 stores
                     .get(&table_name_lower)
                     .map(|store| store.schema().clone())
             };
             if let Some(schema) = vs_schema {
-                let mut schemas = self.schemas.write().unwrap();
+                let mut schemas = self.schemas.write();
                 schemas.insert(table_name_lower.clone(), schema);
                 self.ddl.changed_table(&schemas, &table_name_lower);
             }
@@ -4243,7 +4227,7 @@ impl MVCCEngine {
     /// Notes whether a table's column takes the row identity's name, as only
     /// an older build let one, and warns of each: such a table serves DDL alone
     fn note_reserved_names(&self) {
-        for schema in self.schemas.read().unwrap().values() {
+        for schema in self.schemas.read().values() {
             if let Err(e) = schema.check_column_names() {
                 self.ddl.reserved_names.store(true, Ordering::Release);
                 eprintln!("Warning: {e}");
@@ -4272,7 +4256,7 @@ impl MVCCEngine {
 
         // Collect table names under read lock, then process without holding it
         let table_names: Vec<String> = {
-            let mgrs = self.segment_managers.read().unwrap();
+            let mgrs = self.segment_managers.read();
             mgrs.keys().cloned().collect()
         };
 
@@ -4352,7 +4336,7 @@ impl MVCCEngine {
         // propagates its history after, so this publication is wholly
         // before the change, whose propagation then covers it, or wholly
         // after it
-        let schemas = self.schemas.read().unwrap();
+        let schemas = self.schemas.read();
         let schema = schemas.get(&table_name.to_lowercase()).map(|s| &**s);
         mgr.register_segment_with_owner(
             seg_id,
@@ -4430,7 +4414,7 @@ impl MVCCEngine {
                     // Store the segment manager so WAL replay can use
                     // is_row_id_in_volume_range() for tombstone creation.
                     let mgr = Arc::new(mgr);
-                    let mut mgrs = self.segment_managers.write().unwrap();
+                    let mut mgrs = self.segment_managers.write();
                     if written.as_str() != table_name {
                         // A directory of that name keeps its own manager
                         mgrs.entry(written.to_string())
@@ -4500,7 +4484,7 @@ impl MVCCEngine {
             let table_name = entry.file_name().to_string_lossy().to_lowercase();
 
             {
-                let schemas = self.schemas.read().unwrap();
+                let schemas = self.schemas.read();
                 if !schemas.contains_key(&table_name) {
                     continue;
                 }
@@ -4664,7 +4648,7 @@ impl MVCCEngine {
     /// loaded volume has its rows nowhere else, so its table refuses every
     /// statement; `unreadable` names the files that did not read
     fn mark_unloaded_tables(&self, unreadable: &[(String, String)]) {
-        let mgrs: Vec<_> = (self.segment_managers.read().unwrap().iter())
+        let mgrs: Vec<_> = (self.segment_managers.read().iter())
             .map(|(table, mgr)| (table.clone(), Arc::clone(mgr)))
             .collect();
         for (table, mgr) in mgrs {
@@ -4684,7 +4668,7 @@ impl MVCCEngine {
                 reason.push_str(detail);
             }
             mgr.mark_unavailable(reason);
-            if let Some(store) = self.version_stores.read().unwrap().get(&table) {
+            if let Some(store) = self.version_stores.read().get(&table) {
                 store.mark_cold_unavailable();
             }
         }
@@ -4698,10 +4682,7 @@ impl MVCCEngine {
     /// HNSW is the one cold index that needs explicit graph rebuild.
     /// The largest sequence the volumes and tombstones loaded from disk carry
     fn persisted_sequence_floor(&self) -> i64 {
-        let mgrs = self
-            .segment_managers
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
+        let mgrs = self.segment_managers.read();
         let mut floor = 0u64;
         for mgr in mgrs.values() {
             for seg in &mgr.manifest().segments {
@@ -4716,7 +4697,7 @@ impl MVCCEngine {
 
     fn sync_auto_increment_from_segments(&self) -> Result<()> {
         let mut segment_data: Vec<_> = {
-            let mgrs = self.segment_managers.read().unwrap();
+            let mgrs = self.segment_managers.read();
             if mgrs.is_empty() {
                 return Ok(());
             }
@@ -4729,7 +4710,7 @@ impl MVCCEngine {
             *max_vol_row_id = max_volume_row_id(mgr)?;
         }
 
-        let stores = self.version_stores.read().unwrap();
+        let stores = self.version_stores.read();
         for (table_name, _, max_vol_row_id) in &segment_data {
             if *max_vol_row_id > 0 {
                 if let Some(store) = stores.get(table_name) {
@@ -4766,7 +4747,7 @@ impl MVCCEngine {
 
         // Validate under read lock first
         {
-            let schemas = self.schemas.read().unwrap();
+            let schemas = self.schemas.read();
             let schema_arc = schemas
                 .get(&table_name_lower)
                 .ok_or_else(|| Error::TableNotFound(table_name_lower.to_string()))?;
@@ -4856,7 +4837,7 @@ impl MVCCEngine {
 
         // Validate under read lock first
         {
-            let schemas = self.schemas.read().unwrap();
+            let schemas = self.schemas.read();
             let schema_arc = schemas
                 .get(&table_name_lower)
                 .ok_or_else(|| Error::TableNotFound(table_name_lower.to_string()))?;
@@ -4877,7 +4858,7 @@ impl MVCCEngine {
 
         // Update version store schema first (source of truth)
         {
-            let stores = self.version_stores.read().unwrap();
+            let stores = self.version_stores.read();
             if let Some(store) = stores.get(&table_name_lower) {
                 {
                     let mut vs_schema_guard = store.schema_mut();
@@ -4892,13 +4873,13 @@ impl MVCCEngine {
         // Sync engine schema cache from version store
         {
             let vs_schema = {
-                let stores = self.version_stores.read().unwrap();
+                let stores = self.version_stores.read();
                 stores
                     .get(&table_name_lower)
                     .map(|store| store.schema().clone())
             };
             if let Some(schema) = vs_schema {
-                let mut schemas = self.schemas.write().unwrap();
+                let mut schemas = self.schemas.write();
                 schemas.insert(table_name_lower.clone(), schema);
                 self.ddl.changed_table(&schemas, &table_name_lower);
             }
@@ -4908,8 +4889,8 @@ impl MVCCEngine {
         // is recorded under it, as the SQL path does
         // Propagate rename to cold volumes (persists in manifest) and recompute mappings
         {
-            let schema = self.schemas.read().unwrap().get(&table_name_lower).cloned();
-            if let Some(mgr) = self.segment_managers.read().unwrap().get(&table_name_lower) {
+            let schema = self.schemas.read().get(&table_name_lower).cloned();
+            if let Some(mgr) = self.segment_managers.read().get(&table_name_lower) {
                 let held_already = replayed_lsn.is_some_and(|lsn| lsn <= mgr.ddl_recorded_lsn());
                 if !held_already {
                     mgr.record_column_rename(
@@ -4958,11 +4939,7 @@ impl MVCCEngine {
     /// volume's next compaction builds it anew
     pub(crate) fn discard_uncovered_side_files(&self, table_name: &str) {
         let name = to_lowercase_cow(table_name);
-        let mgr = self
-            .segment_managers
-            .read()
-            .ok()
-            .and_then(|mgrs| mgrs.get(name.as_ref()).cloned());
+        let mgr = self.segment_managers.read().get(name.as_ref()).cloned();
         let Some(mgr) = mgr else {
             return;
         };
@@ -4992,10 +4969,7 @@ impl MVCCEngine {
     /// DROP leaves may be a later CREATE's, and a column dropped before
     /// the checkpoint moves the indexed column's schema position
     fn discard_uncovered_side_files_everywhere(&self) {
-        let tables: Vec<String> = match self.segment_managers.read() {
-            Ok(mgrs) => mgrs.keys().cloned().collect(),
-            Err(_) => return,
-        };
+        let tables: Vec<String> = self.segment_managers.read().keys().cloned().collect();
         for table in tables {
             self.discard_uncovered_side_files(&table);
         }
@@ -5019,13 +4993,7 @@ impl MVCCEngine {
     ) -> Result<()> {
         check_stored_schema(schema)?;
         let name = to_lowercase_cow(table_name);
-        let Some(mgr) = self
-            .segment_managers
-            .read()
-            .map_err(|_| Error::internal("segment managers lock poisoned"))?
-            .get(name.as_ref())
-            .cloned()
-        else {
+        let Some(mgr) = self.segment_managers.read().get(name.as_ref()).cloned() else {
             return Ok(());
         };
         // Above every version a volume or the history holds
@@ -5044,9 +5012,9 @@ impl MVCCEngine {
             return Ok(());
         }
         let name = to_lowercase_cow(table_name);
-        let schema = self.schemas.read().unwrap().get(name.as_ref()).cloned();
+        let schema = self.schemas.read().get(name.as_ref()).cloned();
         if let Some(schema) = schema {
-            if let Some(mgr) = self.segment_managers.read().unwrap().get(name.as_ref()) {
+            if let Some(mgr) = self.segment_managers.read().get(name.as_ref()) {
                 mgr.invalidate_mappings(&schema)?;
             }
         }
@@ -5070,8 +5038,8 @@ impl MVCCEngine {
             new.to_lowercase(),
         );
         let changed = {
-            let mut schemas = self.schemas.write().unwrap();
-            let stores = self.version_stores.read().unwrap();
+            let mut schemas = self.schemas.write();
+            let stores = self.version_stores.read();
             retarget_fks(
                 &mut schemas,
                 &stores,
@@ -5120,12 +5088,7 @@ impl MVCCEngine {
                 table: name.to_string(),
             });
         }
-        let mgr = self
-            .segment_managers
-            .read()
-            .map_err(|_| Error::internal("segment managers lock poisoned"))?
-            .get(name.as_ref())
-            .cloned();
+        let mgr = self.segment_managers.read().get(name.as_ref()).cloned();
         let Some(mgr) = mgr else {
             return Ok(store.committed_row_count() > 0);
         };
@@ -5192,7 +5155,6 @@ impl MVCCEngine {
         let mgr = self
             .segment_managers
             .read()
-            .map_err(|_| Error::internal("segment managers lock poisoned"))?
             .get(to_lowercase_cow(table_name).as_ref())
             .cloned();
         let cold = match mgr {
@@ -5223,7 +5185,7 @@ impl MVCCEngine {
 
         // The version store schema is the source of truth; it validates the key
         {
-            let stores = self.version_stores.read().unwrap();
+            let stores = self.version_stores.read();
             let store = stores
                 .get(&table_name_lower)
                 .ok_or_else(|| Error::TableNotFound(table_name_lower.to_string()))?;
@@ -5234,13 +5196,13 @@ impl MVCCEngine {
         // Sync engine schema cache from version store
         {
             let vs_schema = {
-                let stores = self.version_stores.read().unwrap();
+                let stores = self.version_stores.read();
                 stores
                     .get(&table_name_lower)
                     .map(|store| store.schema().clone())
             };
             if let Some(schema) = vs_schema {
-                let mut schemas = self.schemas.write().unwrap();
+                let mut schemas = self.schemas.write();
                 schemas.insert(table_name_lower.clone(), schema);
                 self.ddl.changed_table(&schemas, &table_name_lower);
             }
@@ -5248,7 +5210,7 @@ impl MVCCEngine {
 
         // The volumes already sealed are checked against the new key by
         // the next compaction, which rewrites the ones out of order
-        if let Some(mgr) = self.segment_managers.read().unwrap().get(&table_name_lower) {
+        if let Some(mgr) = self.segment_managers.read().get(&table_name_lower) {
             mgr.request_recluster();
         }
 
@@ -5265,9 +5227,9 @@ impl MVCCEngine {
         ddl_lsn: Option<u64>,
     ) -> Result<()> {
         let table_name_lower = table_name.to_lowercase();
-        let schema = self.schemas.read().unwrap().get(&table_name_lower).cloned();
+        let schema = self.schemas.read().get(&table_name_lower).cloned();
         let current_epoch = self.ddl.schema_epoch.load(Ordering::Acquire);
-        if let Some(mgr) = self.segment_managers.read().unwrap().get(&table_name_lower) {
+        if let Some(mgr) = self.segment_managers.read().get(&table_name_lower) {
             let held_already = ddl_lsn.is_some_and(|lsn| lsn <= mgr.ddl_recorded_lsn());
             if !held_already {
                 mgr.record_column_drop(col_name, current_epoch, ddl_lsn);
@@ -5299,8 +5261,8 @@ impl MVCCEngine {
     ) -> Result<()> {
         let ddl_lsn = self.recorded_ddl_lsn();
         let table_name_lower = table_name.to_lowercase();
-        let schema = self.schemas.read().unwrap().get(&table_name_lower).cloned();
-        if let Some(mgr) = self.segment_managers.read().unwrap().get(&table_name_lower) {
+        let schema = self.schemas.read().get(&table_name_lower).cloned();
+        if let Some(mgr) = self.segment_managers.read().get(&table_name_lower) {
             let held_already = ddl_lsn.is_some_and(|lsn| lsn <= mgr.ddl_recorded_lsn());
             if !held_already {
                 mgr.record_column_rename(
@@ -5470,7 +5432,7 @@ impl MVCCEngine {
         // Check if a table with the same name exists (acquire schemas before views
         // to maintain consistent lock ordering and prevent deadlock)
         {
-            let schemas = self.schemas.read().unwrap();
+            let schemas = self.schemas.read();
             if schemas.contains_key(&name_lower) {
                 return Err(Error::internal(format!(
                     "cannot create view '{}': a table with the same name exists",
@@ -5479,7 +5441,7 @@ impl MVCCEngine {
             }
         }
 
-        let mut views = self.views.write().unwrap();
+        let mut views = self.views.write();
 
         // Check if view already exists
         if views.contains_key(&name_lower) {
@@ -5523,7 +5485,7 @@ impl MVCCEngine {
         }
 
         let name_lower = name.to_lowercase();
-        let mut views = self.views.write().unwrap();
+        let mut views = self.views.write();
 
         if views.remove(&name_lower).is_none() {
             if if_exists {
@@ -5555,7 +5517,7 @@ impl MVCCEngine {
             return Err(Error::EngineNotOpen);
         }
 
-        let views = self.views.read().unwrap();
+        let views = self.views.read();
         Ok(views.contains_key(name_lower))
     }
 
@@ -5573,7 +5535,7 @@ impl MVCCEngine {
             return Err(Error::EngineNotOpen);
         }
 
-        let views = self.views.read().unwrap();
+        let views = self.views.read();
         Ok(views.get(name_lower).cloned()) // Arc::clone is cheap
     }
 
@@ -5583,7 +5545,7 @@ impl MVCCEngine {
             return Err(Error::EngineNotOpen);
         }
 
-        let views = self.views.read().unwrap();
+        let views = self.views.read();
         Ok(views.values().map(|v| v.original_name.clone()).collect())
     }
 
@@ -5605,7 +5567,7 @@ impl MVCCEngine {
 
         // A table missing a listed volume has no whole copy to back up, and a
         // published partial one would retire the last good backup
-        for mgr in self.segment_managers.read().unwrap().values() {
+        for mgr in self.segment_managers.read().values() {
             mgr.check_available()?;
         }
 
@@ -5635,7 +5597,7 @@ impl MVCCEngine {
         // This prevents concurrent seal from mutating cold state
         // (volumes, tombstones) while we read it, ensuring the backup is
         // a true point-in-time snapshot consistent with snapshot_commit_seq.
-        let _checkpoint_guard = self.checkpoint_mutex.lock().unwrap();
+        let _checkpoint_guard = self.checkpoint_mutex.lock();
         // No column, index or view change starts until ddl.bin is written
         let _ddl = self.ddl_guard();
 
@@ -5675,7 +5637,7 @@ impl MVCCEngine {
         // read can only ADD to the cutoff (making it higher), never subtract.
         // Its tombstones won't be in our frozen set (captured before it started).
         let frozen_tombstones: ahash::AHashMap<String, Arc<FxHashMap<i64, u64>>> = {
-            let mgrs = self.segment_managers.read().unwrap();
+            let mgrs = self.segment_managers.read();
             mgrs.iter()
                 .map(|(name, mgr)| (name.clone(), mgr.tombstone_set_arc()))
                 .collect()
@@ -5683,8 +5645,8 @@ impl MVCCEngine {
 
         let snapshot_commit_seq = self.registry.current_commit_sequence();
 
-        let schemas = self.schemas.read().unwrap();
-        let stores = self.version_stores.read().unwrap();
+        let schemas = self.schemas.read();
+        let stores = self.version_stores.read();
 
         // Generate consistent timestamp for all snapshots in this batch
         let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S%.3f").to_string();
@@ -5727,7 +5689,6 @@ impl MVCCEngine {
             let generation = self
                 .segment_managers
                 .read()
-                .unwrap()
                 .get(table_name)
                 .map(|mgr| mgr.schema_generation());
             if let Err(e) = writer.write_schema(schema) {
@@ -5776,7 +5737,7 @@ impl MVCCEngine {
 
             // Write cold volume rows (skip rows already written from hot buffer)
             let mgr = {
-                let mgrs = self.segment_managers.read().unwrap();
+                let mgrs = self.segment_managers.read();
                 mgrs.get(table_name).cloned()
             };
 
@@ -5889,7 +5850,6 @@ impl MVCCEngine {
             }) || generation.is_some_and(|generation| {
                 self.segment_managers
                     .read()
-                    .unwrap()
                     .get(table_name)
                     .is_some_and(|mgr| mgr.check_schema_generation(generation).is_err())
             });
@@ -6016,7 +5976,7 @@ impl MVCCEngine {
 
             // Collect views
             let view_entries: Vec<Vec<u8>> = {
-                let views = self.views.read().unwrap();
+                let views = self.views.read();
                 views.values().map(|v| v.serialize()).collect()
             };
             ddl_buf.extend_from_slice(&(view_entries.len() as u32).to_le_bytes());
@@ -6085,13 +6045,7 @@ impl MVCCEngine {
         }
 
         // Phase 5: Cleanup old snapshots (read from live config, not immutable PM)
-        let keep_snapshots = self
-            .config
-            .read()
-            .unwrap()
-            .persistence
-            .keep_snapshots
-            .max(1) as usize;
+        let keep_snapshots = self.config.read().persistence.keep_snapshots.max(1) as usize;
         for (_, _, table_name) in &pending_snapshots {
             if schemas.contains_key(table_name) {
                 let disk_store = super::snapshot::DiskVersionStore::new(&snapshot_dir, table_name);
@@ -6193,7 +6147,7 @@ impl MVCCEngine {
         let index_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
 
-        let stores = self.version_stores.read().unwrap();
+        let stores = self.version_stores.read();
         for _ in 0..index_count {
             if pos + 4 > data.len() {
                 break;
@@ -6251,7 +6205,6 @@ impl MVCCEngine {
             };
             self.views
                 .write()
-                .unwrap()
                 .insert(view_def.name.clone(), Arc::new(view_def));
         }
     }
@@ -6293,7 +6246,7 @@ impl MVCCEngine {
         let _compaction_guard = AtomicBoolGuard(&self.compaction_running);
 
         // Acquire checkpoint_mutex to prevent concurrent seal/compact/snapshot
-        let _checkpoint_guard = self.checkpoint_mutex.lock().unwrap();
+        let _checkpoint_guard = self.checkpoint_mutex.lock();
 
         // Stop accepting new transactions and wait for active ones to drain
         self.registry.stop_accepting_transactions();
@@ -6483,7 +6436,7 @@ impl MVCCEngine {
         {
             Vec::new() // Will use DDL file instead
         } else {
-            let stores = self.version_stores.read().unwrap();
+            let stores = self.version_stores.read();
             let mut indexes = Vec::new();
             for (table_name, store) in stores.iter() {
                 let _ = store.for_each_index(|index, identity| {
@@ -6517,7 +6470,7 @@ impl MVCCEngine {
         let saved_views: Vec<Arc<ViewDefinition>> = if ddl_data.is_some() {
             Vec::new()
         } else {
-            let views = self.views.read().unwrap();
+            let views = self.views.read();
             views.values().cloned().collect()
         };
 
@@ -6525,7 +6478,7 @@ impl MVCCEngine {
 
         // Close all version stores
         {
-            let stores = self.version_stores.read().unwrap();
+            let stores = self.version_stores.read();
             for store in stores.values() {
                 store.close();
             }
@@ -6533,7 +6486,7 @@ impl MVCCEngine {
 
         // Clear segment managers and delete volume files on disk
         {
-            let mut mgrs = self.segment_managers.write().unwrap();
+            let mut mgrs = self.segment_managers.write();
             for mgr in mgrs.values() {
                 mgr.clear();
             }
@@ -6561,13 +6514,13 @@ impl MVCCEngine {
         }
 
         // Clear all in-memory state
-        self.schemas.write().unwrap().clear();
-        self.version_stores.write().unwrap().clear();
-        self.views.write().unwrap().clear();
-        self.txn_version_stores.write().unwrap().clear();
-        self.snapshot_timestamps.write().unwrap().clear();
+        self.schemas.write().clear();
+        self.version_stores.write().clear();
+        self.views.write().clear();
+        self.txn_version_stores.write().clear();
+        self.snapshot_timestamps.write().clear();
         {
-            let mut fk_cache = self.fk_reverse_cache.write().unwrap();
+            let mut fk_cache = self.fk_reverse_cache.write();
             *fk_cache = (u64::MAX, crate::common::StringMap::default());
         }
 
@@ -6597,16 +6550,12 @@ impl MVCCEngine {
             match load_result {
                 Ok(_source_lsn) => {
                     total_tables += 1;
-                    if let Ok(stores) = self.version_stores.read() {
-                        if let Some(store) = stores.get(table_name.as_str()) {
-                            total_rows += store.committed_row_count() as u64;
-                        }
+                    if let Some(store) = self.version_stores.read().get(table_name.as_str()) {
+                        total_rows += store.committed_row_count() as u64;
                     }
                     // Also count rows in segment managers (loaded as volume)
-                    if let Ok(mgrs) = self.segment_managers.read() {
-                        if let Some(mgr) = mgrs.get(table_name.as_str()) {
-                            total_rows += mgr.total_row_count() as u64;
-                        }
+                    if let Some(mgr) = self.segment_managers.read().get(table_name.as_str()) {
+                        total_rows += mgr.total_row_count() as u64;
                     }
                 }
                 Err(e) => {
@@ -6640,7 +6589,7 @@ impl MVCCEngine {
             self.restore_ddl_from_bin(data);
         } else {
             // Fallback: recreate indexes from in-memory saved state
-            let stores = self.version_stores.read().unwrap();
+            let stores = self.version_stores.read();
             for (table_name, index_meta) in &saved_indexes {
                 if let Some(store) = stores.get(table_name.as_str()) {
                     match store.create_index_from_metadata_with_graph(index_meta, false, None) {
@@ -6660,10 +6609,7 @@ impl MVCCEngine {
 
             // Fallback: recreate views from in-memory saved state
             for view_def in saved_views {
-                self.views
-                    .write()
-                    .unwrap()
-                    .insert(view_def.name.clone(), view_def);
+                self.views.write().insert(view_def.name.clone(), view_def);
             }
         }
 
@@ -6739,7 +6685,7 @@ impl MVCCEngine {
 
         // Serialize the entire cycle: prevent concurrent seal+compact from
         // the background thread and explicit PRAGMA CHECKPOINT.
-        let _checkpoint_guard = self.checkpoint_mutex.lock().unwrap();
+        let _checkpoint_guard = self.checkpoint_mutex.lock();
 
         // Step 1: Seal hot rows into frozen volumes (the actual checkpoint).
         // Sealed rows are written to .vol files and removed from the hot buffer.
@@ -6756,7 +6702,7 @@ impl MVCCEngine {
         // and may leave small tables (metrics, logs, etc.) unsealed. Without
         // draining them, all_hot_empty is never true and WAL never truncates.
         let all_hot_empty = {
-            let stores = self.version_stores.read().unwrap();
+            let stores = self.version_stores.read();
             stores
                 .values()
                 .all(|store| store.committed_row_count() == 0)
@@ -6772,7 +6718,7 @@ impl MVCCEngine {
         {
             // Under the mutex, so a writer between its check and its wait
             // cannot miss this wakeup
-            let _admission = self.hot_limits.admission.0.lock().unwrap();
+            let _admission = self.hot_limits.admission.0.lock();
             self.hot_limits.admission.1.notify_all();
         }
         seal_result?;
@@ -6825,7 +6771,7 @@ impl MVCCEngine {
             // Collect Arc clones under the read lock, then drop the lock
             // before doing file I/O to avoid blocking writers.
             let mgr_arcs: Vec<_> = {
-                let mgrs = self.segment_managers.read().unwrap();
+                let mgrs = self.segment_managers.read();
                 mgrs.values().cloned().collect()
             };
             #[cfg(feature = "test-failpoints")]
@@ -6882,7 +6828,6 @@ impl MVCCEngine {
         let tables: Vec<String> = self
             .segment_managers
             .read()
-            .map_err(|_| Error::internal("segment managers lock poisoned"))?
             .iter()
             .filter(|(_, mgr)| !mgr.is_unavailable())
             .map(|(table, _)| table.clone())
@@ -6909,7 +6854,7 @@ impl MVCCEngine {
     /// column type change is left without its manifest
     fn may_cut(&self) -> bool {
         let sealed = {
-            let stores = self.version_stores.read().unwrap();
+            let stores = self.version_stores.read();
             stores
                 .values()
                 .all(|store| store.committed_row_count() == 0 && !store.is_cold_unavailable())
@@ -6922,8 +6867,8 @@ impl MVCCEngine {
     fn has_incomplete_change(&self) -> bool {
         self.segment_managers
             .read()
-            .map(|mgrs| mgrs.values().any(|mgr| mgr.has_incomplete_change()))
-            .unwrap_or(true)
+            .values()
+            .any(|mgr| mgr.has_incomplete_change())
     }
 
     /// Run compaction synchronously under the compaction_running flag.
@@ -6962,8 +6907,8 @@ impl MVCCEngine {
         }
         let _guard = AtomicBoolGuard(&self.backfill_running);
         let mut tables: Vec<_> = {
-            let stores = self.version_stores.read().unwrap();
-            let mgrs = self.segment_managers.read().unwrap();
+            let stores = self.version_stores.read();
+            let mgrs = self.segment_managers.read();
             stores
                 .iter()
                 .filter_map(|(name, store)| {
@@ -7041,7 +6986,7 @@ impl MVCCEngine {
             );
             identities_of.push((identities, definition));
         }
-        let mut deferred = self.backfill_deferred.lock().unwrap();
+        let mut deferred = self.backfill_deferred.lock();
         let candidates: FxHashSet<(&str, u64)> = work
             .iter()
             .map(|&(index, id, _)| (tables[index].0.as_str(), id))
@@ -7075,7 +7020,7 @@ impl MVCCEngine {
             }
             report.examined += 1;
             // Waits behind the rest until it is built and leaves the candidates
-            let mut deferred = self.backfill_deferred.lock().unwrap();
+            let mut deferred = self.backfill_deferred.lock();
             deferred.retain(|(table, segment)| !(*segment == seg_id && table == name));
             deferred.push((name.clone(), seg_id));
             drop(deferred);
@@ -7196,7 +7141,7 @@ impl MVCCEngine {
             match mgr.attach_side(seg_id, side) {
                 Some(before) => {
                     report.built += 1;
-                    let mut deferred = self.backfill_deferred.lock().unwrap();
+                    let mut deferred = self.backfill_deferred.lock();
                     deferred.retain(|(table, segment)| !(*segment == seg_id && table == name));
                     drop(deferred);
                     if let Some(before) = before {
@@ -7263,7 +7208,6 @@ impl MVCCEngine {
         let mgr = self
             .segment_managers
             .read()
-            .unwrap()
             .get(&table.to_lowercase())
             .cloned();
         let Some(mgr) = mgr else {
@@ -7289,7 +7233,7 @@ impl MVCCEngine {
         // Publish to global so scanners stamp volumes with the correct epoch.
         // Use fetch_max so multiple engines only move the global forward.
         crate::storage::volume::writer::GLOBAL_EVICTION_EPOCH.fetch_max(epoch, Ordering::Relaxed);
-        let mgrs = self.segment_managers.read().unwrap();
+        let mgrs = self.segment_managers.read();
         for mgr in mgrs.values() {
             mgr.evict_idle_volumes(epoch, false);
         }
@@ -7359,13 +7303,13 @@ impl MVCCEngine {
         let ddl = self.ddl_guard();
         // Collect CreateTable entries and table names in a single schemas lock
         let (table_entries, table_names_for_indexes): (Vec<(String, Vec<u8>)>, Vec<String>) = {
-            let schemas = self.schemas.read().unwrap();
+            let schemas = self.schemas.read();
             if !self.creating_txns.lock().is_empty() {
                 return Ok(None);
             }
             // Each copy ends with the table's id counter: the rows that
             // raised it may be deleted, and the log before the cut goes
-            let stores = self.version_stores.read().unwrap();
+            let stores = self.version_stores.read();
             let entries = schemas
                 .iter()
                 .map(|(name, schema)| {
@@ -7382,7 +7326,7 @@ impl MVCCEngine {
 
         // Collect CreateIndex entries under version_stores lock, then drop
         let index_entries: Vec<(String, String, Vec<u8>)> = {
-            let stores = self.version_stores.read().unwrap();
+            let stores = self.version_stores.read();
             let mut entries = Vec::new();
             for table_name in &table_names_for_indexes {
                 if let Some(store) = stores.get(table_name) {
@@ -7419,7 +7363,7 @@ impl MVCCEngine {
 
         // Collect CreateView entries under views lock, then drop
         let view_entries: Vec<(String, Vec<u8>)> = {
-            let views = self.views.read().unwrap();
+            let views = self.views.read();
             views
                 .iter()
                 .map(|(name, view_def)| (name.clone(), view_def.serialize()))
@@ -7484,20 +7428,17 @@ impl MVCCEngine {
             _ => return Ok(()),
         };
 
-        let (compact_threshold, target_volume_rows) = self
-            .config
-            .read()
-            .map(|c| {
-                (
-                    c.persistence.compact_threshold as usize,
-                    c.persistence.target_volume_rows,
-                )
-            })
-            .unwrap_or((4, 1_048_576));
+        let (compact_threshold, target_volume_rows) = {
+            let c = self.config.read();
+            (
+                c.persistence.compact_threshold as usize,
+                c.persistence.target_volume_rows,
+            )
+        };
         let compact_threshold = compact_threshold.max(2);
 
         let tables_to_compact: Vec<String> = {
-            let mgrs = self.segment_managers.read().unwrap();
+            let mgrs = self.segment_managers.read();
             mgrs.iter()
                 .filter(|(_, mgr)| {
                     // Without a listed volume a rewrite cannot see every copy
@@ -7560,7 +7501,7 @@ impl MVCCEngine {
             // two opens a newer request, which this cycle cannot close
             let recluster_request = mgr.recluster_request();
             let (schema, schema_version) = {
-                let schemas = self.schemas.read().unwrap();
+                let schemas = self.schemas.read();
                 match schemas.get(table_name) {
                     Some(s) => (s.clone(), self.ddl.schema_epoch.load(Ordering::Acquire)),
                     None => continue,
@@ -7859,12 +7800,7 @@ impl MVCCEngine {
                 .iter()
                 .map(|(seg_id, _)| mgr.get_volume_mapping(*seg_id, &schema))
                 .collect();
-            let store = self
-                .version_stores
-                .read()
-                .map_err(|_| Error::internal("version stores lock poisoned"))?
-                .get(table_name)
-                .cloned();
+            let store = self.version_stores.read().get(table_name).cloned();
             // Before the rewrite is visible: a point that has not seen every
             // tombstone it applies would need the rows they hid
             if let Some(store) = &store {
@@ -8015,11 +7951,7 @@ impl MVCCEngine {
             // Build compacted volumes, splitting at target_volume_rows boundary.
             // Only one Row is materialized at a time, avoiding O(N) memory.
             let vol_dir = pm.path().join("volumes");
-            let compress = self
-                .config
-                .read()
-                .map(|c| c.persistence.volume_compression)
-                .unwrap_or(true);
+            let compress = self.config.read().persistence.volume_compression;
 
             // The merged volumes hold their rows in row id order, or in key
             // order for a clustered table, read through each volume's mapping
@@ -8368,7 +8300,7 @@ impl MVCCEngine {
                 // visible, as a seal's registration does: a change completing
                 // during the rewrite is then either before this publication,
                 // and its propagation covers the outputs, or after it
-                let schemas = self.schemas.read().unwrap();
+                let schemas = self.schemas.read();
                 let outcome =
                     mgr.commit_replacement(prepared, schemas.get(table_name).map(|s| &**s));
                 drop(schemas);
@@ -8481,11 +8413,7 @@ impl MVCCEngine {
         };
         let seal_row_threshold = bounded(SEAL_ROW_THRESHOLD);
         let seal_incremental_threshold = bounded(SEAL_INCREMENTAL_THRESHOLD);
-        let target_volume_rows = self
-            .config
-            .read()
-            .map(|c| c.persistence.target_volume_rows)
-            .unwrap_or(1_048_576);
+        let target_volume_rows = self.config.read().persistence.target_volume_rows;
 
         let pm = match self.persistence.as_ref() {
             Some(pm) if pm.is_enabled() => pm,
@@ -8502,7 +8430,7 @@ impl MVCCEngine {
 
         // Step 1: Collect candidates from version_stores (row count check)
         let candidates: Vec<(String, Arc<VersionStore>)> = {
-            let stores = self.version_stores.read().unwrap();
+            let stores = self.version_stores.read();
             stores
                 .iter()
                 .filter_map(|(table_name, store)| {
@@ -8527,7 +8455,7 @@ impl MVCCEngine {
         // Step 2: Filter by threshold using segment_managers.
         // Cache has_segments per table to avoid re-acquiring the lock later.
         let candidates: Vec<(String, Arc<VersionStore>, bool)> = if force_seal {
-            let mgrs = self.segment_managers.read().unwrap();
+            let mgrs = self.segment_managers.read();
             candidates
                 .into_iter()
                 .map(|(table_name, store)| {
@@ -8539,7 +8467,7 @@ impl MVCCEngine {
                 })
                 .collect()
         } else {
-            let mgrs = self.segment_managers.read().unwrap();
+            let mgrs = self.segment_managers.read();
             candidates
                 .into_iter()
                 .filter_map(|(table_name, store)| {
@@ -8576,7 +8504,7 @@ impl MVCCEngine {
             }
             let definition = mgr.definition_epoch();
             let (schema, sealed_schema_version) = {
-                let schemas = self.schemas.read().unwrap();
+                let schemas = self.schemas.read();
                 match schemas.get(&table_name) {
                     Some(schema) => (
                         schema.clone(),
@@ -8670,11 +8598,7 @@ impl MVCCEngine {
             let vol_dir = pm.path().join("volumes");
 
             // Build volumes from rows, splitting at target_volume_rows boundary.
-            let compress = self
-                .config
-                .read()
-                .map(|c| c.persistence.volume_compression)
-                .unwrap_or(true);
+            let compress = self.config.read().persistence.volume_compression;
             // Each volume streams to its file a row group at a time, its
             // unique indexes built as the rows pass, so the first INSERT
             // after the seal reads no column whole
@@ -8858,10 +8782,7 @@ impl MVCCEngine {
                     // The mapping is computed against the schema current now,
                     // under the schema cache's read lock held until the
                     // segments are visible, as a single registration does
-                    let schemas = self
-                        .schemas
-                        .read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let schemas = self.schemas.read();
                     let schema = schemas.get(&table_name).map(|s| &**s);
                     match mgr.register_sealed(std::mem::take(&mut entries), prepared, schema) {
                         Ok(Ok(published)) => break Some((guard, outcome, published)),
@@ -9022,7 +8943,7 @@ impl Engine for MVCCEngine {
         }
 
         let name = to_lowercase_cow(table_name);
-        let schemas = self.schemas.read().unwrap();
+        let schemas = self.schemas.read();
         Ok(schemas.contains_key(name.as_ref()))
     }
 
@@ -9032,7 +8953,7 @@ impl Engine for MVCCEngine {
         }
 
         let name = to_lowercase_cow(table_name);
-        let schemas = self.schemas.read().unwrap();
+        let schemas = self.schemas.read();
         schemas
             .get(name.as_ref())
             .cloned()
@@ -9340,7 +9261,7 @@ impl Engine for MVCCEngine {
 
         // Clear in-memory segment state
         {
-            let mgrs = self.segment_managers.read().unwrap();
+            let mgrs = self.segment_managers.read();
             if let Some(mgr) = mgrs.get(&table_lower) {
                 mgr.clear();
             }
@@ -9600,9 +9521,7 @@ impl MVCCEngine {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::before_index_get_manager();
         // Taken by name, none made; a rename after the check below moves this one
-        let Ok(mgrs) = self.segment_managers.read() else {
-            return Ok(None);
-        };
+        let mgrs = self.segment_managers.read();
         let mgr = mgrs.get(table_name).cloned();
         drop(mgrs);
         if !self
@@ -9854,7 +9773,7 @@ impl MVCCEngine {
             return 0;
         }
 
-        let stores = self.version_stores.read().unwrap();
+        let stores = self.version_stores.read();
         let mut total_removed = 0;
 
         for store in stores.values() {
@@ -9870,7 +9789,7 @@ impl MVCCEngine {
             return 0;
         }
 
-        let stores = self.version_stores.read().unwrap();
+        let stores = self.version_stores.read();
         let mut total_cleaned = 0;
 
         for store in stores.values() {
@@ -9886,7 +9805,7 @@ impl MVCCEngine {
     /// Used by CLI restore to pick the correct DDL file after Database::open()
     /// has determined which snapshots were actually loadable.
     pub fn oldest_loaded_snapshot_timestamp(&self) -> Option<String> {
-        let ts = self.snapshot_timestamps.read().unwrap();
+        let ts = self.snapshot_timestamps.read();
         ts.values().min().cloned()
     }
 
@@ -9903,7 +9822,7 @@ impl MVCCEngine {
 
         let txn_cleaned = self.cleanup_old_transactions(retention);
 
-        let stores = self.version_stores.read().unwrap();
+        let stores = self.version_stores.read();
 
         let mut rows_cleaned = 0;
         let mut versions_cleaned = 0;
@@ -9966,7 +9885,6 @@ fn close_and_settle(
     let name = to_lowercase_cow(table_name);
     let store = version_stores
         .read()
-        .map_err(|_| Error::internal("version stores lock poisoned"))?
         .get(name.as_ref())
         .cloned()
         .ok_or_else(|| Error::TableNotFound(name.to_string()))?;
@@ -10052,9 +9970,9 @@ impl EngineOperations {
 
         // Remove schema and clean up FK references in child tables
         let mut neighbors = {
-            let mut schemas = self.schemas().write().unwrap();
+            let mut schemas = self.schemas().write();
             if let Some(creation) = creation {
-                let made = self.version_stores().read().unwrap();
+                let made = self.version_stores().read();
                 if made.get(&table_name_lower).map(|s| s.creation()) != Some(creation) {
                     return Ok(false);
                 }
@@ -10063,7 +9981,7 @@ impl EngineOperations {
                 return Err(Error::TableNotFound(table_name_lower.to_string()));
             };
             let neighbors = fk_neighbors(&schemas, Some(&removed), &table_name_lower);
-            let version_stores = self.version_stores().read().unwrap();
+            let version_stores = self.version_stores().read();
             strip_fk_references(&mut schemas, &version_stores, &table_name_lower);
             neighbors
         };
@@ -10071,7 +9989,7 @@ impl EngineOperations {
         crate::test_failpoints::table_unlisted();
         // Close and remove version store
         {
-            let mut stores = self.version_stores().write().unwrap();
+            let mut stores = self.version_stores().write();
             if let Some(store) = stores.remove(&table_name_lower) {
                 store.close();
             }
@@ -10087,20 +10005,12 @@ impl EngineOperations {
         }
 
         // Clear in-memory segment state (prevents phantom rows on re-create)
-        let mgr = self
-            .segment_managers
-            .read()
-            .unwrap()
-            .get(&table_name_lower)
-            .cloned();
+        let mgr = self.segment_managers.read().get(&table_name_lower).cloned();
         if let Some(mgr) = &mgr {
             mgr.clear();
             mgr.persist()?;
         }
-        self.segment_managers
-            .write()
-            .unwrap()
-            .remove(&table_name_lower);
+        self.segment_managers.write().remove(&table_name_lower);
         remove_dropped_table_files(self.persistence(), &table_name_lower, mgr.as_deref())?;
 
         neighbors.push(table_name_lower);
@@ -10115,10 +10025,11 @@ impl EngineOperations {
         for (_, txn_store) in tables {
             // A published or read-only store is empty: its drop lets it go,
             // but its count among the inserters goes now
-            let holds = txn_store.read().map_or(true, |store| {
+            let holds = {
+                let store = txn_store.read();
                 store.stop_inserting();
                 store.holds_writes()
-            });
+            };
             if holds {
                 txn_store.write_store().discard();
             }
@@ -10128,7 +10039,7 @@ impl EngineOperations {
     /// Moves the schema epoch for a rename of `old` to `new`, both lower
     /// case, done or undone: a cache built meanwhile is rebuilt
     fn renamed(&self, old: &str, new: &str) {
-        let schemas = self.schemas().read().unwrap();
+        let schemas = self.schemas().read();
         let mut names = fk_neighbors(&schemas, schemas.get(new).map(|s| &**s), old);
         names.extend(fk_neighbors(&schemas, schemas.get(old).map(|s| &**s), new));
         names.push(old.to_string());
@@ -10190,7 +10101,6 @@ impl EngineOperations {
         let store = self
             .version_stores
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&*name)
             .cloned()
             .ok_or_else(|| Error::TableNotFound(name.to_string()))?;
@@ -10477,7 +10387,7 @@ impl TransactionEngineOperations for EngineOperations {
         let table_name_lower = to_lowercase_cow(table_name);
 
         // Get version store
-        let stores = self.version_stores().read().unwrap();
+        let stores = self.version_stores().read();
         let version_store = stores
             .get(&*table_name_lower)
             .cloned()
@@ -10491,7 +10401,7 @@ impl TransactionEngineOperations for EngineOperations {
         // (txn_id, table_name); a new one comes admitted at the layout read
         // before any other handle of the transaction can reach it
         let (txn_versions, admitted) = {
-            let cache = self.txn_version_stores().read().unwrap();
+            let cache = self.txn_version_stores().read();
             let found = if let Some(txn_tables) = cache.get(txn_id) {
                 // Linear search on SmallVec (fast for 1-2 tables)
                 txn_tables
@@ -10519,7 +10429,7 @@ impl TransactionEngineOperations for EngineOperations {
                 (None, None)
             } else {
                 // Upgrade to write lock and re-check (another thread may have inserted)
-                let mut cache = self.txn_version_stores().write().unwrap();
+                let mut cache = self.txn_version_stores().write();
                 let txn_tables = cache.entry(txn_id).or_default();
                 if let Some((_, cached)) = txn_tables
                     .iter()
@@ -10575,7 +10485,7 @@ impl TransactionEngineOperations for EngineOperations {
                 &table_name_lower,
             )
         } else {
-            let mgrs = self.segment_managers.read().unwrap();
+            let mgrs = self.segment_managers.read();
             match mgrs.get(&*table_name_lower) {
                 Some(mgr) if mgr.has_segments() => Arc::clone(mgr),
                 _ => {
@@ -10630,7 +10540,7 @@ impl TransactionEngineOperations for EngineOperations {
 
         // Atomically check-and-insert under write lock to prevent TOCTOU race
         {
-            let mut schemas = self.schemas().write().unwrap();
+            let mut schemas = self.schemas().write();
             if schemas.contains_key(&table_name) {
                 return Err(Error::TableAlreadyExists(table_name.to_string()));
             }
@@ -10641,7 +10551,7 @@ impl TransactionEngineOperations for EngineOperations {
             schemas.insert(table_name.clone(), CompactArc::new(schema));
         }
         {
-            let mut stores = self.version_stores().write().unwrap();
+            let mut stores = self.version_stores().write();
             stores.insert(table_name.clone(), Arc::clone(&version_store));
         }
         if let Err(e) = self.record_created_table(txn_id, name, &schema_data) {
@@ -10649,8 +10559,7 @@ impl TransactionEngineOperations for EngineOperations {
             return Err(e);
         }
         // The caches keyed by the schema epoch, the foreign key map among them, see the table
-        self.ddl
-            .changed_table(&self.schemas().read().unwrap(), &table_name);
+        self.ddl.changed_table(&self.schemas().read(), &table_name);
 
         // Create transaction version store with txn_id 0 (will be set by caller)
         let txn_versions = TransactionVersionStore::new(Arc::clone(&version_store), 0);
@@ -10672,7 +10581,6 @@ impl TransactionEngineOperations for EngineOperations {
     fn table_creation(&self, name: &str) -> u64 {
         self.version_stores()
             .read()
-            .unwrap()
             .get(&*to_lowercase_cow(name))
             .map_or(0, |store| store.creation())
     }
@@ -10682,7 +10590,6 @@ impl TransactionEngineOperations for EngineOperations {
             let name = self
                 .version_stores()
                 .read()
-                .unwrap()
                 .iter()
                 .find(|(_, store)| store.creation() == creation)
                 .map(|(name, _)| name.clone());
@@ -10701,7 +10608,7 @@ impl TransactionEngineOperations for EngineOperations {
     }
 
     fn list_tables(&self) -> Result<Vec<String>> {
-        let schemas = self.schemas().read().unwrap();
+        let schemas = self.schemas().read();
         Ok(schemas.keys().cloned().collect())
     }
 
@@ -10712,7 +10619,7 @@ impl TransactionEngineOperations for EngineOperations {
         // Files under the new name are taken over only by a replay whose
         // open loaded them there, from a manager that holds no rows
         let taken = {
-            let mgrs = self.segment_managers.read().unwrap();
+            let mgrs = self.segment_managers.read();
             let moving = mgrs.get(&old_name_lower);
             match mgrs.get(&new_name_lower) {
                 // The open found the files moved and gave them both names
@@ -10725,7 +10632,7 @@ impl TransactionEngineOperations for EngineOperations {
             }
         };
         if taken {
-            let schemas = self.schemas().read().unwrap();
+            let schemas = self.schemas().read();
             if schemas.contains_key(&old_name_lower) && !schemas.contains_key(&new_name_lower) {
                 return Err(Error::internal(format!(
                     "cannot rename table '{}' to '{}': files of a table '{}' remain",
@@ -10736,7 +10643,7 @@ impl TransactionEngineOperations for EngineOperations {
 
         // Atomically check-and-rename under write lock to prevent TOCTOU race
         {
-            let mut schemas = self.schemas().write().unwrap();
+            let mut schemas = self.schemas().write();
             if !schemas.contains_key(&old_name_lower) {
                 return Err(Error::TableNotFound(old_name_lower.to_string()));
             }
@@ -10753,7 +10660,7 @@ impl TransactionEngineOperations for EngineOperations {
 
         // Rename in version stores
         {
-            let mut stores = self.version_stores().write().unwrap();
+            let mut stores = self.version_stores().write();
             if let Some(store) = stores.remove(&old_name_lower) {
                 {
                     let mut vs_schema_guard = store.schema_mut();
@@ -10765,15 +10672,15 @@ impl TransactionEngineOperations for EngineOperations {
             }
         }
         {
-            let mut schemas = self.schemas().write().unwrap();
-            let stores = self.version_stores().read().unwrap();
+            let mut schemas = self.schemas().write();
+            let stores = self.version_stores().read();
             retarget_fk_references(&mut schemas, &stores, &old_name_lower, &new_name_lower);
         }
 
         // Move segment manager to new name and update its manifest table_name
         // (persist() uses manifest.table_name for the on-disk directory)
         {
-            let mut mgrs = self.segment_managers.write().unwrap();
+            let mut mgrs = self.segment_managers.write();
             if let Some(mgr) = mgrs.remove(&old_name_lower) {
                 mgrs.entry(new_name_lower.clone()).or_insert(mgr);
             }
@@ -10786,7 +10693,7 @@ impl TransactionEngineOperations for EngineOperations {
             .map(|pm| pm.path().join("volumes").join(&old_name_lower))
             .is_some_and(|old_dir| old_dir.exists());
         if !files_to_move {
-            if let Some(mgr) = self.segment_managers.read().unwrap().get(&new_name_lower) {
+            if let Some(mgr) = self.segment_managers.read().get(&new_name_lower) {
                 mgr.rename(new_name_lower.as_str());
             }
         }
@@ -10809,14 +10716,14 @@ impl TransactionEngineOperations for EngineOperations {
                     };
                     #[cfg(any(test, feature = "test-failpoints"))]
                     crate::test_failpoints::rename_directory_moving();
-                    let moved = match self.segment_managers.read().unwrap().get(&new_name_lower) {
+                    let moved = match self.segment_managers.read().get(&new_name_lower) {
                         Some(mgr) => mgr.rename_with(new_name_lower.as_str(), move_dir),
                         None => move_dir(),
                     };
                     if let Err(e) = moved {
                         // Revert ALL in-memory renames on disk failure
                         {
-                            let mut schemas = self.schemas().write().unwrap();
+                            let mut schemas = self.schemas().write();
                             if let Some(mut schema_arc) = schemas.remove(&new_name_lower) {
                                 let schema = CompactArc::make_mut(&mut schema_arc);
                                 schema.table_name = old_name.to_string();
@@ -10825,7 +10732,7 @@ impl TransactionEngineOperations for EngineOperations {
                             }
                         }
                         {
-                            let mut stores = self.version_stores().write().unwrap();
+                            let mut stores = self.version_stores().write();
                             if let Some(store) = stores.remove(&new_name_lower) {
                                 {
                                     let mut vs_schema_guard = store.schema_mut();
@@ -10837,8 +10744,8 @@ impl TransactionEngineOperations for EngineOperations {
                             }
                         }
                         {
-                            let mut schemas = self.schemas().write().unwrap();
-                            let stores = self.version_stores().read().unwrap();
+                            let mut schemas = self.schemas().write();
+                            let stores = self.version_stores().read();
                             retarget_fk_references(
                                 &mut schemas,
                                 &stores,
@@ -10847,7 +10754,7 @@ impl TransactionEngineOperations for EngineOperations {
                             );
                         }
                         {
-                            let mut mgrs = self.segment_managers.write().unwrap();
+                            let mut mgrs = self.segment_managers.write();
                             if let Some(mgr) = mgrs.remove(&new_name_lower) {
                                 mgrs.insert(old_name_lower.clone(), mgr);
                             }
@@ -10914,7 +10821,7 @@ impl TransactionEngineOperations for EngineOperations {
 
     fn has_pending_dml_changes(&self, txn_id: i64) -> bool {
         // Check hot-side DML changes
-        let cache = self.txn_version_stores().read().unwrap();
+        let cache = self.txn_version_stores().read();
         let txn_tables = match cache.get(txn_id) {
             Some(tables) if !tables.is_empty() => tables,
             _ => {
@@ -10928,7 +10835,7 @@ impl TransactionEngineOperations for EngineOperations {
         // Do NOT collect table names here — avoids SmartString clones
         // on the common early-return path.
         for (_, txn_store) in txn_tables.iter() {
-            if txn_store.read().unwrap().has_local_changes() {
+            if txn_store.read().has_local_changes() {
                 return true;
             }
         }
@@ -10941,7 +10848,7 @@ impl TransactionEngineOperations for EngineOperations {
         // Check cold-side pending tombstones only for tables this txn touched.
         // Cold DELETE/UPDATE on non-int-pk tables may create tombstones without
         // hot mutations, but they always go through get_table_for_transaction first.
-        let mgrs = self.segment_managers.read().unwrap();
+        let mgrs = self.segment_managers.read();
         for table_name in &touched_tables {
             if let Some(mgr) = mgrs.get(table_name.as_str()) {
                 if mgr.has_pending_tombstones(txn_id) {
@@ -10966,13 +10873,13 @@ impl TransactionEngineOperations for EngineOperations {
             Arc<VersionStore>,
         )>;
         {
-            let cache = self.txn_version_stores().read().unwrap();
+            let cache = self.txn_version_stores().read();
             tables_to_commit = if let Some(txn_tables) = cache.get(txn_id) {
-                let stores = self.version_stores().read().unwrap();
+                let stores = self.version_stores().read();
                 txn_tables
                     .iter()
                     .filter(|(_, txn_store)| {
-                        let store = txn_store.read().unwrap();
+                        let store = txn_store.read();
                         store.has_local_changes()
                     })
                     .filter_map(|(table_name, txn_store)| {
@@ -11007,7 +10914,7 @@ impl TransactionEngineOperations for EngineOperations {
             String,
             Arc<crate::storage::volume::manifest::SegmentManager>,
         > = {
-            let mgrs = self.segment_managers.read().unwrap();
+            let mgrs = self.segment_managers.read();
             mgrs.iter()
                 .map(|(k, v)| (k.clone(), Arc::clone(v)))
                 .collect()
@@ -11077,7 +10984,6 @@ impl TransactionEngineOperations for EngineOperations {
             let mgr_for_commit = commit_mgrs.get(table_name.as_str()).cloned().or_else(|| {
                 self.segment_managers
                     .read()
-                    .unwrap()
                     .get(table_name.as_str())
                     .cloned()
             });
@@ -11141,7 +11047,7 @@ impl TransactionEngineOperations for EngineOperations {
         // even if commit failed partway through. Handles handed out leave
         // it to the finish or rollback that lets their rows and claims go
         if !handed_out {
-            let mut cache = self.txn_version_stores().write().unwrap();
+            let mut cache = self.txn_version_stores().write();
             cache.remove(txn_id);
             drop(cache);
             self.end_tracking(txn_id);
@@ -11212,15 +11118,15 @@ impl TransactionEngineOperations for EngineOperations {
 
     fn begin_publish(&self, txn_id: i64, commit_seq: i64) -> super::version_store::PublishHold {
         let mut hold = super::version_store::PublishHold::default();
-        let cache = self.txn_version_stores().read().unwrap();
+        let cache = self.txn_version_stores().read();
         if let Some(txn_tables) = cache.get(txn_id) {
-            let stores = self.version_stores().read().unwrap();
+            let stores = self.version_stores().read();
             for (table_name, txn_store) in txn_tables.iter() {
                 let Some(version_store) = stores.get(table_name.as_str()) else {
                     continue;
                 };
                 {
-                    let store = txn_store.read().unwrap();
+                    let store = txn_store.read();
                     if !store.has_local_changes() {
                         continue;
                     }
@@ -11233,14 +11139,14 @@ impl TransactionEngineOperations for EngineOperations {
     }
 
     fn publish_pending_tombstones(&self, txn_id: i64, commit_seq: u64) {
-        let mgrs = self.segment_managers.read().unwrap();
+        let mgrs = self.segment_managers.read();
         for mgr in mgrs.values() {
             mgr.commit_pending_tombstones(txn_id, commit_seq);
         }
     }
 
     fn discard_pending_tombstones(&self, txn_id: i64) {
-        let mgrs = self.segment_managers.read().unwrap();
+        let mgrs = self.segment_managers.read();
         for mgr in mgrs.values() {
             mgr.rollback_pending_tombstones(txn_id);
         }
@@ -11273,7 +11179,7 @@ impl TransactionEngineOperations for EngineOperations {
 
     fn finish_all_tables(&self, txn_id: i64) {
         self.end_tracking(txn_id);
-        let removed = self.txn_version_stores().write().unwrap().remove(txn_id);
+        let removed = self.txn_version_stores().write().remove(txn_id);
         if let Some(tables) = removed {
             Self::discard_stores(&tables);
         }
@@ -11282,7 +11188,8 @@ impl TransactionEngineOperations for EngineOperations {
     fn rollback_all_tables(&self, txn_id: i64, handed_out: bool) {
         self.end_tracking(txn_id);
         // A transaction that opened no store of its own touched no table
-        if let Ok(cache) = self.txn_version_stores().read() {
+        {
+            let cache = self.txn_version_stores().read();
             if cache.get(txn_id).is_none() {
                 return;
             }
@@ -11290,7 +11197,7 @@ impl TransactionEngineOperations for EngineOperations {
         // Collect touched table names BEFORE removing the cache entry,
         // so we only rollback tombstones on tables this txn actually used
         // instead of iterating every segment manager (O(tables) → O(touched)).
-        let mut cache = self.txn_version_stores().write().unwrap();
+        let mut cache = self.txn_version_stores().write();
         let touched: smallvec::SmallVec<[crate::common::SmartString; 4]> = cache
             .get(txn_id)
             .map(|tables| tables.iter().map(|(name, _)| name.clone()).collect())
@@ -11304,7 +11211,7 @@ impl TransactionEngineOperations for EngineOperations {
         // Rollback pending tombstones and clean up seal generation records
         // only on tables this transaction touched.
         if !touched.is_empty() {
-            let mgrs = self.segment_managers.read().unwrap();
+            let mgrs = self.segment_managers.read();
             for name in &touched {
                 if let Some(mgr) = mgrs.get(name.as_str()) {
                     mgr.rollback_pending_tombstones(txn_id);
@@ -11315,7 +11222,7 @@ impl TransactionEngineOperations for EngineOperations {
     }
 
     fn rollback_dml_after(&self, txn_id: i64, timestamp: i64) {
-        let cache = self.txn_version_stores().read().unwrap();
+        let cache = self.txn_version_stores().read();
         let touched: smallvec::SmallVec<[(crate::common::SmartString, Arc<TxnTableStore>); 4]> =
             cache
                 .get(txn_id)
@@ -11329,12 +11236,7 @@ impl TransactionEngineOperations for EngineOperations {
         drop(cache);
 
         for (name, txn_store) in &touched {
-            let mgr = self
-                .segment_managers
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(name.as_str())
-                .cloned();
+            let mgr = self.segment_managers.read().get(name.as_str()).cloned();
             let mut pending = if let Some(mgr) = mgr {
                 mgr.rollback_pending_tombstones_after(txn_id, timestamp);
                 mgr.get_pending_tombstones(txn_id)
@@ -11351,8 +11253,7 @@ impl TransactionEngineOperations for EngineOperations {
     fn track_keys(&self, txn_id: i64) {
         self.tracking_txns.lock().insert(txn_id);
         self.tracking_any.store(true, Ordering::Release);
-        let cache =
-            (self.txn_version_stores().read()).unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cache = self.txn_version_stores().read();
         for (_, store) in cache.get(txn_id).into_iter().flatten() {
             store.write_store().track_keys();
         }
@@ -11375,16 +11276,10 @@ impl TransactionEngineOperations for EngineOperations {
     }
 
     fn check_statement_keys(&self, txn_id: i64) -> Result<()> {
-        let cache =
-            (self.txn_version_stores().read()).unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cache = self.txn_version_stores().read();
         // Only the stores a write changed a key of; the cache, then a store,
         // the order track_keys takes them in
-        let changed = |store: &Arc<TxnTableStore>| {
-            (store
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner))
-            .has_key_changes()
-        };
+        let changed = |store: &Arc<TxnTableStore>| store.read().has_key_changes();
         let touched: smallvec::SmallVec<[(crate::common::SmartString, Arc<TxnTableStore>); 4]> =
             (cache.get(txn_id).into_iter().flatten())
                 .filter(|(_, store)| changed(store))
@@ -11392,12 +11287,7 @@ impl TransactionEngineOperations for EngineOperations {
                 .collect();
         drop(cache);
         for (name, txn_store) in &touched {
-            let mgr = self
-                .segment_managers
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(name.as_str())
-                .cloned();
+            let mgr = self.segment_managers.read().get(name.as_str()).cloned();
             check_statement_keys(txn_id, txn_store, mgr.as_deref())?;
         }
         Ok(())
@@ -11432,14 +11322,14 @@ impl TransactionEngineOperations for EngineOperations {
         // A table whose existing rows this transaction claimed is left out:
         // the seal skips claimed rows, so the wait could not end
         let stores: Vec<Arc<VersionStore>> = {
-            let cache = self.txn_version_stores().read().unwrap();
+            let cache = self.txn_version_stores().read();
             let Some(txn_tables) = cache.get(txn_id) else {
                 return;
             };
-            let stores = self.version_stores().read().unwrap();
+            let stores = self.version_stores().read();
             txn_tables
                 .iter()
-                .filter(|(_, txn_store)| txn_store.read().is_ok_and(|s| !s.holds_hot_rows()))
+                .filter(|(_, txn_store)| !txn_store.read().holds_hot_rows())
                 .filter_map(|(table_name, _)| stores.get(table_name.as_str()).cloned())
                 .collect()
         };
@@ -11454,7 +11344,7 @@ impl TransactionEngineOperations for EngineOperations {
         }
         limits.admission_waits.fetch_add(1, Ordering::Relaxed);
         let deadline = Instant::now() + std::time::Duration::from_secs(10);
-        let mut guard = limits.admission.0.lock().unwrap();
+        let mut guard = limits.admission.0.lock();
         while over() && limits.seal_worker.load(Ordering::Acquire) {
             let now = Instant::now();
             if now >= deadline {
@@ -11462,8 +11352,7 @@ impl TransactionEngineOperations for EngineOperations {
             }
             // Only while the cleanup thread runs; wasm32 has none
             #[allow(clippy::disallowed_methods)]
-            let waited = limits.admission.1.wait_timeout(guard, deadline - now);
-            guard = waited.unwrap().0;
+            limits.admission.1.wait_for(&mut guard, deadline - now);
         }
     }
 }
@@ -12235,9 +12124,9 @@ mod tests {
             assert!(db.execute(&half, ()).is_err(), "{half}");
         }
         let operations = db.engine().operations();
-        let entered: usize = (operations.txn_version_stores().read().unwrap().values())
+        let entered: usize = (operations.txn_version_stores().read().values())
             .flatten()
-            .map(|(_, store)| store.read().unwrap().entered_keys())
+            .map(|(_, store)| store.read().entered_keys())
             .sum();
         assert_eq!(entered, 0, "rows entered under a key");
         db.execute("ROLLBACK", ()).unwrap();
@@ -12254,7 +12143,7 @@ mod tests {
         engine
             .create_column_with_default("t", "v", DataType::Integer, true, (None, None), 0)
             .unwrap();
-        assert!(engine.segment_managers.read().unwrap().is_empty());
+        assert!(engine.segment_managers.read().is_empty());
 
         let mgr = engine.get_or_create_segment_manager("t");
         let before = mgr.schema_generation();
@@ -12861,7 +12750,7 @@ mod tests {
         engine.start_cleanup();
 
         // Verify no cleanup handle was set
-        let handle = engine.cleanup_handle.lock().unwrap();
+        let handle = engine.cleanup_handle.lock();
         assert!(
             handle.is_none(),
             "Cleanup handle should be None when disabled"
@@ -12959,7 +12848,7 @@ mod tests {
 
         // Verify cleanup handle was set
         {
-            let handle = engine.cleanup_handle.lock().unwrap();
+            let handle = engine.cleanup_handle.lock();
             assert!(
                 handle.is_some(),
                 "Cleanup handle should be set after start_cleanup"
@@ -12971,7 +12860,7 @@ mod tests {
 
         // Verify cleanup handle was cleared
         {
-            let handle = engine.cleanup_handle.lock().unwrap();
+            let handle = engine.cleanup_handle.lock();
             assert!(
                 handle.is_none(),
                 "Cleanup handle should be cleared after close"

@@ -29,10 +29,11 @@ use crate::storage::volume::manifest::{ColdSnapshot, SegmentManager, SegmentMeta
 use crate::storage::volume::secondary::IndexFile;
 use crate::storage::volume::side_index::{kind_for, Component, Domain, SideTarget};
 use crate::storage::volume::writer::{self, ColumnMapping, FrozenVolume};
+use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 /// The definition a column takes
 pub struct ColumnTypeChange<'a> {
@@ -66,7 +67,6 @@ pub(super) fn change_column_type(shared: &Shared<'_>, change: &ColumnTypeChange<
     let store = shared
         .version_stores
         .read()
-        .map_err(|_| Error::internal("version stores lock poisoned"))?
         .get(name.as_ref())
         .cloned()
         .ok_or_else(|| Error::TableNotFound(name.to_string()))?;
@@ -195,12 +195,7 @@ pub(super) fn change_column_type(shared: &Shared<'_>, change: &ColumnTypeChange<
 /// the manifest written, then the sources retired. A violation fails the
 /// open with the table's source files kept
 pub(super) fn repair_retyped_volumes(shared: &Shared<'_>, table: &str) -> Result<()> {
-    let store = shared
-        .version_stores
-        .read()
-        .map_err(|_| Error::internal("version stores lock poisoned"))?
-        .get(table)
-        .cloned();
+    let store = shared.version_stores.read().get(table).cloned();
     let (Some(store), Some(mgr)) = (store, segment_manager(shared, table)?) else {
         return Ok(());
     };
@@ -270,12 +265,7 @@ fn record(shared: &Shared<'_>, change: &ColumnTypeChange<'_>) -> Result<()> {
 }
 
 fn segment_manager(shared: &Shared<'_>, table: &str) -> Result<Option<Arc<SegmentManager>>> {
-    Ok(shared
-        .segment_managers
-        .read()
-        .map_err(|_| Error::internal("segment managers lock poisoned"))?
-        .get(table)
-        .cloned())
+    Ok(shared.segment_managers.read().get(table).cloned())
 }
 
 /// Volumes read through renames that carry no version are not rewritten:
@@ -324,17 +314,12 @@ fn check_policy(
     }
     let table = schema.table_name.to_lowercase();
     let column_name = schema.columns[column].name.to_lowercase();
-    let referenced = shared
-        .schemas
-        .read()
-        .map_err(|_| Error::internal("schemas lock poisoned"))?
-        .values()
-        .any(|other| {
-            other
-                .foreign_keys
-                .iter()
-                .any(|fk| fk.referenced_table == table && fk.referenced_column == column_name)
-        });
+    let referenced = shared.schemas.read().values().any(|other| {
+        other
+            .foreign_keys
+            .iter()
+            .any(|fk| fk.referenced_table == table && fk.referenced_column == column_name)
+    });
     if referenced {
         return refuse("a foreign key references it");
     }
