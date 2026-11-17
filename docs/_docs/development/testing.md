@@ -197,7 +197,7 @@ SQLLogicTest files provide a database-agnostic specification format, making it p
 | Job | Description |
 |-----|-------------|
 | **Lint** | `cargo fmt --check` + `cargo clippy -D warnings` |
-| **MSRV** | `cargo check --all-features` on Rust 1.88 |
+| **MSRV** | `cargo check --all-features` on Rust 1.89 |
 | **WASI build** | `cargo check` of the C API (`--features ffi`) for `wasm32-wasip1` |
 | **Test** | Full test suite on Linux, macOS, Windows |
 | **Feature-Gated** | Heap profile (heap-profile), failpoint I/O tests |

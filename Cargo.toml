@@ -2,7 +2,7 @@
 name = "stoolap"
 version = "0.5.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 authors = ["Stoolap Contributors"]
 description = "High-performance embedded SQL database with MVCC, time-travel queries, and full ACID compliance"
 license = "Apache-2.0"

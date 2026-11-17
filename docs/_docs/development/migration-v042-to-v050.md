@@ -18,6 +18,7 @@ Most of the work an upgrade asks for is in SQL. v0.4.2 answered many statements 
 3. **Check for a column named `_rowid_`.** It is now a reserved name (see [Storage and Files](#storage-and-files)).
 4. **Check for TIMESTAMP values before 1677-09-21 or after 2262-04-11** and for TIME values written by v0.4.2 (see [Dates, Times and Intervals](#dates-times-and-intervals)).
 5. **Rust embedders that install their own global allocator** need `default-features = false` (see [Build and Dependencies](#build-and-dependencies)).
+6. **Rust 1.89 or newer** is required to build the crate (it was 1.88).
 
 ## Storage and Files
 
@@ -274,7 +275,7 @@ Changed behaviour:
 - **jemalloc is the default global allocator** (the `jemalloc` feature, on by default). An embedder that installs its own `#[global_allocator]` must depend on `stoolap` with `default-features = false`, adding back `parallel` (and `cli` for the binary) as needed. The `mimalloc` feature is removed.
 - The `heap-profile` feature enables `PRAGMA heap_profile`.
 - The two comparison-benchmark features and `dhat-heap` are removed; the comparison benchmarks live in the unpublished `stoolap-compare` crate.
-- The minimum Rust version stays 1.88.
+- **The minimum Rust version is 1.89** (it was 1.88): the optional `semantic` feature moved to candle 0.11, whose x86_64 code uses AVX-512 intrinsics stable from 1.89.
 - The browser WASM build has its own size-optimized profile: `wasm-pack build --target web --profile wasm -- --no-default-features --features wasm`.
 
 ## Drivers
