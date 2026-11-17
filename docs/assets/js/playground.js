@@ -164,7 +164,7 @@ class Playground {
         errorSpan.textContent = 'Failed to load WASM: ' + err.message;
         const helpP = document.createElement('p');
         helpP.style.cssText = 'color:var(--color-text-muted);font-size:0.85rem;margin-top:0.5rem;';
-        helpP.textContent = 'Make sure the WASM build exists at /assets/wasm/stoolap_bg.wasm. Build with: wasm-pack build --target web --out-dir docs/assets/wasm';
+        helpP.textContent = 'Make sure the WASM build exists at /assets/wasm/stoolap_bg.wasm. Build with: wasm-pack build --target web --out-dir docs/assets/wasm --profile wasm -- --no-default-features --features wasm';
         this.loading.appendChild(errorSpan);
         this.loading.appendChild(helpP);
       }

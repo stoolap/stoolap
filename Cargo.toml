@@ -167,6 +167,13 @@ inherits = "release"
 lto = true            # Fat LTO for maximum runtime performance
 debug = false
 
+# Browser build (wasm-pack --profile wasm): optimized for size
+[profile.wasm]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+debug = false
+
 [[bench]]
 name = "group_by_keys"
 harness = false
