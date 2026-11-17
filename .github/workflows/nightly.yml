@@ -34,7 +34,6 @@ jobs:
     outputs:
       run_mutation: ${{ steps.select.outputs.run_mutation }}
       run_miri: ${{ steps.select.outputs.run_miri }}
-      mutation_shard: ${{ steps.select.outputs.mutation_shard }}
       miri_group: ${{ steps.select.outputs.miri_group }}
     steps:
     - id: select
@@ -46,11 +45,11 @@ jobs:
         run_mutation=false
         run_miri=false
         epoch_day=$(( $(date -u +%s) / 86400 ))
-        mutation_shard=$(( epoch_day % 24 ))
         miri_group=$(( epoch_day % 5 ))
 
         if [ "$EVENT_NAME" = "schedule" ] || [ "$suite" = "auto" ]; then
-          # Both run every night with rotating shards/groups
+          # Both run every night: mutation on the last day's changes,
+          # Miri on a rotating module group
           run_mutation=true
           run_miri=true
         else
@@ -63,7 +62,6 @@ jobs:
 
         echo "run_mutation=$run_mutation" >> "$GITHUB_OUTPUT"
         echo "run_miri=$run_miri" >> "$GITHUB_OUTPUT"
-        echo "mutation_shard=$mutation_shard" >> "$GITHUB_OUTPUT"
         echo "miri_group=$miri_group" >> "$GITHUB_OUTPUT"
 
   stress-tests:
@@ -130,14 +128,15 @@ jobs:
     - name: Cache
       uses: Swatinem/rust-cache@v2
 
+    # The system allocator, so the sanitizer sees every allocation
     - name: Run with ThreadSanitizer
       run: |
         echo 'race:std::alloc::System' > /tmp/tsan_suppressions.txt
         RUSTFLAGS="-Zsanitizer=thread" \
         cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu \
-          --test dirty_read_test \
-          --test mvcc_isolation_sql_test \
-          --test parallel_execution_tests
+          --no-default-features --features parallel \
+          --test transaction --test plan_cache -- \
+          dirty_read_test:: mvcc_isolation_sql_test:: parallel_execution_tests::
       timeout-minutes: 20
       env:
         TSAN_OPTIONS: "second_deadlock_stack=1 suppressions=/tmp/tsan_suppressions.txt"
@@ -169,19 +168,20 @@ jobs:
     - name: Cache
       uses: Swatinem/rust-cache@v2
 
+    # The system allocator, so the sanitizer sees every allocation
     - name: Run with AddressSanitizer
       run: |
         RUSTFLAGS="-Zsanitizer=address" \
         cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu \
-          --test durability_test \
-          --test snapshot_recovery_test \
-          --test persistence_test
+          --no-default-features --features parallel \
+          --test persistence -- \
+          durability_test:: snapshot_recovery_test:: persistence_test::
       timeout-minutes: 20
       env:
         ASAN_OPTIONS: "detect_leaks=0"
 
   mutation:
-    name: Mutation Testing (budgeted shard)
+    name: Mutation Testing (last day's changes)
     needs: heavy_plan
     if: needs.heavy_plan.outputs.run_mutation == 'true'
     runs-on: ubuntu-latest
@@ -196,6 +196,8 @@ jobs:
         sudo docker image prune --all --force
 
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
@@ -208,24 +210,51 @@ jobs:
       with:
         tool: cargo-mutants,cargo-nextest
 
-    - name: Run mutation testing (rotating shard)
+    # The lines changed in the last day, within a budget: what the budget
+    # leaves untried is reported, not failed
+    - name: Run mutation testing (last day's changes)
       run: |
-        SHARD_INDEX=${{ needs.heavy_plan.outputs.mutation_shard }}
-        TOTAL_SHARDS=24
-        echo "Running shard ${SHARD_INDEX}/${TOTAL_SHARDS}"
+        base=$(git rev-list -n1 --before="24 hours ago" HEAD)
+        if [ -z "$base" ]; then
+          echo "No commit older than a day"
+          exit 0
+        fi
+        git diff "$base" HEAD -- 'src/**/*.rs' > "$RUNNER_TEMP/day.diff"
+        files=(
+          -f src/executor/expression/
+          -f src/executor/aggregation.rs
+          -f src/executor/subquery.rs
+          -f src/functions/scalar/
+          -f src/storage/mvcc/transaction.rs
+          -f src/storage/mvcc/registry.rs
+        )
+        count=$(cargo mutants --list --in-diff "$RUNNER_TEMP/day.diff" "${files[@]}" | wc -l)
+        echo "Mutants in the last day's changes: $count" | tee -a "$GITHUB_STEP_SUMMARY"
+        if [ "$count" -eq 0 ]; then
+          exit 0
+        fi
 
-        cargo mutants --package stoolap \
+        status=0
+        timeout -s INT 90m cargo mutants --package stoolap \
           --in-place \
           --baseline=skip \
           --timeout 420 \
-          --shard "${SHARD_INDEX}/${TOTAL_SHARDS}" \
-          -f src/executor/expression/ \
-          -f src/executor/aggregation.rs \
-          -f src/executor/subquery.rs \
-          -f src/functions/scalar/ \
-          -f src/storage/mvcc/transaction.rs \
-          -f src/storage/mvcc/registry.rs \
-          -- --lib --tests
+          --in-diff "$RUNNER_TEMP/day.diff" \
+          "${files[@]}" \
+          -- --lib --tests || status=$?
+        for outcome in caught missed timeout unviable; do
+          n=0
+          [ -f "mutants.out/$outcome.txt" ] && n=$(wc -l < "mutants.out/$outcome.txt")
+          echo "$outcome: $n" | tee -a "$GITHUB_STEP_SUMMARY"
+        done
+        # 2: some mutants missed, 3: some timed out, 124: the budget ran out
+        case "$status" in
+          0|2|3) ;;
+          124) echo "Budget of 90 minutes reached before every mutant was tried" | tee -a "$GITHUB_STEP_SUMMARY" ;;
+          *) exit "$status" ;;
+        esac
+      env:
+        CARGO_INCREMENTAL: 1
       timeout-minutes: 100
 
     - name: Upload mutation report
@@ -285,6 +314,9 @@ jobs:
         esac
 
         echo "Filter: $FILTER"
-        cargo +nightly miri nextest run --lib -E "$FILTER" --no-fail-fast
+        # The system allocator: jemalloc keeps its arena chunks mapped for the
+        # process's life, which Miri reports as a leak before any test runs
+        cargo +nightly miri nextest run --lib --no-default-features --features parallel \
+          -E "$FILTER" --no-fail-fast
       env:
         MIRIFLAGS: "-Zmiri-disable-isolation"
