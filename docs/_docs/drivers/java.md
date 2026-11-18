@@ -142,14 +142,14 @@ File-based databases persist data to disk using WAL (Write-Ahead Logging) and im
 
 ```java
 try (StoolapDB db = StoolapDB.open("file:///tmp/mydata")) {
-    db.execute("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT)");
-    db.execute("INSERT INTO kv VALUES ($1, $2)", "hello", "world");
+    db.execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)");
+    db.execute("INSERT INTO notes VALUES ($1, $2)", 1L, "hello");
 }
 
 // Reopen: data is still there
 try (StoolapDB db = StoolapDB.open("file:///tmp/mydata")) {
-    BulkDecoder.Result result = db.query("SELECT * FROM kv WHERE key = $1", "hello");
-    System.out.println(result.rows().get(0)[1]); // "world"
+    BulkDecoder.Result result = db.query("SELECT * FROM notes WHERE id = $1", 1L);
+    System.out.println(result.rows().get(0)[1]); // "hello"
 }
 ```
 

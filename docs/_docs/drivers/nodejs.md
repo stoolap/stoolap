@@ -134,14 +134,14 @@ File-based databases persist data to disk using WAL (Write-Ahead Logging) and im
 ```js
 const db = await Database.open('./mydata');
 
-await db.exec('CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT)');
-await db.execute('INSERT INTO kv VALUES ($1, $2)', ['hello', 'world']);
+await db.exec('CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)');
+await db.execute('INSERT INTO notes VALUES ($1, $2)', [1, 'hello']);
 await db.close();
 
 // Reopen: data is still there
 const db2 = await Database.open('./mydata');
-const row = await db2.queryOne('SELECT * FROM kv WHERE key = $1', ['hello']);
-// { key: 'hello', value: 'world' }
+const row = await db2.queryOne('SELECT * FROM notes WHERE id = $1', [1]);
+// { id: 1, body: 'hello' }
 await db2.close();
 ```
 

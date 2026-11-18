@@ -114,14 +114,14 @@ File-based databases persist data via Write-Ahead Logging and immutable columnar
 
 ```ruby
 Stoolap::Database.open("./mydata") do |db|
-  db.exec("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT)")
-  db.execute("INSERT INTO kv VALUES ($1, $2)", ["hello", "world"])
+  db.exec("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)")
+  db.execute("INSERT INTO notes VALUES ($1, $2)", [1, "hello"])
 end
 
 # Reopen: data is still there
 Stoolap::Database.open("./mydata") do |db|
-  db.query_one("SELECT value FROM kv WHERE key = $1", ["hello"])
-  # => {"value" => "world"}
+  db.query_one("SELECT body FROM notes WHERE id = $1", [1])
+  # => {"body" => "hello"}
 end
 ```
 

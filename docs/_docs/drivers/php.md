@@ -145,14 +145,14 @@ File-based databases persist data to disk using WAL (Write-Ahead Logging) and im
 ```php
 $db = Database::open('./mydata');
 
-$db->exec('CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT)');
-$db->execute('INSERT INTO kv VALUES ($1, $2)', ['hello', 'world']);
+$db->exec('CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)');
+$db->execute('INSERT INTO notes VALUES ($1, $2)', [1, 'hello']);
 $db->close();
 
 // Reopen: data is still there
 $db2 = Database::open('./mydata');
-$row = $db2->queryOne('SELECT * FROM kv WHERE key = $1', ['hello']);
-// ['key' => 'hello', 'value' => 'world']
+$row = $db2->queryOne('SELECT * FROM notes WHERE id = $1', [1]);
+// ['id' => 1, 'body' => 'hello']
 $db2->close();
 ```
 
