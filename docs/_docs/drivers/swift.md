@@ -16,11 +16,11 @@ High-performance Swift driver for Stoolap. Calls the Rust engine directly throug
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/stoolap/stoolap-swift.git", from: "0.4.0")
+    .package(url: "https://github.com/stoolap/stoolap-swift.git", from: "0.5.0")
 ]
 ```
 
-The package links against `libstoolap_c`, a thin cdylib shim that re-exports the official `stoolap::ffi` cursor API. Prebuilt binaries are available on the [releases page](https://github.com/stoolap/stoolap-swift/releases).
+The package links `StoolapC.xcframework`, the engine's C API built as a static library for macOS and iOS, which Swift Package Manager downloads from the [release](https://github.com/stoolap/stoolap-swift/releases). No Rust toolchain is needed.
 
 ## Quick Start
 
@@ -124,7 +124,7 @@ for id in ids {
 
 ## Streaming Cursor
 
-For large result sets where you want bounded memory instead of bulk materialization:
+For large result sets where you want bounded memory instead of bulk materialization. The cursor reads rows from the engine in packed chunks of 32 rows, doubling up to 256, so memory stays bounded at any result size:
 
 ```swift
 let cursor = try db.queryCursor("SELECT * FROM users ORDER BY id")
@@ -148,7 +148,7 @@ try cursor.forEachRemaining { row in
 
 ## Prepared Statements
 
-Prepared statements parse SQL once and reuse the cached execution plan. Column names are cached after the first execution, eliminating per-call string allocations.
+Prepared statements parse SQL once and reuse the cached execution plan. Column names are reused across calls, eliminating per-call string allocations; each result's column header is checked against them, so a schema change after the prepare (such as `ALTER TABLE ... ADD COLUMN` under a `SELECT *`) is picked up.
 
 ```swift
 let insert = try db.prepare("INSERT INTO users VALUES ($1, $2, $3)")
@@ -224,7 +224,7 @@ do {
 
 ## Async API
 
-`AsyncDatabase` wraps `Database` with Swift concurrency. All calls dispatch to a detached task so they do not block the cooperative thread pool.
+`AsyncDatabase` wraps `Database` with Swift concurrency. Each call runs the synchronous engine call in a detached task, off the calling actor. The task still occupies a thread of the cooperative pool while the engine works.
 
 ```swift
 let db = try await AsyncDatabase.open(":memory:")
@@ -236,6 +236,15 @@ try await db.execute("INSERT INTO users VALUES ($1, $2)",
 let users = try await db.query("SELECT * FROM users")
 let one = try await db.queryOne("SELECT * FROM users WHERE id = $1", [.integer(1)])
 let raw = try await db.queryRaw("SELECT * FROM users")
+```
+
+## Parameters
+
+Parameters are positional (`$1`, `$2`, ...) and passed as `[Value]`. Every parameter the statement uses needs a value: a missing one is an error, not `NULL`.
+
+```swift
+// Throws: $2 has no value
+_ = try db.query("SELECT * FROM users WHERE id = $1 AND name = $2", [.integer(1)])
 ```
 
 ## Error Handling
@@ -259,9 +268,9 @@ do {
 | `.text(String)` | `TEXT` | UTF-8 encoded |
 | `.boolean(Bool)` | `BOOLEAN` | |
 | `.null` | `NULL` | Any type |
-| `.timestamp(Date)` | `TIMESTAMP` | Nanosecond precision |
+| `.timestamp(Date)` | `TIMESTAMP` | Stored in nanoseconds; `Date` holds about 0.1 µs at current dates, years 1677-2262 |
 | `.json(String)` | `JSON` | Pre-serialized JSON string |
-| `.blob(Data)` | `BLOB` | Raw bytes |
+| `.blob(Data)` | `VECTOR` | Packed little-endian f32 bytes (length a multiple of 4); reads back as `.vector` |
 | `.vector([Float])` | `VECTOR` | Packed f32 for similarity search |
 
 ## Persistence
@@ -281,7 +290,7 @@ let row = try db2.queryOne("SELECT * FROM kv WHERE key = $1", [.text("hello")])
 
 ## Thread Safety
 
-`Database` is `@unchecked Sendable` and safe to share across threads (the Rust engine uses interior locking). `Transaction` instances must be used by one thread at a time. `PreparedStatement` is `@unchecked Sendable` with an internal lock protecting the column name cache.
+`Database` and `PreparedStatement` are `@unchecked Sendable` and safe to share across threads. The engine keeps each handle's last error on the handle, so the driver serializes the calls made on one `Database` or `PreparedStatement`. For queries that run in parallel, open the same DSN once per thread: the opens share one engine and its data. `Transaction` and `RowCursor` belong to the thread that uses them.
 
 ## Building from Source
 
@@ -292,9 +301,11 @@ git clone https://github.com/stoolap/stoolap-swift.git
 cd stoolap-swift
 
 # Build the Rust shared library
-cd crates/stoolap-c && cargo build --release && cd ../..
+./scripts/build-rust.sh
 
-# Build and test
-swift build
-swift test
+# Build and test against the library built above
+STOOLAP_LOCAL_BUILD=1 swift build
+STOOLAP_LOCAL_BUILD=1 swift test
 ```
+
+Without `STOOLAP_LOCAL_BUILD=1`, the package links the prebuilt `StoolapC.xcframework` of the release named in `Package.swift`.
