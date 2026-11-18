@@ -2,7 +2,7 @@
 layout: doc
 title: Stoolap Studio
 category: Getting Started
-order: 5
+order: 6
 ---
 
 # Stoolap Studio
