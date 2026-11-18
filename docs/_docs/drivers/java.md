@@ -12,31 +12,23 @@ High-performance Java driver for Stoolap. Built with [jni-rs](https://github.com
 
 ## Installation
 
-Until the first release is published to Maven Central, build from source:
-
-```bash
-git clone https://github.com/stoolap/stoolap-java.git
-cd stoolap-java
-
-# 1. Build the native library (requires Rust)
-cd jni && cargo build --release && cd ..
-
-# 2. Build the Java artifact
-mvn package
-
-# 3. Install to your local Maven repo
-mvn install
-```
-
-In your `pom.xml`:
+The driver is published to Maven Central. The JAR bundles the native library for every supported platform, so no Rust toolchain is needed.
 
 ```xml
 <dependency>
     <groupId>io.stoolap</groupId>
     <artifactId>stoolap-java</artifactId>
-    <version>0.4.0</version>
+    <version>0.5.0</version>
 </dependency>
 ```
+
+Gradle:
+
+```groovy
+implementation 'io.stoolap:stoolap-java:0.5.0'
+```
+
+Driver 0.5.x runs the Stoolap 0.5 engine. It opens a database written by 0.4.x and moves its files forward on their own; see the [migration guide]({{ '/docs/development/migration-v042-to-v050/' | relative_url }}) before upgrading.
 
 Requires **Java 17+** (tested on Java 17, 21, 25). Supported platforms: macOS (aarch64/x86_64), Linux (x86_64/aarch64), Windows (x86_64).
 
@@ -50,7 +42,7 @@ The driver searches for `libstoolap_jni.{dylib,so,dll}` in this order:
 
 ```bash
 export STOOLAP_LIB=/path/to/stoolap-java/jni/target/release/libstoolap_jni.dylib
-java -cp stoolap-java-0.4.0.jar:your-app.jar your.Main
+java -cp stoolap-java-0.5.0.jar:your-app.jar your.Main
 ```
 
 ## Quick Start
@@ -104,8 +96,12 @@ StoolapDB db = StoolapDB.open("file:///absolute/path/to/db");
 |--------|---------|-------------|
 | `execute(sql)` | `long` | Execute DDL/DML statement, returns rows affected |
 | `execute(sql, params...)` | `long` | Execute with positional parameters |
+| `execute(sql, Map)` | `long` | Execute with named parameters |
 | `query(sql)` | `BulkDecoder.Result` | Execute query, returns all rows |
 | `query(sql, params...)` | `BulkDecoder.Result` | Query with positional parameters |
+| `query(sql, Map)` | `BulkDecoder.Result` | Query with named parameters |
+| `cursor(sql, params...)` | `StoolapCursor` | Query, reading the result in chunks |
+| `cursor(sql, Map)` | `StoolapCursor` | Query with named parameters, in chunks |
 | `prepare(sql)` | `StoolapStmt` | Create a prepared statement |
 | `begin()` | `StoolapTx` | Begin a transaction (READ COMMITTED) |
 | `begin(boolean snapshot)` | `StoolapTx` | Begin with SNAPSHOT isolation if `true` |
@@ -124,6 +120,21 @@ public record Result(String[] columnNames, List<Object[]> rows) {
 ```
 
 Each row is an `Object[]` containing typed values. See [Type Mapping](#type-mapping) for how SQL types map to Java types.
+
+### Cursors
+
+`query()` returns the whole result at once. For a large result, `cursor()` reads it 1024 rows per JNI call:
+
+```java
+try (StoolapCursor c = db.cursor("SELECT * FROM events WHERE day = $1", day)) {
+    String[] columns = c.columnNames();
+    for (Object[] row; (row = c.next()) != null; ) {
+        // ...
+    }
+}
+```
+
+`next()` returns `null` once the result is exhausted, and the cursor releases its native result then or on `close()`. A runtime error part way through a result, such as an invalid parameterized `REGEXP` pattern, is raised from `next()`; `query()` raises it too instead of returning the rows read so far. Read a cursor opened in a transaction before the transaction ends.
 
 ## Persistence
 
@@ -165,7 +176,7 @@ All configuration options from the core engine are supported (see the [Python dr
 
 ## Prepared Statements
 
-Prepared statements parse SQL once and reuse the cached execution plan on every call. The Java driver stores a `CachedPlanRef` internally, so `execute`/`query` bypass SQL parsing and plan-cache lookup entirely.
+Prepared statements parse SQL once and run on their compiled plan on every call, on the database and inside a transaction alike.
 
 ```java
 try (StoolapDB db = StoolapDB.openInMemory()) {
@@ -191,7 +202,10 @@ try (StoolapDB db = StoolapDB.openInMemory()) {
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `execute(params...)` | `long` | Execute DDL/DML, returns rows affected |
+| `execute(Map)` | `long` | Execute with named parameters |
 | `query(params...)` | `BulkDecoder.Result` | Execute query |
+| `query(Map)` | `BulkDecoder.Result` | Query with named parameters |
+| `cursor(params...)` / `cursor(Map)` | `StoolapCursor` | Query, reading the result in chunks |
 | `getSql()` | `String` | Return the original SQL text |
 | `close()` | `void` | Finalize the native handle |
 
@@ -227,17 +241,18 @@ try (StoolapTx tx = db.begin(true /* snapshot */)) {
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `execute(sql, params...)` | `long` | Execute DDL/DML |
-| `query(sql, params...)` | `BulkDecoder.Result` | Execute query |
-| `execute(stmt, params...)` | `long` | Execute a prepared statement within the transaction |
-| `query(stmt, params...)` | `BulkDecoder.Result` | Query a prepared statement within the transaction |
-| `commit()` | `void` | Commit the transaction |
+| `execute(sql, params...)` / `execute(sql, Map)` | `long` | Execute DDL/DML |
+| `query(sql, params...)` / `query(sql, Map)` | `BulkDecoder.Result` | Execute query |
+| `execute(stmt, params...)` / `execute(stmt, Map)` | `long` | Execute a prepared statement within the transaction |
+| `query(stmt, params...)` / `query(stmt, Map)` | `BulkDecoder.Result` | Query a prepared statement within the transaction |
+| `cursor(sql, params...)` / `cursor(stmt, params...)` | `StoolapCursor` | Query within the transaction, in chunks |
+| `commit()` | `void` | Commit; a failed commit leaves the transaction active so it can be rolled back |
 | `rollback()` | `void` | Rollback the transaction |
 | `close()` | `void` | Auto-rollback if not committed |
 
 ## Multi-Threaded Use
 
-A single `StoolapDB` handle must not be used concurrently from multiple threads. Use `cloneHandle()` to create a per-thread handle that shares the underlying engine (data, indexes, transactions):
+Every handle is thread-safe. Several threads may run statements on one `StoolapDB` or `StoolapStmt` at once, and calls on one `StoolapTx` or `StoolapCursor` run one at a time. `close()` waits for the calls in flight, and a call on a closed handle raises `StoolapException` instead of touching freed memory. A handle that is never closed is freed once it becomes unreachable, but close handles explicitly: an open database keeps its files locked. `cloneHandle()` gives another handle on the same engine (data, indexes, transactions), closed on its own:
 
 ```java
 StoolapDB main = StoolapDB.open("file:///tmp/mydata");
@@ -259,7 +274,7 @@ t1.join();  t2.join();
 main.close();
 ```
 
-Cloning is cheap and integrates naturally with JDBC connection pools like HikariCP.
+Cloning is cheap, and each JDBC connection holds its own handle.
 
 ## JDBC Driver
 
@@ -310,7 +325,7 @@ try (Connection conn = DriverManager.getConnection("jdbc:stoolap:memory://")) {
 
 ### Batch Execution
 
-The JDBC batch path auto-wraps in a transaction and uses `execute_prepared` on the cached plan AST, so per-row overhead is minimal.
+In auto-commit mode a batch runs in a transaction of its own and every row runs on the statement's compiled plan: all rows commit, or none do. A failing row raises a `BatchUpdateException` naming it (`batch row 2: ...`). With auto-commit off, the batch runs in the connection's transaction.
 
 ```java
 try (Connection conn = DriverManager.getConnection("jdbc:stoolap:memory://")) {
@@ -334,7 +349,9 @@ try (Connection conn = DriverManager.getConnection("jdbc:stoolap:memory://")) {
     conn.setAutoCommit(false);
     try (Statement stmt = conn.createStatement()) {
         stmt.executeUpdate("INSERT INTO t VALUES (1, 'a')");
+        Savepoint sp = conn.setSavepoint();
         stmt.executeUpdate("INSERT INTO t VALUES (2, 'b')");
+        conn.rollback(sp);              // keeps row 1
         conn.commit();
     } catch (SQLException e) {
         conn.rollback();
@@ -345,9 +362,35 @@ try (Connection conn = DriverManager.getConnection("jdbc:stoolap:memory://")) {
 }
 ```
 
+With auto-commit off, DML runs in a transaction that begins with the first statement. A Stoolap transaction accepts only DML and savepoints, so DDL commits the open transaction and runs on its own, as in MySQL and Oracle. `SHOW`, `DESCRIBE`, `EXPLAIN` and every `DatabaseMetaData` lookup run outside the transaction and leave it open. The SQL statements `BEGIN` and `COMMIT` commit the open transaction and `ROLLBACK` rolls it back.
+
+`setTransactionIsolation` takes `TRANSACTION_READ_COMMITTED` (the default) or `TRANSACTION_REPEATABLE_READ`, which runs each transaction on a snapshot; `SERIALIZABLE` is refused.
+
+### Generated Keys
+
+`RETURN_GENERATED_KEYS` adds a `RETURNING` clause for the target table's primary key, and the column-name and column-index forms return those columns:
+
+```java
+try (PreparedStatement ps = conn.prepareStatement(
+        "INSERT INTO users (name) VALUES (?)", Statement.RETURN_GENERATED_KEYS)) {
+    ps.setString(1, "Alice");
+    ps.executeUpdate();
+    try (ResultSet keys = ps.getGeneratedKeys()) {
+        keys.next();
+        long id = keys.getLong(1);
+    }
+}
+```
+
+### Result Sets and Metadata
+
+A `ResultSet` is forward-only and streams from the engine one fetch-size chunk at a time (1024 rows by default); `setMaxRows` stops it early. `Statement.execute()` reports a result set exactly when the statement returns columns, so `INSERT ... RETURNING` and a query with a leading comment are result sets. `ResultSetMetaData` reports column types, `getObject(column, type)` converts to the boxed numbers, `BigDecimal`, the `java.sql` date types and the `java.time` types, and a value a getter cannot represent raises an `SQLException` instead of returning 0. `setQueryTimeout` is enforced outside a transaction; `cancel()` is not supported.
+
+`DatabaseMetaData` answers `getTables`, `getColumns`, `getPrimaryKeys`, `getIndexInfo`, `getImportedKeys`, `getExportedKeys`, `getTypeInfo` and `getTableTypes` from `SHOW TABLES`, `SHOW VIEWS`, `DESCRIBE`, `SHOW INDEXES` and `SHOW CREATE TABLE`. Stoolap has no catalogs or schemas, so those columns are null.
+
 ### Connection Pool Integration
 
-`StoolapConnection` clones the underlying handle, making it safe to pool. Example with HikariCP:
+Each `StoolapConnection` holds its own handle, so it pools well. Closing a connection closes its statements and result sets and rolls back an open transaction. Example with HikariCP:
 
 ```java
 HikariConfig config = new HikariConfig();
@@ -364,27 +407,41 @@ try (HikariDataSource ds = new HikariDataSource(config);
 
 | Java (write) | Stoolap | Java (read) |
 |--------------|---------|-------------|
-| `Long`, `Integer`, `Short`, `Byte` | `INTEGER` | `Long` |
-| `Double`, `Float`, `BigDecimal` | `FLOAT` | `Double` |
+| `Long`, `Integer`, `Short`, `Byte`, `BigInteger` | `INTEGER` | `Long` |
+| `Double`, `Float`, `BigDecimal` (as double) | `FLOAT` | `Double` |
 | `String` | `TEXT` | `String` |
 | `Boolean` | `BOOLEAN` | `Boolean` |
-| `java.time.Instant`, `java.sql.Timestamp` | `TIMESTAMP` | `java.time.Instant` |
+| `Instant`, `java.sql.Timestamp`, `java.util.Date`, `OffsetDateTime`, `ZonedDateTime`, `LocalDateTime` (as UTC) | `TIMESTAMP` | `java.time.Instant` (JDBC `getObject`: `java.sql.Timestamp`) |
 | `String` (JSON) | `JSON` | `String` |
-| `byte[]` | `BLOB` | `byte[]` |
+| `float[]` | `VECTOR(n)` | `float[]` |
 | `null` | `NULL` | `null` |
+
+A `TIMESTAMP` holds 1677-09-21 to 2262-04-11 UTC, and a value outside that range is refused. A `java.sql.Timestamp` binds as its instant, so it reads back unchanged in any JVM time zone. `java.sql.Date` and `java.sql.Time` bind as `yyyy-MM-dd` and `HH:mm:ss` text, which a `TIMESTAMP` column reads as UTC, and JDBC `getDate` and `getTime` read a timestamp's UTC date and time, so they round-trip too. Stoolap has no BLOB type: a `byte[]` parameter is refused, and JDBC `setBytes` throws `SQLFeatureNotSupportedException`. Any other object binds as its `toString()` text.
 
 Aggregate results (`SUM`, `AVG`, `MIN`, `MAX` over integer columns) may be returned as `Double` depending on the engine's promotion rules. Use `((Number) value).longValue()` when reading aggregate output.
 
 ## Parameters
 
-The Java driver currently supports positional parameters only (`$1`, `$2`, ...):
+Positional parameters (`$1`, `$2`, ... or `?`) take varargs:
 
 ```java
 db.query("SELECT * FROM users WHERE id = $1 AND name = $2", 1L, "Alice");
 db.execute("INSERT INTO t VALUES ($1, $2, $3)", 42L, "hello", 3.14);
 ```
 
-Params are encoded to a compact binary format on the Java side by `ParamEncoder` and decoded in Rust without any JNI reflection, keeping the per-call overhead minimal.
+Named parameters (`:name`) take a `Map`, on `StoolapDB`, `StoolapStmt` and `StoolapTx`:
+
+```java
+db.execute("INSERT INTO users VALUES (:id, :name)", Map.of("id", 1, "name", "Alice"));
+
+try (StoolapStmt byName = db.prepare("SELECT id FROM users WHERE name = :name")) {
+    byName.query(Map.of("name", "Alice"));
+}
+```
+
+A leading `:`, `@` or `$` on a key is ignored. A placeholder without a value raises `StoolapException`.
+
+Params are encoded to a compact binary format on the Java side by `ParamEncoder` and decoded in Rust without any JNI reflection, keeping the per-call overhead minimal. Rust refuses a parameter buffer that is truncated, holds text that is not UTF-8, or carries an unknown type.
 
 ## Error Handling
 
@@ -403,7 +460,7 @@ try (StoolapDB db = StoolapDB.openInMemory()) {
 }
 ```
 
-JDBC code catches `SQLException` the normal way.
+JDBC code catches `SQLException` the normal way. Errors carry the SQLState of the engine error: `23505` for a unique or primary key violation, `23502` NOT NULL, `23503` foreign key, `40001` a write conflict worth retrying, `42P01` an unknown table, `42601` a syntax error. Using a closed database, statement or transaction raises an exception rather than crashing the JVM.
 
 ## Architecture
 
@@ -423,8 +480,8 @@ JDBC code catches `SQLException` the normal way.
 +------------------------------------------------------+
 |         stoolap-jni  (Rust crate in jni/)            |
 |  +-- Wraps stoolap::api::{Database, Statement, Tx}   |
-|  +-- CachedPlanRef for zero-parse execution          |
-|  +-- encode_rows / decode_binary_params              |
+|  +-- Statement runs on its compiled plan             |
+|  +-- packs results, whole or in cursor chunks        |
 +------------------------------------------------------+
                           |
                           v
