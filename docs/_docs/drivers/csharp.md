@@ -14,35 +14,25 @@ Targets **.NET 8** and **.NET 9**. Supported platforms: macOS (arm64/x64), Linux
 
 ## Installation
 
-Until the first release is published to NuGet, build from source:
-
 ```bash
-git clone https://github.com/stoolap/stoolap-csharp.git
-cd stoolap-csharp
-
-# 1. Build the native library (requires Rust + stoolap source next to this repo)
-./build/build-native.sh
-
-# 2. Build and test the managed assembly
-dotnet build -c Release
-dotnet test  -c Release
+dotnet add package Stoolap
 ```
 
-In your project file:
+Or in your project file:
 
 ```xml
-<PackageReference Include="Stoolap" Version="0.4.0" />
+<PackageReference Include="Stoolap" Version="0.5.0" />
 ```
 
-Requires **.NET 8 SDK or newer**.
+Driver 0.5.0 is built on Stoolap engine 0.5.0. The package ships the native library for every supported platform under `runtimes/<rid>/native/`. Requires **.NET 8 SDK or newer**. To build from source instead, see [Building from Source](#building-from-source).
 
 ## Native Library Loading
 
-The driver searches for `libstoolap.{dylib,so,dll}` in this order:
+The driver searches for `libstoolap.{dylib,so,dll}` in this order. On Windows the native file is `libstoolap.dll` rather than `stoolap.dll`, so it cannot collide with the managed `Stoolap.dll` on the case-insensitive filesystem.
 
 1. Absolute path in the `STOOLAP_LIB_PATH` environment variable.
 2. The RID-specific folder `runtimes/<rid>/native/` next to the running assembly. This is the canonical NuGet layout and is the resolver's preferred location, both for packed-package consumers and for project-reference consumers (the build targets copy the host platform's binary into this subfolder).
-3. The assembly's base directory next to `Stoolap.dll`. **Skipped on Windows**, where the case-insensitive filesystem would cause `stoolap.dll` (native) to collide with `Stoolap.dll` (managed). Windows users with a custom native location should use `STOOLAP_LIB_PATH`.
+3. The assembly's base directory next to `Stoolap.dll`, where a RID-specific build or publish places it.
 4. The OS loader search path (`LD_LIBRARY_PATH`, `DYLD_LIBRARY_PATH`, `PATH`, `/usr/local/lib`, etc.).
 
 ```bash
@@ -86,14 +76,14 @@ foreach (var row in result.Rows)
 // In-memory (isolated, each call creates a new instance)
 using var db = Database.OpenInMemory();
 
-// In-memory via DSN (shared instance per DSN string)
+// In-memory via DSN (one engine per DSN string)
 using var db = Database.Open("memory://");
 
 // File-based (data persists across restarts)
 using var db = Database.Open("file:///absolute/path/to/db");
 ```
 
-`Database.OpenInMemory()` always returns a fresh engine. `Database.Open(dsn)` routes through a global DSN registry, so opening the same DSN twice returns the same engine instance. For isolated in-memory databases, prefer `OpenInMemory()` or a unique DSN suffix like `memory://test-{guid}`.
+`Database.OpenInMemory()` always returns a fresh engine. `Database.Open(dsn)` routes through a global DSN registry: opening a DSN that is already open gives a new session on the same engine, with its own transaction state, so two handles on `memory://` see the same tables. For isolated in-memory databases, prefer `OpenInMemory()` or a unique DSN suffix like `memory://test-{guid}`.
 
 ## Core API
 
@@ -104,7 +94,7 @@ using var db = Database.Open("file:///absolute/path/to/db");
 | `Database.Version` | `string` | Version of the underlying libstoolap |
 | `db.Execute(sql)` | `long` | Execute DDL/DML, returns rows affected |
 | `db.Execute(sql, params)` | `long` | Execute with positional parameters |
-| `db.Query(sql)` | `QueryResult` | Materialized query (binary fetch-all path) |
+| `db.Query(sql)` | `QueryResult` | Materialized query (one-call path) |
 | `db.Query(sql, params)` | `QueryResult` | Materialized parameterized query |
 | `db.QueryStream(sql)` | `Rows` | Streaming row reader |
 | `db.QueryStream(sql, params)` | `Rows` | Streaming parameterized query |
@@ -118,11 +108,11 @@ using var db = Database.Open("file:///absolute/path/to/db");
 
 The driver exposes two read paths so callers can pick per workload:
 
-- **`QueryResult`**. Fully materialized. Backed by `stoolap_rows_fetch_all`, which transfers the entire result set as a single binary buffer in one P/Invoke crossing. Then `BinaryRowParser` decodes it in one pass with zero copies for numerics. Use for small-to-medium result sets where the ergonomic `row[0]` / `result.Columns` API is useful.
+- **`QueryResult`**. Fully materialized. Backed by `stoolap_query_params_all` / `stoolap_stmt_query_all`, which run the statement and pack the entire result set into one binary buffer in a single P/Invoke call, with no rows handle to open or close. `BinaryRowParser` then decodes it in one pass. Use for small-to-medium result sets where the ergonomic `row[0]` / `result.Columns` API is useful.
 - **`Rows`**. Streaming reader. One P/Invoke call per row advance, per-cell accessors (`GetInt64`, `GetString`, etc.). Use for large result sets, LINQ-style iteration, or when you want to stop early.
 
 ```csharp
-// Materialized (one crossing, all rows decoded up-front)
+// Materialized (one call, all rows decoded up-front)
 var result = db.Query("SELECT id, name FROM users LIMIT 100");
 foreach (var row in result.Rows)
 {
@@ -150,7 +140,9 @@ db.Query("SELECT * FROM t WHERE id = ? AND name = ?", 1, "hello");
 
 Parameters are marshalled with zero heap allocations in the driver layer: a stack-allocated `Span<StoolapValue>` holds the FFI-ready values, and a stack-allocated 1 KiB `byte*` scratch buffer receives UTF-8 payloads for short string/blob parameters. Only oversized payloads fall back to `Marshal.AllocHGlobal`, which is freed at the end of the call.
 
-Supported parameter types: `null` / `DBNull`, `bool`, `sbyte`/`byte`/`short`/`ushort`/`int`/`uint`/`long`/`ulong`, `float`/`double`/`decimal`, `string`, `DateTime`/`DateTimeOffset` (as `TIMESTAMP` with nanosecond precision), `byte[]` / `ReadOnlyMemory<byte>` (as `BLOB`), `float[]` (as `VECTOR`), `Guid` (as `TEXT`).
+Every placeholder needs a value: a missing one is an error, and so is mixing positional (`?`, `$1`) and named (`:name`) placeholders in one statement.
+
+Supported parameter types: `null` / `DBNull`, `bool`, `sbyte`/`byte`/`short`/`ushort`/`int`/`uint`/`long`/`ulong`, `float`/`double`/`decimal`, `string`, `DateTime`/`DateTimeOffset` (as `TIMESTAMP` with nanosecond precision), `byte[]` / `ReadOnlyMemory<byte>` (as a `VECTOR` payload of packed little-endian `float32` values; any other length is an error, since Stoolap has no byte BLOB type), `float[]` (as `VECTOR`), `Guid` (as `TEXT`).
 
 ## Prepared Statements
 
@@ -167,7 +159,7 @@ var result = lookup.Query(1);
 Console.WriteLine(result[0, 1]); // "Alice"
 ```
 
-Prepared statements cache the parsed AST on the Rust side, so every subsequent `Execute`/`Query` skips SQL parsing entirely. The C# side also caches column name `CString`s, so re-queries amortize the column header decode.
+Prepared statements cache the parsed AST on the Rust side, so every subsequent `Execute`/`Query` skips SQL parsing entirely. The C# side remembers the last result header of each statement and reuses its decoded column names while the header bytes stay the same; a schema change after `Prepare` produces a different header, which is decoded afresh.
 
 ### PreparedStatement Methods
 
@@ -199,6 +191,7 @@ using (var tx = db.Begin())
 ### Snapshot Isolation
 
 ```csharp
+// StoolapIsolationLevel lives in the Stoolap.Native namespace.
 using (var tx = db.Begin(StoolapIsolationLevel.Snapshot))
 {
     // Sees a consistent view from the transaction's start point.
@@ -225,13 +218,15 @@ tx.Commit();
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `Execute(sql, params)` | `long` | Execute DDL/DML |
-| `Query(sql, params)` | `QueryResult` | Materialized query (binary fetch-all) |
+| `Query(sql, params)` | `QueryResult` | Materialized query (one-call path) |
 | `QueryStream(sql, params)` | `Rows` | Streaming row reader inside the transaction |
 | `Execute(stmt, params)` | `long` | Execute a prepared statement in this transaction |
 | `Query(stmt, params)` | `QueryResult` | Query a prepared statement in this transaction |
 | `Commit()` | `void` | Commit the transaction |
 | `Rollback()` | `void` | Rollback the transaction (idempotent) |
 | `Dispose()` | `void` | Auto-rollback if not committed |
+
+A transaction keeps its database's native handle alive until it commits, rolls back or is disposed, so disposing the `Database` first does not cut it off.
 
 ## Multi-Threaded Use
 
@@ -253,7 +248,9 @@ t1.Start(); t2.Start();
 t1.Join();  t2.Join();
 ```
 
-Clones share the underlying engine (data, indexes, WAL) but each has its own executor and error state. Cloning is cheap and integrates cleanly with ADO.NET connection pooling.
+Clones share the underlying engine (data, indexes, WAL) but each has its own executor and error state. Cloning is cheap.
+
+Objects that come from a handle (`Transaction`, `PreparedStatement`, `Rows`, and the ADO.NET connection, command and reader) are not thread-safe either, but they are not tied to the thread that created them: using one from different threads one after another, for example across an `await`, is fine. A transaction that is never disposed is rolled back, and releases its connection, on the finalizer thread.
 
 ## ADO.NET Provider
 
@@ -280,7 +277,7 @@ cmd.ExecuteNonQuery();
 
 ### Named Parameters
 
-ADO.NET idiom is named parameters (`@name`, `:name`, `$name`). The command layer rewrites these into positional `?` before sending them to the engine, preserving string literals, quoted identifiers, and line/block comments.
+ADO.NET idiom is named parameters (`@name`, `:name`, `$name`). The command layer rewrites these into numbered placeholders (`$1`, `$2`, ...), one per distinct name, before sending them to the engine, so a name used twice is one value (two anonymous `?` are two different expressions in Stoolap 0.5). String literals, double-quoted and backtick-quoted identifiers, line/block comments and the `::` cast operator are left alone. A command whose SQL names a parameter missing from its `Parameters` collection throws before it runs.
 
 ```csharp
 using var cmd = conn.CreateCommand();
@@ -311,12 +308,18 @@ while (reader.Read())
 }
 ```
 
-`StoolapDataReader` has two backing modes:
+`StoolapDataReader` wraps a streaming `Rows` handle, for connection-level and transaction-level commands alike: one P/Invoke call per `Read` and per-cell native accessors. `ExecuteScalar` uses the materialized one-call path.
 
-- **Streaming** (default for connection-level queries). Wraps a `Rows` handle, one P/Invoke call per `Read`, per-cell native accessors.
-- **Materialized** (used inside transactions). Wraps a pre-decoded `QueryResult` over the binary fetch-all buffer.
+Behaviour that ADO.NET consumers such as Dapper rely on:
 
-All standard accessors are implemented: `GetInt32`, `GetInt64`, `GetString`, `GetDouble`, `GetBoolean`, `GetDateTime`, `GetValues`, `IsDBNull`, `GetOrdinal`, `GetName`, `GetFieldType`, string indexer, integer indexer, `NextResult`.
+- **Column types are learned from the data.** The engine reports each value's type, not a result column's declared type. The reader reads the first row when it opens, and when a column is NULL there it reads ahead (up to 64 rows, replayed in order) until every column has shown a value, so `GetFieldType` is right before the first `Read` even when the first rows hold NULLs. A column that is NULL in all of those rows, and every column of an empty result, reports `object`. Dapper copes with that when a class property's type is exactly the value's type (`long?`, `double?`, `string`, `DateTime?`, `bool?`): an empty result maps to an empty list, and so does `QueryFirstOrDefault`. Two cases still fail, because the engine does not report column types on its own: constructor mapping of a positional `record` on an empty result, and a narrower property (such as `int?` for an INTEGER column) whose column's first value comes after the first 64 rows. Prefer classes with exact property types for queries that can return no rows or long runs of NULLs.
+- **Typed getters are strict.** `GetInt64`, `GetString` and the other typed getters throw `InvalidCastException` on a NULL value; check `IsDBNull` or read the value with `GetValue`, which returns `DBNull.Value`. A getter reads a value of its own type, and converts between INTEGER, FLOAT, BOOLEAN and numeric TEXT (`GetString` also formats numbers and booleans); any other conversion, such as `GetString` on a TIMESTAMP or `GetInt64` on non-numeric TEXT, throws `InvalidCastException`. An ordinal outside the result throws `IndexOutOfRangeException`.
+- **`RecordsAffected`** is the number of rows a DML statement changed and -1 for a query, and stays readable after the reader is closed.
+- **Closing the connection** closes its open readers and rolls back its transactions that have not ended. `CommandBehavior.CloseConnection` closes the connection when the reader closes.
+- **`GetFieldValue<T>`** converts through the typed getters (`GetFieldValue<int>` works on an INTEGER column), and **`GetSchemaTable`** describes the result, so `DataTable.Load` works.
+- **Not supported:** a command returns one result set (`NextResult` is always false, so Dapper's `QueryMultiple` cannot be used); `CommandTimeout` is not applied (set a per-connection limit with the `query_timeout` DSN key or `PRAGMA query_timeout`); a `Guid` is stored as TEXT, so Dapper needs a type handler (`SqlMapper.AddTypeHandler`) to map it back to a `Guid` property.
+
+All standard accessors are implemented: `GetInt32`, `GetInt64`, `GetString`, `GetDouble`, `GetBoolean`, `GetDateTime`, `GetFieldValue<T>`, `GetValues`, `IsDBNull`, `GetOrdinal`, `GetName`, `GetFieldType`, `GetSchemaTable`, string indexer, integer indexer, `NextResult`.
 
 ### Transactions via ADO.NET
 
@@ -362,7 +365,7 @@ var users = await conn.QueryAsync<User>(
 record User(long Id, string Name);
 ```
 
-The async overloads fall back to synchronous execution wrapped in `Task.Run`, matching how Microsoft.Data.Sqlite handles its own async path.
+The provider has no native async I/O: the async methods are the `System.Data.Common` defaults, which run synchronously on the calling thread and return a completed task.
 
 ## Type Mapping
 
@@ -374,22 +377,27 @@ The async overloads fall back to synchronous execution wrapped in `Task.Run`, ma
 | `bool` | `BOOLEAN` | `bool` |
 | `DateTime`, `DateTimeOffset` | `TIMESTAMP` (nanos UTC) | `DateTime` (UTC) |
 | `string` (JSON) | `JSON` | `string` |
-| `byte[]`, `ReadOnlyMemory<byte>` | `BLOB` | `byte[]` |
+| `byte[]`, `ReadOnlyMemory<byte>` (packed little-endian f32, length a multiple of 4) | `VECTOR` | `float[]` |
 | `float[]` | `VECTOR` | `float[]` |
 | `Guid` | `TEXT` (string form) | `string` |
 | `null`, `DBNull.Value` | `NULL` | `null` |
+| `enum` | `INTEGER` (underlying value) | `long` |
+| `char` | `TEXT` | `string` |
+
+Any other parameter type throws `NotSupportedException` rather than being stored in some string form. `ulong` values above `long.MaxValue` throw `OverflowException`, and `DateTime` values outside 1677-09-21 to 2262-04-11 (the range of an i64 nanosecond `TIMESTAMP`) throw `ArgumentOutOfRangeException`.
 
 Aggregate results (`SUM`, `AVG` over integer columns) may be returned as `long` or `double` depending on the planner's promotion rules. Use `Convert.ToInt64` / `Convert.ToDouble` when reading aggregate output.
 
 ## Performance
 
-The driver is built around five performance principles:
+The driver is built around six performance principles:
 
 1. **Source-generated P/Invoke.** Every native entry point uses `[LibraryImport]`, which generates marshalling stubs at compile time instead of at JIT time. No per-call IL stubs, full AOT compatibility.
 2. **UTF-8 end to end.** Stoolap is UTF-8 throughout, and `StringMarshalling.Utf8` skips the UTF-16 round trip a plain `DllImport` would force.
 3. **Zero-allocation parameter binding.** `Span<StoolapValue>` via `stackalloc` holds FFI values on the stack, and a 1 KiB `byte*` scratch buffer receives short UTF-8 payloads. `[SkipLocalsInit]` on the hot path avoids zeroing the scratch buffer. The driver itself allocates **zero bytes per call**; all per-call heap traffic is at the caller (the `params object?[]` array, value-type boxes, and string interpolations).
-4. **Binary fetch-all read path.** `Database.Query()` issues one P/Invoke call, receives the entire result set as a single binary buffer from `stoolap_rows_fetch_all`, and decodes it in one pass over a `ReadOnlySpan<byte>`. Numeric cells are read with `Unsafe.ReadUnaligned<T>` and never boxed until the user asks for them.
-5. **`SafeHandle` everywhere.** Every opaque pointer (`StoolapDB*`, `StoolapStmt*`, `StoolapRows*`, `StoolapTx*`) is wrapped in a `SafeHandle` subclass, so handles are freed on every exception path and during AppDomain teardown without leaking.
+4. **One-call read path.** `Query()` on `Database`, `Transaction` and `PreparedStatement` issues one P/Invoke call: `stoolap_query_params_all` / `stoolap_stmt_query_all` run the statement and pack the whole result into a buffer owned by the handle, so there is no rows handle to open, no second call to fetch, and nothing to free. The buffer is decoded in one pass over a `ReadOnlySpan<byte>`. A prepared point lookup costs about a quarter less than the v0.4 open-fetch-close sequence.
+5. **Cached column headers.** Each connection and prepared statement remembers the last result header and reuses its decoded column names when the next result has the same bytes.
+6. **`SafeHandle` everywhere.** Every opaque pointer (`StoolapDB*`, `StoolapStmt*`, `StoolapRows*`, `StoolapTx*`) is wrapped in a `SafeHandle` subclass, so handles are freed on every exception path and during AppDomain teardown without leaking.
 
 ### Running the Benchmark
 
@@ -435,7 +443,7 @@ Inside the ADO.NET layer, the same exception propagates through `DbCommand.Execu
 |  +-- NamedParameterRewriter|  +-- ParameterBinder    |
 |  +-- StoolapTransaction    |  +-- BinaryRowParser    |
 +------------------------------------------------------+
-|  Stoolap.Native (internal)                            |
+|  Stoolap.Native (bindings internal; public enums)     |
 |  +-- NativeMethods  [LibraryImport] bindings          |
 |  +-- StoolapValue   [StructLayout] tagged union       |
 |  +-- SafeHandle wrappers                              |
@@ -458,7 +466,7 @@ Inside the ADO.NET layer, the same exception propagates through `DbCommand.Execu
 
 ## Testing
 
-The repository ships with a full xUnit suite across eleven test files, covering both target frameworks (`net8.0` and `net9.0`):
+The repository ships with a full xUnit suite across thirteen test files, covering both target frameworks (`net8.0` and `net9.0`):
 
 - `SmokeTests.cs`. Open/close, execute, query, streaming, prepared statements, transactions, clone, NULL parameters.
 - `ParameterBinderTests.cs`. Scratch-buffer fast path, HGlobal slow path, boundary cases, all primitive types, stackalloc capacity transitions.
@@ -470,6 +478,8 @@ The repository ships with a full xUnit suite across eleven test files, covering 
 - `ErrorHandlingTests.cs`. Invalid SQL, missing tables, duplicate tables, disposed objects, transaction-after-end, null arguments.
 - `TypeRoundTripTests.cs`. Every Stoolap type through both the binary and streaming read paths, including 100 K-byte strings, Unicode payloads, timestamps, vectors, JSON, and NULL.
 - `AdoTests.cs`. ADO.NET connection lifecycle, reader streaming, transaction rollback.
+- `FastPathTests.cs`. One-call queries on every handle, the column header cache across schema changes, transaction reads of uncommitted writes, a transaction outliving its `Database`, engine error messages, streaming every value type.
+- `AdoContractTests.cs`. Dapper mapping with NULL-first rows, column type look-ahead, connection close and `CloseConnection`, `RecordsAffected`, ordinal and NULL errors, `GetFieldValue`, `GetSchemaTable`, parameter type rules.
 - `RegressionTests.cs`. Driver-contract regressions: `HasRows` accuracy on empty results, `GetFieldType` schema stability before `Read()`, transaction-foreign-connection rejection, transactional `ExecuteReader` streaming behavior.
 
 Run the full suite:
@@ -505,7 +515,7 @@ The build script resolves the stoolap source in this order:
 
 1. `$STOOLAP_ROOT` if set and points at a Cargo project.
 2. `../stoolap` (a sibling checkout next to this repo).
-3. Auto-clones `github.com/stoolap/stoolap` at the version pinned in `STOOLAP_ENGINE_REF` (default `v0.4.0`) into `build/.stoolap-engine/`. The clone is gitignored and reused on subsequent runs.
+3. Auto-clones `github.com/stoolap/stoolap` at the version pinned in `STOOLAP_ENGINE_REF` (default `v0.5.0`) into `build/.stoolap-engine/`. The clone is gitignored and reused on subsequent runs.
 
 It then runs `cargo build --release --features ffi`, detects the host OS/arch, and drops the resulting binary into `runtimes/<rid>/native/`, the standard NuGet convention. This is the same layout the published package uses to ship per-platform binaries.
 
