@@ -22,6 +22,8 @@ dependencies: [
 
 The package links `StoolapC.xcframework`, the engine's C API built as a static library for macOS and iOS, which Swift Package Manager downloads from the [release](https://github.com/stoolap/stoolap-swift/releases). No Rust toolchain is needed.
 
+Driver 0.5.0 is built on Stoolap engine 0.5.0. Requires macOS 12+ or iOS 15+. To build the engine from source instead, see [Building from Source](#building-from-source).
+
 ## Quick Start
 
 ```swift
@@ -66,12 +68,16 @@ let db = try Database.open("file:///absolute/path/to/db")
 let db = try Database.open("./mydata?sync=full&compression=on")
 ```
 
+`:memory:`, an empty string and `memory://` all name the same in-memory database: while one `Database` on it is open, a second open of the same DSN shares its engine and data. Use a name such as `memory://cache` for a separate in-memory database. The data of an in-memory database is gone once the last `Database` on it is released.
+
+See [Connection Strings]({{ '/docs/getting-started/connection-strings/' | relative_url }}) for every configuration option.
+
 ## Methods
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `execute(sql, params?)` | `Int64` | Execute DML statement, return rows affected |
-| `exec(sql)` | `Void` | Execute one or more semicolon-separated statements |
+| `execute(sql, params?)` | `Int64` | Execute one statement, return rows affected (discardable) |
+| `exec(sql)` | `Void` | Execute a script of semicolon-separated statements, without parameters |
 | `query(sql, params?)` | `[Row]` | Query rows with named column access |
 | `queryOne(sql, params?)` | `Row?` | Query single row |
 | `queryRaw(sql, params?)` | `ColumnarResult` | Query in flat columnar format |
@@ -79,6 +85,9 @@ let db = try Database.open("./mydata?sync=full&compression=on")
 | `prepare(sql)` | `PreparedStatement` | Create a prepared statement |
 | `begin()` | `Transaction` | Begin a transaction |
 | `withTransaction(_:)` | Generic | Auto-commit/rollback closure |
+| `Database.version` | `String` | Engine version, e.g. `"0.5.0"` |
+
+`exec` parses the whole script before it runs anything: a syntax error anywhere runs none of it. After a runtime error, the statements before the failing one stay applied.
 
 ## Row Access
 
@@ -124,7 +133,7 @@ for id in ids {
 
 ## Streaming Cursor
 
-For large result sets where you want bounded memory instead of bulk materialization. The cursor reads rows from the engine in packed chunks of 32 rows, doubling up to 256, so memory stays bounded at any result size:
+For large result sets where you want bounded memory instead of bulk materialization. The cursor reads rows from the engine in packed chunks of 32 rows, doubling up to 256, so it holds at most one chunk at any result size:
 
 ```swift
 let cursor = try db.queryCursor("SELECT * FROM users ORDER BY id")
@@ -145,6 +154,8 @@ try cursor.forEachRemaining { row in
     process(row)
 }
 ```
+
+`cursor.columns` holds the column names. The cursor closes itself when it runs out of rows; call `close()` to stop early. `PreparedStatement` and `Transaction` have `queryCursor` too. An error partway through a chunk is thrown before that chunk's earlier rows are returned.
 
 ## Prepared Statements
 
@@ -169,10 +180,11 @@ let user = try lookup.queryOne([.integer(1)])
 | `queryRaw(params?)` | `ColumnarResult` | Query in columnar format |
 | `queryCursor(params?)` | `RowCursor` | Streaming cursor |
 | `executeBatch(paramsList)` | `Int64` | Batch execute in single FFI call |
+| `sql` | `String` | The statement's SQL text |
 
 ## Batch Execution
 
-Execute multiple parameter sets in a single FFI call. Automatically wraps in a transaction on the Rust side.
+Execute multiple parameter sets in a single FFI call. The engine runs them in one transaction: if any row fails, none of the rows are applied. Every parameter set must have the same number of values.
 
 ```swift
 let insert = try db.prepare("INSERT INTO users VALUES ($1, $2, $3)")
@@ -211,6 +223,8 @@ do {
 }
 ```
 
+A `Transaction` released without `commit()` or `rollback()` is rolled back. After either call, every other call on it throws.
+
 ### Transaction Methods
 
 | Method | Returns | Description |
@@ -219,6 +233,7 @@ do {
 | `query(sql, params?)` | `[Row]` | Query rows |
 | `queryOne(sql, params?)` | `Row?` | Query single row |
 | `queryRaw(sql, params?)` | `ColumnarResult` | Query in columnar format |
+| `queryCursor(sql, params?)` | `RowCursor` | Streaming cursor |
 | `commit()` | `Void` | Commit the transaction |
 | `rollback()` | `Void` | Rollback the transaction |
 
@@ -236,7 +251,10 @@ try await db.execute("INSERT INTO users VALUES ($1, $2)",
 let users = try await db.query("SELECT * FROM users")
 let one = try await db.queryOne("SELECT * FROM users WHERE id = $1", [.integer(1)])
 let raw = try await db.queryRaw("SELECT * FROM users")
+let stmt = try await db.prepare("SELECT * FROM users WHERE id = $1")
 ```
+
+`AsyncDatabase` has `execute`, `exec`, `query`, `queryOne`, `queryRaw` and `prepare`. For transactions and cursors, use the wrapped `Database`: `let inner = await db.db`.
 
 ## Parameters
 
@@ -253,7 +271,9 @@ All methods throw `StoolapError` on failure:
 
 ```swift
 do {
-    try db.execute("INSERT INTO users VALUES ($1, $2)", [.integer(1), .null])
+    // id 1 already exists
+    try db.execute("INSERT INTO users VALUES ($1, $2, $3)",
+                   [.integer(1), .text("Alice"), .null])
 } catch let error as StoolapError {
     print("Database error: \(error.message)")
 }
@@ -273,19 +293,55 @@ do {
 | `.blob(Data)` | `VECTOR` | Packed little-endian f32 bytes (length a multiple of 4); reads back as `.vector` |
 | `.vector([Float])` | `VECTOR` | Packed f32 for similarity search |
 
+Values read back as the same case they were written with, except `.blob`, which reads back as `.vector`. A `.json` parameter that is not valid JSON is an error. A `.timestamp` outside 1677-2262, or a `.blob` whose length is not a multiple of 4, throws before the statement runs.
+
+## Vector Search
+
+Bind a `[Float]` as `.vector` to store it in a `VECTOR(N)` column or to pass it to a distance function:
+
+```swift
+try db.exec("""
+    CREATE TABLE documents (
+        id INTEGER PRIMARY KEY,
+        title TEXT,
+        embedding VECTOR(3)
+    );
+    CREATE INDEX idx_emb ON documents(embedding) USING HNSW WITH (metric = 'cosine');
+""")
+
+try db.execute("INSERT INTO documents VALUES ($1, $2, $3)",
+               [.integer(1), .text("Hello world"), .vector([0.1, 0.2, 0.3])])
+try db.execute("INSERT INTO documents VALUES ($1, $2, $3)",
+               [.integer(2), .text("Goodbye world"), .vector([0.9, 0.1, 0.0])])
+
+// 5 nearest neighbours by cosine distance
+let nearest = try db.query("""
+    SELECT id, title, VEC_DISTANCE_COSINE(embedding, $1) AS dist
+    FROM documents
+    ORDER BY dist
+    LIMIT 5
+""", [.vector([0.1, 0.2, 0.3])])
+
+// Vectors read back as .vector([Float])
+let embedding = try db.queryOne("SELECT embedding FROM documents WHERE id = 1")?["embedding"]
+```
+
+See [Vector Search]({{ '/docs/data-types/vector-search/' | relative_url }}) for the distance functions and HNSW index options.
+
 ## Persistence
 
 File-based databases persist data using WAL and immutable cold volumes.
 
 ```swift
-let db = try Database.open("./mydata?sync=full")
-
-try db.exec("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT)")
-try db.execute("INSERT INTO kv VALUES ($1, $2)", [.text("hello"), .text("world")])
+do {
+    let db = try Database.open("./mydata?sync=full")
+    try db.exec("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)")
+    try db.execute("INSERT INTO notes VALUES ($1, $2)", [.integer(1), .text("hello")])
+}   // the last Database on ./mydata is released here, which closes it
 
 // Reopen: data is still there
-let db2 = try Database.open("./mydata")
-let row = try db2.queryOne("SELECT * FROM kv WHERE key = $1", [.text("hello")])
+let db = try Database.open("./mydata")
+let row = try db.queryOne("SELECT body FROM notes WHERE id = $1", [.integer(1)])
 ```
 
 ## Thread Safety
@@ -294,7 +350,7 @@ let row = try db2.queryOne("SELECT * FROM kv WHERE key = $1", [.text("hello")])
 
 ## Building from Source
 
-Requires [Rust](https://rustup.rs) (stable) and Swift 5.9+.
+Requires [Rust](https://rustup.rs) (stable) and Swift 6.0+.
 
 ```bash
 git clone https://github.com/stoolap/stoolap-swift.git
