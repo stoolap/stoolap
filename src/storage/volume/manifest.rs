@@ -974,10 +974,11 @@ fn shadow_output(
         }
     } else {
         for (newer_pos, &id) in newer.meta.row_ids.iter().enumerate() {
-            if (lo..=hi).contains(&id) && live(newer_pos) {
-                if let Some(pos) = output.locate(id) {
-                    hide(pos);
-                }
+            if (lo..=hi).contains(&id)
+                && live(newer_pos)
+                && let Some(pos) = output.locate(id)
+            {
+                hide(pos);
             }
         }
     }
@@ -1187,10 +1188,10 @@ fn mask_shared_ids(
         }
     } else {
         for &id in new.meta.row_ids.iter() {
-            if (lo..=hi).contains(&id) {
-                if let Some(pos) = old.locate(id) {
-                    clear(pos, id);
-                }
+            if (lo..=hi).contains(&id)
+                && let Some(pos) = old.locate(id)
+            {
+                clear(pos, id);
             }
         }
     }
@@ -1684,11 +1685,11 @@ impl ColumnSchemaChange {
 
 impl Drop for ColumnSchemaChange {
     fn drop(&mut self) {
-        if !self.changed {
-            if let Some(mgr) = &self.mgr {
-                mgr.schema_generation
-                    .fetch_add(1, std::sync::atomic::Ordering::Release);
-            }
+        if !self.changed
+            && let Some(mgr) = &self.mgr
+        {
+            mgr.schema_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
         }
     }
 }
@@ -2301,31 +2302,31 @@ impl SegmentManager {
         stmt: Option<&dyn CapturedVolumes>,
     ) -> crate::core::Result<Option<crate::core::Value>> {
         for seg_id in seg_ids {
-            if let Some(cold) = segments.get(seg_id) {
-                if let Some(idx) = cold.locate_authoritative(row_id) {
-                    let pi = if cold.mapping.is_identity {
-                        col_idx
-                    } else if col_idx < cold.mapping.sources.len() {
-                        match &cold.mapping.sources[col_idx] {
-                            super::writer::ColSource::Volume(vi) => *vi,
-                            super::writer::ColSource::Default(val) => return Ok(Some(val.clone())),
-                        }
-                    } else {
-                        return Ok(None);
-                    };
-                    if cold.volume.is_cold() {
-                        let vol = match stmt {
-                            Some(snap) => snap.volume(self, *seg_id, cold)?,
-                            None => match self.ensure_volume(*seg_id)? {
-                                Some(vol) => vol,
-                                None => return Ok(None),
-                            },
-                        };
-                        return Ok(Some(vol.cell(pi, idx)?));
+            if let Some(cold) = segments.get(seg_id)
+                && let Some(idx) = cold.locate_authoritative(row_id)
+            {
+                let pi = if cold.mapping.is_identity {
+                    col_idx
+                } else if col_idx < cold.mapping.sources.len() {
+                    match &cold.mapping.sources[col_idx] {
+                        super::writer::ColSource::Volume(vi) => *vi,
+                        super::writer::ColSource::Default(val) => return Ok(Some(val.clone())),
                     }
-                    cold.volume.mark_accessed();
-                    return Ok(Some(cold.volume.cell(pi, idx)?));
+                } else {
+                    return Ok(None);
+                };
+                if cold.volume.is_cold() {
+                    let vol = match stmt {
+                        Some(snap) => snap.volume(self, *seg_id, cold)?,
+                        None => match self.ensure_volume(*seg_id)? {
+                            Some(vol) => vol,
+                            None => return Ok(None),
+                        },
+                    };
+                    return Ok(Some(vol.cell(pi, idx)?));
                 }
+                cold.volume.mark_accessed();
+                return Ok(Some(cold.volume.cell(pi, idx)?));
             }
         }
         Ok(None)
@@ -2413,14 +2414,12 @@ impl SegmentManager {
                             continue;
                         }
                         if !col.is_null(i) && col.get_i64(i) == target && !ts.contains_key(&rid) {
-                            if seg_ids.len() > 1 {
-                                if let Some(current_val) =
+                            if seg_ids.len() > 1
+                                && let Some(current_val) =
                                     self.get_authoritative_value(seg_ids, segs, rid, col_idx, stmt)?
-                                {
-                                    if &current_val != value {
-                                        continue;
-                                    }
-                                }
+                                && &current_val != value
+                            {
+                                continue;
                             }
                             found = Some(rid);
                             return Ok(false);
@@ -2556,11 +2555,11 @@ impl SegmentManager {
             // Tier 2: Bloom filter pruning
             let mut bloom_skip = false;
             for (i, &vi) in vol_col_indices.iter().enumerate() {
-                if let Some(h) = bloom_hashes[i] {
-                    if !vol.meta.bloom_filters.might_contain_hash(vi, h)? {
-                        bloom_skip = true;
-                        break;
-                    }
+                if let Some(h) = bloom_hashes[i]
+                    && !vol.meta.bloom_filters.might_contain_hash(vi, h)?
+                {
+                    bloom_skip = true;
+                    break;
                 }
             }
             if bloom_skip {
@@ -2605,7 +2604,7 @@ impl SegmentManager {
                 let present: Vec<(usize, usize)> = vol_col_indices
                     .iter()
                     .enumerate()
-                    .filter(|(_, &vi)| vi != usize::MAX)
+                    .filter(|&(_, &vi)| vi != usize::MAX)
                     .map(|(i, &vi)| (i, vi))
                     .collect();
                 for (i, &rid) in row_ids.iter().enumerate() {
@@ -2859,10 +2858,10 @@ impl SegmentManager {
         let mut segments = self.segments.write();
         let mut new_map = (**segments).clone();
         for (id, old, warm) in warmed {
-            if let Some(cs) = new_map.get_mut(&id) {
-                if Arc::ptr_eq(&old, &cs.volume) {
-                    cs.volume = warm;
-                }
+            if let Some(cs) = new_map.get_mut(&id)
+                && Arc::ptr_eq(&old, &cs.volume)
+            {
+                cs.volume = warm;
             }
         }
         for &(seg_id, _, is_warm) in &targets {
@@ -3612,11 +3611,11 @@ impl SegmentManager {
     /// isolation: older snapshots won't see these tombstones.
     pub fn commit_pending_tombstones(&self, txn_id: i64, commit_seq: u64) {
         let pending = self.pending_txn_tombstones.write().remove(&txn_id);
-        if let Some(ids) = pending {
-            if !ids.is_empty() {
-                let id_vec: Vec<i64> = ids.into_keys().collect();
-                self.add_tombstones(&id_vec, commit_seq);
-            }
+        if let Some(ids) = pending
+            && !ids.is_empty()
+        {
+            let id_vec: Vec<i64> = ids.into_keys().collect();
+            self.add_tombstones(&id_vec, commit_seq);
         }
     }
 
@@ -3679,10 +3678,10 @@ impl SegmentManager {
             if row_id < *min_id || row_id > *max_id {
                 continue;
             }
-            if let Some(cold) = segments.get(seg_id) {
-                if cold.locate_authoritative(row_id).is_some() {
-                    return Ok(true);
-                }
+            if let Some(cold) = segments.get(seg_id)
+                && cold.locate_authoritative(row_id).is_some()
+            {
+                return Ok(true);
             }
         }
         Ok(false)
@@ -3717,22 +3716,22 @@ impl SegmentManager {
             if row_id < *min_id || row_id > *max_id {
                 continue;
             }
-            if let Some(cold) = segments.get(seg_id) {
-                if let Some(idx) = cold.locate_authoritative(row_id) {
-                    let vol = if cold.volume.is_cold() {
-                        match self.ensure_volume(*seg_id)? {
-                            Some(v) => v,
-                            None => {
-                                // Segment removed by compaction — retry with fresh state.
-                                return self.get_cold_row_normalized_retry(row_id, needed);
-                            }
+            if let Some(cold) = segments.get(seg_id)
+                && let Some(idx) = cold.locate_authoritative(row_id)
+            {
+                let vol = if cold.volume.is_cold() {
+                    match self.ensure_volume(*seg_id)? {
+                        Some(v) => v,
+                        None => {
+                            // Segment removed by compaction — retry with fresh state.
+                            return self.get_cold_row_normalized_retry(row_id, needed);
                         }
-                    } else {
-                        cold.volume.mark_accessed();
-                        Arc::clone(&cold.volume)
-                    };
-                    return Ok(Some(row_of(&vol, idx, &cold.mapping, needed)?));
-                }
+                    }
+                } else {
+                    cold.volume.mark_accessed();
+                    Arc::clone(&cold.volume)
+                };
+                return Ok(Some(row_of(&vol, idx, &cold.mapping, needed)?));
             }
         }
         Ok(None)
@@ -3757,21 +3756,21 @@ impl SegmentManager {
             (seg_ids, segments)
         };
         for seg_id in &seg_ids {
-            if let Some(cold) = segments.get(seg_id) {
-                if let Some(idx) = cold.locate_authoritative(row_id) {
-                    if cold.volume.is_cold() {
-                        return Err(crate::core::Error::Internal {
-                            message: format!(
-                                "table '{}': cold volume reload failed for segment {}; \
+            if let Some(cold) = segments.get(seg_id)
+                && let Some(idx) = cold.locate_authoritative(row_id)
+            {
+                if cold.volume.is_cold() {
+                    return Err(crate::core::Error::Internal {
+                        message: format!(
+                            "table '{}': cold volume reload failed for segment {}; \
                                  refusing to serve partial data",
-                                self.table_name.read(),
-                                seg_id
-                            ),
-                        });
-                    }
-                    cold.volume.mark_accessed();
-                    return Ok(Some(row_of(&cold.volume, idx, &cold.mapping, needed)?));
+                            self.table_name.read(),
+                            seg_id
+                        ),
+                    });
                 }
+                cold.volume.mark_accessed();
+                return Ok(Some(row_of(&cold.volume, idx, &cold.mapping, needed)?));
             }
         }
         Ok(None)
@@ -3795,10 +3794,10 @@ impl SegmentManager {
             if row_id < *min_id || row_id > *max_id {
                 continue;
             }
-            if let Some(cold) = segments.get(seg_id) {
-                if cold.locate_authoritative(row_id).is_some() {
-                    return Ok(true);
-                }
+            if let Some(cold) = segments.get(seg_id)
+                && cold.locate_authoritative(row_id).is_some()
+            {
+                return Ok(true);
             }
         }
         Ok(false)
@@ -3835,10 +3834,10 @@ impl SegmentManager {
         // Read before the maps are captured, so a change published after
         // the capture leaves the stored count stale
         let epoch = self.count_epoch.load(std::sync::atomic::Ordering::Acquire);
-        if let Some((at, count)) = *self.cached_count.lock() {
-            if at == epoch {
-                return Ok(count);
-            }
+        if let Some((at, count)) = *self.cached_count.lock()
+            && at == epoch
+        {
+            return Ok(count);
         }
         let count = self.compute_deduped_row_count()?;
         *self.cached_count.lock() = Some((epoch, count));
@@ -3898,15 +3897,15 @@ impl SegmentManager {
     /// a later INSERT within the same txn cannot hide an earlier seal.
     #[inline]
     pub fn record_txn_seal_generation(&self, txn_id: i64) {
-        let gen = self.seal_generation();
+        let seal_gen = self.seal_generation();
         let mut map = self.txn_seal_gens.lock();
         map.entry(txn_id)
             .and_modify(|existing| {
-                if gen < *existing && *existing != UNCHECKED_WRITES {
-                    *existing = gen;
+                if seal_gen < *existing && *existing != UNCHECKED_WRITES {
+                    *existing = seal_gen;
                 }
             })
-            .or_insert(gen);
+            .or_insert(seal_gen);
     }
 
     /// A write whose keys were not checked against the volumes: the commit

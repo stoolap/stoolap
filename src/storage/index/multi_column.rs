@@ -565,14 +565,15 @@ impl MultiColumnIndex {
             }
         }
 
-        if let Some(rows) = value_to_rows.get(key) {
-            if !rows.is_empty() && !rows.contains(row_id) {
-                return Err(Error::unique_constraint(
-                    &self.name,
-                    self.column_names.join(", "),
-                    key.0.to_vec(),
-                ));
-            }
+        if let Some(rows) = value_to_rows.get(key)
+            && !rows.is_empty()
+            && !rows.contains(row_id)
+        {
+            return Err(Error::unique_constraint(
+                &self.name,
+                self.column_names.join(", "),
+                key.0.to_vec(),
+            ));
         }
         Ok(())
     }
@@ -744,25 +745,26 @@ impl Index for MultiColumnIndex {
                 let key = CompositeKey(values.to_vec());
 
                 // Check intra-batch duplicates
-                if let Some(&existing_row_id) = batch_keys.get(&key) {
-                    if existing_row_id != row_id {
-                        return Err(Error::unique_constraint(
-                            &self.name,
-                            self.column_names.join(", "),
-                            values.to_vec(),
-                        ));
-                    }
+                if let Some(&existing_row_id) = batch_keys.get(&key)
+                    && existing_row_id != row_id
+                {
+                    return Err(Error::unique_constraint(
+                        &self.name,
+                        self.column_names.join(", "),
+                        values.to_vec(),
+                    ));
                 }
 
                 // Check against existing index
-                if let Some(existing_rows) = value_to_rows.get(&key) {
-                    if !existing_rows.is_empty() && !existing_rows.contains(row_id) {
-                        return Err(Error::unique_constraint(
-                            &self.name,
-                            self.column_names.join(", "),
-                            values.to_vec(),
-                        ));
-                    }
+                if let Some(existing_rows) = value_to_rows.get(&key)
+                    && !existing_rows.is_empty()
+                    && !existing_rows.contains(row_id)
+                {
+                    return Err(Error::unique_constraint(
+                        &self.name,
+                        self.column_names.join(", "),
+                        values.to_vec(),
+                    ));
                 }
 
                 batch_keys.insert(key, row_id);

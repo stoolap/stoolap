@@ -528,10 +528,10 @@ impl<'a> HashJoinOperator<'a> {
         let reads = cross.text_reads[reading as usize].get_or_insert_with(|| {
             let mut reads: ValueMap<SmallVec<[usize; 2]>> = ValueMap::default();
             for (idx, row) in build_rows.iter().enumerate() {
-                if let Some(Value::Text(text)) = row.get(build_idx) {
-                    if let Some(read) = reading.read(text).as_ref().and_then(reading_key) {
-                        reads.entry(read).or_default().push(idx);
-                    }
+                if let Some(Value::Text(text)) = row.get(build_idx)
+                    && let Some(read) = reading.read(text).as_ref().and_then(reading_key)
+                {
+                    reads.entry(read).or_default().push(idx);
                 }
             }
             reads
@@ -821,10 +821,11 @@ impl Operator for HashJoinOperator<'_> {
             // Handle unmatched probe row
             // - ANTI JOIN: Return probe row when NO match found
             // - OUTER JOINs: Return probe row with NULL build columns
-            if self.join_type.is_anti() && !self.probe_had_match {
-                if let Some(probe_row) = self.current_probe_row.take() {
-                    return Ok(Some(RowRef::Owned(probe_row)));
-                }
+            if self.join_type.is_anti()
+                && !self.probe_had_match
+                && let Some(probe_row) = self.current_probe_row.take()
+            {
+                return Ok(Some(RowRef::Owned(probe_row)));
             }
 
             // Handle unmatched probe row for OUTER joins
@@ -836,11 +837,12 @@ impl Operator for HashJoinOperator<'_> {
                 || (matches!(self.join_type, JoinType::Right) && self.build_side == JoinSide::Left)
                 || (matches!(self.join_type, JoinType::Left) && self.build_side == JoinSide::Right);
 
-            if needs_unmatched_probe && !self.probe_had_match {
-                if let Some(probe_row) = self.current_probe_row.take() {
-                    let null_build = self.null_build_row();
-                    return Ok(Some(self.combine_rows_ref(probe_row, null_build)));
-                }
+            if needs_unmatched_probe
+                && !self.probe_had_match
+                && let Some(probe_row) = self.current_probe_row.take()
+            {
+                let null_build = self.null_build_row();
+                return Ok(Some(self.combine_rows_ref(probe_row, null_build)));
             }
 
             // Get next probe row (must be done before borrowing hash_table)

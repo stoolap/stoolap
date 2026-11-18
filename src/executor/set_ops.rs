@@ -88,13 +88,12 @@ impl Executor {
         // Process each set operation in sequence
         for (index, set_op) in set_ops.iter().enumerate() {
             // For UNION ALL with limit, check if we already have enough rows
-            if matches!(set_op.operation, SetOperationType::UnionAll) {
-                if let Some(lim) = limit {
-                    if running.len() >= lim {
-                        // Already have enough rows, skip remaining set operations
-                        break;
-                    }
-                }
+            if matches!(set_op.operation, SetOperationType::UnionAll)
+                && let Some(lim) = limit
+                && running.len() >= lim
+            {
+                // Already have enough rows, skip remaining set operations
+                break;
             }
 
             // Execute the right side query with incremented depth (part of same logical query)
@@ -148,10 +147,10 @@ impl Executor {
                                 row_id += 1;
                                 count += 1;
                             }
-                            if count < needed {
-                                if let Some(err) = right_result.last_error() {
-                                    return Err(err);
-                                }
+                            if count < needed
+                                && let Some(err) = right_result.last_error()
+                            {
+                                return Err(err);
                             }
                         }
                     } else {

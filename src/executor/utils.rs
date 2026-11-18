@@ -806,12 +806,12 @@ pub fn extract_and_conditions(expr: &Expression) -> Vec<&Expression> {
     let mut conditions = Vec::new();
 
     fn collect<'a>(expr: &'a Expression, out: &mut Vec<&'a Expression>) {
-        if let Expression::Infix(infix) = expr {
-            if matches!(infix.op_type, InfixOperator::And) {
-                collect(&infix.left, out);
-                collect(&infix.right, out);
-                return;
-            }
+        if let Expression::Infix(infix) = expr
+            && matches!(infix.op_type, InfixOperator::And)
+        {
+            collect(&infix.left, out);
+            collect(&infix.right, out);
+            return;
         }
         out.push(expr);
     }
@@ -1581,10 +1581,10 @@ pub fn expression_contains_aggregate(expr: &Expression) -> bool {
                     return true;
                 }
             }
-            if let Some(ref else_val) = case.else_value {
-                if expression_contains_aggregate(else_val) {
-                    return true;
-                }
+            if let Some(ref else_val) = case.else_value
+                && expression_contains_aggregate(else_val)
+            {
+                return true;
             }
             false
         }
@@ -1633,10 +1633,10 @@ pub fn find_column_index(col_info: &(Option<String>, String), columns: &[String]
         }
 
         // Try qualified match (table.column)
-        if let Some(ref q) = qualified {
-            if col_lower == *q {
-                return Some(idx);
-            }
+        if let Some(ref q) = qualified
+            && col_lower == *q
+        {
+            return Some(idx);
         }
     }
 
@@ -2168,24 +2168,22 @@ fn extract_join_keys_recursive(
                 if let (Some(left_idx), Some(right_idx)) = (
                     find_join_side_index(&left_col, left_columns, right_columns),
                     find_join_side_index(&right_col, right_columns, left_columns),
-                ) {
-                    if keep(left_idx, right_idx) {
-                        left_indices.push(left_idx);
-                        right_indices.push(right_idx);
-                        return;
-                    }
+                ) && keep(left_idx, right_idx)
+                {
+                    left_indices.push(left_idx);
+                    right_indices.push(right_idx);
+                    return;
                 }
 
                 // Case 2: right.col = left.col (swapped)
                 if let (Some(left_idx), Some(right_idx)) = (
                     find_join_side_index(&right_col, left_columns, right_columns),
                     find_join_side_index(&left_col, right_columns, left_columns),
-                ) {
-                    if keep(left_idx, right_idx) {
-                        left_indices.push(left_idx);
-                        right_indices.push(right_idx);
-                        return;
-                    }
+                ) && keep(left_idx, right_idx)
+                {
+                    left_indices.push(left_idx);
+                    right_indices.push(right_idx);
+                    return;
                 }
             }
             // Non-join equality (e.g., a.x = 5) - add to residual
@@ -2397,13 +2395,13 @@ pub fn compute_join_projection(
         // "t.val" answers to "val" when no other column has that base name
         let mut found = None;
         for (i, c) in columns_all().enumerate() {
-            if let Some((_, bare)) = split_qualified(c) {
-                if eq_folded(bare, name) {
-                    if found.is_some() {
-                        return None;
-                    }
-                    found = Some(i);
+            if let Some((_, bare)) = split_qualified(c)
+                && eq_folded(bare, name)
+            {
+                if found.is_some() {
+                    return None;
                 }
+                found = Some(i);
             }
         }
         found

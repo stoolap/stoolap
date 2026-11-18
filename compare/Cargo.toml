@@ -1,7 +1,7 @@
 [package]
 name = "stoolap-compare"
 version = "0.0.0"
-edition = "2021"
+edition = "2024"
 rust-version = "1.89"
 license = "Apache-2.0"
 description = "Comparison benchmarks and the differential oracle against SQLite and DuckDB"

@@ -616,11 +616,11 @@ fn dictionary_memory(dicts: &[(usize, ColumnDict)]) -> usize {
     let mut text: Option<Arc<DictText>> = None;
     for (_, dict) in dicts {
         size += dict.built_size();
-        if let Some((held, _, _)) = &*dict.text.lock() {
-            if !text.as_ref().is_some_and(|t| Arc::ptr_eq(t, held)) {
-                size += held.text.capacity() + held.ends.len() * 4;
-                text = Some(Arc::clone(held));
-            }
+        if let Some((held, _, _)) = &*dict.text.lock()
+            && !text.as_ref().is_some_and(|t| Arc::ptr_eq(t, held))
+        {
+            size += held.text.capacity() + held.ends.len() * 4;
+            text = Some(Arc::clone(held));
         }
     }
     size
@@ -3368,10 +3368,10 @@ impl VolumeBuilder {
             sum += v as i128;
             count += 1;
             if self.sorted[col_idx] {
-                if let Some(last) = self.last_values[col_idx] {
-                    if v < last {
-                        self.sorted[col_idx] = false;
-                    }
+                if let Some(last) = self.last_values[col_idx]
+                    && v < last
+                {
+                    self.sorted[col_idx] = false;
                 }
                 self.last_values[col_idx] = Some(v);
             }
@@ -3658,10 +3658,10 @@ impl VolumeBuilder {
                     };
                     // Track sortedness
                     if self.sorted[col_idx] {
-                        if let Some(last) = self.last_values[col_idx] {
-                            if v < last {
-                                self.sorted[col_idx] = false;
-                            }
+                        if let Some(last) = self.last_values[col_idx]
+                            && v < last
+                        {
+                            self.sorted[col_idx] = false;
                         }
                         self.last_values[col_idx] = Some(v);
                     }
@@ -3681,10 +3681,10 @@ impl VolumeBuilder {
                         _ => 0,
                     };
                     if self.sorted[col_idx] {
-                        if let Some(last) = self.last_values[col_idx] {
-                            if nanos < last {
-                                self.sorted[col_idx] = false;
-                            }
+                        if let Some(last) = self.last_values[col_idx]
+                            && nanos < last
+                        {
+                            self.sorted[col_idx] = false;
                         }
                         self.last_values[col_idx] = Some(nanos);
                     }
@@ -3928,10 +3928,10 @@ impl RowReader {
         }
         let shift = self.volume.meta.group_shift();
         let start = row_idx >> shift << shift;
-        if let Some((column, held)) = &self.pinned[col_idx] {
-            if *held == start {
-                return Ok(column.get_value(row_idx - start));
-            }
+        if let Some((column, held)) = &self.pinned[col_idx]
+            && *held == start
+        {
+            return Ok(column.get_value(row_idx - start));
         }
         let store = self.volume.columns.compressed_store().ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "column data is not loaded")
@@ -4227,12 +4227,12 @@ pub fn reading_turns_on_a_drop<'a>(
         let mut turns = dropped(name);
         let mut held = volume.column_index(name).is_some();
         for (_, _, event) in &events {
-            if let SchemaEvent::Renamed { old, new } = event {
-                if eq_names(new, name) {
-                    name = old;
-                    turns |= dropped(name);
-                    held |= volume.column_index(name).is_some();
-                }
+            if let SchemaEvent::Renamed { old, new } = event
+                && eq_names(new, name)
+            {
+                name = old;
+                turns |= dropped(name);
+                held |= volume.column_index(name).is_some();
             }
         }
         (turns && held).then_some(col.name.as_str())

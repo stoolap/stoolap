@@ -354,12 +354,11 @@ impl PkIndex {
     /// Compute the overflow max, considering both I64Set and the i64::MIN flag.
     #[inline]
     fn overflow_max(inner: &PkIndexInner) -> Option<i64> {
-        let set_max = if !inner.overflow.is_empty() {
+        if !inner.overflow.is_empty() {
             inner.overflow.iter().max()
         } else {
             None
-        };
-        set_max
+        }
     }
 }
 
@@ -578,10 +577,10 @@ impl Index for PkIndex {
         let inner = self.data.read();
         let mut found: smallvec::SmallVec<[(i64, i64); 16]> = smallvec::SmallVec::new();
         for value in members {
-            if let Value::Integer(row_id) = value {
-                if inner.contains(*row_id) {
-                    found.push((*row_id, *row_id));
-                }
+            if let Value::Integer(row_id) = value
+                && inner.contains(*row_id)
+            {
+                found.push((*row_id, *row_id));
             }
         }
         super::each_entry_once(&found, |row_id| buffer.push(row_id));
@@ -617,11 +616,11 @@ impl Index for PkIndex {
         let mut stopped = None;
         for_each_set_bit(&inner.words, |rid| {
             result.push(Value::Integer(rid));
-            if result.len() % CHARGE_BEAT == 0 {
-                if let Err(error) = deadline.charge(DeadlineSite::StorageRead, CHARGE_BEAT) {
-                    stopped = Some(error);
-                    return false;
-                }
+            if result.len() % CHARGE_BEAT == 0
+                && let Err(error) = deadline.charge(DeadlineSite::StorageRead, CHARGE_BEAT)
+            {
+                stopped = Some(error);
+                return false;
             }
             true
         });

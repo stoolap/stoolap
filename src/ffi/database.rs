@@ -33,7 +33,7 @@ static VERSION_CSTR: std::sync::OnceLock<CString> = std::sync::OnceLock::new();
 /// Returns the stoolap version string.
 ///
 /// The returned pointer is static and must NOT be freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn stoolap_version() -> *const c_char {
     VERSION_CSTR
         .get_or_init(|| CString::new(VERSION).unwrap_or_default())
@@ -46,48 +46,51 @@ pub extern "C" fn stoolap_version() -> *const c_char {
 ///
 /// - `dsn` must be a valid null-terminated UTF-8 string.
 /// - `out_db` must be a valid pointer to a `*mut StoolapDB`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_open(dsn: *const c_char, out_db: *mut *mut StoolapDB) -> i32 {
-    if out_db.is_null() {
-        return STOOLAP_ERROR;
-    }
-    *out_db = std::ptr::null_mut();
-
-    if dsn.is_null() {
-        error::set_global_error("DSN string is NULL");
-        return STOOLAP_ERROR;
-    }
-
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let dsn_str = match CStr::from_ptr(dsn).to_str() {
-            Ok(s) => s,
-            Err(e) => {
-                error::set_global_error(&format!("invalid UTF-8 in DSN: {}", e));
-                return STOOLAP_ERROR;
-            }
-        };
-
-        match Database::open(dsn_str) {
-            Ok(db) => {
-                let handle = Box::new(StoolapDB {
-                    db,
-                    last_error: None,
-                    packed: Vec::new(),
-                });
-                *out_db = Box::into_raw(handle);
-                STOOLAP_OK
-            }
-            Err(e) => {
-                error::set_global_error(&e.to_string());
-                STOOLAP_ERROR
-            }
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        if out_db.is_null() {
+            return STOOLAP_ERROR;
         }
-    }));
+        *out_db = std::ptr::null_mut();
 
-    result.unwrap_or_else(|_| {
-        error::set_global_error("panic during stoolap_open");
-        STOOLAP_ERROR
-    })
+        if dsn.is_null() {
+            error::set_global_error("DSN string is NULL");
+            return STOOLAP_ERROR;
+        }
+
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let dsn_str = match CStr::from_ptr(dsn).to_str() {
+                Ok(s) => s,
+                Err(e) => {
+                    error::set_global_error(&format!("invalid UTF-8 in DSN: {}", e));
+                    return STOOLAP_ERROR;
+                }
+            };
+
+            match Database::open(dsn_str) {
+                Ok(db) => {
+                    let handle = Box::new(StoolapDB {
+                        db,
+                        last_error: None,
+                        packed: Vec::new(),
+                    });
+                    *out_db = Box::into_raw(handle);
+                    STOOLAP_OK
+                }
+                Err(e) => {
+                    error::set_global_error(&e.to_string());
+                    STOOLAP_ERROR
+                }
+            }
+        }));
+
+        result.unwrap_or_else(|_| {
+            error::set_global_error("panic during stoolap_open");
+            STOOLAP_ERROR
+        })
+    }
 }
 
 /// Open an in-memory database.
@@ -95,35 +98,39 @@ pub unsafe extern "C" fn stoolap_open(dsn: *const c_char, out_db: *mut *mut Stoo
 /// # Safety
 ///
 /// `out_db` must be a valid pointer to a `*mut StoolapDB`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_open_in_memory(out_db: *mut *mut StoolapDB) -> i32 {
-    if out_db.is_null() {
-        return STOOLAP_ERROR;
-    }
-    *out_db = std::ptr::null_mut();
-
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        match Database::open_in_memory() {
-            Ok(db) => {
-                let handle = Box::new(StoolapDB {
-                    db,
-                    last_error: None,
-                    packed: Vec::new(),
-                });
-                *out_db = Box::into_raw(handle);
-                STOOLAP_OK
-            }
-            Err(e) => {
-                error::set_global_error(&e.to_string());
-                STOOLAP_ERROR
-            }
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        if out_db.is_null() {
+            return STOOLAP_ERROR;
         }
-    }));
+        *out_db = std::ptr::null_mut();
 
-    result.unwrap_or_else(|_| {
-        error::set_global_error("panic during stoolap_open_in_memory");
-        STOOLAP_ERROR
-    })
+        let result =
+            panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                match Database::open_in_memory() {
+                    Ok(db) => {
+                        let handle = Box::new(StoolapDB {
+                            db,
+                            last_error: None,
+                            packed: Vec::new(),
+                        });
+                        *out_db = Box::into_raw(handle);
+                        STOOLAP_OK
+                    }
+                    Err(e) => {
+                        error::set_global_error(&e.to_string());
+                        STOOLAP_ERROR
+                    }
+                }
+            }));
+
+        result.unwrap_or_else(|_| {
+            error::set_global_error("panic during stoolap_open_in_memory");
+            STOOLAP_ERROR
+        })
+    }
 }
 
 /// Close a database connection and free resources.
@@ -134,24 +141,27 @@ pub unsafe extern "C" fn stoolap_open_in_memory(out_db: *mut *mut StoolapDB) -> 
 ///
 /// `db` must be a pointer returned by `stoolap_open*`, or NULL.
 /// After this call, the pointer is invalid.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_close(db: *mut StoolapDB) -> i32 {
-    if db.is_null() {
-        return STOOLAP_OK;
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        if db.is_null() {
+            return STOOLAP_OK;
+        }
+
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let handle = Box::from_raw(db);
+
+            // Drop the handle. The underlying engine is reference-counted (Arc)
+            // and will be closed automatically when the last handle drops.
+            // We intentionally do NOT call handle.db.close() here because it
+            // would shut down the shared engine, breaking any cloned handles.
+            drop(handle);
+            STOOLAP_OK
+        }));
+
+        result.unwrap_or(STOOLAP_ERROR)
     }
-
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let handle = Box::from_raw(db);
-
-        // Drop the handle. The underlying engine is reference-counted (Arc)
-        // and will be closed automatically when the last handle drops.
-        // We intentionally do NOT call handle.db.close() here because it
-        // would shut down the shared engine, breaking any cloned handles.
-        drop(handle);
-        STOOLAP_OK
-    }));
-
-    result.unwrap_or(STOOLAP_ERROR)
 }
 
 /// Clone a database handle for use in another thread.
@@ -166,37 +176,40 @@ pub unsafe extern "C" fn stoolap_close(db: *mut StoolapDB) -> i32 {
 ///
 /// - `db` must be a valid `StoolapDB` pointer.
 /// - `out_db` must be a valid pointer to a `*mut StoolapDB`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_clone(db: *const StoolapDB, out_db: *mut *mut StoolapDB) -> i32 {
-    if out_db.is_null() {
-        error::set_global_error("out_db pointer is NULL");
-        return STOOLAP_ERROR;
-    }
-    *out_db = std::ptr::null_mut();
-
-    let handle = match db.as_ref() {
-        Some(h) => h,
-        None => {
-            error::set_global_error("db handle is NULL");
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        if out_db.is_null() {
+            error::set_global_error("out_db pointer is NULL");
             return STOOLAP_ERROR;
         }
-    };
+        *out_db = std::ptr::null_mut();
 
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let cloned = handle.db.clone();
-        let new_handle = Box::new(StoolapDB {
-            db: cloned,
-            last_error: None,
-            packed: Vec::new(),
-        });
-        *out_db = Box::into_raw(new_handle);
-        STOOLAP_OK
-    }));
+        let handle = match db.as_ref() {
+            Some(h) => h,
+            None => {
+                error::set_global_error("db handle is NULL");
+                return STOOLAP_ERROR;
+            }
+        };
 
-    result.unwrap_or_else(|_| {
-        error::set_global_error("panic during stoolap_clone");
-        STOOLAP_ERROR
-    })
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let cloned = handle.db.clone();
+            let new_handle = Box::new(StoolapDB {
+                db: cloned,
+                last_error: None,
+                packed: Vec::new(),
+            });
+            *out_db = Box::into_raw(new_handle);
+            STOOLAP_OK
+        }));
+
+        result.unwrap_or_else(|_| {
+            error::set_global_error("panic during stoolap_clone");
+            STOOLAP_ERROR
+        })
+    }
 }
 
 /// Get the last error message for a database handle.
@@ -209,11 +222,14 @@ pub unsafe extern "C" fn stoolap_clone(db: *const StoolapDB, out_db: *mut *mut S
 /// # Safety
 ///
 /// `db` must be a valid `StoolapDB` pointer or NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_errmsg(db: *const StoolapDB) -> *const c_char {
-    match db.as_ref() {
-        Some(handle) => handle.error_ptr(),
-        None => error::global_error_ptr(),
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        match db.as_ref() {
+            Some(handle) => handle.error_ptr(),
+            None => error::global_error_ptr(),
+        }
     }
 }
 
@@ -224,50 +240,53 @@ pub unsafe extern "C" fn stoolap_errmsg(db: *const StoolapDB) -> *const c_char {
 /// - `db` must be a valid `StoolapDB` pointer.
 /// - `sql` must be a valid null-terminated UTF-8 string.
 /// - `rows_affected` may be NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_exec(
     db: *mut StoolapDB,
     sql: *const c_char,
     rows_affected: *mut i64,
 ) -> i32 {
-    let handle = match db.as_mut() {
-        Some(h) => h,
-        None => return STOOLAP_ERROR,
-    };
-    handle.last_error = None;
-
-    if sql.is_null() {
-        handle.set_error("SQL string is NULL");
-        return STOOLAP_ERROR;
-    }
-
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let sql_str = match CStr::from_ptr(sql).to_str() {
-            Ok(s) => s,
-            Err(e) => {
-                handle.set_error(&format!("invalid UTF-8 in SQL: {}", e));
-                return STOOLAP_ERROR;
-            }
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        let handle = match db.as_mut() {
+            Some(h) => h,
+            None => return STOOLAP_ERROR,
         };
+        handle.last_error = None;
 
-        match handle.db.execute(sql_str, ()) {
-            Ok(affected) => {
-                if !rows_affected.is_null() {
-                    *rows_affected = affected;
-                }
-                STOOLAP_OK
-            }
-            Err(e) => {
-                handle.set_error(&e.to_string());
-                STOOLAP_ERROR
-            }
+        if sql.is_null() {
+            handle.set_error("SQL string is NULL");
+            return STOOLAP_ERROR;
         }
-    }));
 
-    result.unwrap_or_else(|_| {
-        handle.set_error("panic during stoolap_exec");
-        STOOLAP_ERROR
-    })
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let sql_str = match CStr::from_ptr(sql).to_str() {
+                Ok(s) => s,
+                Err(e) => {
+                    handle.set_error(&format!("invalid UTF-8 in SQL: {}", e));
+                    return STOOLAP_ERROR;
+                }
+            };
+
+            match handle.db.execute(sql_str, ()) {
+                Ok(affected) => {
+                    if !rows_affected.is_null() {
+                        *rows_affected = affected;
+                    }
+                    STOOLAP_OK
+                }
+                Err(e) => {
+                    handle.set_error(&e.to_string());
+                    STOOLAP_ERROR
+                }
+            }
+        }));
+
+        result.unwrap_or_else(|_| {
+            handle.set_error("panic during stoolap_exec");
+            STOOLAP_ERROR
+        })
+    }
 }
 
 /// Execute a SQL statement with positional parameters.
@@ -278,7 +297,7 @@ pub unsafe extern "C" fn stoolap_exec(
 /// - `sql` must be a valid null-terminated UTF-8 string.
 /// - `params` must point to `params_len` valid `StoolapValue` structs (or be NULL if `params_len` is 0).
 /// - `rows_affected` may be NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_exec_params(
     db: *mut StoolapDB,
     sql: *const c_char,
@@ -286,14 +305,17 @@ pub unsafe extern "C" fn stoolap_exec_params(
     params_len: i32,
     rows_affected: *mut i64,
 ) -> i32 {
-    stoolap_exec_params_counts(
-        db,
-        sql,
-        params,
-        params_len,
-        rows_affected,
-        std::ptr::null_mut(),
-    )
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        stoolap_exec_params_counts(
+            db,
+            sql,
+            params,
+            params_len,
+            rows_affected,
+            std::ptr::null_mut(),
+        )
+    }
 }
 
 /// Execute a SQL statement with positional parameters, writing the rows it
@@ -307,7 +329,7 @@ pub unsafe extern "C" fn stoolap_exec_params(
 /// - `sql` must be a valid null-terminated UTF-8 string.
 /// - `params` must point to `params_len` valid `StoolapValue` structs (or be NULL if `params_len` is 0).
 /// - `rows_affected` and `rows_changed` may be NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_exec_params_counts(
     db: *mut StoolapDB,
     sql: *const c_char,
@@ -316,49 +338,52 @@ pub unsafe extern "C" fn stoolap_exec_params_counts(
     rows_affected: *mut i64,
     rows_changed: *mut i64,
 ) -> i32 {
-    let handle = match db.as_mut() {
-        Some(h) => h,
-        None => return STOOLAP_ERROR,
-    };
-    handle.last_error = None;
-
-    if sql.is_null() {
-        handle.set_error("SQL string is NULL");
-        return STOOLAP_ERROR;
-    }
-
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let sql_str = match CStr::from_ptr(sql).to_str() {
-            Ok(s) => s,
-            Err(e) => {
-                handle.set_error(&format!("invalid UTF-8 in SQL: {}", e));
-                return STOOLAP_ERROR;
-            }
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        let handle = match db.as_mut() {
+            Some(h) => h,
+            None => return STOOLAP_ERROR,
         };
+        handle.last_error = None;
 
-        let executed = value::params_to_vec(params, params_len)
-            .and_then(|p| handle.db.execute_counts(sql_str, p));
-        match executed {
-            Ok(counts) => {
-                if !rows_affected.is_null() {
-                    *rows_affected = counts.matched;
-                }
-                if !rows_changed.is_null() {
-                    *rows_changed = counts.changed;
-                }
-                STOOLAP_OK
-            }
-            Err(e) => {
-                handle.set_error(&e.to_string());
-                STOOLAP_ERROR
-            }
+        if sql.is_null() {
+            handle.set_error("SQL string is NULL");
+            return STOOLAP_ERROR;
         }
-    }));
 
-    result.unwrap_or_else(|_| {
-        handle.set_error("panic during stoolap_exec_params");
-        STOOLAP_ERROR
-    })
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let sql_str = match CStr::from_ptr(sql).to_str() {
+                Ok(s) => s,
+                Err(e) => {
+                    handle.set_error(&format!("invalid UTF-8 in SQL: {}", e));
+                    return STOOLAP_ERROR;
+                }
+            };
+
+            let executed = value::params_to_vec(params, params_len)
+                .and_then(|p| handle.db.execute_counts(sql_str, p));
+            match executed {
+                Ok(counts) => {
+                    if !rows_affected.is_null() {
+                        *rows_affected = counts.matched;
+                    }
+                    if !rows_changed.is_null() {
+                        *rows_changed = counts.changed;
+                    }
+                    STOOLAP_OK
+                }
+                Err(e) => {
+                    handle.set_error(&e.to_string());
+                    STOOLAP_ERROR
+                }
+            }
+        }));
+
+        result.unwrap_or_else(|_| {
+            handle.set_error("panic during stoolap_exec_params");
+            STOOLAP_ERROR
+        })
+    }
 }
 
 /// Execute a query without parameters, returning a result set.
@@ -368,13 +393,14 @@ pub unsafe extern "C" fn stoolap_exec_params_counts(
 /// - `db` must be a valid `StoolapDB` pointer.
 /// - `sql` must be a valid null-terminated UTF-8 string.
 /// - `out_rows` must be a valid pointer to a `*mut StoolapRows`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_query(
     db: *mut StoolapDB,
     sql: *const c_char,
     out_rows: *mut *mut StoolapRows,
 ) -> i32 {
-    stoolap_query_params(db, sql, std::ptr::null(), 0, out_rows)
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe { stoolap_query_params(db, sql, std::ptr::null(), 0, out_rows) }
 }
 
 /// Execute a query with positional parameters, returning a result set.
@@ -385,7 +411,7 @@ pub unsafe extern "C" fn stoolap_query(
 /// - `sql` must be a valid null-terminated UTF-8 string.
 /// - `params` must point to `params_len` valid `StoolapValue` structs (or be NULL).
 /// - `out_rows` must be a valid pointer to a `*mut StoolapRows`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_query_params(
     db: *mut StoolapDB,
     sql: *const c_char,
@@ -393,47 +419,51 @@ pub unsafe extern "C" fn stoolap_query_params(
     params_len: i32,
     out_rows: *mut *mut StoolapRows,
 ) -> i32 {
-    if out_rows.is_null() {
-        return STOOLAP_ERROR;
-    }
-    *out_rows = std::ptr::null_mut();
-
-    let handle = match db.as_mut() {
-        Some(h) => h,
-        None => return STOOLAP_ERROR,
-    };
-    handle.last_error = None;
-
-    if sql.is_null() {
-        handle.set_error("SQL string is NULL");
-        return STOOLAP_ERROR;
-    }
-
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let sql_str = match CStr::from_ptr(sql).to_str() {
-            Ok(s) => s,
-            Err(e) => {
-                handle.set_error(&format!("invalid UTF-8 in SQL: {}", e));
-                return STOOLAP_ERROR;
-            }
-        };
-
-        match value::params_to_vec(params, params_len).and_then(|p| handle.db.query(sql_str, p)) {
-            Ok(rows) => {
-                *out_rows = StoolapRows::boxed(rows, None);
-                STOOLAP_OK
-            }
-            Err(e) => {
-                handle.set_error(&e.to_string());
-                STOOLAP_ERROR
-            }
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        if out_rows.is_null() {
+            return STOOLAP_ERROR;
         }
-    }));
+        *out_rows = std::ptr::null_mut();
 
-    result.unwrap_or_else(|_| {
-        handle.set_error("panic during stoolap_query_params");
-        STOOLAP_ERROR
-    })
+        let handle = match db.as_mut() {
+            Some(h) => h,
+            None => return STOOLAP_ERROR,
+        };
+        handle.last_error = None;
+
+        if sql.is_null() {
+            handle.set_error("SQL string is NULL");
+            return STOOLAP_ERROR;
+        }
+
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let sql_str = match CStr::from_ptr(sql).to_str() {
+                Ok(s) => s,
+                Err(e) => {
+                    handle.set_error(&format!("invalid UTF-8 in SQL: {}", e));
+                    return STOOLAP_ERROR;
+                }
+            };
+
+            match value::params_to_vec(params, params_len).and_then(|p| handle.db.query(sql_str, p))
+            {
+                Ok(rows) => {
+                    *out_rows = StoolapRows::boxed(rows, None);
+                    STOOLAP_OK
+                }
+                Err(e) => {
+                    handle.set_error(&e.to_string());
+                    STOOLAP_ERROR
+                }
+            }
+        }));
+
+        result.unwrap_or_else(|_| {
+            handle.set_error("panic during stoolap_query_params");
+            STOOLAP_ERROR
+        })
+    }
 }
 
 /// Run a query with positional parameters and pack every row into one
@@ -453,7 +483,7 @@ pub unsafe extern "C" fn stoolap_query_params(
 /// - `sql` must be a valid null-terminated UTF-8 string.
 /// - `params` must point to `params_len` valid `StoolapValue` structs (or be NULL).
 /// - `out_buf` and `out_len` must not be NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_query_params_all(
     db: *mut StoolapDB,
     tx: *mut StoolapTx,
@@ -463,55 +493,58 @@ pub unsafe extern "C" fn stoolap_query_params_all(
     out_buf: *mut *const u8,
     out_len: *mut i64,
 ) -> i32 {
-    if out_buf.is_null() || out_len.is_null() {
-        return STOOLAP_ERROR;
-    }
-    *out_buf = std::ptr::null();
-    *out_len = 0;
-
-    let handle = match db.as_mut() {
-        Some(h) => h,
-        None => return STOOLAP_ERROR,
-    };
-    handle.last_error = None;
-
-    if sql.is_null() {
-        handle.set_error("SQL string is NULL");
-        return STOOLAP_ERROR;
-    }
-
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let sql_str = match CStr::from_ptr(sql).to_str() {
-            Ok(s) => s,
-            Err(e) => {
-                handle.set_error(&format!("invalid UTF-8 in SQL: {}", e));
-                return STOOLAP_ERROR;
-            }
-        };
-
-        let rows = value::params_to_vec(params, params_len).and_then(|p| {
-            match super::statement::open_transaction_on(&handle.db, tx)? {
-                None => handle.db.query(sql_str, p),
-                Some(inner_tx) => inner_tx.query(sql_str, p),
-            }
-        });
-        match rows.and_then(|mut rows| pack_all(&mut rows, &mut handle.packed)) {
-            Ok(_) => {
-                *out_buf = handle.packed.as_ptr();
-                *out_len = handle.packed.len() as i64;
-                STOOLAP_OK
-            }
-            Err(e) => {
-                handle.set_error(&e.to_string());
-                STOOLAP_ERROR
-            }
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        if out_buf.is_null() || out_len.is_null() {
+            return STOOLAP_ERROR;
         }
-    }));
+        *out_buf = std::ptr::null();
+        *out_len = 0;
 
-    result.unwrap_or_else(|_| {
-        handle.set_error("panic during stoolap_query_params_all");
-        STOOLAP_ERROR
-    })
+        let handle = match db.as_mut() {
+            Some(h) => h,
+            None => return STOOLAP_ERROR,
+        };
+        handle.last_error = None;
+
+        if sql.is_null() {
+            handle.set_error("SQL string is NULL");
+            return STOOLAP_ERROR;
+        }
+
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let sql_str = match CStr::from_ptr(sql).to_str() {
+                Ok(s) => s,
+                Err(e) => {
+                    handle.set_error(&format!("invalid UTF-8 in SQL: {}", e));
+                    return STOOLAP_ERROR;
+                }
+            };
+
+            let rows = value::params_to_vec(params, params_len).and_then(|p| {
+                match super::statement::open_transaction_on(&handle.db, tx)? {
+                    None => handle.db.query(sql_str, p),
+                    Some(inner_tx) => inner_tx.query(sql_str, p),
+                }
+            });
+            match rows.and_then(|mut rows| pack_all(&mut rows, &mut handle.packed)) {
+                Ok(_) => {
+                    *out_buf = handle.packed.as_ptr();
+                    *out_len = handle.packed.len() as i64;
+                    STOOLAP_OK
+                }
+                Err(e) => {
+                    handle.set_error(&e.to_string());
+                    STOOLAP_ERROR
+                }
+            }
+        }));
+
+        result.unwrap_or_else(|_| {
+            handle.set_error("panic during stoolap_query_params_all");
+            STOOLAP_ERROR
+        })
+    }
 }
 
 /// Execute a SQL statement with named parameters.
@@ -522,7 +555,7 @@ pub unsafe extern "C" fn stoolap_query_params_all(
 /// - `sql` must be a valid null-terminated UTF-8 string.
 /// - `params` must point to `params_len` valid `StoolapNamedParam` structs (or be NULL).
 /// - `rows_affected` may be NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_exec_named(
     db: *mut StoolapDB,
     sql: *const c_char,
@@ -530,49 +563,52 @@ pub unsafe extern "C" fn stoolap_exec_named(
     params_len: i32,
     rows_affected: *mut i64,
 ) -> i32 {
-    let handle = match db.as_mut() {
-        Some(h) => h,
-        None => return STOOLAP_ERROR,
-    };
-    handle.last_error = None;
-
-    if sql.is_null() {
-        handle.set_error("SQL string is NULL");
-        return STOOLAP_ERROR;
-    }
-
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let sql_str = match CStr::from_ptr(sql).to_str() {
-            Ok(s) => s,
-            Err(e) => {
-                handle.set_error(&format!("invalid UTF-8 in SQL: {}", e));
-                return STOOLAP_ERROR;
-            }
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        let handle = match db.as_mut() {
+            Some(h) => h,
+            None => return STOOLAP_ERROR,
         };
+        handle.last_error = None;
 
-        let mut value_of = value::ffi_value_of(params, params_len);
-        match handle
-            .db
-            .executor()
-            .execute_named_with(sql_str, &mut value_of)
-        {
-            Ok(result) => {
-                if !rows_affected.is_null() {
-                    *rows_affected = result.rows_affected();
-                }
-                STOOLAP_OK
-            }
-            Err(e) => {
-                handle.set_error(&e.to_string());
-                STOOLAP_ERROR
-            }
+        if sql.is_null() {
+            handle.set_error("SQL string is NULL");
+            return STOOLAP_ERROR;
         }
-    }));
 
-    result.unwrap_or_else(|_| {
-        handle.set_error("panic during stoolap_exec_named");
-        STOOLAP_ERROR
-    })
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let sql_str = match CStr::from_ptr(sql).to_str() {
+                Ok(s) => s,
+                Err(e) => {
+                    handle.set_error(&format!("invalid UTF-8 in SQL: {}", e));
+                    return STOOLAP_ERROR;
+                }
+            };
+
+            let mut value_of = value::ffi_value_of(params, params_len);
+            match handle
+                .db
+                .executor()
+                .execute_named_with(sql_str, &mut value_of)
+            {
+                Ok(result) => {
+                    if !rows_affected.is_null() {
+                        *rows_affected = result.rows_affected();
+                    }
+                    STOOLAP_OK
+                }
+                Err(e) => {
+                    handle.set_error(&e.to_string());
+                    STOOLAP_ERROR
+                }
+            }
+        }));
+
+        result.unwrap_or_else(|_| {
+            handle.set_error("panic during stoolap_exec_named");
+            STOOLAP_ERROR
+        })
+    }
 }
 
 /// Execute a query with named parameters, returning a result set.
@@ -583,7 +619,7 @@ pub unsafe extern "C" fn stoolap_exec_named(
 /// - `sql` must be a valid null-terminated UTF-8 string.
 /// - `params` must point to `params_len` valid `StoolapNamedParam` structs (or be NULL).
 /// - `out_rows` must be a valid pointer to a `*mut StoolapRows`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_query_named(
     db: *mut StoolapDB,
     sql: *const c_char,
@@ -591,52 +627,55 @@ pub unsafe extern "C" fn stoolap_query_named(
     params_len: i32,
     out_rows: *mut *mut StoolapRows,
 ) -> i32 {
-    if out_rows.is_null() {
-        return STOOLAP_ERROR;
-    }
-    *out_rows = std::ptr::null_mut();
-
-    let handle = match db.as_mut() {
-        Some(h) => h,
-        None => return STOOLAP_ERROR,
-    };
-    handle.last_error = None;
-
-    if sql.is_null() {
-        handle.set_error("SQL string is NULL");
-        return STOOLAP_ERROR;
-    }
-
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let sql_str = match CStr::from_ptr(sql).to_str() {
-            Ok(s) => s,
-            Err(e) => {
-                handle.set_error(&format!("invalid UTF-8 in SQL: {}", e));
-                return STOOLAP_ERROR;
-            }
-        };
-
-        let mut value_of = value::ffi_value_of(params, params_len);
-        match handle
-            .db
-            .executor()
-            .execute_named_with(sql_str, &mut value_of)
-        {
-            Ok(result) => {
-                *out_rows = StoolapRows::boxed(Rows::new(result), None);
-                STOOLAP_OK
-            }
-            Err(e) => {
-                handle.set_error(&e.to_string());
-                STOOLAP_ERROR
-            }
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        if out_rows.is_null() {
+            return STOOLAP_ERROR;
         }
-    }));
+        *out_rows = std::ptr::null_mut();
 
-    result.unwrap_or_else(|_| {
-        handle.set_error("panic during stoolap_query_named");
-        STOOLAP_ERROR
-    })
+        let handle = match db.as_mut() {
+            Some(h) => h,
+            None => return STOOLAP_ERROR,
+        };
+        handle.last_error = None;
+
+        if sql.is_null() {
+            handle.set_error("SQL string is NULL");
+            return STOOLAP_ERROR;
+        }
+
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let sql_str = match CStr::from_ptr(sql).to_str() {
+                Ok(s) => s,
+                Err(e) => {
+                    handle.set_error(&format!("invalid UTF-8 in SQL: {}", e));
+                    return STOOLAP_ERROR;
+                }
+            };
+
+            let mut value_of = value::ffi_value_of(params, params_len);
+            match handle
+                .db
+                .executor()
+                .execute_named_with(sql_str, &mut value_of)
+            {
+                Ok(result) => {
+                    *out_rows = StoolapRows::boxed(Rows::new(result), None);
+                    STOOLAP_OK
+                }
+                Err(e) => {
+                    handle.set_error(&e.to_string());
+                    STOOLAP_ERROR
+                }
+            }
+        }));
+
+        result.unwrap_or_else(|_| {
+            handle.set_error("panic during stoolap_query_named");
+            STOOLAP_ERROR
+        })
+    }
 }
 
 /// `stoolap_query_params_all()` with named parameters (`:name`).
@@ -648,7 +687,7 @@ pub unsafe extern "C" fn stoolap_query_named(
 /// - `sql` must be a valid null-terminated UTF-8 string.
 /// - `params` must point to `params_len` valid `StoolapNamedParam` structs (or be NULL).
 /// - `out_buf` and `out_len` must not be NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_query_named_all(
     db: *mut StoolapDB,
     tx: *mut StoolapTx,
@@ -658,59 +697,62 @@ pub unsafe extern "C" fn stoolap_query_named_all(
     out_buf: *mut *const u8,
     out_len: *mut i64,
 ) -> i32 {
-    if out_buf.is_null() || out_len.is_null() {
-        return STOOLAP_ERROR;
-    }
-    *out_buf = std::ptr::null();
-    *out_len = 0;
-
-    let handle = match db.as_mut() {
-        Some(h) => h,
-        None => return STOOLAP_ERROR,
-    };
-    handle.last_error = None;
-
-    if sql.is_null() {
-        handle.set_error("SQL string is NULL");
-        return STOOLAP_ERROR;
-    }
-
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let sql_str = match CStr::from_ptr(sql).to_str() {
-            Ok(s) => s,
-            Err(e) => {
-                handle.set_error(&format!("invalid UTF-8 in SQL: {}", e));
-                return STOOLAP_ERROR;
-            }
-        };
-
-        let mut value_of = value::ffi_value_of(params, params_len);
-        let rows = super::statement::open_transaction_on(&handle.db, tx).and_then(|inner_tx| {
-            Ok(Rows::new(match inner_tx {
-                None => handle
-                    .db
-                    .executor()
-                    .execute_named_with(sql_str, &mut value_of)?,
-                Some(inner_tx) => inner_tx.run_named(sql_str, &mut value_of)?,
-            }))
-        });
-        match rows.and_then(|mut rows| pack_all(&mut rows, &mut handle.packed)) {
-            Ok(_) => {
-                *out_buf = handle.packed.as_ptr();
-                *out_len = handle.packed.len() as i64;
-                STOOLAP_OK
-            }
-            Err(e) => {
-                handle.set_error(&e.to_string());
-                STOOLAP_ERROR
-            }
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        if out_buf.is_null() || out_len.is_null() {
+            return STOOLAP_ERROR;
         }
-    }));
+        *out_buf = std::ptr::null();
+        *out_len = 0;
 
-    result.unwrap_or_else(|_| {
-        handle.set_error("panic during stoolap_query_named_all");
-        STOOLAP_ERROR
-    })
+        let handle = match db.as_mut() {
+            Some(h) => h,
+            None => return STOOLAP_ERROR,
+        };
+        handle.last_error = None;
+
+        if sql.is_null() {
+            handle.set_error("SQL string is NULL");
+            return STOOLAP_ERROR;
+        }
+
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let sql_str = match CStr::from_ptr(sql).to_str() {
+                Ok(s) => s,
+                Err(e) => {
+                    handle.set_error(&format!("invalid UTF-8 in SQL: {}", e));
+                    return STOOLAP_ERROR;
+                }
+            };
+
+            let mut value_of = value::ffi_value_of(params, params_len);
+            let rows = super::statement::open_transaction_on(&handle.db, tx).and_then(|inner_tx| {
+                Ok(Rows::new(match inner_tx {
+                    None => handle
+                        .db
+                        .executor()
+                        .execute_named_with(sql_str, &mut value_of)?,
+                    Some(inner_tx) => inner_tx.run_named(sql_str, &mut value_of)?,
+                }))
+            });
+            match rows.and_then(|mut rows| pack_all(&mut rows, &mut handle.packed)) {
+                Ok(_) => {
+                    *out_buf = handle.packed.as_ptr();
+                    *out_len = handle.packed.len() as i64;
+                    STOOLAP_OK
+                }
+                Err(e) => {
+                    handle.set_error(&e.to_string());
+                    STOOLAP_ERROR
+                }
+            }
+        }));
+
+        result.unwrap_or_else(|_| {
+            handle.set_error("panic during stoolap_query_named_all");
+            STOOLAP_ERROR
+        })
+    }
 }
 
 /// Free a string allocated by the library.
@@ -720,9 +762,12 @@ pub unsafe extern "C" fn stoolap_query_named_all(
 /// # Safety
 ///
 /// `s` must be a pointer returned by a stoolap function that requires freeing, or NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_string_free(s: *mut c_char) {
-    if !s.is_null() {
-        let _ = CString::from_raw(s);
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        if !s.is_null() {
+            let _ = CString::from_raw(s);
+        }
     }
 }

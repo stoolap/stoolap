@@ -557,10 +557,12 @@ impl ExprVM {
         let (Some(text), Some(pat)) = (text_val.text_form(), pattern_val.text_form()) else {
             return Value::Null(DataType::Boolean);
         };
-        if let Some((cached_pat, cached_ci, cached_esc, compiled)) = &self.cached_like {
-            if cached_pat.as_str() == pat && *cached_ci == ci && *cached_esc == esc {
-                return Value::Boolean(compiled.matches(&text));
-            }
+        if let Some((cached_pat, cached_ci, cached_esc, compiled)) = &self.cached_like
+            && cached_pat.as_str() == pat
+            && *cached_ci == ci
+            && *cached_esc == esc
+        {
+            return Value::Boolean(compiled.matches(&text));
         }
         // !% becomes \% so the pattern reads the wildcard as literal
         let processed = match esc {
@@ -578,10 +580,10 @@ impl ExprVM {
         let (Some(text), Some(pat)) = (text_val.text_form(), pattern_val.text_form()) else {
             return Value::Null(DataType::Boolean);
         };
-        if let Some((cached_pat, compiled)) = &self.cached_glob {
-            if cached_pat.as_str() == pat {
-                return Value::Boolean(compiled.matches(&text));
-            }
+        if let Some((cached_pat, compiled)) = &self.cached_glob
+            && cached_pat.as_str() == pat
+        {
+            return Value::Boolean(compiled.matches(&text));
         }
         let compiled = Pattern::glob(&pat);
         let matched = compiled.matches(&text);
@@ -595,10 +597,10 @@ impl ExprVM {
         let (Some(text), Some(pat)) = (text_val.text_form(), pattern_val.text_form()) else {
             return Ok(Value::Null(DataType::Boolean));
         };
-        if let Some((cached_pat, re)) = &self.cached_regexp {
-            if cached_pat.as_str() == pat {
-                return Ok(Value::Boolean(re.is_match(&text)));
-            }
+        if let Some((cached_pat, re)) = &self.cached_regexp
+            && cached_pat.as_str() == pat
+        {
+            return Ok(Value::Boolean(re.is_match(&text)));
         }
         let re = regex::Regex::new(&pat).map_err(|e| {
             crate::core::Error::invalid_argument(format!(
@@ -2124,17 +2126,15 @@ impl ExprVM {
             Op::InColumnParams(idx, slots, read_as) => {
                 let cell = ctx.row.get(*idx as usize).unwrap_or(&NULL_VALUE);
                 let params = ctx.params;
-                if let Value::Integer(v) = cell {
-                    if read_as.is_none_or(|t| t == DataType::Integer) {
-                        let mut members = slots.iter().map(|slot| params.get(*slot as usize));
-                        if let Some(found) = members.try_fold(false, |found, member| match member {
-                            Some(Value::Integer(p)) => {
-                                Some(found || CompareOp::Eq.integers(*v, *p))
-                            }
-                            _ => None,
-                        }) {
-                            return Some(found);
-                        }
+                if let Value::Integer(v) = cell
+                    && read_as.is_none_or(|t| t == DataType::Integer)
+                {
+                    let mut members = slots.iter().map(|slot| params.get(*slot as usize));
+                    if let Some(found) = members.try_fold(false, |found, member| match member {
+                        Some(Value::Integer(p)) => Some(found || CompareOp::Eq.integers(*v, *p)),
+                        _ => None,
+                    }) {
+                        return Some(found);
                     }
                 }
                 let items = slots.iter().filter_map(|slot| params.get(*slot as usize));

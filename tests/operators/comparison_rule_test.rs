@@ -634,10 +634,10 @@ fn join_wrong_answers(db: &Database, keys: &JoinKeys, wrong: &mut Vec<String>) {
     for (sql, want) in queries {
         let sql = sql.as_str();
         let mut got = join_rows(db, sql);
-        if !sql.contains("ORDER BY") {
-            if let Ok(rows) = got.as_mut() {
-                rows.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            }
+        if !sql.contains("ORDER BY")
+            && let Ok(rows) = got.as_mut()
+        {
+            rows.sort_by(|a, b| a.partial_cmp(b).unwrap());
         }
         if got.as_ref() != Ok(&want) {
             wrong.push(format!(

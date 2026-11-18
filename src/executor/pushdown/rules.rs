@@ -46,11 +46,11 @@ fn extract_literal_with_ctx(expr: &ast::Expression, ctx: &PushdownContext<'_>) -
     }
 
     // Try parameter reference
-    if let ast::Expression::Parameter(param) = expr {
-        if let Some(exec_ctx) = ctx.exec_ctx {
-            // Slots are 1-indexed
-            return exec_ctx.params().get(param.index.checked_sub(1)?).cloned();
-        }
+    if let ast::Expression::Parameter(param) = expr
+        && let Some(exec_ctx) = ctx.exec_ctx
+    {
+        // Slots are 1-indexed
+        return exec_ctx.params().get(param.index.checked_sub(1)?).cloned();
     }
 
     // A statement constant is frozen (NOW() - INTERVAL '24 hours'); a value that
@@ -85,23 +85,21 @@ fn extract_comparison_parts(
     ctx: &PushdownContext<'_>,
 ) -> Option<(SmartString, Value, bool)> {
     // Try column on left, value on right
-    if let Some(column) = column_name_of(left) {
-        if ctx.has_column(column) {
-            if let Some(value) = extract_literal_with_ctx(right, ctx) {
-                let coerced = ctx.coerce_to_column_type(column, value)?;
-                return Some((column.clone(), coerced, false)); // false = not flipped
-            }
-        }
+    if let Some(column) = column_name_of(left)
+        && ctx.has_column(column)
+        && let Some(value) = extract_literal_with_ctx(right, ctx)
+    {
+        let coerced = ctx.coerce_to_column_type(column, value)?;
+        return Some((column.clone(), coerced, false)); // false = not flipped
     }
 
     // Try value on left, column on right (will need to flip operator)
-    if let Some(column) = column_name_of(right) {
-        if ctx.has_column(column) {
-            if let Some(value) = extract_literal_with_ctx(left, ctx) {
-                let coerced = ctx.coerce_to_column_type(column, value)?;
-                return Some((column.clone(), coerced, true)); // true = flipped
-            }
-        }
+    if let Some(column) = column_name_of(right)
+        && ctx.has_column(column)
+        && let Some(value) = extract_literal_with_ctx(left, ctx)
+    {
+        let coerced = ctx.coerce_to_column_type(column, value)?;
+        return Some((column.clone(), coerced, true)); // true = flipped
     }
 
     None

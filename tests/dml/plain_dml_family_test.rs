@@ -132,11 +132,9 @@ fn answers(name: &str, cold: bool, in_transaction: bool) -> Vec<String> {
             Ok(changed) => format!("{sql}: changed {changed}"),
             Err(error) => format!("{sql}: error {error}"),
         });
-        if in_transaction {
-            if let Err(error) = db.execute("COMMIT", ()) {
-                answers.push(format!("{sql}: commit error {error}"));
-                let _ = db.execute("ROLLBACK", ());
-            }
+        if in_transaction && let Err(error) = db.execute("COMMIT", ()) {
+            answers.push(format!("{sql}: commit error {error}"));
+            let _ = db.execute("ROLLBACK", ());
         }
     }
     let rows = db.query("SELECT * FROM t ORDER BY id", ()).unwrap();

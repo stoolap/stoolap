@@ -313,7 +313,7 @@ impl Executor {
             let row = Row::from_values(row_values);
 
             // FK parent validation
-            if let Some(ref fks) = fk_schema {
+            if let Some(fks) = fk_schema {
                 super::foreign_key::check_inserted_parents(
                     &self.engine,
                     table.txn_id(),
@@ -479,7 +479,7 @@ impl Executor {
 
         let row = Row::from_values(row_values);
 
-        if let Some(ref fks) = fk_schema {
+        if let Some(fks) = fk_schema {
             super::foreign_key::check_inserted_parents(
                 &self.engine,
                 table.txn_id(),
@@ -551,17 +551,17 @@ impl CopyDefaults {
 /// Validate vector dimensions if the column is a VECTOR type.
 #[inline]
 fn validate_vector_dims(value: &Value, target_type: DataType, expected_dims: u16) -> Result<()> {
-    if target_type == DataType::Vector && expected_dims > 0 {
-        if let Value::Extension(data) = value {
-            if data.first() == Some(&(DataType::Vector as u8)) {
-                let got_dim = u16::try_from((data.len() - 1) / 4).unwrap_or(u16::MAX);
-                if got_dim != expected_dims {
-                    return Err(Error::VectorDimensionMismatch {
-                        expected: expected_dims,
-                        got: got_dim,
-                    });
-                }
-            }
+    if target_type == DataType::Vector
+        && expected_dims > 0
+        && let Value::Extension(data) = value
+        && data.first() == Some(&(DataType::Vector as u8))
+    {
+        let got_dim = u16::try_from((data.len() - 1) / 4).unwrap_or(u16::MAX);
+        if got_dim != expected_dims {
+            return Err(Error::VectorDimensionMismatch {
+                expected: expected_dims,
+                got: got_dim,
+            });
         }
     }
     Ok(())
@@ -607,10 +607,10 @@ fn json_value_to_stoolap(
             }
         }
         serde_json::Value::String(s) => {
-            if let Some(ns) = null_str {
-                if s == ns {
-                    return Ok(Value::null_unknown());
-                }
+            if let Some(ns) = null_str
+                && s == ns
+            {
+                return Ok(Value::null_unknown());
             }
             Value::text(s)
         }

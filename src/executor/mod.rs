@@ -494,10 +494,8 @@ impl Executor {
     /// The gate for one entry: shared while this session has no explicit
     /// transaction and `exclusive` is false, exclusive otherwise
     fn enter(&self, exclusive: bool) -> StatementGate<'_> {
-        if !exclusive {
-            if let Some(read) = self.enter_shared() {
-                return StatementGate::Shared { _read: read };
-            }
+        if !exclusive && let Some(read) = self.enter_shared() {
+            return StatementGate::Shared { _read: read };
         }
         #[cfg(feature = "test-failpoints")]
         if self.statement_gate.try_write().is_none() {
@@ -1406,16 +1404,16 @@ impl Executor {
             return self.execute_insert_with_compiled_cache(stmt, &ctx, &plan.compiled);
         }
         let (active_txn_id, ctx) = self.gated_txn_ctx(&gate, ctx);
-        if held {
-            if let Some(result) = self.compiled_fast_paths_until_held(
+        if held
+            && let Some(result) = self.compiled_fast_paths_until_held(
                 plan.statement.as_ref(),
                 &ctx,
                 plan.compiled.slot(),
                 &plan.classification,
                 active_txn_id.is_some(),
-            ) {
-                return result;
-            }
+            )
+        {
+            return result;
         }
 
         self.execute_statement_inner(

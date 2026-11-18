@@ -151,10 +151,10 @@ impl OutputLayout {
         visit_order_by_inputs(stmt, &mut |column, key| {
             if let Some(position) = self.position(&key) {
                 slots.entry(ExprKey::of(column)).or_insert(position);
-            } else if let OrderKey::Input(Some(qualifier), name) = key {
-                if input_column_index(&self.input_columns, Some(qualifier), name).is_none() {
-                    missing.get_or_insert_with(|| format!("{qualifier}.{name}"));
-                }
+            } else if let OrderKey::Input(Some(qualifier), name) = key
+                && input_column_index(&self.input_columns, Some(qualifier), name).is_none()
+            {
+                missing.get_or_insert_with(|| format!("{qualifier}.{name}"));
             }
         });
         match missing {
@@ -263,12 +263,11 @@ fn visit_expression_inputs<'e>(
 pub(crate) fn order_by_inputs(stmt: &SelectStatement, columns: &[String]) -> Vec<usize> {
     let mut inputs = Vec::new();
     let read_all = visit_order_by_inputs(stmt, &mut |_, key| {
-        if let OrderKey::Input(qualifier, name) = key {
-            if let Some(input) = input_column_index(columns, qualifier, name) {
-                if !inputs.contains(&input) {
-                    inputs.push(input);
-                }
-            }
+        if let OrderKey::Input(qualifier, name) = key
+            && let Some(input) = input_column_index(columns, qualifier, name)
+            && !inputs.contains(&input)
+        {
+            inputs.push(input);
         }
     });
     if read_all {
@@ -438,11 +437,11 @@ impl<'r, 'p> JoinedWhere<'r, 'p> {
 
     fn matches(&mut self, row: &Row, blocks: Option<&dyn SubqueryExecutor>) -> Result<bool> {
         let passed = self.filter.matches_checked_with(row, blocks)?;
-        if let Some((bound, run)) = self.bound.as_mut() {
-            if run.rebound(bound) {
-                let program = CompactArc::clone(run.current(bound));
-                self.filter = RowFilter::from_program(program).with_context(self.ctx);
-            }
+        if let Some((bound, run)) = self.bound.as_mut()
+            && run.rebound(bound)
+        {
+            let program = CompactArc::clone(run.current(bound));
+            self.filter = RowFilter::from_program(program).with_context(self.ctx);
         }
         Ok(passed)
     }
@@ -1385,11 +1384,11 @@ pub(crate) fn any_constant_term<'e>(
     registry: &FunctionRegistry,
     each: &mut impl FnMut(&'e Expression) -> bool,
 ) -> bool {
-    if let Expression::Infix(infix) = expr {
-        if infix.op_type == InfixOperator::And {
-            return any_constant_term(&infix.left, registry, each)
-                || any_constant_term(&infix.right, registry, each);
-        }
+    if let Expression::Infix(infix) = expr
+        && infix.op_type == InfixOperator::And
+    {
+        return any_constant_term(&infix.left, registry, each)
+            || any_constant_term(&infix.right, registry, each);
     }
     statement_constant(expr, registry) && each(expr)
 }
@@ -1942,15 +1941,16 @@ impl Executor {
             None => get_classification(stmt),
         };
         // Every path reads a rowid as the column it is, spelled once here
-        if classification.names_rowid && !spelled {
-            if let Some(spelled) = self.rowids_spelled(stmt, ctx)? {
-                debug_assert!(
-                    self.rowids_spelled(&spelled, ctx)
-                        .is_ok_and(|again| again.is_none()),
-                    "a statement's rowid spelled twice"
-                );
-                return self.select_rows_with_plan(&spelled, ctx, (false, true), None, compiled);
-            }
+        if classification.names_rowid
+            && !spelled
+            && let Some(spelled) = self.rowids_spelled(stmt, ctx)?
+        {
+            debug_assert!(
+                self.rowids_spelled(&spelled, ctx)
+                    .is_ok_and(|again| again.is_none()),
+                "a statement's rowid spelled twice"
+            );
+            return self.select_rows_with_plan(&spelled, ctx, (false, true), None, compiled);
         }
 
         // A statement of the prepared family runs on that path and no other,
@@ -2521,29 +2521,29 @@ impl Executor {
             // TOP-N OPTIMIZATION: Use bounded heap when LIMIT is present
             // This is O(n log k) instead of O(n log n), where k = limit
             // Skip when DISTINCT ON is active: DISTINCT ON must happen between ORDER BY and LIMIT
-            if let Some(lim) = limit {
-                if stmt.distinct_on.is_empty() {
-                    // Use TopNResult for ORDER BY + LIMIT (5-50x faster for large datasets)
-                    result = Box::new(TopNResult::new(
-                        result,
-                        move |a, b| Self::compare_rows_with_indices(a, b, &order_specs),
-                        lim,
-                        offset,
-                        ctx.deadline_of_call(),
-                    )?);
+            if let Some(lim) = limit
+                && stmt.distinct_on.is_empty()
+            {
+                // Use TopNResult for ORDER BY + LIMIT (5-50x faster for large datasets)
+                result = Box::new(TopNResult::new(
+                    result,
+                    move |a, b| Self::compare_rows_with_indices(a, b, &order_specs),
+                    lim,
+                    offset,
+                    ctx.deadline_of_call(),
+                )?);
 
-                    OrderLimitPath::TopN.taken();
-                    if columns.len() > expected_columns && expected_columns > 0 {
-                        // Remove extra ORDER BY columns if needed
-                        result = Box::new(ProjectedResult::new(result, expected_columns));
-                    }
-
-                    // LIMIT/OFFSET already applied by TopNResult
-                    return Ok(result);
+                OrderLimitPath::TopN.taken();
+                if columns.len() > expected_columns && expected_columns > 0 {
+                    // Remove extra ORDER BY columns if needed
+                    result = Box::new(ProjectedResult::new(result, expected_columns));
                 }
-                // DISTINCT ON with LIMIT: fall through to full sort
-                // (DISTINCT ON is applied after ORDER BY, LIMIT after DISTINCT ON)
+
+                // LIMIT/OFFSET already applied by TopNResult
+                return Ok(result);
             }
+            // DISTINCT ON with LIMIT: fall through to full sort
+            // (DISTINCT ON is applied after ORDER BY, LIMIT after DISTINCT ON)
             {
                 // No LIMIT - use full sort
                 // OPTIMIZATION: Try radix sort for integer columns (O(n) vs O(n log n))
@@ -2899,10 +2899,10 @@ impl Executor {
     ) -> Result<(RowVec, Vec<String>)> {
         // Short-circuit: if WHERE is a constant-false expression (e.g., 1=0),
         // skip TVF generation entirely and return empty result.
-        if let Some(where_clause) = where_clause {
-            if true_for_no_row(where_clause, ctx, global_registry()) {
-                return Ok((RowVec::new(), Self::tvf_columns(tvf_source)?));
-            }
+        if let Some(where_clause) = where_clause
+            && true_for_no_row(where_clause, ctx, global_registry())
+        {
+            return Ok((RowVec::new(), Self::tvf_columns(tvf_source)?));
         }
 
         // Extract range bounds from WHERE clause to narrow TVF generation range.
@@ -4345,8 +4345,8 @@ impl Executor {
             let grouped_probe = join_plan.probes[0]
                 .as_ref()
                 .filter(|_| join_plan.grouped_index && left_window.is_none());
-            if let Some(probe) = grouped_probe {
-                if let Some(result) = self.try_grouped_index_join(
+            if let Some(probe) = grouped_probe
+                && let Some(result) = self.try_grouped_index_join(
                     stmt,
                     ctx,
                     join_source,
@@ -4357,9 +4357,9 @@ impl Executor {
                     cross_filter.as_ref(),
                     prepared,
                     (&plan, probe),
-                )? {
-                    return Ok(result);
-                }
+                )?
+            {
+                return Ok(result);
             }
             // Semi-join reduction for INNER/LEFT JOIN + GROUP BY: fetch the left
             // side with the limit, then the right side through an IN filter on
@@ -4955,7 +4955,7 @@ impl Executor {
                     // A cross-table WHERE filter counts toward LIMIT, so it is
                     // applied per joined row rather than after collection
                     let mut cross_row_filter = match cross_filter {
-                        Some(ref cross) => Some(JoinedWhere::new(
+                        Some(cross) => Some(JoinedWhere::new(
                             self.join_where(
                                 prepared,
                                 WhereSite::IndexJoin,
@@ -7760,21 +7760,22 @@ impl Executor {
             let mut enough = false;
             while let Some(row_ref) = op.next()? {
                 let row = row_ref.into_owned();
-                if let Some(cross) = cross.as_mut() {
-                    if !cross.matches(&row, cross_blocks)? {
-                        continue;
-                    }
+                if let Some(cross) = cross.as_mut()
+                    && !cross.matches(&row, cross_blocks)?
+                {
+                    continue;
                 }
                 let new_group = match &current {
                     Some(first) => group_idx.iter().any(|&idx| first.get(idx) != row.get(idx)),
                     None => true,
                 };
                 if new_group {
-                    if let Some(first) = current.take() {
-                        if finish(&first, &mut funcs, &mut groups)? && groups.len() >= want {
-                            enough = true;
-                            break;
-                        }
+                    if let Some(first) = current.take()
+                        && finish(&first, &mut funcs, &mut groups)?
+                        && groups.len() >= want
+                    {
+                        enough = true;
+                        break;
                     }
                     for func in funcs.iter_mut() {
                         func.reset();
@@ -7791,10 +7792,8 @@ impl Executor {
                     }
                 }
             }
-            if !enough {
-                if let Some(first) = current.take() {
-                    finish(&first, &mut funcs, &mut groups)?;
-                }
+            if !enough && let Some(first) = current.take() {
+                finish(&first, &mut funcs, &mut groups)?;
             }
             op.close()?;
             // A probe the inner table could not answer: the groups so far are
@@ -7872,10 +7871,10 @@ impl Executor {
         join_op.open()?;
         while let Some(row_ref) = join_op.next()? {
             let row = row_ref.into_owned();
-            if let Some(filter) = cross.as_deref_mut() {
-                if !filter.matches(&row, blocks)? {
-                    continue;
-                }
+            if let Some(filter) = cross.as_deref_mut()
+                && !filter.matches(&row, blocks)?
+            {
+                continue;
             }
             out.push((out.len() as i64, row));
             if limit.is_some_and(|lim| out.len() >= lim as usize) {
@@ -7888,10 +7887,10 @@ impl Executor {
     /// The first `cap` rows of `result`, shared as they are when it holds no
     /// more; an error in the rows read is the result's
     fn first_rows(mut result: Box<dyn QueryResult>, cap: usize) -> Result<CompactArc<Vec<Row>>> {
-        if result.exact_len().is_some_and(|len| len <= cap) {
-            if let Some(rows) = result.try_into_arc_rows() {
-                return Ok(rows);
-            }
+        if result.exact_len().is_some_and(|len| len <= cap)
+            && let Some(rows) = result.try_into_arc_rows()
+        {
+            return Ok(rows);
         }
         let mut rows = Vec::new();
         while rows.len() < cap && result.next() {
@@ -7959,25 +7958,22 @@ impl Executor {
         }
 
         // Handle SELECT t.* - filter to only columns matching the qualifier
-        if select_exprs.len() == 1 {
-            if let Expression::QualifiedStar(qs) = &select_exprs[0] {
-                let mut indices_to_use = Vec::new();
-                for_each_qualified_star_column(
-                    all_columns,
-                    &qs.qualifier,
-                    table_alias,
-                    |idx, _| indices_to_use.push(idx),
-                );
+        if select_exprs.len() == 1
+            && let Expression::QualifiedStar(qs) = &select_exprs[0]
+        {
+            let mut indices_to_use = Vec::new();
+            for_each_qualified_star_column(all_columns, &qs.qualifier, table_alias, |idx, _| {
+                indices_to_use.push(idx)
+            });
 
-                // OPTIMIZATION: If selecting all columns in order (identity), pass through directly
-                let is_identity = indices_to_use.len() == all_columns.len()
-                    && indices_to_use.iter().enumerate().all(|(i, &idx)| i == idx);
+            // OPTIMIZATION: If selecting all columns in order (identity), pass through directly
+            let is_identity = indices_to_use.len() == all_columns.len()
+                && indices_to_use.iter().enumerate().all(|(i, &idx)| i == idx);
 
-                if is_identity {
-                    return Ok(SelectProjection::Whole);
-                }
-                return Ok(SelectProjection::Subset(indices_to_use));
+            if is_identity {
+                return Ok(SelectProjection::Whole);
             }
+            return Ok(SelectProjection::Subset(indices_to_use));
         }
 
         // OPTIMIZATION: For fast path check, use linear search to avoid HashMap allocation.
@@ -8595,19 +8591,18 @@ impl Executor {
         for (expr, distinct) in keys {
             match expr {
                 Expression::Identifier(id) => {
-                    if let Some(idx) = uncarried(None, &id.value_lower) {
-                        if !extra_order_indices.contains(&idx) {
-                            extra_order_indices.push(idx);
-                        }
+                    if let Some(idx) = uncarried(None, &id.value_lower)
+                        && !extra_order_indices.contains(&idx)
+                    {
+                        extra_order_indices.push(idx);
                     }
                 }
                 Expression::QualifiedIdentifier(qi) if reads_input(from, qi) => {
                     if let Some(idx) =
                         uncarried(Some(&qi.qualifier.value_lower), &qi.name.value_lower)
+                        && !extra_order_indices.contains(&idx)
                     {
-                        if !extra_order_indices.contains(&idx) {
-                            extra_order_indices.push(idx);
-                        }
+                        extra_order_indices.push(idx);
                     }
                 }
                 // A subquery is read per row against the parent, which the
@@ -8647,12 +8642,11 @@ impl Executor {
                 // it names, which the sort reads by the layout
                 other if Self::has_subqueries(other) => {
                     visit_expression_inputs(other, from, &mut |_, key| {
-                        if let OrderKey::Input(qualifier, name) = key {
-                            if let Some(idx) = input_column_index(all_columns, qualifier, name) {
-                                if !extra_order_indices.contains(&idx) {
-                                    extra_order_indices.push(idx);
-                                }
-                            }
+                        if let OrderKey::Input(qualifier, name) = key
+                            && let Some(idx) = input_column_index(all_columns, qualifier, name)
+                            && !extra_order_indices.contains(&idx)
+                        {
+                            extra_order_indices.push(idx);
                         }
                     });
                 }
@@ -10722,10 +10716,10 @@ mod tests {
         let mut found = false;
         while result.next() {
             let row = result.row();
-            if let Some(Value::Text(name)) = row.get(0) {
-                if &**name == "test" {
-                    found = true;
-                }
+            if let Some(Value::Text(name)) = row.get(0)
+                && &**name == "test"
+            {
+                found = true;
             }
         }
         assert!(found);

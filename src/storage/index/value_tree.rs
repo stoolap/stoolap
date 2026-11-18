@@ -320,16 +320,16 @@ impl<const CAP: usize, V: Blank> Keys<CAP, V> {
     #[inline]
     fn locate(&self, probe: &Probe<'_>) -> Result<usize, usize> {
         let key = probe.key;
-        if self.skip > 0 {
-            if let Value::Text(text) = key {
-                let text = text.as_str().as_bytes();
-                let n = text.len().min(self.skip);
-                let order = cmp_bytes(&text[..n], &self.prefix[..n]).then(n.cmp(&self.skip));
-                match order {
-                    Ordering::Less => return Err(0),
-                    Ordering::Greater => return Err(self.len),
-                    Ordering::Equal => {}
-                }
+        if self.skip > 0
+            && let Value::Text(text) = key
+        {
+            let text = text.as_str().as_bytes();
+            let n = text.len().min(self.skip);
+            let order = cmp_bytes(&text[..n], &self.prefix[..n]).then(n.cmp(&self.skip));
+            match order {
+                Ordering::Less => return Err(0),
+                Ordering::Greater => return Err(self.len),
+                Ordering::Equal => {}
             }
         }
         let word = probe.word.unwrap_or_else(|| key.order_word_at(self.skip));
@@ -399,12 +399,12 @@ impl<const CAP: usize, V: Blank> Keys<CAP, V> {
         let mut free = (0..at).filter(|&s| taken[s]);
         for p in 0..at {
             let slot = usize::from(self.slots[p]);
-            if slot >= at {
-                if let Some(to) = free.next() {
-                    self.keys.swap(slot, to);
-                    self.values.swap(slot, to);
-                    self.slots[p] = to as u8;
-                }
+            if slot >= at
+                && let Some(to) = free.next()
+            {
+                self.keys.swap(slot, to);
+                self.values.swap(slot, to);
+                self.slots[p] = to as u8;
             }
         }
         right.len = n - at;
@@ -444,11 +444,11 @@ impl<const CAP: usize, V: Blank> Keys<CAP, V> {
 
     fn rewrite(&mut self) {
         self.skip = self.shared();
-        if self.skip > 0 {
-            if let Value::Text(first) = &self.keys[usize::from(self.slots[0])] {
-                let prefix = &first.as_str().as_bytes()[..self.skip];
-                self.prefix[..self.skip].copy_from_slice(prefix);
-            }
+        if self.skip > 0
+            && let Value::Text(first) = &self.keys[usize::from(self.slots[0])]
+        {
+            let prefix = &first.as_str().as_bytes()[..self.skip];
+            self.prefix[..self.skip].copy_from_slice(prefix);
         }
         for i in 0..self.len {
             let word = self.key(i).order_word_at(self.skip);
@@ -845,14 +845,14 @@ impl ValueTree {
             return Ok(true);
         };
         let inserted = Self::insert_in(node, &Probe::new(key), id, unique)?;
-        if let Some((separator, right)) = inserted.split {
-            if let Some(left) = root.take() {
-                let mut children = Children::new();
-                children.push(left);
-                let mut top = Inner::new(children);
-                top.insert_at(0, separator, right);
-                *root = Some(Node::Inner(top));
-            }
+        if let Some((separator, right)) = inserted.split
+            && let Some(left) = root.take()
+        {
+            let mut children = Children::new();
+            children.push(left);
+            let mut top = Inner::new(children);
+            top.insert_at(0, separator, right);
+            *root = Some(Node::Inner(top));
         }
         self.keys += usize::from(inserted.key);
         Ok(inserted.id)

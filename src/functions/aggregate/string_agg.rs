@@ -171,10 +171,10 @@ impl AggregateFunction for StringAggFunction {
     }
 
     fn result(&self) -> Result<Value> {
-        if !self.has_order_by || self.ordered_entries.is_empty() {
-            if let Some(joined) = &self.joined {
-                return Ok(Value::text(joined));
-            }
+        if (!self.has_order_by || self.ordered_entries.is_empty())
+            && let Some(joined) = &self.joined
+        {
+            return Ok(Value::text(joined));
         }
         // Sorted by their keys under ORDER BY, else in arrival order
         let mut entries: Vec<&OrderedEntry> = self.ordered_entries.iter().collect();

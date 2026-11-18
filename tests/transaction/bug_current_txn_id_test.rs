@@ -50,10 +50,9 @@ fn test_current_transaction_id_in_where_parallel() {
             (),
         )
         .unwrap();
-    let count = if let Some(Ok(row)) = rows.next() {
-        row.get::<i64>(0).unwrap()
-    } else {
-        0
+    let count = match rows.next() {
+        Some(Ok(row)) => row.get::<i64>(0).unwrap(),
+        _ => 0,
     };
     drop(rows);
     tx.rollback().unwrap();
@@ -136,13 +135,16 @@ fn test_current_transaction_id_null_in_autocommit() {
     let mut rows = db
         .query("SELECT CURRENT_TRANSACTION_ID() IS NULL FROM t", ())
         .unwrap();
-    if let Some(Ok(row)) = rows.next() {
-        let is_null = row.get::<bool>(0).unwrap();
-        assert!(
-            is_null,
-            "CURRENT_TRANSACTION_ID() should be NULL in auto-commit mode"
-        );
-    } else {
-        panic!("Expected one row");
+    match rows.next() {
+        Some(Ok(row)) => {
+            let is_null = row.get::<bool>(0).unwrap();
+            assert!(
+                is_null,
+                "CURRENT_TRANSACTION_ID() should be NULL in auto-commit mode"
+            );
+        }
+        _ => {
+            panic!("Expected one row");
+        }
     }
 }

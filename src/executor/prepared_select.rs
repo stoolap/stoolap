@@ -3046,12 +3046,11 @@ impl Chain<'_> {
 /// Each column of the projected row `expr` reads past the statement's first
 /// `from` columns, by its position on that row
 fn projected_columns(expr: &Expression, from: usize, out: &mut SmallVec<[usize; 2]>) {
-    if let Expression::Column(column) = expr {
-        if let Some(at) = (column.index as usize).checked_sub(from) {
-            if !out.contains(&at) {
-                out.push(at);
-            }
-        }
+    if let Expression::Column(column) = expr
+        && let Some(at) = (column.index as usize).checked_sub(from)
+        && !out.contains(&at)
+    {
+        out.push(at);
     }
     let _ = for_each_child(expr, &mut |child| {
         projected_columns(child, from, out);
@@ -3998,10 +3997,10 @@ impl RowSource for PassedRows<'_, '_> {
                 };
             }
             self.ctx.charge(DeadlineSite::Scan, 1)?;
-            if let Some(bound) = &self.bound {
-                if !self.runner.matches(&mut self.vm, bound, self.scan.row())? {
-                    continue;
-                }
+            if let Some(bound) = &self.bound
+                && !self.runner.matches(&mut self.vm, bound, self.scan.row())?
+            {
+                continue;
             }
             return Ok(Some(self.scan.row()));
         }
@@ -7006,44 +7005,44 @@ impl Builder<'_> {
         conjunct: &Expression,
         work: &mut Rewritten,
     ) -> Result<Expression> {
-        if let Expression::Infix(infix) = conjunct {
-            if is_comparison(infix.op_type) {
-                let left = chain.reads(&infix.left)?;
-                let right = chain.reads(&infix.right)?;
-                let hoist = |value: &Expression, reads: Reads| {
-                    reads & 1 == 0
-                        && reads.count_ones() <= 1
-                        && !is_leaf(value)
-                        && !volatile(value, global_registry())
-                };
-                let sides = [(&infix.left, left), (&infix.right, right)];
-                if let Some(index) = sides.iter().position(|(value, reads)| hoist(value, *reads)) {
-                    let (value, reads) = sides[index];
-                    let other = sides[1 - index].0;
-                    if matches!(chain.resolve(other)?, Some((0, _))) {
-                        self.note_params(value);
-                        let slot = self.slot();
-                        let depth = reads.trailing_zeros() as usize;
-                        let value_in_scope = chain.in_scope(value)?;
-                        if reads == 0 || depth == 1 {
-                            work.reads_parent |= reads != 0;
-                            work.holes.push((slot, value_in_scope));
-                            work.written.push((slot, (**value).clone()));
-                        } else {
-                            work.delegated
-                                .push((slot, value_in_scope, depth, (**value).clone()));
-                        }
-                        let mut out = infix.clone();
-                        let other = self.rewrite(chain, Some(id), other, work)?;
-                        let (left, right) = if index == 0 {
-                            (slot_parameter(slot), other)
-                        } else {
-                            (other, slot_parameter(slot))
-                        };
-                        *out.left = left;
-                        *out.right = right;
-                        return Ok(Expression::Infix(out));
+        if let Expression::Infix(infix) = conjunct
+            && is_comparison(infix.op_type)
+        {
+            let left = chain.reads(&infix.left)?;
+            let right = chain.reads(&infix.right)?;
+            let hoist = |value: &Expression, reads: Reads| {
+                reads & 1 == 0
+                    && reads.count_ones() <= 1
+                    && !is_leaf(value)
+                    && !volatile(value, global_registry())
+            };
+            let sides = [(&infix.left, left), (&infix.right, right)];
+            if let Some(index) = sides.iter().position(|(value, reads)| hoist(value, *reads)) {
+                let (value, reads) = sides[index];
+                let other = sides[1 - index].0;
+                if matches!(chain.resolve(other)?, Some((0, _))) {
+                    self.note_params(value);
+                    let slot = self.slot();
+                    let depth = reads.trailing_zeros() as usize;
+                    let value_in_scope = chain.in_scope(value)?;
+                    if reads == 0 || depth == 1 {
+                        work.reads_parent |= reads != 0;
+                        work.holes.push((slot, value_in_scope));
+                        work.written.push((slot, (**value).clone()));
+                    } else {
+                        work.delegated
+                            .push((slot, value_in_scope, depth, (**value).clone()));
                     }
+                    let mut out = infix.clone();
+                    let other = self.rewrite(chain, Some(id), other, work)?;
+                    let (left, right) = if index == 0 {
+                        (slot_parameter(slot), other)
+                    } else {
+                        (other, slot_parameter(slot))
+                    };
+                    *out.left = left;
+                    *out.right = right;
+                    return Ok(Expression::Infix(out));
                 }
             }
         }
@@ -8659,11 +8658,10 @@ impl PreparedProjection {
             | Output::Key(computed)
             | Output::Block(computed)
             | Output::AliasKey(computed, _) = output
+                && Computed::binds(&computed.program)
             {
-                if Computed::binds(&computed.program) {
-                    computed.slot = Some(slots);
-                    slots += 1;
-                }
+                computed.slot = Some(slots);
+                slots += 1;
             }
         }
         let alias_keys = outputs.iter().any(|o| matches!(o, Output::AliasKey(..)));
@@ -8885,11 +8883,11 @@ impl PreparedProjection {
             };
             let exec = run.exec_over(row, &run.base).with_subquery_executor(run);
             for (position, output) in self.outputs.iter().enumerate() {
-                if let Output::Program(computed) | Output::Block(computed) = output {
-                    if !read.contains(&position) {
-                        let item = Self::output_item(run, &mut bound, computed);
-                        out.set(position, item.value(&mut vm, &exec)?)?;
-                    }
+                if let Output::Program(computed) | Output::Block(computed) = output
+                    && !read.contains(&position)
+                {
+                    let item = Self::output_item(run, &mut bound, computed);
+                    out.set(position, item.value(&mut vm, &exec)?)?;
                 }
             }
             out.truncate(width);
@@ -10125,7 +10123,7 @@ impl PreparedGrouped {
                 .subqueries
                 .iter()
                 .zip(&late_blocks)
-                .filter(|(_, &late)| late)
+                .filter(|(_, late)| **late)
             {
                 for (_, written) in &sq.hole_written {
                     if alias_at(written).is_some() {
@@ -10482,15 +10480,15 @@ impl Executor {
             ctx.params().len(),
             epoch,
         )?);
-        if let Some(mut guard) = compiled.map(|slot| slot.write()) {
-            if matches!(
+        if let Some(mut guard) = compiled.map(|slot| slot.write())
+            && matches!(
                 &*guard,
                 CompiledExecution::Unknown
                     | CompiledExecution::NotOptimizable(_)
                     | CompiledExecution::PreparedGrouped(_)
-            ) {
-                *guard = CompiledExecution::PreparedGrouped(Arc::clone(&prepared));
-            }
+            )
+        {
+            *guard = CompiledExecution::PreparedGrouped(Arc::clone(&prepared));
         }
         Ok(Some(GroupedRun {
             held: prepared,
@@ -11149,15 +11147,14 @@ impl JoinBlocks {
             .transpose()?;
         // A named window only as its windows read it
         let windows = Executor::used_window_defs(stmt);
-        let checked = stmt
-            .columns
+
+        stmt.columns
             .iter()
             .map(unaliased)
             .chain(keys)
             .chain(having.as_ref())
             .chain(windows.iter().flat_map(WindowDefinition::expressions))
-            .try_for_each(|expr| names(&chain, expr));
-        checked
+            .try_for_each(|expr| names(&chain, expr))
     }
 
     /// The column a joined side's merged column read through column `at`
@@ -11519,11 +11516,11 @@ impl JoinBlocks {
                         .map(<[bool]>::to_vec);
                 }
                 // As a statement over the table plans its scan
-                if blockless {
-                    if let Ok(store) = executor.engine.get_version_store(&schema.table_name) {
-                        side_scans[i] =
-                            Some(scan_choice(&store, schema, where_.pushdown.as_ref(), false));
-                    }
+                if blockless
+                    && let Ok(store) = executor.engine.get_version_store(&schema.table_name)
+                {
+                    side_scans[i] =
+                        Some(scan_choice(&store, schema, where_.pushdown.as_ref(), false));
                 }
                 side_wheres[i] = Some(where_);
                 side_filters[i] = joined_clause;
@@ -13688,10 +13685,10 @@ impl Executor {
         while scan.next() {
             ctx.charge(DeadlineSite::Scan, 1)?;
             let row = scan.row();
-            if let Some(bound) = &bound {
-                if !runner.matches(&mut filter_vm, bound, row)? {
-                    continue;
-                }
+            if let Some(bound) = &bound
+                && !runner.matches(&mut filter_vm, bound, row)?
+            {
+                continue;
             }
             // A row that is its own output is copied only when new
             let out = if projection.whole_row {
@@ -16036,14 +16033,13 @@ impl<'a> PreparedRunner<'a> {
                 None => return Ok(None),
             }
         }
-        if let Some(expr) = &storage_expr {
-            if self
+        if let Some(expr) = &storage_expr
+            && self
                 .executor
                 .get_query_planner()
                 .can_prune_entire_scan(table, expr.as_ref())
-            {
-                return Ok(None);
-            }
+        {
+            return Ok(None);
         }
         // The scan took the whole WHERE: its rows need no second look
         let scanned_whole = static_whole && taken == where_.conjuncts;
@@ -16565,11 +16561,11 @@ impl<'a> PreparedRunner<'a> {
                             if stream && scanned_whole && extra_whole {
                                 return Ok(Passing::Scan(scan));
                             }
-                            if stream && extra_whole {
-                                if let Some(bound) = self.bound_program(&where_.rest(rest).program)
-                                {
-                                    return Ok(Passing::Filtered(scan, bound));
-                                }
+                            if stream
+                                && extra_whole
+                                && let Some(bound) = self.bound_program(&where_.rest(rest).program)
+                            {
+                                return Ok(Passing::Filtered(scan, bound));
                             }
                             (None, Some(scan), false, scanned_whole)
                         }
@@ -16940,10 +16936,10 @@ impl<'a> PreparedRunner<'a> {
                 let exec = self
                     .exec_over(scanner.row(), &params)
                     .with_subquery_executor(self);
-                if let Some(candidates) = &sq.candidates {
-                    if !vm.execute_bool_checked(candidates, &exec)? {
-                        continue;
-                    }
+                if let Some(candidates) = &sq.candidates
+                    && !vm.execute_bool_checked(candidates, &exec)?
+                {
+                    continue;
                 }
                 match self.passes_rest(sq, &mut vm, &exec, &slots_failed) {
                     Ok(true) => {}
@@ -17489,10 +17485,10 @@ impl PreparedRunner<'_> {
             .subqueries
             .get(index)
             .ok_or_else(|| Error::internal("unknown prepared subquery"))?;
-        if sq.uncorrelated() {
-            if let Some(value) = self.blocks[index].value.borrow().as_ref() {
-                return Ok(value.clone());
-            }
+        if sq.uncorrelated()
+            && let Some(value) = self.blocks[index].value.borrow().as_ref()
+        {
+            return Ok(value.clone());
         }
         let call = self.parent_call(sq);
         if let Some(BlockAnswer::Value(value)) = self.answered(index, call) {
@@ -17748,10 +17744,10 @@ impl PreparedRunner<'_> {
             let row = scanner.row();
             let exec = self.exec_over(row, &params).with_subquery_executor(self);
             if !decided {
-                if let Some(candidates) = &sq.candidates {
-                    if !vm.execute_bool_checked(candidates, &exec)? {
-                        continue;
-                    }
+                if let Some(candidates) = &sq.candidates
+                    && !vm.execute_bool_checked(candidates, &exec)?
+                {
+                    continue;
                 }
                 if !self.passes_rest(sq, &mut vm, &exec, &slots_failed)? {
                     continue;
@@ -17800,16 +17796,16 @@ impl PreparedRunner<'_> {
                     row,
                     order,
                 });
-            } else if let Some(mut worst) = held.peek_mut() {
-                if order.compare(&keys, &worst.keys).is_lt() {
-                    let row = row.clone();
-                    *worst = HeldRow {
-                        keys,
-                        read: passed,
-                        row,
-                        order,
-                    };
-                }
+            } else if let Some(mut worst) = held.peek_mut()
+                && order.compare(&keys, &worst.keys).is_lt()
+            {
+                let row = row.clone();
+                *worst = HeldRow {
+                    keys,
+                    read: passed,
+                    row,
+                    order,
+                };
             }
         }
         if let Some(err) = scanner.err() {
@@ -17864,10 +17860,10 @@ impl PreparedRunner<'_> {
         let Answer::Exists(existence) = &sq.answer else {
             return Err(Error::internal("a scalar block run for EXISTS"));
         };
-        if sq.uncorrelated() {
-            if let Some(Value::Boolean(exists)) = self.blocks[index].value.borrow().as_ref() {
-                return Ok(*exists);
-            }
+        if sq.uncorrelated()
+            && let Some(Value::Boolean(exists)) = self.blocks[index].value.borrow().as_ref()
+        {
+            return Ok(*exists);
         }
         let call = self.parent_call(sq);
         if let Some(BlockAnswer::Once(exists)) = self.answered(index, call) {
@@ -18563,10 +18559,10 @@ impl PreparedRunner<'_> {
                 .exec_over(scanner.row(), &params)
                 .with_subquery_executor(self);
             if !decided {
-                if let Some(candidates) = &sq.candidates {
-                    if !vm.execute_bool_checked(candidates, &exec)? {
-                        continue;
-                    }
+                if let Some(candidates) = &sq.candidates
+                    && !vm.execute_bool_checked(candidates, &exec)?
+                {
+                    continue;
                 }
                 match self.passes_rest(sq, &mut vm, &exec, &slots_failed) {
                     Ok(true) => {}
@@ -18699,10 +18695,10 @@ impl PreparedRunner<'_> {
                 }
             }
             let exec = self.exec_over(row, &params).with_subquery_executor(self);
-            if let Some(candidates) = candidates.filter(|_| !decided) {
-                if !vm.execute_bool_checked(candidates, &exec)? {
-                    continue;
-                }
+            if let Some(candidates) = candidates.filter(|_| !decided)
+                && !vm.execute_bool_checked(candidates, &exec)?
+            {
+                continue;
             }
             let passed = if decided {
                 Ok(true)
@@ -19107,38 +19103,39 @@ impl PreparedRunner<'_> {
         answer: impl FnOnce(&[Row], &[Value], &mut ExprVM) -> Result<T>,
     ) -> Result<T> {
         self.fill(index, &mut self.blocks[index].vm.borrow_mut(), caller, site)?;
-        if let Some(plan) = grouping.keyed.as_ref() {
-            if self.takes_keyed_set(index, plan) && self.keys_fit(index, plan) {
-                if self.blocks[index].grouped.borrow().is_none() {
-                    let keys = self.grouped_keys(index, grouping, plan)?;
-                    *self.blocks[index].grouped.borrow_mut() = Some(keys);
-                }
-                let keys = self.blocks[index].grouped.borrow();
-                let keys = keys
-                    .as_ref()
-                    .ok_or_else(|| Error::internal("a keyed block's groups not read"))?;
-                let params = self.blocks[index].buffer.borrow();
-                let group = if plan.keys.iter().any(|(_, slot, _)| params[*slot].is_null()) {
-                    None
-                } else {
-                    match plan.keys.as_slice() {
-                        [(_, slot, _)] => keys.groups.get(std::slice::from_ref(&params[*slot])),
-                        many => {
-                            let key: SmallVec<[Value; 4]> = many
-                                .iter()
-                                .map(|(_, slot, _)| params[*slot].clone())
-                                .collect();
-                            keys.groups.get(key.as_slice())
-                        }
-                    }
-                };
-                let rows = match group {
-                    Some(Ok(rows)) => rows.as_slice(),
-                    Some(Err(e)) => return Err(e.clone()),
-                    None => keys.missing.as_slice(),
-                };
-                return answer(rows, &params, &mut self.blocks[index].vm.borrow_mut());
+        if let Some(plan) = grouping.keyed.as_ref()
+            && self.takes_keyed_set(index, plan)
+            && self.keys_fit(index, plan)
+        {
+            if self.blocks[index].grouped.borrow().is_none() {
+                let keys = self.grouped_keys(index, grouping, plan)?;
+                *self.blocks[index].grouped.borrow_mut() = Some(keys);
             }
+            let keys = self.blocks[index].grouped.borrow();
+            let keys = keys
+                .as_ref()
+                .ok_or_else(|| Error::internal("a keyed block's groups not read"))?;
+            let params = self.blocks[index].buffer.borrow();
+            let group = if plan.keys.iter().any(|(_, slot, _)| params[*slot].is_null()) {
+                None
+            } else {
+                match plan.keys.as_slice() {
+                    [(_, slot, _)] => keys.groups.get(std::slice::from_ref(&params[*slot])),
+                    many => {
+                        let key: SmallVec<[Value; 4]> = many
+                            .iter()
+                            .map(|(_, slot, _)| params[*slot].clone())
+                            .collect();
+                        keys.groups.get(key.as_slice())
+                    }
+                }
+            };
+            let rows = match group {
+                Some(Ok(rows)) => rows.as_slice(),
+                Some(Err(e)) => return Err(e.clone()),
+                None => keys.missing.as_slice(),
+            };
+            return answer(rows, &params, &mut self.blocks[index].vm.borrow_mut());
         }
         let rows = self.group_rows(index, grouping)?;
         let params = self.blocks[index].buffer.borrow();
@@ -19322,10 +19319,10 @@ impl PreparedRunner<'_> {
             }
             let exec = self.exec_over(row, &params).with_subquery_executor(self);
             let fed = (|| {
-                if let (false, Some(filter)) = (decided, &sq.filter) {
-                    if !vm.execute_bool_checked(filter, &exec)? {
-                        return Ok(());
-                    }
+                if let (false, Some(filter)) = (decided, &sq.filter)
+                    && !vm.execute_bool_checked(filter, &exec)?
+                {
+                    return Ok(());
                 }
                 match key.group(grouping, &mut groups, row, &mut vm, &exec)? {
                     Some(group) => grouping.feed(&mut groups, group, row, &exec, &mut feed_vm),

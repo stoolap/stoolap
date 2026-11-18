@@ -449,50 +449,49 @@ impl Executor {
         match expr {
             Expression::TableSource(simple) => {
                 // Try to get the table and analyze access plan
-                if let Ok(tx) = self.begin_transaction() {
-                    if let Ok(table) =
+                if let Ok(tx) = self.begin_transaction()
+                    && let Ok(table) =
                         tx.get_read_table_at(&simple.name.value, None, TableUse::Read)
-                    {
-                        // Build storage expression from WHERE clause for analysis
-                        let storage_expr = if let Some(where_expr) = where_clause {
-                            let schema = table.schema();
-                            let (expr, _) = pushdown::try_pushdown(where_expr, schema, None);
-                            expr
+                {
+                    // Build storage expression from WHERE clause for analysis
+                    let storage_expr = if let Some(where_expr) = where_clause {
+                        let schema = table.schema();
+                        let (expr, _) = pushdown::try_pushdown(where_expr, schema, None);
+                        expr
+                    } else {
+                        None
+                    };
+
+                    // The access the rule decides, shown as the runner shows it
+                    let plan = storage_expr.as_deref().and_then(|e| table.index_plan(e));
+                    let table = table.schema().table_name.clone();
+                    let plan_str = match plan {
+                        Some(plan) => ScanChoice::Index(plan, Weak::new())
+                            .explain(&table, where_clause)
+                            .join("\n"),
+                        // For SeqScan, use the AST expression's Display format instead of storage expr Debug
+                        None => ScanPlan::SeqScan {
+                            table,
+                            filter: where_clause.map(|w| format!("{}", w)),
+                        }
+                        .to_string(),
+                    };
+
+                    // Format the scan plan with indentation
+                    for (i, line) in plan_str.lines().enumerate() {
+                        if i == 0 {
+                            lines.push(format!("{}-> {}", prefix, line));
                         } else {
-                            None
-                        };
-
-                        // The access the rule decides, shown as the runner shows it
-                        let plan = storage_expr.as_deref().and_then(|e| table.index_plan(e));
-                        let table = table.schema().table_name.clone();
-                        let plan_str = match plan {
-                            Some(plan) => ScanChoice::Index(plan, Weak::new())
-                                .explain(&table, where_clause)
-                                .join("\n"),
-                            // For SeqScan, use the AST expression's Display format instead of storage expr Debug
-                            None => ScanPlan::SeqScan {
-                                table,
-                                filter: where_clause.map(|w| format!("{}", w)),
-                            }
-                            .to_string(),
-                        };
-
-                        // Format the scan plan with indentation
-                        for (i, line) in plan_str.lines().enumerate() {
-                            if i == 0 {
-                                lines.push(format!("{}-> {}", prefix, line));
-                            } else {
-                                lines.push(format!("{}   {}", prefix, line));
-                            }
+                            lines.push(format!("{}   {}", prefix, line));
                         }
-
-                        // Add alias if present
-                        if let Some(ref alias) = simple.alias {
-                            lines.push(format!("{}   Alias: {}", prefix, alias));
-                        }
-
-                        return;
                     }
+
+                    // Add alias if present
+                    if let Some(ref alias) = simple.alias {
+                        lines.push(format!("{}   Alias: {}", prefix, alias));
+                    }
+
+                    return;
                 }
 
                 // Fallback if table not found

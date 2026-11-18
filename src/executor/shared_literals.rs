@@ -358,14 +358,14 @@ fn is_comparison(op: InfixOperator) -> bool {
 /// `expr` with each literal starting at an offset of `slots` read as the
 /// parameter of its slot
 fn with_slots(expr: &Expression, slots: &FxHashMap<u32, usize>) -> Result<Expression> {
-    if let Some(token) = literal_token(expr) {
-        if let Some(&slot) = slots.get(&token.position.offset) {
-            return Ok(Expression::Parameter(Parameter {
-                token: token.clone(),
-                name: SmartString::from(format!("${slot}")),
-                index: slot,
-            }));
-        }
+    if let Some(token) = literal_token(expr)
+        && let Some(&slot) = slots.get(&token.position.offset)
+    {
+        return Ok(Expression::Parameter(Parameter {
+            token: token.clone(),
+            name: SmartString::from(format!("${slot}")),
+            index: slot,
+        }));
     }
     rebuild(expr, &mut |child| with_slots(child, slots))
 }

@@ -395,11 +395,14 @@ fn serialize_snapshot_schema(schema: &Schema) -> Vec<u8> {
         buf.extend_from_slice(&(schema.columns.len() as u16).to_le_bytes());
         for col in &schema.columns {
             if let Some(ref default_value) = col.default_value {
-                if let Ok(val_bytes) = serialize_value(default_value) {
-                    buf.extend_from_slice(&(val_bytes.len() as u16).to_le_bytes());
-                    buf.extend_from_slice(&val_bytes);
-                } else {
-                    buf.extend_from_slice(&0u16.to_le_bytes());
+                match serialize_value(default_value) {
+                    Ok(val_bytes) => {
+                        buf.extend_from_slice(&(val_bytes.len() as u16).to_le_bytes());
+                        buf.extend_from_slice(&val_bytes);
+                    }
+                    _ => {
+                        buf.extend_from_slice(&0u16.to_le_bytes());
+                    }
                 }
             } else {
                 buf.extend_from_slice(&0u16.to_le_bytes());
@@ -1488,14 +1491,15 @@ impl DiskVersionStore {
         // Legacy format: hnsw_{name}.bin — always remove (orphaned from pre-timestamp code).
         if let Ok(entries) = fs::read_dir(&snapshot_dir) {
             for entry in entries.flatten() {
-                if let Some(name_str) = entry.file_name().to_str().map(|s| s.to_string()) {
-                    if name_str.starts_with("hnsw_") && name_str.ends_with(".bin") {
-                        let should_keep = surviving_timestamps
-                            .iter()
-                            .any(|ts| name_str.ends_with(&format!("-{}.bin", ts)));
-                        if !should_keep {
-                            let _ = fs::remove_file(entry.path());
-                        }
+                if let Some(name_str) = entry.file_name().to_str().map(|s| s.to_string())
+                    && name_str.starts_with("hnsw_")
+                    && name_str.ends_with(".bin")
+                {
+                    let should_keep = surviving_timestamps
+                        .iter()
+                        .any(|ts| name_str.ends_with(&format!("-{}.bin", ts)));
+                    if !should_keep {
+                        let _ = fs::remove_file(entry.path());
                     }
                 }
             }

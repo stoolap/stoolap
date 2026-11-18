@@ -408,13 +408,13 @@ impl VolumeScanner {
             let group_start = group_idx << self.group_shift;
             if self.reverse_group != Some(group_idx) {
                 let cached = self.group_cache.as_ref().map(|c| c.group_idx);
-                if cached != Some(group_idx) {
-                    if let Some(ref skips) = self.row_group_skips {
-                        if group_idx < skips.len() && skips[group_idx] {
-                            self.end_idx = group_start.max(self.current_idx);
-                            continue;
-                        }
-                    }
+                if cached != Some(group_idx)
+                    && let Some(ref skips) = self.row_group_skips
+                    && group_idx < skips.len()
+                    && skips[group_idx]
+                {
+                    self.end_idx = group_start.max(self.current_idx);
+                    continue;
                 }
                 let rows = self.end_idx - group_start.max(self.current_idx);
                 self.deadline.charge(DeadlineSite::StorageRead, rows)?;
@@ -799,22 +799,22 @@ impl VolumeScanner {
             if op != crate::core::Operator::Eq {
                 continue;
             }
-            if let Value::Text(s) = value {
-                if let Some(col_idx) = self.filter_column(col_name) {
-                    #[cfg(feature = "test-failpoints")]
-                    crate::test_failpoints::dictionary_searched();
-                    let dict_id = if let Some(st) = store {
-                        st.dict_lookup(col_idx, s.as_str())
-                    } else {
-                        self.volume.columns.get(col_idx)?.dict_lookup(s.as_str())
-                    };
-                    if let Some(id) = dict_id {
-                        self.dict_filters.push((col_idx, id));
-                    } else {
-                        self.current_idx = self.end_idx;
-                        self.filter = Some(filter);
-                        return Ok(());
-                    }
+            if let Value::Text(s) = value
+                && let Some(col_idx) = self.filter_column(col_name)
+            {
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::dictionary_searched();
+                let dict_id = if let Some(st) = store {
+                    st.dict_lookup(col_idx, s.as_str())
+                } else {
+                    self.volume.columns.get(col_idx)?.dict_lookup(s.as_str())
+                };
+                if let Some(id) = dict_id {
+                    self.dict_filters.push((col_idx, id));
+                } else {
+                    self.current_idx = self.end_idx;
+                    self.filter = Some(filter);
+                    return Ok(());
                 }
             }
         }
@@ -1159,15 +1159,15 @@ impl VolumeScanner {
             // The mask names schema columns: widen it to the schema the
             // mapping describes, so a column added after the volume was
             // sealed keeps its place in the projection
-            if !mapping.is_identity {
-                if let Some(mask) = self.needed_cols.as_mut() {
-                    let len = mapping.sources.len().max(mask.len());
-                    mask.resize(len, false);
-                    if !self.wanted {
-                        for &ci in &self.project_cols {
-                            if ci < len {
-                                mask[ci] = true;
-                            }
+            if !mapping.is_identity
+                && let Some(mask) = self.needed_cols.as_mut()
+            {
+                let len = mapping.sources.len().max(mask.len());
+                mask.resize(len, false);
+                if !self.wanted {
+                    for &ci in &self.project_cols {
+                        if ci < len {
+                            mask[ci] = true;
                         }
                     }
                 }
@@ -1249,10 +1249,10 @@ impl VolumeScanner {
         col_idx: usize,
         global_idx: usize,
     ) -> Result<(&'a super::column::ColumnData, usize)> {
-        if let Some(cache) = cache {
-            if let Some(pair) = cache.col_and_local(col_idx, global_idx) {
-                return Ok(pair);
-            }
+        if let Some(cache) = cache
+            && let Some(pair) = cache.col_and_local(col_idx, global_idx)
+        {
+            return Ok(pair);
         }
         Ok((volume.columns.get(col_idx)?, global_idx))
     }
@@ -1284,10 +1284,11 @@ impl VolumeScanner {
         match (self.needed_cols.as_deref(), self.row_mapping()) {
             (Some(needed), Some(mapping)) => {
                 for (ci, src) in mapping.sources.iter().enumerate() {
-                    if let super::writer::ColSource::Volume(v) = src {
-                        if needed.get(ci).copied().unwrap_or(false) && *v < col_count {
-                            wanted[*v] = true;
-                        }
+                    if let super::writer::ColSource::Volume(v) = src
+                        && needed.get(ci).copied().unwrap_or(false)
+                        && *v < col_count
+                    {
+                        wanted[*v] = true;
                     }
                 }
             }
@@ -1300,10 +1301,10 @@ impl VolumeScanner {
             }
             (None, Some(mapping)) => {
                 for src in &mapping.sources {
-                    if let super::writer::ColSource::Volume(v) = src {
-                        if *v < col_count {
-                            wanted[*v] = true;
-                        }
+                    if let super::writer::ColSource::Volume(v) = src
+                        && *v < col_count
+                    {
+                        wanted[*v] = true;
                     }
                 }
             }
@@ -1355,22 +1356,20 @@ impl VolumeScanner {
             }
         }
         let rid = self.volume.meta.row_ids[idx];
-        if let Some(ref ts) = self.committed_tombstones {
-            if let Some(&commit_seq) = ts.get(&rid) {
-                if self.cut.sees(commit_seq as i64)
-                    && self
-                        .view
-                        .as_ref()
-                        .is_none_or(|view| view.sees_commit(commit_seq as i64))
-                {
-                    return true;
-                }
-            }
+        if let Some(ref ts) = self.committed_tombstones
+            && let Some(&commit_seq) = ts.get(&rid)
+            && self.cut.sees(commit_seq as i64)
+            && self
+                .view
+                .as_ref()
+                .is_none_or(|view| view.sees_commit(commit_seq as i64))
+        {
+            return true;
         }
-        if let Some(ref pending) = self.pending_cold_deletes {
-            if pending.contains(&rid) {
-                return true;
-            }
+        if let Some(ref pending) = self.pending_cold_deletes
+            && pending.contains(&rid)
+        {
+            return true;
         }
         false
     }
@@ -1399,17 +1398,16 @@ impl VolumeScanner {
         // The needed columns of the volume's own layout are written into the
         // scanner's row, from the row group's cache or the volume, and the
         // filter judges the row there
-        if self.is_full_projection && self.row_mapping().is_none() {
-            if let Some(needed) = self.needed_cols.as_deref() {
-                let cache = self.group_cache.as_ref();
-                Self::write_needed(cache, &self.volume, needed, idx, &mut self.current_row)?;
-                return match &self.filter {
-                    Some(filter) => {
-                        passes(filter.as_ref(), self.filter_fallible, &self.current_row)
-                    }
-                    None => Ok(true),
-                };
-            }
+        if self.is_full_projection
+            && self.row_mapping().is_none()
+            && let Some(needed) = self.needed_cols.as_deref()
+        {
+            let cache = self.group_cache.as_ref();
+            Self::write_needed(cache, &self.volume, needed, idx, &mut self.current_row)?;
+            return match &self.filter {
+                Some(filter) => passes(filter.as_ref(), self.filter_fallible, &self.current_row),
+                None => Ok(true),
+            };
         }
         if self.group_cache.is_some() {
             return self.materialize_row_from_cache(idx);
@@ -1547,10 +1545,10 @@ impl VolumeScanner {
         };
 
         // Apply filter if present
-        if let Some(ref filter) = self.filter {
-            if !passes(filter.as_ref(), self.filter_fallible, &full_row)? {
-                return Ok(false);
-            }
+        if let Some(ref filter) = self.filter
+            && !passes(filter.as_ref(), self.filter_fallible, &full_row)?
+        {
+            return Ok(false);
         }
 
         // Project
@@ -1698,11 +1696,12 @@ impl VolumeScanner {
                 self.next_group_boundary = ((group_idx + 1) << self.group_shift).min(self.end_idx);
 
                 // Zone map skip
-                if let Some(ref skips) = self.row_group_skips {
-                    if group_idx < skips.len() && skips[group_idx] {
-                        self.current_idx = self.next_group_boundary;
-                        continue;
-                    }
+                if let Some(ref skips) = self.row_group_skips
+                    && group_idx < skips.len()
+                    && skips[group_idx]
+                {
+                    self.current_idx = self.next_group_boundary;
+                    continue;
                 }
                 let rows = self.next_group_boundary - self.current_idx;
                 self.deadline.charge(DeadlineSite::StorageRead, rows)?;

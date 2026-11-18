@@ -248,13 +248,13 @@ impl GroupedAggregates {
         if self.width == 0 && self.groups == 1 {
             return Some(0);
         }
-        if self.width == 1 {
-            if let Value::Integer(i) = key.at(0) {
-                if let Some(&group) = self.integers.get(*i) {
-                    return Some(group as usize);
-                }
-                return self.integer_group(key, *i);
+        if self.width == 1
+            && let Value::Integer(i) = key.at(0)
+        {
+            if let Some(&group) = self.integers.get(*i) {
+                return Some(group as usize);
             }
+            return self.integer_group(key, *i);
         }
         self.find_or_add(key)
     }
@@ -355,10 +355,10 @@ impl GroupedAggregates {
             std::result::Result<CompactVec<Value>, (CompactVec<Value>, crate::core::Error)>,
         ) -> Result<()>,
     ) -> Result<()> {
-        if self.groups > 0 {
-            if let Some(error) = self.calls.iter().find_map(CallTemplate::failure) {
-                return Err(error.clone());
-            }
+        if self.groups > 0
+            && let Some(error) = self.calls.iter().find_map(CallTemplate::failure)
+        {
+            return Err(error.clone());
         }
         let calls = self.calls.len();
         let mut keys = self.keys.into_iter();

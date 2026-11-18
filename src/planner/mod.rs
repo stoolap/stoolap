@@ -892,11 +892,11 @@ impl IndexTerm for Expression {
     }
 
     fn each_operand<'s>(&'s self, each: &mut dyn FnMut(&'s Self)) {
-        if let Expression::Infix(infix) = self {
-            if matches!(infix.op_type, InfixOperator::And | InfixOperator::Or) {
-                each(&infix.left);
-                each(&infix.right);
-            }
+        if let Expression::Infix(infix) = self
+            && matches!(infix.op_type, InfixOperator::And | InfixOperator::Or)
+        {
+            each(&infix.left);
+            each(&infix.right);
         }
     }
 }

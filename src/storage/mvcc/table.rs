@@ -2033,12 +2033,11 @@ impl MVCCTable {
     /// OPTIMIZATION: Uses cached_schema and pk_column_index to avoid iteration
     fn extract_row_pk(&self, row: &Row) -> i64 {
         // Fast path: use cached PK index if available
-        if let Some(pk_idx) = self.cached_schema.pk_column_index() {
-            if let Some(value) = row.get(pk_idx) {
-                if let Some(pk) = value.as_int64() {
-                    return pk;
-                }
-            }
+        if let Some(pk_idx) = self.cached_schema.pk_column_index()
+            && let Some(value) = row.get(pk_idx)
+            && let Some(pk) = value.as_int64()
+        {
+            return pk;
         }
 
         // Fallback: If no primary key or not an integer, generate a synthetic row ID
@@ -2282,15 +2281,14 @@ impl MVCCTable {
         };
 
         // Check if row exists in global store
-        if !deleted_locally && self.version_store.quick_check_row_existence(row_id) {
-            if let Some(version) = self
+        if !deleted_locally
+            && self.version_store.quick_check_row_existence(row_id)
+            && let Some(version) = self
                 .version_store
                 .get_visible_version(row_id, self.reader())
-            {
-                if !version.is_deleted() {
-                    return Err(Error::primary_key_constraint(row_id));
-                }
-            }
+            && !version.is_deleted()
+        {
+            return Err(Error::primary_key_constraint(row_id));
         }
 
         // Check unique index constraints (READ lock).
@@ -2563,10 +2561,10 @@ impl MVCCTable {
             }
             // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
             let row = self.normalize_row_to_schema(row, schema);
-            if let Some(expr) = filter {
-                if !passes(expr, fallible, &row)? {
-                    continue;
-                }
+            if let Some(expr) = filter
+                && !passes(expr, fallible, &row)?
+            {
+                continue;
             }
             rows.push((row_id, row));
         }
@@ -2574,10 +2572,10 @@ impl MVCCTable {
         // Step 5: Add local versions (both updates and inserts)
         for (row_id, row) in local_rows {
             deadline.charge(DeadlineSite::StorageRead, 1)?;
-            if let Some(expr) = filter {
-                if !passes(expr, fallible, &row)? {
-                    continue;
-                }
+            if let Some(expr) = filter
+                && !passes(expr, fallible, &row)?
+            {
+                continue;
             }
             rows.push((row_id, row));
         }
@@ -2704,10 +2702,10 @@ impl MVCCTable {
                 continue; // Local version takes precedence
             }
             let row = self.normalize_row_to_schema(row, schema);
-            if let Some(expr) = filter {
-                if !passes(expr, fallible, &row)? {
-                    continue;
-                }
+            if let Some(expr) = filter
+                && !passes(expr, fallible, &row)?
+            {
+                continue;
             }
             if count >= offset {
                 result.push((row_id, row));
@@ -2742,10 +2740,10 @@ impl MVCCTable {
             if TIMED {
                 deadline.charge_one(DeadlineSite::StorageRead, &mut unpaid)?;
             }
-            if let Some(expr) = filter {
-                if !passes(expr, fallible, &row)? {
-                    continue;
-                }
+            if let Some(expr) = filter
+                && !passes(expr, fallible, &row)?
+            {
+                continue;
             }
             if count >= offset {
                 result.push((row_id, row));
@@ -3251,10 +3249,10 @@ impl MVCCTable {
             .filter(|index| index.is_unique())
             .any(|index| {
                 let column_ids = index.column_ids();
-                if let [only] = column_ids {
-                    if pk == Some(*only as usize) {
-                        return false;
-                    }
+                if let [only] = column_ids
+                    && pk == Some(*only as usize)
+                {
+                    return false;
                 }
                 plan.hot.iter().any(|(_, row, read)| {
                     column_ids
@@ -3599,10 +3597,9 @@ impl MVCCTable {
             if let Some(version) = self
                 .version_store
                 .get_visible_version(row_id, self.reader())
+                && !version.is_deleted()
             {
-                if !version.is_deleted() {
-                    rows.push((row_id, version.data.clone()));
-                }
+                rows.push((row_id, version.data.clone()));
             }
         }
     }
@@ -4156,10 +4153,10 @@ impl Table for MVCCTable {
                     continue; // Already locally deleted — skip
                 }
                 // Apply filter on local row
-                if let Some(expr) = where_expr {
-                    if !passes(expr, fallible, &row)? {
-                        continue;
-                    }
+                if let Some(expr) = where_expr
+                    && !passes(expr, fallible, &row)?
+                {
+                    continue;
                 }
                 // Mark as deleted
                 self.writes()?.put(row_id, row, true)?;
@@ -4179,10 +4176,10 @@ impl Table for MVCCTable {
                 }
 
                 // Apply filter BEFORE cloning - evaluate on reference
-                if let Some(expr) = where_expr {
-                    if !passes(expr, fallible, &version.data)? {
-                        continue; // Skip clone entirely!
-                    }
+                if let Some(expr) = where_expr
+                    && !passes(expr, fallible, &version.data)?
+                {
+                    continue; // Skip clone entirely!
                 }
 
                 // Only clone AFTER filter passes
@@ -4210,10 +4207,10 @@ impl Table for MVCCTable {
             };
             if let Some(row) = row {
                 // Apply filter
-                if let Some(expr) = where_expr {
-                    if !passes(expr, fallible, &row)? {
-                        continue;
-                    }
+                if let Some(expr) = where_expr
+                    && !passes(expr, fallible, &row)?
+                {
+                    continue;
                 }
 
                 // Row is already owned from txn_versions.get(), no extra clone needed
@@ -4465,10 +4462,9 @@ impl Table for MVCCTable {
             if let Some(version) = self
                 .version_store
                 .get_visible_version(row_id, self.reader())
+                && !version.is_deleted()
             {
-                if !version.is_deleted() {
-                    rows.push((row_id, version.data.clone()));
-                }
+                rows.push((row_id, version.data.clone()));
             }
         }
         self.check_read()?;
@@ -4919,20 +4915,19 @@ impl Table for MVCCTable {
             if let Some(version) = self
                 .version_store
                 .get_visible_version(row_id, self.reader())
+                && !version.is_deleted()
             {
-                if !version.is_deleted() {
-                    let values: Vec<Value> = col_indices
-                        .iter()
-                        .map(|&idx| {
-                            version
-                                .data
-                                .get(idx)
-                                .cloned()
-                                .unwrap_or(Value::Null(DataType::Null))
-                        })
-                        .collect();
-                    entries.push((row_id, values));
-                }
+                let values: Vec<Value> = col_indices
+                    .iter()
+                    .map(|&idx| {
+                        version
+                            .data
+                            .get(idx)
+                            .cloned()
+                            .unwrap_or(Value::Null(DataType::Null))
+                    })
+                    .collect();
+                entries.push((row_id, values));
             }
         }
 
@@ -5015,15 +5010,14 @@ impl Table for MVCCTable {
             if let Some(version) = self
                 .version_store
                 .get_visible_version(row_id, self.reader())
+                && !version.is_deleted()
             {
-                if !version.is_deleted() {
-                    let val = version
-                        .data
-                        .get(col_idx)
-                        .cloned()
-                        .unwrap_or(Value::Null(DataType::Null));
-                    entries.push((row_id, vec![val]));
-                }
+                let val = version
+                    .data
+                    .get(col_idx)
+                    .cloned()
+                    .unwrap_or(Value::Null(DataType::Null));
+                entries.push((row_id, vec![val]));
             }
         }
         if !entries.is_empty() {
@@ -5269,12 +5263,10 @@ impl Table for MVCCTable {
             if let Some(version) = self
                 .version_store
                 .get_visible_version(row_id, self.reader())
+                && !version.is_deleted()
+                && let Some(value) = version.data.get(col_idx)
             {
-                if !version.is_deleted() {
-                    if let Some(value) = version.data.get(col_idx) {
-                        entries.push((row_id, vec![value.clone()]));
-                    }
-                }
+                entries.push((row_id, vec![value.clone()]));
             }
         }
 
@@ -5449,10 +5441,10 @@ impl Table for MVCCTable {
 
         // Copying and sorting every distinct value costs more than the scan
         // the caller falls back to once they pass a sixth of the rows
-        if let Some(distinct) = index.distinct_keys_hint() {
-            if distinct.saturating_mul(6) > self.version_store.committed_row_count() {
-                return Ok(None);
-            }
+        if let Some(distinct) = index.distinct_keys_hint()
+            && distinct.saturating_mul(6) > self.version_store.committed_row_count()
+        {
+            return Ok(None);
         }
 
         // Fallback path: Get all values and sort (for non-B-tree indexes)
@@ -5688,10 +5680,9 @@ impl Table for MVCCTable {
                 if let Some(version) = self
                     .version_store
                     .get_visible_version(row_id, self.reader())
+                    && !version.is_deleted()
                 {
-                    if !version.is_deleted() {
-                        partition_rows.push((row_id, version.data.clone()));
-                    }
+                    partition_rows.push((row_id, version.data.clone()));
                 }
             }
 

@@ -28,10 +28,12 @@ fn cstr(s: &str) -> CString {
 
 /// Helper to read a C string pointer as &str.
 unsafe fn read_cstr(ptr: *const c_char) -> &'static str {
-    if ptr.is_null() {
-        return "";
+    unsafe {
+        if ptr.is_null() {
+            return "";
+        }
+        CStr::from_ptr(ptr).to_str().unwrap_or("")
     }
-    CStr::from_ptr(ptr).to_str().unwrap_or("")
 }
 
 // =========================================================================
@@ -2037,12 +2039,13 @@ fn test_empty_vector_round_trip() {
 
 /// Helper: open db, create a populated table, return db handle.
 unsafe fn setup_aggregate_test_db() -> *mut StoolapDB {
-    let mut db: *mut StoolapDB = std::ptr::null_mut();
-    let rc = stoolap_open_in_memory(&mut db);
-    assert_eq!(rc, STOOLAP_OK);
+    unsafe {
+        let mut db: *mut StoolapDB = std::ptr::null_mut();
+        let rc = stoolap_open_in_memory(&mut db);
+        assert_eq!(rc, STOOLAP_OK);
 
-    let sql = cstr(
-        "CREATE TABLE orders (
+        let sql = cstr(
+            "CREATE TABLE orders (
             id INTEGER PRIMARY KEY,
             customer TEXT NOT NULL,
             product TEXT,
@@ -2050,69 +2053,74 @@ unsafe fn setup_aggregate_test_db() -> *mut StoolapDB {
             price FLOAT NOT NULL,
             region TEXT
         )",
-    );
-    let rc = stoolap_exec(db, sql.as_ptr(), std::ptr::null_mut());
-    assert_eq!(rc, STOOLAP_OK);
-
-    let inserts = [
-        "INSERT INTO orders VALUES (1, 'Alice', 'Widget', 10, 9.99, 'East')",
-        "INSERT INTO orders VALUES (2, 'Bob', 'Gadget', 5, 24.50, 'West')",
-        "INSERT INTO orders VALUES (3, 'Alice', 'Widget', 3, 9.99, 'East')",
-        "INSERT INTO orders VALUES (4, 'Charlie', 'Gizmo', 7, 15.00, 'East')",
-        "INSERT INTO orders VALUES (5, 'Bob', 'Widget', 12, 9.99, 'West')",
-        "INSERT INTO orders VALUES (6, 'Alice', 'Gadget', 1, 24.50, 'North')",
-        "INSERT INTO orders VALUES (7, 'Charlie', 'Widget', 20, 9.99, 'East')",
-        "INSERT INTO orders VALUES (8, 'Bob', 'Gizmo', 2, 15.00, 'West')",
-        "INSERT INTO orders VALUES (9, 'Alice', 'Gizmo', 8, 15.00, 'North')",
-        "INSERT INTO orders VALUES (10, 'Charlie', 'Gadget', 4, 24.50, 'East')",
-    ];
-    for insert in &inserts {
-        let sql = cstr(insert);
+        );
         let rc = stoolap_exec(db, sql.as_ptr(), std::ptr::null_mut());
-        assert_eq!(rc, STOOLAP_OK, "Failed: {}", insert);
-    }
+        assert_eq!(rc, STOOLAP_OK);
 
-    db
+        let inserts = [
+            "INSERT INTO orders VALUES (1, 'Alice', 'Widget', 10, 9.99, 'East')",
+            "INSERT INTO orders VALUES (2, 'Bob', 'Gadget', 5, 24.50, 'West')",
+            "INSERT INTO orders VALUES (3, 'Alice', 'Widget', 3, 9.99, 'East')",
+            "INSERT INTO orders VALUES (4, 'Charlie', 'Gizmo', 7, 15.00, 'East')",
+            "INSERT INTO orders VALUES (5, 'Bob', 'Widget', 12, 9.99, 'West')",
+            "INSERT INTO orders VALUES (6, 'Alice', 'Gadget', 1, 24.50, 'North')",
+            "INSERT INTO orders VALUES (7, 'Charlie', 'Widget', 20, 9.99, 'East')",
+            "INSERT INTO orders VALUES (8, 'Bob', 'Gizmo', 2, 15.00, 'West')",
+            "INSERT INTO orders VALUES (9, 'Alice', 'Gizmo', 8, 15.00, 'North')",
+            "INSERT INTO orders VALUES (10, 'Charlie', 'Gadget', 4, 24.50, 'East')",
+        ];
+        for insert in &inserts {
+            let sql = cstr(insert);
+            let rc = stoolap_exec(db, sql.as_ptr(), std::ptr::null_mut());
+            assert_eq!(rc, STOOLAP_OK, "Failed: {}", insert);
+        }
+
+        db
+    }
 }
 
 /// Helper: run a query that returns a single integer result.
 unsafe fn query_single_int(db: *mut StoolapDB, sql_str: &str) -> i64 {
-    let sql = cstr(sql_str);
-    let mut rows: *mut StoolapRows = std::ptr::null_mut();
-    let rc = stoolap_query(db, sql.as_ptr(), &mut rows);
-    assert_eq!(
-        rc,
-        STOOLAP_OK,
-        "Query failed: {} — {}",
-        sql_str,
-        read_cstr(stoolap_errmsg(db))
-    );
+    unsafe {
+        let sql = cstr(sql_str);
+        let mut rows: *mut StoolapRows = std::ptr::null_mut();
+        let rc = stoolap_query(db, sql.as_ptr(), &mut rows);
+        assert_eq!(
+            rc,
+            STOOLAP_OK,
+            "Query failed: {} — {}",
+            sql_str,
+            read_cstr(stoolap_errmsg(db))
+        );
 
-    let rc = stoolap_rows_next(rows);
-    assert_eq!(rc, STOOLAP_ROW, "No row returned for: {}", sql_str);
-    let val = stoolap_rows_column_int64(rows, 0);
-    stoolap_rows_close(rows);
-    val
+        let rc = stoolap_rows_next(rows);
+        assert_eq!(rc, STOOLAP_ROW, "No row returned for: {}", sql_str);
+        let val = stoolap_rows_column_int64(rows, 0);
+        stoolap_rows_close(rows);
+        val
+    }
 }
 
 /// Helper: run a query that returns a single float result.
 unsafe fn query_single_float(db: *mut StoolapDB, sql_str: &str) -> f64 {
-    let sql = cstr(sql_str);
-    let mut rows: *mut StoolapRows = std::ptr::null_mut();
-    let rc = stoolap_query(db, sql.as_ptr(), &mut rows);
-    assert_eq!(
-        rc,
-        STOOLAP_OK,
-        "Query failed: {} — {}",
-        sql_str,
-        read_cstr(stoolap_errmsg(db))
-    );
+    unsafe {
+        let sql = cstr(sql_str);
+        let mut rows: *mut StoolapRows = std::ptr::null_mut();
+        let rc = stoolap_query(db, sql.as_ptr(), &mut rows);
+        assert_eq!(
+            rc,
+            STOOLAP_OK,
+            "Query failed: {} — {}",
+            sql_str,
+            read_cstr(stoolap_errmsg(db))
+        );
 
-    let rc = stoolap_rows_next(rows);
-    assert_eq!(rc, STOOLAP_ROW, "No row returned for: {}", sql_str);
-    let val = stoolap_rows_column_double(rows, 0);
-    stoolap_rows_close(rows);
-    val
+        let rc = stoolap_rows_next(rows);
+        assert_eq!(rc, STOOLAP_ROW, "No row returned for: {}", sql_str);
+        let val = stoolap_rows_column_double(rows, 0);
+        stoolap_rows_close(rows);
+        val
+    }
 }
 
 #[test]
@@ -3309,84 +3317,91 @@ fn test_tx_stmt_exec_named_rollback() {
 
 /// Decodes a packed buffer into its column names and rows, each cell as text
 unsafe fn decode_packed(buf: *const u8, len: i64) -> (Vec<String>, Vec<Vec<String>>) {
-    let b = std::slice::from_raw_parts(buf, len as usize);
-    let mut at = 0;
-    let mut take = |n: usize| {
-        let s = &b[at..at + n];
-        at += n;
-        s
-    };
-    let cols = u32::from_le_bytes(take(4).try_into().unwrap()) as usize;
-    let mut names = Vec::new();
-    for _ in 0..cols {
-        let n = u16::from_le_bytes(take(2).try_into().unwrap()) as usize;
-        names.push(String::from_utf8(take(n).to_vec()).unwrap());
-    }
-    let count = u32::from_le_bytes(take(4).try_into().unwrap()) as usize;
-    let mut rows = Vec::new();
-    for _ in 0..count {
-        let mut row = Vec::new();
+    unsafe {
+        let b = std::slice::from_raw_parts(buf, len as usize);
+        let mut at = 0;
+        let mut take = |n: usize| {
+            let s = &b[at..at + n];
+            at += n;
+            s
+        };
+        let cols = u32::from_le_bytes(take(4).try_into().unwrap()) as usize;
+        let mut names = Vec::new();
         for _ in 0..cols {
-            let cell = match take(1)[0] {
-                0 => "NULL".to_string(),
-                1 => i64::from_le_bytes(take(8).try_into().unwrap()).to_string(),
-                2 => f64::from_le_bytes(take(8).try_into().unwrap()).to_string(),
-                4 => (take(1)[0] != 0).to_string(),
-                5 => format!("ts:{}", i64::from_le_bytes(take(8).try_into().unwrap())),
-                tag => {
-                    let n = u32::from_le_bytes(take(4).try_into().unwrap()) as usize;
-                    format!("{}:{}", tag, String::from_utf8_lossy(take(n)))
-                }
-            };
-            row.push(cell);
+            let n = u16::from_le_bytes(take(2).try_into().unwrap()) as usize;
+            names.push(String::from_utf8(take(n).to_vec()).unwrap());
         }
-        rows.push(row);
+        let count = u32::from_le_bytes(take(4).try_into().unwrap()) as usize;
+        let mut rows = Vec::new();
+        for _ in 0..count {
+            let mut row = Vec::new();
+            for _ in 0..cols {
+                let cell = match take(1)[0] {
+                    0 => "NULL".to_string(),
+                    1 => i64::from_le_bytes(take(8).try_into().unwrap()).to_string(),
+                    2 => f64::from_le_bytes(take(8).try_into().unwrap()).to_string(),
+                    4 => (take(1)[0] != 0).to_string(),
+                    5 => format!("ts:{}", i64::from_le_bytes(take(8).try_into().unwrap())),
+                    tag => {
+                        let n = u32::from_le_bytes(take(4).try_into().unwrap()) as usize;
+                        format!("{}:{}", tag, String::from_utf8_lossy(take(n)))
+                    }
+                };
+                row.push(cell);
+            }
+            rows.push(row);
+        }
+        assert_eq!(at, b.len(), "packed buffer has trailing bytes");
+        (names, rows)
     }
-    assert_eq!(at, b.len(), "packed buffer has trailing bytes");
-    (names, rows)
 }
 
 unsafe fn packed_test_db(rows: i64) -> *mut StoolapDB {
-    let mut db: *mut StoolapDB = std::ptr::null_mut();
-    assert_eq!(stoolap_open_in_memory(&mut db), STOOLAP_OK);
-    let ddl = cstr("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score FLOAT, ok BOOLEAN)");
-    assert_eq!(
-        stoolap_exec(db, ddl.as_ptr(), std::ptr::null_mut()),
-        STOOLAP_OK
-    );
-    for i in 1..=rows {
-        let name = if i % 4 == 0 {
-            "NULL".to_string()
-        } else {
-            format!("'n{}'", i)
-        };
-        let sql = cstr(&format!(
-            "INSERT INTO t VALUES ({}, {}, {}.5, {})",
-            i,
-            name,
-            i,
-            i % 2 == 0
-        ));
+    unsafe {
+        let mut db: *mut StoolapDB = std::ptr::null_mut();
+        assert_eq!(stoolap_open_in_memory(&mut db), STOOLAP_OK);
+        let ddl =
+            cstr("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score FLOAT, ok BOOLEAN)");
         assert_eq!(
-            stoolap_exec(db, sql.as_ptr(), std::ptr::null_mut()),
+            stoolap_exec(db, ddl.as_ptr(), std::ptr::null_mut()),
             STOOLAP_OK
         );
+        for i in 1..=rows {
+            let name = if i % 4 == 0 {
+                "NULL".to_string()
+            } else {
+                format!("'n{}'", i)
+            };
+            let sql = cstr(&format!(
+                "INSERT INTO t VALUES ({}, {}, {}.5, {})",
+                i,
+                name,
+                i,
+                i % 2 == 0
+            ));
+            assert_eq!(
+                stoolap_exec(db, sql.as_ptr(), std::ptr::null_mut()),
+                STOOLAP_OK
+            );
+        }
+        db
     }
-    db
 }
 
 /// Runs `sql` through `stoolap_query` and `stoolap_rows_fetch_all`
 unsafe fn fetch_all_of(db: *mut StoolapDB, sql: &str) -> (Vec<String>, Vec<Vec<String>>) {
-    let sql = cstr(sql);
-    let mut rows: *mut StoolapRows = std::ptr::null_mut();
-    assert_eq!(stoolap_query(db, sql.as_ptr(), &mut rows), STOOLAP_OK);
-    let mut buf: *mut u8 = std::ptr::null_mut();
-    let mut len: i64 = 0;
-    assert_eq!(stoolap_rows_fetch_all(rows, &mut buf, &mut len), STOOLAP_OK);
-    let decoded = decode_packed(buf, len);
-    stoolap_buffer_free(buf, len);
-    stoolap_rows_close(rows);
-    decoded
+    unsafe {
+        let sql = cstr(sql);
+        let mut rows: *mut StoolapRows = std::ptr::null_mut();
+        assert_eq!(stoolap_query(db, sql.as_ptr(), &mut rows), STOOLAP_OK);
+        let mut buf: *mut u8 = std::ptr::null_mut();
+        let mut len: i64 = 0;
+        assert_eq!(stoolap_rows_fetch_all(rows, &mut buf, &mut len), STOOLAP_OK);
+        let decoded = decode_packed(buf, len);
+        stoolap_buffer_free(buf, len);
+        stoolap_rows_close(rows);
+        decoded
+    }
 }
 
 fn int_param(v: i64) -> StoolapValue {

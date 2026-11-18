@@ -127,7 +127,7 @@ fn check(db: &Database, context: &str, wrong: &mut Vec<String>) {
                 let shapes = SHAPES.iter().map(|s| (s, true));
                 for (shape, holds_subquery) in shapes.chain(PLAIN_SHAPES.iter().map(|s| (s, false)))
                 {
-                    if shape.contains("{on}") != !on.is_empty() {
+                    if shape.contains("{on}") == on.is_empty() {
                         continue;
                     }
                     let shape = shape.replace("{f}", &from).replace("{on}", &on);

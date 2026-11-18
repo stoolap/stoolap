@@ -443,14 +443,13 @@ impl SemanticCache {
                 // If entry was evicted/replaced, skip update (benign miss)
                 {
                     let mut cache = self.cache.write();
-                    if let Some(table_cache) = cache.get_mut(table_key.as_ref()) {
-                        if let Some(entries) = table_cache.get_mut(&column_key) {
-                            if let Some(entry) = entries.get_mut(idx) {
-                                // Only update if it's still the same entry
-                                if entry.fingerprint.predicate_structure_hash == expected_hash {
-                                    entry.record_access();
-                                }
-                            }
+                    if let Some(table_cache) = cache.get_mut(table_key.as_ref())
+                        && let Some(entries) = table_cache.get_mut(&column_key)
+                        && let Some(entry) = entries.get_mut(idx)
+                    {
+                        // Only update if it's still the same entry
+                        if entry.fingerprint.predicate_structure_hash == expected_hash {
+                            entry.record_access();
                         }
                     }
                 }
@@ -1033,24 +1032,24 @@ fn check_and_subsumption(cached: &Expression, new: &Expression) -> Option<Subsum
     }
 
     // Check if cached is also an AND and new extends it
-    if let Expression::Infix(cached_infix) = cached {
-        if matches!(cached_infix.op_type, InfixOperator::And) {
-            // Extract conditions from both
-            let cached_conditions = extract_and_conditions(cached);
-            let new_conditions = extract_and_conditions(new);
+    if let Expression::Infix(cached_infix) = cached
+        && matches!(cached_infix.op_type, InfixOperator::And)
+    {
+        // Extract conditions from both
+        let cached_conditions = extract_and_conditions(cached);
+        let new_conditions = extract_and_conditions(new);
 
-            // New must contain all of cached's conditions
-            let all_cached_present = cached_conditions.iter().all(|cc| {
-                new_conditions
-                    .iter()
-                    .any(|nc| expressions_equivalent(cc, nc))
+        // New must contain all of cached's conditions
+        let all_cached_present = cached_conditions.iter().all(|cc| {
+            new_conditions
+                .iter()
+                .any(|nc| expressions_equivalent(cc, nc))
+        });
+
+        if all_cached_present && new_conditions.len() > cached_conditions.len() {
+            return Some(SubsumptionResult::Subsumed {
+                filter: Box::new(new.clone()),
             });
-
-            if all_cached_present && new_conditions.len() > cached_conditions.len() {
-                return Some(SubsumptionResult::Subsumed {
-                    filter: Box::new(new.clone()),
-                });
-            }
         }
     }
 

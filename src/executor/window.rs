@@ -1621,22 +1621,21 @@ impl Executor {
         }
 
         // LIMIT pushdown for PARTITION BY queries, as the plan admits it
-        if plan.streams {
-            if let Some(limit_val) = super::row_count::rows_needed(stmt, ctx) {
-                if limit_val > 0 {
-                    // Streaming runs without an ORDER BY, which reads no layout
-                    let result = self.execute_select_with_window_functions_streaming(
-                        plan,
-                        ctx,
-                        base_rows,
-                        base_columns,
-                        group_slots,
-                        limit_val,
-                        blocks,
-                    )?;
-                    return Ok((result, None));
-                }
-            }
+        if plan.streams
+            && let Some(limit_val) = super::row_count::rows_needed(stmt, ctx)
+            && limit_val > 0
+        {
+            // Streaming runs without an ORDER BY, which reads no layout
+            let result = self.execute_select_with_window_functions_streaming(
+                plan,
+                ctx,
+                base_rows,
+                base_columns,
+                group_slots,
+                limit_val,
+                blocks,
+            )?;
+            return Ok((result, None));
         }
 
         let col_index_map = &plan.col_index_map;
@@ -1847,24 +1846,24 @@ impl Executor {
                 }
 
                 // Evaluate extended expressions (if any) and update their column values
-                if !ext_expr_items.is_empty() {
-                    if let Some(ref mut eval) = ext_eval {
-                        ext_row.clear();
-                        ext_row.extend_from_slice(base_row.as_slice());
-                        for wf_name in added_wf_names {
-                            let wf_value = window_value_map
-                                .get(wf_name)
-                                .and_then(|vals| vals.get(row_idx).cloned())
-                                .unwrap_or(NULL_VALUE);
-                            ext_row.push(wf_value);
-                        }
+                if !ext_expr_items.is_empty()
+                    && let Some(ref mut eval) = ext_eval
+                {
+                    ext_row.clear();
+                    ext_row.extend_from_slice(base_row.as_slice());
+                    for wf_name in added_wf_names {
+                        let wf_value = window_value_map
+                            .get(wf_name)
+                            .and_then(|vals| vals.get(row_idx).cloned())
+                            .unwrap_or(NULL_VALUE);
+                        ext_row.push(wf_value);
+                    }
 
-                        ext_results.clear();
-                        eval.eval_into(&ext_row, &mut ext_results)?;
-                        for (eval_idx, (item_idx, _)) in ext_expr_items.iter().enumerate() {
-                            if eval_idx < ext_results.len() {
-                                column_data[*item_idx][row_idx] = ext_results[eval_idx].clone();
-                            }
+                    ext_results.clear();
+                    eval.eval_into(&ext_row, &mut ext_results)?;
+                    for (eval_idx, (item_idx, _)) in ext_expr_items.iter().enumerate() {
+                        if eval_idx < ext_results.len() {
+                            column_data[*item_idx][row_idx] = ext_results[eval_idx].clone();
                         }
                     }
                 }
@@ -3005,10 +3004,8 @@ impl Executor {
     ) -> Result<SharedSortedPartitions> {
         let shareable = self.over_clause_is_shareable(wf_info);
         let key = &wf_info.over_key;
-        if shareable {
-            if let Some((_, cached)) = partition_cache.iter().find(|(k, _)| k == key) {
-                return Ok(std::sync::Arc::clone(cached));
-            }
+        if shareable && let Some((_, cached)) = partition_cache.iter().find(|(k, _)| k == key) {
+            return Ok(std::sync::Arc::clone(cached));
         }
 
         let mut partition_vec: Vec<Vec<usize>> = if wf_info.partition_by_exprs.is_empty() {
@@ -4886,20 +4883,20 @@ mod tests {
 
         // Test with window function
         let mut parser = crate::parser::Parser::new("SELECT ROW_NUMBER() OVER () FROM test");
-        if let Ok(program) = parser.parse_program() {
-            if let crate::parser::ast::Statement::Select(stmt) = &program.statements[0] {
-                let classification = get_classification(stmt);
-                assert!(classification.has_window_functions);
-            }
+        if let Ok(program) = parser.parse_program()
+            && let crate::parser::ast::Statement::Select(stmt) = &program.statements[0]
+        {
+            let classification = get_classification(stmt);
+            assert!(classification.has_window_functions);
         }
 
         // Test without window function
         let mut parser2 = crate::parser::Parser::new("SELECT * FROM test");
-        if let Ok(program) = parser2.parse_program() {
-            if let crate::parser::ast::Statement::Select(stmt) = &program.statements[0] {
-                let classification = get_classification(stmt);
-                assert!(!classification.has_window_functions);
-            }
+        if let Ok(program) = parser2.parse_program()
+            && let crate::parser::ast::Statement::Select(stmt) = &program.statements[0]
+        {
+            let classification = get_classification(stmt);
+            assert!(!classification.has_window_functions);
         }
     }
 

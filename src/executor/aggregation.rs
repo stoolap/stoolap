@@ -2072,10 +2072,11 @@ impl Executor {
                 having_rows,
             )));
         }
-        if group_by_count == 0 && std::ptr::eq(stmt, written_stmt) {
-            if let Some(names) = Self::calls_alone(stmt, aggregations) {
-                return Ok(Box::new(ExecutorResult::new(names, having_rows)));
-            }
+        if group_by_count == 0
+            && std::ptr::eq(stmt, written_stmt)
+            && let Some(names) = Self::calls_alone(stmt, aggregations)
+        {
+            return Ok(Box::new(ExecutorResult::new(names, having_rows)));
         }
 
         // ORDER BY may name a grouped column the SELECT list drops. Capture
@@ -3383,10 +3384,10 @@ impl Executor {
     fn find_expression_alias(&self, stmt: &SelectStatement, target_expr: &Expression) -> String {
         let target = ExprKey::of(target_expr);
         for col_expr in &stmt.columns {
-            if let Expression::Aliased(aliased) = col_expr {
-                if ExprKey::of(&aliased.expression) == target {
-                    return aliased.alias.value.to_string();
-                }
+            if let Expression::Aliased(aliased) = col_expr
+                && ExprKey::of(&aliased.expression) == target
+            {
+                return aliased.alias.value.to_string();
             }
         }
         // No alias found, generate a name from the expression
@@ -3507,7 +3508,7 @@ impl Executor {
                 set.active_columns
                     .iter()
                     .enumerate()
-                    .filter(|(_, &active)| active)
+                    .filter(|&(_, &active)| active)
                     .map(|(i, _)| i)
                     .collect()
             })

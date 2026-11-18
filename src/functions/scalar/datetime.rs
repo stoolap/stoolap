@@ -194,10 +194,10 @@ impl TimeTruncFunction {
         }
         CACHE.with(|cell| {
             let cached = cell.borrow();
-            if cached.0 == duration_str {
-                if let Some(nanos) = cached.1 {
-                    return Ok(nanos);
-                }
+            if cached.0 == duration_str
+                && let Some(nanos) = cached.1
+            {
+                return Ok(nanos);
             }
             drop(cached);
             let nanos = Self::parse_duration(duration_str)?;

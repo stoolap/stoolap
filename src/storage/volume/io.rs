@@ -1144,10 +1144,13 @@ mod tests {
 
         assert_eq!(loaded.meta.row_count, 2);
         // Timestamp nanosecond precision
-        if let Value::Timestamp(loaded_ts) = loaded.columns.get(0).unwrap().get_value(0) {
-            assert_eq!(loaded_ts.timestamp_nanos_opt(), ts.timestamp_nanos_opt());
-        } else {
-            panic!("expected Timestamp");
+        match loaded.columns.get(0).unwrap().get_value(0) {
+            Value::Timestamp(loaded_ts) => {
+                assert_eq!(loaded_ts.timestamp_nanos_opt(), ts.timestamp_nanos_opt());
+            }
+            _ => {
+                panic!("expected Timestamp");
+            }
         }
         assert!(loaded.columns.get(1).unwrap().get_bool(0));
         assert!(!loaded.columns.get(1).unwrap().get_bool(1));

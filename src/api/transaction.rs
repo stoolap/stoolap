@@ -386,12 +386,12 @@ impl Transaction {
     pub fn commit(&mut self) -> Result<()> {
         self.check_active()?;
 
-        if let Some(mut tx) = self.executor.take_transaction() {
-            if let Err(e) = tx.commit() {
-                // Restore the transaction so rollback is still possible
-                self.executor.install_transaction(tx);
-                return Err(e);
-            }
+        if let Some(mut tx) = self.executor.take_transaction()
+            && let Err(e) = tx.commit()
+        {
+            // Restore the transaction so rollback is still possible
+            self.executor.install_transaction(tx);
+            return Err(e);
         }
         self.committed = true;
         self._session = None;

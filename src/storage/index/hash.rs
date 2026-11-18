@@ -357,14 +357,14 @@ impl Index for HashIndex {
                 self.check_unique_constraint(values, row_id, hash, &hash_to_values)?;
 
                 // Check against other entries in this batch using actual values as key
-                if let Some(&existing_row_id) = batch_values.get(values) {
-                    if existing_row_id != row_id {
-                        return Err(Error::unique_constraint(
-                            &self.name,
-                            self.column_names.join(", "),
-                            values.to_vec(),
-                        ));
-                    }
+                if let Some(&existing_row_id) = batch_values.get(values)
+                    && existing_row_id != row_id
+                {
+                    return Err(Error::unique_constraint(
+                        &self.name,
+                        self.column_names.join(", "),
+                        values.to_vec(),
+                    ));
                 }
                 batch_values.insert(values, row_id);
             }

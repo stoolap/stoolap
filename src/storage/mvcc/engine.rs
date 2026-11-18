@@ -198,10 +198,10 @@ impl RecheckKeys {
                 }
             }
             for (index, (col_indices, ..)) in unique_indexes.iter().enumerate() {
-                if let Some(old) = old_row {
-                    if col_indices.iter().all(|&idx| row.get(idx) == old.get(idx)) {
-                        continue;
-                    }
+                if let Some(old) = old_row
+                    && col_indices.iter().all(|&idx| row.get(idx) == old.get(idx))
+                {
+                    continue;
                 }
                 if col_indices.iter().any(|&idx| row.get(idx).is_none()) {
                     continue;
@@ -874,10 +874,10 @@ fn write_snapshot_metadata(path: &std::path::Path, lsn: u64) -> Result<()> {
     // Sync directory to ensure rename is durable.
     // Windows does not support opening directories for fsync.
     #[cfg(not(windows))]
-    if let Some(parent) = path.parent() {
-        if let Ok(dir_file) = std::fs::File::open(parent) {
-            let _ = dir_file.sync_all();
-        }
+    if let Some(parent) = path.parent()
+        && let Ok(dir_file) = std::fs::File::open(parent)
+    {
+        let _ = dir_file.sync_all();
     }
 
     Ok(())
@@ -907,15 +907,15 @@ fn read_snapshot_lsn(snapshot_dir: &std::path::Path) -> u64 {
 
     // Fall back to old JSON format for backward compatibility
     let json_path = snapshot_dir.join("snapshot_meta.json");
-    if json_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&json_path) {
-            return content
-                .trim()
-                .strip_prefix("{\"lsn\":")
-                .and_then(|s| s.strip_suffix("}"))
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .unwrap_or(0);
-        }
+    if json_path.exists()
+        && let Ok(content) = std::fs::read_to_string(&json_path)
+    {
+        return content
+            .trim()
+            .strip_prefix("{\"lsn\":")
+            .and_then(|s| s.strip_suffix("}"))
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
     }
 
     0
@@ -1514,176 +1514,172 @@ impl MVCCEngine {
         self.registry.start_accepting_transactions();
 
         // If persistence is enabled, start it and replay WAL for recovery
-        if let Some(ref pm) = *self.persistence {
-            if pm.is_enabled() {
-                pm.start()?;
+        if let Some(ref pm) = *self.persistence
+            && pm.is_enabled()
+        {
+            pm.start()?;
 
-                // Mark that we're loading from disk to prevent WAL writes during recovery
-                self.loading_from_disk.store(true, Ordering::Release);
+            // Mark that we're loading from disk to prevent WAL writes during recovery
+            self.loading_from_disk.store(true, Ordering::Release);
 
-                // Determine recovery mode:
-                // 1. If snapshots/ exists with snapshot files -> legacy snapshot recovery
-                // 2. If volumes/ exists with manifests -> new checkpoint-to-volume recovery
-                // 3. Otherwise -> pure WAL replay from beginning
-                let snapshot_dir = pm.path().join("snapshots");
+            // Determine recovery mode:
+            // 1. If snapshots/ exists with snapshot files -> legacy snapshot recovery
+            // 2. If volumes/ exists with manifests -> new checkpoint-to-volume recovery
+            // 3. Otherwise -> pure WAL replay from beginning
+            let snapshot_dir = pm.path().join("snapshots");
 
-                // Volume recovery takes priority over snapshot backup files.
-                let volume_lsn = self.load_manifests_from_volumes()?;
-                // The schema epoch restarts above every version the
-                // manifests carry, before the log is replayed, so a change
-                // replayed or made from now on orders after the seals and
-                // changes made before the open
-                let persisted = {
-                    let mgrs = self.segment_managers.read();
-                    mgrs.values().map(|mgr| mgr.max_schema_version()).max()
-                };
-                if let Some(persisted) = persisted {
-                    self.ddl.changed_all(persisted + 1);
-                }
-
-                // Legacy snapshots: only used when volumes/ does NOT exist.
-                // This handles migration from pre-volume databases.
-                let has_legacy_snapshots = volume_lsn.is_none()
-                    && snapshot_dir.exists()
-                    && std::fs::read_dir(&snapshot_dir)
-                        .ok()
-                        .map(|entries| {
-                            entries
-                                .flatten()
-                                .any(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
-                        })
-                        .unwrap_or(false);
-
-                let mut unreadable = Vec::new();
-                let replay_from_lsn = if let Some(lsn) = volume_lsn {
-                    // New path: load manifests + volumes BEFORE WAL replay.
-                    // Volumes must be loaded so is_row_id_in_volume() can check
-                    // row_ids for idempotent INSERT during replay.
-                    unreadable = self.load_standalone_volumes_no_schema_check();
-                    lsn
-                } else if has_legacy_snapshots {
-                    // Legacy path: load snapshots (creates schemas + version stores)
-                    let snapshot_lsn = match self.load_snapshots() {
-                        Ok(lsn) => lsn,
-                        Err(e) => {
-                            remove_migration_volumes(&pm.path().join("volumes"));
-                            return Err(e);
-                        }
-                    };
-                    self.load_standalone_volumes();
-                    snapshot_lsn
-                } else {
-                    0
-                };
-
-                // Clean up stale .dv files from previous versions
-                self.cleanup_stale_dv_files();
-
-                // Replay WAL entries after the checkpoint/snapshot LSN
-                self.replay_wal(replay_from_lsn)?;
-                // A TRUNCATE or DROP replayed above may have retired a segment
-                // whose file it removed, so the check follows the replay
-                self.mark_unloaded_tables(&unreadable);
-
-                // History opens at the recovered state, above every sequence
-                // a volume or a tombstone kept from earlier runs
-                self.registry
-                    .open_history_at(self.persisted_sequence_floor());
-
-                // Populate pre-computed default_value from default_expr for schema evolution.
-                // Neither snapshots nor WAL persist the cached default_value, so old rows
-                // read via normalize_row_to_schema would get NULL instead of the column default.
-                self.populate_schema_defaults();
-
-                self.note_reserved_names();
-
-                // A volume an older build left holding a column in another
-                // type than the schema's is rewritten before any mapping
-                self.repair_retyped_volumes()?;
-
-                // Recompute cold volume column mappings now that schemas have
-                // default_value populated. Volumes loaded from disk had identity
-                // mappings; after ALTER TABLE ADD COLUMN, the schema differs.
-                {
-                    let schemas = self.schemas.read();
-                    let mgrs = self.segment_managers.read();
-                    for (table_name, schema) in schemas.iter() {
-                        if let Some(mgr) = mgrs.get(table_name.as_str()) {
-                            mgr.invalidate_mappings(schema)?;
-                        }
-                    }
-                }
-
-                // HNSW indexes hold the sealed rows too, read through the
-                // mappings just recomputed, so a column renamed or dropped
-                // before the checkpoint resolves to its volume column
-                self.populate_hnsw_from_segments()?;
-
-                // Whether a side file still stands for an index is decided
-                // through the same mappings, once the catalog is final
-                self.discard_uncovered_side_files_everywhere();
-
-                // Sync auto-increment counters from segment data so the next
-                // generated row_id doesn't collide with cold rows.
-                self.sync_auto_increment_from_segments()?;
-
-                // Migration: if we loaded from legacy snapshots, seal all data
-                // into volumes and remove the old snapshots/ directory.
-                if has_legacy_snapshots {
-                    // Clear loading flag temporarily so checkpoint can write WAL
-                    self.loading_from_disk.store(false, Ordering::Release);
-
-                    // Force seal ALL hot rows into volumes
-                    self.checkpoint_cycle_inner(true)?;
-                    self.compact_after_checkpoint_forced()?;
-
-                    // Only remove snapshots/ if this is a real v0.3.7 migration
-                    // (no ddl-*.bin). If DDL metadata exists, these are user-created
-                    // backup snapshots from PRAGMA SNAPSHOT that should be kept.
-                    let snapshot_dir = pm.path().join("snapshots");
-                    let is_user_backup =
-                        std::fs::read_dir(&snapshot_dir)
-                            .ok()
-                            .is_some_and(|entries| {
-                                entries.filter_map(|e| e.ok()).any(|e| {
-                                    e.file_name().to_str().is_some_and(|n| {
-                                        (n.starts_with("ddl-") && n.ends_with(".bin"))
-                                            || n == "ddl.bin"
-                                    })
-                                })
-                            });
-                    if !is_user_backup {
-                        if let Err(e) = std::fs::remove_dir_all(&snapshot_dir) {
-                            eprintln!("Warning: failed to remove snapshots/: {}", e);
-                        }
-                    }
-
-                    // Set loading flag back so the code below clears it
-                    self.loading_from_disk.store(true, Ordering::Release);
-                }
-
-                // After recovery, seal hot rows immediately before accepting
-                // queries. Without this, a dirty shutdown that loads 1M+ rows
-                // into hot via WAL replay makes ALL queries O(hot_size) until
-                // the first background checkpoint fires (up to 60s later).
-                // Sealing here drains the hot buffer while no concurrent reads
-                // exist, so there's no seal_overlap performance impact.
-                {
-                    self.loading_from_disk.store(false, Ordering::Release);
-                    let has_hot_rows = {
-                        let stores = self.version_stores.read();
-                        stores.values().any(|s| s.committed_row_count() > 0)
-                    };
-                    if has_hot_rows {
-                        // A checkpoint, so the next recovery starts past the log sealed here
-                        self.checkpoint_cycle_inner(true)?;
-                    }
-                    self.loading_from_disk.store(true, Ordering::Release);
-                }
-
-                // Clear the loading flag
-                self.loading_from_disk.store(false, Ordering::Release);
+            // Volume recovery takes priority over snapshot backup files.
+            let volume_lsn = self.load_manifests_from_volumes()?;
+            // The schema epoch restarts above every version the
+            // manifests carry, before the log is replayed, so a change
+            // replayed or made from now on orders after the seals and
+            // changes made before the open
+            let persisted = {
+                let mgrs = self.segment_managers.read();
+                mgrs.values().map(|mgr| mgr.max_schema_version()).max()
+            };
+            if let Some(persisted) = persisted {
+                self.ddl.changed_all(persisted + 1);
             }
+
+            // Legacy snapshots: only used when volumes/ does NOT exist.
+            // This handles migration from pre-volume databases.
+            let has_legacy_snapshots = volume_lsn.is_none()
+                && snapshot_dir.exists()
+                && std::fs::read_dir(&snapshot_dir)
+                    .ok()
+                    .map(|entries| {
+                        entries
+                            .flatten()
+                            .any(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+                    })
+                    .unwrap_or(false);
+
+            let mut unreadable = Vec::new();
+            let replay_from_lsn = if let Some(lsn) = volume_lsn {
+                // New path: load manifests + volumes BEFORE WAL replay.
+                // Volumes must be loaded so is_row_id_in_volume() can check
+                // row_ids for idempotent INSERT during replay.
+                unreadable = self.load_standalone_volumes_no_schema_check();
+                lsn
+            } else if has_legacy_snapshots {
+                // Legacy path: load snapshots (creates schemas + version stores)
+                let snapshot_lsn = match self.load_snapshots() {
+                    Ok(lsn) => lsn,
+                    Err(e) => {
+                        remove_migration_volumes(&pm.path().join("volumes"));
+                        return Err(e);
+                    }
+                };
+                self.load_standalone_volumes();
+                snapshot_lsn
+            } else {
+                0
+            };
+
+            // Clean up stale .dv files from previous versions
+            self.cleanup_stale_dv_files();
+
+            // Replay WAL entries after the checkpoint/snapshot LSN
+            self.replay_wal(replay_from_lsn)?;
+            // A TRUNCATE or DROP replayed above may have retired a segment
+            // whose file it removed, so the check follows the replay
+            self.mark_unloaded_tables(&unreadable);
+
+            // History opens at the recovered state, above every sequence
+            // a volume or a tombstone kept from earlier runs
+            self.registry
+                .open_history_at(self.persisted_sequence_floor());
+
+            // Populate pre-computed default_value from default_expr for schema evolution.
+            // Neither snapshots nor WAL persist the cached default_value, so old rows
+            // read via normalize_row_to_schema would get NULL instead of the column default.
+            self.populate_schema_defaults();
+
+            self.note_reserved_names();
+
+            // A volume an older build left holding a column in another
+            // type than the schema's is rewritten before any mapping
+            self.repair_retyped_volumes()?;
+
+            // Recompute cold volume column mappings now that schemas have
+            // default_value populated. Volumes loaded from disk had identity
+            // mappings; after ALTER TABLE ADD COLUMN, the schema differs.
+            {
+                let schemas = self.schemas.read();
+                let mgrs = self.segment_managers.read();
+                for (table_name, schema) in schemas.iter() {
+                    if let Some(mgr) = mgrs.get(table_name.as_str()) {
+                        mgr.invalidate_mappings(schema)?;
+                    }
+                }
+            }
+
+            // HNSW indexes hold the sealed rows too, read through the
+            // mappings just recomputed, so a column renamed or dropped
+            // before the checkpoint resolves to its volume column
+            self.populate_hnsw_from_segments()?;
+
+            // Whether a side file still stands for an index is decided
+            // through the same mappings, once the catalog is final
+            self.discard_uncovered_side_files_everywhere();
+
+            // Sync auto-increment counters from segment data so the next
+            // generated row_id doesn't collide with cold rows.
+            self.sync_auto_increment_from_segments()?;
+
+            // Migration: if we loaded from legacy snapshots, seal all data
+            // into volumes and remove the old snapshots/ directory.
+            if has_legacy_snapshots {
+                // Clear loading flag temporarily so checkpoint can write WAL
+                self.loading_from_disk.store(false, Ordering::Release);
+
+                // Force seal ALL hot rows into volumes
+                self.checkpoint_cycle_inner(true)?;
+                self.compact_after_checkpoint_forced()?;
+
+                // Only remove snapshots/ if this is a real v0.3.7 migration
+                // (no ddl-*.bin). If DDL metadata exists, these are user-created
+                // backup snapshots from PRAGMA SNAPSHOT that should be kept.
+                let snapshot_dir = pm.path().join("snapshots");
+                let is_user_backup = std::fs::read_dir(&snapshot_dir)
+                    .ok()
+                    .is_some_and(|entries| {
+                        entries.filter_map(|e| e.ok()).any(|e| {
+                            e.file_name().to_str().is_some_and(|n| {
+                                (n.starts_with("ddl-") && n.ends_with(".bin")) || n == "ddl.bin"
+                            })
+                        })
+                    });
+                if !is_user_backup && let Err(e) = std::fs::remove_dir_all(&snapshot_dir) {
+                    eprintln!("Warning: failed to remove snapshots/: {}", e);
+                }
+
+                // Set loading flag back so the code below clears it
+                self.loading_from_disk.store(true, Ordering::Release);
+            }
+
+            // After recovery, seal hot rows immediately before accepting
+            // queries. Without this, a dirty shutdown that loads 1M+ rows
+            // into hot via WAL replay makes ALL queries O(hot_size) until
+            // the first background checkpoint fires (up to 60s later).
+            // Sealing here drains the hot buffer while no concurrent reads
+            // exist, so there's no seal_overlap performance impact.
+            {
+                self.loading_from_disk.store(false, Ordering::Release);
+                let has_hot_rows = {
+                    let stores = self.version_stores.read();
+                    stores.values().any(|s| s.committed_row_count() > 0)
+                };
+                if has_hot_rows {
+                    // A checkpoint, so the next recovery starts past the log sealed here
+                    self.checkpoint_cycle_inner(true)?;
+                }
+                self.loading_from_disk.store(true, Ordering::Release);
+            }
+
+            // Clear the loading flag
+            self.loading_from_disk.store(false, Ordering::Release);
         }
 
         // Note: Cleanup is started separately via start_cleanup() after Arc wrapping
@@ -1786,34 +1782,34 @@ impl MVCCEngine {
                     .hot_limits
                     .seal_requested
                     .swap(false, Ordering::AcqRel);
-                if requested || !current_checkpoint_interval.is_zero() {
-                    if let Some(ref pm) = *engine.persistence {
-                        let last = pm.last_checkpoint_time();
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_nanos() as i64)
-                            .unwrap_or(0);
-                        let elapsed_nanos = now.saturating_sub(last);
-                        let interval_nanos = current_checkpoint_interval.as_nanos() as i64;
-                        if requested
-                            || (!current_checkpoint_interval.is_zero()
-                                && elapsed_nanos >= interval_nanos)
-                        {
-                            // Call checkpoint_cycle_inner directly (not
-                            // checkpoint_cycle) so compaction is spawned on
-                            // a separate thread instead of running synchronously.
-                            match engine.checkpoint_cycle_inner(false) {
-                                Ok(()) => {
-                                    // Eviction runs inside spawn_compaction, AFTER
-                                    // compaction finishes. Running them in the same
-                                    // cycle but concurrently causes thrashing:
-                                    // eviction frees volumes that compaction
-                                    // immediately reloads via segments_snapshot.
-                                    engine.spawn_compaction();
-                                }
-                                Err(e) => {
-                                    eprintln!("Warning: checkpoint cycle failed: {}", e);
-                                }
+                if (requested || !current_checkpoint_interval.is_zero())
+                    && let Some(ref pm) = *engine.persistence
+                {
+                    let last = pm.last_checkpoint_time();
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as i64)
+                        .unwrap_or(0);
+                    let elapsed_nanos = now.saturating_sub(last);
+                    let interval_nanos = current_checkpoint_interval.as_nanos() as i64;
+                    if requested
+                        || (!current_checkpoint_interval.is_zero()
+                            && elapsed_nanos >= interval_nanos)
+                    {
+                        // Call checkpoint_cycle_inner directly (not
+                        // checkpoint_cycle) so compaction is spawned on
+                        // a separate thread instead of running synchronously.
+                        match engine.checkpoint_cycle_inner(false) {
+                            Ok(()) => {
+                                // Eviction runs inside spawn_compaction, AFTER
+                                // compaction finishes. Running them in the same
+                                // cycle but concurrently causes thrashing:
+                                // eviction frees volumes that compaction
+                                // immediately reloads via segments_snapshot.
+                                engine.spawn_compaction();
+                            }
+                            Err(e) => {
+                                eprintln!("Warning: checkpoint cycle failed: {}", e);
                             }
                         }
                     }
@@ -1915,15 +1911,14 @@ impl MVCCEngine {
                         }
                         // Extract timestamp from snapshot filename for HNSW graph pairing.
                         // Format: "snapshot-{timestamp}.bin" → extract "{timestamp}"
-                        if let Some(fname) = snapshot_path.file_name().and_then(|n| n.to_str()) {
-                            if let Some(ts) = fname
+                        if let Some(fname) = snapshot_path.file_name().and_then(|n| n.to_str())
+                            && let Some(ts) = fname
                                 .strip_prefix("snapshot-")
                                 .and_then(|s| s.strip_suffix(".bin"))
-                            {
-                                self.snapshot_timestamps
-                                    .write()
-                                    .insert(table_name.clone(), ts.to_string());
-                            }
+                        {
+                            self.snapshot_timestamps
+                                .write()
+                                .insert(table_name.clone(), ts.to_string());
                         }
                         break; // Successfully loaded, stop trying older snapshots
                     }
@@ -2224,13 +2219,12 @@ impl MVCCEngine {
 
         let vol_dir = pm.path().join("volumes");
         let table_vol_dir = vol_dir.join(table_name);
-        if let Some(volume_id) = marked {
-            if table_vol_dir
+        if let Some(volume_id) = marked
+            && table_vol_dir
                 .join(format!("vol_{:016x}.vol", volume_id))
                 .exists()
-            {
-                return Some(volume_id);
-            }
+        {
+            return Some(volume_id);
         }
 
         if let Err(e) = std::fs::create_dir_all(&table_vol_dir) {
@@ -2325,12 +2319,11 @@ impl MVCCEngine {
                 }
                 // A table the log dropped and nothing named again leaves no files
                 for (name, mgr) in &log.dropped {
-                    if !self.schemas.read().contains_key(name) {
-                        if let Err(e) =
+                    if !self.schemas.read().contains_key(name)
+                        && let Err(e) =
                             remove_dropped_table_files(&self.persistence, name, Some(mgr))
-                        {
-                            eprintln!("Warning: Failed to remove dropped table '{}': {}", name, e);
-                        }
+                    {
+                        eprintln!("Warning: Failed to remove dropped table '{}': {}", name, e);
                     }
                 }
 
@@ -2554,15 +2547,15 @@ impl MVCCEngine {
             }
             let schema = CompactArc::make_mut(&mut *schema_guard);
             for col in &mut schema.columns {
-                if col.default_value.is_none() {
-                    if let Some(ref expr) = col.default_expr {
-                        // Backward-compat fallback for WAL/snapshots written before
-                        // default_value persistence was added. Only handles simple
-                        // literals (integers, floats, booleans, strings, NULL).
-                        // Non-deterministic expressions (NOW(), CURRENT_TIMESTAMP)
-                        // cannot be recovered here — they require the new format.
-                        col.default_value = try_parse_default_literal(expr, col.data_type);
-                    }
+                if col.default_value.is_none()
+                    && let Some(ref expr) = col.default_expr
+                {
+                    // Backward-compat fallback for WAL/snapshots written before
+                    // default_value persistence was added. Only handles simple
+                    // literals (integers, floats, booleans, strings, NULL).
+                    // Non-deterministic expressions (NOW(), CURRENT_TIMESTAMP)
+                    // cannot be recovered here — they require the new format.
+                    col.default_value = try_parse_default_literal(expr, col.data_type);
                 }
             }
         }
@@ -2846,12 +2839,11 @@ impl MVCCEngine {
                     }
                 }
                 // Delete standalone volume files from disk
-                if let Some(ref pm) = *self.persistence {
-                    if pm.is_enabled() {
-                        let vol_dir = pm.path().join("volumes");
-                        let _ =
-                            crate::storage::volume::io::delete_all_volumes(&vol_dir, &table_name);
-                    }
+                if let Some(ref pm) = *self.persistence
+                    && pm.is_enabled()
+                {
+                    let vol_dir = pm.path().join("volumes");
+                    let _ = crate::storage::volume::io::delete_all_volumes(&vol_dir, &table_name);
                 }
             }
         }
@@ -3168,36 +3160,35 @@ impl MVCCEngine {
         // in volumes so startup is fast and doesn't depend on WAL replay.
         // Skipped when checkpoint_on_close is false (crash simulation in tests).
         let checkpoint_on_close = self.config.read().persistence.checkpoint_on_close;
-        if checkpoint_on_close {
-            if let Some(ref pm) = *self.persistence {
-                if pm.is_enabled() {
-                    // Retry checkpoint until all hot buffers are empty.
-                    // After stop_accepting_transactions(), no new writes can start,
-                    // but in-flight commits may still add rows between seal passes.
-                    // Retry ensures WAL truncation happens and startup is fast.
-                    for attempt in 0..5 {
-                        if let Err(e) = self.checkpoint_cycle_inner(true) {
-                            first_error.get_or_insert(e);
-                            break;
-                        }
-                        let all_empty = self
-                            .version_stores
-                            .read()
-                            .values()
-                            .all(|s| s.committed_row_count() == 0);
-                        if all_empty {
-                            break;
-                        }
-                        if attempt < 4 {
-                            #[allow(clippy::disallowed_methods)]
-                            // persistence only: never in a browser
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                        }
-                    }
-                    if let Err(e) = self.compact_after_checkpoint_forced() {
-                        first_error.get_or_insert(e);
-                    }
+        if checkpoint_on_close
+            && let Some(ref pm) = *self.persistence
+            && pm.is_enabled()
+        {
+            // Retry checkpoint until all hot buffers are empty.
+            // After stop_accepting_transactions(), no new writes can start,
+            // but in-flight commits may still add rows between seal passes.
+            // Retry ensures WAL truncation happens and startup is fast.
+            for attempt in 0..5 {
+                if let Err(e) = self.checkpoint_cycle_inner(true) {
+                    first_error.get_or_insert(e);
+                    break;
                 }
+                let all_empty = self
+                    .version_stores
+                    .read()
+                    .values()
+                    .all(|s| s.committed_row_count() == 0);
+                if all_empty {
+                    break;
+                }
+                if attempt < 4 {
+                    #[allow(clippy::disallowed_methods)]
+                    // persistence only: never in a browser
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            if let Err(e) = self.compact_after_checkpoint_forced() {
+                first_error.get_or_insert(e);
             }
         } // checkpoint_on_close
 
@@ -3226,12 +3217,11 @@ impl MVCCEngine {
         drop(stores);
 
         // Stop persistence manager
-        if let Some(ref pm) = *self.persistence {
-            if pm.is_enabled() {
-                if let Err(e) = pm.stop() {
-                    first_error.get_or_insert(e);
-                }
-            }
+        if let Some(ref pm) = *self.persistence
+            && pm.is_enabled()
+            && let Err(e) = pm.stop()
+        {
+            first_error.get_or_insert(e);
         }
 
         // Release file lock (drops the lock, allowing other processes to access)
@@ -3684,10 +3674,10 @@ impl MVCCEngine {
         if self.should_skip_wal() {
             return Ok(None);
         }
-        if let Some(ref pm) = *self.persistence {
-            if pm.is_enabled() {
-                return pm.record_ddl_operation(table_name, op, schema_data);
-            }
+        if let Some(ref pm) = *self.persistence
+            && pm.is_enabled()
+        {
+            return pm.record_ddl_operation(table_name, op, schema_data);
         }
         Ok(None)
     }
@@ -3763,11 +3753,14 @@ impl MVCCEngine {
             buf.extend_from_slice(&(schema.columns.len() as u16).to_le_bytes());
             for col in &schema.columns {
                 if let Some(ref default_value) = col.default_value {
-                    if let Ok(val_bytes) = serialize_value(default_value) {
-                        buf.extend_from_slice(&(val_bytes.len() as u16).to_le_bytes());
-                        buf.extend_from_slice(&val_bytes);
-                    } else {
-                        buf.extend_from_slice(&0u16.to_le_bytes());
+                    match serialize_value(default_value) {
+                        Ok(val_bytes) => {
+                            buf.extend_from_slice(&(val_bytes.len() as u16).to_le_bytes());
+                            buf.extend_from_slice(&val_bytes);
+                        }
+                        _ => {
+                            buf.extend_from_slice(&0u16.to_le_bytes());
+                        }
                     }
                 } else {
                     buf.extend_from_slice(&0u16.to_le_bytes());
@@ -4712,10 +4705,10 @@ impl MVCCEngine {
 
         let stores = self.version_stores.read();
         for (table_name, _, max_vol_row_id) in &segment_data {
-            if *max_vol_row_id > 0 {
-                if let Some(store) = stores.get(table_name) {
-                    store.set_auto_increment_counter(*max_vol_row_id);
-                }
+            if *max_vol_row_id > 0
+                && let Some(store) = stores.get(table_name)
+            {
+                store.set_auto_increment_counter(*max_vol_row_id);
             }
         }
         Ok(())
@@ -5013,10 +5006,10 @@ impl MVCCEngine {
         }
         let name = to_lowercase_cow(table_name);
         let schema = self.schemas.read().get(name.as_ref()).cloned();
-        if let Some(schema) = schema {
-            if let Some(mgr) = self.segment_managers.read().get(name.as_ref()) {
-                mgr.invalidate_mappings(&schema)?;
-            }
+        if let Some(schema) = schema
+            && let Some(mgr) = self.segment_managers.read().get(name.as_ref())
+        {
+            mgr.invalidate_mappings(&schema)?;
         }
         Ok(())
     }
@@ -6049,13 +6042,13 @@ impl MVCCEngine {
         for (_, _, table_name) in &pending_snapshots {
             if schemas.contains_key(table_name) {
                 let disk_store = super::snapshot::DiskVersionStore::new(&snapshot_dir, table_name);
-                if let Ok(disk_store) = disk_store {
-                    if let Err(e) = disk_store.cleanup_old_snapshots(keep_snapshots) {
-                        eprintln!(
-                            "Warning: Failed to cleanup old snapshots for {}: {}",
-                            table_name, e
-                        );
-                    }
+                if let Ok(disk_store) = disk_store
+                    && let Err(e) = disk_store.cleanup_old_snapshots(keep_snapshots)
+                {
+                    eprintln!(
+                        "Warning: Failed to cleanup old snapshots for {}: {}",
+                        table_name, e
+                    );
                 }
             }
         }
@@ -6332,10 +6325,10 @@ impl MVCCEngine {
             let table_name = entry.file_name().to_string_lossy().to_string();
 
             // Skip tables not in the manifest (prevents resurrecting dropped tables)
-            if let Some(ref tables) = effective_tables {
-                if !tables.iter().any(|t| t.eq_ignore_ascii_case(&table_name)) {
-                    continue;
-                }
+            if let Some(ref tables) = effective_tables
+                && !tables.iter().any(|t| t.eq_ignore_ascii_case(&table_name))
+            {
+                continue;
             }
 
             let paths = Self::find_snapshots_newest_first(&entry.path());
@@ -6379,14 +6372,14 @@ impl MVCCEngine {
             }
             // Also validate companion .vol if it exists (will be used by load_table_snapshot_as_volume)
             let vol_path = path.with_extension("vol");
-            if vol_path.exists() {
-                if let Err(e) = crate::storage::volume::io::read_volume_from_disk(&vol_path) {
-                    self.registry.start_accepting_transactions();
-                    return Err(Error::internal(format!(
-                        "Snapshot volume validation failed for table {}: {}",
-                        table_name, e
-                    )));
-                }
+            if vol_path.exists()
+                && let Err(e) = crate::storage::volume::io::read_volume_from_disk(&vol_path)
+            {
+                self.registry.start_accepting_transactions();
+                return Err(Error::internal(format!(
+                    "Snapshot volume validation failed for table {}: {}",
+                    table_name, e
+                )));
             }
         }
 
@@ -6495,12 +6488,12 @@ impl MVCCEngine {
 
         // Delete all volume directories on disk
         let vol_dir = pm.path().join("volumes");
-        if vol_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&vol_dir) {
-                for entry in entries.flatten() {
-                    if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                        let _ = std::fs::remove_dir_all(entry.path());
-                    }
+        if vol_dir.exists()
+            && let Ok(entries) = std::fs::read_dir(&vol_dir)
+        {
+            for entry in entries.flatten() {
+                if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                    let _ = std::fs::remove_dir_all(entry.path());
                 }
             }
         }
@@ -6757,10 +6750,10 @@ impl MVCCEngine {
         if checkpoint_lsn > 0 {
             crate::test_failpoints::checkpoint_cut_taken();
         }
-        if checkpoint_lsn > 0 {
-            if let Some(ref pm) = *self.persistence {
-                pm.publish_checkpoint(checkpoint_lsn)?;
-            }
+        if checkpoint_lsn > 0
+            && let Some(ref pm) = *self.persistence
+        {
+            pm.publish_checkpoint(checkpoint_lsn)?;
         }
 
         // Step 4: Persist manifests (includes tombstones + checkpoint_lsn).
@@ -6804,12 +6797,12 @@ impl MVCCEngine {
         // checkpoint_lsn > 0 already guarantees all_hot_empty was true inside
         // the fence. Don't re-check the outer all_hot_empty (stale, checked
         // before fence when continuous inserts make it always false).
-        if checkpoint_lsn > 0 && manifest_error.is_none() {
-            if let Some(ref pm) = *self.persistence {
-                if let Err(e) = pm.truncate_wal(checkpoint_lsn) {
-                    eprintln!("Warning: Failed to truncate WAL: {}", e);
-                }
-            }
+        if checkpoint_lsn > 0
+            && manifest_error.is_none()
+            && let Some(ref pm) = *self.persistence
+            && let Err(e) = pm.truncate_wal(checkpoint_lsn)
+        {
+            eprintln!("Warning: Failed to truncate WAL: {}", e);
         }
 
         // A WAL any step above poisoned, its error swallowed or not, refuses every write
@@ -7416,10 +7409,10 @@ impl MVCCEngine {
         // restore from before identities) takes its copy's LSN, the copy
         // being the first record that stands for it
         for ((table_name, index_name), &lsn) in indexes.iter().zip(lsns.iter().skip(tables)) {
-            if let Ok(store) = self.get_version_store(table_name) {
-                if store.index_identity(index_name).is_none() {
-                    store.set_index_identity(index_name, lsn);
-                }
+            if let Ok(store) = self.get_version_store(table_name)
+                && store.index_identity(index_name).is_none()
+            {
+                store.set_index_identity(index_name, lsn);
             }
         }
         // An id taken after its counter was read may belong to a write
@@ -7562,13 +7555,14 @@ impl MVCCEngine {
                         // seal_seq = cutoff used during extraction. A volume with
                         // seal_seq <= limit contains only pre-snapshot data (safe).
                         // seal_seq > limit means the volume may have post-snapshot data.
-                        if let Some(limit) = compact_seal_seq_limit {
-                            if seg.seal_seq > 0 && seg.seal_seq > limit {
-                                deferred = true;
-                                planned.push((seg.segment_id, seg.row_count, false, true));
-                                size_only.push(false);
-                                continue;
-                            }
+                        if let Some(limit) = compact_seal_seq_limit
+                            && seg.seal_seq > 0
+                            && seg.seal_seq > limit
+                        {
+                            deferred = true;
+                            planned.push((seg.segment_id, seg.row_count, false, true));
+                            size_only.push(false);
+                            continue;
                         }
                         // Tombstoned rows that compaction can actually apply:
                         // only tombstones with commit_seq < limit (the others
@@ -7658,10 +7652,10 @@ impl MVCCEngine {
                 } else {
                     1
                 };
-                if let Some(position) = v4_position {
-                    if !selected.contains(&position) {
-                        selected.push(position);
-                    }
+                if let Some(position) = v4_position
+                    && !selected.contains(&position)
+                {
+                    selected.push(position);
                 }
 
                 // Volumes take precedence by manifest position, newest last,
@@ -7700,10 +7694,12 @@ impl MVCCEngine {
                     )
                 };
                 let reclustering = selected.iter().any(|&p| Some(p) != v4_position);
-                if let Some(request) = recluster_request {
-                    if all_checked && !reduced && !reclustering {
-                        mgr.recluster_done(request);
-                    }
+                if let Some(request) = recluster_request
+                    && all_checked
+                    && !reduced
+                    && !reclustering
+                {
+                    mgr.recluster_done(request);
                 }
                 if held {
                     continue;
@@ -7941,12 +7937,12 @@ impl MVCCEngine {
                 if let Ok(entries) = std::fs::read_dir(&vol_table_dir) {
                     for entry in entries.flatten() {
                         let path = entry.path();
-                        if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
-                            if old_filenames.contains(fname) {
-                                // Through the registry, so a reader that
-                                // pinned this file keeps it until it lets go
-                                crate::storage::volume::writer::VolumeFile::shared(&path).retire();
-                            }
+                        if let Some(fname) = path.file_name().and_then(|n| n.to_str())
+                            && old_filenames.contains(fname)
+                        {
+                            // Through the registry, so a reader that
+                            // pinned this file keeps it until it lets go
+                            crate::storage::volume::writer::VolumeFile::shared(&path).retire();
                         }
                     }
                 }
@@ -8371,14 +8367,13 @@ impl MVCCEngine {
                     let ext = path.extension().and_then(|e| e.to_str());
                     if ext == Some("dv") {
                         let _ = std::fs::remove_file(&path);
-                    } else if ext == Some("vol") {
-                        if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
-                            if old_filenames.contains(fname) {
-                                // Through the registry, so a reader that
-                                // pinned this file keeps it until it lets go
-                                crate::storage::volume::writer::VolumeFile::shared(&path).retire();
-                            }
-                        }
+                    } else if ext == Some("vol")
+                        && let Some(fname) = path.file_name().and_then(|n| n.to_str())
+                        && old_filenames.contains(fname)
+                    {
+                        // Through the registry, so a reader that
+                        // pinned this file keeps it until it lets go
+                        crate::storage::volume::writer::VolumeFile::shared(&path).retire();
                     }
                 }
             }
@@ -9277,14 +9272,14 @@ impl Engine for MVCCEngine {
         }
 
         // Delete volume files from disk (standalone volumes + legacy tombstones)
-        if let Some(ref pm) = *self.persistence {
-            if pm.is_enabled() {
-                let vol_dir = pm.path().join("volumes");
-                let _ = crate::storage::volume::io::delete_all_volumes(&vol_dir, &table_lower);
-                let snapshot_dir = pm.path().join("snapshots");
-                let ts_path = snapshot_dir.join(&table_lower).join("tombstones.dat");
-                let _ = std::fs::remove_file(ts_path);
-            }
+        if let Some(ref pm) = *self.persistence
+            && pm.is_enabled()
+        {
+            let vol_dir = pm.path().join("volumes");
+            let _ = crate::storage::volume::io::delete_all_volumes(&vol_dir, &table_lower);
+            let snapshot_dir = pm.path().join("snapshots");
+            let ts_path = snapshot_dir.join(&table_lower).join("tombstones.dat");
+            let _ = std::fs::remove_file(ts_path);
         }
 
         Ok(())
@@ -9374,10 +9369,10 @@ impl MVCCEngine {
                     let found_ids: rustc_hash::FxHashSet<i64> =
                         result.iter().map(|(id, _)| *id).collect();
                     for &rid in row_ids {
-                        if !found_ids.contains(&rid) {
-                            if let Some(row) = mgr.get_cold_row_normalized(rid, needed)? {
-                                result.push((rid, row));
-                            }
+                        if !found_ids.contains(&rid)
+                            && let Some(row) = mgr.get_cold_row_normalized(rid, needed)?
+                        {
+                            result.push((rid, row));
                         }
                     }
                 }
@@ -10005,12 +10000,11 @@ impl EngineOperations {
         }
 
         // Record DDL to WAL so the drop survives crash recovery
-        if !self.should_skip_wal() {
-            if let Some(ref pm) = *self.persistence() {
-                if pm.is_enabled() {
-                    pm.record_ddl_operation(name, WALOperationType::DropTable, &[])?;
-                }
-            }
+        if !self.should_skip_wal()
+            && let Some(ref pm) = *self.persistence()
+            && pm.is_enabled()
+        {
+            pm.record_ddl_operation(name, WALOperationType::DropTable, &[])?;
         }
 
         // Clear in-memory segment state (prevents phantom rows on re-create)
@@ -10294,12 +10288,11 @@ impl EngineOperations {
                     continue;
                 };
                 let pk_val = &keys.values[check.start];
-                if let Some(cold_rid) = mgr.check_value_exists_in(snapshot, pk_col, pk_val)? {
-                    if (!check.update || cold_rid != check.row_id)
-                        && !mgr.is_pending_tombstone(Pending::of(txn_id), cold_rid)
-                    {
-                        return Err(crate::core::Error::PrimaryKeyConstraint { row_id: cold_rid });
-                    }
+                if let Some(cold_rid) = mgr.check_value_exists_in(snapshot, pk_col, pk_val)?
+                    && (!check.update || cold_rid != check.row_id)
+                    && !mgr.is_pending_tombstone(Pending::of(txn_id), cold_rid)
+                {
+                    return Err(crate::core::Error::PrimaryKeyConstraint { row_id: cold_rid });
                 }
                 continue;
             };
@@ -10316,18 +10309,17 @@ impl EngineOperations {
             let values: smallvec::SmallVec<[&crate::core::Value; 4]> = coerced.iter().collect();
             let found = mgr.find_row_id_by_values_in(snapshot, col_indices, &values, defaults)?;
             drop(values);
-            if let Some(cold_rid) = found {
-                if (!check.update || cold_rid != check.row_id)
-                    && !mgr.is_pending_tombstone(Pending::of(txn_id), cold_rid)
-                {
-                    return Err(crate::core::Error::UniqueConstraint {
-                        index: unique_index_name(version_store, col_indices)
-                            .unwrap_or_else(|| col_names.join("_")),
-                        column: col_names.join(", "),
-                        value: coerced.into_vec().into(),
-                        row_id: cold_rid,
-                    });
-                }
+            if let Some(cold_rid) = found
+                && (!check.update || cold_rid != check.row_id)
+                && !mgr.is_pending_tombstone(Pending::of(txn_id), cold_rid)
+            {
+                return Err(crate::core::Error::UniqueConstraint {
+                    index: unique_index_name(version_store, col_indices)
+                        .unwrap_or_else(|| col_names.join("_")),
+                    column: col_names.join(", "),
+                    value: coerced.into_vec().into(),
+                    row_id: cold_rid,
+                });
             }
         }
         Ok(())
@@ -10354,7 +10346,7 @@ impl EngineOperations {
     fn record_table_to_wal(&self, txn_id: i64, table: &MVCCTable) -> Result<()> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::table_wal_record_written();
-        if let Some(ref pm) = self.persistence() {
+        if let Some(pm) = self.persistence() {
             let table_name = table.name();
             let pending = table.get_pending_versions();
 
@@ -10701,87 +10693,83 @@ impl TransactionEngineOperations for EngineOperations {
             .filter(|pm| pm.is_enabled())
             .map(|pm| pm.path().join("volumes").join(&old_name_lower))
             .is_some_and(|old_dir| old_dir.exists());
-        if !files_to_move {
-            if let Some(mgr) = self.segment_managers.read().get(&new_name_lower) {
-                mgr.rename(new_name_lower.as_str());
-            }
+        if !files_to_move && let Some(mgr) = self.segment_managers.read().get(&new_name_lower) {
+            mgr.rename(new_name_lower.as_str());
         }
         // Rename on-disk volume directory and tombstones
-        if let Some(ref pm) = *self.persistence {
-            if pm.is_enabled() {
-                let vol_dir = pm.path().join("volumes");
-                let old_dir = vol_dir.join(&old_name_lower);
-                let new_dir = vol_dir.join(&new_name_lower);
-                if old_dir.exists() {
-                    // The directory moves and every holder of a file in it
-                    // moves with it, under the manager's reload lock, the
-                    // name changing only once the move succeeded
-                    let move_dir = || {
-                        crate::storage::volume::writer::VolumeFile::relocate(
-                            &old_dir,
-                            &new_dir,
-                            || std::fs::rename(&old_dir, &new_dir),
-                        )
-                    };
-                    #[cfg(any(test, feature = "test-failpoints"))]
-                    crate::test_failpoints::rename_directory_moving();
-                    let moved = match self.segment_managers.read().get(&new_name_lower) {
-                        Some(mgr) => mgr.rename_with(new_name_lower.as_str(), move_dir),
-                        None => move_dir(),
-                    };
-                    if let Err(e) = moved {
-                        // Revert ALL in-memory renames on disk failure
-                        {
-                            let mut schemas = self.schemas().write();
-                            if let Some(mut schema_arc) = schemas.remove(&new_name_lower) {
-                                let schema = CompactArc::make_mut(&mut schema_arc);
+        if let Some(ref pm) = *self.persistence
+            && pm.is_enabled()
+        {
+            let vol_dir = pm.path().join("volumes");
+            let old_dir = vol_dir.join(&old_name_lower);
+            let new_dir = vol_dir.join(&new_name_lower);
+            if old_dir.exists() {
+                // The directory moves and every holder of a file in it
+                // moves with it, under the manager's reload lock, the
+                // name changing only once the move succeeded
+                let move_dir = || {
+                    crate::storage::volume::writer::VolumeFile::relocate(&old_dir, &new_dir, || {
+                        std::fs::rename(&old_dir, &new_dir)
+                    })
+                };
+                #[cfg(any(test, feature = "test-failpoints"))]
+                crate::test_failpoints::rename_directory_moving();
+                let moved = match self.segment_managers.read().get(&new_name_lower) {
+                    Some(mgr) => mgr.rename_with(new_name_lower.as_str(), move_dir),
+                    None => move_dir(),
+                };
+                if let Err(e) = moved {
+                    // Revert ALL in-memory renames on disk failure
+                    {
+                        let mut schemas = self.schemas().write();
+                        if let Some(mut schema_arc) = schemas.remove(&new_name_lower) {
+                            let schema = CompactArc::make_mut(&mut schema_arc);
+                            schema.table_name = old_name.to_string();
+                            schema.table_name_lower = old_name_lower.clone();
+                            schemas.insert(old_name_lower.clone(), schema_arc);
+                        }
+                    }
+                    {
+                        let mut stores = self.version_stores().write();
+                        if let Some(store) = stores.remove(&new_name_lower) {
+                            {
+                                let mut vs_schema_guard = store.schema_mut();
+                                let schema = CompactArc::make_mut(&mut *vs_schema_guard);
                                 schema.table_name = old_name.to_string();
                                 schema.table_name_lower = old_name_lower.clone();
-                                schemas.insert(old_name_lower.clone(), schema_arc);
                             }
+                            stores.insert(old_name_lower.clone(), store);
                         }
-                        {
-                            let mut stores = self.version_stores().write();
-                            if let Some(store) = stores.remove(&new_name_lower) {
-                                {
-                                    let mut vs_schema_guard = store.schema_mut();
-                                    let schema = CompactArc::make_mut(&mut *vs_schema_guard);
-                                    schema.table_name = old_name.to_string();
-                                    schema.table_name_lower = old_name_lower.clone();
-                                }
-                                stores.insert(old_name_lower.clone(), store);
-                            }
-                        }
-                        {
-                            let mut schemas = self.schemas().write();
-                            let stores = self.version_stores().read();
-                            retarget_fk_references(
-                                &mut schemas,
-                                &stores,
-                                &new_name_lower,
-                                &old_name_lower,
-                            );
-                        }
-                        {
-                            let mut mgrs = self.segment_managers.write();
-                            if let Some(mgr) = mgrs.remove(&new_name_lower) {
-                                mgrs.insert(old_name_lower.clone(), mgr);
-                            }
-                        }
-                        self.renamed(&old_name_lower, &new_name_lower);
-                        return Err(Error::Internal {
-                            message: format!("Failed to rename volume directory: {}", e),
-                        });
                     }
+                    {
+                        let mut schemas = self.schemas().write();
+                        let stores = self.version_stores().read();
+                        retarget_fk_references(
+                            &mut schemas,
+                            &stores,
+                            &new_name_lower,
+                            &old_name_lower,
+                        );
+                    }
+                    {
+                        let mut mgrs = self.segment_managers.write();
+                        if let Some(mgr) = mgrs.remove(&new_name_lower) {
+                            mgrs.insert(old_name_lower.clone(), mgr);
+                        }
+                    }
+                    self.renamed(&old_name_lower, &new_name_lower);
+                    return Err(Error::Internal {
+                        message: format!("Failed to rename volume directory: {}", e),
+                    });
                 }
-                let snap_dir = pm.path().join("snapshots");
-                let old_ts = snap_dir.join(&old_name_lower).join("tombstones.dat");
-                let new_ts_dir = snap_dir.join(&new_name_lower);
-                let new_ts = new_ts_dir.join("tombstones.dat");
-                if old_ts.exists() {
-                    let _ = std::fs::create_dir_all(&new_ts_dir);
-                    let _ = std::fs::rename(&old_ts, &new_ts);
-                }
+            }
+            let snap_dir = pm.path().join("snapshots");
+            let old_ts = snap_dir.join(&old_name_lower).join("tombstones.dat");
+            let new_ts_dir = snap_dir.join(&new_name_lower);
+            let new_ts = new_ts_dir.join("tombstones.dat");
+            if old_ts.exists() {
+                let _ = std::fs::create_dir_all(&new_ts_dir);
+                let _ = std::fs::rename(&old_ts, &new_ts);
             }
         }
 
@@ -10803,10 +10791,10 @@ impl TransactionEngineOperations for EngineOperations {
 
         // Record commit in WAL — propagate errors since missing commit records
         // means crash recovery won't replay this transaction's changes
-        if let Some(ref pm) = self.persistence() {
-            if pm.is_enabled() {
-                pm.record_commit(txn_id)?;
-            }
+        if let Some(pm) = self.persistence()
+            && pm.is_enabled()
+        {
+            pm.record_commit(txn_id)?;
         }
         Ok(())
     }
@@ -10818,12 +10806,11 @@ impl TransactionEngineOperations for EngineOperations {
         }
 
         // Record rollback in WAL
-        if let Some(ref pm) = self.persistence() {
-            if pm.is_enabled() {
-                if let Err(e) = pm.record_rollback(txn_id) {
-                    eprintln!("Warning: Failed to record rollback in WAL: {}", e);
-                }
-            }
+        if let Some(pm) = self.persistence()
+            && pm.is_enabled()
+            && let Err(e) = pm.record_rollback(txn_id)
+        {
+            eprintln!("Warning: Failed to record rollback in WAL: {}", e);
         }
         Ok(())
     }
@@ -10859,10 +10846,10 @@ impl TransactionEngineOperations for EngineOperations {
         // hot mutations, but they always go through get_table_for_transaction first.
         let mgrs = self.segment_managers.read();
         for table_name in &touched_tables {
-            if let Some(mgr) = mgrs.get(table_name.as_str()) {
-                if mgr.has_pending_tombstones(txn_id) {
-                    return true;
-                }
+            if let Some(mgr) = mgrs.get(table_name.as_str())
+                && mgr.has_pending_tombstones(txn_id)
+            {
+                return true;
             }
         }
         false
@@ -10938,25 +10925,25 @@ impl TransactionEngineOperations for EngineOperations {
             if should_record_wal {
                 if let Some(mgr) = commit_mgrs.get(table_name.as_str()) {
                     let pending = mgr.get_pending_tombstones(txn_id);
-                    if !pending.is_empty() {
-                        if let Some(ref pm) = *self.persistence() {
-                            for &row_id in &pending {
-                                let version = crate::storage::mvcc::version_store::RowVersion {
-                                    txn_id,
-                                    deleted_at_txn_id: txn_id,
-                                    data: crate::core::Row::new(),
-                                    create_time: 0,
-                                };
-                                if let Err(e) = pm.record_dml_operation(
-                                    txn_id,
-                                    table_name,
-                                    row_id,
-                                    crate::storage::mvcc::wal_manager::WALOperationType::Delete,
-                                    &version,
-                                ) {
-                                    commit_error = Some(e);
-                                    break;
-                                }
+                    if !pending.is_empty()
+                        && let Some(ref pm) = *self.persistence()
+                    {
+                        for &row_id in &pending {
+                            let version = crate::storage::mvcc::version_store::RowVersion {
+                                txn_id,
+                                deleted_at_txn_id: txn_id,
+                                data: crate::core::Row::new(),
+                                create_time: 0,
+                            };
+                            if let Err(e) = pm.record_dml_operation(
+                                txn_id,
+                                table_name,
+                                row_id,
+                                crate::storage::mvcc::wal_manager::WALOperationType::Delete,
+                                &version,
+                            ) {
+                                commit_error = Some(e);
+                                break;
                             }
                         }
                     }
@@ -10974,11 +10961,9 @@ impl TransactionEngineOperations for EngineOperations {
             );
 
             // Record hot pending versions to WAL (after tombstone DELETEs)
-            if should_record_wal {
-                if let Err(e) = self.record_table_to_wal(txn_id, &table) {
-                    commit_error = Some(e);
-                    break;
-                }
+            if should_record_wal && let Err(e) = self.record_table_to_wal(txn_id, &table) {
+                commit_error = Some(e);
+                break;
             }
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::table_wal_recorded();
@@ -10999,11 +10984,11 @@ impl TransactionEngineOperations for EngineOperations {
             // A column change in progress refuses the commit before the
             // volumes are read through its half-moved layout
             let schema_generation = mgr_for_commit.as_ref().map(|mgr| mgr.schema_generation());
-            if let Some((mgr, generation)) = mgr_for_commit.as_ref().zip(schema_generation) {
-                if let Err(e) = mgr.check_schema_generation(generation) {
-                    commit_error = Some(e);
-                    break;
-                }
+            if let Some((mgr, generation)) = mgr_for_commit.as_ref().zip(schema_generation)
+                && let Err(e) = mgr.check_schema_generation(generation)
+            {
+                commit_error = Some(e);
+                break;
             }
 
             // Always take fence if manager exists — even before first seal
@@ -11087,25 +11072,25 @@ impl TransactionEngineOperations for EngineOperations {
                     // Record cold-only tombstones to WAL (tables not already handled above)
                     if should_record_wal && !tombstones_wal_recorded.contains(table_name.as_str()) {
                         let pending = mgr.get_pending_tombstones(txn_id);
-                        if !pending.is_empty() {
-                            if let Some(ref pm) = *self.persistence() {
-                                for &row_id in &pending {
-                                    let version = crate::storage::mvcc::version_store::RowVersion {
-                                        txn_id,
-                                        deleted_at_txn_id: txn_id,
-                                        data: crate::core::Row::new(),
-                                        create_time: 0,
-                                    };
-                                    if let Err(e) = pm.record_dml_operation(
-                                        txn_id,
-                                        table_name,
-                                        row_id,
-                                        crate::storage::mvcc::wal_manager::WALOperationType::Delete,
-                                        &version,
-                                    ) {
-                                        commit_error = Some(e);
-                                        break;
-                                    }
+                        if !pending.is_empty()
+                            && let Some(ref pm) = *self.persistence()
+                        {
+                            for &row_id in &pending {
+                                let version = crate::storage::mvcc::version_store::RowVersion {
+                                    txn_id,
+                                    deleted_at_txn_id: txn_id,
+                                    data: crate::core::Row::new(),
+                                    create_time: 0,
+                                };
+                                if let Err(e) = pm.record_dml_operation(
+                                    txn_id,
+                                    table_name,
+                                    row_id,
+                                    crate::storage::mvcc::wal_manager::WALOperationType::Delete,
+                                    &version,
+                                ) {
+                                    commit_error = Some(e);
+                                    break;
                                 }
                             }
                         }
@@ -11636,35 +11621,35 @@ fn close_batch_over_overlap<'a>(
         let mut held = false;
         let first = planned.iter().position(|entry| entry.2);
         let last = planned.iter().rposition(|entry| entry.2);
-        if let (Some(first), Some(last)) = (first, last) {
-            if last > first {
-                let mut batch_ids: FxHashSet<i64> = FxHashSet::default();
-                for entry in &planned[first..=last] {
+        if let (Some(first), Some(last)) = (first, last)
+            && last > first
+        {
+            let mut batch_ids: FxHashSet<i64> = FxHashSet::default();
+            for entry in &planned[first..=last] {
+                if entry.2 {
+                    batch_ids.extend(ids_of(entry.0).iter().copied());
+                }
+            }
+            loop {
+                let mut grew = false;
+                for entry in planned[first..=last].iter_mut() {
                     if entry.2 {
-                        batch_ids.extend(ids_of(entry.0).iter().copied());
+                        continue;
+                    }
+                    let ids = ids_of(entry.0);
+                    if !ids.iter().any(|id| batch_ids.contains(id)) {
+                        continue;
+                    }
+                    if entry.3 {
+                        held = true;
+                    } else {
+                        entry.2 = true;
+                        batch_ids.extend(ids.iter().copied());
+                        grew = true;
                     }
                 }
-                loop {
-                    let mut grew = false;
-                    for entry in planned[first..=last].iter_mut() {
-                        if entry.2 {
-                            continue;
-                        }
-                        let ids = ids_of(entry.0);
-                        if !ids.iter().any(|id| batch_ids.contains(id)) {
-                            continue;
-                        }
-                        if entry.3 {
-                            held = true;
-                        } else {
-                            entry.2 = true;
-                            batch_ids.extend(ids.iter().copied());
-                            grew = true;
-                        }
-                    }
-                    if !grew {
-                        break;
-                    }
+                if !grew {
+                    break;
                 }
             }
         }

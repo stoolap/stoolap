@@ -26,8 +26,8 @@ fn seal_seqs(dir: &Path) -> Vec<u64> {
     let mgr = SegmentManager::load_from_disk("t", &dir.join("volumes"))
         .unwrap()
         .unwrap();
-    let seqs = mgr.manifest().segments.iter().map(|m| m.seal_seq).collect();
-    seqs
+
+    mgr.manifest().segments.iter().map(|m| m.seal_seq).collect()
 }
 
 #[test]

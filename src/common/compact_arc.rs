@@ -117,16 +117,20 @@ pub unsafe trait CompactArcDrop {
 unsafe impl<T> CompactArcDrop for T {
     #[inline]
     unsafe fn drop_and_dealloc(ptr: *mut u8) {
-        let data_offset = data_offset_for::<T>();
-        let align = mem::align_of::<T>().max(mem::align_of::<Header>());
+        // SAFETY: `ptr` is an exclusively owned CompactArc allocation, as the trait method's `# Safety` section requires.
+        unsafe {
+            let data_offset = data_offset_for::<T>();
+            let align = mem::align_of::<T>().max(mem::align_of::<Header>());
 
-        // Drop the data
-        let data_ptr = ptr.add(data_offset) as *mut T;
-        ptr::drop_in_place(data_ptr);
+            // Drop the data
+            let data_ptr = ptr.add(data_offset) as *mut T;
+            ptr::drop_in_place(data_ptr);
 
-        // Deallocate
-        let layout = Layout::from_size_align_unchecked(data_offset + mem::size_of::<T>(), align);
-        dealloc(ptr, layout);
+            // Deallocate
+            let layout =
+                Layout::from_size_align_unchecked(data_offset + mem::size_of::<T>(), align);
+            dealloc(ptr, layout);
+        }
     }
 }
 
@@ -135,12 +139,15 @@ unsafe impl<T> CompactArcDrop for T {
 unsafe impl CompactArcDrop for str {
     #[inline]
     unsafe fn drop_and_dealloc(ptr: *mut u8) {
-        let header = ptr as *mut Header;
-        let len = (*header).len;
-        let data_offset = data_offset_for::<u8>(); // str has align 1
-        let total_size = data_offset + len;
-        let layout = Layout::from_size_align_unchecked(total_size, mem::align_of::<Header>());
-        dealloc(ptr, layout);
+        // SAFETY: `ptr` is an exclusively owned CompactArc allocation, as the trait method's `# Safety` section requires.
+        unsafe {
+            let header = ptr as *mut Header;
+            let len = (*header).len;
+            let data_offset = data_offset_for::<u8>(); // str has align 1
+            let total_size = data_offset + len;
+            let layout = Layout::from_size_align_unchecked(total_size, mem::align_of::<Header>());
+            dealloc(ptr, layout);
+        }
     }
 }
 
@@ -150,19 +157,22 @@ unsafe impl CompactArcDrop for str {
 unsafe impl<T> CompactArcDrop for [T] {
     #[inline]
     unsafe fn drop_and_dealloc(ptr: *mut u8) {
-        let header = ptr as *mut Header;
-        let len = (*header).len;
-        let data_offset = data_offset_for::<T>();
-        let align = mem::align_of::<T>().max(mem::align_of::<Header>());
+        // SAFETY: `ptr` is an exclusively owned CompactArc allocation, as the trait method's `# Safety` section requires.
+        unsafe {
+            let header = ptr as *mut Header;
+            let len = (*header).len;
+            let data_offset = data_offset_for::<T>();
+            let align = mem::align_of::<T>().max(mem::align_of::<Header>());
 
-        // Drop elements
-        let data_ptr = ptr.add(data_offset) as *mut T;
-        ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(data_ptr, len));
+            // Drop elements
+            let data_ptr = ptr.add(data_offset) as *mut T;
+            ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(data_ptr, len));
 
-        // Deallocate
-        let layout =
-            Layout::from_size_align_unchecked(data_offset + mem::size_of::<T>() * len, align);
-        dealloc(ptr, layout);
+            // Deallocate
+            let layout =
+                Layout::from_size_align_unchecked(data_offset + mem::size_of::<T>() * len, align);
+            dealloc(ptr, layout);
+        }
     }
 }
 

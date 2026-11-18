@@ -240,10 +240,10 @@ impl<const P: usize> IdList<P> {
             IdList::Inline(list) => subtract(list, ids),
             IdList::Paged(paged) => paged.remove_sorted::<P>(ids),
         };
-        if let IdList::Paged(paged) = self {
-            if paged.len <= P / 2 {
-                *self = IdList::Inline(paged.take_one_page());
-            }
+        if let IdList::Paged(paged) = self
+            && paged.len <= P / 2
+        {
+            *self = IdList::Inline(paged.take_one_page());
         }
         removed
     }
@@ -443,12 +443,13 @@ impl Paged {
                 .range(..key)
                 .next_back()
                 .map(|(&k, page)| (k, page.len()));
-            if let Some((prev_key, prev_len)) = prev {
-                if (under(len) || under(prev_len)) && prev_len + len <= P {
-                    self.merge(prev_key, key);
-                    key = prev_key;
-                    continue;
-                }
+            if let Some((prev_key, prev_len)) = prev
+                && (under(len) || under(prev_len))
+                && prev_len + len <= P
+            {
+                self.merge(prev_key, key);
+                key = prev_key;
+                continue;
             }
             if let Some(next_key) = self.next_key(key) {
                 let next_len = len_of(&self.pages, next_key).unwrap_or(P);
@@ -559,7 +560,7 @@ impl<'a> GroupIds<'a> {
         }
     }
 
-    pub fn iter(&self) -> impl DoubleEndedIterator<Item = i64> + 'a {
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = i64> + 'a + use<'a> {
         self.pages().flat_map(|page| page.iter().copied())
     }
 }

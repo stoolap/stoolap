@@ -64,10 +64,8 @@ pub fn parse_sql_number(text: &str) -> Option<Value> {
     if at != bytes.len() {
         return None;
     }
-    if integral {
-        if let Ok(i) = text.parse::<i64>() {
-            return Some(Value::Integer(i));
-        }
+    if integral && let Ok(i) = text.parse::<i64>() {
+        return Some(Value::Integer(i));
     }
     let f: f64 = text.parse().ok()?;
     f.is_finite().then_some(Value::Float(f))

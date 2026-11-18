@@ -1906,10 +1906,11 @@ impl<'a, V: Clone, R: std::ops::RangeBounds<i64>> CowBTreeRangeChunkIter<'a, V, 
                     0
                 };
 
-                if let Bound::Excluded(&k) = self.range.start_bound() {
-                    if idx < keys.len() && keys[idx] == k {
-                        idx += 1;
-                    }
+                if let Bound::Excluded(&k) = self.range.start_bound()
+                    && idx < keys.len()
+                    && keys[idx] == k
+                {
+                    idx += 1;
                 }
 
                 self.current_leaf = Some(node);

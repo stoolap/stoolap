@@ -150,10 +150,10 @@ impl TextReads {
         while scanner.next() {
             deadline.charge(DeadlineSite::IndexProbe, 1)?;
             let row_id = scanner.current_row_id();
-            if let Some(Value::Text(text)) = scanner.row().get(column) {
-                if let Some(read) = reading.read(text).as_ref().and_then(reading_key) {
-                    by_read.entry(read).or_default().push(row_id);
-                }
+            if let Some(Value::Text(text)) = scanner.row().get(column)
+                && let Some(read) = reading.read(text).as_ref().and_then(reading_key)
+            {
+                by_read.entry(read).or_default().push(row_id);
             }
         }
         if let Some(error) = scanner.err() {

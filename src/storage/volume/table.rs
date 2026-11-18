@@ -1003,10 +1003,10 @@ impl SegmentedTable {
                     // even during the skip phase to get correct offset counting.
                     if where_expr.is_some() {
                         let row = reader.row(i, &cs.mapping)?;
-                        if let Some(expr) = where_expr {
-                            if !passes(expr, fallible, &row)? {
-                                continue;
-                            }
+                        if let Some(expr) = where_expr
+                            && !passes(expr, fallible, &row)?
+                        {
+                            continue;
                         }
                         // Skip without storing if still in offset range
                         if cold_skipped < cold_skip {
@@ -1577,18 +1577,18 @@ impl SegmentedTable {
                 return Ok(());
             }
         };
-        if shown.is_none() {
-            if let Some(dictionary) = vol.get_column_dictionary(phys)? {
-                for texts in dictionary.chunks(CHARGE_BEAT) {
-                    deadline.charge(DeadlineSite::StorageRead, texts.len())?;
-                    distinct.extend(texts.iter().map(|text| Value::Text(text.clone())));
-                }
-                let zone = vol.meta.zone_maps.get(phys);
-                if with_null && zone.is_some_and(|zone| zone.null_count > 0) {
-                    distinct.insert(Value::null(data_type));
-                }
-                return Ok(());
+        if shown.is_none()
+            && let Some(dictionary) = vol.get_column_dictionary(phys)?
+        {
+            for texts in dictionary.chunks(CHARGE_BEAT) {
+                deadline.charge(DeadlineSite::StorageRead, texts.len())?;
+                distinct.extend(texts.iter().map(|text| Value::Text(text.clone())));
             }
+            let zone = vol.meta.zone_maps.get(phys);
+            if with_null && zone.is_some_and(|zone| zone.null_count > 0) {
+                distinct.insert(Value::null(data_type));
+            }
+            return Ok(());
         }
         if let Some(def) = side {
             let column = (phys, data_type, with_null);
@@ -2771,10 +2771,10 @@ impl SegmentedTable {
                 .map(|(reader, mapping)| (reader, &*mapping))
                 .expect("reader just set");
             let row = reader.row(idx, mapping)?;
-            if let Some(expr) = where_expr {
-                if !passes(expr, fallible, &row)? {
-                    continue;
-                }
+            if let Some(expr) = where_expr
+                && !passes(expr, fallible, &row)?
+            {
+                continue;
             }
             self.prepare_cold_row(seg_id, row_id, row, setter, prep)?;
         }
@@ -2827,10 +2827,10 @@ impl SegmentedTable {
                 let row = reader.row(i, &mapping)?;
                 #[cfg(feature = "test-failpoints")]
                 crate::test_failpoints::cold_update_row_walked();
-                if let Some(expr) = where_expr {
-                    if !passes(expr, fallible, &row)? {
-                        continue;
-                    }
+                if let Some(expr) = where_expr
+                    && !passes(expr, fallible, &row)?
+                {
+                    continue;
                 }
                 self.prepare_cold_row(*seg_id, row_id, row, setter, prep)?;
             }
@@ -3041,24 +3041,21 @@ impl SegmentedTable {
         let schema = self.hot.schema();
 
         // 1. PK constraint: binary search on sorted INT column
-        if let Some(pk_idx) = schema.pk_column_index() {
-            if let Some(pk_value) = row.get(pk_idx) {
-                if !pk_value.is_null() {
-                    if let Some(row_id) = self
-                        .segment_mgr
-                        .check_value_exists_with_snapshot(snapshot, loads, pk_idx, pk_value)?
-                    {
-                        // check_value_exists_in_segments filters committed tombstones.
-                        // A row this txn deleted is no key conflict; the
-                        // row's unique keys are still checked below
-                        if !self
-                            .segment_mgr
-                            .is_pending_tombstone(self.pending(), row_id)
-                        {
-                            return Err(crate::core::Error::PrimaryKeyConstraint { row_id });
-                        }
-                    }
-                }
+        if let Some(pk_idx) = schema.pk_column_index()
+            && let Some(pk_value) = row.get(pk_idx)
+            && !pk_value.is_null()
+            && let Some(row_id) = self
+                .segment_mgr
+                .check_value_exists_with_snapshot(snapshot, loads, pk_idx, pk_value)?
+        {
+            // check_value_exists_in_segments filters committed tombstones.
+            // A row this txn deleted is no key conflict; the
+            // row's unique keys are still checked below
+            if !self
+                .segment_mgr
+                .is_pending_tombstone(self.pending(), row_id)
+            {
+                return Err(crate::core::Error::PrimaryKeyConstraint { row_id });
             }
         }
 
@@ -4149,10 +4146,10 @@ impl SegmentedTable {
                                 } else {
                                     Some(vol.columns.get(col_idx)?.binary_search_ge(target))
                                 };
-                                if let Some(idx) = idx {
-                                    if idx > start {
-                                        start = idx;
-                                    }
+                                if let Some(idx) = idx
+                                    && idx > start
+                                {
+                                    start = idx;
                                 }
                             }
                             crate::core::Operator::Gt => {
@@ -4161,10 +4158,10 @@ impl SegmentedTable {
                                 } else {
                                     Some(vol.columns.get(col_idx)?.binary_search_gt(target))
                                 };
-                                if let Some(idx) = idx {
-                                    if idx > start {
-                                        start = idx;
-                                    }
+                                if let Some(idx) = idx
+                                    && idx > start
+                                {
+                                    start = idx;
                                 }
                             }
                             crate::core::Operator::Lte => {
@@ -4173,10 +4170,10 @@ impl SegmentedTable {
                                 } else {
                                     Some(vol.columns.get(col_idx)?.binary_search_gt(target))
                                 };
-                                if let Some(idx) = idx {
-                                    if idx < end {
-                                        end = idx;
-                                    }
+                                if let Some(idx) = idx
+                                    && idx < end
+                                {
+                                    end = idx;
                                 }
                             }
                             crate::core::Operator::Lt => {
@@ -4185,10 +4182,10 @@ impl SegmentedTable {
                                 } else {
                                     Some(vol.columns.get(col_idx)?.binary_search_ge(target))
                                 };
-                                if let Some(idx) = idx {
-                                    if idx < end {
-                                        end = idx;
-                                    }
+                                if let Some(idx) = idx
+                                    && idx < end
+                                {
+                                    end = idx;
                                 }
                             }
                             _ => {}
@@ -4648,21 +4645,21 @@ impl SegmentedTable {
                     }
                     // Through the mapping: the volume may hold a dropped or
                     // renamed column under this name
-                    if let Some(col_idx) = cs.mapping.volume_column(vol, col_name) {
-                        if let Value::Text(s) = value {
-                            #[cfg(feature = "test-failpoints")]
-                            crate::test_failpoints::dictionary_searched();
-                            let dict_id = if let Some(st) = store {
-                                st.dict_lookup(col_idx, s.as_str())
-                            } else {
-                                vol.columns.get(col_idx)?.dict_lookup(s.as_str())
-                            };
-                            if let Some(id) = dict_id {
-                                dict_filters.push((col_idx, id));
-                            } else {
-                                start = end;
-                                break;
-                            }
+                    if let Some(col_idx) = cs.mapping.volume_column(vol, col_name)
+                        && let Value::Text(s) = value
+                    {
+                        #[cfg(feature = "test-failpoints")]
+                        crate::test_failpoints::dictionary_searched();
+                        let dict_id = if let Some(st) = store {
+                            st.dict_lookup(col_idx, s.as_str())
+                        } else {
+                            vol.columns.get(col_idx)?.dict_lookup(s.as_str())
+                        };
+                        if let Some(id) = dict_id {
+                            dict_filters.push((col_idx, id));
+                        } else {
+                            start = end;
+                            break;
                         }
                     }
                 }
@@ -4766,10 +4763,10 @@ impl SegmentedTable {
                     }
 
                     let row = reader.row(i, mapping)?;
-                    if let Some(expr) = where_expr {
-                        if !passes(expr, fallible, &row)? {
-                            continue;
-                        }
+                    if let Some(expr) = where_expr
+                        && !passes(expr, fallible, &row)?
+                    {
+                        continue;
                     }
                     vol_rows.push((row_id, row));
                 }
@@ -5271,27 +5268,30 @@ impl SegmentedTable {
         cached: &mut Option<(super::writer::RowReader, super::writer::ColumnMapping)>,
     ) -> Result<()> {
         for &row_id in row_ids {
-            if let Some(found) = self.find_segment_row(row_id, deadline)? {
-                let idx = found.idx;
-                if !cached
-                    .as_ref()
-                    .is_some_and(|(reader, _)| Arc::ptr_eq(reader.volume(), &found.volume))
-                {
-                    *cached = Some((
-                        super::writer::RowReader::new(Arc::clone(&found.volume)),
-                        found.mapping()?.clone(),
-                    ));
+            match self.find_segment_row(row_id, deadline)? {
+                Some(found) => {
+                    let idx = found.idx;
+                    if !cached
+                        .as_ref()
+                        .is_some_and(|(reader, _)| Arc::ptr_eq(reader.volume(), &found.volume))
+                    {
+                        *cached = Some((
+                            super::writer::RowReader::new(Arc::clone(&found.volume)),
+                            found.mapping()?.clone(),
+                        ));
+                    }
+                    let (reader, mapping) = cached
+                        .as_mut()
+                        .map(|(reader, mapping)| (reader, &*mapping))
+                        .expect("reader just set");
+                    let row = reader.row(idx, mapping)?;
+                    if passes(filter, fallible, &row)? {
+                        buffer.push((row_id, row));
+                    }
                 }
-                let (reader, mapping) = cached
-                    .as_mut()
-                    .map(|(reader, mapping)| (reader, &*mapping))
-                    .expect("reader just set");
-                let row = reader.row(idx, mapping)?;
-                if passes(filter, fallible, &row)? {
-                    buffer.push((row_id, row));
+                _ => {
+                    hot_ids.push(row_id);
                 }
-            } else {
-                hot_ids.push(row_id);
             }
         }
         Ok(())
@@ -5480,7 +5480,7 @@ impl SegmentedTable {
                 let val = col.get_value(i);
                 match overall_min {
                     None => *overall_min = Some(val),
-                    Some(ref current) => {
+                    &mut Some(ref current) => {
                         if let Ok(std::cmp::Ordering::Less) = val.compare(current) {
                             *overall_min = Some(val);
                         }
@@ -5521,7 +5521,7 @@ impl SegmentedTable {
                 let val = col.get_value(i);
                 match overall_max {
                     None => *overall_max = Some(val),
-                    Some(ref current) => {
+                    &mut Some(ref current) => {
                         if let Ok(std::cmp::Ordering::Greater) = val.compare(current) {
                             *overall_max = Some(val);
                         }
@@ -5956,25 +5956,28 @@ impl Table for SegmentedTable {
             let mut cached: Option<(super::writer::RowReader, super::writer::ColumnMapping)> = None;
 
             for &row_id in row_ids {
-                if let Some(found) = self.find_segment_row(row_id, Deadline::NONE)? {
-                    let idx = found.idx;
-                    if !cached
-                        .as_ref()
-                        .is_some_and(|(reader, _)| Arc::ptr_eq(reader.volume(), &found.volume))
-                    {
-                        cached = Some((
-                            super::writer::RowReader::new(Arc::clone(&found.volume)),
-                            found.mapping()?.clone(),
-                        ));
+                match self.find_segment_row(row_id, Deadline::NONE)? {
+                    Some(found) => {
+                        let idx = found.idx;
+                        if !cached
+                            .as_ref()
+                            .is_some_and(|(reader, _)| Arc::ptr_eq(reader.volume(), &found.volume))
+                        {
+                            cached = Some((
+                                super::writer::RowReader::new(Arc::clone(&found.volume)),
+                                found.mapping()?.clone(),
+                            ));
+                        }
+                        let (reader, mapping) = cached
+                            .as_mut()
+                            .map(|(reader, mapping)| (reader, &*mapping))
+                            .expect("reader just set");
+                        let row = reader.row(idx, mapping)?;
+                        result.push((row_id, row));
                     }
-                    let (reader, mapping) = cached
-                        .as_mut()
-                        .map(|(reader, mapping)| (reader, &*mapping))
-                        .expect("reader just set");
-                    let row = reader.row(idx, mapping)?;
-                    result.push((row_id, row));
-                } else {
-                    hot_ids.push(row_id);
+                    _ => {
+                        hot_ids.push(row_id);
+                    }
                 }
             }
             #[cfg(any(test, feature = "test-failpoints"))]
@@ -6230,10 +6233,10 @@ impl Table for SegmentedTable {
                         continue;
                     }
                     let row = reader.row(i, &cs.mapping)?;
-                    if let Some(expr) = where_expr {
-                        if !passes(expr, fallible, &row)? {
-                            continue;
-                        }
+                    if let Some(expr) = where_expr
+                        && !passes(expr, fallible, &row)?
+                    {
+                        continue;
                     }
                     if indexed {
                         served += 1;
@@ -6701,21 +6704,19 @@ impl Table for SegmentedTable {
                 };
 
                 // Zone-map pruning: skip this volume if its min cannot beat current best
-                if let Some(ref current_best) = overall_min {
-                    if let Some(pi) = phys {
-                        if pi < vol.meta.zone_maps.len() {
-                            let zm = &vol.meta.zone_maps[pi];
-                            if !zm.min.is_null() {
-                                if let Ok(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal) =
-                                    zm.min.compare(current_best)
-                                {
-                                    // Volume's min >= current best: no row in this volume
-                                    // can improve the result. If column is missing (phys=None)
-                                    // we still need to check default below.
-                                    continue;
-                                }
-                            }
-                        }
+                if let Some(ref current_best) = overall_min
+                    && let Some(pi) = phys
+                    && pi < vol.meta.zone_maps.len()
+                {
+                    let zm = &vol.meta.zone_maps[pi];
+                    if !zm.min.is_null()
+                        && let Ok(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal) =
+                            zm.min.compare(current_best)
+                    {
+                        // Volume's min >= current best: no row in this volume
+                        // can improve the result. If column is missing (phys=None)
+                        // we still need to check default below.
+                        continue;
                     }
                 }
 
@@ -7020,20 +7021,19 @@ impl Table for SegmentedTable {
                 };
 
                 // Zone-map pruning: skip this volume if its max cannot beat current best
-                if let Some(ref current_best) = overall_max {
-                    if let Some(pi) = phys {
-                        if pi < vol.meta.zone_maps.len() {
-                            let zm = &vol.meta.zone_maps[pi];
-                            // The zone map leaves NaN out, and a NaN would beat it
-                            if !zm.max.is_null() && vol.meta.nan_count(pi) == Some(0) {
-                                if let Ok(std::cmp::Ordering::Less | std::cmp::Ordering::Equal) =
-                                    zm.max.compare(current_best)
-                                {
-                                    // Volume's max <= current best: no row can improve result
-                                    continue;
-                                }
-                            }
-                        }
+                if let Some(ref current_best) = overall_max
+                    && let Some(pi) = phys
+                    && pi < vol.meta.zone_maps.len()
+                {
+                    let zm = &vol.meta.zone_maps[pi];
+                    // The zone map leaves NaN out, and a NaN would beat it
+                    if !zm.max.is_null()
+                        && vol.meta.nan_count(pi) == Some(0)
+                        && let Ok(std::cmp::Ordering::Less | std::cmp::Ordering::Equal) =
+                            zm.max.compare(current_best)
+                    {
+                        // Volume's max <= current best: no row can improve result
+                        continue;
                     }
                 }
 
@@ -7589,10 +7589,10 @@ impl Table for SegmentedTable {
                     let rid = vs.row_ids[idx];
 
                     // Visibility check: inter-volume dedup bitmap
-                    if let Some(ref bits) = vs.visible {
-                        if (bits[idx >> 6] >> (idx & 63)) & 1 == 0 {
-                            continue;
-                        }
+                    if let Some(ref bits) = vs.visible
+                        && (bits[idx >> 6] >> (idx & 63)) & 1 == 0
+                    {
+                        continue;
                     }
 
                     // Skip if hot shadows this row or if tombstoned
@@ -8100,10 +8100,10 @@ impl Table for SegmentedTable {
                 groups.sort_by(|a, b| keep.bound_order(a.2, b.2));
 
                 for (start, end, group_bound) in groups {
-                    if let Some(bound) = group_bound {
-                        if keep.cannot_improve(bound) {
-                            break;
-                        }
+                    if let Some(bound) = group_bound
+                        && keep.cannot_improve(bound)
+                    {
+                        break;
                     }
                     // In a sorted volume the rows come in key order: walk from the
                     // best end and stop at the first key the heap cannot use
@@ -8307,10 +8307,10 @@ impl Table for SegmentedTable {
         crate::test_failpoints::join_probe_admitted();
         // A key the directories already refuse is found before any key's
         // pages are read
-        if let Some(view) = view.as_ref().filter(|_| keys.len() > 1) {
-            if !self.cold_keys_admitted(view, column, keys, &scratch.defs, &mut scratch.key)? {
-                return Ok(None);
-            }
+        if let Some(view) = view.as_ref().filter(|_| keys.len() > 1)
+            && !self.cold_keys_admitted(view, column, keys, &scratch.defs, &mut scratch.key)?
+        {
+            return Ok(None);
         }
         for key in keys.iter().filter(|key| !key.is_null()) {
             if let Some(view) = &view {
@@ -8529,13 +8529,10 @@ impl Table for SegmentedTable {
             // regular path answers
             self.check_cold().ok()?;
             match (hot_min, vol_min) {
-                (Some(h), Some(v)) => {
-                    if let Ok(std::cmp::Ordering::Less) = v.compare(&h) {
-                        Some(v)
-                    } else {
-                        Some(h)
-                    }
-                }
+                (Some(h), Some(v)) => match v.compare(&h) {
+                    Ok(std::cmp::Ordering::Less) => Some(v),
+                    _ => Some(h),
+                },
                 (Some(h), None) => Some(h),
                 (None, Some(v)) => Some(v),
                 (None, None) => None,
@@ -8593,13 +8590,10 @@ impl Table for SegmentedTable {
             // regular path answers
             self.check_cold().ok()?;
             match (hot_max, vol_max) {
-                (Some(h), Some(v)) => {
-                    if let Ok(std::cmp::Ordering::Greater) = v.compare(&h) {
-                        Some(v)
-                    } else {
-                        Some(h)
-                    }
-                }
+                (Some(h), Some(v)) => match v.compare(&h) {
+                    Ok(std::cmp::Ordering::Greater) => Some(v),
+                    _ => Some(h),
+                },
                 (Some(h), None) => Some(h),
                 (None, Some(v)) => Some(v),
                 (None, None) => None,
@@ -8938,7 +8932,7 @@ impl Table for SegmentedTable {
                         }
                         match &mapping.sources[pred.schema_col_idx] {
                             super::writer::ColSource::Volume(phys_idx) => {
-                                let dict_id = if let (TypedTarget::DictEq(ref s), None) =
+                                let dict_id = if let (TypedTarget::DictEq(s), None) =
                                     (&pred.target, &walk)
                                 {
                                     match vol.get_column_dictionary(*phys_idx)? {
@@ -10079,14 +10073,14 @@ mod tests {
         fn max_column(&self, col_idx: usize, _: Deadline) -> Result<Option<Option<Value>>> {
             let mut max: Option<Value> = None;
             for (_, row) in &self.rows {
-                if let Some(val) = row.get(col_idx) {
-                    if !val.is_null() {
-                        match &max {
-                            None => max = Some(val.clone()),
-                            Some(current) => {
-                                if let Ok(std::cmp::Ordering::Greater) = val.compare(current) {
-                                    max = Some(val.clone());
-                                }
+                if let Some(val) = row.get(col_idx)
+                    && !val.is_null()
+                {
+                    match &max {
+                        None => max = Some(val.clone()),
+                        Some(current) => {
+                            if let Ok(std::cmp::Ordering::Greater) = val.compare(current) {
+                                max = Some(val.clone());
                             }
                         }
                     }

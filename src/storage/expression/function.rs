@@ -240,14 +240,13 @@ impl Expression for FunctionExpr {
     fn evaluate(&self, row: &Row) -> Result<bool> {
         // Fast path for single-argument column functions (most common case)
         // This avoids function call overhead and directly extracts from row
-        if self.arguments.len() == 1 {
-            if let FunctionArg::Column(_) = &self.arguments[0] {
-                if let Some(idx) = self.arg_indices.first().copied().flatten() {
-                    let value = row.get(idx).unwrap_or(&NULL_VALUE);
-                    let result = self.function.evaluate(std::slice::from_ref(value))?;
-                    return Ok(self.compare(&result, &self.compare_value));
-                }
-            }
+        if self.arguments.len() == 1
+            && let FunctionArg::Column(_) = &self.arguments[0]
+            && let Some(idx) = self.arg_indices.first().copied().flatten()
+        {
+            let value = row.get(idx).unwrap_or(&NULL_VALUE);
+            let result = self.function.evaluate(std::slice::from_ref(value))?;
+            return Ok(self.compare(&result, &self.compare_value));
         }
 
         // Use thread-local buffer for multi-arg functions

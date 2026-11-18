@@ -907,15 +907,18 @@ impl Parser<'_> {
             self.next_token(); // consume IN
             self.next_token(); // move to string expression
 
-            if let Some(string_arg) = self.parse_expression(Precedence::Lowest) {
-                // For POSITION(x IN y), the result is POSITION(x, y) = position of x in y
-                call.arguments.push(string_arg);
-            } else {
-                self.add_error(format!(
-                    "expected expression after IN in POSITION at {}",
-                    self.cur_token.position
-                ));
-                return None;
+            match self.parse_expression(Precedence::Lowest) {
+                Some(string_arg) => {
+                    // For POSITION(x IN y), the result is POSITION(x, y) = position of x in y
+                    call.arguments.push(string_arg);
+                }
+                _ => {
+                    self.add_error(format!(
+                        "expected expression after IN in POSITION at {}",
+                        self.cur_token.position
+                    ));
+                    return None;
+                }
             }
         }
 
@@ -924,14 +927,17 @@ impl Parser<'_> {
             self.next_token(); // consume comma
             self.next_token(); // move to next arg
 
-            if let Some(arg) = self.parse_expression(Precedence::Lowest) {
-                call.arguments.push(arg);
-            } else {
-                self.add_error(format!(
-                    "expected expression after ',' at {}",
-                    self.cur_token.position
-                ));
-                return None;
+            match self.parse_expression(Precedence::Lowest) {
+                Some(arg) => {
+                    call.arguments.push(arg);
+                }
+                _ => {
+                    self.add_error(format!(
+                        "expected expression after ',' at {}",
+                        self.cur_token.position
+                    ));
+                    return None;
+                }
             }
         }
 

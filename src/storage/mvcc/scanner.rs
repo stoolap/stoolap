@@ -244,11 +244,12 @@ impl HotScanner {
         self.finished = !more;
         self.step = (self.step * 2).min(MAX_STEP_ROWS);
         let columns = self.schema.columns.len();
-        if let Some((_, first)) = self.rows.first() {
-            if self.filter.is_none() && *self.normalize.get_or_insert(first.len() != columns) {
-                for (_, row) in self.rows.iter_mut() {
-                    *row = normalize_row_to_schema(std::mem::take(row), &self.schema);
-                }
+        if let Some((_, first)) = self.rows.first()
+            && self.filter.is_none()
+            && *self.normalize.get_or_insert(first.len() != columns)
+        {
+            for (_, row) in self.rows.iter_mut() {
+                *row = normalize_row_to_schema(std::mem::take(row), &self.schema);
             }
         }
         if !self.projection.is_empty() {
