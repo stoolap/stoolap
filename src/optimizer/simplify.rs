@@ -433,12 +433,11 @@ impl ExpressionSimplifier {
             Expression::BooleanLiteral(b) => !b.value,
             Expression::Infix(infix) => {
                 // 1 = 2 is always false
-                if infix.op_type == InfixOperator::Equal {
-                    if let (Expression::IntegerLiteral(l), Expression::IntegerLiteral(r)) =
+                if infix.op_type == InfixOperator::Equal
+                    && let (Expression::IntegerLiteral(l), Expression::IntegerLiteral(r)) =
                         (infix.left.as_ref(), infix.right.as_ref())
-                    {
-                        return l.value != r.value;
-                    }
+                {
+                    return l.value != r.value;
                 }
                 false
             }

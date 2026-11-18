@@ -25,10 +25,9 @@ use stoolap::Database;
 /// Helper to get a single value from a query as string
 fn query_one(db: &Database, sql: &str) -> String {
     let mut rows = db.query(sql, ()).unwrap();
-    if let Some(Ok(row)) = rows.next() {
-        row.get::<String>(0).unwrap_or_default()
-    } else {
-        "NO ROWS".to_string()
+    match rows.next() {
+        Some(Ok(row)) => row.get::<String>(0).unwrap_or_default(),
+        _ => "NO ROWS".to_string(),
     }
 }
 

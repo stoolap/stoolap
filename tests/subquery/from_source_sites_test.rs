@@ -667,11 +667,11 @@ fn a_write_reading_a_source() {
                 for source in sources.iter().filter(|s| s.whole || !template.whole) {
                     let sql = fill(template, *source);
                     let got = run(sealed, &sql);
-                    if let Err(e) = &got {
-                        if e.starts_with("failed but wrote") {
-                            wrong.push(format!("{}/{}: {sql}: {e}", source.label, template.name));
-                            continue;
-                        }
+                    if let Err(e) = &got
+                        && e.starts_with("failed but wrote")
+                    {
+                        wrong.push(format!("{}/{}: {sql}: {e}", source.label, template.name));
+                        continue;
                     }
                     judge(
                         format!("{}/{} sealed {sealed}: {sql}", source.label, template.name),

@@ -246,10 +246,13 @@ impl Parser<'_> {
             || self.peek_token_is_keyword(Keyword::Intersect)
             || self.peek_token_is_keyword(Keyword::Except)
         {
-            if let Some(set_op) = self.parse_set_operation() {
-                stmt.set_operations.push(set_op);
-            } else {
-                break;
+            match self.parse_set_operation() {
+                Some(set_op) => {
+                    stmt.set_operations.push(set_op);
+                }
+                _ => {
+                    break;
+                }
             }
         }
 
@@ -367,10 +370,13 @@ impl Parser<'_> {
         // operations that follow, because INTERSECT has higher precedence
         if binds_looser {
             while self.peek_token_is_keyword(Keyword::Intersect) {
-                if let Some(set_op) = self.parse_set_operation() {
-                    right.set_operations.push(set_op);
-                } else {
-                    break;
+                match self.parse_set_operation() {
+                    Some(set_op) => {
+                        right.set_operations.push(set_op);
+                    }
+                    _ => {
+                        break;
+                    }
                 }
             }
         }
@@ -1245,10 +1251,13 @@ impl Parser<'_> {
             }
 
             self.next_token();
-            if let Some(expr) = self.parse_expression(Precedence::Lowest) {
-                update_expressions.push(expr);
-            } else {
-                return (update_columns, update_expressions);
+            match self.parse_expression(Precedence::Lowest) {
+                Some(expr) => {
+                    update_expressions.push(expr);
+                }
+                _ => {
+                    return (update_columns, update_expressions);
+                }
             }
 
             if !self.peek_token_is_punctuator(",") {
@@ -1480,14 +1489,17 @@ impl Parser<'_> {
             while self.peek_token_is_punctuator(",") {
                 self.next_token(); // consume ','
                 self.next_token(); // move to next arg
-                if let Some(arg) = self.parse_expression(Precedence::Lowest) {
-                    arguments.push(arg);
-                } else {
-                    self.add_error(format!(
-                        "expected expression after ',' at {}",
-                        self.cur_token.position
-                    ));
-                    return None;
+                match self.parse_expression(Precedence::Lowest) {
+                    Some(arg) => {
+                        arguments.push(arg);
+                    }
+                    _ => {
+                        self.add_error(format!(
+                            "expected expression after ',' at {}",
+                            self.cur_token.position
+                        ));
+                        return None;
+                    }
                 }
             }
         }

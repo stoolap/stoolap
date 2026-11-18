@@ -243,12 +243,12 @@ impl TxnStatusTable {
     /// Stores `slot` for `txn_id` when a segment holds its run; false when none does
     fn set(&self, txn_id: i64, slot: i64) -> bool {
         let run = Self::run_of(txn_id);
-        if let Some(segment) = self.segment_at(run, Ordering::Relaxed) {
-            if segment.run.load(Ordering::Relaxed) == run {
-                segment.slots[txn_id as usize & (STATUS_SEGMENT_LEN - 1)]
-                    .store(slot, Ordering::Release);
-                return true;
-            }
+        if let Some(segment) = self.segment_at(run, Ordering::Relaxed)
+            && segment.run.load(Ordering::Relaxed) == run
+        {
+            segment.slots[txn_id as usize & (STATUS_SEGMENT_LEN - 1)]
+                .store(slot, Ordering::Release);
+            return true;
         }
         false
     }
@@ -815,10 +815,10 @@ impl TransactionRegistry {
     /// Gets the isolation level for a specific transaction.
     #[inline(always)]
     pub fn get_isolation_level(&self, txn_id: i64) -> IsolationLevel {
-        if self.override_count.load(Ordering::Relaxed) > 0 {
-            if let Some(&level) = self.isolation_overrides.lock().get(txn_id) {
-                return Self::u8_to_isolation(level);
-            }
+        if self.override_count.load(Ordering::Relaxed) > 0
+            && let Some(&level) = self.isolation_overrides.lock().get(txn_id)
+        {
+            return Self::u8_to_isolation(level);
         }
         self.get_global_isolation_level()
     }
@@ -830,10 +830,10 @@ impl TransactionRegistry {
         if global == 1 {
             return true;
         }
-        if self.override_count.load(Ordering::Relaxed) > 0 {
-            if let Some(&level) = self.isolation_overrides.lock().get(txn_id) {
-                return level == 1;
-            }
+        if self.override_count.load(Ordering::Relaxed) > 0
+            && let Some(&level) = self.isolation_overrides.lock().get(txn_id)
+        {
+            return level == 1;
         }
         false
     }
@@ -1267,10 +1267,10 @@ impl TransactionRegistry {
         }
 
         // Check if still active/aborted
-        if let Some(state) = self.transactions.lock().get(txn_id) {
-            if state.is_aborted() || state.is_active_or_committing() {
-                return None;
-            }
+        if let Some(state) = self.transactions.lock().get(txn_id)
+            && (state.is_aborted() || state.is_active_or_committing())
+        {
+            return None;
         }
 
         // Valid committed transaction (GC'd from snapshot_seqs)
@@ -1372,10 +1372,10 @@ impl TransactionRegistry {
         cut: HistoricalCut,
     ) -> crate::core::Result<ReadPoint> {
         // History events log as transaction 0; no transaction has an id below 1
-        if txn_id > 0 {
-            if let Some(point) = self.commit_log.point_of_transaction(txn_id, cut)? {
-                return Ok(point);
-            }
+        if txn_id > 0
+            && let Some(point) = self.commit_log.point_of_transaction(txn_id, cut)?
+        {
+            return Ok(point);
         }
         let why = match self.transactions.lock().get(txn_id).map(|e| e.status()) {
             Some(TxnStatus::Aborted) => "was rolled back",

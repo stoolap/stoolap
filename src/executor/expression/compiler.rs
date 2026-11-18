@@ -338,10 +338,10 @@ impl<'a> CompileContext<'a> {
         }
 
         // Try second row if available (Row2)
-        if let Some(ref cols2) = self.columns2 {
-            if let Some(&idx) = cols2.get(&lower) {
-                return Some(ColumnSource::Row2(idx));
-            }
+        if let Some(ref cols2) = self.columns2
+            && let Some(&idx) = cols2.get(&lower)
+        {
+            return Some(ColumnSource::Row2(idx));
         }
 
         None
@@ -576,11 +576,12 @@ impl<'a> ExprCompiler<'a> {
         // This optimizes deterministic expressions like ABS(-5) + 1 or UPPER('text').
         // Non-deterministic functions (NOW, RANDOM, etc.) are excluded by is_foldable_expr
         // and handled separately by pushdown's try_eval_constant_expr at query time.
-        if !self.folding.get() && is_foldable_expr(expr, self.ctx) {
-            if let Some(value) = self.try_fold_constant(expr) {
-                builder.emit(Op::LoadConst(value));
-                return Ok(());
-            }
+        if !self.folding.get()
+            && is_foldable_expr(expr, self.ctx)
+            && let Some(value) = self.try_fold_constant(expr)
+        {
+            builder.emit(Op::LoadConst(value));
+            return Ok(());
         }
 
         match expr {
@@ -961,15 +962,16 @@ impl<'a> ExprCompiler<'a> {
                 }
             }
 
-            InfixOperator::Multiply => {
-                if let Some(operand) = Self::interval_product(infix)? {
+            InfixOperator::Multiply => match Self::interval_product(infix)? {
+                Some(operand) => {
                     self.compile_interval(&operand, builder)?;
-                } else {
+                }
+                _ => {
                     self.compile_expr(&infix.left, builder)?;
                     self.compile_expr(&infix.right, builder)?;
                     builder.emit(Op::Mul);
                 }
-            }
+            },
 
             InfixOperator::Divide | InfixOperator::Modulo => {
                 if Self::interval_operand(&infix.left)?.is_some()
@@ -1471,29 +1473,35 @@ impl<'a> ExprCompiler<'a> {
         match &*in_expr.right {
             Expression::List(list) => {
                 for item in &list.elements {
-                    if let Some(value) = constant(item) {
-                        if value.is_null() {
-                            has_null = true;
-                        } else {
-                            values.insert(value);
+                    match constant(item) {
+                        Some(value) => {
+                            if value.is_null() {
+                                has_null = true;
+                            } else {
+                                values.insert(value);
+                            }
                         }
-                    } else {
-                        all_constant = false;
-                        break;
+                        _ => {
+                            all_constant = false;
+                            break;
+                        }
                     }
                 }
             }
             Expression::ExpressionList(list) => {
                 for item in &list.expressions {
-                    if let Some(value) = constant(item) {
-                        if value.is_null() {
-                            has_null = true;
-                        } else {
-                            values.insert(value);
+                    match constant(item) {
+                        Some(value) => {
+                            if value.is_null() {
+                                has_null = true;
+                            } else {
+                                values.insert(value);
+                            }
                         }
-                    } else {
-                        all_constant = false;
-                        break;
+                        _ => {
+                            all_constant = false;
+                            break;
+                        }
                     }
                 }
             }
@@ -1904,36 +1912,41 @@ impl<'a> ExprCompiler<'a> {
         }
 
         // Get function from registry
-        if let Some(scalar_func) = self.ctx.functions.get_scalar(&func_name) {
-            // Compile arguments
-            for arg in &func.arguments {
-                match scalar_func.reads_vectors() {
-                    true => self.compile_vector_operand(arg, builder)?,
-                    false => self.compile_expr(arg, builder)?,
+        match self.ctx.functions.get_scalar(&func_name) {
+            Some(scalar_func) => {
+                // Compile arguments
+                for arg in &func.arguments {
+                    match scalar_func.reads_vectors() {
+                        true => self.compile_vector_operand(arg, builder)?,
+                        false => self.compile_expr(arg, builder)?,
+                    }
                 }
-            }
 
-            // Try native function pointer for single-arg functions (no dynamic dispatch)
-            if func.arguments.len() == 1 {
-                if let Some(native_fn) = scalar_func.native_fn1() {
+                // Try native function pointer for single-arg functions (no dynamic dispatch)
+                if func.arguments.len() == 1
+                    && let Some(native_fn) = scalar_func.native_fn1()
+                {
                     builder.emit(Op::NativeFn1(native_fn));
                     return Ok(());
                 }
-            }
 
-            // Fallback to dynamic dispatch
-            builder.emit(Op::CallScalar {
-                func: scalar_func.into(),
-                arg_count: func.arguments.len() as u8,
-            });
-            Ok(())
-        } else if self.ctx.functions.is_aggregate(&func_name) {
-            // An aggregate the grouping did not take reads no group here
-            Err(CompileError::InvalidExpression(format!(
+                // Fallback to dynamic dispatch
+                builder.emit(Op::CallScalar {
+                    func: scalar_func.into(),
+                    arg_count: func.arguments.len() as u8,
+                });
+                Ok(())
+            }
+            _ => {
+                if self.ctx.functions.is_aggregate(&func_name) {
+                    // An aggregate the grouping did not take reads no group here
+                    Err(CompileError::InvalidExpression(format!(
                 "aggregate function {func_name} is not allowed where the rows are not grouped"
             )))
-        } else {
-            Err(CompileError::FunctionNotFound(func_name.to_string()))
+                } else {
+                    Err(CompileError::FunctionNotFound(func_name.to_string()))
+                }
+            }
         }
     }
 

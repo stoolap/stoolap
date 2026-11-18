@@ -406,8 +406,8 @@ impl Executor {
         for col_def in &stmt.columns {
             for constraint in &col_def.constraints {
                 if let ColumnConstraint::References {
-                    table: ref ref_table,
-                    column: ref ref_col,
+                    table: ref_table,
+                    column: ref_col,
                     on_delete,
                     on_update,
                 } = constraint
@@ -894,19 +894,17 @@ impl Executor {
         // the WAL persists the exact values used at runtime. This covers both the
         // no-WITH path (all params auto-tuned from dims) and partial-WITH paths
         // (e.g., WITH(metric='cosine') where ef_* are still auto-tuned).
-        if index_type == crate::core::IndexType::Hnsw {
-            if let Some(idx) = table.get_index(index_name) {
-                if let Some(hnsw) = idx
-                    .as_any()
-                    .downcast_ref::<crate::storage::index::HnswIndex>()
-                {
-                    let (m, efc, efs, met) = hnsw.params();
-                    hnsw_m = Some(m as u16);
-                    hnsw_ef_construction = Some(efc as u16);
-                    hnsw_ef_search = Some(efs as u16);
-                    hnsw_distance_metric = Some(met as u8);
-                }
-            }
+        if index_type == crate::core::IndexType::Hnsw
+            && let Some(idx) = table.get_index(index_name)
+            && let Some(hnsw) = idx
+                .as_any()
+                .downcast_ref::<crate::storage::index::HnswIndex>()
+        {
+            let (m, efc, efs, met) = hnsw.params();
+            hnsw_m = Some(m as u16);
+            hnsw_ef_construction = Some(efc as u16);
+            hnsw_ef_search = Some(efs as u16);
+            hnsw_distance_metric = Some(met as u8);
         }
 
         // Record index creation to WAL for persistence.

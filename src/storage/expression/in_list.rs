@@ -315,10 +315,10 @@ impl InListExpr {
                         if crate::core::value::i64_eq_f64(val, *f) {
                             return true;
                         }
-                    } else if let Some(list_val) = v.as_int64() {
-                        if val == list_val {
-                            return true;
-                        }
+                    } else if let Some(list_val) = v.as_int64()
+                        && val == list_val
+                    {
+                        return true;
                     }
                 }
                 false
@@ -343,10 +343,10 @@ impl InListExpr {
                     }
                 }
                 _ => {
-                    if let Some(list_val) = v.as_float64() {
-                        if crate::core::value::f64_eq(val, list_val) {
-                            return true;
-                        }
+                    if let Some(list_val) = v.as_float64()
+                        && crate::core::value::f64_eq(val, list_val)
+                    {
+                        return true;
                     }
                 }
             }
@@ -362,10 +362,10 @@ impl InListExpr {
             _ => {
                 // Fallback to linear search
                 for v in &self.values {
-                    if let Some(list_val) = v.as_string() {
-                        if val == list_val {
-                            return true;
-                        }
+                    if let Some(list_val) = v.as_string()
+                        && val == list_val
+                    {
+                        return true;
                     }
                 }
                 false

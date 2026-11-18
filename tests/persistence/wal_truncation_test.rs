@@ -41,10 +41,11 @@ fn wal_dir_total_size(db_path: &Path) -> u64 {
     if let Ok(entries) = fs::read_dir(&wal_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if (name.starts_with("wal-") || name.starts_with("wal_")) && name.ends_with(".log") {
-                if let Ok(meta) = entry.metadata() {
-                    total += meta.len();
-                }
+            if (name.starts_with("wal-") || name.starts_with("wal_"))
+                && name.ends_with(".log")
+                && let Ok(meta) = entry.metadata()
+            {
+                total += meta.len();
             }
         }
     }

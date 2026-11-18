@@ -180,10 +180,10 @@ impl QueryPlanner {
         let table_name = table.name();
 
         // Try to get analyzed stats first
-        if let Some(stats) = self.get_table_stats(table_name) {
-            if stats.row_count > 0 {
-                return stats;
-            }
+        if let Some(stats) = self.get_table_stats(table_name)
+            && stats.row_count > 0
+        {
+            return stats;
         }
 
         // Fallback: compute basic stats from table (use hint for O(1))
@@ -321,15 +321,15 @@ impl QueryPlanner {
         while result.next() {
             let row = result.row();
             // Check if this row is for our table (table_name is column 1)
-            if let Some(Value::Text(name)) = row.get(1) {
-                if eq_names(name, table_name) {
-                    return Ok(TableStats {
-                        table_name: table_name.to_string(),
-                        row_count: row.get(2).and_then(|v| v.as_int64()).unwrap_or(0) as u64,
-                        page_count: row.get(3).and_then(|v| v.as_int64()).unwrap_or(1) as u64,
-                        avg_row_size: row.get(4).and_then(|v| v.as_int64()).unwrap_or(100) as u64,
-                    });
-                }
+            if let Some(Value::Text(name)) = row.get(1)
+                && eq_names(name, table_name)
+            {
+                return Ok(TableStats {
+                    table_name: table_name.to_string(),
+                    row_count: row.get(2).and_then(|v| v.as_int64()).unwrap_or(0) as u64,
+                    page_count: row.get(3).and_then(|v| v.as_int64()).unwrap_or(1) as u64,
+                    avg_row_size: row.get(4).and_then(|v| v.as_int64()).unwrap_or(100) as u64,
+                });
             }
         }
 
@@ -359,30 +359,28 @@ impl QueryPlanner {
         while result.next() {
             let row = result.row();
             // Check if this row is for our table (table_name is column 1)
-            if let Some(Value::Text(name)) = row.get(1) {
-                if eq_names(name, table_name) {
-                    if let Some(Value::Text(col_name)) = row.get(2) {
-                        // Parse histogram from JSON string if available
-                        let histogram = row
-                            .get(8)
-                            .and_then(|v| match v {
-                                Value::Text(s) => Some(s.to_string()),
-                                _ => None,
-                            })
-                            .and_then(|s| Histogram::from_json(&s));
+            if let Some(Value::Text(name)) = row.get(1)
+                && eq_names(name, table_name)
+                && let Some(Value::Text(col_name)) = row.get(2)
+            {
+                // Parse histogram from JSON string if available
+                let histogram = row
+                    .get(8)
+                    .and_then(|v| match v {
+                        Value::Text(s) => Some(s.to_string()),
+                        _ => None,
+                    })
+                    .and_then(|s| Histogram::from_json(&s));
 
-                        let col_stats = ColumnStatsCache {
-                            null_count: row.get(3).and_then(|v| v.as_int64()).unwrap_or(0) as u64,
-                            distinct_count: row.get(4).and_then(|v| v.as_int64()).unwrap_or(0)
-                                as u64,
-                            min_value: row.get(5).cloned(),
-                            max_value: row.get(6).cloned(),
-                            avg_width: row.get(7).and_then(|v| v.as_int64()).unwrap_or(8) as usize,
-                            histogram,
-                        };
-                        stats.insert(col_name.to_lowercase().to_string(), col_stats);
-                    }
-                }
+                let col_stats = ColumnStatsCache {
+                    null_count: row.get(3).and_then(|v| v.as_int64()).unwrap_or(0) as u64,
+                    distinct_count: row.get(4).and_then(|v| v.as_int64()).unwrap_or(0) as u64,
+                    min_value: row.get(5).cloned(),
+                    max_value: row.get(6).cloned(),
+                    avg_width: row.get(7).and_then(|v| v.as_int64()).unwrap_or(8) as usize,
+                    histogram,
+                };
+                stats.insert(col_name.to_lowercase().to_string(), col_stats);
             }
         }
 

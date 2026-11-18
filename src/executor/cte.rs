@@ -795,17 +795,17 @@ impl Executor {
     /// Check if a query references a specific CTE by name
     fn query_references_cte(&self, stmt: &SelectStatement, cte_name: &str) -> bool {
         // Check table expression
-        if let Some(ref table_expr) = stmt.table_expr {
-            if self.expr_references_cte(table_expr, cte_name) {
-                return true;
-            }
+        if let Some(ref table_expr) = stmt.table_expr
+            && self.expr_references_cte(table_expr, cte_name)
+        {
+            return true;
         }
 
         // Check WHERE clause
-        if let Some(ref where_clause) = stmt.where_clause {
-            if self.expr_references_cte(where_clause, cte_name) {
-                return true;
-            }
+        if let Some(ref where_clause) = stmt.where_clause
+            && self.expr_references_cte(where_clause, cte_name)
+        {
+            return true;
         }
 
         false
@@ -1085,17 +1085,17 @@ impl Executor {
             }
             Expression::SubquerySource(sq) => {
                 // Only recurse if there's a table_expr
-                if let Some(ref table_expr) = sq.subquery.table_expr {
-                    if let Some(inlined) = self.try_inline_cte_references(table_expr, cte_defs) {
-                        let mut new_subquery = (*sq.subquery).clone();
-                        new_subquery.table_expr = Some(Box::new(inlined));
-                        return Some(Expression::SubquerySource(Box::new(SubqueryTableSource {
-                            token: sq.token.clone(),
-                            subquery: Box::new(new_subquery),
-                            alias: sq.alias.clone(),
-                            keeps_names: sq.keeps_names,
-                        })));
-                    }
+                if let Some(ref table_expr) = sq.subquery.table_expr
+                    && let Some(inlined) = self.try_inline_cte_references(table_expr, cte_defs)
+                {
+                    let mut new_subquery = (*sq.subquery).clone();
+                    new_subquery.table_expr = Some(Box::new(inlined));
+                    return Some(Expression::SubquerySource(Box::new(SubqueryTableSource {
+                        token: sq.token.clone(),
+                        subquery: Box::new(new_subquery),
+                        alias: sq.alias.clone(),
+                        keeps_names: sq.keeps_names,
+                    })));
                 }
                 None
             }
@@ -1495,18 +1495,18 @@ mod tests {
 
         // With CTE
         let mut parser = crate::parser::Parser::new("WITH x AS (SELECT 1) SELECT * FROM x");
-        if let Ok(program) = parser.parse_program() {
-            if let Statement::Select(stmt) = &program.statements[0] {
-                assert!(executor.has_cte(stmt));
-            }
+        if let Ok(program) = parser.parse_program()
+            && let Statement::Select(stmt) = &program.statements[0]
+        {
+            assert!(executor.has_cte(stmt));
         }
 
         // Without CTE
         let mut parser2 = crate::parser::Parser::new("SELECT * FROM test");
-        if let Ok(program) = parser2.parse_program() {
-            if let Statement::Select(stmt) = &program.statements[0] {
-                assert!(!executor.has_cte(stmt));
-            }
+        if let Ok(program) = parser2.parse_program()
+            && let Statement::Select(stmt) = &program.statements[0]
+        {
+            assert!(!executor.has_cte(stmt));
         }
     }
 }

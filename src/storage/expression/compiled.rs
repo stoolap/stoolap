@@ -291,10 +291,10 @@ impl CompiledFilter {
             return Self::compile_or(or_expr, schema);
         }
 
-        if let Some(not_expr) = expr.as_any().downcast_ref::<NotExpr>() {
-            if let Some(inner) = not_expr.get_inner() {
-                return CompiledFilter::Not(Box::new(Self::compile(inner, schema)));
-            }
+        if let Some(not_expr) = expr.as_any().downcast_ref::<NotExpr>()
+            && let Some(inner) = not_expr.get_inner()
+        {
+            return CompiledFilter::Not(Box::new(Self::compile(inner, schema)));
         }
 
         if let Some(null_check) = expr.as_any().downcast_ref::<NullCheckExpr>() {

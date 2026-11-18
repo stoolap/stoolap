@@ -302,16 +302,17 @@ fn test_get_visible_versions_batch_arena_preference() {
             (),
         );
         match result {
-            Ok(mut rows) => {
-                if let Some(row_result) = rows.next() {
+            Ok(mut rows) => match rows.next() {
+                Some(row_result) => {
                     if let Ok(row) = row_result {
                         let val: i64 = row.get(0).unwrap_or(-1);
                         eprintln!("DEBUG: AS OF TRANSACTION {} returns val = {}", txn_id, val);
                     }
-                } else {
+                }
+                _ => {
                     eprintln!("DEBUG: AS OF TRANSACTION {} returns no rows", txn_id);
                 }
-            }
+            },
             Err(e) => {
                 eprintln!("DEBUG: AS OF TRANSACTION {} error: {}", txn_id, e);
             }
@@ -334,16 +335,17 @@ fn test_get_visible_versions_batch_arena_preference() {
             (),
         );
         match result {
-            Ok(mut rows) => {
-                if let Some(row_result) = rows.next() {
+            Ok(mut rows) => match rows.next() {
+                Some(row_result) => {
                     if let Ok(row) = row_result {
                         let val: i64 = row.get(0).unwrap_or(-1);
                         eprintln!("DEBUG: AS OF TRANSACTION {} returns val = {}", txn_id, val);
                     }
-                } else {
+                }
+                _ => {
                     eprintln!("DEBUG: AS OF TRANSACTION {} returns no rows", txn_id);
                 }
-            }
+            },
             Err(e) => {
                 eprintln!("DEBUG: AS OF TRANSACTION {} error: {}", txn_id, e);
             }

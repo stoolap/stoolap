@@ -448,16 +448,22 @@ mod tests {
             Value::Float(0.0)
         );
         // Row 1: (2-1)/(4-1) = 1/3 ≈ 0.333
-        if let Value::Float(v) = f.process(&partition, &order_by, 1).unwrap() {
-            assert!((v - 0.3333333333333333).abs() < 0.0001);
-        } else {
-            panic!("Expected float");
+        match f.process(&partition, &order_by, 1).unwrap() {
+            Value::Float(v) => {
+                assert!((v - 0.3333333333333333).abs() < 0.0001);
+            }
+            _ => {
+                panic!("Expected float");
+            }
         }
         // Row 2: (3-1)/(4-1) = 2/3 ≈ 0.667
-        if let Value::Float(v) = f.process(&partition, &order_by, 2).unwrap() {
-            assert!((v - 0.6666666666666666).abs() < 0.0001);
-        } else {
-            panic!("Expected float");
+        match f.process(&partition, &order_by, 2).unwrap() {
+            Value::Float(v) => {
+                assert!((v - 0.6666666666666666).abs() < 0.0001);
+            }
+            _ => {
+                panic!("Expected float");
+            }
         }
         // Row 3: (4-1)/(4-1) = 3/3 = 1.0
         assert_eq!(
@@ -545,15 +551,21 @@ mod tests {
         let order_by = vec![];
 
         // Both rows with value 10: 2/3 ≈ 0.667 (2 rows have value <= 10)
-        if let Value::Float(v) = f.process(&partition, &order_by, 0).unwrap() {
-            assert!((v - 0.6666666666666666).abs() < 0.0001);
-        } else {
-            panic!("Expected float");
+        match f.process(&partition, &order_by, 0).unwrap() {
+            Value::Float(v) => {
+                assert!((v - 0.6666666666666666).abs() < 0.0001);
+            }
+            _ => {
+                panic!("Expected float");
+            }
         }
-        if let Value::Float(v) = f.process(&partition, &order_by, 1).unwrap() {
-            assert!((v - 0.6666666666666666).abs() < 0.0001);
-        } else {
-            panic!("Expected float");
+        match f.process(&partition, &order_by, 1).unwrap() {
+            Value::Float(v) => {
+                assert!((v - 0.6666666666666666).abs() < 0.0001);
+            }
+            _ => {
+                panic!("Expected float");
+            }
         }
         // Row with value 30: 3/3 = 1.0
         assert_eq!(

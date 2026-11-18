@@ -2964,7 +2964,7 @@ impl fmt::Display for AlterTableStatement {
                 }
             }
             AlterTableOperation::RenameColumn => {
-                if let (Some(ref old), Some(ref new)) = (&self.column_name, &self.new_column_name) {
+                if let (Some(old), Some(new)) = (&self.column_name, &self.new_column_name) {
                     result.push_str(&format!("RENAME COLUMN {} TO {}", old, new));
                 }
             }

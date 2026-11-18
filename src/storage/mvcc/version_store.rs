@@ -314,7 +314,7 @@ fn unique_on(index: &Arc<dyn Index>, column: usize) -> bool {
 
 /// Whether `index` is a unique index other than one on the key column `key` alone
 pub(crate) fn unique_beside_key(index: &dyn Index, key: Option<usize>) -> bool {
-    index.is_unique() && !key.is_some_and(|key| index.column_ids() == [key as i32])
+    index.is_unique() && key.is_none_or(|key| index.column_ids() != [key as i32])
 }
 
 /// Convert arena index (usize) to compact representation (Option<NonZeroU64>)
@@ -380,20 +380,18 @@ static WRITE_SET_MAP_POOL: Mutex<Vec<I64Map<WriteSetEntry>>> = Mutex::new(Vec::n
 /// Get a VersionList map from pool or create a new one
 #[inline]
 fn get_version_list_map() -> I64Map<VersionList> {
-    if let Some(map) = VERSION_LIST_MAP_POOL.lock().pop() {
-        map
-    } else {
-        new_i64_map_with_capacity(TX_VERSION_MAP_INITIAL_CAPACITY)
+    match VERSION_LIST_MAP_POOL.lock().pop() {
+        Some(map) => map,
+        _ => new_i64_map_with_capacity(TX_VERSION_MAP_INITIAL_CAPACITY),
     }
 }
 
 /// Get a WriteSetEntry map from pool or create a new one
 #[inline]
 fn get_write_set_map() -> I64Map<WriteSetEntry> {
-    if let Some(map) = WRITE_SET_MAP_POOL.lock().pop() {
-        map
-    } else {
-        new_i64_map_with_capacity(TX_VERSION_MAP_INITIAL_CAPACITY)
+    match WRITE_SET_MAP_POOL.lock().pop() {
+        Some(map) => map,
+        _ => new_i64_map_with_capacity(TX_VERSION_MAP_INITIAL_CAPACITY),
     }
 }
 
@@ -657,10 +655,8 @@ fn sum_live_heads<const LEAD: u8>(
             last_txn_id = meta.txn_id;
             last_visible = visible(meta.txn_id);
         }
-        if last_visible {
-            if let Some(val) = row.get(col_idx) {
-                add_led::<LEAD>(&mut sum, val);
-            }
+        if last_visible && let Some(val) = row.get(col_idx) {
+            add_led::<LEAD>(&mut sum, val);
         }
     }
     *total = sum;
@@ -2260,10 +2256,10 @@ impl VersionStore {
             if let Some(head) = head {
                 entry.version.data = Row::from_arc(head);
             }
-            if let Some(prev) = &entry.prev {
-                if let Some(moved) = relayout_history(prev, relayout) {
-                    entry.prev = Some(moved);
-                }
+            if let Some(prev) = &entry.prev
+                && let Some(moved) = relayout_history(prev, relayout)
+            {
+                entry.prev = Some(moved);
             }
         }
     }
@@ -3416,11 +3412,9 @@ impl VersionStore {
         let mut current: Option<&VersionChainEntry> = chain.prev.as_ref().map(|b| b.as_ref());
 
         while let Some(e) = current {
-            if TIMED {
-                if let Err(e) = deadline.charge_one(DeadlineSite::StorageRead, unpaid) {
-                    *failed = Some(e);
-                    return None;
-                }
+            if TIMED && let Err(e) = deadline.charge_one(DeadlineSite::StorageRead, unpaid) {
+                *failed = Some(e);
+                return None;
             }
             let version_txn_id = e.version.txn_id;
             let deleted_at_txn_id = e.version.deleted_at_txn_id;
@@ -5812,10 +5806,10 @@ impl VersionStore {
     /// Releases a row claim
     pub fn release_row_claim(&self, row_id: i64, txn_id: i64) {
         let mut map = self.uncommitted_writes.write();
-        if let Some(&v) = map.get(row_id) {
-            if v == txn_id {
-                map.remove(row_id);
-            }
+        if let Some(&v) = map.get(row_id)
+            && v == txn_id
+        {
+            map.remove(row_id);
         }
     }
 
@@ -5825,10 +5819,10 @@ impl VersionStore {
     pub fn release_row_claims_batch(&self, row_ids: &[i64], txn_id: i64) {
         let mut map = self.uncommitted_writes.write();
         for &row_id in row_ids {
-            if let Some(&v) = map.get(row_id) {
-                if v == txn_id {
-                    map.remove(row_id);
-                }
+            if let Some(&v) = map.get(row_id)
+                && v == txn_id
+            {
+                map.remove(row_id);
             }
         }
     }
@@ -5844,10 +5838,10 @@ impl VersionStore {
 
         let mut map = self.uncommitted_writes.write();
         for row_id in row_ids.clone() {
-            if let Some(&holder) = map.get(row_id) {
-                if holder != txn_id {
-                    return Err(Self::claim_refused(row_id, holder));
-                }
+            if let Some(&holder) = map.get(row_id)
+                && holder != txn_id
+            {
+                return Err(Self::claim_refused(row_id, holder));
             }
         }
         for row_id in row_ids {
@@ -6524,12 +6518,11 @@ impl VersionStore {
         }
 
         // Skip if a PkIndex already covers this single column
-        if meta.column_names.len() == 1 {
-            if let Some(existing) = self.get_index_by_column(&meta.column_names[0]) {
-                if existing.index_type() == IndexType::PrimaryKey {
-                    return Ok(()); // PK column covered by PkIndex
-                }
-            }
+        if meta.column_names.len() == 1
+            && let Some(existing) = self.get_index_by_column(&meta.column_names[0])
+            && existing.index_type() == IndexType::PrimaryKey
+        {
+            return Ok(()); // PK column covered by PkIndex
         }
 
         // Get row count for capacity hint
@@ -6555,10 +6548,10 @@ impl VersionStore {
                 let mut entries: Vec<(i64, Vec<crate::core::Value>)> = Vec::new();
                 for (&row_id, version_chain) in versions.iter() {
                     let version = &version_chain.version;
-                    if !version.is_deleted() {
-                        if let Some(value) = version.data.get(col_idx) {
-                            entries.push((row_id, vec![value.clone()]));
-                        }
+                    if !version.is_deleted()
+                        && let Some(value) = version.data.get(col_idx)
+                    {
+                        entries.push((row_id, vec![value.clone()]));
                     }
                 }
                 if !entries.is_empty() {
@@ -7013,13 +7006,12 @@ impl VersionStore {
 
         let positions = &cleaners.positions;
         for (index, buffers) in cleaners.indexes.iter_mut() {
-            if let Some(buffers) = buffers {
-                if index
+            if let Some(buffers) = buffers
+                && index
                     .remove_batch_ids(&cleanup.removed_ids, buffers)
                     .is_some()
-                {
-                    continue;
-                }
+            {
+                continue;
             }
             // Every row's key in one buffer, so nothing is allocated per row
             let col_ids = index.column_ids();
@@ -7105,18 +7097,17 @@ impl VersionStore {
             let mut versions = self.versions.write();
             for &row_id in &rows_to_delete {
                 // Re-check: the row must still exist AND still be deleted below the bound
-                if let Some(entry) = versions.get(row_id) {
-                    if removable(&entry.version)
-                        && self.past_retention(point.as_ref(), &entry.version)
-                    {
-                        if let Some(idx) = unpack_arena_idx(entry.arena_idx) {
-                            actual_arena_indices.push(idx);
-                        }
-                        // A point before the delete would need the row
-                        self.raise_history_mark(entry.version.create_time);
-                        versions.remove(row_id);
-                        actually_deleted.push(row_id);
+                if let Some(entry) = versions.get(row_id)
+                    && removable(&entry.version)
+                    && self.past_retention(point.as_ref(), &entry.version)
+                {
+                    if let Some(idx) = unpack_arena_idx(entry.arena_idx) {
+                        actual_arena_indices.push(idx);
                     }
+                    // A point before the delete would need the row
+                    self.raise_history_mark(entry.version.create_time);
+                    versions.remove(row_id);
+                    actually_deleted.push(row_id);
                 }
             }
         }
@@ -7812,10 +7803,10 @@ impl KeyRows {
             return;
         };
         rows.swap_remove(at);
-        if let Some(&moved) = rows.get(at) {
-            if let Some(entry) = self.by_row.get_mut(moved) {
-                entry.1 = at as u32;
-            }
+        if let Some(&moved) = rows.get(at)
+            && let Some(entry) = self.by_row.get_mut(moved)
+        {
+            entry.1 = at as u32;
         }
         if rows.is_empty() {
             self.by_hash.remove(&hash);
@@ -9010,10 +9001,10 @@ impl TransactionVersionStore {
             if version.is_deleted() {
                 continue;
             }
-            if let Some(value) = version.data.get(column) {
-                if !value.is_null() {
-                    out.push((value.clone(), row_id));
-                }
+            if let Some(value) = version.data.get(column)
+                && !value.is_null()
+            {
+                out.push((value.clone(), row_id));
             }
         }
     }
@@ -9309,44 +9300,46 @@ impl TransactionVersionStore {
 
                 // OPTIMIZATION: For UPDATEs, check if any indexed column changed
                 // BEFORE allocating Vecs
-                if let Some(old_r) = old_row {
-                    if !is_deleted {
-                        // UPDATE case: check if indexed columns differ
-                        let any_changed = column_ids.iter().any(|&col_id| {
-                            let col_idx = col_id as usize;
-                            let old_val = old_r.get(col_idx);
-                            let new_val = new_row.get(col_idx);
-                            old_val != new_val
-                        });
+                if let Some(old_r) = old_row
+                    && !is_deleted
+                {
+                    // UPDATE case: check if indexed columns differ
+                    let any_changed = column_ids.iter().any(|&col_id| {
+                        let col_idx = col_id as usize;
+                        let old_val = old_r.get(col_idx);
+                        let new_val = new_row.get(col_idx);
+                        old_val != new_val
+                    });
 
-                        if !any_changed {
-                            // Indexed columns unchanged - skip this index
-                            continue;
-                        }
-
-                        // Values differ - collect old and new values
-                        let old_values: Vec<crate::core::Value> = column_ids
-                            .iter()
-                            .map(|&col_id| {
-                                old_r.get(col_id as usize).cloned().unwrap_or(
-                                    crate::core::Value::Null(crate::core::DataType::Null),
-                                )
-                            })
-                            .collect();
-
-                        let new_values: Vec<crate::core::Value> = column_ids
-                            .iter()
-                            .map(|&col_id| {
-                                new_row.get(col_id as usize).cloned().unwrap_or(
-                                    crate::core::Value::Null(crate::core::DataType::Null),
-                                )
-                            })
-                            .collect();
-
-                        remove_batches[idx].push((row_id, old_values));
-                        add_batches[idx].push((row_id, new_values));
+                    if !any_changed {
+                        // Indexed columns unchanged - skip this index
                         continue;
                     }
+
+                    // Values differ - collect old and new values
+                    let old_values: Vec<crate::core::Value> = column_ids
+                        .iter()
+                        .map(|&col_id| {
+                            old_r
+                                .get(col_id as usize)
+                                .cloned()
+                                .unwrap_or(crate::core::Value::Null(crate::core::DataType::Null))
+                        })
+                        .collect();
+
+                    let new_values: Vec<crate::core::Value> = column_ids
+                        .iter()
+                        .map(|&col_id| {
+                            new_row
+                                .get(col_id as usize)
+                                .cloned()
+                                .unwrap_or(crate::core::Value::Null(crate::core::DataType::Null))
+                        })
+                        .collect();
+
+                    remove_batches[idx].push((row_id, old_values));
+                    add_batches[idx].push((row_id, new_values));
+                    continue;
                 }
 
                 if is_deleted {
@@ -9440,14 +9433,14 @@ impl TransactionVersionStore {
                 }
 
                 // Check intra-batch duplicates (applies to all index types, including HNSW)
-                if let Some(&existing_row_id) = seen.get(values.as_slice()) {
-                    if existing_row_id != *row_id {
-                        return Err(Error::unique_constraint(
-                            index.name(),
-                            index.column_names().join(", "),
-                            values.to_vec(),
-                        ));
-                    }
+                if let Some(&existing_row_id) = seen.get(values.as_slice())
+                    && existing_row_id != *row_id
+                {
+                    return Err(Error::unique_constraint(
+                        index.name(),
+                        index.column_names().join(", "),
+                        values.to_vec(),
+                    ));
                 }
                 seen.insert(values.as_slice(), *row_id);
 
@@ -9464,20 +9457,19 @@ impl TransactionVersionStore {
                         )));
                     };
 
-                    if let Some(value) = values.first() {
-                        if let Some(existing_row_id) =
+                    if let Some(value) = values.first()
+                        && let Some(existing_row_id) =
                             hnsw_index.find_exact_duplicate(value, *row_id, Some(&removals_set))
-                        {
-                            let dims = value.as_vector_f32().map_or(0, |v| v.len());
-                            return Err(Error::unique_constraint(
-                                index.name(),
-                                index.column_names().join(", "),
-                                crate::core::ConflictValues::Vector {
-                                    dims,
-                                    holder: Some(existing_row_id),
-                                },
-                            ));
-                        }
+                    {
+                        let dims = value.as_vector_f32().map_or(0, |v| v.len());
+                        return Err(Error::unique_constraint(
+                            index.name(),
+                            index.column_names().join(", "),
+                            crate::core::ConflictValues::Vector {
+                                dims,
+                                holder: Some(existing_row_id),
+                            },
+                        ));
                     }
                 } else {
                     // Non-HNSW: standard equality-based uniqueness check
@@ -9657,55 +9649,55 @@ impl TransactionVersionStore {
             };
 
             // OPTIMIZATION: For UPDATEs, check if any indexed column changed BEFORE allocating
-            if let Some(old_r) = old_row {
-                if !is_deleted {
-                    // UPDATE case: check if indexed columns differ (no allocation)
-                    let any_changed = column_ids.iter().any(|&col_id| {
-                        let col_idx = col_id as usize;
-                        old_r.get(col_idx) != new_row.get(col_idx)
-                    });
+            if let Some(old_r) = old_row
+                && !is_deleted
+            {
+                // UPDATE case: check if indexed columns differ (no allocation)
+                let any_changed = column_ids.iter().any(|&col_id| {
+                    let col_idx = col_id as usize;
+                    old_r.get(col_idx) != new_row.get(col_idx)
+                });
 
-                    if !any_changed {
-                        // Indexed columns unchanged - skip this index entirely
-                        continue;
-                    }
-
-                    // Values differ - collect and update using SmallVec (stack allocation for 1-2 cols)
-                    let old_values: SmallVec<[Value; 2]> = column_ids
-                        .iter()
-                        .map(|&col_id| {
-                            old_r
-                                .get(col_id as usize)
-                                .cloned()
-                                .unwrap_or(Value::Null(DataType::Null))
-                        })
-                        .collect();
-
-                    let new_values: SmallVec<[Value; 2]> = column_ids
-                        .iter()
-                        .map(|&col_id| {
-                            new_row
-                                .get(col_id as usize)
-                                .cloned()
-                                .unwrap_or(Value::Null(DataType::Null))
-                        })
-                        .collect();
-
-                    // Remove old, add new; the removal is in completed_ops,
-                    // so a failed add re-adds it through the rollback
-                    self.parent_store.note_index_change();
-                    let _ = index.remove(&old_values, row_id, row_id);
-                    #[cfg(feature = "test-failpoints")]
-                    crate::test_failpoints::commit_index_removed();
-                    completed_ops.push((idx, false, old_values));
-
-                    if let Err(e) = index.add(&new_values, row_id, row_id) {
-                        self.rollback_single_row_ops(&completed_ops, indexes, row_id);
-                        return Err(e);
-                    }
-                    completed_ops.push((idx, true, new_values));
+                if !any_changed {
+                    // Indexed columns unchanged - skip this index entirely
                     continue;
                 }
+
+                // Values differ - collect and update using SmallVec (stack allocation for 1-2 cols)
+                let old_values: SmallVec<[Value; 2]> = column_ids
+                    .iter()
+                    .map(|&col_id| {
+                        old_r
+                            .get(col_id as usize)
+                            .cloned()
+                            .unwrap_or(Value::Null(DataType::Null))
+                    })
+                    .collect();
+
+                let new_values: SmallVec<[Value; 2]> = column_ids
+                    .iter()
+                    .map(|&col_id| {
+                        new_row
+                            .get(col_id as usize)
+                            .cloned()
+                            .unwrap_or(Value::Null(DataType::Null))
+                    })
+                    .collect();
+
+                // Remove old, add new; the removal is in completed_ops,
+                // so a failed add re-adds it through the rollback
+                self.parent_store.note_index_change();
+                let _ = index.remove(&old_values, row_id, row_id);
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::commit_index_removed();
+                completed_ops.push((idx, false, old_values));
+
+                if let Err(e) = index.add(&new_values, row_id, row_id) {
+                    self.rollback_single_row_ops(&completed_ops, indexes, row_id);
+                    return Err(e);
+                }
+                completed_ops.push((idx, true, new_values));
+                continue;
             }
 
             if is_deleted {

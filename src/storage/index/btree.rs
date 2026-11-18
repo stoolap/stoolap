@@ -182,11 +182,11 @@ impl BTreeIndex {
         let mut stopped = None;
         sorted_values.walk(Bound::Unbounded, true, &mut |key, _| {
             values.push(key.clone());
-            if values.len() % CHARGE_BEAT == 0 {
-                if let Err(error) = deadline.charge(DeadlineSite::StorageRead, CHARGE_BEAT) {
-                    stopped = Some(error);
-                    return false;
-                }
+            if values.len() % CHARGE_BEAT == 0
+                && let Err(error) = deadline.charge(DeadlineSite::StorageRead, CHARGE_BEAT)
+            {
+                stopped = Some(error);
+                return false;
             }
             true
         });
@@ -327,14 +327,14 @@ impl Index for BTreeIndex {
                 if value.is_null() {
                     continue;
                 }
-                if let Some(&existing_row_id) = seen.get(value) {
-                    if existing_row_id != row_id {
-                        return Err(Error::unique_constraint(
-                            &self.name,
-                            &self.column_name,
-                            vec![value.clone()],
-                        ));
-                    }
+                if let Some(&existing_row_id) = seen.get(value)
+                    && existing_row_id != row_id
+                {
+                    return Err(Error::unique_constraint(
+                        &self.name,
+                        &self.column_name,
+                        vec![value.clone()],
+                    ));
                 }
                 seen.insert(value, row_id);
             }
@@ -550,11 +550,11 @@ impl Index for BTreeIndex {
             return None;
         }
         let sorted_values = self.sorted_values.read();
-        if let (Bound::Included(low), Bound::Included(high)) = (lower, upper) {
-            if low == high {
-                let count = sorted_values.get(low).map_or(0, Ids::len);
-                return Some(count.min(max.saturating_add(1)));
-            }
+        if let (Bound::Included(low), Bound::Included(high)) = (lower, upper)
+            && low == high
+        {
+            let count = sorted_values.get(low).map_or(0, Ids::len);
+            return Some(count.min(max.saturating_add(1)));
         }
         // NULL, the first key, compares with no bound
         let lower = match lower {
@@ -745,10 +745,10 @@ impl Index for BTreeIndex {
                     }
                     ids.len() == chunk
                 };
-                if let Some((key, last)) = &inside {
-                    if let Some(rows) = sorted_values.get(key) {
-                        full = take(key, rows, Some(*last));
-                    }
+                if let Some((key, last)) = &inside
+                    && let Some(rows) = sorted_values.get(key)
+                {
+                    full = take(key, rows, Some(*last));
                 }
                 if !full && ascending {
                     sorted_values.walk(start.as_ref(), true, &mut |key, rows| {

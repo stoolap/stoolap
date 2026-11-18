@@ -929,10 +929,10 @@ impl CheckpointMetadata {
         // Sync directory to ensure rename is durable.
         // Windows does not support opening directories for fsync.
         #[cfg(not(windows))]
-        if let Some(parent) = path.parent() {
-            if let Ok(dir_file) = File::open(parent) {
-                let _ = dir_file.sync_all();
-            }
+        if let Some(parent) = path.parent()
+            && let Ok(dir_file) = File::open(parent)
+        {
+            let _ = dir_file.sync_all();
         }
 
         Ok(())
@@ -1174,23 +1174,21 @@ impl WALManager {
                 let wal_path = path.join(newest);
 
                 // Try to extract LSN from filename
-                if let Some(lsn_start) = wal_filename.find("lsn-") {
-                    if let Some(lsn_end) = wal_filename[lsn_start + 4..].find('.') {
-                        if let Ok(lsn) =
-                            wal_filename[lsn_start + 4..lsn_start + 4 + lsn_end].parse::<u64>()
-                        {
-                            initial_lsn = initial_lsn.max(lsn);
-                        }
-                    }
+                if let Some(lsn_start) = wal_filename.find("lsn-")
+                    && let Some(lsn_end) = wal_filename[lsn_start + 4..].find('.')
+                    && let Ok(lsn) =
+                        wal_filename[lsn_start + 4..lsn_start + 4 + lsn_end].parse::<u64>()
+                {
+                    initial_lsn = initial_lsn.max(lsn);
                 }
 
                 if let Ok(mut file) = OpenOptions::new().read(true).append(true).open(&wal_path) {
                     // Read only: another process may own the file until the
                     // engine's lock is taken, and `cut_torn_tail` runs then
-                    if let Ok((last_lsn, _)) = find_valid_end(&mut file) {
-                        if last_lsn > initial_lsn {
-                            initial_lsn = last_lsn;
-                        }
+                    if let Ok((last_lsn, _)) = find_valid_end(&mut file)
+                        && last_lsn > initial_lsn
+                    {
+                        initial_lsn = last_lsn;
                     }
                     wal_file = Some(file);
                 }
@@ -1276,19 +1274,18 @@ impl WALManager {
     /// Extract sequence number from WAL filename
     fn extract_sequence_from_filename(filename: &str) -> Option<u64> {
         // Try new format: wal_00000001.log
-        if filename.starts_with("wal_") {
-            if let Some(dot_pos) = filename.find('.') {
-                return filename[4..dot_pos].parse().ok();
-            }
+        if filename.starts_with("wal_")
+            && let Some(dot_pos) = filename.find('.')
+        {
+            return filename[4..dot_pos].parse().ok();
         }
         // Try old format: wal-YYYYMMDD-HHMMSS-lsn-N.log (sequence is implicit from LSN)
-        if filename.starts_with("wal-") {
-            if let Some(lsn_pos) = filename.find("lsn-") {
-                if let Some(dot_pos) = filename[lsn_pos..].find('.') {
-                    // Use LSN as a proxy for sequence
-                    return filename[lsn_pos + 4..lsn_pos + dot_pos].parse().ok();
-                }
-            }
+        if filename.starts_with("wal-")
+            && let Some(lsn_pos) = filename.find("lsn-")
+            && let Some(dot_pos) = filename[lsn_pos..].find('.')
+        {
+            // Use LSN as a proxy for sequence
+            return filename[lsn_pos + 4..lsn_pos + dot_pos].parse().ok();
         }
         None
     }
@@ -1503,13 +1500,11 @@ impl WALManager {
             self.clean_failure(&wal_file, &name(), self.failed_write_cut());
             return self.outcome(lsn, need, e);
         }
-        if sync {
-            if let Err(e) = self.sync_with_file(&wal_file) {
-                // Written bytes stay in Normal mode: a sync is a commit's
-                // requirement only in Full mode, which goes to its floor
-                self.clean_failure(&wal_file, &name(), Cut::Keep);
-                return self.outcome(lsn, need, e);
-            }
+        if sync && let Err(e) = self.sync_with_file(&wal_file) {
+            // Written bytes stay in Normal mode: a sync is a commit's
+            // requirement only in Full mode, which goes to its floor
+            self.clean_failure(&wal_file, &name(), Cut::Keep);
+            return self.outcome(lsn, need, e);
         }
         Ok(())
     }
@@ -1810,10 +1805,10 @@ impl WALManager {
         // by tables whose snapshots are older (e.g., after a crash during snapshot rename).
         if from_lsn == 0 {
             let checkpoint_path = self.path.join("checkpoint.meta");
-            if let Ok(checkpoint) = CheckpointMetadata::read_from_file(&checkpoint_path) {
-                if checkpoint.lsn > from_lsn {
-                    from_lsn = checkpoint.lsn;
-                }
+            if let Ok(checkpoint) = CheckpointMetadata::read_from_file(&checkpoint_path)
+                && checkpoint.lsn > from_lsn
+            {
+                from_lsn = checkpoint.lsn;
             }
         }
 
@@ -2196,13 +2191,13 @@ impl WALManager {
 
             // The file's entries span (file_lsn, next_lsn]. Safe to delete only if
             // all entries are covered: next_lsn <= up_to_lsn.
-            if next_lsn <= up_to_lsn {
-                if let Err(e) = fs::remove_file(path) {
-                    eprintln!(
-                        "Warning: Could not remove old rotated WAL file {:?}: {}",
-                        path, e
-                    );
-                }
+            if next_lsn <= up_to_lsn
+                && let Err(e) = fs::remove_file(path)
+            {
+                eprintln!(
+                    "Warning: Could not remove old rotated WAL file {:?}: {}",
+                    path, e
+                );
             }
         }
     }
@@ -2246,10 +2241,10 @@ impl WALManager {
         Self::cleanup_old_wal_files(&self.path, &current_wal_name, up_to_lsn);
 
         // A file starting at or after the LSN holds nothing to leave behind
-        if let Some(current_file_lsn) = Self::extract_lsn_from_filename(&current_wal_name) {
-            if up_to_lsn <= current_file_lsn {
-                return Ok(());
-            }
+        if let Some(current_file_lsn) = Self::extract_lsn_from_filename(&current_wal_name)
+            && up_to_lsn <= current_file_lsn
+        {
+            return Ok(());
         }
 
         self.start_new_wal_file(&current_wal_name).map(|_| ())
@@ -2399,10 +2394,10 @@ impl WALManager {
             // a failed commit's marker there must not replay; Normal mode
             // acknowledged the tail when it was written, so it stays
             self.poisoned.store(true, Ordering::Release);
-            if let Some(file) = file.as_ref().filter(|_| self.sync_mode == SyncMode::Full) {
-                if shorten_wal_file(file, &path, durable_len).is_err() {
-                    self.retired_cut_failed.store(true, Ordering::Release);
-                }
+            if let Some(file) = file.as_ref().filter(|_| self.sync_mode == SyncMode::Full)
+                && shorten_wal_file(file, &path, durable_len).is_err()
+            {
+                self.retired_cut_failed.store(true, Ordering::Release);
             }
             return Err(e);
         }

@@ -590,10 +590,10 @@ impl<V> I64Map<V> {
             self.remove(key);
         }
 
-        if let Some(value) = self.min_slot.as_mut() {
-            if !f(EMPTY, value) {
-                self.min_slot = None;
-            }
+        if let Some(value) = self.min_slot.as_mut()
+            && !f(EMPTY, value)
+        {
+            self.min_slot = None;
         }
     }
 

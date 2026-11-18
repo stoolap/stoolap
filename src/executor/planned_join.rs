@@ -595,10 +595,11 @@ pub(crate) fn pick_index_join_side<T>(
     if unswapped.is_none() && (!right_is_table || right_small()) {
         return probe_left().map(|probe| (probe, true));
     }
-    if right_filtered && !left_filtered {
-        if let Some(probe) = probe_left().filter(&is_primary_key) {
-            return Some((probe, true));
-        }
+    if right_filtered
+        && !left_filtered
+        && let Some(probe) = probe_left().filter(&is_primary_key)
+    {
+        return Some((probe, true));
     }
     unswapped.map(|probe| (probe, false))
 }

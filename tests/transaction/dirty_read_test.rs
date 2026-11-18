@@ -84,15 +84,15 @@ fn test_dirty_read_reproduction() {
             let value: Result<i64, _> =
                 db_reader.query_one("SELECT value FROM dirty_test WHERE id = 1", ());
 
-            if let Ok(v) = value {
-                if v == 999 {
-                    // DIRTY READ DETECTED!
-                    dirty_count.fetch_add(1, Ordering::SeqCst);
-                    eprintln!(
-                        "DIRTY READ in iteration {}: Read uncommitted value 999!",
-                        iteration
-                    );
-                }
+            if let Ok(v) = value
+                && v == 999
+            {
+                // DIRTY READ DETECTED!
+                dirty_count.fetch_add(1, Ordering::SeqCst);
+                eprintln!(
+                    "DIRTY READ in iteration {}: Read uncommitted value 999!",
+                    iteration
+                );
             }
         });
 

@@ -322,8 +322,11 @@ impl SmartString {
     /// valid UTF-8.
     #[inline]
     unsafe fn heap_bytes_mut(&mut self) -> &mut [u8] {
-        let (block, len) = self.heap_parts();
-        std::slice::from_raw_parts_mut(block.add(HEADER), len)
+        // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+        unsafe {
+            let (block, len) = self.heap_parts();
+            std::slice::from_raw_parts_mut(block.add(HEADER), len)
+        }
     }
 
     /// A heap string's reference count, at the start of its block
@@ -427,13 +430,13 @@ impl SmartString {
     pub fn push(&mut self, ch: char) {
         let ch_len = ch.len_utf8();
 
-        if let Some(current_len) = self.tag.inline_len() {
-            if current_len + ch_len <= MAX_INLINE_LEN {
-                // Still fits inline
-                ch.encode_utf8(&mut self.data[current_len..]);
-                self.tag = StringTag::inline(current_len + ch_len);
-                return;
-            }
+        if let Some(current_len) = self.tag.inline_len()
+            && current_len + ch_len <= MAX_INLINE_LEN
+        {
+            // Still fits inline
+            ch.encode_utf8(&mut self.data[current_len..]);
+            self.tag = StringTag::inline(current_len + ch_len);
+            return;
         }
 
         // Need to go to heap or already on heap
@@ -451,13 +454,13 @@ impl SmartString {
 
         let add_len = string.len();
 
-        if let Some(current_len) = self.tag.inline_len() {
-            if current_len + add_len <= MAX_INLINE_LEN {
-                // Still fits inline
-                self.data[current_len..current_len + add_len].copy_from_slice(string.as_bytes());
-                self.tag = StringTag::inline(current_len + add_len);
-                return;
-            }
+        if let Some(current_len) = self.tag.inline_len()
+            && current_len + add_len <= MAX_INLINE_LEN
+        {
+            // Still fits inline
+            self.data[current_len..current_len + add_len].copy_from_slice(string.as_bytes());
+            self.tag = StringTag::inline(current_len + add_len);
+            return;
         }
 
         // Need to go to heap or already on heap
@@ -472,12 +475,12 @@ impl SmartString {
     /// fold, so the result is the same as the general path.
     #[inline]
     pub fn to_lowercase(&self) -> SmartString {
-        if let Some(len) = self.tag.inline_len() {
-            if self.data[..len].is_ascii() {
-                let mut copy = self.clone();
-                copy.data[..len].make_ascii_lowercase();
-                return copy;
-            }
+        if let Some(len) = self.tag.inline_len()
+            && self.data[..len].is_ascii()
+        {
+            let mut copy = self.clone();
+            copy.data[..len].make_ascii_lowercase();
+            return copy;
         }
         SmartString::from_string(self.as_str().to_lowercase())
     }
@@ -486,12 +489,12 @@ impl SmartString {
     /// [`SmartString::to_lowercase`].
     #[inline]
     pub fn to_uppercase(&self) -> SmartString {
-        if let Some(len) = self.tag.inline_len() {
-            if self.data[..len].is_ascii() {
-                let mut copy = self.clone();
-                copy.data[..len].make_ascii_uppercase();
-                return copy;
-            }
+        if let Some(len) = self.tag.inline_len()
+            && self.data[..len].is_ascii()
+        {
+            let mut copy = self.clone();
+            copy.data[..len].make_ascii_uppercase();
+            return copy;
         }
         SmartString::from_string(self.as_str().to_uppercase())
     }

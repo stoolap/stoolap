@@ -506,10 +506,10 @@ impl MvccTransaction {
             return false;
         }
         // Check for DML changes via engine operations
-        if let Some(ops) = &self.engine_operations {
-            if ops.has_pending_dml_changes(self.id) {
-                return false;
-            }
+        if let Some(ops) = &self.engine_operations
+            && ops.has_pending_dml_changes(self.id)
+        {
+            return false;
         }
         true
     }
@@ -771,10 +771,8 @@ impl Transaction for MvccTransaction {
         }
 
         // Record in WAL if not read-only
-        if !is_read_only {
-            if let Some(ops) = &self.engine_operations {
-                let _ = ops.record_rollback(self.id);
-            }
+        if !is_read_only && let Some(ops) = &self.engine_operations {
+            let _ = ops.record_rollback(self.id);
         }
 
         // Mark as rolled back
@@ -885,10 +883,10 @@ impl Transaction for MvccTransaction {
         self.tables.remove(name);
 
         // Clear fast path cache if needed
-        if let Some(last_name) = &self.last_table_name {
-            if last_name == name {
-                self.last_table_name = None;
-            }
+        if let Some(last_name) = &self.last_table_name
+            && last_name == name
+        {
+            self.last_table_name = None;
         }
 
         dropped
@@ -973,10 +971,10 @@ impl Transaction for MvccTransaction {
         }
 
         // Update fast path cache
-        if let Some(last_name) = &self.last_table_name {
-            if last_name == old_name {
-                self.last_table_name = Some(new_name.to_string());
-            }
+        if let Some(last_name) = &self.last_table_name
+            && last_name == old_name
+        {
+            self.last_table_name = Some(new_name.to_string());
         }
 
         Ok(())

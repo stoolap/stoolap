@@ -791,10 +791,10 @@ fn explain_analyze_says_whether_the_statement_it_ran_held_a_plan() {
         let mut result = result.unwrap();
         let mut lines = Vec::new();
         while result.next() {
-            if let Some(stoolap::core::Value::Text(line)) = result.row().get(0) {
-                if line.trim().starts_with("Prepared:") {
-                    lines.push(line.trim().to_string());
-                }
+            if let Some(stoolap::core::Value::Text(line)) = result.row().get(0)
+                && line.trim().starts_with("Prepared:")
+            {
+                lines.push(line.trim().to_string());
             }
         }
         lines

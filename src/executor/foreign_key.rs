@@ -1532,7 +1532,7 @@ fn write_changed(
                 column
                     .rows
                     .iter()
-                    .filter(|(_, &at)| column.values[at].changed)
+                    .filter(|&(_, &at)| column.values[at].changed)
                     .map(|(id, _)| id),
             );
         }

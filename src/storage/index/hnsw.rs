@@ -326,11 +326,11 @@ impl HnswInner {
     #[inline(always)]
     /// Takes the row's node out of the answers, if the row has one
     fn tombstone_row(&mut self, row_id: i64) {
-        if let Some(&node_id) = self.row_id_to_node.get(row_id) {
-            if !self.is_deleted(node_id) {
-                self.unique_map_remove(node_id);
-                self.set_deleted(node_id);
-            }
+        if let Some(&node_id) = self.row_id_to_node.get(row_id)
+            && !self.is_deleted(node_id)
+        {
+            self.unique_map_remove(node_id);
+            self.set_deleted(node_id);
         }
     }
 
@@ -1645,13 +1645,13 @@ impl HnswInner {
         }
 
         // Validate entry_point is within bounds
-        if let Some(ep) = entry_point {
-            if ep >= node_count {
-                return Err(format!(
-                    "HNSW corrupted: entry_point {} but only {} nodes exist",
-                    ep, node_count
-                ));
-            }
+        if let Some(ep) = entry_point
+            && ep >= node_count
+        {
+            return Err(format!(
+                "HNSW corrupted: entry_point {} but only {} nodes exist",
+                ep, node_count
+            ));
         }
 
         let mut inner = Self {
@@ -1758,37 +1758,40 @@ fn prefetch_read(addr: *const u8) {
 #[target_feature(enable = "neon")]
 #[inline]
 unsafe fn l2_distance_sq_neon(ap: *const f32, bp: *const f32, n: usize) -> f32 {
-    use std::arch::aarch64::*;
-    let mut acc0 = vdupq_n_f32(0.0);
-    let mut acc1 = vdupq_n_f32(0.0);
-    let mut acc2 = vdupq_n_f32(0.0);
-    let mut acc3 = vdupq_n_f32(0.0);
-    let end16 = n & !15;
-    let mut i = 0;
-    while i < end16 {
-        let d0 = vsubq_f32(vld1q_f32(ap.add(i)), vld1q_f32(bp.add(i)));
-        acc0 = vfmaq_f32(acc0, d0, d0);
-        let d1 = vsubq_f32(vld1q_f32(ap.add(i + 4)), vld1q_f32(bp.add(i + 4)));
-        acc1 = vfmaq_f32(acc1, d1, d1);
-        let d2 = vsubq_f32(vld1q_f32(ap.add(i + 8)), vld1q_f32(bp.add(i + 8)));
-        acc2 = vfmaq_f32(acc2, d2, d2);
-        let d3 = vsubq_f32(vld1q_f32(ap.add(i + 12)), vld1q_f32(bp.add(i + 12)));
-        acc3 = vfmaq_f32(acc3, d3, d3);
-        i += 16;
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        use std::arch::aarch64::*;
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        let mut acc2 = vdupq_n_f32(0.0);
+        let mut acc3 = vdupq_n_f32(0.0);
+        let end16 = n & !15;
+        let mut i = 0;
+        while i < end16 {
+            let d0 = vsubq_f32(vld1q_f32(ap.add(i)), vld1q_f32(bp.add(i)));
+            acc0 = vfmaq_f32(acc0, d0, d0);
+            let d1 = vsubq_f32(vld1q_f32(ap.add(i + 4)), vld1q_f32(bp.add(i + 4)));
+            acc1 = vfmaq_f32(acc1, d1, d1);
+            let d2 = vsubq_f32(vld1q_f32(ap.add(i + 8)), vld1q_f32(bp.add(i + 8)));
+            acc2 = vfmaq_f32(acc2, d2, d2);
+            let d3 = vsubq_f32(vld1q_f32(ap.add(i + 12)), vld1q_f32(bp.add(i + 12)));
+            acc3 = vfmaq_f32(acc3, d3, d3);
+            i += 16;
+        }
+        acc0 = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+        while i + 4 <= n {
+            let d = vsubq_f32(vld1q_f32(ap.add(i)), vld1q_f32(bp.add(i)));
+            acc0 = vfmaq_f32(acc0, d, d);
+            i += 4;
+        }
+        let mut result = vaddvq_f32(acc0);
+        while i < n {
+            let d = *ap.add(i) - *bp.add(i);
+            result += d * d;
+            i += 1;
+        }
+        result
     }
-    acc0 = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
-    while i + 4 <= n {
-        let d = vsubq_f32(vld1q_f32(ap.add(i)), vld1q_f32(bp.add(i)));
-        acc0 = vfmaq_f32(acc0, d, d);
-        i += 4;
-    }
-    let mut result = vaddvq_f32(acc0);
-    while i < n {
-        let d = *ap.add(i) - *bp.add(i);
-        result += d * d;
-        i += 1;
-    }
-    result
 }
 
 // ---------------------------------------------------------------------------
@@ -2052,72 +2055,75 @@ fn l2_distance_sq_f32(a: &[f32], b: &[f32]) -> f32 {
 #[target_feature(enable = "neon")]
 #[inline]
 unsafe fn cosine_distance_neon(ap: *const f32, bp: *const f32, n: usize) -> f32 {
-    use std::arch::aarch64::*;
-    let mut dot0 = vdupq_n_f32(0.0);
-    let mut dot1 = vdupq_n_f32(0.0);
-    let mut dot2 = vdupq_n_f32(0.0);
-    let mut dot3 = vdupq_n_f32(0.0);
-    let mut na0 = vdupq_n_f32(0.0);
-    let mut na1 = vdupq_n_f32(0.0);
-    let mut na2 = vdupq_n_f32(0.0);
-    let mut na3 = vdupq_n_f32(0.0);
-    let mut nb0 = vdupq_n_f32(0.0);
-    let mut nb1 = vdupq_n_f32(0.0);
-    let mut nb2 = vdupq_n_f32(0.0);
-    let mut nb3 = vdupq_n_f32(0.0);
-    let end16 = n & !15;
-    let mut i = 0;
-    while i < end16 {
-        let a0 = vld1q_f32(ap.add(i));
-        let b0 = vld1q_f32(bp.add(i));
-        dot0 = vfmaq_f32(dot0, a0, b0);
-        na0 = vfmaq_f32(na0, a0, a0);
-        nb0 = vfmaq_f32(nb0, b0, b0);
-        let a1 = vld1q_f32(ap.add(i + 4));
-        let b1 = vld1q_f32(bp.add(i + 4));
-        dot1 = vfmaq_f32(dot1, a1, b1);
-        na1 = vfmaq_f32(na1, a1, a1);
-        nb1 = vfmaq_f32(nb1, b1, b1);
-        let a2 = vld1q_f32(ap.add(i + 8));
-        let b2 = vld1q_f32(bp.add(i + 8));
-        dot2 = vfmaq_f32(dot2, a2, b2);
-        na2 = vfmaq_f32(na2, a2, a2);
-        nb2 = vfmaq_f32(nb2, b2, b2);
-        let a3 = vld1q_f32(ap.add(i + 12));
-        let b3 = vld1q_f32(bp.add(i + 12));
-        dot3 = vfmaq_f32(dot3, a3, b3);
-        na3 = vfmaq_f32(na3, a3, a3);
-        nb3 = vfmaq_f32(nb3, b3, b3);
-        i += 16;
-    }
-    dot0 = vaddq_f32(vaddq_f32(dot0, dot1), vaddq_f32(dot2, dot3));
-    na0 = vaddq_f32(vaddq_f32(na0, na1), vaddq_f32(na2, na3));
-    nb0 = vaddq_f32(vaddq_f32(nb0, nb1), vaddq_f32(nb2, nb3));
-    while i + 4 <= n {
-        let av = vld1q_f32(ap.add(i));
-        let bv = vld1q_f32(bp.add(i));
-        dot0 = vfmaq_f32(dot0, av, bv);
-        na0 = vfmaq_f32(na0, av, av);
-        nb0 = vfmaq_f32(nb0, bv, bv);
-        i += 4;
-    }
-    let mut dot = vaddvq_f32(dot0);
-    let mut norm_a = vaddvq_f32(na0);
-    let mut norm_b = vaddvq_f32(nb0);
-    while i < n {
-        let av = *ap.add(i);
-        let bv = *bp.add(i);
-        dot += av * bv;
-        norm_a += av * av;
-        norm_b += bv * bv;
-        i += 1;
-    }
-    let denom = (norm_a * norm_b).sqrt();
-    if denom < f32::EPSILON {
-        1.0
-    } else {
-        // Clamp: f32 rounding can produce tiny negatives for near-identical vectors
-        (1.0 - dot / denom).max(0.0)
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        use std::arch::aarch64::*;
+        let mut dot0 = vdupq_n_f32(0.0);
+        let mut dot1 = vdupq_n_f32(0.0);
+        let mut dot2 = vdupq_n_f32(0.0);
+        let mut dot3 = vdupq_n_f32(0.0);
+        let mut na0 = vdupq_n_f32(0.0);
+        let mut na1 = vdupq_n_f32(0.0);
+        let mut na2 = vdupq_n_f32(0.0);
+        let mut na3 = vdupq_n_f32(0.0);
+        let mut nb0 = vdupq_n_f32(0.0);
+        let mut nb1 = vdupq_n_f32(0.0);
+        let mut nb2 = vdupq_n_f32(0.0);
+        let mut nb3 = vdupq_n_f32(0.0);
+        let end16 = n & !15;
+        let mut i = 0;
+        while i < end16 {
+            let a0 = vld1q_f32(ap.add(i));
+            let b0 = vld1q_f32(bp.add(i));
+            dot0 = vfmaq_f32(dot0, a0, b0);
+            na0 = vfmaq_f32(na0, a0, a0);
+            nb0 = vfmaq_f32(nb0, b0, b0);
+            let a1 = vld1q_f32(ap.add(i + 4));
+            let b1 = vld1q_f32(bp.add(i + 4));
+            dot1 = vfmaq_f32(dot1, a1, b1);
+            na1 = vfmaq_f32(na1, a1, a1);
+            nb1 = vfmaq_f32(nb1, b1, b1);
+            let a2 = vld1q_f32(ap.add(i + 8));
+            let b2 = vld1q_f32(bp.add(i + 8));
+            dot2 = vfmaq_f32(dot2, a2, b2);
+            na2 = vfmaq_f32(na2, a2, a2);
+            nb2 = vfmaq_f32(nb2, b2, b2);
+            let a3 = vld1q_f32(ap.add(i + 12));
+            let b3 = vld1q_f32(bp.add(i + 12));
+            dot3 = vfmaq_f32(dot3, a3, b3);
+            na3 = vfmaq_f32(na3, a3, a3);
+            nb3 = vfmaq_f32(nb3, b3, b3);
+            i += 16;
+        }
+        dot0 = vaddq_f32(vaddq_f32(dot0, dot1), vaddq_f32(dot2, dot3));
+        na0 = vaddq_f32(vaddq_f32(na0, na1), vaddq_f32(na2, na3));
+        nb0 = vaddq_f32(vaddq_f32(nb0, nb1), vaddq_f32(nb2, nb3));
+        while i + 4 <= n {
+            let av = vld1q_f32(ap.add(i));
+            let bv = vld1q_f32(bp.add(i));
+            dot0 = vfmaq_f32(dot0, av, bv);
+            na0 = vfmaq_f32(na0, av, av);
+            nb0 = vfmaq_f32(nb0, bv, bv);
+            i += 4;
+        }
+        let mut dot = vaddvq_f32(dot0);
+        let mut norm_a = vaddvq_f32(na0);
+        let mut norm_b = vaddvq_f32(nb0);
+        while i < n {
+            let av = *ap.add(i);
+            let bv = *bp.add(i);
+            dot += av * bv;
+            norm_a += av * av;
+            norm_b += bv * bv;
+            i += 1;
+        }
+        let denom = (norm_a * norm_b).sqrt();
+        if denom < f32::EPSILON {
+            1.0
+        } else {
+            // Clamp: f32 rounding can produce tiny negatives for near-identical vectors
+            (1.0 - dot / denom).max(0.0)
+        }
     }
 }
 
@@ -2208,31 +2214,34 @@ fn cosine_distance_f32(a: &[f32], b: &[f32]) -> f32 {
 #[target_feature(enable = "neon")]
 #[inline]
 unsafe fn ip_distance_neon(ap: *const f32, bp: *const f32, n: usize) -> f32 {
-    use std::arch::aarch64::*;
-    let mut acc0 = vdupq_n_f32(0.0);
-    let mut acc1 = vdupq_n_f32(0.0);
-    let mut acc2 = vdupq_n_f32(0.0);
-    let mut acc3 = vdupq_n_f32(0.0);
-    let end16 = n & !15;
-    let mut i = 0;
-    while i < end16 {
-        acc0 = vfmaq_f32(acc0, vld1q_f32(ap.add(i)), vld1q_f32(bp.add(i)));
-        acc1 = vfmaq_f32(acc1, vld1q_f32(ap.add(i + 4)), vld1q_f32(bp.add(i + 4)));
-        acc2 = vfmaq_f32(acc2, vld1q_f32(ap.add(i + 8)), vld1q_f32(bp.add(i + 8)));
-        acc3 = vfmaq_f32(acc3, vld1q_f32(ap.add(i + 12)), vld1q_f32(bp.add(i + 12)));
-        i += 16;
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        use std::arch::aarch64::*;
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        let mut acc2 = vdupq_n_f32(0.0);
+        let mut acc3 = vdupq_n_f32(0.0);
+        let end16 = n & !15;
+        let mut i = 0;
+        while i < end16 {
+            acc0 = vfmaq_f32(acc0, vld1q_f32(ap.add(i)), vld1q_f32(bp.add(i)));
+            acc1 = vfmaq_f32(acc1, vld1q_f32(ap.add(i + 4)), vld1q_f32(bp.add(i + 4)));
+            acc2 = vfmaq_f32(acc2, vld1q_f32(ap.add(i + 8)), vld1q_f32(bp.add(i + 8)));
+            acc3 = vfmaq_f32(acc3, vld1q_f32(ap.add(i + 12)), vld1q_f32(bp.add(i + 12)));
+            i += 16;
+        }
+        acc0 = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+        while i + 4 <= n {
+            acc0 = vfmaq_f32(acc0, vld1q_f32(ap.add(i)), vld1q_f32(bp.add(i)));
+            i += 4;
+        }
+        let mut dot = vaddvq_f32(acc0);
+        while i < n {
+            dot += *ap.add(i) * *bp.add(i);
+            i += 1;
+        }
+        -dot
     }
-    acc0 = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
-    while i + 4 <= n {
-        acc0 = vfmaq_f32(acc0, vld1q_f32(ap.add(i)), vld1q_f32(bp.add(i)));
-        i += 4;
-    }
-    let mut dot = vaddvq_f32(acc0);
-    while i < n {
-        dot += *ap.add(i) * *bp.add(i);
-        i += 1;
-    }
-    -dot
 }
 
 /// Negative inner product distance on f32 slices: -dot(a,b)
@@ -2711,16 +2720,15 @@ impl HnswIndex {
                         continue;
                     }
                     // Verify byte equality (hash collision guard)
-                    if let Some(&node_id) = inner.row_id_to_node.get(candidate_row_id) {
-                        if !inner.is_deleted(node_id) {
-                            let offset = node_id as usize * inner.dims_bytes;
-                            if let Some(existing_bytes) =
-                                inner.vectors.get(offset..offset + inner.dims_bytes)
-                            {
-                                if existing_bytes == vec_bytes {
-                                    return Some(candidate_row_id);
-                                }
-                            }
+                    if let Some(&node_id) = inner.row_id_to_node.get(candidate_row_id)
+                        && !inner.is_deleted(node_id)
+                    {
+                        let offset = node_id as usize * inner.dims_bytes;
+                        if let Some(existing_bytes) =
+                            inner.vectors.get(offset..offset + inner.dims_bytes)
+                            && existing_bytes == vec_bytes
+                        {
+                            return Some(candidate_row_id);
                         }
                     }
                 }
@@ -2740,10 +2748,10 @@ impl HnswIndex {
                 continue;
             }
             let offset = node_idx * inner.dims_bytes;
-            if let Some(existing_bytes) = inner.vectors.get(offset..offset + inner.dims_bytes) {
-                if existing_bytes == vec_bytes {
-                    return Some(existing_row_id);
-                }
+            if let Some(existing_bytes) = inner.vectors.get(offset..offset + inner.dims_bytes)
+                && existing_bytes == vec_bytes
+            {
+                return Some(existing_row_id);
             }
         }
         None

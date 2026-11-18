@@ -909,34 +909,34 @@ fn main() {
         // Timestamp restore: open the database normally and use the engine's
         // restore_snapshot() API, which loads the specific timestamp without
         // deleting other backup files. Other snapshots are preserved.
-        if let Some(ref ts) = args.restore {
-            if !ts.is_empty() {
-                if !args.quiet {
-                    eprintln!("[restore] Restoring to timestamp: {}", ts);
-                }
-
-                let db = match Database::open(&db_path) {
-                    Ok(db) => db,
-                    Err(e) => {
-                        eprintln!("Error opening database: {}", e);
-                        std::process::exit(1);
-                    }
-                };
-
-                match db.restore_snapshot(Some(ts)) {
-                    Ok(msg) => {
-                        println!("{}", msg);
-                    }
-                    Err(e) => {
-                        eprintln!("Error restoring snapshot: {}", e);
-                        db.close().unwrap_or(());
-                        std::process::exit(1);
-                    }
-                }
-
-                db.close().unwrap_or(());
-                return;
+        if let Some(ref ts) = args.restore
+            && !ts.is_empty()
+        {
+            if !args.quiet {
+                eprintln!("[restore] Restoring to timestamp: {}", ts);
             }
+
+            let db = match Database::open(&db_path) {
+                Ok(db) => db,
+                Err(e) => {
+                    eprintln!("Error opening database: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            match db.restore_snapshot(Some(ts)) {
+                Ok(msg) => {
+                    println!("{}", msg);
+                }
+                Err(e) => {
+                    eprintln!("Error restoring snapshot: {}", e);
+                    db.close().unwrap_or(());
+                    std::process::exit(1);
+                }
+            }
+
+            db.close().unwrap_or(());
+            return;
         }
 
         // Crash recovery (no timestamp): find the newest complete manifest
@@ -1070,18 +1070,18 @@ fn main() {
 
             // Remove volumes/ and wal/ for clean startup
             let vol_dir = dir.join("volumes");
-            if vol_dir.exists() {
-                if let Err(e) = std::fs::remove_dir_all(&vol_dir) {
-                    eprintln!("Error removing volumes/: {}", e);
-                    std::process::exit(1);
-                }
+            if vol_dir.exists()
+                && let Err(e) = std::fs::remove_dir_all(&vol_dir)
+            {
+                eprintln!("Error removing volumes/: {}", e);
+                std::process::exit(1);
             }
             let wal_dir = dir.join("wal");
-            if wal_dir.exists() {
-                if let Err(e) = std::fs::remove_dir_all(&wal_dir) {
-                    eprintln!("Error removing wal/: {}", e);
-                    std::process::exit(1);
-                }
+            if wal_dir.exists()
+                && let Err(e) = std::fs::remove_dir_all(&wal_dir)
+            {
+                eprintln!("Error removing wal/: {}", e);
+                std::process::exit(1);
             }
 
             let db = match Database::open(&db_path) {
@@ -1140,10 +1140,10 @@ fn main() {
     if args.snapshot {
         match db.query("PRAGMA SNAPSHOT", ()) {
             Ok(mut rows) => {
-                if let Some(Ok(row)) = rows.next() {
-                    if let Ok(msg) = row.get::<String>(0) {
-                        println!("{}", msg);
-                    }
+                if let Some(Ok(row)) = rows.next()
+                    && let Ok(msg) = row.get::<String>(0)
+                {
+                    println!("{}", msg);
                 }
             }
             Err(e) => {
@@ -1509,10 +1509,10 @@ fn convert_param_value(value: &str) -> Value {
     }
 
     // Try to convert to float (only if contains '.')
-    if value.contains('.') {
-        if let Ok(f) = value.parse::<f64>() {
-            return Value::Float(f);
-        }
+    if value.contains('.')
+        && let Ok(f) = value.parse::<f64>()
+    {
+        return Value::Float(f);
     }
 
     // Try to convert to boolean
@@ -1651,15 +1651,15 @@ const C_CTE: &str = "\x1b[38;5;183m"; // Lavender for CTE/subquery scans
 
 /// Check if rows look like EXPLAIN plan output (not a regular query with a "plan" column)
 fn is_explain_output(rows: &[Vec<Value>]) -> bool {
-    if let Some(first_row) = rows.first() {
-        if let Some(Value::Text(line)) = first_row.first() {
-            let trimmed = line.trim();
-            return trimmed.starts_with("SELECT")
-                || trimmed.starts_with("INSERT")
-                || trimmed.starts_with("UPDATE")
-                || trimmed.starts_with("DELETE")
-                || trimmed.starts_with("WITH ");
-        }
+    if let Some(first_row) = rows.first()
+        && let Some(Value::Text(line)) = first_row.first()
+    {
+        let trimmed = line.trim();
+        return trimmed.starts_with("SELECT")
+            || trimmed.starts_with("INSERT")
+            || trimmed.starts_with("UPDATE")
+            || trimmed.starts_with("DELETE")
+            || trimmed.starts_with("WITH ");
     }
     false
 }

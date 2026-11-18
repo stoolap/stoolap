@@ -93,10 +93,10 @@ impl AggregateFunction for FirstFunction {
     }
 
     fn result(&self) -> Result<Value> {
-        if self.has_order_by {
-            if let Some(ref entry) = self.best_entry {
-                return Ok(entry.value.clone());
-            }
+        if self.has_order_by
+            && let Some(ref entry) = self.best_entry
+        {
+            return Ok(entry.value.clone());
         }
 
         Ok(self.first_value.clone().unwrap_or_else(Value::null_unknown))

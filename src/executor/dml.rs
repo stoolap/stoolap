@@ -166,19 +166,18 @@ pub(crate) fn validate_coercion(
         )));
     }
     // Validate vector dimension matches column definition
-    if target_type == DataType::Vector {
-        if let Value::Extension(data) = coerced {
-            if data.first() == Some(&(DataType::Vector as u8)) {
-                // Payload is packed LE f32 bytes after the tag byte
-                let got_dim = u16::try_from((data.len() - 1) / 4).unwrap_or(u16::MAX);
-                // vector_dimensions == 0 means unspecified, skip check
-                if vector_dimensions > 0 && got_dim != vector_dimensions {
-                    return Err(Error::VectorDimensionMismatch {
-                        expected: vector_dimensions,
-                        got: got_dim,
-                    });
-                }
-            }
+    if target_type == DataType::Vector
+        && let Value::Extension(data) = coerced
+        && data.first() == Some(&(DataType::Vector as u8))
+    {
+        // Payload is packed LE f32 bytes after the tag byte
+        let got_dim = u16::try_from((data.len() - 1) / 4).unwrap_or(u16::MAX);
+        // vector_dimensions == 0 means unspecified, skip check
+        if vector_dimensions > 0 && got_dim != vector_dimensions {
+            return Err(Error::VectorDimensionMismatch {
+                expected: vector_dimensions,
+                got: got_dim,
+            });
         }
     }
     Ok(())
@@ -213,10 +212,10 @@ fn try_extract_simple_value(expr: &Expression, ctx: &ExecutionContext) -> Option
     if let Some(v) = try_extract_literal(expr) {
         return Some(v);
     }
-    if let Expression::Parameter(param) = expr {
-        if param.index > 0 {
-            return ctx.params().get(param.index - 1).cloned();
-        }
+    if let Expression::Parameter(param) = expr
+        && param.index > 0
+    {
+        return ctx.params().get(param.index - 1).cloned();
     }
     None
 }
@@ -616,13 +615,12 @@ pub(crate) fn move_rows(table: &mut dyn Table, moves: Vec<(i64, Row)>) -> Result
         return Ok(());
     }
     let schema = table.schema();
-    if let Some(pk) = schema.pk_column_index() {
-        if moves
+    if let Some(pk) = schema.pk_column_index()
+        && moves
             .iter()
             .any(|(_, row)| row.get(pk).is_none_or(Value::is_null))
-        {
-            return Err(Error::not_null_constraint(&schema.columns[pk].name));
-        }
+    {
+        return Err(Error::not_null_constraint(&schema.columns[pk].name));
     }
     let ids: Vec<i64> = moves.iter().map(|(id, _)| *id).collect();
     table.delete_by_row_ids(&ids)?;
@@ -685,10 +683,10 @@ fn compile_check(
     let mut reads = SmallVec::new();
     super::utils::visit_column_refs(&expr, &mut |reference| {
         let read = binding.reference(reference).and_then(|r| r.row_column());
-        if let Some(i) = read.map(usize::from) {
-            if !reads.contains(&i) {
-                reads.push(i);
-            }
+        if let Some(i) = read.map(usize::from)
+            && !reads.contains(&i)
+        {
+            reads.push(i);
         }
     });
     let registry = crate::functions::registry::global_registry();
@@ -1395,37 +1393,35 @@ impl Executor {
             // Nor one that outlasted its deadline
             ctx.check_deadline()?;
             // Commit if this is a standalone (auto-commit) transaction
-            if should_auto_commit {
-                if let Some(mut tx) = standalone_tx {
-                    match tx.commit() {
-                        Ok(()) => {}
-                        Err(e)
-                            if (stmt.on_duplicate || stmt.do_nothing)
-                                && e.is_pk_or_unique_violation() =>
-                        {
-                            if stmt.on_duplicate && ctx.query_depth == 0 {
-                                // Commit-time PK/unique violation during upsert:
-                                // a concurrent plain INSERT committed first. Retry once.
-                                drop(returning_result);
-                                drop(_upsert_guard);
-                                let (stmt, ctx, plan) = retry_of;
-                                let retry_ctx = ctx.with_incremented_query_depth();
-                                return self.execute_insert(stmt, &retry_ctx, plan);
-                            }
-                            if stmt.do_nothing {
-                                // DO NOTHING: returning 0 rows is the correct semantic
-                                rows_affected = 0;
-                                if let Some(result) = &mut returning_result {
-                                    *result = Box::new(ExecutorResult::with_columns(
-                                        result.columns().to_vec(),
-                                    ));
-                                }
-                            } else {
-                                return Err(e);
-                            }
+            if should_auto_commit && let Some(mut tx) = standalone_tx {
+                match tx.commit() {
+                    Ok(()) => {}
+                    Err(e)
+                        if (stmt.on_duplicate || stmt.do_nothing)
+                            && e.is_pk_or_unique_violation() =>
+                    {
+                        if stmt.on_duplicate && ctx.query_depth == 0 {
+                            // Commit-time PK/unique violation during upsert:
+                            // a concurrent plain INSERT committed first. Retry once.
+                            drop(returning_result);
+                            drop(_upsert_guard);
+                            let (stmt, ctx, plan) = retry_of;
+                            let retry_ctx = ctx.with_incremented_query_depth();
+                            return self.execute_insert(stmt, &retry_ctx, plan);
                         }
-                        Err(e) => return Err(e),
+                        if stmt.do_nothing {
+                            // DO NOTHING: returning 0 rows is the correct semantic
+                            rows_affected = 0;
+                            if let Some(result) = &mut returning_result {
+                                *result = Box::new(ExecutorResult::with_columns(
+                                    result.columns().to_vec(),
+                                ));
+                            }
+                        } else {
+                            return Err(e);
+                        }
                     }
+                    Err(e) => return Err(e),
                 }
             }
 
@@ -1770,35 +1766,31 @@ impl Executor {
         // Nor one that outlasted its deadline
         ctx.check_deadline()?;
         // Commit if this is a standalone (auto-commit) transaction
-        if should_auto_commit {
-            if let Some(mut tx) = standalone_tx {
-                match tx.commit() {
-                    Ok(()) => {}
-                    Err(e)
-                        if (stmt.on_duplicate || stmt.do_nothing)
-                            && e.is_pk_or_unique_violation() =>
-                    {
-                        if stmt.on_duplicate && ctx.query_depth == 0 {
-                            drop(returning_result);
-                            drop(_upsert_guard);
-                            let (stmt, ctx, plan) = retry_of;
-                            let retry_ctx = ctx.with_incremented_query_depth();
-                            return self.execute_insert(stmt, &retry_ctx, plan);
-                        }
-                        if stmt.do_nothing {
-                            // DO NOTHING: returning 0 rows is the correct semantic
-                            rows_affected = 0;
-                            if let Some(result) = &mut returning_result {
-                                *result = Box::new(ExecutorResult::with_columns(
-                                    result.columns().to_vec(),
-                                ));
-                            }
-                        } else {
-                            return Err(e);
-                        }
+        if should_auto_commit && let Some(mut tx) = standalone_tx {
+            match tx.commit() {
+                Ok(()) => {}
+                Err(e)
+                    if (stmt.on_duplicate || stmt.do_nothing) && e.is_pk_or_unique_violation() =>
+                {
+                    if stmt.on_duplicate && ctx.query_depth == 0 {
+                        drop(returning_result);
+                        drop(_upsert_guard);
+                        let (stmt, ctx, plan) = retry_of;
+                        let retry_ctx = ctx.with_incremented_query_depth();
+                        return self.execute_insert(stmt, &retry_ctx, plan);
                     }
-                    Err(e) => return Err(e),
+                    if stmt.do_nothing {
+                        // DO NOTHING: returning 0 rows is the correct semantic
+                        rows_affected = 0;
+                        if let Some(result) = &mut returning_result {
+                            *result =
+                                Box::new(ExecutorResult::with_columns(result.columns().to_vec()));
+                        }
+                    } else {
+                        return Err(e);
+                    }
                 }
+                Err(e) => return Err(e),
             }
         }
 
@@ -1925,101 +1917,104 @@ impl Executor {
             column_names,
             programs,
             compiled_checks,
-        ) = if let Some(cached) = cached_insert
+        ) = match cached_insert
             .filter(|cached| cached.token == token && cached.validity.epoch() == opened_epoch)
         {
-            // Use cached values (Arc clone is cheap)
-            (
-                cached.column_indices,
-                cached.column_types,
-                cached.column_vector_dims,
-                cached.column_names,
-                cached.programs,
-                cached.compiled_checks,
-            )
-        } else {
-            // Compile and cache
-            let schema = table.schema();
-            let schema_column_count = schema.columns.len();
+            Some(cached) => {
+                // Use cached values (Arc clone is cheap)
+                (
+                    cached.column_indices,
+                    cached.column_types,
+                    cached.column_vector_dims,
+                    cached.column_names,
+                    cached.programs,
+                    cached.compiled_checks,
+                )
+            }
+            _ => {
+                // Compile and cache
+                let schema = table.schema();
+                let schema_column_count = schema.columns.len();
 
-            // Pre-compile CHECK constraints once per plan. A constraint that
-            // does not parse is skipped; one that fails to compile fails the
-            // INSERT instead of silently disabling the constraint (e.g. a
-            // stale check_expr after RENAME COLUMN).
-            let compiled_checks = compile_check_programs(schema)?;
+                // Pre-compile CHECK constraints once per plan. A constraint that
+                // does not parse is skipped; one that fails to compile fails the
+                // INSERT instead of silently disabling the constraint (e.g. a
+                // stale check_expr after RENAME COLUMN).
+                let compiled_checks = compile_check_programs(schema)?;
 
-            let all_column_types: Vec<DataType> =
-                schema.columns.iter().map(|c| c.data_type).collect();
+                let all_column_types: Vec<DataType> =
+                    schema.columns.iter().map(|c| c.data_type).collect();
 
-            // Constant defaults land in the template; non-literal defaults
-            // and VALUES expressions compile once and execute per row
-            let programs = Arc::new(InsertPrograms::of(schema, stmt));
+                // Constant defaults land in the template; non-literal defaults
+                // and VALUES expressions compile once and execute per row
+                let programs = Arc::new(InsertPrograms::of(schema, stmt));
 
-            let (column_indices, column_types, column_vector_dims, column_names) =
-                if stmt.columns.is_empty() {
-                    // No columns specified - insert into all columns in order
-                    let indices: Vec<usize> = (0..schema_column_count).collect();
-                    let types = all_column_types.clone();
-                    let dims: Vec<u16> =
-                        schema.columns.iter().map(|c| c.vector_dimensions).collect();
-                    let names: Vec<SmartString> = schema
-                        .columns
-                        .iter()
-                        .map(|c| SmartString::new(&c.name))
-                        .collect();
-                    (indices, types, dims, names)
-                } else {
-                    // Validate columns exist and pre-compute their indices
-                    let indices: Vec<usize> = stmt
-                        .columns
-                        .iter()
-                        .map(|id| {
-                            written_column(schema, id.value_lower.as_str())?
-                                .ok_or_else(|| Error::ColumnNotFound(id.value.to_string()))
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    let types: Vec<DataType> = indices
-                        .iter()
-                        .map(|&idx| schema.columns[idx].data_type)
-                        .collect();
-                    let dims: Vec<u16> = indices
-                        .iter()
-                        .map(|&idx| schema.columns[idx].vector_dimensions)
-                        .collect();
-                    let names: Vec<SmartString> = indices
-                        .iter()
-                        .map(|&idx| SmartString::new(&schema.columns[idx].name))
-                        .collect();
-                    (indices, types, dims, names)
+                let (column_indices, column_types, column_vector_dims, column_names) =
+                    if stmt.columns.is_empty() {
+                        // No columns specified - insert into all columns in order
+                        let indices: Vec<usize> = (0..schema_column_count).collect();
+                        let types = all_column_types.clone();
+                        let dims: Vec<u16> =
+                            schema.columns.iter().map(|c| c.vector_dimensions).collect();
+                        let names: Vec<SmartString> = schema
+                            .columns
+                            .iter()
+                            .map(|c| SmartString::new(&c.name))
+                            .collect();
+                        (indices, types, dims, names)
+                    } else {
+                        // Validate columns exist and pre-compute their indices
+                        let indices: Vec<usize> = stmt
+                            .columns
+                            .iter()
+                            .map(|id| {
+                                written_column(schema, id.value_lower.as_str())?
+                                    .ok_or_else(|| Error::ColumnNotFound(id.value.to_string()))
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        let types: Vec<DataType> = indices
+                            .iter()
+                            .map(|&idx| schema.columns[idx].data_type)
+                            .collect();
+                        let dims: Vec<u16> = indices
+                            .iter()
+                            .map(|&idx| schema.columns[idx].vector_dimensions)
+                            .collect();
+                        let names: Vec<SmartString> = indices
+                            .iter()
+                            .map(|&idx| SmartString::new(&schema.columns[idx].name))
+                            .collect();
+                        (indices, types, dims, names)
+                    };
+
+                // Store in cache for next execution
+                let compiled = CompiledInsert {
+                    table_name: SmartString::new(table_name),
+                    column_indices: Arc::new(column_indices.clone()),
+                    column_types: Arc::new(column_types.clone()),
+                    column_vector_dims: Arc::new(column_vector_dims.clone()),
+                    column_names: Arc::new(column_names.clone()),
+                    programs: Arc::clone(&programs),
+                    compiled_checks: Arc::new(compiled_checks.clone()),
+                    validity: self.insert_validity(stmt, current_epoch),
+                    token,
+                    reads_through_view,
+                    reads_prepared,
+                    prepared: None,
                 };
 
-            // Store in cache for next execution
-            let compiled = CompiledInsert {
-                table_name: SmartString::new(table_name),
-                column_indices: Arc::new(column_indices.clone()),
-                column_types: Arc::new(column_types.clone()),
-                column_vector_dims: Arc::new(column_vector_dims.clone()),
-                column_names: Arc::new(column_names.clone()),
-                programs: Arc::clone(&programs),
-                compiled_checks: Arc::new(compiled_checks.clone()),
-                validity: self.insert_validity(stmt, current_epoch),
-                token,
-                reads_through_view,
-                reads_prepared,
-                prepared: None,
-            };
+                // Update the cache
+                *compiled_cache.write() = CompiledExecution::Insert(compiled);
 
-            // Update the cache
-            *compiled_cache.write() = CompiledExecution::Insert(compiled);
-
-            (
-                Arc::new(column_indices),
-                Arc::new(column_types),
-                Arc::new(column_vector_dims),
-                Arc::new(column_names),
-                programs,
-                Arc::new(compiled_checks),
-            )
+                (
+                    Arc::new(column_indices),
+                    Arc::new(column_types),
+                    Arc::new(column_vector_dims),
+                    Arc::new(column_names),
+                    programs,
+                    Arc::new(compiled_checks),
+                )
+            }
         };
         let (default_row_template, default_programs) =
             (&programs.default_values, &programs.default_programs);
@@ -2219,14 +2214,22 @@ impl Executor {
                         } else {
                             // OPTIMIZATION: literals and bound parameters
                             // resolve directly (avoids VM compilation)
-                            let value = if let Some(simple) = try_extract_simple_value(expr, ctx) {
-                                simple
-                            } else if let Ok(at) =
-                                answers.binary_search_by_key(&(row, value_pos), |(at, _)| *at)
-                            {
-                                std::mem::replace(&mut answers[at].1, Value::null_unknown())
-                            } else {
-                                programs.value(&mut vm, &base_exec_ctx, (row, value_pos), expr)?
+                            let value = match try_extract_simple_value(expr, ctx) {
+                                Some(simple) => simple,
+                                _ => {
+                                    if let Ok(at) = answers
+                                        .binary_search_by_key(&(row, value_pos), |(at, _)| *at)
+                                    {
+                                        std::mem::replace(&mut answers[at].1, Value::null_unknown())
+                                    } else {
+                                        programs.value(
+                                            &mut vm,
+                                            &base_exec_ctx,
+                                            (row, value_pos),
+                                            expr,
+                                        )?
+                                    }
+                                }
                             };
 
                             let target_type = column_types[value_pos];
@@ -2303,10 +2306,8 @@ impl Executor {
         // Nor one that outlasted its deadline
         ctx.check_deadline()?;
         // Commit if this is a standalone (auto-commit) transaction
-        if should_auto_commit {
-            if let Some(mut tx) = standalone_tx {
-                tx.commit()?;
-            }
+        if should_auto_commit && let Some(mut tx) = standalone_tx {
+            tx.commit()?;
         }
 
         statement_rollback.finish(Ok(Box::new(ExecResult::with_rows_affected(rows_affected))))
@@ -2809,14 +2810,14 @@ impl Executor {
                 // Track referenced column changes for FK cascade enforcement
                 if !ref_old_values.is_empty() {
                     for (ci, old_val) in &ref_old_values {
-                        if let Some(new_val) = row.get(*ci) {
-                            if old_val != new_val {
-                                ref_col_changes.borrow_mut().push((
-                                    *ci,
-                                    old_val.clone(),
-                                    new_val.clone(),
-                                ));
-                            }
+                        if let Some(new_val) = row.get(*ci)
+                            && old_val != new_val
+                        {
+                            ref_col_changes.borrow_mut().push((
+                                *ci,
+                                old_val.clone(),
+                                new_val.clone(),
+                            ));
                         }
                     }
                 }
@@ -2828,15 +2829,15 @@ impl Executor {
 
                 // A row whose key changes is held as it was, claimed for the
                 // statement, and moved once every row is set
-                if let (Some(key), Some(original)) = (key_set, original) {
-                    if row.get(key) != original.get(key) {
-                        let mut row = row;
-                        if widen {
-                            row.pop();
-                        }
-                        moves.borrow_mut().push((row_id, row));
-                        return Ok((original, true));
+                if let (Some(key), Some(original)) = (key_set, original)
+                    && row.get(key) != original.get(key)
+                {
+                    let mut row = row;
+                    if widen {
+                        row.pop();
                     }
+                    moves.borrow_mut().push((row_id, row));
+                    return Ok((original, true));
                 }
 
                 Ok((row, changed))
@@ -2852,7 +2853,8 @@ impl Executor {
 
             // OPTIMIZATION: Use SELECT executor to find matching row_ids, then batch update.
             // This reuses ALL SELECT optimizations: indexes, semi-joins, parallel execution, etc.
-            let rows = if let Some(candidates) = candidates {
+
+            if let Some(candidates) = candidates {
                 match candidates {
                     Candidates::Pruned => 0,
                     Candidates::Keyed(mut row_ids) => {
@@ -2890,8 +2892,7 @@ impl Executor {
                     &mut setter,
                     ctx.deadline_of_call(),
                 )?
-            };
-            rows
+            }
         };
         move_rows(&mut *table, moves.into_inner())?;
 
@@ -3898,18 +3899,17 @@ impl Executor {
                         .execute(program, &exec_ctx)?
                         .try_into_coerce_to_type(*col_type)?;
                     // Validate vector dimensions
-                    if *col_type == DataType::Vector && *vec_dims > 0 {
-                        if let Value::Extension(data) = &coerced {
-                            if data.first() == Some(&(DataType::Vector as u8)) {
-                                let got_dim =
-                                    u16::try_from((data.len() - 1) / 4).unwrap_or(u16::MAX);
-                                if got_dim != *vec_dims {
-                                    return Err(Error::VectorDimensionMismatch {
-                                        expected: *vec_dims,
-                                        got: got_dim,
-                                    });
-                                }
-                            }
+                    if *col_type == DataType::Vector
+                        && *vec_dims > 0
+                        && let Value::Extension(data) = &coerced
+                        && data.first() == Some(&(DataType::Vector as u8))
+                    {
+                        let got_dim = u16::try_from((data.len() - 1) / 4).unwrap_or(u16::MAX);
+                        if got_dim != *vec_dims {
+                            return Err(Error::VectorDimensionMismatch {
+                                expected: *vec_dims,
+                                got: got_dim,
+                            });
                         }
                     }
                     updates.push((*idx, coerced));
@@ -3949,14 +3949,14 @@ impl Executor {
                     false => row.clone(),
                 });
             }
-            if let (Some(key), Some(mut original)) = (key_set, original) {
-                if row.get(key) != original.get(key) {
-                    if effective.widens {
-                        original.pop();
-                    }
-                    moves.push((id, row));
-                    return Ok((original, true));
+            if let (Some(key), Some(mut original)) = (key_set, original)
+                && row.get(key) != original.get(key)
+            {
+                if effective.widens {
+                    original.pop();
                 }
+                moves.push((id, row));
+                return Ok((original, true));
             }
 
             Ok((row, changed))

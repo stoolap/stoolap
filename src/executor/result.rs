@@ -543,10 +543,10 @@ impl QueryResult for LimitedResult {
         }
 
         // Check limit
-        if let Some(limit) = self.limit {
-            if self.returned_count >= limit {
-                return false;
-            }
+        if let Some(limit) = self.limit
+            && self.returned_count >= limit
+        {
+            return false;
         }
 
         // Get next row

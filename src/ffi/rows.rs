@@ -36,53 +36,57 @@ use super::{
 /// # Safety
 ///
 /// `rows` must be a valid `StoolapRows` pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_rows_next(rows: *mut StoolapRows) -> i32 {
-    let handle = match rows.as_mut() {
-        Some(h) => h,
-        None => return STOOLAP_ERROR,
-    };
-
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let rows_inner = match &mut handle.rows {
-            Some(r) => r,
-            None => return STOOLAP_DONE,
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        let handle = match rows.as_mut() {
+            Some(h) => h,
+            None => return STOOLAP_ERROR,
         };
 
-        handle.row_gen += 1;
-        if rows_inner.advance() {
-            // A TIMESTAMP the C API cannot carry as nanoseconds is an error,
-            // not the epoch a column read would give
-            let unrepresentable = rows_inner
-                .current_row()
-                .as_slice()
-                .iter()
-                .find_map(|value| match value {
-                    Value::Timestamp(t) => crate::core::value::timestamp_nanos(t).err(),
-                    _ => None,
-                });
-            if let Some(err) = unrepresentable {
-                handle.has_row = false;
-                handle.set_error(&err.to_string());
-                return STOOLAP_ERROR;
-            }
-            handle.has_row = true;
-            STOOLAP_ROW
-        } else {
-            handle.has_row = false;
-            // Check for runtime filter errors (e.g., invalid parameterized REGEXP)
-            if let Some(err) = rows_inner.error() {
-                handle.set_error(&err.to_string());
-                return STOOLAP_ERROR;
-            }
-            STOOLAP_DONE
-        }
-    }));
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let rows_inner = match &mut handle.rows {
+                Some(r) => r,
+                None => return STOOLAP_DONE,
+            };
 
-    result.unwrap_or_else(|_| {
-        handle.set_error("panic during stoolap_rows_next");
-        STOOLAP_ERROR
-    })
+            handle.row_gen += 1;
+            if rows_inner.advance() {
+                // A TIMESTAMP the C API cannot carry as nanoseconds is an error,
+                // not the epoch a column read would give
+                let unrepresentable =
+                    rows_inner
+                        .current_row()
+                        .as_slice()
+                        .iter()
+                        .find_map(|value| match value {
+                            Value::Timestamp(t) => crate::core::value::timestamp_nanos(t).err(),
+                            _ => None,
+                        });
+                if let Some(err) = unrepresentable {
+                    handle.has_row = false;
+                    handle.set_error(&err.to_string());
+                    return STOOLAP_ERROR;
+                }
+                handle.has_row = true;
+                STOOLAP_ROW
+            } else {
+                handle.has_row = false;
+                // Check for runtime filter errors (e.g., invalid parameterized REGEXP)
+                if let Some(err) = rows_inner.error() {
+                    handle.set_error(&err.to_string());
+                    return STOOLAP_ERROR;
+                }
+                STOOLAP_DONE
+            }
+        }));
+
+        result.unwrap_or_else(|_| {
+            handle.set_error("panic during stoolap_rows_next");
+            STOOLAP_ERROR
+        })
+    }
 }
 
 /// Get the number of columns in the result set.
@@ -90,11 +94,14 @@ pub unsafe extern "C" fn stoolap_rows_next(rows: *mut StoolapRows) -> i32 {
 /// # Safety
 ///
 /// `rows` must be a valid `StoolapRows` pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_rows_column_count(rows: *const StoolapRows) -> i32 {
-    match rows.as_ref() {
-        Some(handle) => handle.columns.len() as i32,
-        None => 0,
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        match rows.as_ref() {
+            Some(handle) => handle.columns.len() as i32,
+            None => 0,
+        }
     }
 }
 
@@ -106,23 +113,26 @@ pub unsafe extern "C" fn stoolap_rows_column_count(rows: *const StoolapRows) -> 
 /// # Safety
 ///
 /// `rows` must be a valid `StoolapRows` pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_rows_column_name(
     rows: *const StoolapRows,
     index: i32,
 ) -> *const c_char {
-    let handle = match rows.as_ref() {
-        Some(h) => h,
-        None => return std::ptr::null(),
-    };
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        let handle = match rows.as_ref() {
+            Some(h) => h,
+            None => return std::ptr::null(),
+        };
 
-    if index < 0 {
-        return std::ptr::null();
-    }
+        if index < 0 {
+            return std::ptr::null();
+        }
 
-    match handle.column_cstrs().get(index as usize) {
-        Some(cs) => cs.as_ptr(),
-        None => std::ptr::null(),
+        match handle.column_cstrs().get(index as usize) {
+            Some(cs) => cs.as_ptr(),
+            None => std::ptr::null(),
+        }
     }
 }
 
@@ -143,30 +153,33 @@ unsafe fn get_current_value(handle: &StoolapRows, index: i32) -> Option<&Value> 
 /// # Safety
 ///
 /// `rows` must be a valid `StoolapRows` pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_rows_column_type(rows: *const StoolapRows, index: i32) -> i32 {
-    let handle = match rows.as_ref() {
-        Some(h) => h,
-        None => return STOOLAP_TYPE_NULL,
-    };
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        let handle = match rows.as_ref() {
+            Some(h) => h,
+            None => return STOOLAP_TYPE_NULL,
+        };
 
-    match get_current_value(handle, index) {
-        Some(val) => {
-            if val.is_null() {
-                return STOOLAP_TYPE_NULL;
+        match get_current_value(handle, index) {
+            Some(val) => {
+                if val.is_null() {
+                    return STOOLAP_TYPE_NULL;
+                }
+                match val.data_type() {
+                    DataType::Null => STOOLAP_TYPE_NULL,
+                    DataType::Integer => STOOLAP_TYPE_INTEGER,
+                    DataType::Float => STOOLAP_TYPE_FLOAT,
+                    DataType::Text => STOOLAP_TYPE_TEXT,
+                    DataType::Boolean => STOOLAP_TYPE_BOOLEAN,
+                    DataType::Timestamp => STOOLAP_TYPE_TIMESTAMP,
+                    DataType::Json => STOOLAP_TYPE_JSON,
+                    DataType::Vector => STOOLAP_TYPE_BLOB,
+                }
             }
-            match val.data_type() {
-                DataType::Null => STOOLAP_TYPE_NULL,
-                DataType::Integer => STOOLAP_TYPE_INTEGER,
-                DataType::Float => STOOLAP_TYPE_FLOAT,
-                DataType::Text => STOOLAP_TYPE_TEXT,
-                DataType::Boolean => STOOLAP_TYPE_BOOLEAN,
-                DataType::Timestamp => STOOLAP_TYPE_TIMESTAMP,
-                DataType::Json => STOOLAP_TYPE_JSON,
-                DataType::Vector => STOOLAP_TYPE_BLOB,
-            }
+            None => STOOLAP_TYPE_NULL,
         }
-        None => STOOLAP_TYPE_NULL,
     }
 }
 
@@ -175,16 +188,19 @@ pub unsafe extern "C" fn stoolap_rows_column_type(rows: *const StoolapRows, inde
 /// # Safety
 ///
 /// `rows` must be a valid `StoolapRows` pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_rows_column_int64(rows: *const StoolapRows, index: i32) -> i64 {
-    let handle = match rows.as_ref() {
-        Some(h) => h,
-        None => return 0,
-    };
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        let handle = match rows.as_ref() {
+            Some(h) => h,
+            None => return 0,
+        };
 
-    match get_current_value(handle, index) {
-        Some(val) => val.as_int64().unwrap_or(0),
-        None => 0,
+        match get_current_value(handle, index) {
+            Some(val) => val.as_int64().unwrap_or(0),
+            None => 0,
+        }
     }
 }
 
@@ -193,16 +209,19 @@ pub unsafe extern "C" fn stoolap_rows_column_int64(rows: *const StoolapRows, ind
 /// # Safety
 ///
 /// `rows` must be a valid `StoolapRows` pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_rows_column_double(rows: *const StoolapRows, index: i32) -> f64 {
-    let handle = match rows.as_ref() {
-        Some(h) => h,
-        None => return 0.0,
-    };
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        let handle = match rows.as_ref() {
+            Some(h) => h,
+            None => return 0.0,
+        };
 
-    match get_current_value(handle, index) {
-        Some(val) => val.as_float64().unwrap_or(0.0),
-        None => 0.0,
+        match get_current_value(handle, index) {
+            Some(val) => val.as_float64().unwrap_or(0.0),
+            None => 0.0,
+        }
     }
 }
 
@@ -215,65 +234,68 @@ pub unsafe extern "C" fn stoolap_rows_column_double(rows: *const StoolapRows, in
 /// # Safety
 ///
 /// `rows` must be a valid `StoolapRows` pointer. `out_len` may be NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_rows_column_text(
     rows: *mut StoolapRows,
     index: i32,
     out_len: *mut i64,
 ) -> *const c_char {
-    let handle = match rows.as_mut() {
-        Some(h) => h,
-        None => return std::ptr::null(),
-    };
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        let handle = match rows.as_mut() {
+            Some(h) => h,
+            None => return std::ptr::null(),
+        };
 
-    if !handle.has_row || index < 0 {
-        return std::ptr::null();
-    }
-
-    let idx = index as usize;
-    let row_gen = handle.row_gen;
-    let fresh = match handle.text_cache.get(idx) {
-        Some((read_at, _)) => *read_at != row_gen,
-        None => true,
-    };
-    if fresh {
-        let Some(rows_inner) = &handle.rows else {
-            return std::ptr::null();
-        };
-        let Some(val) = rows_inner.current_row().get(idx) else {
-            return std::ptr::null();
-        };
-        if handle.text_cache.len() <= idx {
-            let len = handle.columns.len().max(idx + 1);
-            handle
-                .text_cache
-                .resize_with(len, || (u64::MAX, Vec::new()));
-        }
-        let (read_at, buf) = &mut handle.text_cache[idx];
-        // Interior NULs are kept: out_len gives the full text, a C string
-        // reader stops at the first one
-        let mut fill = |s: &str| {
-            buf.clear();
-            buf.reserve(s.len() + 1);
-            buf.extend_from_slice(s.as_bytes());
-            buf.push(0);
-        };
-        if let Some(s) = val.as_str() {
-            fill(s);
-        } else if let Some(s) = val.as_string() {
-            fill(&s);
-        } else {
+        if !handle.has_row || index < 0 {
             return std::ptr::null();
         }
-        *read_at = row_gen;
-    }
 
-    let (_, cached) = &handle.text_cache[idx];
-    if !out_len.is_null() {
-        // Length excludes the trailing NUL terminator
-        *out_len = (cached.len() - 1) as i64;
+        let idx = index as usize;
+        let row_gen = handle.row_gen;
+        let fresh = match handle.text_cache.get(idx) {
+            Some((read_at, _)) => *read_at != row_gen,
+            None => true,
+        };
+        if fresh {
+            let Some(rows_inner) = &handle.rows else {
+                return std::ptr::null();
+            };
+            let Some(val) = rows_inner.current_row().get(idx) else {
+                return std::ptr::null();
+            };
+            if handle.text_cache.len() <= idx {
+                let len = handle.columns.len().max(idx + 1);
+                handle
+                    .text_cache
+                    .resize_with(len, || (u64::MAX, Vec::new()));
+            }
+            let (read_at, buf) = &mut handle.text_cache[idx];
+            // Interior NULs are kept: out_len gives the full text, a C string
+            // reader stops at the first one
+            let mut fill = |s: &str| {
+                buf.clear();
+                buf.reserve(s.len() + 1);
+                buf.extend_from_slice(s.as_bytes());
+                buf.push(0);
+            };
+            if let Some(s) = val.as_str() {
+                fill(s);
+            } else if let Some(s) = val.as_string() {
+                fill(&s);
+            } else {
+                return std::ptr::null();
+            }
+            *read_at = row_gen;
+        }
+
+        let (_, cached) = &handle.text_cache[idx];
+        if !out_len.is_null() {
+            // Length excludes the trailing NUL terminator
+            *out_len = (cached.len() - 1) as i64;
+        }
+        cached.as_ptr() as *const c_char
     }
-    cached.as_ptr() as *const c_char
 }
 
 /// Get a boolean value from the current row. Returns 0 (false) if NULL or not convertible.
@@ -281,17 +303,20 @@ pub unsafe extern "C" fn stoolap_rows_column_text(
 /// # Safety
 ///
 /// `rows` must be a valid `StoolapRows` pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_rows_column_bool(rows: *const StoolapRows, index: i32) -> i32 {
-    let handle = match rows.as_ref() {
-        Some(h) => h,
-        None => return 0,
-    };
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        let handle = match rows.as_ref() {
+            Some(h) => h,
+            None => return 0,
+        };
 
-    match get_current_value(handle, index) {
-        Some(val) if val.as_boolean().unwrap_or(false) => 1,
-        Some(_) => 0,
-        None => 0,
+        match get_current_value(handle, index) {
+            Some(val) if val.as_boolean().unwrap_or(false) => 1,
+            Some(_) => 0,
+            None => 0,
+        }
     }
 }
 
@@ -301,22 +326,25 @@ pub unsafe extern "C" fn stoolap_rows_column_bool(rows: *const StoolapRows, inde
 /// # Safety
 ///
 /// `rows` must be a valid `StoolapRows` pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_rows_column_timestamp(
     rows: *const StoolapRows,
     index: i32,
 ) -> i64 {
-    let handle = match rows.as_ref() {
-        Some(h) => h,
-        None => return 0,
-    };
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        let handle = match rows.as_ref() {
+            Some(h) => h,
+            None => return 0,
+        };
 
-    match get_current_value(handle, index) {
-        Some(val) => match val.as_timestamp() {
-            Some(ts) => ts.timestamp_nanos_opt().unwrap_or(0),
+        match get_current_value(handle, index) {
+            Some(val) => match val.as_timestamp() {
+                Some(ts) => ts.timestamp_nanos_opt().unwrap_or(0),
+                None => 0,
+            },
             None => 0,
-        },
-        None => 0,
+        }
     }
 }
 
@@ -329,42 +357,45 @@ pub unsafe extern "C" fn stoolap_rows_column_timestamp(
 /// # Safety
 ///
 /// `rows` must be a valid `StoolapRows` pointer. `out_len` must not be NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_rows_column_blob(
     rows: *const StoolapRows,
     index: i32,
     out_len: *mut i64,
 ) -> *const u8 {
-    if !out_len.is_null() {
-        *out_len = 0;
-    }
-
-    let handle = match rows.as_ref() {
-        Some(h) => h,
-        None => return std::ptr::null(),
-    };
-
-    if !handle.has_row || index < 0 {
-        return std::ptr::null();
-    }
-
-    let rows_inner = match &handle.rows {
-        Some(r) => r,
-        None => return std::ptr::null(),
-    };
-
-    let row = rows_inner.current_row();
-    match row.get(index as usize) {
-        Some(Value::Extension(data)) if data.first() == Some(&(DataType::Vector as u8)) => {
-            // Skip the internal type-tag byte; expose only the f32 payload.
-            // For empty vectors (tag byte only), returns a valid pointer with len=0.
-            let payload = &data[1..];
-            if !out_len.is_null() {
-                *out_len = payload.len() as i64;
-            }
-            payload.as_ptr()
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        if !out_len.is_null() {
+            *out_len = 0;
         }
-        _ => std::ptr::null(),
+
+        let handle = match rows.as_ref() {
+            Some(h) => h,
+            None => return std::ptr::null(),
+        };
+
+        if !handle.has_row || index < 0 {
+            return std::ptr::null();
+        }
+
+        let rows_inner = match &handle.rows {
+            Some(r) => r,
+            None => return std::ptr::null(),
+        };
+
+        let row = rows_inner.current_row();
+        match row.get(index as usize) {
+            Some(Value::Extension(data)) if data.first() == Some(&(DataType::Vector as u8)) => {
+                // Skip the internal type-tag byte; expose only the f32 payload.
+                // For empty vectors (tag byte only), returns a valid pointer with len=0.
+                let payload = &data[1..];
+                if !out_len.is_null() {
+                    *out_len = payload.len() as i64;
+                }
+                payload.as_ptr()
+            }
+            _ => std::ptr::null(),
+        }
     }
 }
 
@@ -374,22 +405,25 @@ pub unsafe extern "C" fn stoolap_rows_column_blob(
 /// # Safety
 ///
 /// `rows` must be a valid `StoolapRows` pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_rows_column_is_null(rows: *const StoolapRows, index: i32) -> i32 {
-    let handle = match rows.as_ref() {
-        Some(h) => h,
-        None => return 1,
-    };
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        let handle = match rows.as_ref() {
+            Some(h) => h,
+            None => return 1,
+        };
 
-    match get_current_value(handle, index) {
-        Some(val) => {
-            if val.is_null() {
-                1
-            } else {
-                0
+        match get_current_value(handle, index) {
+            Some(val) => {
+                if val.is_null() {
+                    1
+                } else {
+                    0
+                }
             }
+            None => 1,
         }
-        None => 1,
     }
 }
 
@@ -398,11 +432,14 @@ pub unsafe extern "C" fn stoolap_rows_column_is_null(rows: *const StoolapRows, i
 /// # Safety
 ///
 /// `rows` must be a valid `StoolapRows` pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_rows_affected(rows: *const StoolapRows) -> i64 {
-    match rows.as_ref() {
-        Some(handle) => handle.rows_affected,
-        None => 0,
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        match rows.as_ref() {
+            Some(handle) => handle.rows_affected,
+            None => 0,
+        }
     }
 }
 
@@ -525,10 +562,10 @@ fn write_rows(
         }
         row_count += 1;
     }
-    if (row_count as usize) < max_rows {
-        if let Some(err) = rows.error() {
-            return Err(err);
-        }
+    if (row_count as usize) < max_rows
+        && let Some(err) = rows.error()
+    {
+        return Err(err);
     }
     buf[count_at..count_at + 4].copy_from_slice(&row_count.to_le_bytes());
     Ok(row_count)
@@ -571,56 +608,59 @@ pub(crate) fn pack_all(rows: &mut Rows, buf: &mut Vec<u8>) -> Result<u32> {
 /// # Safety
 ///
 /// `rows` must be a valid `StoolapRows` pointer. `out_buf` and `out_len` must not be NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_rows_fetch_all(
     rows: *mut StoolapRows,
     out_buf: *mut *mut u8,
     out_len: *mut i64,
 ) -> i32 {
-    if out_buf.is_null() || out_len.is_null() {
-        return STOOLAP_ERROR;
-    }
-    *out_buf = std::ptr::null_mut();
-    *out_len = 0;
-
-    let handle = match rows.as_mut() {
-        Some(h) => h,
-        None => return STOOLAP_ERROR,
-    };
-
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let mut buf = Vec::with_capacity(4096);
-        let col_count = handle.columns.len();
-        let header = write_header(handle.columns.iter().map(|n| n.as_bytes()), &mut buf);
-        let packed = header.and_then(|count_at| match &mut handle.rows {
-            Some(r) => write_rows(r, col_count, usize::MAX, count_at, &mut buf),
-            None => Ok(0),
-        });
-        if let Err(e) = packed {
-            handle.set_error(&e.to_string());
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        if out_buf.is_null() || out_len.is_null() {
             return STOOLAP_ERROR;
         }
+        *out_buf = std::ptr::null_mut();
+        *out_len = 0;
 
-        // Transfer ownership to caller.
-        // into_boxed_slice guarantees len == capacity (unlike shrink_to_fit
-        // which is only a hint). This makes stoolap_buffer_free safe.
-        let boxed = buf.into_boxed_slice();
-        let len = boxed.len();
-        let ptr = Box::into_raw(boxed) as *mut u8;
+        let handle = match rows.as_mut() {
+            Some(h) => h,
+            None => return STOOLAP_ERROR,
+        };
 
-        *out_buf = ptr;
-        *out_len = len as i64;
-        STOOLAP_OK
-    }));
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let mut buf = Vec::with_capacity(4096);
+            let col_count = handle.columns.len();
+            let header = write_header(handle.columns.iter().map(|n| n.as_bytes()), &mut buf);
+            let packed = header.and_then(|count_at| match &mut handle.rows {
+                Some(r) => write_rows(r, col_count, usize::MAX, count_at, &mut buf),
+                None => Ok(0),
+            });
+            if let Err(e) = packed {
+                handle.set_error(&e.to_string());
+                return STOOLAP_ERROR;
+            }
 
-    // Close rows handle after fetching
-    handle.rows = None;
-    handle.has_row = false;
+            // Transfer ownership to caller.
+            // into_boxed_slice guarantees len == capacity (unlike shrink_to_fit
+            // which is only a hint). This makes stoolap_buffer_free safe.
+            let boxed = buf.into_boxed_slice();
+            let len = boxed.len();
+            let ptr = Box::into_raw(boxed) as *mut u8;
 
-    result.unwrap_or_else(|_| {
-        handle.set_error("panic during stoolap_rows_fetch_all");
-        STOOLAP_ERROR
-    })
+            *out_buf = ptr;
+            *out_len = len as i64;
+            STOOLAP_OK
+        }));
+
+        // Close rows handle after fetching
+        handle.rows = None;
+        handle.has_row = false;
+
+        result.unwrap_or_else(|_| {
+            handle.set_error("panic during stoolap_rows_fetch_all");
+            STOOLAP_ERROR
+        })
+    }
 }
 
 /// Fetch up to `max_rows` of the remaining rows into a packed buffer, in
@@ -635,7 +675,7 @@ pub unsafe extern "C" fn stoolap_rows_fetch_all(
 ///
 /// `rows` must be a valid `StoolapRows` pointer. `out_buf`, `out_len` and
 /// `out_rows` must not be NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_rows_fetch_chunk(
     rows: *mut StoolapRows,
     max_rows: i32,
@@ -643,56 +683,59 @@ pub unsafe extern "C" fn stoolap_rows_fetch_chunk(
     out_len: *mut i64,
     out_rows: *mut i32,
 ) -> i32 {
-    if out_buf.is_null() || out_len.is_null() || out_rows.is_null() {
-        return STOOLAP_ERROR;
-    }
-    *out_buf = std::ptr::null();
-    *out_len = 0;
-    *out_rows = 0;
-
-    let handle = match rows.as_mut() {
-        Some(h) => h,
-        None => return STOOLAP_ERROR,
-    };
-    if max_rows <= 0 {
-        handle.set_error("max_rows must be positive");
-        return STOOLAP_ERROR;
-    }
-
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        handle.has_row = false;
-        reset_packed(&mut handle.packed);
-        let names = handle.columns.iter().map(|n| n.as_bytes());
-        let header = write_header(names, &mut handle.packed);
-        let col_count = handle.columns.len();
-        let max = max_rows as usize;
-        let packed = header.and_then(|count_at| match &mut handle.rows {
-            Some(r) => write_rows(r, col_count, max, count_at, &mut handle.packed),
-            None => Ok(0),
-        });
-        match packed {
-            Ok(n) => {
-                if (n as usize) < max {
-                    handle.rows = None;
-                }
-                *out_buf = handle.packed.as_ptr();
-                *out_len = handle.packed.len() as i64;
-                *out_rows = n as i32;
-                STOOLAP_OK
-            }
-            Err(e) => {
-                handle.rows = None;
-                handle.set_error(&e.to_string());
-                STOOLAP_ERROR
-            }
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        if out_buf.is_null() || out_len.is_null() || out_rows.is_null() {
+            return STOOLAP_ERROR;
         }
-    }));
+        *out_buf = std::ptr::null();
+        *out_len = 0;
+        *out_rows = 0;
 
-    result.unwrap_or_else(|_| {
-        handle.rows = None;
-        handle.set_error("panic during stoolap_rows_fetch_chunk");
-        STOOLAP_ERROR
-    })
+        let handle = match rows.as_mut() {
+            Some(h) => h,
+            None => return STOOLAP_ERROR,
+        };
+        if max_rows <= 0 {
+            handle.set_error("max_rows must be positive");
+            return STOOLAP_ERROR;
+        }
+
+        let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            handle.has_row = false;
+            reset_packed(&mut handle.packed);
+            let names = handle.columns.iter().map(|n| n.as_bytes());
+            let header = write_header(names, &mut handle.packed);
+            let col_count = handle.columns.len();
+            let max = max_rows as usize;
+            let packed = header.and_then(|count_at| match &mut handle.rows {
+                Some(r) => write_rows(r, col_count, max, count_at, &mut handle.packed),
+                None => Ok(0),
+            });
+            match packed {
+                Ok(n) => {
+                    if (n as usize) < max {
+                        handle.rows = None;
+                    }
+                    *out_buf = handle.packed.as_ptr();
+                    *out_len = handle.packed.len() as i64;
+                    *out_rows = n as i32;
+                    STOOLAP_OK
+                }
+                Err(e) => {
+                    handle.rows = None;
+                    handle.set_error(&e.to_string());
+                    STOOLAP_ERROR
+                }
+            }
+        }));
+
+        result.unwrap_or_else(|_| {
+            handle.rows = None;
+            handle.set_error("panic during stoolap_rows_fetch_chunk");
+            STOOLAP_ERROR
+        })
+    }
 }
 
 /// Free a buffer allocated by `stoolap_rows_fetch_all()`.
@@ -701,12 +744,15 @@ pub unsafe extern "C" fn stoolap_rows_fetch_chunk(
 ///
 /// `buf` must be a pointer returned by `stoolap_rows_fetch_all`, or NULL.
 /// `len` must be the exact length returned alongside the buffer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_buffer_free(buf: *mut u8, len: i64) {
-    if !buf.is_null() && len > 0 {
-        // The buffer was created via Box::into_raw(Vec::into_boxed_slice()),
-        // so len == capacity is guaranteed. Reconstruct and drop.
-        let _ = Vec::from_raw_parts(buf, len as usize, len as usize);
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        if !buf.is_null() && len > 0 {
+            // The buffer was created via Box::into_raw(Vec::into_boxed_slice()),
+            // so len == capacity is guaranteed. Reconstruct and drop.
+            let _ = Vec::from_raw_parts(buf, len as usize, len as usize);
+        }
     }
 }
 
@@ -719,10 +765,13 @@ pub unsafe extern "C" fn stoolap_buffer_free(buf: *mut u8, len: i64) {
 ///
 /// `rows` must be a pointer returned by a stoolap query function, or NULL.
 /// After this call, the pointer is invalid.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_rows_close(rows: *mut StoolapRows) {
-    if !rows.is_null() {
-        let _ = Box::from_raw(rows);
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        if !rows.is_null() {
+            let _ = Box::from_raw(rows);
+        }
     }
 }
 
@@ -731,10 +780,13 @@ pub unsafe extern "C" fn stoolap_rows_close(rows: *mut StoolapRows) {
 /// # Safety
 ///
 /// `rows` must be a valid `StoolapRows` pointer.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn stoolap_rows_errmsg(rows: *const StoolapRows) -> *const c_char {
-    match rows.as_ref() {
-        Some(handle) => handle.error_ptr(),
-        None => super::error::empty_cstr(),
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        match rows.as_ref() {
+            Some(handle) => handle.error_ptr(),
+            None => super::error::empty_cstr(),
+        }
     }
 }

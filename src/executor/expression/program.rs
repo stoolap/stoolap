@@ -269,30 +269,31 @@ impl Program {
                 }
             };
             let after = source.get(next).map(|op| (next, op));
-            if let Some((first, takes_next, taken)) =
-                Self::taken_by(&op, at, after, &ops, &emitted, &targets)
-            {
-                let first_position = emitted[first].1;
-                ops.truncate(first);
-                emitted.truncate(first);
-                for position in position_map.iter_mut().rev() {
-                    if *position <= first {
-                        break;
+            match Self::taken_by(&op, at, after, &ops, &emitted, &targets) {
+                Some((first, takes_next, taken)) => {
+                    let first_position = emitted[first].1;
+                    ops.truncate(first);
+                    emitted.truncate(first);
+                    for position in position_map.iter_mut().rev() {
+                        if *position <= first {
+                            break;
+                        }
+                        *position = first;
                     }
-                    *position = first;
+                    ops.push(taken);
+                    // Built from a value known only now, as a value it is one too,
+                    // standing where the first op it took stood
+                    emitted.push((true, first_position));
+                    if takes_next {
+                        position_map.push(first);
+                        at = next + 1;
+                        continue;
+                    }
                 }
-                ops.push(taken);
-                // Built from a value known only now, as a value it is one too,
-                // standing where the first op it took stood
-                emitted.push((true, first_position));
-                if takes_next {
-                    position_map.push(first);
-                    at = next + 1;
-                    continue;
+                _ => {
+                    ops.push(op);
+                    emitted.push((known_now, at));
                 }
-            } else {
-                ops.push(op);
-                emitted.push((known_now, at));
             }
             at = next;
         }
@@ -513,27 +514,26 @@ impl Program {
             if i + 3 < ops.len() {
                 let is_safe = !jump_targets.inside(i, 4);
 
-                if is_safe {
-                    if let (
+                if is_safe
+                    && let (
                         Op::LoadColumn(col_idx),
                         Op::LoadConst(low_val),
                         Op::LoadConst(high_val),
                         Op::Between,
                     ) = (&ops[i], &ops[i + 1], &ops[i + 2], &ops[i + 3])
-                    {
-                        result.push(Op::BetweenColumnConst(
-                            *col_idx,
-                            low_val.clone(),
-                            high_val.clone(),
-                        ));
-                        // All 4 positions map to this single new position
-                        position_map.push(new_pos);
-                        position_map.push(new_pos);
-                        position_map.push(new_pos);
-                        position_map.push(new_pos);
-                        i += 4;
-                        continue;
-                    }
+                {
+                    result.push(Op::BetweenColumnConst(
+                        *col_idx,
+                        low_val.clone(),
+                        high_val.clone(),
+                    ));
+                    // All 4 positions map to this single new position
+                    position_map.push(new_pos);
+                    position_map.push(new_pos);
+                    position_map.push(new_pos);
+                    position_map.push(new_pos);
+                    i += 4;
+                    continue;
                 }
             }
 
@@ -541,31 +541,30 @@ impl Program {
             if i + 2 < ops.len() {
                 let is_safe = !jump_targets.inside(i, 3);
 
-                if is_safe {
-                    if let (
+                if is_safe
+                    && let (
                         Op::LoadColumn(col_idx) | Op::LoadAggregateResult(col_idx),
                         Op::LoadConst(const_val),
                     ) = (&ops[i], &ops[i + 1])
-                    {
-                        let fused = match &ops[i + 2] {
-                            Op::Eq => Some(Op::EqColumnConst(*col_idx, const_val.clone())),
-                            Op::Ne => Some(Op::NeColumnConst(*col_idx, const_val.clone())),
-                            Op::Lt => Some(Op::LtColumnConst(*col_idx, const_val.clone())),
-                            Op::Le => Some(Op::LeColumnConst(*col_idx, const_val.clone())),
-                            Op::Gt => Some(Op::GtColumnConst(*col_idx, const_val.clone())),
-                            Op::Ge => Some(Op::GeColumnConst(*col_idx, const_val.clone())),
-                            _ => None,
-                        };
+                {
+                    let fused = match &ops[i + 2] {
+                        Op::Eq => Some(Op::EqColumnConst(*col_idx, const_val.clone())),
+                        Op::Ne => Some(Op::NeColumnConst(*col_idx, const_val.clone())),
+                        Op::Lt => Some(Op::LtColumnConst(*col_idx, const_val.clone())),
+                        Op::Le => Some(Op::LeColumnConst(*col_idx, const_val.clone())),
+                        Op::Gt => Some(Op::GtColumnConst(*col_idx, const_val.clone())),
+                        Op::Ge => Some(Op::GeColumnConst(*col_idx, const_val.clone())),
+                        _ => None,
+                    };
 
-                        if let Some(fused_op) = fused {
-                            result.push(fused_op);
-                            // All 3 positions map to this single new position
-                            position_map.push(new_pos);
-                            position_map.push(new_pos);
-                            position_map.push(new_pos);
-                            i += 3;
-                            continue;
-                        }
+                    if let Some(fused_op) = fused {
+                        result.push(fused_op);
+                        // All 3 positions map to this single new position
+                        position_map.push(new_pos);
+                        position_map.push(new_pos);
+                        position_map.push(new_pos);
+                        i += 3;
+                        continue;
                     }
                 }
             }
@@ -574,24 +573,22 @@ impl Program {
             if i + 1 < ops.len() {
                 let is_safe = !jump_targets.inside(i, 2);
 
-                if is_safe {
-                    if let Op::LoadColumn(col_idx) = &ops[i] {
-                        let fused = match &ops[i + 1] {
-                            Op::IsNull => Some(Op::IsNullColumn(*col_idx)),
-                            Op::IsNotNull => Some(Op::IsNotNullColumn(*col_idx)),
-                            Op::Like(pattern) => Some(Op::LikeColumn(*col_idx, pattern.clone())),
-                            Op::InSet(set) => Some(Op::InSetColumn(*col_idx, set.clone())),
-                            _ => None,
-                        };
+                if is_safe && let Op::LoadColumn(col_idx) = &ops[i] {
+                    let fused = match &ops[i + 1] {
+                        Op::IsNull => Some(Op::IsNullColumn(*col_idx)),
+                        Op::IsNotNull => Some(Op::IsNotNullColumn(*col_idx)),
+                        Op::Like(pattern) => Some(Op::LikeColumn(*col_idx, pattern.clone())),
+                        Op::InSet(set) => Some(Op::InSetColumn(*col_idx, set.clone())),
+                        _ => None,
+                    };
 
-                        if let Some(fused_op) = fused {
-                            result.push(fused_op);
-                            // Both positions map to this single new position
-                            position_map.push(new_pos);
-                            position_map.push(new_pos);
-                            i += 2;
-                            continue;
-                        }
+                    if let Some(fused_op) = fused {
+                        result.push(fused_op);
+                        // Both positions map to this single new position
+                        position_map.push(new_pos);
+                        position_map.push(new_pos);
+                        i += 2;
+                        continue;
                     }
                 }
             }

@@ -59,16 +59,16 @@ const SNAPSHOT_META_MAGIC: u32 = 0x50414E53;
 fn read_snapshot_lsn(db_path: &Path) -> Option<u64> {
     // First try new binary format
     let bin_path = db_path.join("snapshots/snapshot_meta.bin");
-    if let Ok(data) = fs::read(&bin_path) {
-        if data.len() >= 28 {
-            let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
-            if magic == SNAPSHOT_META_MAGIC {
-                // Verify CRC32
-                let stored_crc = u32::from_le_bytes(data[24..28].try_into().unwrap());
-                let computed_crc = crc32fast::hash(&data[0..24]);
-                if stored_crc == computed_crc {
-                    return Some(u64::from_le_bytes(data[8..16].try_into().unwrap()));
-                }
+    if let Ok(data) = fs::read(&bin_path)
+        && data.len() >= 28
+    {
+        let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        if magic == SNAPSHOT_META_MAGIC {
+            // Verify CRC32
+            let stored_crc = u32::from_le_bytes(data[24..28].try_into().unwrap());
+            let computed_crc = crc32fast::hash(&data[0..24]);
+            if stored_crc == computed_crc {
+                return Some(u64::from_le_bytes(data[8..16].try_into().unwrap()));
             }
         }
     }
@@ -101,10 +101,10 @@ fn get_wal_lsn(db_path: &Path) -> Option<u64> {
             let name = e.file_name().to_string_lossy().to_string();
             if (name.starts_with("wal-") || name.starts_with("wal_")) && name.ends_with(".log") {
                 // Extract LSN from "...-lsn-N.log"
-                if let Some(lsn_start) = name.find("lsn-") {
-                    if let Some(lsn_end) = name[lsn_start + 4..].find('.') {
-                        return name[lsn_start + 4..lsn_start + 4 + lsn_end].parse().ok();
-                    }
+                if let Some(lsn_start) = name.find("lsn-")
+                    && let Some(lsn_end) = name[lsn_start + 4..].find('.')
+                {
+                    return name[lsn_start + 4..lsn_start + 4 + lsn_end].parse().ok();
                 }
             }
             None

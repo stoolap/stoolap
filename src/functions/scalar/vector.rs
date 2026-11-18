@@ -52,10 +52,10 @@ fn extract_vector_bytes<'a>(v: &'a Value, buf: &'a mut Vec<u8>) -> Option<&'a [u
 /// `value` as a vector function reads it: a TEXT writing a vector is that
 /// VECTOR, any other value stays as it is
 pub(crate) fn read_as_vector(value: Value) -> Value {
-    if let Value::Text(text) = &value {
-        if let Some(floats) = crate::core::value::parse_vector_str(text.as_ref()) {
-            return Value::vector(floats);
-        }
+    if let Value::Text(text) = &value
+        && let Some(floats) = crate::core::value::parse_vector_str(text.as_ref())
+    {
+        return Value::vector(floats);
     }
     value
 }

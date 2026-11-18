@@ -684,14 +684,13 @@ impl Executor {
             // now through a view, or at a snapshot's own point
             let view = taken.cloned().or_else(|| self.autocommit_view());
             let deadline = ctx.map_or(Deadline::NONE, ExecutionContext::deadline_of_call);
-            if let Some(view) = view.as_ref() {
-                if let Some(rows) =
+            if let Some(view) = view.as_ref()
+                && let Some(rows) =
                     self.engine
                         .fetch_hot_rows_at(table_name, &[pk_value], token, view, deadline)?
-                {
-                    view.held()?;
-                    return Ok(KeyRows::Many(rows));
-                }
+            {
+                view.held()?;
+                return Ok(KeyRows::Many(rows));
             }
             let tx = self.begin_transaction()?;
             let table = tx.get_read_table_at(table_name, view.as_ref(), TableUse::Read)?;

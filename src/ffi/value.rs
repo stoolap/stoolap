@@ -31,70 +31,81 @@ use super::{
 ///
 /// The caller must ensure text/blob pointers are valid for the specified length.
 pub(crate) unsafe fn ffi_value_to_rust(v: &StoolapValue) -> Result<Value> {
-    Ok(match v.value_type {
-        STOOLAP_TYPE_NULL => Value::null_unknown(),
-        STOOLAP_TYPE_INTEGER => Value::Integer(v.v.integer),
-        STOOLAP_TYPE_FLOAT => Value::Float(v.v.float64),
-        STOOLAP_TYPE_TEXT => {
-            let text = &v.v.text;
-            if text.ptr.is_null() || text.len < 0 {
-                Value::null_unknown()
-            } else if text.len == 0 {
-                Value::text("")
-            } else {
-                let slice = std::slice::from_raw_parts(text.ptr as *const u8, text.len as usize);
-                match std::str::from_utf8(slice) {
-                    Ok(s) => Value::text(s),
-                    Err(_) => {
-                        return Err(Error::invalid_argument("text parameter is not valid UTF-8"))
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        Ok(match v.value_type {
+            STOOLAP_TYPE_NULL => Value::null_unknown(),
+            STOOLAP_TYPE_INTEGER => Value::Integer(v.v.integer),
+            STOOLAP_TYPE_FLOAT => Value::Float(v.v.float64),
+            STOOLAP_TYPE_TEXT => {
+                let text = &v.v.text;
+                if text.ptr.is_null() || text.len < 0 {
+                    Value::null_unknown()
+                } else if text.len == 0 {
+                    Value::text("")
+                } else {
+                    let slice =
+                        std::slice::from_raw_parts(text.ptr as *const u8, text.len as usize);
+                    match std::str::from_utf8(slice) {
+                        Ok(s) => Value::text(s),
+                        Err(_) => {
+                            return Err(Error::invalid_argument(
+                                "text parameter is not valid UTF-8",
+                            ))
+                        }
                     }
                 }
             }
-        }
-        STOOLAP_TYPE_BOOLEAN => Value::Boolean(v.v.boolean != 0),
-        STOOLAP_TYPE_TIMESTAMP => {
-            let nanos = v.v.timestamp_nanos;
-            let secs = nanos.div_euclid(1_000_000_000);
-            let nsecs = nanos.rem_euclid(1_000_000_000) as u32;
-            match chrono::DateTime::from_timestamp(secs, nsecs) {
-                Some(dt) => Value::Timestamp(dt),
-                None => Value::null_unknown(),
-            }
-        }
-        STOOLAP_TYPE_JSON => {
-            let text = &v.v.text;
-            if text.ptr.is_null() || text.len < 0 {
-                Value::null_unknown()
-            } else {
-                let slice = std::slice::from_raw_parts(text.ptr as *const u8, text.len as usize);
-                // The parser the JSON functions read with, so a value bound
-                // here is one they can read
-                match std::str::from_utf8(slice) {
-                    Ok(s) if serde_json::from_str::<serde_json::Value>(s).is_ok() => Value::json(s),
-                    _ => return Err(Error::invalid_argument("JSON parameter is not valid JSON")),
+            STOOLAP_TYPE_BOOLEAN => Value::Boolean(v.v.boolean != 0),
+            STOOLAP_TYPE_TIMESTAMP => {
+                let nanos = v.v.timestamp_nanos;
+                let secs = nanos.div_euclid(1_000_000_000);
+                let nsecs = nanos.rem_euclid(1_000_000_000) as u32;
+                match chrono::DateTime::from_timestamp(secs, nsecs) {
+                    Some(dt) => Value::Timestamp(dt),
+                    None => Value::null_unknown(),
                 }
             }
-        }
-        STOOLAP_TYPE_BLOB => {
-            let blob = &v.v.blob;
-            if blob.ptr.is_null() || blob.len < 0 {
-                Value::null_unknown()
-            } else if blob.len == 0 {
-                // Empty vector (zero dimensions)
-                Value::vector(vec![])
-            } else {
-                let len = blob.len as usize;
-                if !len.is_multiple_of(4) {
-                    // Vector data must be packed f32 (4 bytes each)
+            STOOLAP_TYPE_JSON => {
+                let text = &v.v.text;
+                if text.ptr.is_null() || text.len < 0 {
                     Value::null_unknown()
                 } else {
-                    let slice = std::slice::from_raw_parts(blob.ptr, len);
-                    Value::vector_from_bytes(slice.into())
+                    let slice =
+                        std::slice::from_raw_parts(text.ptr as *const u8, text.len as usize);
+                    // The parser the JSON functions read with, so a value bound
+                    // here is one they can read
+                    match std::str::from_utf8(slice) {
+                        Ok(s) if serde_json::from_str::<serde_json::Value>(s).is_ok() => {
+                            Value::json(s)
+                        }
+                        _ => {
+                            return Err(Error::invalid_argument("JSON parameter is not valid JSON"))
+                        }
+                    }
                 }
             }
-        }
-        _ => Value::null_unknown(),
-    })
+            STOOLAP_TYPE_BLOB => {
+                let blob = &v.v.blob;
+                if blob.ptr.is_null() || blob.len < 0 {
+                    Value::null_unknown()
+                } else if blob.len == 0 {
+                    // Empty vector (zero dimensions)
+                    Value::vector(vec![])
+                } else {
+                    let len = blob.len as usize;
+                    if !len.is_multiple_of(4) {
+                        // Vector data must be packed f32 (4 bytes each)
+                        Value::null_unknown()
+                    } else {
+                        let slice = std::slice::from_raw_parts(blob.ptr, len);
+                        Value::vector_from_bytes(slice.into())
+                    }
+                }
+            }
+            _ => Value::null_unknown(),
+        })
+    }
 }
 
 /// Convert an FFI parameter array to a Rust `ParamVec`.
@@ -103,11 +114,14 @@ pub(crate) unsafe fn ffi_value_to_rust(v: &StoolapValue) -> Result<Value> {
 ///
 /// `params` must point to `len` valid `StoolapValue` structs (or be null if `len <= 0`).
 pub(crate) unsafe fn params_to_vec(params: *const StoolapValue, len: i32) -> Result<ParamVec> {
-    if params.is_null() || len <= 0 {
-        return Ok(ParamVec::new());
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        if params.is_null() || len <= 0 {
+            return Ok(ParamVec::new());
+        }
+        let slice = std::slice::from_raw_parts(params, len as usize);
+        slice.iter().map(|v| ffi_value_to_rust(v)).collect()
     }
-    let slice = std::slice::from_raw_parts(params, len as usize);
-    slice.iter().map(|v| ffi_value_to_rust(v)).collect()
 }
 
 /// Arrays up to this length are searched in place; a longer one is indexed
@@ -125,40 +139,40 @@ pub(crate) unsafe fn ffi_value_of<'a>(
     params: *const StoolapNamedParam,
     len: i32,
 ) -> impl FnMut(&str) -> Result<Option<Value>> + 'a {
-    let slice: &'a [StoolapNamedParam] = if params.is_null() || len <= 0 {
-        &[]
-    } else {
-        std::slice::from_raw_parts(params, len as usize)
-    };
-    let name_of = |p: &'a StoolapNamedParam| -> Option<&'a [u8]> {
-        // SAFETY: the caller keeps every name valid for `name_len` bytes and
-        // every value valid while the statement binds
-        (!p.name.is_null() && p.name_len > 0).then(|| unsafe {
-            std::slice::from_raw_parts(p.name as *const u8, p.name_len as usize)
-        })
-    };
-    let mut index: Option<FxHashMap<&'a [u8], &'a StoolapNamedParam>> = None;
-    move |name| {
-        let given = if slice.len() <= NAMED_SCAN_MAX {
-            slice
-                .iter()
-                .rev()
-                .find(|p| name_of(p) == Some(name.as_bytes()))
+    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    unsafe {
+        let slice: &'a [StoolapNamedParam] = if params.is_null() || len <= 0 {
+            &[]
         } else {
-            index
-                .get_or_insert_with(|| {
-                    // Later entries overwrite earlier ones: the last value wins
-                    slice
-                        .iter()
-                        .filter_map(|p| Some((name_of(p)?, p)))
-                        .collect()
-                })
-                .get(name.as_bytes())
-                .copied()
+            std::slice::from_raw_parts(params, len as usize)
         };
-        // SAFETY: as above, the value is valid while the statement binds
-        given
-            .map(|p| unsafe { ffi_value_to_rust(&p.value) })
-            .transpose()
+        let name_of = |p: &'a StoolapNamedParam| -> Option<&'a [u8]> {
+            // SAFETY: the caller keeps every name valid for `name_len` bytes and
+            // every value valid while the statement binds
+            (!p.name.is_null() && p.name_len > 0)
+                .then(|| std::slice::from_raw_parts(p.name as *const u8, p.name_len as usize))
+        };
+        let mut index: Option<FxHashMap<&'a [u8], &'a StoolapNamedParam>> = None;
+        move |name| {
+            let given = if slice.len() <= NAMED_SCAN_MAX {
+                slice
+                    .iter()
+                    .rev()
+                    .find(|p| name_of(p) == Some(name.as_bytes()))
+            } else {
+                index
+                    .get_or_insert_with(|| {
+                        // Later entries overwrite earlier ones: the last value wins
+                        slice
+                            .iter()
+                            .filter_map(|p| Some((name_of(p)?, p)))
+                            .collect()
+                    })
+                    .get(name.as_bytes())
+                    .copied()
+            };
+            // SAFETY: as above, the value is valid while the statement binds
+            given.map(|p| ffi_value_to_rust(&p.value)).transpose()
+        }
     }
 }

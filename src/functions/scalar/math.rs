@@ -283,12 +283,10 @@ impl ScalarFunction for ModFunction {
 
         // Try integer modulo first, unless a float would be truncated
         let any_float = matches!(args[0], Value::Float(_)) || matches!(args[1], Value::Float(_));
-        if !any_float {
-            if let (Some(a), Some(b)) = (value_to_i64(&args[0]), value_to_i64(&args[1])) {
-                // A zero divisor gives NULL, as the % operator does
-                return Ok(crate::core::integer::integer_op(IntegerOp::Mod, a, b)?
-                    .map_or_else(Value::null_unknown, Value::Integer));
-            }
+        if !any_float && let (Some(a), Some(b)) = (value_to_i64(&args[0]), value_to_i64(&args[1])) {
+            // A zero divisor gives NULL, as the % operator does
+            return Ok(crate::core::integer::integer_op(IntegerOp::Mod, a, b)?
+                .map_or_else(Value::null_unknown, Value::Integer));
         }
 
         // Fall back to float modulo

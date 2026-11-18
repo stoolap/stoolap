@@ -433,21 +433,20 @@ impl Executor {
                 values.push(run.result()?);
             }
             let row = Row::from_values(values);
-            if let Some(filter) = &having_filter {
-                if !having_vm
+            if let Some(filter) = &having_filter
+                && !having_vm
                     .execute_bool_checked(filter, &super::aggregation::slot_context(&row, ctx))?
-                {
-                    return Ok(true); // Continue to next group
-                }
+            {
+                return Ok(true); // Continue to next group
             }
             result_rows.push((result_row_id, row));
             result_row_id += 1;
 
             // Early termination: stop once we have LIMIT groups that passed HAVING
-            if let Some(limit) = limit_for_early_exit {
-                if result_rows.len() >= limit {
-                    return Ok(false); // Stop iteration
-                }
+            if let Some(limit) = limit_for_early_exit
+                && result_rows.len() >= limit
+            {
+                return Ok(false); // Stop iteration
             }
 
             Ok(true) // Continue to next group

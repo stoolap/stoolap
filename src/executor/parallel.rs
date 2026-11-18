@@ -1138,16 +1138,16 @@ pub fn parallel_topn_vector_search(
                                 distance: dist,
                                 idx,
                             });
-                        } else if let Some(worst) = heap.peek() {
-                            if dist < worst.distance {
-                                let evict_idx = worst.idx;
-                                heap.pop();
-                                entries[evict_idx] = (row_id, row, dist);
-                                heap.push(HeapEntry {
-                                    distance: dist,
-                                    idx: evict_idx,
-                                });
-                            }
+                        } else if let Some(worst) = heap.peek()
+                            && dist < worst.distance
+                        {
+                            let evict_idx = worst.idx;
+                            heap.pop();
+                            entries[evict_idx] = (row_id, row, dist);
+                            heap.push(HeapEntry {
+                                distance: dist,
+                                idx: evict_idx,
+                            });
                         }
                     }
 
@@ -1196,16 +1196,16 @@ pub fn parallel_topn_vector_search(
                 distance: dist,
                 idx,
             });
-        } else if let Some(worst) = heap.peek() {
-            if dist < worst.distance {
-                let evict_idx = worst.idx;
-                heap.pop();
-                entries[evict_idx] = (row_id, row, dist);
-                heap.push(HeapEntry {
-                    distance: dist,
-                    idx: evict_idx,
-                });
-            }
+        } else if let Some(worst) = heap.peek()
+            && dist < worst.distance
+        {
+            let evict_idx = worst.idx;
+            heap.pop();
+            entries[evict_idx] = (row_id, row, dist);
+            heap.push(HeapEntry {
+                distance: dist,
+                idx: evict_idx,
+            });
         }
     }
 

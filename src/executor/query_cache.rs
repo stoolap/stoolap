@@ -549,10 +549,10 @@ impl QueryCache {
     /// structure; None when its structure has no key
     pub(crate) fn statement_plan(&self, stmt: &SelectStatement) -> Option<Arc<NestedPlan>> {
         let address = std::ptr::from_ref(stmt) as usize;
-        if let Some((held, plan)) = self.statements.lock().by_address.get(&address) {
-            if held == stmt {
-                return Some(Arc::clone(plan));
-            }
+        if let Some((held, plan)) = self.statements.lock().by_address.get(&address)
+            && held == stmt
+        {
+            return Some(Arc::clone(plan));
         }
         let key = ExprKey::of_statement(stmt)?;
         let mut plans = self.statements.lock();

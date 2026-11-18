@@ -220,10 +220,10 @@ impl Executor {
         let subquery_tables = Self::collect_subquery_table_columns(subquery);
 
         // Check if the WHERE clause references any outer columns
-        if let Some(ref where_clause) = subquery.where_clause {
-            if Self::references_outer_columns(where_clause, &subquery_tables) {
-                return true;
-            }
+        if let Some(ref where_clause) = subquery.where_clause
+            && Self::references_outer_columns(where_clause, &subquery_tables)
+        {
+            return true;
         }
 
         // Also check SELECT expressions (for scalar subqueries)
@@ -234,10 +234,10 @@ impl Executor {
         }
 
         // A HAVING reads the parent row the same way a WHERE does
-        if let Some(ref having) = subquery.having {
-            if Self::references_outer_columns(having, &subquery_tables) {
-                return true;
-            }
+        if let Some(ref having) = subquery.having
+            && Self::references_outer_columns(having, &subquery_tables)
+        {
+            return true;
         }
 
         // So does an ORDER BY, which decides what a LIMIT keeps, and a
@@ -395,10 +395,10 @@ impl Executor {
                     || Self::references_outer_columns(&between.upper, subquery_tables)
             }
             Expression::Case(case) => {
-                if let Some(ref value) = case.value {
-                    if Self::references_outer_columns(value, subquery_tables) {
-                        return true;
-                    }
+                if let Some(ref value) = case.value
+                    && Self::references_outer_columns(value, subquery_tables)
+                {
+                    return true;
                 }
                 for when in &case.when_clauses {
                     if Self::references_outer_columns(&when.condition, subquery_tables)
@@ -407,10 +407,10 @@ impl Executor {
                         return true;
                     }
                 }
-                if let Some(ref else_val) = case.else_value {
-                    if Self::references_outer_columns(else_val, subquery_tables) {
-                        return true;
-                    }
+                if let Some(ref else_val) = case.else_value
+                    && Self::references_outer_columns(else_val, subquery_tables)
+                {
+                    return true;
                 }
                 false
             }

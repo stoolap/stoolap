@@ -485,10 +485,10 @@ fn vol_files(dir: &std::path::Path) -> std::collections::BTreeSet<String> {
     let mut names = std::collections::BTreeSet::new();
     if let Ok(entries) = std::fs::read_dir(dir.join("volumes").join("t")) {
         for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.ends_with(".vol") {
-                    names.insert(name.to_string());
-                }
+            if let Some(name) = entry.file_name().to_str()
+                && name.ends_with(".vol")
+            {
+                names.insert(name.to_string());
             }
         }
     }

@@ -450,13 +450,13 @@ fn mismatches(db: &Database) -> (Vec<String>, usize) {
                         continue;
                     }
                 };
-                if let Some(computed) = &computed {
-                    if sorted(reference.clone()) != sorted(computed.clone()) {
-                        found.push(format!(
-                            "{reference_sql}\n    reference {reference:?}\n    computed  {computed:?}"
-                        ));
-                        continue;
-                    }
+                if let Some(computed) = &computed
+                    && sorted(reference.clone()) != sorted(computed.clone())
+                {
+                    found.push(format!(
+                        "{reference_sql}\n    reference {reference:?}\n    computed  {computed:?}"
+                    ));
+                    continue;
                 }
                 for (limit, offset) in CUTS {
                     let mut cut = String::new();

@@ -208,20 +208,18 @@ impl BitmapIndex {
         // Check uniqueness constraint
         if self.is_unique {
             let has_null = values.iter().any(|v| v.is_null());
-            if !has_null {
-                if let Some(bitmap) = bitmaps.get(&arc_key) {
-                    let existing_count = if bitmap.contains(row_id_u64) {
-                        bitmap.len() - 1
-                    } else {
-                        bitmap.len()
-                    };
-                    if existing_count > 0 {
-                        return Err(Error::unique_constraint(
-                            &self.name,
-                            self.column_names.join(", "),
-                            values.to_vec(),
-                        ));
-                    }
+            if !has_null && let Some(bitmap) = bitmaps.get(&arc_key) {
+                let existing_count = if bitmap.contains(row_id_u64) {
+                    bitmap.len() - 1
+                } else {
+                    bitmap.len()
+                };
+                if existing_count > 0 {
+                    return Err(Error::unique_constraint(
+                        &self.name,
+                        self.column_names.join(", "),
+                        values.to_vec(),
+                    ));
                 }
             }
         }
@@ -273,21 +271,22 @@ impl Index for BitmapIndex {
         };
 
         // Check uniqueness constraint (using Borrow trait for &Value lookup)
-        if self.is_unique && !lookup_value.is_null() {
-            if let Some(bitmap) = bitmaps.get(lookup_value) {
-                // Check if there's already a row with this value (excluding current row)
-                let existing_count = if bitmap.contains(row_id_u64) {
-                    bitmap.len() - 1
-                } else {
-                    bitmap.len()
-                };
-                if existing_count > 0 {
-                    return Err(Error::unique_constraint(
-                        &self.name,
-                        self.column_names.join(", "),
-                        vec![lookup_value.clone()],
-                    ));
-                }
+        if self.is_unique
+            && !lookup_value.is_null()
+            && let Some(bitmap) = bitmaps.get(lookup_value)
+        {
+            // Check if there's already a row with this value (excluding current row)
+            let existing_count = if bitmap.contains(row_id_u64) {
+                bitmap.len() - 1
+            } else {
+                bitmap.len()
+            };
+            if existing_count > 0 {
+                return Err(Error::unique_constraint(
+                    &self.name,
+                    self.column_names.join(", "),
+                    vec![lookup_value.clone()],
+                ));
             }
         }
 
@@ -365,14 +364,14 @@ impl Index for BitmapIndex {
                 let arc_key = self.value_to_arc_key(values);
 
                 // Check intra-batch duplicates
-                if let Some(&existing_row_id) = batch_keys.get(&arc_key) {
-                    if existing_row_id != row_id {
-                        return Err(Error::unique_constraint(
-                            &self.name,
-                            self.column_names.join(", "),
-                            values.to_vec(),
-                        ));
-                    }
+                if let Some(&existing_row_id) = batch_keys.get(&arc_key)
+                    && existing_row_id != row_id
+                {
+                    return Err(Error::unique_constraint(
+                        &self.name,
+                        self.column_names.join(", "),
+                        values.to_vec(),
+                    ));
                 }
 
                 // Check against existing index

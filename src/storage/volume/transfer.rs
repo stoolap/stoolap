@@ -739,12 +739,12 @@ fn gather(
             // goes through its value, cast to the output's type
             (scratch, source) => {
                 let value = source.get_value(local).coerce_to_type(data_type);
-                if let (Some(nulled), Value::Timestamp(t)) = (nulled.as_mut(), &value) {
-                    if !crate::core::value::timestamp_fits(t) {
-                        scratch.push_null();
-                        nulled.push((row_id, *t));
-                        continue;
-                    }
+                if let (Some(nulled), Value::Timestamp(t)) = (nulled.as_mut(), &value)
+                    && !crate::core::value::timestamp_fits(t)
+                {
+                    scratch.push_null();
+                    nulled.push((row_id, *t));
+                    continue;
                 }
                 scratch.push_value(&value, &mut |text| builder.intern_text(column, text))?;
             }

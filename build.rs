@@ -51,13 +51,12 @@ fn chrono_free_timestamp() -> String {
 
 fn main() {
     // Embed git commit hash at compile time
-    if std::env::var("STOOLAP_GIT_COMMIT").is_err() {
-        if let Ok(output) = Command::new("git").args(["rev-parse", "HEAD"]).output() {
-            if output.status.success() {
-                let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                println!("cargo:rustc-env=STOOLAP_GIT_COMMIT={}", commit);
-            }
-        }
+    if std::env::var("STOOLAP_GIT_COMMIT").is_err()
+        && let Ok(output) = Command::new("git").args(["rev-parse", "HEAD"]).output()
+        && output.status.success()
+    {
+        let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        println!("cargo:rustc-env=STOOLAP_GIT_COMMIT={}", commit);
     }
 
     // Embed build timestamp at compile time

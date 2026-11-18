@@ -71,22 +71,25 @@ impl JoinFilter {
             let ctx = self.bound.context(pair, blocks);
             // A condition calling a function that runs a join again on this
             // thread gets a fresh VM, whose error goes to the fallback slot
-            if let Ok(mut vm) = vm.try_borrow_mut() {
-                let matched = vm.execute_bool(&self.bound.program, &ctx);
-                if vm.has_bool_error() {
-                    *failed = true;
+            match vm.try_borrow_mut() {
+                Ok(mut vm) => {
+                    let matched = vm.execute_bool(&self.bound.program, &ctx);
+                    if vm.has_bool_error() {
+                        *failed = true;
+                    }
+                    matched
                 }
-                matched
-            } else {
-                let mut vm = ExprVM::new();
-                let matched = vm.execute_bool(&self.bound.program, &ctx);
-                if let Some(e) = vm.take_bool_error() {
-                    JOIN_FALLBACK_ERROR.with(|slot| {
-                        slot.borrow_mut().get_or_insert(e);
-                    });
-                    *failed = true;
+                _ => {
+                    let mut vm = ExprVM::new();
+                    let matched = vm.execute_bool(&self.bound.program, &ctx);
+                    if let Some(e) = vm.take_bool_error() {
+                        JOIN_FALLBACK_ERROR.with(|slot| {
+                            slot.borrow_mut().get_or_insert(e);
+                        });
+                        *failed = true;
+                    }
+                    matched
                 }
-                matched
             }
         })
     }

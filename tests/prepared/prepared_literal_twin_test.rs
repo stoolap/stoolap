@@ -120,24 +120,24 @@ fn param_test_as_constant(op: &str, params: &[Value]) -> String {
             .map(|slot| value(slot))
             .collect::<Option<Vec<_>>>()
     };
-    if let Some(args) = args("CompareColumnParam(") {
-        if let Some(value) = value(&args[1]) {
-            return format!("{}ColumnConst({}, {value:?})", args[2], args[0]);
-        }
+    if let Some(args) = args("CompareColumnParam(")
+        && let Some(value) = value(&args[1])
+    {
+        return format!("{}ColumnConst({}, {value:?})", args[2], args[0]);
     }
-    if let Some(args) = args("BetweenColumnParams(") {
-        if let Some([low, high]) = known(&args[1..3]).as_deref() {
-            return format!("BetweenColumnConst({}, {low:?}, {high:?})", args[0]);
-        }
+    if let Some(args) = args("BetweenColumnParams(")
+        && let Some([low, high]) = known(&args[1..3]).as_deref()
+    {
+        return format!("BetweenColumnConst({}, {low:?}, {high:?})", args[0]);
     }
-    if let Some(args) = args("InColumnParams(") {
-        if let Some(members) = known(&args[1..args.len() - 1]) {
-            let has_null = members.iter().any(|v| v.is_null());
-            let mut distinct: Vec<&Value> = members.into_iter().filter(|v| !v.is_null()).collect();
-            distinct.dedup();
-            let len = distinct.len();
-            return format!("InSetColumn({}, len={len}, has_null={has_null})", args[0]);
-        }
+    if let Some(args) = args("InColumnParams(")
+        && let Some(members) = known(&args[1..args.len() - 1])
+    {
+        let has_null = members.iter().any(|v| v.is_null());
+        let mut distinct: Vec<&Value> = members.into_iter().filter(|v| !v.is_null()).collect();
+        distinct.dedup();
+        let len = distinct.len();
+        return format!("InSetColumn({}, len={len}, has_null={has_null})", args[0]);
     }
     op.to_string()
 }
