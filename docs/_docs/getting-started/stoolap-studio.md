@@ -27,13 +27,13 @@ Stoolap Studio is a web-based database management interface for Stoolap. It runs
 - **Vector Search** dialog for HNSW-indexed k-NN queries with distance visualization
 - **Backup and Restore** via SQL dump export and import
 - **EXPLAIN** plan viewer for query analysis
-- **CSV/JSON Export and Import**
+- **CSV and JSON export**, CSV import
 - **Dark and Light themes** with multiple accent color and editor theme options
 - **Keyboard shortcuts** for common operations
 
 ## Installation
 
-Requires Node.js 18 or later.
+Requires Node.js 20.9 or later (the minimum for Next.js 16). Stoolap Studio 0.5.0 uses `@stoolap/node` 0.5.0, which runs the Stoolap 0.5.0 engine.
 
 ```bash
 git clone https://github.com/stoolap/stoolap-studio.git
@@ -78,11 +78,11 @@ Open a table in the data viewer to sort, filter, and paginate. Click a cell to e
 
 ### Vector Search
 
-For tables with HNSW-indexed vector columns, right-click the index and select **k-NN Search** to open the vector similarity search dialog. Choose a distance metric, paste a query vector, and run the search.
+Right-click a table with a `VECTOR` column and select **Vector Similarity Search** to open the search dialog. Choose a column, a distance metric, paste or pick a query vector, set the number of results, and run the search. Right-clicking an HNSW index in the schema tree inserts a k-NN query template into the editor.
 
 ### Backup and Restore
 
-Click **Backup** to export the database as a SQL dump. Click **Restore** to import a SQL dump file. Both operations support progress tracking and run inside transactions for safety.
+Click **Backup** to export the database as a SQL dump of tables, data, indexes and views, written in foreign key order. Click **Restore** to import a SQL dump file; INSERT statements can run inside a transaction so a failed restore leaves no partial data. Both show progress as they run.
 
 ## Keyboard Shortcuts
 
@@ -94,7 +94,9 @@ Click **Backup** to export the database as a SQL dump. Click **Restore** to impo
 | Cmd/Ctrl + B | Toggle sidebar |
 | Cmd/Ctrl + T | New tab |
 | Cmd/Ctrl + W | Close tab |
-| Cmd/Ctrl + S | Save query to bookmarks |
+| Ctrl + Tab | Next tab |
+| Ctrl + Shift + Tab | Previous tab |
+| Cmd/Ctrl + ? | Shortcuts help |
 
 ## Tech Stack
 
