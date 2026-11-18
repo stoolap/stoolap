@@ -117,7 +117,7 @@ pub unsafe trait CompactArcDrop {
 unsafe impl<T> CompactArcDrop for T {
     #[inline]
     unsafe fn drop_and_dealloc(ptr: *mut u8) {
-        // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+        // SAFETY: `ptr` is an exclusively owned CompactArc allocation, as the trait method's `# Safety` section requires.
         unsafe {
             let data_offset = data_offset_for::<T>();
             let align = mem::align_of::<T>().max(mem::align_of::<Header>());
@@ -139,7 +139,7 @@ unsafe impl<T> CompactArcDrop for T {
 unsafe impl CompactArcDrop for str {
     #[inline]
     unsafe fn drop_and_dealloc(ptr: *mut u8) {
-        // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+        // SAFETY: `ptr` is an exclusively owned CompactArc allocation, as the trait method's `# Safety` section requires.
         unsafe {
             let header = ptr as *mut Header;
             let len = (*header).len;
@@ -157,7 +157,7 @@ unsafe impl CompactArcDrop for str {
 unsafe impl<T> CompactArcDrop for [T] {
     #[inline]
     unsafe fn drop_and_dealloc(ptr: *mut u8) {
-        // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+        // SAFETY: `ptr` is an exclusively owned CompactArc allocation, as the trait method's `# Safety` section requires.
         unsafe {
             let header = ptr as *mut Header;
             let len = (*header).len;

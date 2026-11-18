@@ -462,7 +462,7 @@ impl StoolapStmt {
         out_buf: *mut *const u8,
         out_len: *mut i64,
     ) -> i32 {
-        // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+        // SAFETY: `out_buf` and `out_len` are writable pointers supplied by the C caller of a `*_query_all` entry point, which documents that requirement.
         unsafe {
             match rows.and_then(|mut rows| pack_all(&mut rows, &mut self.packed)) {
                 Ok(_) => {
@@ -483,7 +483,7 @@ impl StoolapStmt {
 pub(super) unsafe fn open_transaction<'a>(
     tx: *mut StoolapTx,
 ) -> Result<Option<&'a mut Transaction>> {
-    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    // SAFETY: `tx` is NULL or a `StoolapTx` pointer the C caller obtained from this library and has not freed, as every entry point passing it documents.
     unsafe {
         match tx.as_mut() {
             None => Ok(None),
@@ -500,7 +500,7 @@ pub(super) unsafe fn open_transaction_on<'a>(
     db: &Database,
     tx: *mut StoolapTx,
 ) -> Result<Option<&'a mut Transaction>> {
-    // SAFETY: the caller upholds the contract in this function's `# Safety` section.
+    // SAFETY: `tx` is NULL or a `StoolapTx` pointer the C caller obtained from this library and has not freed, as every entry point passing it documents.
     unsafe {
         let inner = open_transaction(tx)?;
         if inner.as_ref().is_some_and(|inner_tx| {
