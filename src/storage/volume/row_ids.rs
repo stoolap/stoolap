@@ -208,8 +208,9 @@ impl Blocks {
         (offset_at(k) == target).then_some(block * BLOCK + k)
     }
 
+    /// Heap bytes held, the boxed struct included
     fn memory_size(&self) -> usize {
-        self.heads.len() * 8 + self.data.len()
+        size_of::<Blocks>() + self.heads.len() * 8 + self.data.len()
     }
 }
 
@@ -502,7 +503,7 @@ impl RowIds {
         match &self.0 {
             Repr::Range { .. } => 0,
             Repr::Offsets { offsets, .. } => offsets.capacity() * 4,
-            Repr::Blocks(blocks) => std::mem::size_of::<Blocks>() + blocks.memory_size(),
+            Repr::Blocks(blocks) => blocks.memory_size(),
             Repr::Full(ids) => ids.capacity() * 8,
         }
     }
@@ -652,6 +653,8 @@ mod tests {
     fn ids_within_32_bits_of_the_smallest_take_four_bytes_each() {
         let gap = RowIds::from(vec![-3, 10, 4_000_000_000]);
         assert_eq!(gap.memory_size(), 12);
+        let few = RowIds::from(vec![0, 2, 4, 6, 8, 10]);
+        assert_eq!(few.memory_size(), 24, "blocks cost more than offsets here");
         assert_eq!(all(&gap), [-3, 10, 4_000_000_000]);
         assert_eq!(
             (gap.at(1), gap.get(3), gap.max()),

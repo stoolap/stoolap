@@ -1738,7 +1738,8 @@ impl SegmentedTable {
 
     /// The positions of `cs` the statement sees, as bits; None when it sees
     /// every row. Each tombstoned or hot id is located in the volume, or,
-    /// with more such ids than rows, each row's id is looked up
+    /// when their searches would read more than one pass over the rows,
+    /// each row's id is looked up
     fn shown_rows(
         &self,
         cs: &super::manifest::ColdSegment,
@@ -1762,7 +1763,8 @@ impl SegmentedTable {
             bits[i >> 6] &= !(1u64 << (i & 63));
             cleared = true;
         };
-        if hidden <= rows {
+        let search_reads = (usize::BITS - rows.leading_zeros()) as usize;
+        if hidden.saturating_mul(search_reads) <= rows {
             let mut unpaid = 0;
             for (&id, &seq) in tombstones.iter() {
                 unpaid += 1;
@@ -1789,10 +1791,12 @@ impl SegmentedTable {
             }
         } else {
             let row_ids = vol.row_ids()?;
+            let mut ids = Vec::new();
             for start in (0..row_ids.len()).step_by(CHARGE_BEAT) {
                 let end = (start + CHARGE_BEAT).min(row_ids.len());
                 deadline.charge(DeadlineSite::StorageRead, end - start)?;
-                for (at, id) in (start..).zip(row_ids.iter_range(start..end)) {
+                row_ids.copy_into(start..end, &mut ids);
+                for (at, &id) in (start..).zip(&ids) {
                     if hot_skip.contains(&id) || self.is_row_tombstoned(tombstones, id, cut) {
                         hide(at);
                     }

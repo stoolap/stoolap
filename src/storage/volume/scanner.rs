@@ -180,6 +180,9 @@ pub struct VolumeScanner {
     /// Kept separate from pending_cold_deletes to avoid cloning the tombstone set.
     /// Map: row_id → commit_seq (for snapshot isolation filtering).
     committed_tombstones: Option<Arc<rustc_hash::FxHashMap<i64, u64>>>,
+    /// The ids of the row group a linear scan is in, loaded when tombstones
+    /// or pending deletes make it read every row's id
+    group_ids: super::row_ids::GroupRowIds,
     /// The statement view of the read: a tombstone counts only when it sees
     /// the commit
     pub view: Option<StatementView>,
@@ -530,6 +533,7 @@ impl VolumeScanner {
             visibility_bitmap: None,
             pending_cold_deletes: None,
             committed_tombstones: None,
+            group_ids: Default::default(),
             view: None,
             cut: CommitCut::every(),
             deadline: Deadline::NONE,
@@ -598,6 +602,7 @@ impl VolumeScanner {
             visibility_bitmap: None,
             pending_cold_deletes: None,
             committed_tombstones: None,
+            group_ids: Default::default(),
             view: None,
             cut: CommitCut::every(),
             deadline: Deadline::NONE,
@@ -697,6 +702,7 @@ impl VolumeScanner {
             visibility_bitmap: None,
             pending_cold_deletes: None,
             committed_tombstones: None,
+            group_ids: Default::default(),
             view: None,
             cut: CommitCut::every(),
             deadline: Deadline::NONE,
@@ -1353,7 +1359,10 @@ impl VolumeScanner {
         if self.committed_tombstones.is_none() && self.pending_cold_deletes.is_none() {
             return false;
         }
-        let rid = self.volume.meta.row_ids.at(idx);
+        let rid = match self.group_ids.holds(idx) {
+            true => self.group_ids.at(idx),
+            false => self.volume.meta.row_ids.at(idx),
+        };
         if let Some(ref ts) = self.committed_tombstones
             && let Some(&commit_seq) = ts.get(&rid)
             && self.cut.sees(commit_seq as i64)
@@ -1702,6 +1711,12 @@ impl VolumeScanner {
                 }
                 let rows = self.next_group_boundary - self.current_idx;
                 self.deadline.charge(DeadlineSite::StorageRead, rows)?;
+                if self.committed_tombstones.is_some() || self.pending_cold_deletes.is_some() {
+                    self.group_ids.load(
+                        &self.volume.meta.row_ids,
+                        self.current_idx..self.next_group_boundary,
+                    );
+                }
 
                 // Load per-group cache (V4 only)
                 if use_group_cache {
