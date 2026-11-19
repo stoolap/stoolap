@@ -23,6 +23,8 @@ pub struct RowIds(Repr);
 enum Repr {
     /// `start`, `start + 1`, ... for `len` positions
     Range { start: i64, len: usize },
+    /// Ascending ids within 2^32 of the smallest, packed by blocks of 64
+    Blocks(Box<Blocks>),
     /// `base + offsets[pos]`: ids within 2^32 of the smallest, four bytes each
     Offsets { base: i64, offsets: Vec<u32> },
     /// Any other ids, eight bytes each
@@ -30,8 +32,9 @@ enum Repr {
 }
 
 impl From<Vec<i64>> for RowIds {
-    /// Ids that run without a gap are kept as their range, ids that fit in
-    /// 32 bits above the smallest as offsets from it
+    /// Ids that run without a gap are kept as their range; ids that fit in
+    /// 32 bits above the smallest are packed by blocks when they ascend and
+    /// that takes less, else kept as offsets from the smallest
     fn from(ids: Vec<i64>) -> Self {
         let Some(&start) = ids.first() else {
             return Self(Repr::Full(ids));
@@ -42,14 +45,216 @@ impl From<Vec<i64>> for RowIds {
         let (min, max) = ids
             .iter()
             .fold((start, start), |(min, max), &id| (min.min(id), max.max(id)));
-        match u32::try_from(i128::from(max) - i128::from(min)) {
-            Ok(_) => Self(Repr::Offsets {
+        if u32::try_from(i128::from(max) - i128::from(min)).is_err() {
+            return Self(Repr::Full(ids));
+        }
+        let blocks = ids
+            .windows(2)
+            .all(|w| w[0] < w[1])
+            .then(|| Blocks::new(&ids, min, max));
+        match blocks.flatten() {
+            Some(blocks) if blocks.memory_size() < ids.len() * 4 => Self(Repr::Blocks(blocks)),
+            _ => Self(Repr::Offsets {
                 base: min,
                 offsets: ids.iter().map(|&id| (id - min) as u32).collect(),
             }),
-            Err(_) => Self(Repr::Full(ids)),
         }
     }
+}
+
+/// Positions per block of `Blocks`
+const BLOCK: usize = 64;
+/// Bits of a block header that hold where its offsets start in `data`
+const START_BITS: u32 = 26;
+
+/// Ascending ids packed by blocks of 64 positions: each id as its offset
+/// from the first id of its block, at the block's width
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Blocks {
+    min: i64,
+    max: i64,
+    len: usize,
+    /// Per block, one word: the offset of its smallest id from `min` (bits
+    /// 0..32), its first bit in `data` (32..58) and its width (58..64)
+    heads: Box<[u64]>,
+    /// The offsets, then 8 spare bytes so that any read takes 8 bytes
+    data: Box<[u8]>,
+}
+
+impl Blocks {
+    /// None when the packed offsets would not fit the header's bit start
+    fn new(ids: &[i64], min: i64, max: i64) -> Option<Box<Blocks>> {
+        let mut heads = Vec::with_capacity(ids.len().div_ceil(BLOCK));
+        let mut bit = 0u64;
+        for block in ids.chunks(BLOCK) {
+            let (lo, hi) = (block[0], block[block.len() - 1]);
+            let width = u64::from(64 - ((hi - lo) as u64).leading_zeros());
+            if bit >= 1 << START_BITS {
+                return None;
+            }
+            heads.push((lo - min) as u64 | bit << 32 | width << (32 + START_BITS));
+            bit += block.len() as u64 * width;
+        }
+        let mut data = vec![0u8; bit.div_ceil(8) as usize + 8];
+        for (block, &head) in ids.chunks(BLOCK).zip(&heads) {
+            let (lo, start, width) = Self::parts(head, min);
+            for (k, &id) in block.iter().enumerate() {
+                let at = start + k as u64 * u64::from(width);
+                let bytes = &mut data[(at >> 3) as usize..][..8];
+                let mut word = [0u8; 8];
+                word.copy_from_slice(bytes);
+                let packed = u64::from_le_bytes(word) | ((id - lo) as u64) << (at & 7);
+                bytes.copy_from_slice(&packed.to_le_bytes());
+            }
+        }
+        Some(Box::new(Blocks {
+            min,
+            max,
+            len: ids.len(),
+            heads: heads.into_boxed_slice(),
+            data: data.into_boxed_slice(),
+        }))
+    }
+
+    /// A block's first id, first bit and width
+    #[inline(always)]
+    fn parts(head: u64, min: i64) -> (i64, u64, u32) {
+        let lo = min + i64::from(head as u32);
+        let start = (head >> 32) & ((1 << START_BITS) - 1);
+        (lo, start, (head >> (32 + START_BITS)) as u32)
+    }
+
+    /// The bits from bit `at` of `data` on, at least 57 of them, to be masked
+    /// to a width of at most 32
+    #[inline(always)]
+    fn read(&self, at: u64) -> u64 {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&self.data[(at >> 3) as usize..][..8]);
+        u64::from_le_bytes(word) >> (at & 7)
+    }
+
+    #[inline(always)]
+    fn at(&self, pos: usize) -> i64 {
+        match self.get(pos) {
+            Some(id) => id,
+            None => past_end(pos, self.len),
+        }
+    }
+
+    #[inline(always)]
+    fn get(&self, pos: usize) -> Option<i64> {
+        if pos >= self.len {
+            return None;
+        }
+        let (lo, start, width) = Self::parts(self.heads[pos / BLOCK], self.min);
+        let offset = self.read(start + (pos % BLOCK) as u64 * u64::from(width));
+        Some(lo + (offset & !(u64::MAX << width)) as i64)
+    }
+
+    /// Unpacks `positions` a block at a time, the block's parts read once
+    fn copy_into(&self, positions: std::ops::Range<usize>, out: &mut Vec<i64>) {
+        assert!(positions.start <= positions.end && positions.end <= self.len);
+        out.reserve(positions.len());
+        let mut pos = positions.start;
+        while pos < positions.end {
+            let (lo, start, width) = Self::parts(self.heads[pos / BLOCK], self.min);
+            let end = (pos / BLOCK * BLOCK + BLOCK).min(positions.end);
+            let (mask, step) = (!(u64::MAX << width), u64::from(width));
+            let first = start + (pos % BLOCK) as u64 * step;
+            out.extend(
+                (0..(end - pos) as u64).map(|k| lo + (self.read(first + k * step) & mask) as i64),
+            );
+            pos = end;
+        }
+    }
+
+    /// The first of `positions` whose id is `id` or larger, in ids that ascend
+    fn first_at_least(&self, positions: std::ops::Range<usize>, id: i64) -> usize {
+        assert!(positions.start <= positions.end && positions.end <= self.len);
+        let (mut lo, mut hi) = (positions.start, positions.end);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.at(mid) < id {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// The position of `id` in ids that ascend: the block by its first id,
+    /// then within it, each from where the id would lie if ids were spread
+    /// evenly
+    fn search_ascending(&self, id: i64) -> Option<usize> {
+        if id > self.max {
+            return None;
+        }
+        let offset = u64::try_from(id.checked_sub(self.min)?).ok()?;
+        let span = (self.max - self.min) as u64 + 1;
+        let first_of = |b: usize| u64::from(self.heads[b] as u32);
+        let blocks = self.heads.len();
+        let block = last_at_most(blocks, offset * blocks as u64 / span, offset, first_of)?;
+        let (_, start, width) = Self::parts(self.heads[block], self.min);
+        let len = (self.len - block * BLOCK).min(BLOCK);
+        let end = match block + 1 < blocks {
+            true => first_of(block + 1),
+            false => span,
+        };
+        let (target, mask) = (offset - first_of(block), !(u64::MAX << width));
+        let offset_at = |k: usize| self.read(start + k as u64 * u64::from(width)) & mask;
+        let guess = target * len as u64 / (end - first_of(block));
+        let k = last_at_most(len, guess, target, offset_at)?;
+        (offset_at(k) == target).then_some(block * BLOCK + k)
+    }
+
+    fn memory_size(&self) -> usize {
+        self.heads.len() * 8 + self.data.len()
+    }
+}
+
+/// The last of `0..len` whose ascending `value` is `target` or less, None
+/// when none is: galloping from `guess` away from the side it misses on,
+/// then halving the bracket found
+#[inline(always)]
+fn last_at_most(
+    len: usize,
+    guess: u64,
+    target: u64,
+    value: impl Fn(usize) -> u64,
+) -> Option<usize> {
+    let guess = (guess as usize).min(len - 1);
+    let mut step = 1;
+    let (mut below, mut above) = if value(guess) <= target {
+        let mut below = guess;
+        while below + step < len && value(below + step) <= target {
+            below += step;
+            step *= 2;
+        }
+        (below, (below + step).min(len))
+    } else {
+        let mut above = guess;
+        loop {
+            let next = above.saturating_sub(step);
+            if value(next) <= target {
+                break (next, above);
+            }
+            if next == 0 {
+                return None;
+            }
+            above = next;
+            step *= 2;
+        }
+    };
+    while above - below > 1 {
+        let mid = below + (above - below) / 2;
+        if value(mid) <= target {
+            below = mid;
+        } else {
+            above = mid;
+        }
+    }
+    Some(below)
 }
 
 #[cold]
@@ -82,6 +287,7 @@ impl RowIds {
         match &self.0 {
             Repr::Range { len, .. } => *len,
             Repr::Offsets { offsets, .. } => offsets.len(),
+            Repr::Blocks(blocks) => blocks.len,
             Repr::Full(ids) => ids.len(),
         }
     }
@@ -96,6 +302,7 @@ impl RowIds {
     pub fn at(&self, pos: usize) -> i64 {
         match &self.0 {
             Repr::Offsets { base, offsets } => base + i64::from(offsets[pos]),
+            Repr::Blocks(blocks) => blocks.at(pos),
             Repr::Full(ids) => ids[pos],
             Repr::Range { start, len } => {
                 if pos >= *len {
@@ -114,6 +321,7 @@ impl RowIds {
             Repr::Offsets { base, offsets } => {
                 offsets.get(pos).map(|&offset| base + i64::from(offset))
             }
+            Repr::Blocks(blocks) => blocks.get(pos),
             Repr::Full(ids) => ids.get(pos).copied(),
         }
     }
@@ -133,6 +341,7 @@ impl RowIds {
             Repr::Offsets { base, offsets } => {
                 offsets.iter().max().map(|&offset| base + i64::from(offset))
             }
+            Repr::Blocks(blocks) => Some(blocks.max),
             Repr::Full(ids) => ids.iter().max().copied(),
         }
     }
@@ -158,6 +367,10 @@ impl RowIds {
                 base: *base,
                 offsets: offsets[positions].iter(),
             },
+            Repr::Blocks(blocks) => {
+                assert!(positions.start <= positions.end && positions.end <= blocks.len);
+                IterRepr::Blocks { blocks, positions }
+            }
             Repr::Full(ids) => IterRepr::Full(ids[positions].iter()),
         })
     }
@@ -181,6 +394,7 @@ impl RowIds {
                     .iter()
                     .map(|&offset| base + i64::from(offset)),
             ),
+            Repr::Blocks(blocks) => blocks.copy_into(positions, out),
             Repr::Full(ids) => out.extend_from_slice(&ids[positions]),
         }
     }
@@ -188,7 +402,7 @@ impl RowIds {
     /// Whether every id is larger than the one before it
     pub fn ascends(&self) -> bool {
         match &self.0 {
-            Repr::Range { .. } => true,
+            Repr::Range { .. } | Repr::Blocks(_) => true,
             Repr::Offsets { offsets, .. } => offsets.windows(2).all(|w| w[0] < w[1]),
             Repr::Full(ids) => ids.windows(2).all(|w| w[0] < w[1]),
         }
@@ -198,7 +412,7 @@ impl RowIds {
     pub fn as_range(&self) -> Option<(i64, usize)> {
         match &self.0 {
             Repr::Range { start, len } => Some((*start, *len)),
-            Repr::Offsets { .. } | Repr::Full(_) => None,
+            Repr::Offsets { .. } | Repr::Blocks(_) | Repr::Full(_) => None,
         }
     }
 
@@ -208,7 +422,7 @@ impl RowIds {
             return None;
         }
         match &self.0 {
-            Repr::Range { .. } => None,
+            Repr::Range { .. } | Repr::Blocks(_) => None,
             Repr::Offsets { offsets, .. } => {
                 let mut order: Vec<u32> = (0..offsets.len() as u32).collect();
                 order.sort_unstable_by_key(|&i| offsets[i as usize]);
@@ -232,6 +446,7 @@ impl RowIds {
                 }
                 offsets.binary_search(&offset).ok()
             }
+            Repr::Blocks(blocks) => blocks.search_ascending(id),
             Repr::Full(ids) => {
                 if id < *ids.first()? || id > *ids.last()? {
                     return None;
@@ -259,6 +474,7 @@ impl RowIds {
                 };
                 positions.start + found
             }
+            Repr::Blocks(blocks) => blocks.first_at_least(positions, id),
             Repr::Full(ids) => {
                 positions.start + ids[positions].partition_point(|&other| other < id)
             }
@@ -286,6 +502,7 @@ impl RowIds {
         match &self.0 {
             Repr::Range { .. } => 0,
             Repr::Offsets { offsets, .. } => offsets.capacity() * 4,
+            Repr::Blocks(blocks) => std::mem::size_of::<Blocks>() + blocks.memory_size(),
             Repr::Full(ids) => ids.capacity() * 8,
         }
     }
@@ -311,6 +528,12 @@ impl GroupRowIds {
     pub fn at(&self, pos: usize) -> i64 {
         self.ids[pos - self.start]
     }
+
+    /// Whether `pos` is one of the loaded positions
+    #[inline(always)]
+    pub fn holds(&self, pos: usize) -> bool {
+        pos.wrapping_sub(self.start) < self.ids.len()
+    }
 }
 
 /// The ids of a range of positions, in order
@@ -325,6 +548,10 @@ enum IterRepr<'a> {
     Offsets {
         base: i64,
         offsets: std::slice::Iter<'a, u32>,
+    },
+    Blocks {
+        blocks: &'a Blocks,
+        positions: std::ops::Range<usize>,
     },
     Full(std::slice::Iter<'a, i64>),
 }
@@ -344,6 +571,7 @@ impl Iterator for Iter<'_> {
             IterRepr::Offsets { base, offsets } => {
                 offsets.next().map(|&offset| *base + i64::from(offset))
             }
+            IterRepr::Blocks { blocks, positions } => positions.next().map(|pos| blocks.at(pos)),
             IterRepr::Full(ids) => ids.next().copied(),
         }
     }
@@ -369,6 +597,7 @@ impl Iterator for Iter<'_> {
             IterRepr::Offsets { base, offsets } => {
                 offsets.nth(n).map(|&offset| *base + i64::from(offset))
             }
+            IterRepr::Blocks { blocks, positions } => positions.nth(n).map(|pos| blocks.at(pos)),
             IterRepr::Full(ids) => ids.nth(n).copied(),
         }
     }
@@ -380,6 +609,7 @@ impl ExactSizeIterator for Iter<'_> {
         match &self.0 {
             IterRepr::Range { left, .. } => *left,
             IterRepr::Offsets { offsets, .. } => offsets.len(),
+            IterRepr::Blocks { positions, .. } => positions.len(),
             IterRepr::Full(ids) => ids.len(),
         }
     }
@@ -468,6 +698,78 @@ mod tests {
             [1, 2, 4]
         );
         assert_eq!([11, i64::MAX].map(|id| at_least(&forms[2], id)), [2, 3]);
+    }
+
+    #[test]
+    fn ascending_ids_with_gaps_are_packed_by_blocks_of_64() {
+        let mut expected = Vec::new();
+        let mut id = -5_000i64;
+        for pos in 0..10_000u64 {
+            id += 1 + (pos * 7919 % 97) as i64 + if pos % 3000 == 2999 { 1 << 30 } else { 0 };
+            expected.push(id);
+        }
+        let ids = RowIds::from(expected.clone());
+        assert!(
+            ids.memory_size() < expected.len() * 4,
+            "{}",
+            ids.memory_size()
+        );
+        assert_eq!(all(&ids), expected);
+        assert_eq!(
+            ids.iter_range(63..130).collect::<Vec<_>>(),
+            expected[63..130]
+        );
+        assert_eq!(ids.iter_range(5..9).nth(2), Some(expected[7]));
+        assert_eq!(ids.to_vec(100..9_999), expected[100..9_999]);
+        assert_eq!(
+            (ids.get(10_000), ids.max()),
+            (None, expected.last().copied())
+        );
+        assert!(ids.ascends() && ids.sorted_order().is_none() && ids.as_range().is_none());
+        for (pos, &id) in expected.iter().enumerate() {
+            assert_eq!(ids.at(pos), id);
+            assert_eq!(ids.search_ascending(id), Some(pos), "{id}");
+            assert_eq!(
+                ids.search_ascending(id + 1),
+                (expected.get(pos + 1) == Some(&(id + 1))).then_some(pos + 1)
+            );
+            assert_eq!(ids.first_at_least(0..10_000, id + 1), pos + 1);
+        }
+        assert_eq!(ids.search_ascending(i64::MIN), None);
+        assert_eq!(ids.search_ascending(i64::MAX), None);
+        assert_eq!(ids.first_at_least(200..300, i64::MIN), 200);
+        let mut bytes = Vec::new();
+        ids.write_le(&mut bytes).unwrap();
+        assert_eq!(bytes[8 * 77..8 * 78], expected[77].to_le_bytes());
+        let mut group = GroupRowIds::default();
+        group.load(&ids, 65..4_000);
+        assert_eq!(group.at(3_999), expected[3_999]);
+    }
+
+    #[test]
+    fn packed_ids_are_found_where_they_are_spread_unevenly() {
+        let dense = (0..5_000i64).map(|k| 10 + 3 * k + k % 3);
+        let sparse = (1..5_000i64).map(|k| 20_000 + k * 60_000 + (k * 7919) % 1_000);
+        let expected: Vec<i64> = dense.chain(sparse).chain([4_000_000_000]).collect();
+        let ids = RowIds::from(expected.clone());
+        assert!(
+            ids.memory_size() < expected.len() * 4,
+            "{}",
+            ids.memory_size()
+        );
+        for (pos, &id) in expected.iter().enumerate() {
+            assert_eq!(ids.search_ascending(id), Some(pos), "{id}");
+            if expected.get(pos + 1) != Some(&(id + 1)) {
+                assert_eq!(ids.search_ascending(id + 1), None, "{}", id + 1);
+            }
+        }
+        assert_eq!(ids.search_ascending(9), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "row id position 4096 past 4096")]
+    fn packed_ids_panic_past_the_end_inside_the_last_block() {
+        RowIds::from((0..4096).map(|pos| pos * 3).collect::<Vec<i64>>()).at(4096);
     }
 
     #[test]

@@ -3919,9 +3919,21 @@ impl RowReader {
         &self.volume
     }
 
-    fn cell(&mut self, col_idx: usize, row_idx: usize) -> std::io::Result<Value> {
+    /// The cell of `col_idx` at `row_idx`, whose row id is `row_id` when the
+    /// caller holds it already
+    fn cell(
+        &mut self,
+        col_idx: usize,
+        row_idx: usize,
+        row_id: Option<i64>,
+    ) -> std::io::Result<Value> {
         if let Some(column) = self.volume.columns.resident(col_idx) {
             return Ok(column.get_value(row_idx));
+        }
+        if let Some(id) = row_id
+            && self.volume.meta.row_id_column == Some(col_idx)
+        {
+            return Ok(Value::Integer(id));
         }
         if let Some(value) = self.volume.meta.row_id_cell(col_idx, row_idx) {
             return Ok(value);
@@ -3956,8 +3968,8 @@ impl RowReader {
                 continue;
             }
             *value = match mapping.sources.get(ci) {
-                _ if mapping.is_identity => self.cell(ci, idx)?,
-                Some(ColSource::Volume(col_idx)) => self.cell(*col_idx, idx)?,
+                _ if mapping.is_identity => self.cell(ci, idx, None)?,
+                Some(ColSource::Volume(col_idx)) => self.cell(*col_idx, idx, None)?,
                 Some(ColSource::Default(default)) => default.clone(),
                 None => continue,
             };
@@ -3967,17 +3979,27 @@ impl RowReader {
 
     /// The row at `idx` through `mapping`, every schema column
     pub fn row(&mut self, idx: usize, mapping: &ColumnMapping) -> std::io::Result<Row> {
+        self.row_with_id(idx, None, mapping)
+    }
+
+    /// `row`, for a caller that holds the row's id already
+    pub fn row_with_id(
+        &mut self,
+        idx: usize,
+        row_id: Option<i64>,
+        mapping: &ColumnMapping,
+    ) -> std::io::Result<Row> {
         if mapping.is_identity {
             let mut values = Vec::with_capacity(self.volume.columns.len());
             for col_idx in 0..self.volume.columns.len() {
-                values.push(self.cell(col_idx, idx)?);
+                values.push(self.cell(col_idx, idx, row_id)?);
             }
             return Ok(Row::from_values(values));
         }
         let mut values = Vec::with_capacity(mapping.sources.len());
         for source in &mapping.sources {
             values.push(match source {
-                ColSource::Volume(col_idx) => self.cell(*col_idx, idx)?,
+                ColSource::Volume(col_idx) => self.cell(*col_idx, idx, row_id)?,
                 ColSource::Default(value) => value.clone(),
             });
         }

@@ -141,8 +141,6 @@ pub struct VolumeScanner {
     end_idx: usize,
     /// Current reconstructed row
     current_row: Row,
-    /// Row ID of the current row (from segment's row_ids array)
-    current_rid: i64,
     /// Where the current row lies in the volume
     current_pos: usize,
     /// Whether we have a valid current row
@@ -482,7 +480,6 @@ impl VolumeScanner {
                 continue;
             }
             self.current_pos = idx;
-            self.current_rid = self.volume.meta.row_ids.at(idx);
             self.has_current = true;
             return Ok(true);
         }
@@ -520,7 +517,6 @@ impl VolumeScanner {
             is_full_projection,
             current_idx: 0,
             current_row: Row::new(),
-            current_rid: 0,
             current_pos: 0,
             has_current: false,
             error: None,
@@ -589,7 +585,6 @@ impl VolumeScanner {
             current_idx: start_idx,
             end_idx,
             current_row: Row::new(),
-            current_rid: 0,
             current_pos: 0,
             has_current: false,
             error: None,
@@ -689,7 +684,6 @@ impl VolumeScanner {
             current_idx: 0,
             end_idx: 0,
             current_row: Row::new(),
-            current_rid: 0,
             current_pos: 0,
             has_current: false,
             error: None,
@@ -1685,7 +1679,6 @@ impl VolumeScanner {
                     side.rows += 1;
                 }
                 self.current_pos = idx;
-                self.current_rid = self.volume.meta.row_ids.at(idx);
                 self.has_current = true;
                 return Ok(true);
             }
@@ -1747,7 +1740,6 @@ impl VolumeScanner {
             }
 
             self.current_pos = idx;
-            self.current_rid = self.volume.meta.row_ids.at(idx);
             self.has_current = true;
             self.current_idx += 1;
             return Ok(true);
@@ -1798,13 +1790,13 @@ impl Scanner for VolumeScanner {
     }
 
     fn take_row_with_id(&mut self) -> (i64, Row) {
-        let rid = self.current_rid;
+        let rid = self.current_row_id();
         self.has_current = false;
         (rid, std::mem::take(&mut self.current_row))
     }
 
     fn current_row_id(&self) -> i64 {
-        self.current_rid
+        self.volume.meta.row_ids.get(self.current_pos).unwrap_or(0)
     }
 
     fn estimated_count(&self) -> Option<usize> {
