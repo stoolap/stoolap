@@ -241,6 +241,30 @@ impl RowIds {
         }
     }
 
+    /// The first of `positions` whose id is `id` or larger, `positions.end`
+    /// when none is, in ids that ascend; panics past the end, as a slice does
+    pub fn first_at_least(&self, positions: std::ops::Range<usize>, id: i64) -> usize {
+        match &self.0 {
+            Repr::Range { start, len } => {
+                assert!(positions.start <= positions.end && positions.end <= *len);
+                let from = i128::from(id) - i128::from(*start);
+                (from.clamp(positions.start as i128, positions.end as i128)) as usize
+            }
+            Repr::Offsets { base, offsets } => {
+                let below = &offsets[positions.clone()];
+                let found = match u32::try_from(i128::from(id) - i128::from(*base)) {
+                    Ok(offset) => below.partition_point(|&o| o < offset),
+                    Err(_) if id < *base => 0,
+                    Err(_) => below.len(),
+                };
+                positions.start + found
+            }
+            Repr::Full(ids) => {
+                positions.start + ids[positions].partition_point(|&other| other < id)
+            }
+        }
+    }
+
     /// Writes every id as 8 little-endian bytes
     pub fn write_le<W: std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
         if let Repr::Full(ids) = &self.0 {
@@ -422,6 +446,28 @@ mod tests {
         let mut bytes = Vec::new();
         unordered.write_le(&mut bytes).unwrap();
         assert_eq!(bytes[8..16], 2i64.to_le_bytes());
+    }
+
+    #[test]
+    fn the_first_id_at_least_a_bound_is_found_within_the_positions() {
+        let forms = [
+            RowIds::from(vec![10, 11, 12, 13]),
+            RowIds::from(vec![10, 12, 13, 20]),
+            RowIds::from(vec![i64::MIN, 10, 12, i64::MAX]),
+        ];
+        for ids in &forms {
+            assert_eq!(ids.first_at_least(0..4, i64::MIN), 0, "{ids:?}");
+            assert_eq!(ids.first_at_least(1..3, 0), 1, "{ids:?}");
+            assert_eq!(ids.first_at_least(1..3, 14), 3, "{ids:?}");
+            assert_eq!(ids.first_at_least(2..2, 0), 2, "{ids:?}");
+        }
+        let at_least = |ids: &RowIds, id| ids.first_at_least(0..4, id);
+        assert_eq!([12, 14].map(|id| at_least(&forms[0], id)), [2, 4]);
+        assert_eq!(
+            [11, 13, i64::MAX].map(|id| at_least(&forms[1], id)),
+            [1, 2, 4]
+        );
+        assert_eq!([11, i64::MAX].map(|id| at_least(&forms[2], id)), [2, 3]);
     }
 
     #[test]

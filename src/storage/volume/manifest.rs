@@ -777,6 +777,14 @@ pub struct StoredManifest {
 thread_local! {
     /// Entries a tombstone cleanup looked at on this thread
     static CLEANUP_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Rows a visibility computation read on this thread
+    static VISIBILITY_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn count_visibility_visits(_rows: usize) {
+    #[cfg(test)]
+    VISIBILITY_VISITS.with(|v| v.set(v.get() + _rows));
 }
 
 #[inline]
@@ -830,66 +838,15 @@ fn remove_tombstones_where<I: Iterator<Item = i64>>(
     map.len() != before
 }
 
-/// Recompute the visibility bitmaps for all segments in `segments`.
-///
-/// `seg_order` lists segment IDs in ascending (oldest-first) order.
-/// Segments are processed newest-first: the first time a row_id is seen at
-/// an authoritative position it is marked visible; subsequent occurrences
-/// (in older volumes) are masked out.
-/// When there is at most one segment every row is authoritative, so all
-/// `visible` fields are set to `None` (fast path for the common case).
+/// Recompute the visibility bitmaps for all segments in `segments`, ordered
+/// as `seg_order` (ascending), `bounds` the id range of each from the
+/// manifest: every segment masked by the live copies of the segments after it
 fn compute_visibility_bitmaps(
     seg_order: &[u64],
+    bounds: &rustc_hash::FxHashMap<u64, (i64, i64)>,
     segments: &mut rustc_hash::FxHashMap<u64, ColdSegment>,
 ) {
-    if segments.len() <= 1 {
-        for cs in segments.values_mut() {
-            let rc = cs.volume.meta.row_count;
-            cs.visible = cs
-                .dead
-                .as_ref()
-                .map(|dead| Arc::new(bits_without(rc, dead)));
-        }
-        return;
-    }
-    // Sized to the table and let go on return, so no table-sized set is kept
-    let total: usize = segments.values().map(|cs| cs.volume.meta.row_count).sum();
-    let mut seen: rustc_hash::FxHashSet<i64> =
-        rustc_hash::FxHashSet::with_capacity_and_hasher(total, Default::default());
-    // Process newest-first (seg_order is ascending, so iterate reversed)
-    for &seg_id in seg_order.iter().rev() {
-        if let Some(cs) = segments.get_mut(&seg_id) {
-            let rc = cs.volume.meta.row_count;
-            if rc == 0 {
-                cs.visible = None;
-                continue;
-            }
-            let num_words = rc.div_ceil(64);
-            let mut bits = vec![!0u64; num_words];
-            // Clear trailing bits beyond row_count
-            let trailing = rc % 64;
-            if trailing != 0 {
-                bits[num_words - 1] &= (1u64 << trailing) - 1;
-            }
-            let mut has_overlap = false;
-            // A copy that never got authority takes no part in precedence
-            let mut dead = cs.dead.as_deref().unwrap_or(&[]).iter().peekable();
-            for i in 0..rc {
-                if dead.next_if_eq(&&(i as u32)).is_some() {
-                    bits[i >> 6] &= !(1u64 << (i & 63));
-                } else if !seen.insert(cs.volume.meta.row_ids.at(i)) {
-                    bits[i >> 6] &= !(1u64 << (i & 63));
-                    has_overlap = true;
-                }
-            }
-            // No overlap with newer volumes: None = all visible (zero memory, no per-row check)
-            cs.visible = if has_overlap || cs.dead.is_some() {
-                Some(Arc::new(bits))
-            } else {
-                None
-            };
-        }
-    }
+    mask_segments(seg_order, |_| true, bounds, segments);
 }
 
 /// The visibility of a compaction's `outputs` in `segments`, ordered as
@@ -903,45 +860,240 @@ fn mask_outputs(
     bounds: &rustc_hash::FxHashMap<u64, (i64, i64)>,
     segments: &mut rustc_hash::FxHashMap<u64, ColdSegment>,
 ) {
-    for (position, seg_id) in seg_order.iter().enumerate() {
-        if !outputs.contains(seg_id) {
-            continue;
+    mask_segments(
+        seg_order,
+        |seg_id| outputs.contains(seg_id),
+        bounds,
+        segments,
+    );
+    debug_assert!(
+        same_as_full_pass(seg_order, bounds, segments),
+        "a compaction's publication changed a bitmap the full pass would set otherwise"
+    );
+}
+
+/// A segment's volume and dead positions, taken out of the map for a pass
+type HeldCopies = Option<(Arc<FrozenVolume>, Option<Arc<[u32]>>)>;
+
+/// Sets the visibility of each segment of `seg_order` that `target` names:
+/// its dead positions, and each position whose id a later segment holds a
+/// live copy of. Only rows where a target's id range meets another segment's
+/// are read, each a bounded number of times however many segments overlap.
+/// A dead copy takes no part in precedence; an untouched target keeps no bitmap
+fn mask_segments(
+    seg_order: &[u64],
+    target: impl Fn(&u64) -> bool,
+    bounds: &rustc_hash::FxHashMap<u64, (i64, i64)>,
+    segments: &mut rustc_hash::FxHashMap<u64, ColdSegment>,
+) {
+    let held: Vec<HeldCopies> = (seg_order.iter())
+        .map(|id| (segments.get(id)).map(|cs| (Arc::clone(&cs.volume), cs.dead.clone())))
+        .collect();
+    let ranges: Vec<Option<(i64, i64)>> = (seg_order.iter().zip(&held))
+        .map(|(id, held)| {
+            let (volume, _) = held.as_ref()?;
+            bounds.get(id).copied().or_else(|| volume.id_bounds())
+        })
+        .collect();
+    let targets: Vec<bool> = seg_order.iter().map(&target).collect();
+    // Per position: the parts of its range a later segment shares, read when
+    // it is a target, and the parts an earlier target shares, where its live
+    // copies can hide one
+    let newer: Vec<Vec<(i64, i64)>> = (0..seg_order.len())
+        .map(|p| match targets[p] {
+            true => covered(ranges[p], ranges[p + 1..].iter().flatten().copied()),
+            false => Vec::new(),
+        })
+        .collect();
+    let older: Vec<Vec<(i64, i64)>> = (0..seg_order.len())
+        .map(|p| {
+            covered(
+                ranges[p],
+                (0..p).filter(|&q| targets[q]).filter_map(|q| ranges[q]),
+            )
+        })
+        .collect();
+    let mut bits: Vec<Option<Vec<u64>>> = (held.iter().zip(&targets))
+        .map(|(held, &is_target)| {
+            let (volume, dead) = held.as_ref().filter(|_| is_target)?;
+            (dead.as_deref()).map(|dead| bits_without(volume.meta.row_count, dead))
+        })
+        .collect();
+    let mut shared = (held.iter().enumerate())
+        .filter(|&(p, _)| !newer[p].is_empty() || !older[p].is_empty())
+        .filter_map(|(_, held)| held.as_ref())
+        .peekable();
+    if shared.peek().is_some() {
+        if shared.all(|(volume, _)| ascends(volume)) {
+            merge_copies(&held, &newer, &older, &mut bits);
+        } else {
+            hash_copies(&held, &newer, &older, &mut bits);
         }
-        let Some(output) = segments.get(seg_id).map(|cs| Arc::clone(&cs.volume)) else {
-            continue;
-        };
-        let Some(range) = bounds.get(seg_id).copied().or_else(|| output.id_bounds()) else {
-            continue;
-        };
-        let mut bits: Option<Vec<u64>> = None;
-        for newer_id in &seg_order[position + 1..] {
-            let Some(newer) = segments.get(newer_id) else {
-                continue;
-            };
-            let shared = match bounds.get(newer_id) {
-                Some(&(lo, hi)) if hi < range.0 || range.1 < lo => continue,
-                Some(&(lo, hi)) => (lo.max(range.0), hi.min(range.1)),
-                None => range,
-            };
-            shadow_output(
-                &output,
-                &newer.volume,
-                newer.dead.as_deref(),
-                shared,
-                |pos| {
-                    let bits = bits.get_or_insert_with(|| bits_without(output.meta.row_count, &[]));
-                    bits[pos >> 6] &= !(1u64 << (pos & 63));
-                },
-            );
-        }
-        if let Some(cs) = segments.get_mut(seg_id) {
+    }
+    for ((seg_id, &is_target), bits) in seg_order.iter().zip(&targets).zip(bits) {
+        if is_target && let Some(cs) = segments.get_mut(seg_id) {
             cs.visible = bits.map(Arc::new);
         }
     }
-    debug_assert!(
-        same_as_full_pass(seg_order, segments),
-        "a compaction's publication changed a bitmap the full pass would set otherwise"
-    );
+}
+
+/// Masks the targets when every volume sharing ids holds them ascending: one
+/// merge of their shared rows, by id and newest copy first, with no set
+fn merge_copies(
+    held: &[HeldCopies],
+    newer: &[Vec<(i64, i64)>],
+    older: &[Vec<(i64, i64)>],
+    bits: &mut [Option<Vec<u64>>],
+) {
+    use std::cmp::Reverse;
+    // Per position: the row slices its shared parts cut, and where it stands
+    let mut slices: Vec<Vec<(usize, usize)>> = Vec::with_capacity(held.len());
+    let mut at = vec![(0usize, 0usize); held.len()];
+    let mut heap = std::collections::BinaryHeap::new();
+    for (p, held) in held.iter().enumerate() {
+        let mut rows = Vec::new();
+        if let Some((volume, _)) = held {
+            let ids = &volume.meta.row_ids;
+            for (lo, hi) in merged(newer[p].iter().chain(&older[p]).copied().collect()) {
+                let start = ids.first_at_least(0..ids.len(), lo);
+                let end = hi
+                    .checked_add(1)
+                    .map_or(ids.len(), |past| ids.first_at_least(0..ids.len(), past));
+                if start < end {
+                    rows.push((start, end));
+                }
+            }
+            if let Some(&(start, _)) = rows.first() {
+                at[p] = (0, start);
+                heap.push(Reverse((ids.at(start), Reverse(p))));
+            }
+        }
+        slices.push(rows);
+    }
+    let (mut current, mut newer_live) = (None, false);
+    while let Some(Reverse((id, Reverse(p)))) = heap.pop() {
+        count_visibility_visits(1);
+        let Some((volume, dead)) = &held[p] else {
+            continue;
+        };
+        let (slice, pos) = at[p];
+        if current != Some(id) {
+            (current, newer_live) = (Some(id), false);
+        }
+        // Only a target reads a later segment's parts
+        if newer_live && !newer[p].is_empty() {
+            hide(&mut bits[p], volume.meta.row_count, pos);
+        }
+        if dead
+            .as_deref()
+            .is_none_or(|dead| dead.binary_search(&(pos as u32)).is_err())
+        {
+            newer_live = true;
+        }
+        // Rows below every other cursor's id have no other copy: skipped
+        let Some(&Reverse((least, _))) = heap.peek() else {
+            break;
+        };
+        let ids = &volume.meta.row_ids;
+        let mut next = None;
+        for (s, &(start, end)) in slices[p].iter().enumerate().skip(slice) {
+            let from = if s == slice { pos + 1 } else { start };
+            let skip = ids.first_at_least(from..end, least);
+            if skip < end {
+                next = Some((s, skip));
+                break;
+            }
+        }
+        if let Some((slice, pos)) = next {
+            at[p] = (slice, pos);
+            heap.push(Reverse((ids.at(pos), Reverse(p))));
+        }
+    }
+}
+
+/// Masks the targets newest segment first by a set of the live ids that can
+/// hide an earlier target, for volumes whose ids do not all ascend
+fn hash_copies(
+    held: &[HeldCopies],
+    newer: &[Vec<(i64, i64)>],
+    older: &[Vec<(i64, i64)>],
+    bits: &mut [Option<Vec<u64>>],
+) {
+    let mut newer_live: rustc_hash::FxHashSet<i64> = rustc_hash::FxHashSet::default();
+    for (p, held) in held.iter().enumerate().rev() {
+        let Some((volume, dead)) = held else {
+            continue;
+        };
+        let ids = &volume.meta.row_ids;
+        if !newer[p].is_empty() && !newer_live.is_empty() {
+            for (pos, id) in ids.iter().enumerate() {
+                count_visibility_visits(1);
+                if within(&newer[p], id) && newer_live.contains(&id) {
+                    hide(&mut bits[p], volume.meta.row_count, pos);
+                }
+            }
+        }
+        if !older[p].is_empty() {
+            let mut dead = dead.as_deref().unwrap_or(&[]).iter().peekable();
+            for (pos, id) in ids.iter().enumerate() {
+                count_visibility_visits(1);
+                if dead.next_if_eq(&&(pos as u32)).is_none() && within(&older[p], id) {
+                    newer_live.insert(id);
+                }
+            }
+        }
+    }
+}
+
+/// Clears `pos` in a bitmap over `row_count` rows, made full on first use
+fn hide(bits: &mut Option<Vec<u64>>, row_count: usize, pos: usize) {
+    let bits = bits.get_or_insert_with(|| bits_without(row_count, &[]));
+    bits[pos >> 6] &= !(1u64 << (pos & 63));
+}
+
+/// Whether `volume` holds its ids ascending, from the decided order when
+/// there is one, else by a scan that decides nothing
+fn ascends(volume: &FrozenVolume) -> bool {
+    match volume.meta.row_order.get() {
+        Some(order) => order.is_none(),
+        None => {
+            count_visibility_visits(volume.meta.row_count);
+            volume.meta.row_ids.ascends()
+        }
+    }
+}
+
+/// The parts of `range` that `others` cover, sorted and merged; none of an
+/// absent range
+fn covered(range: Option<(i64, i64)>, others: impl Iterator<Item = (i64, i64)>) -> Vec<(i64, i64)> {
+    let Some(range) = range else {
+        return Vec::new();
+    };
+    merged(
+        others
+            .filter(|&(lo, hi)| lo <= range.1 && range.0 <= hi)
+            .map(|(lo, hi)| (lo.max(range.0), hi.min(range.1)))
+            .collect(),
+    )
+}
+
+/// `parts` sorted, with the ones that meet or touch made one
+fn merged(mut parts: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    parts.sort_unstable();
+    parts.dedup_by(|next, kept| {
+        let joins = next.0 <= kept.1.saturating_add(1);
+        if joins {
+            kept.1 = kept.1.max(next.1);
+        }
+        joins
+    });
+    parts
+}
+
+/// Whether `id` falls in one of the sorted, merged `parts`
+fn within(parts: &[(i64, i64)], id: i64) -> bool {
+    let i = parts.partition_point(|&(_, hi)| hi < id);
+    parts.get(i).is_some_and(|&(lo, _)| lo <= id)
 }
 
 /// The id range each manifest entry records, by segment
@@ -954,41 +1106,12 @@ fn segment_bounds<'a>(
         .collect()
 }
 
-/// Calls `hide` with each position of `output` whose id, within `(lo, hi)`,
-/// `newer` holds a live copy of. No permutation is built for `newer`: it is
-/// searched only when its order is decided already, else its ids are walked
-/// and located in the output, whose order its build decided
-fn shadow_output(
-    output: &FrozenVolume,
-    newer: &FrozenVolume,
-    dead: Option<&[u32]>,
-    (lo, hi): (i64, i64),
-    mut hide: impl FnMut(usize),
-) {
-    let live = |pos: usize| dead.is_none_or(|dead| dead.binary_search(&(pos as u32)).is_err());
-    if newer.meta.row_order.get().is_some() && output.meta.row_count < newer.meta.row_count {
-        for (pos, id) in output.meta.row_ids.iter().enumerate() {
-            if (lo..=hi).contains(&id) && newer.locate(id).is_some_and(live) {
-                hide(pos);
-            }
-        }
-    } else {
-        for (newer_pos, id) in newer.meta.row_ids.iter().enumerate() {
-            if (lo..=hi).contains(&id)
-                && live(newer_pos)
-                && let Some(pos) = output.locate(id)
-            {
-                hide(pos);
-            }
-        }
-    }
-}
-
 /// Whether every segment's visibility equals what `compute_visibility_bitmaps`
 /// gives the same map, an absent bitmap and a full one counting as one
 #[cfg(debug_assertions)]
 fn same_as_full_pass(
     seg_order: &[u64],
+    bounds: &rustc_hash::FxHashMap<u64, (i64, i64)>,
     segments: &rustc_hash::FxHashMap<u64, ColdSegment>,
 ) -> bool {
     let bits_of = |cs: &ColdSegment| match &cs.visible {
@@ -996,14 +1119,18 @@ fn same_as_full_pass(
         None => bits_without(cs.volume.meta.row_count, &[]),
     };
     let mut full = segments.clone();
-    compute_visibility_bitmaps(seg_order, &mut full);
+    compute_visibility_bitmaps(seg_order, bounds, &mut full);
     segments
         .iter()
         .all(|(id, cs)| full.get(id).is_some_and(|f| bits_of(f) == bits_of(cs)))
 }
 
 #[cfg(not(debug_assertions))]
-fn same_as_full_pass(_: &[u64], _: &rustc_hash::FxHashMap<u64, ColdSegment>) -> bool {
+fn same_as_full_pass(
+    _: &[u64],
+    _: &rustc_hash::FxHashMap<u64, (i64, i64)>,
+    _: &rustc_hash::FxHashMap<u64, ColdSegment>,
+) -> bool {
     true
 }
 
@@ -3200,10 +3327,11 @@ impl SegmentManager {
                 side,
             };
             let seg_ids: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
+            let bounds = segment_bounds(&manifest.segments);
             let mut segments = self.segments.write();
             let mut new_map = (**segments).clone();
             new_map.insert(segment_id, cold);
-            compute_visibility_bitmaps(&seg_ids, &mut new_map);
+            compute_visibility_bitmaps(&seg_ids, &bounds, &mut new_map);
             // Before the segment is visible, so a reader that sees the volume
             // sees the generation that published it
             self.seal_generation
@@ -4345,10 +4473,13 @@ impl SegmentManager {
     }
 
     fn remove_segments_inner(&self, segment_ids: &[u64], _invalidate_cache: bool) {
-        let seg_ids: Vec<u64> = {
+        let (seg_ids, bounds): (Vec<u64>, _) = {
             let mut manifest = self.manifest.write();
             manifest.remove_segments(segment_ids);
-            manifest.segments.iter().map(|m| m.segment_id).collect()
+            (
+                manifest.segments.iter().map(|m| m.segment_id).collect(),
+                segment_bounds(&manifest.segments),
+            )
         };
         {
             let mut segments = self.segments.write();
@@ -4356,7 +4487,7 @@ impl SegmentManager {
             for &id in segment_ids {
                 new_map.remove(&id);
             }
-            compute_visibility_bitmaps(&seg_ids, &mut new_map);
+            compute_visibility_bitmaps(&seg_ids, &bounds, &mut new_map);
             if self.has_cold.load(std::sync::atomic::Ordering::Relaxed)
                 && !new_map.values().any(|cs| cs.volume.is_cold())
             {
@@ -4865,10 +4996,11 @@ impl SegmentManager {
     pub fn recompute_visibility(&self) {
         let manifest = self.manifest.read();
         let seg_ids: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
+        let bounds = segment_bounds(&manifest.segments);
         drop(manifest);
         let mut segments = self.segments.write();
         let mut new_map = (**segments).clone();
-        compute_visibility_bitmaps(&seg_ids, &mut new_map);
+        compute_visibility_bitmaps(&seg_ids, &bounds, &mut new_map);
         *segments = Arc::new(new_map);
     }
 }
@@ -5825,6 +5957,65 @@ mod tests {
     }
 
     #[test]
+    fn a_recompute_masks_each_copy_by_the_newer_ranges_it_shares() {
+        for fifth in [[2, 3, 30], [3, 30, 2]] {
+            let mgr = SegmentManager::new("t", None);
+            register_with_dead(&mgr, 1, &[1, 2, 3, 4, 5], &[]);
+            register_with_dead(&mgr, 2, &[4, 5, 6], &[]);
+            register_with_dead(&mgr, 3, &[5, 9], &[]);
+            register_with_dead(&mgr, 4, &[20, 21], &[]);
+            register_with_dead(&mgr, 5, &fifth, &[]);
+            register_with_dead(&mgr, 6, &[1], &[0]);
+            mgr.recompute_visibility();
+            assert_eq!(
+                visible_positions(&mgr, 1),
+                vec![0],
+                "1 kept by a dead copy only, {fifth:?}"
+            );
+            assert_eq!(
+                visible_positions(&mgr, 2),
+                vec![0, 2],
+                "5 is newer in segment 3, {fifth:?}"
+            );
+            assert_eq!(visible_positions(&mgr, 3), vec![0, 1]);
+            assert_eq!(visible_positions(&mgr, 4), vec![0, 1]);
+            assert_eq!(visible_positions(&mgr, 5), vec![0, 1, 2]);
+            assert!(visible_positions(&mgr, 6).is_empty());
+            assert!(
+                mgr.segments_raw()[&4].visible.is_none(),
+                "no overlap keeps no bitmap, {fifth:?}"
+            );
+            assert_eq!(mgr.deduped_row_count().unwrap(), 10);
+        }
+    }
+
+    #[test]
+    fn a_recompute_reads_each_row_a_bounded_number_of_times_when_every_range_overlaps() {
+        let rows = 256i64;
+        for segments in [4i64, 16, 64] {
+            for ascending in [true, false] {
+                let mgr = SegmentManager::new("t", None);
+                for k in 0..segments {
+                    let mut ids: Vec<i64> = (0..rows).map(|i| i * segments + k).collect();
+                    if !ascending {
+                        ids.reverse();
+                    }
+                    register_with_dead(&mgr, k as u64 + 1, &ids, &[]);
+                }
+                VISIBILITY_VISITS.with(|v| v.set(0));
+                mgr.recompute_visibility();
+                let visits = VISIBILITY_VISITS.with(|v| v.get());
+                let total = (segments * rows) as usize;
+                assert!(
+                    visits <= 3 * total,
+                    "{segments} interleaved segments of {rows} rows, ascending {ascending}, read {visits} rows"
+                );
+                assert_eq!(mgr.deduped_row_count().unwrap(), total);
+            }
+        }
+    }
+
+    #[test]
     fn a_published_registration_hands_its_hidden_rows_back() {
         let mgr = SegmentManager::new("t", None);
         register_with_dead(&mgr, 1, &[1, 2, 3], &[]);
@@ -5988,8 +6179,9 @@ mod tests {
             .iter()
             .map(|m| m.segment_id)
             .collect();
+        let bounds = segment_bounds(&mgr.manifest.read().segments);
         let mut map = (*mgr.segments_raw()).clone();
-        compute_visibility_bitmaps(&order, &mut map);
+        compute_visibility_bitmaps(&order, &bounds, &mut map);
         order
             .iter()
             .map(|id| (*id, map[id].visible.as_ref().map(|v| (**v).clone())))
