@@ -180,8 +180,8 @@ pub struct VolumeScanner {
     /// Kept separate from pending_cold_deletes to avoid cloning the tombstone set.
     /// Map: row_id → commit_seq (for snapshot isolation filtering).
     committed_tombstones: Option<Arc<rustc_hash::FxHashMap<i64, u64>>>,
-    /// The ids of the row group a linear scan is in, loaded when tombstones
-    /// or pending deletes make it read every row's id
+    /// The next 64 ids of a linear scan, loaded as it reaches them when
+    /// tombstones or pending deletes make it read every row's id
     group_ids: super::row_ids::GroupRowIds,
     /// The statement view of the read: a tombstone counts only when it sees
     /// the commit
@@ -1711,12 +1711,6 @@ impl VolumeScanner {
                 }
                 let rows = self.next_group_boundary - self.current_idx;
                 self.deadline.charge(DeadlineSite::StorageRead, rows)?;
-                if self.committed_tombstones.is_some() || self.pending_cold_deletes.is_some() {
-                    self.group_ids.load(
-                        &self.volume.meta.row_ids,
-                        self.current_idx..self.next_group_boundary,
-                    );
-                }
 
                 // Load per-group cache (V4 only)
                 if use_group_cache {
@@ -1734,6 +1728,13 @@ impl VolumeScanner {
                 return Ok(false);
             }
 
+            if (self.committed_tombstones.is_some() || self.pending_cold_deletes.is_some())
+                && !self.group_ids.holds(self.current_idx)
+            {
+                let end = (self.current_idx + 64).min(self.next_group_boundary);
+                self.group_ids
+                    .load(&self.volume.meta.row_ids, self.current_idx..end);
+            }
             if self.should_skip_row(self.current_idx) || self.past_skip_key(self.current_idx)? {
                 self.current_idx += 1;
                 continue;
