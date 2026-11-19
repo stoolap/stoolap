@@ -41,16 +41,16 @@ unsafe impl GlobalAlloc for Counting {
         if in_recheck_fence_section() {
             let _ = UNDER_FENCE.try_with(|n| n.set(n.get() + 1));
         }
-        System.alloc(layout)
+        unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout)
+        unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         if in_recheck_fence_section() {
             let _ = UNDER_FENCE.try_with(|n| n.set(n.get() + 1));
         }
-        System.realloc(ptr, layout, new_size)
+        unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
 

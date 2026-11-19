@@ -34,14 +34,14 @@ unsafe impl GlobalAlloc for ThreadCounting {
     // thread-local Cell, which never allocates
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOCATED.with(|a| a.set(a.get() + layout.size()));
-        System.alloc(layout)
+        unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout)
+        unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         ALLOCATED.with(|a| a.set(a.get() + new_size));
-        System.realloc(ptr, layout, new_size)
+        unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
 

@@ -30,18 +30,18 @@ struct LiveBytes;
 unsafe impl GlobalAlloc for LiveBytes {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         LIVE.fetch_add(layout.size() as isize, Ordering::Relaxed);
-        System.alloc(layout)
+        unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         LIVE.fetch_sub(layout.size() as isize, Ordering::Relaxed);
-        System.dealloc(ptr, layout)
+        unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         LIVE.fetch_add(
             new_size as isize - layout.size() as isize,
             Ordering::Relaxed,
         );
-        System.realloc(ptr, layout, new_size)
+        unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
 

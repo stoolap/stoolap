@@ -37,11 +37,11 @@ unsafe impl GlobalAlloc for ThreadCounting {
         if COUNTING.try_with(Cell::get).unwrap_or(false) {
             ALLOCATIONS.with(|a| a.set(a.get() + 1));
         }
-        System.alloc(layout)
+        unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout)
+        unsafe { System.dealloc(ptr, layout) }
     }
 }
 
