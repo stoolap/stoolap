@@ -59,6 +59,17 @@ fn count_slot_visits(slots: usize) {
     let _ = slots;
 }
 
+/// A key's home slot is the low bits of this. Multiplication carries entropy
+/// only upwards, so the key's bits 16 and 32 up are folded down first: a run
+/// of dense keys keeps distinct homes, and keys that differ only high up,
+/// such as multiples of 2^32 or ids with a clock in their top bits, spread
+#[inline(always)]
+fn slot_hash(key: i64) -> usize {
+    let k = key as u64;
+    let k = k ^ (k >> 16) ^ (k >> 32);
+    k.wrapping_mul(0x517cc1b727220a95) as usize
+}
+
 /// Slot with key and value. key == EMPTY means slot is empty.
 #[repr(C)]
 struct Slot<V> {
@@ -212,23 +223,9 @@ impl<V> I64Map<V> {
         debug_assert_eq!(self.len, old_len);
     }
 
-    /// FxHash with pre-mixing - XOR the key with its shifted self before
-    /// multiplication to break stride patterns while preserving bijectivity.
-    /// This maintains 0 collisions for sequential keys while reducing strided
-    /// key collisions by ~65% (e.g., stride=1024 goes from 99,872 to 34,464).
-    ///
-    /// The bucket is the low bits of the returned value, and multiplication
-    /// only carries entropy upwards, so only the low bits of the key and the
-    /// 16 above them can reach it. That is what keeps dense keys collision
-    /// free, and it is deliberate: row ids, transaction ids and every other
-    /// counter key their maps this way. The price is that a key carrying its
-    /// entropy higher up has to be mixed before it arrives here, which is
-    /// what [`key_from_f64`] is for.
     #[inline(always)]
     fn hash(key: i64) -> usize {
-        let k = key as u64;
-        let k = k ^ (k >> 16); // Pre-mix to break stride patterns (bijective)
-        k.wrapping_mul(0x517cc1b727220a95) as usize
+        slot_hash(key)
     }
 
     #[inline(always)]
@@ -955,12 +952,9 @@ impl I64Set {
         self.slots.len()
     }
 
-    /// FxHash with pre-mixing - same as I64Map
     #[inline(always)]
     fn hash(key: i64) -> usize {
-        let k = key as u64;
-        let k = k ^ (k >> 16);
-        k.wrapping_mul(0x517cc1b727220a95) as usize
+        slot_hash(key)
     }
 
     /// Insert a value into the set. Returns true if the value was newly inserted.
@@ -1348,6 +1342,31 @@ mod tests {
     use super::*;
 
     const LARGE: i64 = 1_000_000;
+
+    /// Distinct home slots of `keys` in a table of `slots` slots
+    fn homes(keys: impl Iterator<Item = i64>, slots: usize) -> usize {
+        let mut seen = vec![false; slots];
+        keys.filter(|&key| !std::mem::replace(&mut seen[slot_hash(key) & (slots - 1)], true))
+            .count()
+    }
+
+    #[test]
+    fn keys_that_differ_only_high_up_get_distinct_homes() {
+        let slots = 1 << 17;
+        let n = 1 << 16;
+        let dense = homes((0..n).map(|k| 7_000_000_000 + k), slots);
+        assert_eq!(dense, n as usize, "a dense run keeps its homes apart");
+        let wide = homes((0..n).map(|k| k << 32), slots);
+        assert!(
+            wide > n as usize / 2,
+            "multiples of 2^32 share {wide} homes"
+        );
+        let clock = homes((0..n).map(|ms| (1_700_000_000_000 + ms) << 22 | 5), slots);
+        assert!(
+            clock > n as usize / 2,
+            "ids with a clock on top share {clock} homes"
+        );
+    }
 
     #[test]
     fn a_plain_remove_still_shrinks() {
