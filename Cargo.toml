@@ -87,7 +87,7 @@ ureq = { version = "2", optional = true }
 flate2 = { version = "1", optional = true }
 
 # Global allocator
-stoolap-jemalloc = { version = "0.1.5", optional = true }
+stoolap-jemalloc = { version = "0.1.6", optional = true }
 
 # Semantic embedding (optional — enables EMBED() SQL function)
 candle-core = { version = "0.11", optional = true }

@@ -1762,6 +1762,10 @@ impl MVCCEngine {
                 {
                     thread::sleep(check_interval);
                     elapsed += check_interval;
+                    // The allocator returns freed memory only as threads
+                    // allocate; this keeps it going while the engine waits
+                    #[cfg(feature = "jemalloc")]
+                    stoolap_jemalloc::decay();
                 }
 
                 if stop_flag_clone.load(Ordering::Acquire) {
