@@ -111,7 +111,10 @@ fn sealed_rows_of_a_clustered_table_are_held_in_key_order() {
         })
         .collect();
     let volume = seal_rows(&schema, &rows).unwrap();
-    assert_eq!(volume.row_ids().unwrap(), &[3, 1, 2]);
+    assert_eq!(
+        volume.row_ids().unwrap().iter().collect::<Vec<_>>(),
+        [3, 1, 2]
+    );
     for id in 1..=3 {
         let idx = volume.locate(id).unwrap();
         assert_eq!(
@@ -228,7 +231,7 @@ fn sealed_volumes(
         .iter()
         .map(|path| {
             let volume = read_volume_from_disk(path).unwrap();
-            let ids = volume.row_ids().unwrap().to_vec();
+            let ids: Vec<i64> = volume.row_ids().unwrap().iter().collect();
             ids.iter()
                 .enumerate()
                 .map(|(i, &id)| {

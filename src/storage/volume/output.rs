@@ -925,7 +925,7 @@ mod tests {
         let columns: Vec<&ColumnData> = (0..schema.columns.len())
             .map(|c| by_rows.columns.get(c).unwrap())
             .collect();
-        let ids = by_rows.row_ids().unwrap();
+        let ids: Vec<i64> = by_rows.row_ids().unwrap().iter().collect();
         let mut start = 0;
         while start < rows as usize {
             let end = (start + batch).min(rows as usize);
@@ -1053,7 +1053,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut writer =
             VolumeFileWriter::new(dir.path(), "t", 9, &schema, rows as usize, true).unwrap();
-        let ids = by_rows.row_ids().unwrap();
+        let ids: Vec<i64> = by_rows.row_ids().unwrap().iter().collect();
         let (id_col, name_col) = (
             by_rows.columns.get(0).unwrap(),
             by_rows.columns.get(1).unwrap(),
@@ -1213,9 +1213,8 @@ mod tests {
     #[test]
     fn a_written_volume_holds_its_row_ids_without_spare_capacity() {
         let (_, volume, _, _dir) = written(&schema(), 3000, 128);
-        assert_eq!(
-            volume.meta.row_ids.capacity(),
-            volume.meta.row_ids.len(),
+        assert!(
+            volume.meta.row_ids.memory_size() <= volume.meta.row_ids.len() * 8,
             "the row ids kept the growth of their batches"
         );
     }

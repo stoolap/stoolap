@@ -40,6 +40,7 @@ use super::format::{
     deserialize_column_block, deserialize_column_block_into, serialize_column_block, COL_BYTES,
     COL_DICTIONARY,
 };
+use super::row_ids::RowIds;
 use super::stats::VolumeAggregateStats;
 
 // =============================================================================
@@ -644,7 +645,7 @@ pub struct CompressedBlockStore {
     row_count: usize,
     /// The column whose cells equal the volume's row ids, with the ids:
     /// its groups are built from them, its blocks never decoded
-    row_id_column: Option<(usize, Arc<Vec<i64>>)>,
+    row_id_column: Option<(usize, Arc<RowIds>)>,
     /// Process-unique id, the key of this store's entries in the decoded
     /// group cache
     id: usize,
@@ -693,7 +694,7 @@ impl CompressedBlockStore {
     /// Builds the groups of `column` from `row_ids` instead of decoding its
     /// blocks: the volume's row id column, whose cells the writer found
     /// equal to them, none NULL
-    pub(crate) fn build_from_row_ids(&mut self, column: Option<usize>, row_ids: &Arc<Vec<i64>>) {
+    pub(crate) fn build_from_row_ids(&mut self, column: Option<usize>, row_ids: &Arc<RowIds>) {
         self.row_id_column = column.map(|col_idx| (col_idx, Arc::clone(row_ids)));
     }
 
@@ -707,12 +708,12 @@ impl CompressedBlockStore {
         let (column, ids) = self.row_id_column.as_ref().filter(|(c, _)| *c == col_idx)?;
         let start = group_idx.saturating_mul(self.group_size);
         let end = start.saturating_add(self.group_size).min(ids.len());
-        Some(match ids.get(start..end) {
-            Some(values) if start < end => Ok(ColumnData::Int64 {
-                values: values.to_vec(),
-                nulls: vec![false; values.len()],
+        Some(match start < end {
+            true => Ok(ColumnData::Int64 {
+                values: ids.to_vec(start..end),
+                nulls: vec![false; end - start],
             }),
-            _ => Err(std::io::Error::new(
+            false => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("group {group_idx} of column {column} is out of range"),
             )),
@@ -2060,7 +2061,7 @@ pub struct VolumeMeta {
     /// Column types (from schema)
     pub column_types: Vec<DataType>,
     /// Row IDs for each row (preserves original IDs for index compatibility)
-    pub row_ids: Arc<Vec<i64>>,
+    pub row_ids: Arc<RowIds>,
     /// Positions sorted by row id when the ids are not ascending, built on
     /// first use; None when a binary search over `row_ids` works
     pub row_order: std::sync::OnceLock<Option<Box<[u32]>>>,
@@ -2099,7 +2100,7 @@ impl LocatorPlace {
     /// their CRC and order `ids`; None otherwise, for the caller to sort.
     /// In bounds and strictly ascending by distinct ids, they are a
     /// permutation
-    fn read(&self, ids: &[i64]) -> Option<Box<[u32]>> {
+    fn read(&self, ids: &RowIds) -> Option<Box<[u32]>> {
         if self.len != ids.len() as u64 * 4 {
             return None;
         }
@@ -2118,7 +2119,7 @@ impl LocatorPlace {
             .collect();
         let mut last = None;
         for &position in order.iter() {
-            let id = *ids.get(position as usize)?;
+            let id = ids.get(position as usize)?;
             if last.is_some_and(|last| id <= last) {
                 return None;
             }
@@ -2290,7 +2291,7 @@ impl VolumeMeta {
         if self.row_id_column != Some(col_idx) {
             return None;
         }
-        self.row_ids.get(row_idx).map(|&id| Value::Integer(id))
+        self.row_ids.get(row_idx).map(Value::Integer)
     }
 
     /// NaN cells of a physical column: the zone map counts them among its
@@ -2310,8 +2311,7 @@ impl VolumeMeta {
     /// Estimate the in-memory size of this metadata in bytes.
     pub fn memory_size(&self) -> usize {
         let mut size = 0usize;
-        // row_ids: Vec<i64>
-        size += self.row_ids.len() * 8;
+        size += self.row_ids.memory_size();
         // row_order: one u32 per row when the ids do not ascend
         if let Some(Some(order)) = self.row_order.get() {
             size += order.len() * 4;
@@ -3213,7 +3213,7 @@ impl VolumeBuilder {
             row_count: self.row_count,
             column_names,
             column_types,
-            row_ids: Arc::new(std::mem::take(&mut self.row_ids)),
+            row_ids: Arc::new(RowIds::from(std::mem::take(&mut self.row_ids))),
             row_order: std::sync::OnceLock::from(row_order),
             locator: None,
             sorted_columns: std::mem::take(&mut self.sorted),
@@ -3878,7 +3878,7 @@ impl VolumeBuilder {
                 row_count: self.row_count,
                 column_names,
                 column_types,
-                row_ids: Arc::new(self.row_ids),
+                row_ids: Arc::new(RowIds::from(self.row_ids)),
                 row_order: std::sync::OnceLock::from(row_order),
                 locator: None,
                 sorted_columns,
@@ -4327,7 +4327,7 @@ impl FrozenVolume {
 
     /// Borrow the resident physical row IDs.
     #[inline]
-    pub fn row_ids(&self) -> std::io::Result<&[i64]> {
+    pub fn row_ids(&self) -> std::io::Result<&RowIds> {
         Ok(&self.meta.row_ids)
     }
 
@@ -4342,7 +4342,7 @@ impl FrozenVolume {
                 if let Some(order) = self.meta.locator.as_ref().and_then(|l| l.read(ids)) {
                     return Some(order);
                 }
-                let order = (!ids.windows(2).all(|w| w[0] < w[1])).then(|| row_order_of(ids));
+                let order = ids.sorted_order();
                 #[cfg(feature = "test-failpoints")]
                 if order.is_some() {
                     crate::test_failpoints::row_order_built();
@@ -4357,8 +4357,11 @@ impl FrozenVolume {
     pub fn id_bounds(&self) -> Option<(i64, i64)> {
         let ids = &self.meta.row_ids;
         match self.row_order() {
-            None => Some((*ids.first()?, *ids.last()?)),
-            Some(order) => Some((ids[*order.first()? as usize], ids[*order.last()? as usize])),
+            None => Some((ids.first()?, ids.last()?)),
+            Some(order) => Some((
+                ids.at(*order.first()? as usize),
+                ids.at(*order.last()? as usize),
+            )),
         }
     }
 
@@ -4382,23 +4385,19 @@ impl FrozenVolume {
     /// permutation read from the file or built on first use
     pub fn locate(&self, row_id: i64) -> Option<usize> {
         let ids = &self.meta.row_ids;
-        let (Some(&first), Some(&last)) = (ids.first(), ids.last()) else {
+        if ids.is_empty() {
             return None;
-        };
+        }
         match self.row_order() {
-            None => {
-                if row_id < first || row_id > last {
-                    return None;
-                }
-                ids.binary_search(&row_id).ok()
-            }
+            None => ids.search_ascending(row_id),
             Some(order) => {
-                if row_id < ids[order[0] as usize] || row_id > ids[order[order.len() - 1] as usize]
+                if row_id < ids.at(order[0] as usize)
+                    || row_id > ids.at(order[order.len() - 1] as usize)
                 {
                     return None;
                 }
                 order
-                    .binary_search_by(|&i| ids[i as usize].cmp(&row_id))
+                    .binary_search_by(|&i| ids.at(i as usize).cmp(&row_id))
                     .ok()
                     .map(|k| order[k] as usize)
             }
@@ -5610,7 +5609,7 @@ mod tests {
     #[test]
     fn a_locator_is_trusted_only_when_it_orders_the_ids() {
         let dir = tempfile::tempdir().unwrap();
-        let ids = [30i64, 10, 20];
+        let ids = RowIds::from(vec![30i64, 10, 20]);
         let place = |name: &str, order: &[u32], crc_off: u32| {
             let bytes: Vec<u8> = order.iter().flat_map(|p| p.to_le_bytes()).collect();
             let path = dir.path().join(name);

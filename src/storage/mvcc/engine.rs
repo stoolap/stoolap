@@ -45,6 +45,7 @@ use crate::storage::mvcc::{
 use crate::storage::traits::transaction::TableUse;
 use crate::storage::traits::{Engine, Index, NewIndex, Table, Transaction};
 use crate::storage::volume::manifest::Pending;
+use crate::storage::volume::row_ids::RowIds;
 
 mod retype;
 pub use retype::ColumnTypeChange;
@@ -224,7 +225,7 @@ impl RecheckKeys {
 fn max_volume_row_id(mgr: &crate::storage::volume::manifest::SegmentManager) -> Result<i64> {
     let mut max = 0;
     for vol in mgr.get_segments_ordered_meta() {
-        if let Some(&last_id) = vol.row_ids()?.iter().max() {
+        if let Some(last_id) = vol.row_ids()?.max() {
             max = max.max(last_id);
         }
     }
@@ -2437,7 +2438,7 @@ fn populate_hnsw_from_volumes(
         let vol = &cs.volume;
         let row_ids = vol.row_ids()?;
         let Some(start) = (0..vol.meta.row_count).find(|&i| {
-            let row_id = row_ids[i];
+            let row_id = row_ids.at(i);
             !cs.is_dead(i) && !tombstones.contains_key(&row_id) && !seen.contains(&row_id)
         }) else {
             continue;
@@ -2462,7 +2463,7 @@ fn populate_hnsw_from_volumes(
                 columns[*ci] = Some(vol.columns.get(*ci)?);
             }
         }
-        for (i, &row_id) in row_ids.iter().enumerate().skip(start) {
+        for (i, row_id) in row_ids.iter().enumerate().skip(start) {
             if cs.is_dead(i) || tombstones.contains_key(&row_id) || !seen.insert(row_id) {
                 continue;
             }
@@ -5769,7 +5770,7 @@ impl MVCCEngine {
                             break;
                         }
                     };
-                    for (i, &row_id) in row_ids.iter().enumerate() {
+                    for (i, row_id) in row_ids.iter().enumerate() {
                         // A copy that never got authority is not backed up
                         if cs.is_dead(i) {
                             continue;
@@ -7570,7 +7571,7 @@ impl MVCCEngine {
                         let tombstoned = !ts.is_empty()
                             && segs.get(&seg.segment_id).is_some_and(|cs| {
                                 cs.volume.meta.row_ids.iter().any(|rid| {
-                                    ts.get(rid)
+                                    ts.get(&rid)
                                         .is_some_and(|&commit_seq| commit_seq < planned_limit)
                                 })
                             });
@@ -7680,8 +7681,8 @@ impl MVCCEngine {
                     let segs = mgr.segments_raw();
                     let ids_of = |id: u64| {
                         segs.get(&id)
-                            .map(|cs| cs.volume.meta.row_ids.as_slice())
-                            .unwrap_or(&[])
+                            .map(|cs| &*cs.volume.meta.row_ids)
+                            .unwrap_or(RowIds::none())
                     };
                     accept_batch(
                         &mut planned,
@@ -7844,7 +7845,7 @@ impl MVCCEngine {
 
             for (vol_idx, (_seg_id, vol)) in volumes.iter().enumerate() {
                 let dead = dead[vol_idx].as_deref().unwrap_or(&[]);
-                for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
+                for (i, row_id) in vol.row_ids()?.iter().enumerate() {
                     // A copy that never got authority is no row at all
                     if !dead.is_empty() && dead.binary_search(&(i as u32)).is_ok() {
                         continue;
@@ -8864,7 +8865,7 @@ impl MVCCEngine {
                         let mut sealed_ids: FxHashSet<i64> = FxHashSet::default();
                         if !ts.is_empty() {
                             for (vol, _, _) in &sealed_volumes {
-                                for &rid in vol.meta.row_ids.iter() {
+                                for rid in vol.meta.row_ids.iter() {
                                     if ts.contains_key(&rid) && !skip_set.contains(&rid) {
                                         sealed_ids.insert(rid);
                                     }
@@ -11448,8 +11449,8 @@ fn held_outside(outside: &[OutsideVolume], candidates: &FxHashSet<i64>) -> FxHas
             continue;
         }
         let ids = &volume.meta.row_ids;
-        if volume.meta.row_order.get().is_none() && !ids.is_sorted() {
-            held.extend(ids.iter().copied().filter(|id| in_range.contains(id)));
+        if volume.meta.row_order.get().is_none() && !ids.ascends() {
+            held.extend(ids.iter().filter(|id| in_range.contains(id)));
         } else {
             held.extend(
                 in_range
@@ -11476,7 +11477,7 @@ fn accept_batch<'a>(
     selected: &mut Vec<usize>,
     limit: usize,
     target_volume_rows: usize,
-    ids_of: impl Fn(u64) -> &'a [i64],
+    ids_of: impl Fn(u64) -> &'a RowIds,
 ) -> (bool, bool) {
     let members: Vec<bool> = (0..planned.len())
         .map(|position| base[position] || selected.contains(&position))
@@ -11610,7 +11611,7 @@ fn close_batch_over_overlap<'a>(
     base: &[bool],
     selected: &mut Vec<usize>,
     limit: usize,
-    ids_of: impl Fn(u64) -> &'a [i64],
+    ids_of: impl Fn(u64) -> &'a RowIds,
 ) -> (bool, bool) {
     let mut reduced = false;
     let mut with_base = true;
@@ -11627,7 +11628,7 @@ fn close_batch_over_overlap<'a>(
             let mut batch_ids: FxHashSet<i64> = FxHashSet::default();
             for entry in &planned[first..=last] {
                 if entry.2 {
-                    batch_ids.extend(ids_of(entry.0).iter().copied());
+                    batch_ids.extend(ids_of(entry.0).iter());
                 }
             }
             loop {
@@ -11637,14 +11638,14 @@ fn close_batch_over_overlap<'a>(
                         continue;
                     }
                     let ids = ids_of(entry.0);
-                    if !ids.iter().any(|id| batch_ids.contains(id)) {
+                    if !ids.iter().any(|id| batch_ids.contains(&id)) {
                         continue;
                     }
                     if entry.3 {
                         held = true;
                     } else {
                         entry.2 = true;
-                        batch_ids.extend(ids.iter().copied());
+                        batch_ids.extend(ids.iter());
                         grew = true;
                     }
                 }
@@ -11937,7 +11938,8 @@ mod tests {
         // longer reaches the 85k volume; the second 31k volume is then
         // out of proportion with three single rows and waits as well
         let rows: Vec<&[i64]> = vec![&[1, 2], &[2, 3], &[4], &[5], &[6], &[7]];
-        let ids_of = |id: u64| rows[id as usize - 1];
+        let row_ids: Vec<RowIds> = rows.iter().map(|r| RowIds::from(r.to_vec())).collect();
+        let ids_of = |id: u64| &row_ids[id as usize - 1];
         let mut planned = vec![
             (1, 31_000, true, false),
             (2, 85_000, false, false),
@@ -11975,7 +11977,8 @@ mod tests {
         // one 20k volume leaves for the same reduction of three at
         // 65,001 rows, the closure holding through the 5k volume
         let rows: Vec<&[i64]> = vec![&[1, 2], &[2, 3], &[4], &[5], &[6]];
-        let ids_of = |id: u64| rows[id as usize - 1];
+        let row_ids: Vec<RowIds> = rows.iter().map(|r| RowIds::from(r.to_vec())).collect();
+        let ids_of = |id: u64| &row_ids[id as usize - 1];
         let mut planned = vec![
             (1, 5_000, true, false),
             (2, 40_000, true, false),
@@ -12004,7 +12007,8 @@ mod tests {
     #[test]
     fn a_closed_batch_stays_within_the_recluster_limit() {
         let rows: Vec<&[i64]> = vec![&[1, 2], &[2, 3], &[3, 4]];
-        let ids_of = |id: u64| rows[id as usize - 1];
+        let row_ids: Vec<RowIds> = rows.iter().map(|r| RowIds::from(r.to_vec())).collect();
+        let ids_of = |id: u64| &row_ids[id as usize - 1];
         // Two selected around an ordered volume that shares rows with both:
         // the closure would take all three, so the selection drops to one
         let mut planned = batch_of(&rows);
@@ -12027,7 +12031,8 @@ mod tests {
         // A lone member closes over nothing: the volumes around it keep
         // their places on either side of its rewrite
         let rows: Vec<&[i64]> = vec![&[1], &[1, 2], &[2, 3], &[3, 4]];
-        let ids_of = |id: u64| rows[id as usize - 1];
+        let row_ids: Vec<RowIds> = rows.iter().map(|r| RowIds::from(r.to_vec())).collect();
+        let ids_of = |id: u64| &row_ids[id as usize - 1];
         let mut planned = batch_of(&rows);
         let mut selected = vec![0];
         let (_, reduced) =
@@ -12059,7 +12064,8 @@ mod tests {
     #[test]
     fn a_deferred_volume_sharing_a_row_with_the_batch_holds_it() {
         let rows: Vec<&[i64]> = vec![&[1], &[1, 2], &[5], &[5, 6]];
-        let ids_of = |id: u64| rows[id as usize - 1];
+        let row_ids: Vec<RowIds> = rows.iter().map(|r| RowIds::from(r.to_vec())).collect();
+        let ids_of = |id: u64| &row_ids[id as usize - 1];
         let mut planned = batch_of(&rows);
         planned[1].3 = true;
         let mut selected = vec![0, 3];

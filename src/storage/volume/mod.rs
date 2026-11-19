@@ -64,6 +64,7 @@ pub mod io;
 pub mod manifest;
 pub mod merge;
 pub mod output;
+pub mod row_ids;
 pub mod scanner;
 pub mod seal;
 pub mod secondary;

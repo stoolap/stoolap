@@ -573,7 +573,7 @@ fn rewrite_volume(
         .iter()
         .enumerate()
         .filter(|(i, _)| !is_dead(*i))
-        .map(|(i, &row_id)| (row_id, 0, i))
+        .map(|(i, row_id)| (row_id, 0, i))
         .collect();
     let inputs = [(seg_id, Arc::clone(source))];
     let mut transfer =
@@ -669,7 +669,7 @@ fn validate(
         else {
             continue;
         };
-        for (i, &row_id) in volume.row_ids()?.iter().enumerate() {
+        for (i, row_id) in volume.row_ids()?.iter().enumerate() {
             if dead.binary_search(&(i as u32)).is_ok()
                 || cast.holds(row_id)
                 || snapshot.ts.contains_key(&row_id)

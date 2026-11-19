@@ -403,7 +403,7 @@ mod tests {
     fn refs(inputs: &[(u64, Arc<FrozenVolume>)]) -> Vec<(i64, usize, usize)> {
         let mut refs = Vec::new();
         for (input, (_, volume)) in inputs.iter().enumerate() {
-            for (row, &id) in volume.row_ids().unwrap().iter().enumerate() {
+            for (row, id) in volume.row_ids().unwrap().iter().enumerate() {
                 refs.push((id, input, row));
             }
         }

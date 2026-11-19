@@ -170,7 +170,7 @@ fn volume_rejects_missing_block_group() {
 fn metadata_preserves_null_dictionary_and_implicit_group() {
     let (_dir, path, _bytes) = fixture();
     let volume = read_volume_from_disk(&path).unwrap();
-    assert_eq!(volume.row_ids().unwrap(), &[1]);
+    assert_eq!(volume.row_ids().unwrap().iter().collect::<Vec<_>>(), [1]);
     assert!(volume.meta.row_groups.is_empty());
     assert_eq!(
         volume.get_row(0).unwrap().get(0),
