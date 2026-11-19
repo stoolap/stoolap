@@ -899,13 +899,13 @@ fn mask_segments(
     // Per position: the parts of its range a later segment shares, read when
     // it is a target, and the parts an earlier target shares, where its live
     // copies can hide one
-    let newer: Vec<Vec<(i64, i64)>> = (0..seg_order.len())
+    let newer: Vec<Box<[(i64, i64)]>> = (0..seg_order.len())
         .map(|p| match targets[p] {
             true => covered(ranges[p], ranges[p + 1..].iter().flatten().copied()),
-            false => Vec::new(),
+            false => Box::default(),
         })
         .collect();
-    let older: Vec<Vec<(i64, i64)>> = (0..seg_order.len())
+    let older: Vec<Box<[(i64, i64)]>> = (0..seg_order.len())
         .map(|p| {
             covered(
                 ranges[p],
@@ -941,8 +941,8 @@ fn mask_segments(
 /// merge of their shared rows, by id and newest copy first, with no set
 fn merge_copies(
     held: &[HeldCopies],
-    newer: &[Vec<(i64, i64)>],
-    older: &[Vec<(i64, i64)>],
+    newer: &[Box<[(i64, i64)]>],
+    older: &[Box<[(i64, i64)]>],
     bits: &mut [Option<Vec<u64>>],
 ) {
     use std::cmp::Reverse;
@@ -998,7 +998,7 @@ fn merge_copies(
         let mut next = None;
         for (s, &(start, end)) in slices[p].iter().enumerate().skip(slice) {
             let from = if s == slice { pos + 1 } else { start };
-            let skip = ids.first_at_least(from..end, least);
+            let skip = skip_below(ids, from..end, least);
             if skip < end {
                 next = Some((s, skip));
                 break;
@@ -1015,8 +1015,8 @@ fn merge_copies(
 /// hide an earlier target, for volumes whose ids do not all ascend
 fn hash_copies(
     held: &[HeldCopies],
-    newer: &[Vec<(i64, i64)>],
-    older: &[Vec<(i64, i64)>],
+    newer: &[Box<[(i64, i64)]>],
+    older: &[Box<[(i64, i64)]>],
     bits: &mut [Option<Vec<u64>>],
 ) {
     let mut newer_live: rustc_hash::FxHashSet<i64> = rustc_hash::FxHashSet::default();
@@ -1065,9 +1065,12 @@ fn ascends(volume: &FrozenVolume) -> bool {
 
 /// The parts of `range` that `others` cover, sorted and merged; none of an
 /// absent range
-fn covered(range: Option<(i64, i64)>, others: impl Iterator<Item = (i64, i64)>) -> Vec<(i64, i64)> {
+fn covered(
+    range: Option<(i64, i64)>,
+    others: impl Iterator<Item = (i64, i64)>,
+) -> Box<[(i64, i64)]> {
     let Some(range) = range else {
-        return Vec::new();
+        return Box::default();
     };
     merged(
         others
@@ -1077,8 +1080,9 @@ fn covered(range: Option<(i64, i64)>, others: impl Iterator<Item = (i64, i64)>) 
     )
 }
 
-/// `parts` sorted, with the ones that meet or touch made one
-fn merged(mut parts: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+/// `parts` sorted, with the ones that meet or touch made one, holding no
+/// room for the parts merged away
+fn merged(mut parts: Vec<(i64, i64)>) -> Box<[(i64, i64)]> {
     parts.sort_unstable();
     parts.dedup_by(|next, kept| {
         let joins = next.0 <= kept.1.saturating_add(1);
@@ -1087,7 +1091,37 @@ fn merged(mut parts: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
         }
         joins
     });
-    parts
+    parts.into_boxed_slice()
+}
+
+/// The first of `rows` whose id is `least` or larger, in ids that ascend:
+/// steps that double from the start, then a search inside the last step,
+/// so skipping k rows reads O(log k) ids and skipping none reads one
+fn skip_below(ids: &super::row_ids::RowIds, rows: std::ops::Range<usize>, least: i64) -> usize {
+    let (mut below, mut step) = (rows.start, 1);
+    loop {
+        if below >= rows.end {
+            return rows.end;
+        }
+        count_visibility_visits(1);
+        if ids.at(below) >= least {
+            return below;
+        }
+        let probe = below.saturating_add(step).min(rows.end);
+        if probe == rows.end || {
+            count_visibility_visits(1);
+            ids.at(probe) >= least
+        } {
+            count_visibility_visits(search_reads(probe - below));
+            return ids.first_at_least(below + 1..probe, least);
+        }
+        (below, step) = (probe + 1, step * 2);
+    }
+}
+
+/// The ids a binary search over `len` positions reads
+fn search_reads(len: usize) -> usize {
+    (usize::BITS - len.leading_zeros()) as usize
 }
 
 /// Whether `id` falls in one of the sorted, merged `parts`
@@ -5987,6 +6021,18 @@ mod tests {
             );
             assert_eq!(mgr.deduped_row_count().unwrap(), 10);
         }
+    }
+
+    #[test]
+    fn ranges_that_all_overlap_are_held_as_one_part() {
+        let parts = covered(Some((0, 1000)), (0..64).map(|i| (i * 10, i * 10 + 500)));
+        assert_eq!(&*parts, &[(0, 1000)], "64 overlapping ranges, one part");
+        let apart = covered(
+            Some((0, 100)),
+            [(0, 9), (11, 20), (50, 400), (200, 300)].into_iter(),
+        );
+        assert_eq!(&*apart, &[(0, 9), (11, 20), (50, 100)]);
+        assert!(covered(None, [(0, 9)].into_iter()).is_empty());
     }
 
     #[test]
