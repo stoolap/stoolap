@@ -38,8 +38,8 @@ fn rows_added_in_row_id_order_keep_their_own_payload() {
     let volume = builder_with(&[(1, "a"), (2, "b"), (3, "c")])
         .finish()
         .unwrap();
-    let ids = volume.row_ids().unwrap();
-    assert_eq!(ids, &[1, 2, 3]);
+    let ids: Vec<i64> = volume.row_ids().unwrap().iter().collect();
+    assert_eq!(ids, [1, 2, 3]);
     for (i, id) in ids.iter().enumerate() {
         let row = volume.get_row(i).unwrap();
         assert_eq!(
@@ -98,7 +98,10 @@ fn a_producer_that_ordered_its_rows_gets_them_located_by_id() {
         );
     }
     let volume = builder.finish().unwrap();
-    assert_eq!(volume.row_ids().unwrap(), &[3, 1, 2]);
+    assert_eq!(
+        volume.row_ids().unwrap().iter().collect::<Vec<_>>(),
+        [3, 1, 2]
+    );
     for id in 1..=3 {
         let idx = volume.locate(id).expect("row id not located");
         let row = volume.get_row(idx).unwrap();
@@ -131,12 +134,12 @@ fn a_producer_that_ordered_its_rows_may_not_repeat_an_id() {
 
 #[test]
 fn the_permutation_of_an_ordered_producer_is_counted_in_the_metadata_size() {
-    let ascending = builder_with(&[(1, "a"), (2, "b"), (3, "c")])
+    let ascending = builder_with(&[(1, "a"), (2, "b"), (4, "c")])
         .finish()
         .unwrap();
     let mut builder = builder_with(&[]);
     builder.allow_any_row_order();
-    for (id, name) in [(3, "c"), (1, "a"), (2, "b")] {
+    for (id, name) in [(4, "c"), (1, "a"), (2, "b")] {
         builder.add_row(
             id,
             &Row::from_values(vec![Value::Integer(id), Value::text(name)]),

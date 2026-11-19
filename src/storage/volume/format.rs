@@ -185,7 +185,7 @@ fn write_i64_bulk(buf: &mut Vec<u8>, values: &[i64]) {
 
 /// Write i64 values as little-endian bytes to any writer, the slice's
 /// own bytes on a little-endian platform
-fn write_i64_le<W: Write>(w: &mut W, values: &[i64]) -> io::Result<()> {
+pub(crate) fn write_i64_le<W: Write>(w: &mut W, values: &[i64]) -> io::Result<()> {
     #[cfg(target_endian = "little")]
     {
         // SAFETY: &[i64] is layout-compatible with &[u8] on LE platforms.
@@ -1165,7 +1165,7 @@ pub(crate) struct VolumeMetadata {
     pub col_sorted: Vec<bool>,
     pub col_dict_counts: Vec<u32>,
     pub shared_dict: super::writer::SharedDict,
-    pub row_ids: Vec<i64>,
+    pub row_ids: super::row_ids::RowIds,
     pub zone_maps: Vec<ZoneMap>,
     pub bloom_filters: super::writer::VolumeBlooms,
     pub stats: VolumeAggregateStats,
@@ -1296,7 +1296,7 @@ fn write_volume_metadata_parts<W: Write>(
     }
 
     // Row IDs (bulk — single memcpy on LE)
-    write_i64_le(buf, row_ids)?;
+    row_ids.write_le(buf)?;
 
     // Zone maps
     for zm in &meta.zone_maps {
@@ -1442,7 +1442,7 @@ pub(crate) fn deserialize_volume_metadata(data: &[u8]) -> io::Result<VolumeMetad
 
     // Row IDs (bulk read — single memcpy on LE platforms)
     check_metadata_count(data, pos, row_count, 8)?;
-    let row_ids = read_i64_bulk(data, &mut pos, row_count)?;
+    let row_ids = super::row_ids::RowIds::from(read_i64_bulk(data, &mut pos, row_count)?);
 
     // Zone maps
     check_metadata_count(data, pos, col_count, 12)?;
@@ -1772,16 +1772,15 @@ pub(crate) fn v5_metadata_sections(
     }
 
     let ids = &meta.row_ids;
-    let contiguous = !ids.is_empty() && ids.windows(2).all(|w| w[0].checked_add(1) == Some(w[1]));
-    if contiguous {
+    if let Some((start, len)) = ids.as_range().filter(|&(_, len)| len > 0) {
         let mut b = Vec::with_capacity(16);
-        b.extend_from_slice(&ids[0].to_le_bytes());
-        b.extend_from_slice(&(ids.len() as u64).to_le_bytes());
+        b.extend_from_slice(&start.to_le_bytes());
+        b.extend_from_slice(&(len as u64).to_le_bytes());
         sections.push(section(V5_ROW_IDS, true, ROW_IDS_RANGE, false, b));
     } else {
         let mut b = Vec::with_capacity(8 + ids.len() * 8);
         b.extend_from_slice(&(ids.len() as u64).to_le_bytes());
-        write_i64_le(&mut b, ids)?;
+        ids.write_le(&mut b)?;
         sections.push(section(V5_ROW_IDS, true, ROW_IDS_RAW, true, b));
     }
 
@@ -2006,11 +2005,7 @@ pub(crate) fn v5_metadata_from_sections(
             if count != row_count as u64 || (count > 0 && last.is_none()) || pos != data.len() {
                 return Err(invalid("row id range"));
             }
-            let mut ids = Vec::new();
-            ids.try_reserve_exact(row_count)
-                .map_err(|_| invalid("row id range exceeds memory"))?;
-            ids.extend((0..count as i64).map(|i| first + i));
-            ids
+            super::row_ids::RowIds::range(first, row_count)
         }
         ROW_IDS_RAW => {
             let count = read_u64(data, &mut pos)?;
@@ -2022,7 +2017,7 @@ pub(crate) fn v5_metadata_from_sections(
             if pos != data.len() {
                 return Err(invalid("row id trailing bytes"));
             }
-            ids
+            super::row_ids::RowIds::from(ids)
         }
         _ => return Err(invalid("row id encoding")),
     };

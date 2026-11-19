@@ -109,7 +109,7 @@ pub fn write_volume_to_disk(
         super::output::VolumeFileWriter::new(dir, table_name, volume_id, &schema, rows, true)?;
     writer.allow_any_row_order();
     let ids = volume.row_ids()?;
-    for (idx, &row_id) in ids.iter().enumerate() {
+    for (idx, row_id) in ids.iter().enumerate() {
         writer.add_row(row_id, &volume.get_row(idx)?)?;
     }
     let (written, path) = writer.finish()?;
@@ -1034,7 +1034,7 @@ mod tests {
         assert!(loaded.meta.sorted_columns[0]);
 
         // Row IDs survived
-        assert_eq!(&loaded.meta.row_ids[..], [1, 2, 3]);
+        assert_eq!(loaded.meta.row_ids.iter().collect::<Vec<_>>(), [1, 2, 3]);
     }
 
     #[test]
@@ -1374,7 +1374,7 @@ mod tests {
             let path =
                 write_volume_to_disk(dir.path(), "t", n as u64 + 1, &id_volume(ids)).unwrap();
             let loaded = read_volume_from_disk(&path).unwrap();
-            assert_eq!(&loaded.meta.row_ids[..], &ids[..]);
+            assert_eq!(loaded.meta.row_ids.iter().collect::<Vec<_>>(), *ids);
         }
     }
 

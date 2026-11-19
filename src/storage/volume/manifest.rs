@@ -877,7 +877,7 @@ fn compute_visibility_bitmaps(
             for i in 0..rc {
                 if dead.next_if_eq(&&(i as u32)).is_some() {
                     bits[i >> 6] &= !(1u64 << (i & 63));
-                } else if !seen.insert(cs.volume.meta.row_ids[i]) {
+                } else if !seen.insert(cs.volume.meta.row_ids.at(i)) {
                     bits[i >> 6] &= !(1u64 << (i & 63));
                     has_overlap = true;
                 }
@@ -967,13 +967,13 @@ fn shadow_output(
 ) {
     let live = |pos: usize| dead.is_none_or(|dead| dead.binary_search(&(pos as u32)).is_err());
     if newer.meta.row_order.get().is_some() && output.meta.row_count < newer.meta.row_count {
-        for (pos, &id) in output.meta.row_ids.iter().enumerate() {
+        for (pos, id) in output.meta.row_ids.iter().enumerate() {
             if (lo..=hi).contains(&id) && newer.locate(id).is_some_and(live) {
                 hide(pos);
             }
         }
     } else {
-        for (newer_pos, &id) in newer.meta.row_ids.iter().enumerate() {
+        for (newer_pos, id) in newer.meta.row_ids.iter().enumerate() {
             if (lo..=hi).contains(&id)
                 && live(newer_pos)
                 && let Some(pos) = output.locate(id)
@@ -1086,7 +1086,7 @@ fn tombstoned_visible(
             if !cs.is_visible(i) {
                 continue;
             }
-            if tombstones.contains_key(row_id) {
+            if tombstones.contains_key(&row_id) {
                 continue;
             }
             live += 1;
@@ -1110,7 +1110,7 @@ fn same_as_walk(
             let ids = &cs.volume.meta.row_ids;
             ids.iter()
                 .enumerate()
-                .filter(|&(i, id)| cs.is_visible(i) && !tombstones.contains_key(id))
+                .filter(|&(i, id)| cs.is_visible(i) && !tombstones.contains_key(&id))
                 .count()
         })
         .sum();
@@ -1163,7 +1163,7 @@ fn mask_shared_ids(
         bits[pos >> 6] &= !(1u64 << (pos & 63));
     };
     if row_count < new.meta.row_count {
-        for (pos, &id) in old.meta.row_ids.iter().enumerate() {
+        for (pos, id) in old.meta.row_ids.iter().enumerate() {
             if (lo..=hi).contains(&id) && new.locate(id).is_some() {
                 clear(pos, id);
             }
@@ -1175,19 +1175,18 @@ fn mask_shared_ids(
             .meta
             .row_ids
             .iter()
-            .copied()
             .filter(|id| (lo..=hi).contains(id))
             .collect();
         if shared.is_empty() {
             return;
         }
-        for (pos, &id) in old.meta.row_ids.iter().enumerate() {
+        for (pos, id) in old.meta.row_ids.iter().enumerate() {
             if shared.contains(&id) {
                 clear(pos, id);
             }
         }
     } else {
-        for &id in new.meta.row_ids.iter() {
+        for id in new.meta.row_ids.iter() {
             if (lo..=hi).contains(&id)
                 && let Some(pos) = old.locate(id)
             {
@@ -2409,7 +2408,7 @@ impl SegmentManager {
                         if vol.is_sorted(pi) && (col.is_null(i) || col.get_i64(i) != target) {
                             return Ok(false);
                         }
-                        let rid = row_ids[global];
+                        let rid = row_ids.at(global);
                         if cold.is_dead(global) || !seen.insert(rid) {
                             continue;
                         }
@@ -2587,7 +2586,7 @@ impl SegmentManager {
             if !has_missing {
                 // Common path: no schema evolution, pass values directly (zero alloc)
                 vol.unique_lookup_all(&vol_col_indices, values, |row_idx| {
-                    let rid = row_ids[row_idx as usize];
+                    let rid = row_ids.at(row_idx as usize);
                     if cold.is_dead(row_idx as usize) || ts.contains_key(&rid) {
                         false
                     } else if seen.insert(rid) {
@@ -2607,7 +2606,7 @@ impl SegmentManager {
                     .filter(|&(_, &vi)| vi != usize::MAX)
                     .map(|(i, &vi)| (i, vi))
                     .collect();
-                for (i, &rid) in row_ids.iter().enumerate() {
+                for (i, rid) in row_ids.iter().enumerate() {
                     if cold.is_dead(i) || ts.contains_key(&rid) || !seen.insert(rid) {
                         continue;
                     }
@@ -3057,7 +3056,7 @@ impl SegmentManager {
         };
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::row_id_order_scanned();
-        let verdict = volume.meta.row_ids.windows(2).all(|w| w[0] < w[1]);
+        let verdict = volume.meta.row_ids.ascends();
         self.key_order_verdicts
             .lock()
             .insert(seg_id, (ROW_ID_ORDER.to_vec(), verdict));
@@ -3280,7 +3279,7 @@ impl SegmentManager {
                 .flat_map(|(_, volume, _, _, _, dead)| {
                     let ids = &volume.meta.row_ids;
                     dead.iter()
-                        .flat_map(|dead| dead.iter().map(|&pos| ids[pos as usize]))
+                        .flat_map(|dead| dead.iter().map(|&pos| ids.at(pos as usize)))
                 })
                 .collect();
             dead_ids.sort_unstable();

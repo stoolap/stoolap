@@ -482,7 +482,7 @@ impl VolumeScanner {
                 continue;
             }
             self.current_pos = idx;
-            self.current_rid = self.volume.meta.row_ids[idx];
+            self.current_rid = self.volume.meta.row_ids.at(idx);
             self.has_current = true;
             return Ok(true);
         }
@@ -641,8 +641,9 @@ impl VolumeScanner {
         committed: Arc<rustc_hash::FxHashMap<i64, u64>>,
         dynamic: Arc<rustc_hash::FxHashSet<i64>>,
     ) {
-        self.committed_tombstones = Some(committed);
-        self.pending_cold_deletes = Some(dynamic);
+        // An empty set skips nothing, so a row's id is read only when one is not
+        self.committed_tombstones = (!committed.is_empty()).then_some(committed);
+        self.pending_cold_deletes = (!dynamic.is_empty()).then_some(dynamic);
     }
 
     /// Set a pre-computed inter-volume visibility bitmap.
@@ -666,7 +667,7 @@ impl VolumeScanner {
                     row_count: 0,
                     column_names: Vec::new(),
                     column_types: Vec::new(),
-                    row_ids: Arc::new(Vec::new()),
+                    row_ids: Arc::new(super::row_ids::RowIds::from(Vec::new())),
                     row_order: std::sync::OnceLock::new(),
                     locator: None,
                     sorted_columns: Vec::new(),
@@ -1355,7 +1356,10 @@ impl VolumeScanner {
                 return true;
             }
         }
-        let rid = self.volume.meta.row_ids[idx];
+        if self.committed_tombstones.is_none() && self.pending_cold_deletes.is_none() {
+            return false;
+        }
+        let rid = self.volume.meta.row_ids.at(idx);
         if let Some(ref ts) = self.committed_tombstones
             && let Some(&commit_seq) = ts.get(&rid)
             && self.cut.sees(commit_seq as i64)
@@ -1681,7 +1685,7 @@ impl VolumeScanner {
                     side.rows += 1;
                 }
                 self.current_pos = idx;
-                self.current_rid = self.volume.meta.row_ids[idx];
+                self.current_rid = self.volume.meta.row_ids.at(idx);
                 self.has_current = true;
                 return Ok(true);
             }
@@ -1743,7 +1747,7 @@ impl VolumeScanner {
             }
 
             self.current_pos = idx;
-            self.current_rid = self.volume.meta.row_ids[idx];
+            self.current_rid = self.volume.meta.row_ids.at(idx);
             self.has_current = true;
             self.current_idx += 1;
             return Ok(true);
