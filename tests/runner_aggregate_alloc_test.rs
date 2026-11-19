@@ -46,15 +46,15 @@ unsafe impl GlobalAlloc for ThreadPeak {
     // thread-local Cells, which never allocate
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         held(layout.size() as isize);
-        System.alloc(layout)
+        unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         held(-(layout.size() as isize));
-        System.dealloc(ptr, layout)
+        unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         held(new_size as isize - layout.size() as isize);
-        System.realloc(ptr, layout, new_size)
+        unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
 

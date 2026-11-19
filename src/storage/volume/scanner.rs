@@ -141,8 +141,6 @@ pub struct VolumeScanner {
     end_idx: usize,
     /// Current reconstructed row
     current_row: Row,
-    /// Row ID of the current row (from segment's row_ids array)
-    current_rid: i64,
     /// Where the current row lies in the volume
     current_pos: usize,
     /// Whether we have a valid current row
@@ -182,6 +180,9 @@ pub struct VolumeScanner {
     /// Kept separate from pending_cold_deletes to avoid cloning the tombstone set.
     /// Map: row_id → commit_seq (for snapshot isolation filtering).
     committed_tombstones: Option<Arc<rustc_hash::FxHashMap<i64, u64>>>,
+    /// The next 64 ids of a linear scan, loaded as it reaches them when
+    /// tombstones or pending deletes make it read every row's id
+    group_ids: super::row_ids::GroupRowIds,
     /// The statement view of the read: a tombstone counts only when it sees
     /// the commit
     pub view: Option<StatementView>,
@@ -482,7 +483,6 @@ impl VolumeScanner {
                 continue;
             }
             self.current_pos = idx;
-            self.current_rid = self.volume.meta.row_ids.at(idx);
             self.has_current = true;
             return Ok(true);
         }
@@ -520,7 +520,6 @@ impl VolumeScanner {
             is_full_projection,
             current_idx: 0,
             current_row: Row::new(),
-            current_rid: 0,
             current_pos: 0,
             has_current: false,
             error: None,
@@ -534,6 +533,7 @@ impl VolumeScanner {
             visibility_bitmap: None,
             pending_cold_deletes: None,
             committed_tombstones: None,
+            group_ids: Default::default(),
             view: None,
             cut: CommitCut::every(),
             deadline: Deadline::NONE,
@@ -589,7 +589,6 @@ impl VolumeScanner {
             current_idx: start_idx,
             end_idx,
             current_row: Row::new(),
-            current_rid: 0,
             current_pos: 0,
             has_current: false,
             error: None,
@@ -603,6 +602,7 @@ impl VolumeScanner {
             visibility_bitmap: None,
             pending_cold_deletes: None,
             committed_tombstones: None,
+            group_ids: Default::default(),
             view: None,
             cut: CommitCut::every(),
             deadline: Deadline::NONE,
@@ -689,7 +689,6 @@ impl VolumeScanner {
             current_idx: 0,
             end_idx: 0,
             current_row: Row::new(),
-            current_rid: 0,
             current_pos: 0,
             has_current: false,
             error: None,
@@ -703,6 +702,7 @@ impl VolumeScanner {
             visibility_bitmap: None,
             pending_cold_deletes: None,
             committed_tombstones: None,
+            group_ids: Default::default(),
             view: None,
             cut: CommitCut::every(),
             deadline: Deadline::NONE,
@@ -1359,7 +1359,10 @@ impl VolumeScanner {
         if self.committed_tombstones.is_none() && self.pending_cold_deletes.is_none() {
             return false;
         }
-        let rid = self.volume.meta.row_ids.at(idx);
+        let rid = match self.group_ids.holds(idx) {
+            true => self.group_ids.at(idx),
+            false => self.volume.meta.row_ids.at(idx),
+        };
         if let Some(ref ts) = self.committed_tombstones
             && let Some(&commit_seq) = ts.get(&rid)
             && self.cut.sees(commit_seq as i64)
@@ -1685,7 +1688,6 @@ impl VolumeScanner {
                     side.rows += 1;
                 }
                 self.current_pos = idx;
-                self.current_rid = self.volume.meta.row_ids.at(idx);
                 self.has_current = true;
                 return Ok(true);
             }
@@ -1726,6 +1728,13 @@ impl VolumeScanner {
                 return Ok(false);
             }
 
+            if (self.committed_tombstones.is_some() || self.pending_cold_deletes.is_some())
+                && !self.group_ids.holds(self.current_idx)
+            {
+                let end = (self.current_idx + 64).min(self.next_group_boundary);
+                self.group_ids
+                    .load(&self.volume.meta.row_ids, self.current_idx..end);
+            }
             if self.should_skip_row(self.current_idx) || self.past_skip_key(self.current_idx)? {
                 self.current_idx += 1;
                 continue;
@@ -1747,7 +1756,6 @@ impl VolumeScanner {
             }
 
             self.current_pos = idx;
-            self.current_rid = self.volume.meta.row_ids.at(idx);
             self.has_current = true;
             self.current_idx += 1;
             return Ok(true);
@@ -1798,13 +1806,13 @@ impl Scanner for VolumeScanner {
     }
 
     fn take_row_with_id(&mut self) -> (i64, Row) {
-        let rid = self.current_rid;
+        let rid = self.current_row_id();
         self.has_current = false;
         (rid, std::mem::take(&mut self.current_row))
     }
 
     fn current_row_id(&self) -> i64 {
-        self.current_rid
+        self.volume.meta.row_ids.get(self.current_pos).unwrap_or(0)
     }
 
     fn estimated_count(&self) -> Option<usize> {
