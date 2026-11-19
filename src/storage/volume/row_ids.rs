@@ -148,8 +148,9 @@ impl RowIds {
         Iter(match &self.0 {
             Repr::Range { start, len } => {
                 assert!(positions.start <= positions.end && positions.end <= *len);
+                // Wrapping only where nothing is left: the empty range past i64::MAX
                 IterRepr::Range {
-                    next: start + positions.start as i64,
+                    next: start.wrapping_add(positions.start as i64),
                     left: positions.len(),
                 }
             }
@@ -384,6 +385,13 @@ mod tests {
         assert_eq!(top.as_range(), Some((i64::MAX - 1, 2)));
         assert_eq!(all(&top), [i64::MAX - 1, i64::MAX]);
         assert_eq!(top.iter().nth(1), Some(i64::MAX));
+        let last = RowIds::from(vec![i64::MAX]);
+        assert_eq!(
+            last.iter_range(1..1).count(),
+            0,
+            "the empty range past i64::MAX"
+        );
+        assert!(last.to_vec(1..1).is_empty());
     }
 
     #[test]
