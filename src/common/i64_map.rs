@@ -60,14 +60,16 @@ fn count_slot_visits(slots: usize) {
 }
 
 /// A key's home slot is the low bits of this. Multiplication carries entropy
-/// only upwards, so the key's bits 16 and 32 up are folded down first: a run
-/// of dense keys keeps distinct homes, and keys that differ only high up,
-/// such as multiples of 2^32 or ids with a clock in their top bits, spread
+/// only upwards, so the key's top half, mixed, is added before it: a run of
+/// dense keys shares that offset and keeps distinct homes, while keys that
+/// differ high up, whatever their low bits, get offsets of their own
 #[inline(always)]
 fn slot_hash(key: i64) -> usize {
     let k = key as u64;
-    let k = k ^ (k >> 16) ^ (k >> 32);
-    k.wrapping_mul(0x517cc1b727220a95) as usize
+    const MIX: u64 = 0x517cc1b727220a95;
+    let k = k ^ (k >> 16);
+    let k = k.wrapping_add((k >> 32).wrapping_mul(MIX));
+    k.wrapping_mul(MIX) as usize
 }
 
 /// Slot with key and value. key == EMPTY means slot is empty.
@@ -1360,6 +1362,16 @@ mod tests {
         assert!(
             wide > n as usize / 2,
             "multiples of 2^32 share {wide} homes"
+        );
+        let mirrored = homes((0..n).map(|k| k * 4_294_967_297), slots);
+        assert!(
+            mirrored > n as usize / 2,
+            "keys repeating their low half on top share {mirrored} homes"
+        );
+        let strided = homes((0..n).map(|k| k << 16), slots);
+        assert!(
+            strided > n as usize / 2,
+            "multiples of 2^16 share {strided} homes"
         );
         let clock = homes((0..n).map(|ms| (1_700_000_000_000 + ms) << 22 | 5), slots);
         assert!(
