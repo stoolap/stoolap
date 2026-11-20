@@ -38,7 +38,7 @@
 
 use std::hash::{Hash, Hasher};
 
-use rustc_hash::FxHasher;
+use crate::common::KeyHasher;
 
 use crate::core::{Row, Value};
 
@@ -320,13 +320,13 @@ impl Iterator for ProbeIter<'_> {
 /// Hash values at given indices using a get function.
 ///
 /// This is a generic version that works with any type that provides indexed access
-/// to values (Row, RowRef, etc.). Uses the same FxHash algorithm as hash_row_keys.
+/// to values (Row, RowRef, etc.). Uses the same hash as hash_row_keys.
 #[inline]
 pub fn hash_keys_with<'a, F>(key_indices: &[usize], get_value: F) -> u64
 where
     F: Fn(usize) -> Option<&'a Value>,
 {
-    let mut hasher = FxHasher::default();
+    let mut hasher = KeyHasher::default();
 
     for &idx in key_indices {
         if let Some(value) = get_value(idx) {
@@ -342,11 +342,11 @@ where
 
 /// Hash row key columns into a single u64.
 ///
-/// Uses FxHasher which is optimized for trusted keys in embedded database context.
+/// Uses KeyHasher which is optimized for trusted keys in embedded database context.
 /// This is the same algorithm used in utils.rs but kept here to avoid circular deps.
 #[inline]
 pub fn hash_row_keys(row: &Row, key_indices: &[usize]) -> u64 {
-    let mut hasher = FxHasher::default();
+    let mut hasher = KeyHasher::default();
 
     for &idx in key_indices {
         if let Some(value) = row.get(idx) {
@@ -363,7 +363,7 @@ pub fn hash_row_keys(row: &Row, key_indices: &[usize]) -> u64 {
 /// The hash `hash_row_keys` gives a row whose one key is `value`
 #[inline]
 pub fn hash_key_value(value: &Value) -> u64 {
-    let mut hasher = FxHasher::default();
+    let mut hasher = KeyHasher::default();
     hash_value(&mut hasher, value);
     hasher.finish()
 }

@@ -21,7 +21,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use rustc_hash::FxHashMap;
+use stoolap::common::KeyMap;
 use stoolap::storage::volume::manifest::SegmentManager;
 use stoolap::Database;
 
@@ -64,7 +64,7 @@ fn live() -> isize {
 /// manager builds its map
 fn map_alone(ids: &[i64]) -> isize {
     let before = live();
-    let mut map: FxHashMap<i64, u64> = FxHashMap::default();
+    let mut map: KeyMap<i64, u64> = KeyMap::default();
     for &id in ids {
         map.insert(id, 1);
     }

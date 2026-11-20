@@ -89,8 +89,8 @@ pub mod utils;
 mod volatility;
 mod window;
 
+use crate::common::KeyMap;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
@@ -156,7 +156,7 @@ struct ActiveTransaction {
     /// The transaction object
     transaction: Box<dyn Transaction>,
     /// Tables accessed within this transaction (cached for proper commit/rollback)
-    tables: FxHashMap<String, Box<dyn Table>>,
+    tables: KeyMap<String, Box<dyn Table>>,
 }
 
 /// The session's explicit transaction, with whether one is open readable
@@ -445,7 +445,7 @@ impl Executor {
             statement_gate: RwLock::new(()),
             active_transaction: TransactionSlot::new(Some(ActiveTransaction {
                 transaction: tx,
-                tables: FxHashMap::default(),
+                tables: KeyMap::default(),
             })),
             query_planner: std::sync::OnceLock::new(),
             view_spares: parking_lot::Mutex::new(smallvec::SmallVec::new()),
@@ -625,7 +625,7 @@ impl Executor {
     pub fn execute_with_named_params(
         &self,
         sql: &str,
-        params: FxHashMap<String, Value>,
+        params: KeyMap<String, Value>,
     ) -> Result<Box<dyn QueryResult>> {
         self.execute_named_with(sql, &mut value_in(&params))
     }
@@ -1320,7 +1320,7 @@ impl Executor {
         let mut active_tx = self.active_transaction.lock();
         *active_tx = Some(ActiveTransaction {
             transaction: tx,
-            tables: FxHashMap::default(),
+            tables: KeyMap::default(),
         });
     }
 
@@ -1522,7 +1522,7 @@ pub(crate) fn bind_program(
 
 /// The `value_of` of a map of named values
 pub(crate) fn value_in(
-    params: &FxHashMap<String, Value>,
+    params: &KeyMap<String, Value>,
 ) -> impl FnMut(&str) -> Result<Option<Value>> + '_ {
     |name| Ok(params.get(name).cloned())
 }

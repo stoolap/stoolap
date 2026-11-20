@@ -23,8 +23,8 @@
 
 use std::any::Any;
 
+use crate::common::{KeyMap, KeySet};
 use chrono::{DateTime, Utc};
-use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{find_column_index, resolve_alias, Expression};
 use crate::common::I64Set;
@@ -42,11 +42,11 @@ enum HashedValues {
     /// Integer hash set for O(1) lookup
     Integers(I64Set),
     /// String hash set for O(1) lookup
-    Strings(FxHashSet<String>),
+    Strings(KeySet<String>),
     /// Boolean set (only 2 possible values)
     Booleans { has_true: bool, has_false: bool },
     /// Timestamp hash set for O(1) lookup
-    Timestamps(FxHashSet<DateTime<Utc>>),
+    Timestamps(KeySet<DateTime<Utc>>),
     /// Mixed types - fall back to linear search
     Mixed,
 }
@@ -77,7 +77,7 @@ pub struct InListExpr {
     has_null: bool,
 
     /// Column aliases
-    aliases: FxHashMap<String, String>,
+    aliases: KeyMap<String, String>,
     /// Original column name if using alias
     original_column: Option<String>,
 
@@ -98,7 +98,7 @@ impl InListExpr {
             col_index: None,
             hashed: HashedValues::None,
             has_null,
-            aliases: FxHashMap::default(),
+            aliases: KeyMap::default(),
             cached_min: None,
             cached_max: None,
             original_column: None,
@@ -115,7 +115,7 @@ impl InListExpr {
             col_index: None,
             hashed: HashedValues::None,
             has_null,
-            aliases: FxHashMap::default(),
+            aliases: KeyMap::default(),
             original_column: None,
             cached_min: None,
             cached_max: None,
@@ -203,7 +203,7 @@ impl InListExpr {
                 }
             }
             Some("text") => {
-                let mut set = FxHashSet::default();
+                let mut set = KeySet::default();
                 let mut all_text = true;
                 for v in &self.values {
                     match v {
@@ -480,7 +480,7 @@ impl Expression for InListExpr {
         }
     }
 
-    fn with_aliases(&self, aliases: &FxHashMap<String, String>) -> Box<dyn Expression> {
+    fn with_aliases(&self, aliases: &KeyMap<String, String>) -> Box<dyn Expression> {
         let resolved = resolve_alias(&self.column, aliases);
         let mut expr = self.clone();
 
@@ -739,7 +739,7 @@ mod tests {
             Value::text("active"),
         ]);
 
-        let mut aliases = FxHashMap::default();
+        let mut aliases = KeyMap::default();
         aliases.insert("i".to_string(), "id".to_string());
 
         let expr = InListExpr::new("i", vec![Value::integer(1), Value::integer(2)]);

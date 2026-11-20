@@ -32,7 +32,7 @@ use std::cell::Cell;
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use crate::common::{KeyMap, KeySet};
 use smallvec::SmallVec;
 
 use crate::common::deadline::{Deadline, DeadlineSite};
@@ -1085,7 +1085,7 @@ struct Changed<'p> {
     shape: &'p Shape,
     /// Each distinct value the column's rows held at the statement's start
     values: Vec<Taken>,
-    by_value: FxHashMap<Value, usize>,
+    by_value: KeyMap<Value, usize>,
     /// Each row an action reached and the place of its start value in `values`
     rows: I64Map<usize>,
     depth: usize,
@@ -1095,7 +1095,7 @@ struct Changed<'p> {
     /// The child table's store and layout `column` was read from
     token: Option<LayoutToken>,
     /// The shadowed root's new values when they are too many to look through
-    written: FxHashSet<Value>,
+    written: KeySet<Value>,
 }
 
 /// Up to this many values a statement wrote are looked through, not hashed
@@ -1152,13 +1152,13 @@ impl<'p> Changed<'p> {
         Changed {
             shape,
             values: Vec::new(),
-            by_value: FxHashMap::default(),
+            by_value: KeyMap::default(),
             rows: I64Map::new(),
             depth: 0,
             waiting: shape.waiting,
             done: false,
             token: None,
-            written: FxHashSet::default(),
+            written: KeySet::default(),
         }
     }
 

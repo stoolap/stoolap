@@ -21,8 +21,8 @@ use crate::common::deadline::{Deadline, DeadlineSite, CHARGE_BEAT};
 use crate::common::time_compat::SystemTime;
 use crate::storage::traits::transaction::StatementTable;
 
+use crate::common::KeySet;
 use rand::Rng;
-use rustc_hash::FxHashSet;
 
 use crate::core::{Error, Result, Row, RowVec, Value};
 use crate::parser::ast::AnalyzeStatement;
@@ -336,7 +336,7 @@ impl Executor {
         Option<Histogram>,
     ) {
         let mut null_count = 0i64;
-        let mut distinct_values: FxHashSet<String> = FxHashSet::default();
+        let mut distinct_values: KeySet<String> = KeySet::default();
         let mut min_value: Option<Value> = None;
         let mut max_value: Option<Value> = None;
         let mut total_width = 0usize;
@@ -347,7 +347,7 @@ impl Executor {
                 if value.is_null() {
                     null_count += 1;
                 } else {
-                    // Track distinct values using string representation with FxHash for speed
+                    // Track distinct values using string representation
                     distinct_values.insert(format!("{}", value));
 
                     // Track min/max

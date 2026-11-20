@@ -16,8 +16,7 @@
 // - Uses i64::MIN as the empty marker inside the slot array; the entry
 //   for that key lives in a side slot, so the full i64 range is storable
 // - Direct key storage (no XOR transform)
-// - FxHash with pre-mixing (XOR>>16 before multiply) - 0 sequential collisions,
-//   65% reduction in strided key collisions
+// - The engine's integer hash, `common::hash::slot_hash`
 // - Backward-shift deletion (no tombstones)
 
 use std::mem::MaybeUninit;
@@ -59,17 +58,10 @@ fn count_slot_visits(slots: usize) {
     let _ = slots;
 }
 
-/// A key's home slot is the low bits of this. Multiplication carries entropy
-/// only upwards, so the key's top half, mixed, is added before it: a run of
-/// dense keys shares that offset and keeps distinct homes, while keys that
-/// differ high up, whatever their low bits, get offsets of their own
+/// A key's home slot is the low bits of the engine's hash of the key
 #[inline(always)]
 fn slot_hash(key: i64) -> usize {
-    let k = key as u64;
-    const MIX: u64 = 0x517cc1b727220a95;
-    let k = k ^ (k >> 16);
-    let k = k.wrapping_add((k >> 32).wrapping_mul(MIX));
-    k.wrapping_mul(MIX) as usize
+    super::hash::slot_hash(key) as usize
 }
 
 /// Slot with key and value. key == EMPTY means slot is empty.
@@ -877,7 +869,7 @@ pub struct Drain<'a, V> {
 ///
 /// Uses the same optimizations as I64Map:
 /// - i64::MIN marks empty slots; that member is held beside the array
-/// - FxHash with pre-mixing (XOR>>16 before multiply) - 0 sequential collisions
+/// - The engine's integer hash, `common::hash::slot_hash`
 /// - Backward-shift deletion (no tombstones)
 pub struct I64Set {
     slots: Box<[i64]>,
@@ -1372,6 +1364,11 @@ mod tests {
         assert!(
             strided > n as usize / 2,
             "multiples of 2^16 share {strided} homes"
+        );
+        let repeated = homes((0..n).map(|k| k * 65_537), slots);
+        assert!(
+            repeated > n as usize / 8,
+            "keys repeating their low quarter above it share {repeated} homes"
         );
         let clock = homes((0..n).map(|ms| (1_700_000_000_000 + ms) << 22 | 5), slots);
         assert!(

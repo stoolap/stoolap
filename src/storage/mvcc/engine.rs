@@ -18,8 +18,8 @@
 //!
 
 use crate::common::{CompactArc, I64Map, SmartString, StringMap};
+use crate::common::{KeyMap, KeySet};
 use parking_lot::{Condvar, Mutex, RwLock};
-use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -394,7 +394,7 @@ fn registry_as_visibility_checker(
 /// The tables `schema`, the schema of `table`, references by foreign key and
 /// the tables in `schemas` whose foreign keys reference `table`, lower case
 fn fk_neighbors(
-    schemas: &FxHashMap<String, CompactArc<Schema>>,
+    schemas: &KeyMap<String, CompactArc<Schema>>,
     schema: Option<&Schema>,
     table: &str,
 ) -> Vec<String> {
@@ -422,8 +422,8 @@ fn fk_neighbors(
 /// Updates both the schemas map and each affected VersionStore's schema.
 /// Caller must hold schemas as write-locked and version_stores as read-locked.
 fn strip_fk_references(
-    schemas: &mut FxHashMap<String, CompactArc<Schema>>,
-    version_stores: &FxHashMap<String, Arc<VersionStore>>,
+    schemas: &mut KeyMap<String, CompactArc<Schema>>,
+    version_stores: &KeyMap<String, Arc<VersionStore>>,
     parent_table_lower: &str,
 ) {
     let children_to_update: Vec<String> = schemas
@@ -473,8 +473,8 @@ fn strip_fk_references(
 /// the schemas map and each affected VersionStore's schema.
 /// Caller must hold schemas as write-locked and version_stores as read-locked.
 fn retarget_fk_references(
-    schemas: &mut FxHashMap<String, CompactArc<Schema>>,
-    version_stores: &FxHashMap<String, Arc<VersionStore>>,
+    schemas: &mut KeyMap<String, CompactArc<Schema>>,
+    version_stores: &KeyMap<String, Arc<VersionStore>>,
     from: &str,
     to: &str,
 ) {
@@ -490,8 +490,8 @@ fn retarget_fk_references(
 /// each affected VersionStore's schema; the names of the tables changed.
 /// Caller must hold schemas as write-locked and version_stores as read-locked.
 fn retarget_fks(
-    schemas: &mut FxHashMap<String, CompactArc<Schema>>,
-    version_stores: &FxHashMap<String, Arc<VersionStore>>,
+    schemas: &mut KeyMap<String, CompactArc<Schema>>,
+    version_stores: &KeyMap<String, Arc<VersionStore>>,
     matches: impl Fn(&ForeignKeyConstraint) -> bool,
     retarget: impl Fn(&mut ForeignKeyConstraint),
 ) -> Vec<String> {
@@ -1056,7 +1056,7 @@ struct DdlShared {
     schema_epoch: AtomicU64,
     /// The epoch of the last change to each table or view, by lower-case
     /// name; a name absent last changed at or before `name_floor`
-    name_epochs: parking_lot::RwLock<FxHashMap<String, u64>>,
+    name_epochs: parking_lot::RwLock<KeyMap<String, u64>>,
     /// The epoch at which every name last changed together, by an open or
     /// a restore
     name_floor: AtomicU64,
@@ -1106,7 +1106,7 @@ impl DdlShared {
     /// Moves the schema epoch for a change to `table`, lower case, and to the
     /// tables its foreign keys reference or that reference it in `schemas`,
     /// whose constraints the change may alter
-    fn changed_table(&self, schemas: &FxHashMap<String, CompactArc<Schema>>, table: &str) {
+    fn changed_table(&self, schemas: &KeyMap<String, CompactArc<Schema>>, table: &str) {
         let mut names = fk_neighbors(schemas, schemas.get(table).map(|s| &**s), table);
         names.push(table.to_string());
         self.changed(&names.iter().map(String::as_str).collect::<Vec<_>>());
@@ -1192,9 +1192,9 @@ pub struct MVCCEngine {
     config: RwLock<Config>,
     /// Table schemas (Arc-wrapped for safe sharing with transactions)
     /// Each schema is also Arc-wrapped to avoid cloning on lookup (critical for PK fast path)
-    schemas: Arc<RwLock<FxHashMap<String, CompactArc<Schema>>>>,
+    schemas: Arc<RwLock<KeyMap<String, CompactArc<Schema>>>>,
     /// Version stores for each table (Arc-wrapped for safe sharing with transactions)
-    version_stores: Arc<RwLock<FxHashMap<String, Arc<VersionStore>>>>,
+    version_stores: Arc<RwLock<KeyMap<String, Arc<VersionStore>>>>,
     /// Transaction registry
     registry: Arc<TransactionRegistry>,
     /// Whether the engine is open
@@ -1205,7 +1205,7 @@ pub struct MVCCEngine {
     /// (Arc-wrapped for safe sharing with transactions)
     txn_version_stores: Arc<RwLock<TxnVersionStoreMap>>,
     /// View definitions (Arc for cheap cloning on lookup)
-    views: RwLock<FxHashMap<String, Arc<ViewDefinition>>>,
+    views: RwLock<KeyMap<String, Arc<ViewDefinition>>>,
     /// Persistence manager for WAL and snapshot operations (Arc-wrapped for safe sharing)
     persistence: Arc<Option<PersistenceManager>>,
     /// Why a file database's persistence could not start: the open fails
@@ -1231,11 +1231,11 @@ pub struct MVCCEngine {
     fk_reverse_cache: RwLock<FkReverseCache>,
     /// Snapshot timestamps loaded per table — used to pair HNSW graph files with their
     /// matching data snapshots during WAL replay.
-    snapshot_timestamps: RwLock<FxHashMap<String, String>>,
+    snapshot_timestamps: RwLock<KeyMap<String, String>>,
     /// Per-table segment managers (owns segments, delete vectors, manifest).
     /// Key: lowercase table name. Replaces frozen_volumes + volume_tombstones.
     segment_managers:
-        Arc<RwLock<FxHashMap<String, Arc<crate::storage::volume::manifest::SegmentManager>>>>,
+        Arc<RwLock<KeyMap<String, Arc<crate::storage::volume::manifest::SegmentManager>>>>,
     /// When true, seal_hot_buffers bypasses thresholds and seals all rows.
     /// Set during close_engine to ensure all data is in volumes before shutdown.
     force_seal_all: AtomicBool,
@@ -1251,7 +1251,7 @@ pub struct MVCCEngine {
     seal_fence: Arc<parking_lot::RwLock<()>>,
     /// The open transactions that created a table, entered before the table
     /// is in `schemas`: the catalog copies wait until they end
-    creating_txns: Arc<parking_lot::Mutex<FxHashSet<i64>>>,
+    creating_txns: Arc<parking_lot::Mutex<KeySet<i64>>>,
     /// True while a background compaction thread is running.
     /// Background checkpoint skips compaction when set. Forced compaction
     /// (PRAGMA CHECKPOINT, close, restore) waits for it to finish first.
@@ -1305,7 +1305,7 @@ fn parse_volume_id(path: &std::path::Path) -> Option<u64> {
 /// Get or create a segment manager for a table.
 fn get_or_create_segment_manager(
     segment_managers: &RwLock<
-        FxHashMap<String, Arc<crate::storage::volume::manifest::SegmentManager>>,
+        KeyMap<String, Arc<crate::storage::volume::manifest::SegmentManager>>,
     >,
     persistence: &Option<PersistenceManager>,
     table_name: &str,
@@ -1353,7 +1353,7 @@ fn remove_dropped_table_files(
 /// engine persists, so a seal starting later carries the change
 fn column_change_manager(
     segment_managers: &RwLock<
-        FxHashMap<String, Arc<crate::storage::volume::manifest::SegmentManager>>,
+        KeyMap<String, Arc<crate::storage::volume::manifest::SegmentManager>>,
     >,
     persistence: &Option<PersistenceManager>,
     table_name: &str,
@@ -1370,7 +1370,7 @@ fn column_change_manager(
 
 fn begin_column_change(
     segment_managers: &RwLock<
-        FxHashMap<String, Arc<crate::storage::volume::manifest::SegmentManager>>,
+        KeyMap<String, Arc<crate::storage::volume::manifest::SegmentManager>>,
     >,
     persistence: &Option<PersistenceManager>,
     table_name: &str,
@@ -1385,8 +1385,8 @@ fn begin_column_change(
 /// The engine's schema cache takes the version store's schema of
 /// `table_name`, the schema epoch moving under the same lock
 fn refresh_schema(
-    version_stores: &RwLock<FxHashMap<String, Arc<VersionStore>>>,
-    schemas: &RwLock<FxHashMap<String, CompactArc<Schema>>>,
+    version_stores: &RwLock<KeyMap<String, Arc<VersionStore>>>,
+    schemas: &RwLock<KeyMap<String, CompactArc<Schema>>>,
     ddl: &DdlShared,
     table_name: &str,
 ) -> Result<()> {
@@ -1450,13 +1450,13 @@ impl MVCCEngine {
                 path
             },
             config: RwLock::new(config),
-            schemas: Arc::new(RwLock::new(FxHashMap::default())),
-            version_stores: Arc::new(RwLock::new(FxHashMap::default())),
+            schemas: Arc::new(RwLock::new(KeyMap::default())),
+            version_stores: Arc::new(RwLock::new(KeyMap::default())),
             registry: Arc::new(TransactionRegistry::new()),
             open: Arc::new(AtomicBool::new(false)),
             operations: OnceLock::new(),
             txn_version_stores: Arc::new(RwLock::new(I64Map::new())),
-            views: RwLock::new(FxHashMap::default()),
+            views: RwLock::new(KeyMap::default()),
             persistence: Arc::new(persistence),
             persistence_error,
             loading_from_disk: Arc::new(AtomicBool::new(false)),
@@ -1464,7 +1464,7 @@ impl MVCCEngine {
             ddl: Arc::new(DdlShared {
                 serial: parking_lot::ReentrantMutex::new(()),
                 schema_epoch: AtomicU64::new(0),
-                name_epochs: parking_lot::RwLock::new(FxHashMap::default()),
+                name_epochs: parking_lot::RwLock::new(KeyMap::default()),
                 name_floor: AtomicU64::new(0),
                 reserved_names: AtomicBool::new(false),
             }),
@@ -1472,13 +1472,13 @@ impl MVCCEngine {
             stats_epoch: AtomicU64::new(0),
             cleanup_handle: Mutex::new(None),
             fk_reverse_cache: RwLock::new((u64::MAX, StringMap::default())),
-            snapshot_timestamps: RwLock::new(FxHashMap::default()),
-            segment_managers: Arc::new(RwLock::new(FxHashMap::default())),
+            snapshot_timestamps: RwLock::new(KeyMap::default()),
+            segment_managers: Arc::new(RwLock::new(KeyMap::default())),
             force_seal_all: AtomicBool::new(false),
             hot_limits,
             checkpoint_mutex: Mutex::new(()),
             seal_fence: Arc::new(parking_lot::RwLock::new(())),
-            creating_txns: Arc::new(parking_lot::Mutex::new(FxHashSet::default())),
+            creating_txns: Arc::new(parking_lot::Mutex::new(KeySet::default())),
             compaction_running: Arc::new(AtomicBool::new(false)),
             backfill_running: AtomicBool::new(false),
             closing: AtomicBool::new(false),
@@ -2420,7 +2420,7 @@ fn populate_hnsw_from_volumes(
     let volumes = mgr.get_volumes_newest_first()?;
 
     // Seed seen set with hot row_ids (already indexed by populate_all_indexes)
-    let mut seen: rustc_hash::FxHashSet<i64> = store
+    let mut seen: crate::common::KeySet<i64> = store
         .get_all_visible_row_ids((INVALID_TRANSACTION_ID + 1).into())
         .into_iter()
         .collect();
@@ -3319,7 +3319,7 @@ impl MVCCEngine {
     /// Per-table memory figures for PRAGMA MEMORY_STATS, plus a final `*`
     /// row with the totals and the number of commits that waited for a seal.
     pub fn memory_stats(&self) -> Vec<MemoryStat> {
-        let mut volume_bytes: FxHashMap<String, usize> = FxHashMap::default();
+        let mut volume_bytes: KeyMap<String, usize> = KeyMap::default();
         for (table, _, _, _, mem, _, _) in self.volume_stats() {
             *volume_bytes.entry(table).or_default() += mem;
         }
@@ -5357,7 +5357,7 @@ impl MVCCEngine {
         }
 
         // Check for duplicate column names
-        let mut seen_names = FxHashSet::default();
+        let mut seen_names = KeySet::default();
         for col in &schema.columns {
             if col.name.is_empty() {
                 return Err(Error::internal("column name cannot be empty"));
@@ -5634,7 +5634,7 @@ impl MVCCEngine {
         // A new commit starting after our tombstone read but before our cutoff
         // read can only ADD to the cutoff (making it higher), never subtract.
         // Its tombstones won't be in our frozen set (captured before it started).
-        let frozen_tombstones: ahash::AHashMap<String, Arc<FxHashMap<i64, u64>>> = {
+        let frozen_tombstones: ahash::AHashMap<String, Arc<KeyMap<i64, u64>>> = {
             let mgrs = self.segment_managers.read();
             mgrs.iter()
                 .map(|(name, mgr)| (name.clone(), mgr.tombstone_set_arc()))
@@ -5703,7 +5703,7 @@ impl MVCCEngine {
             // Snapshot-consistent skip set: hot row_ids committed at or before
             // snapshot_commit_seq. Built during the hot-row write pass below to
             // avoid a redundant second B-tree traversal.
-            let mut seen = FxHashSet::default();
+            let mut seen = KeySet::default();
 
             // Write hot committed rows (single pass: write + collect row_ids)
             if let Some(store) = stores.get(table_name) {
@@ -5882,7 +5882,7 @@ impl MVCCEngine {
         let mut renamed_successfully: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
 
         if all_succeeded {
-            let mut dirs_to_sync: FxHashSet<std::path::PathBuf> = FxHashSet::default();
+            let mut dirs_to_sync: KeySet<std::path::PathBuf> = KeySet::default();
 
             for (temp_path, final_path, table_name) in &pending_snapshots {
                 if let Err(e) = rename_snapshot(temp_path, final_path) {
@@ -6985,13 +6985,13 @@ impl MVCCEngine {
             identities_of.push((identities, definition));
         }
         let mut deferred = self.backfill_deferred.lock();
-        let candidates: FxHashSet<(&str, u64)> = work
+        let candidates: KeySet<(&str, u64)> = work
             .iter()
             .map(|&(index, id, _)| (tables[index].0.as_str(), id))
             .collect();
         deferred.retain(|(table, segment)| candidates.contains(&(table.as_str(), *segment)));
         // A volume's place in the queue, one past it; 0 for one not queued
-        let waiting: FxHashMap<(&str, u64), usize> = deferred
+        let waiting: KeyMap<(&str, u64), usize> = deferred
             .iter()
             .enumerate()
             .map(|(at, (table, segment))| ((table.as_str(), *segment), at + 1))
@@ -7837,7 +7837,7 @@ impl MVCCEngine {
             // collect only (row_id, volume_index, row_index) references, then sort
             // and stream into VolumeBuilder. This avoids materializing all Row objects
             // at once (which would be 2-3x the table size for large tables).
-            let mut seen = FxHashSet::default();
+            let mut seen = KeySet::default();
             let mut live_refs: Vec<(i64, usize, usize)> = Vec::new(); // (row_id, vol_idx, row_idx)
 
             // The tombstones this compaction applies, as (row_id, commit_seq):
@@ -7875,7 +7875,7 @@ impl MVCCEngine {
             }
             // A copy outside the batch would outlive the tombstone: the row
             // stays, newest copy and tombstone, for a batch that holds all
-            let candidates: FxHashSet<i64> = tombstoned.iter().map(|t| t.0).collect();
+            let candidates: KeySet<i64> = tombstoned.iter().map(|t| t.0).collect();
             let held = held_outside(&outside, &candidates);
             let mut kept: Vec<(i64, usize, usize)> = Vec::new();
             for (row_id, commit_seq, vol_idx, i) in tombstoned {
@@ -7934,7 +7934,7 @@ impl MVCCEngine {
                 let vol_table_dir = vol_dir.join(table_name);
                 // A file read by a volume some reader may still hold is
                 // removed when the last holder lets go; the others now
-                let old_filenames: FxHashSet<String> = volumes
+                let old_filenames: KeySet<String> = volumes
                     .iter()
                     .filter(|(_, vol)| !vol.retire_file())
                     .map(|(id, _)| format!("vol_{:016x}.vol", id))
@@ -8361,7 +8361,7 @@ impl MVCCEngine {
             let vol_table_dir = vol_dir.join(table_name);
             // A file read by a volume some reader may still hold is removed
             // when the last holder lets go; the others now
-            let old_filenames: FxHashSet<String> = volumes
+            let old_filenames: KeySet<String> = volumes
                 .iter()
                 .filter(|(_, vol)| !vol.retire_file())
                 .map(|(id, _)| format!("vol_{:016x}.vol", id))
@@ -8856,7 +8856,7 @@ impl MVCCEngine {
 
                 // Clear tombstones for sealed row_ids INSIDE the fence.
                 {
-                    let skip_set: FxHashSet<i64> = outcome
+                    let skip_set: KeySet<i64> = outcome
                         .dead
                         .iter()
                         .chain(&outcome.deferred)
@@ -8866,7 +8866,7 @@ impl MVCCEngine {
                     // alone never makes it copy the map
                     let sealed_ids = {
                         let ts = mgr.tombstone_set_arc();
-                        let mut sealed_ids: FxHashSet<i64> = FxHashSet::default();
+                        let mut sealed_ids: KeySet<i64> = KeySet::default();
                         if !ts.is_empty() {
                             for (vol, _, _) in &sealed_volumes {
                                 for rid in vol.meta.row_ids.iter() {
@@ -8978,13 +8978,13 @@ impl Engine for MVCCEngine {
         self.ddl.name_epoch(name)
     }
 
-    fn list_table_indexes(&self, table_name: &str) -> Result<FxHashMap<String, String>> {
+    fn list_table_indexes(&self, table_name: &str) -> Result<KeyMap<String, String>> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
 
         let store = self.get_version_store(table_name)?;
-        let mut result = FxHashMap::default();
+        let mut result = KeyMap::default();
         for index_name in store.list_indexes() {
             result.insert(index_name, "BTree".to_string());
         }
@@ -9371,7 +9371,7 @@ impl MVCCEngine {
                 }
                 stale = true;
                 if mgr.has_segments() {
-                    let found_ids: rustc_hash::FxHashSet<i64> =
+                    let found_ids: crate::common::KeySet<i64> =
                         result.iter().map(|(id, _)| *id).collect();
                     for &rid in row_ids {
                         if !found_ids.contains(&rid)
@@ -9882,9 +9882,9 @@ impl Drop for CleanupHandle {
 
 /// See MVCCEngine::close_for_column_change; the caller holds the DDL guard
 fn close_and_settle(
-    version_stores: &RwLock<FxHashMap<String, Arc<VersionStore>>>,
+    version_stores: &RwLock<KeyMap<String, Arc<VersionStore>>>,
     segment_managers: &RwLock<
-        FxHashMap<String, Arc<crate::storage::volume::manifest::SegmentManager>>,
+        KeyMap<String, Arc<crate::storage::volume::manifest::SegmentManager>>,
     >,
     persistence: &Option<PersistenceManager>,
     registry: &TransactionRegistry,
@@ -9929,9 +9929,9 @@ fn close_and_settle(
 /// from transactions without raw pointers.
 struct EngineOperations {
     /// Shared reference to schemas (each schema is Arc-wrapped to avoid cloning on lookup)
-    schemas: Arc<RwLock<FxHashMap<String, CompactArc<Schema>>>>,
+    schemas: Arc<RwLock<KeyMap<String, CompactArc<Schema>>>>,
     /// Shared reference to version stores
-    version_stores: Arc<RwLock<FxHashMap<String, Arc<VersionStore>>>>,
+    version_stores: Arc<RwLock<KeyMap<String, Arc<VersionStore>>>>,
     /// Shared reference to registry
     registry: Arc<TransactionRegistry>,
     /// Shared reference to transaction version stores cache
@@ -9942,11 +9942,11 @@ struct EngineOperations {
     loading_from_disk: Arc<AtomicBool>,
     /// Shared reference to segment managers
     segment_managers:
-        Arc<RwLock<FxHashMap<String, Arc<crate::storage::volume::manifest::SegmentManager>>>>,
+        Arc<RwLock<KeyMap<String, Arc<crate::storage::volume::manifest::SegmentManager>>>>,
     /// Seal fence for WAL truncation safety
     seal_fence: Arc<parking_lot::RwLock<()>>,
     /// The engine's open transactions that created a table
-    creating_txns: Arc<parking_lot::Mutex<FxHashSet<i64>>>,
+    creating_txns: Arc<parking_lot::Mutex<KeySet<i64>>>,
     /// Hot size limits shared with the engine
     hot_limits: Arc<HotLimits>,
     /// The engine's DDL guard and schema epoch
@@ -9962,7 +9962,7 @@ struct EngineOperations {
     /// The next creation `new_creation` hands out; 0 stands for none
     next_creation: AtomicU64,
     /// The open transactions that judge their unique keys as they write them
-    tracking_txns: parking_lot::Mutex<FxHashSet<i64>>,
+    tracking_txns: parking_lot::Mutex<KeySet<i64>>,
     /// Whether `tracking_txns` has an entry, so a store or an end skips its lock
     tracking_any: AtomicBool,
 }
@@ -10074,7 +10074,7 @@ impl EngineOperations {
             holding_keys: AtomicBool::new(false),
             creating: AtomicBool::new(false),
             next_creation: AtomicU64::new(1),
-            tracking_txns: parking_lot::Mutex::new(FxHashSet::default()),
+            tracking_txns: parking_lot::Mutex::new(KeySet::default()),
             tracking_any: AtomicBool::new(false),
         }
     }
@@ -10126,11 +10126,11 @@ impl EngineOperations {
         Ok(())
     }
 
-    fn schemas(&self) -> &RwLock<FxHashMap<String, CompactArc<Schema>>> {
+    fn schemas(&self) -> &RwLock<KeyMap<String, CompactArc<Schema>>> {
         &self.schemas
     }
 
-    fn version_stores(&self) -> &RwLock<FxHashMap<String, Arc<VersionStore>>> {
+    fn version_stores(&self) -> &RwLock<KeyMap<String, Arc<VersionStore>>> {
         &self.version_stores
     }
 
@@ -10899,8 +10899,8 @@ impl TransactionEngineOperations for EngineOperations {
         let mut commit_error: Option<crate::core::Error> = None;
         let mut any_committed = false;
         let mut recheck_keys = RecheckKeys::default();
-        let mut tombstones_wal_recorded: rustc_hash::FxHashSet<String> =
-            rustc_hash::FxHashSet::default();
+        let mut tombstones_wal_recorded: crate::common::KeySet<String> =
+            crate::common::KeySet::default();
 
         // Check if WAL recording is needed (persistence enabled and not in recovery)
         let should_record_wal = !self.should_skip_wal()
@@ -11382,7 +11382,7 @@ fn mark_dead_copies(
     entries: &mut [crate::storage::volume::manifest::SealedEntry],
     outcome: &super::version_store::SealOutcome,
 ) {
-    let unauthorized: FxHashSet<i64> = outcome
+    let unauthorized: KeySet<i64> = outcome
         .dead
         .iter()
         .chain(&outcome.deferred)
@@ -11418,7 +11418,7 @@ fn compaction_chunk_rows(target_volume_rows: usize) -> usize {
 
 /// The commit_seq of a row's tombstone when a compaction may apply it: one
 /// committed below the maintenance limit
-fn applied_commit_seq(tombstones: &FxHashMap<i64, u64>, row_id: i64, limit: u64) -> Option<u64> {
+fn applied_commit_seq(tombstones: &KeyMap<i64, u64>, row_id: i64, limit: u64) -> Option<u64> {
     tombstones
         .get(&row_id)
         .copied()
@@ -11437,13 +11437,13 @@ type OutsideVolume = (
 /// for; a volume whose ids ascend is searched, one whose order is not
 /// decided and whose ids do not ascend is walked, so no permutation is
 /// built for it
-fn held_outside(outside: &[OutsideVolume], candidates: &FxHashSet<i64>) -> FxHashSet<i64> {
-    let mut held = FxHashSet::default();
+fn held_outside(outside: &[OutsideVolume], candidates: &KeySet<i64>) -> KeySet<i64> {
+    let mut held = KeySet::default();
     for (volume, bounds) in outside {
         if held.len() == candidates.len() {
             break;
         }
-        let in_range: FxHashSet<i64> = candidates
+        let in_range: KeySet<i64> = candidates
             .iter()
             .copied()
             .filter(|id| !held.contains(id))
@@ -11629,7 +11629,7 @@ fn close_batch_over_overlap<'a>(
         if let (Some(first), Some(last)) = (first, last)
             && last > first
         {
-            let mut batch_ids: FxHashSet<i64> = FxHashSet::default();
+            let mut batch_ids: KeySet<i64> = KeySet::default();
             for entry in &planned[first..=last] {
                 if entry.2 {
                     batch_ids.extend(ids_of(entry.0).iter());
@@ -11754,7 +11754,7 @@ mod tests {
         // copy of 7 waits outside it, as the base does behind a recluster
         let waiting = volume_holding(&[1, 3, 7, 9]);
         let other = volume_holding(&[20, 30]);
-        let candidates: FxHashSet<i64> = [7, 8, 25].into_iter().collect();
+        let candidates: KeySet<i64> = [7, 8, 25].into_iter().collect();
         let held = held_outside(
             &[
                 (Arc::clone(&other), Some((20, 30))),
@@ -11800,7 +11800,7 @@ mod tests {
 
     #[test]
     fn a_compaction_applies_a_tombstone_only_below_the_maintenance_limit() {
-        let tombstones: FxHashMap<i64, u64> = [(1, 9), (2, 10), (3, 11)].into_iter().collect();
+        let tombstones: KeyMap<i64, u64> = [(1, 9), (2, 10), (3, 11)].into_iter().collect();
         assert_eq!(applied_commit_seq(&tombstones, 1, 10), Some(9));
         assert_eq!(applied_commit_seq(&tombstones, 2, 10), None, "at the limit");
         assert_eq!(applied_commit_seq(&tombstones, 3, 10), None);

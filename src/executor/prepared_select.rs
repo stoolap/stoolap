@@ -22,7 +22,7 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use crate::common::{KeyMap, KeySet};
 use smallvec::SmallVec;
 
 use crate::api::params::ParamVec;
@@ -3174,11 +3174,7 @@ fn slot_keys(conjunct: &Expression, slot: usize) -> Option<Vec<PreparedValue>> {
 
 /// Each bare name in `key` of an alias in `positions`, by node address, to
 /// that alias's position on the projected row
-fn bind_aliases(
-    key: &Expression,
-    positions: &FxHashMap<&str, u16>,
-    out: &mut FxHashMap<usize, u16>,
-) {
+fn bind_aliases(key: &Expression, positions: &KeyMap<&str, u16>, out: &mut KeyMap<usize, u16>) {
     match key {
         Expression::Identifier(id) => {
             if let Some(&i) = positions.get(id.value_lower.as_str()) {
@@ -3248,7 +3244,7 @@ fn reads_row_column(expr: &Expression) -> bool {
 /// Every value a WHERE program compares with a column of `schema`, by node
 /// address, to the column's type: the program reads it as the scan reads a
 /// pushed comparison's value, so both give one answer
-fn compare_as_scan(expr: &Expression, schema: &Schema, out: &mut FxHashMap<usize, DataType>) {
+fn compare_as_scan(expr: &Expression, schema: &Schema, out: &mut KeyMap<usize, DataType>) {
     let column_type = |e: &Expression| {
         bound_column(e)
             .and_then(|i| schema.columns.get(i))
@@ -3657,7 +3653,7 @@ fn grouped_having(
 /// call holding a subquery rewritten by `call`, outside its subqueries
 fn read_inputs(
     expr: &Expression,
-    items: &FxHashMap<ExprKey, Expression>,
+    items: &KeyMap<ExprKey, Expression>,
     call: &mut impl FnMut(&Expression) -> Result<Expression>,
 ) -> Result<Expression> {
     if let Some(item) = items.get(&ExprKey::of(expr)) {
@@ -4114,7 +4110,7 @@ impl WhereParts {
 
     /// Each value a clause of the WHERE compares with a column of `schema`,
     /// read as the scan reads it, by node address
-    fn read_as(&self, schema: &Schema, out: &mut FxHashMap<usize, DataType>) {
+    fn read_as(&self, schema: &Schema, out: &mut KeyMap<usize, DataType>) {
         let narrowed = self
             .narrowed
             .iter()
@@ -5429,7 +5425,7 @@ impl KeyReader {
 /// candidate has, or a NULL one, reads `missing`: without GROUP BY, the
 /// one row of no input
 struct GroupedKeys {
-    groups: FxHashMap<SmallVec<[Value; 1]>, Result<Vec<Row>>>,
+    groups: KeyMap<SmallVec<[Value; 1]>, Result<Vec<Row>>>,
     missing: Vec<Row>,
 }
 
@@ -6049,7 +6045,7 @@ struct Rewritten {
     reads_row: bool,
     /// The slot of each enclosing column read, by scope depth and column,
     /// and by its spelling when the holes are kept as written
-    outer: FxHashMap<(usize, usize, Option<ExprKey>), usize>,
+    outer: KeyMap<(usize, usize, Option<ExprKey>), usize>,
 }
 
 impl Builder<'_> {
@@ -6842,7 +6838,7 @@ impl Builder<'_> {
         chain: &Chain<'_>,
         id: u16,
         expr: &Expression,
-        outer: &FxHashMap<(usize, usize, Option<ExprKey>), usize>,
+        outer: &KeyMap<(usize, usize, Option<ExprKey>), usize>,
     ) -> Result<Expression> {
         let (next_slot, blocks) = (self.next_slot, self.subqueries.len());
         let mut trial = Rewritten {
@@ -7450,7 +7446,7 @@ impl Builder<'_> {
             None
         };
 
-        let mut read_as = FxHashMap::default();
+        let mut read_as = KeyMap::default();
         for expr in candidates.iter().chain(&filter) {
             compare_as_scan(expr, &schema, &mut read_as);
         }
@@ -7688,7 +7684,7 @@ impl Builder<'_> {
             None => None,
         };
 
-        let item_keys: FxHashSet<ExprKey> = items.iter().map(ExprKey::of).collect();
+        let item_keys: KeySet<ExprKey> = items.iter().map(ExprKey::of).collect();
         let mut unread = Rewritten {
             outer: work.outer.clone(),
             ..Rewritten::default()
@@ -7761,7 +7757,7 @@ impl Builder<'_> {
         let slot = |i: usize| {
             u16::try_from(i).map_err(|_| Error::internal("too many grouped values in a block"))
         };
-        let mut slots = FxHashMap::default();
+        let mut slots = KeyMap::default();
         for (i, item) in items.iter().enumerate() {
             slots.entry(ExprKey::of(item)).or_insert(slot(i)?);
         }
@@ -7873,7 +7869,7 @@ struct Grouped {
 
 /// The block's own column that `expr` reads outside every aggregate call
 /// and every GROUP BY item, keyed by `items`
-fn ungrouped(expr: &Expression, items: &FxHashSet<ExprKey>) -> Option<usize> {
+fn ungrouped(expr: &Expression, items: &KeySet<ExprKey>) -> Option<usize> {
     if items.contains(&ExprKey::of(expr)) {
         return None;
     }
@@ -8175,7 +8171,7 @@ fn source_programs(
     compile: impl Fn(&Expression) -> Result<SharedProgram>,
 ) -> Result<SourcePrograms> {
     // A value written again shares its program, and a constant it folds
-    let mut compiled: FxHashMap<ExprKey, SharedProgram> = FxHashMap::default();
+    let mut compiled: KeyMap<ExprKey, SharedProgram> = KeyMap::default();
     let mut program = |value: &Expression| match compiled.entry(ExprKey::exact(value)) {
         std::collections::hash_map::Entry::Occupied(held) => Ok(CompactArc::clone(held.get())),
         std::collections::hash_map::Entry::Vacant(slot) => {
@@ -8593,7 +8589,7 @@ impl PreparedProjection {
         // Each alias reference is bound to its position by node, not by name,
         // so no column name can meet it; a repeated alias is its last use,
         // as the general path's evaluator over the output columns reads it
-        let mut positions: FxHashMap<&str, u16> = FxHashMap::default();
+        let mut positions: KeyMap<&str, u16> = KeyMap::default();
         for (i, name) in reads.items.iter().enumerate() {
             if let Some(name) = name {
                 let i =
@@ -8615,7 +8611,7 @@ impl PreparedProjection {
             .iter()
             .map(|key| bind_own(chain, key, &is_alias))
             .collect::<Result<Vec<_>>>()?;
-        let mut bindings = FxHashMap::default();
+        let mut bindings = KeyMap::default();
         for key in &bound_keys {
             bind_aliases(key, &positions, &mut bindings);
         }
@@ -8811,7 +8807,7 @@ impl PreparedProjection {
             offset,
         );
         // A scanned row is kept only while the sort keeps its output
-        let mut scanned: FxHashMap<i64, Row> = FxHashMap::default();
+        let mut scanned: KeyMap<i64, Row> = KeyMap::default();
         // The storage of a row the sort does not keep holds the next row's keys
         let mut spare: Vec<Value> = Vec::new();
         let mut bound = self.unbound();
@@ -9172,7 +9168,7 @@ impl PreparedSelect {
         let source = builder.prepare_source_values(stmt, |b, chain, value| {
             b.rewrite(chain, None, value, &mut Rewritten::default())
         })?;
-        let mut read_as = FxHashMap::default();
+        let mut read_as = KeyMap::default();
         parts.read_as(schema, &mut read_as);
         let own = CompileContext::bound(registry)
             .with_prepared_subqueries()
@@ -9771,7 +9767,7 @@ impl PreparedGrouped {
         // A grouped SELECT item or GROUP BY expression holding a subquery is
         // rewritten where it is written; a SELECT item or HAVING written as
         // one reads the first of that identity
-        let mut items = FxHashMap::default();
+        let mut items = KeyMap::default();
         let mut grouped = vec![None; stmt.columns.len()];
         for ((column, &key), slot) in stmt.columns.iter().zip(&keys).zip(&mut grouped) {
             if key {
@@ -10006,7 +10002,7 @@ impl PreparedGrouped {
             .iter()
             .map(|(slot, value)| compile_with(&values, value).map(|p| (*slot, p)))
             .collect::<Result<Vec<_>>>()?;
-        let mut read_as = FxHashMap::default();
+        let mut read_as = KeyMap::default();
         if let Some(parts) = &where_parts {
             parts.read_as(&schema, &mut read_as);
         }
@@ -10098,7 +10094,7 @@ impl PreparedGrouped {
         // Each value of the group a late key or its blocks read that is no
         // SELECT item, which the run's row then holds in a column of its own;
         // added before any hole counts its aggregates
-        let mut group_reads: FxHashMap<ExprKey, u16> = FxHashMap::default();
+        let mut group_reads: KeyMap<ExprKey, u16> = KeyMap::default();
         if !late.is_empty() {
             let mut read = |expr: &Expression| -> Result<()> {
                 let key = ExprKey::of(expr);
@@ -10867,7 +10863,7 @@ impl PreparedDml {
             }
             returning_parts = Some(values);
         }
-        let mut read_as = FxHashMap::default();
+        let mut read_as = KeyMap::default();
         if let Some(parts) = &where_parts {
             parts.read_as(schema, &mut read_as);
         }
@@ -11461,7 +11457,7 @@ impl JoinBlocks {
                 &mut Rewritten::default(),
                 &mut run_slots,
             )?;
-            let mut read_as = FxHashMap::default();
+            let mut read_as = KeyMap::default();
             parts.read_as(schema, &mut read_as);
             let own = CompileContext::bound(registry)
                 .with_prepared_subqueries()
@@ -15171,7 +15167,7 @@ fn over_items(
     expr: &Expression,
     chain: &Chain<'_>,
     item_of: &dyn Fn(usize, &Expression) -> Option<usize>,
-    slots: Option<&FxHashMap<ExprKey, usize>>,
+    slots: Option<&KeyMap<ExprKey, usize>>,
 ) -> Result<Expression> {
     if let Some(&slot) = slots.and_then(|slots| slots.get(&ExprKey::of(expr))) {
         let name = expr.to_string();
@@ -18683,7 +18679,7 @@ impl PreparedRunner<'_> {
         let candidates = sq.candidates.as_ref().filter(|_| plan.is_none());
         let decided =
             (sq.filter.is_none() && candidates.is_none()) || (bound.is_some() && pushed_whole);
-        let mut groups: FxHashMap<SmallVec<[Value; 1]>, MemberGroup> = FxHashMap::default();
+        let mut groups: KeyMap<SmallVec<[Value; 1]>, MemberGroup> = KeyMap::default();
         'rows: while scanner.next() {
             self.ctx.charge(DeadlineSite::Block, 1)?;
             let row = scanner.row();
@@ -19308,7 +19304,7 @@ impl PreparedRunner<'_> {
         let prefix: Vec<usize> = plan.keys.iter().map(|(own, _, _)| *own).collect();
         let mut groups = grouping.groups(prefix.len(), None)?;
         let mut key = KeyReader::new(grouping, prefix.clone());
-        let mut failed: FxHashMap<SmallVec<[Value; 1]>, Error> = FxHashMap::default();
+        let mut failed: KeyMap<SmallVec<[Value; 1]>, Error> = KeyMap::default();
         'rows: while scanner.next() {
             self.ctx.charge(DeadlineSite::Block, 1)?;
             let row = scanner.row();
@@ -19344,7 +19340,7 @@ impl PreparedRunner<'_> {
         if let Some(err) = scanner.err() {
             return Err(err.clone());
         }
-        let mut by_key: FxHashMap<SmallVec<[Value; 1]>, Result<Vec<Row>>> = FxHashMap::default();
+        let mut by_key: KeyMap<SmallVec<[Value; 1]>, Result<Vec<Row>>> = KeyMap::default();
         // A group's error belongs to its key alone
         for group in groups.into_group_results()? {
             match group {

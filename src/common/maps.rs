@@ -34,6 +34,15 @@ pub type I64Map<V> = crate::common::i64_map::I64Map<V>;
 /// Note: i64::MIN cannot be used (reserved as empty sentinel).
 pub type I64Set = crate::common::i64_map::I64Set;
 
+/// Builds the engine's hasher, see [`crate::common::hash`]
+pub type KeyState = std::hash::BuildHasherDefault<crate::common::hash::KeyHasher>;
+
+/// Hash map for in-memory keys under the engine's hasher
+pub type KeyMap<K, V> = std::collections::HashMap<K, V, KeyState>;
+
+/// Hash set for in-memory keys under the engine's hasher
+pub type KeySet<K> = std::collections::HashSet<K, KeyState>;
+
 /// Fast hash map for String keys
 ///
 /// Uses AHash which provides ~10% faster lookups than FxHash for String keys

@@ -305,7 +305,7 @@ pub enum Op {
     // =========================================================================
     // SET OPERATIONS
     // =========================================================================
-    /// IN set membership (pre-built FxHashSet for fast lookups)
+    /// IN set membership (pre-built KeySet for fast lookups)
     /// Stack: `[value] -> [bool]`
     InSet(CompactArc<PredicateSet>),
 

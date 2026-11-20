@@ -17,7 +17,7 @@
 //! Provides transaction semantics with two-phase commit protocol.
 //!
 
-use rustc_hash::FxHashMap;
+use crate::common::KeyMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -75,7 +75,7 @@ pub struct MvccTransaction {
     /// Transaction state
     state: TransactionState,
     /// Tables accessed in this transaction
-    tables: FxHashMap<String, Box<dyn Table>>,
+    tables: KeyMap<String, Box<dyn Table>>,
     /// Transaction-specific isolation level (if different from engine default)
     isolation_level: Option<IsolationLevel>,
     /// Reference to the transaction registry
@@ -323,7 +323,7 @@ impl MvccTransaction {
         Self {
             id,
             state: TransactionState::Active,
-            tables: FxHashMap::default(),
+            tables: KeyMap::default(),
             isolation_level: None,
             registry,
             begin_seq,

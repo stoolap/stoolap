@@ -18,8 +18,8 @@
 
 use std::hash::{Hash, Hasher};
 
+use crate::common::KeyHasher;
 use hashbrown::HashTable;
-use rustc_hash::FxHasher;
 
 use crate::common::{CompactVec, I64Map};
 use crate::core::value::NULL_VALUE;
@@ -163,7 +163,7 @@ impl GroupKey for ColumnsKey<'_> {
 /// hashes its bytes; every other value hashes as `Value` does
 #[inline(always)]
 fn hash_key<K: GroupKey + ?Sized>(key: &K) -> u64 {
-    let mut hasher = FxHasher::default();
+    let mut hasher = KeyHasher::default();
     for i in 0..key.width() {
         match key.at(i) {
             Value::Text(text) => text.as_str().hash(&mut hasher),

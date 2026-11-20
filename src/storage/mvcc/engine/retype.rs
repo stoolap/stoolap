@@ -22,6 +22,7 @@ use super::{
     WALOperationType, ALTER_MODIFY_COLUMN,
 };
 use crate::common::{CompactArc, SmartString};
+use crate::common::{KeyMap, KeySet};
 use crate::core::{DataType, Error, Result, Schema, Value};
 use crate::storage::mvcc::version_store::HotCast;
 use crate::storage::traits::Index;
@@ -30,7 +31,6 @@ use crate::storage::volume::secondary::IndexFile;
 use crate::storage::volume::side_index::{kind_for, Component, Domain, SideTarget};
 use crate::storage::volume::writer::{self, ColumnMapping, FrozenVolume};
 use parking_lot::RwLock;
-use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -47,11 +47,11 @@ pub struct ColumnTypeChange<'a> {
 /// What a change reads and writes of the engine, shared by the engine and
 /// a transaction's engine operations
 pub(super) struct Shared<'a> {
-    pub version_stores: &'a RwLock<FxHashMap<String, Arc<VersionStore>>>,
-    pub segment_managers: &'a RwLock<FxHashMap<String, Arc<SegmentManager>>>,
+    pub version_stores: &'a RwLock<KeyMap<String, Arc<VersionStore>>>,
+    pub segment_managers: &'a RwLock<KeyMap<String, Arc<SegmentManager>>>,
     pub persistence: &'a Option<PersistenceManager>,
     pub registry: &'a TransactionRegistry,
-    pub schemas: &'a RwLock<FxHashMap<String, CompactArc<Schema>>>,
+    pub schemas: &'a RwLock<KeyMap<String, CompactArc<Schema>>>,
     pub ddl: &'a DdlShared,
     /// WAL replay applies the change to the hot rows only, with no record:
     /// the volumes are repaired once the log is replayed
@@ -662,7 +662,7 @@ fn validate(
     if !wanted.contains(&column) {
         wanted.push(column);
     }
-    let mut seen = FxHashSet::default();
+    let mut seen = KeySet::default();
     for &seg_id in snapshot.seg_ids.iter().rev() {
         let Some((volume, mapping, dead, nulled)) =
             sealed_input(mgr, &snapshot, cold, seg_id, schema, &dropped, &renames)?
@@ -748,7 +748,7 @@ fn sealed_input<'c>(
 
 /// A unique index's name, its columns, and each key seen with the row
 /// holding it
-type SeenKeys = (String, Vec<usize>, FxHashMap<Vec<Value>, i64>);
+type SeenKeys = (String, Vec<usize>, KeyMap<Vec<Value>, i64>);
 
 /// The keys of each unique index over the changed column, a key seen twice
 /// refusing the change
@@ -768,7 +768,7 @@ impl UniqueKeys {
             })
             .map(|index| {
                 let columns = index.column_ids().iter().map(|&id| id as usize).collect();
-                (index.name().to_string(), columns, FxHashMap::default())
+                (index.name().to_string(), columns, KeyMap::default())
             })
             .collect();
         Self { indexes }

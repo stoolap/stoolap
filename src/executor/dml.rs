@@ -22,6 +22,7 @@
 use crate::common::names::eq_names;
 use crate::common::CompactArc;
 use crate::common::I64Set;
+use crate::common::KeyMap;
 use crate::common::SmartString;
 use crate::core::integer::integer_neg;
 use crate::core::{DataType, Error, Result, Row, RowVec, Schema, Value, ROWID_SLOT};
@@ -30,7 +31,6 @@ use crate::storage::expression::{ComparisonExpr, Expression as StorageExpr};
 use crate::storage::mvcc::version_store::LayoutToken;
 use crate::storage::traits::transaction::StatementTable;
 use crate::storage::traits::{Engine, QueryResult, ScanAccess, Table, Transaction};
-use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::sync::Arc;
 
@@ -121,7 +121,7 @@ fn conflict_matches_target(conflict_target: &[Identifier], schema: &Schema, erro
     }
 
     // Build normalized set of target column names
-    let target_set: rustc_hash::FxHashSet<&str> = conflict_target
+    let target_set: crate::common::KeySet<&str> = conflict_target
         .iter()
         .map(|id| id.value_lower.as_str())
         .collect();
@@ -129,7 +129,7 @@ fn conflict_matches_target(conflict_target: &[Identifier], schema: &Schema, erro
     match error {
         Error::PrimaryKeyConstraint { .. } => {
             // Collect PK column names from schema
-            let pk_cols: rustc_hash::FxHashSet<&str> = schema
+            let pk_cols: crate::common::KeySet<&str> = schema
                 .columns
                 .iter()
                 .filter(|c| c.primary_key)
@@ -301,7 +301,7 @@ impl InsertPrograms {
         let (default_values, default_programs) = build_default_slots(schema);
         let mut values = Vec::new();
         let mut programs = Vec::new();
-        let mut seen = FxHashMap::default();
+        let mut seen = KeyMap::default();
         for (row, value_row) in stmt.values.iter().enumerate() {
             for (at, expr) in value_row.iter().enumerate() {
                 if matches!(expr, Expression::Default(_) | Expression::Parameter(_))
@@ -2608,7 +2608,7 @@ impl Executor {
                         .get(fk.referenced_column.to_lowercase().as_str())
                         .copied()
                 })
-                .collect::<rustc_hash::FxHashSet<usize>>()
+                .collect::<crate::common::KeySet<usize>>()
                 .into_iter()
                 .collect()
         } else {
@@ -2617,11 +2617,11 @@ impl Executor {
 
         // Pre-partition FKs by referenced column index for post-update dispatch.
         // This avoids re-borrowing schema after table.update().
-        let fks_by_ref_col: FxHashMap<usize, Vec<(String, crate::core::ForeignKeyConstraint)>> =
+        let fks_by_ref_col: KeyMap<usize, Vec<(String, crate::core::ForeignKeyConstraint)>> =
             if !referencing_fks_for_update.is_empty() {
                 let col_map = schema.column_index_map();
-                let mut map: FxHashMap<usize, Vec<(String, crate::core::ForeignKeyConstraint)>> =
-                    FxHashMap::default();
+                let mut map: KeyMap<usize, Vec<(String, crate::core::ForeignKeyConstraint)>> =
+                    KeyMap::default();
                 for (tbl, fk) in referencing_fks_for_update.iter() {
                     if let Some(&idx) = col_map.get(fk.referenced_column.to_lowercase().as_str()) {
                         map.entry(idx).or_default().push((tbl.clone(), fk.clone()));
@@ -2629,7 +2629,7 @@ impl Executor {
                 }
                 map
             } else {
-                FxHashMap::default()
+                KeyMap::default()
             };
 
         // Create a setter function that applies updates using pre-computed indices
@@ -2917,7 +2917,7 @@ impl Executor {
         if !fks_by_ref_col.is_empty() {
             // Each column's changes cascade together, so a child row is
             // matched by the value the statement found, once
-            let mut by_column: FxHashMap<usize, Vec<(Value, Value)>> = FxHashMap::default();
+            let mut by_column: KeyMap<usize, Vec<(Value, Value)>> = KeyMap::default();
             let restricted: Vec<usize> = fks_by_ref_col
                 .iter()
                 .filter(|(_, fks)| super::foreign_key::fk_tree_needs_precheck(&self.engine, fks))
@@ -3226,7 +3226,7 @@ impl Executor {
                 .collect();
             let mut fk_values: Vec<Vec<Value>> = vec![Vec::new(); fk_columns.len()];
             // Each row's place in `fk_values`, to find whether it changed
-            let mut fk_places: FxHashMap<i64, usize> = FxHashMap::default();
+            let mut fk_places: KeyMap<i64, usize> = KeyMap::default();
             let mut collect = |row_id: i64, row: &Row| {
                 if has_referencing_fks {
                     fk_places.insert(row_id, fk_places.len());
@@ -3339,7 +3339,7 @@ impl Executor {
                 .map(|run| run.context(&no_row));
             let judge_widens = dml_run.as_ref().is_some_and(|r| r.widens());
             let whole_storage = where_expr.as_deref().filter(|_| !needs_memory_filter);
-            let mut returned: FxHashMap<i64, Row> = FxHashMap::default();
+            let mut returned: KeyMap<i64, Row> = KeyMap::default();
             let mut judge = |row_id: i64, row: &Row| -> Result<bool> {
                 let widened;
                 let row = match judge_widens {
@@ -3826,8 +3826,8 @@ impl Executor {
         // foreign key moved, and each value a child references that it gave up
         let referencing =
             super::foreign_key::find_referencing_fks(&self.engine, &schema.table_name);
-        let mut fks_by_ref_col: FxHashMap<usize, Vec<(String, crate::core::ForeignKeyConstraint)>> =
-            FxHashMap::default();
+        let mut fks_by_ref_col: KeyMap<usize, Vec<(String, crate::core::ForeignKeyConstraint)>> =
+            KeyMap::default();
         for (child, fk) in referencing.iter() {
             if let Some(idx) = schema.get_column_index(&fk.referenced_column) {
                 fks_by_ref_col

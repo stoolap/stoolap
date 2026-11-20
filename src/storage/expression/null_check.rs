@@ -17,7 +17,7 @@
 
 use std::any::Any;
 
-use rustc_hash::FxHashMap;
+use crate::common::KeyMap;
 
 use super::{find_column_index, resolve_alias, Expression};
 use crate::core::{Result, Row, Schema};
@@ -36,7 +36,7 @@ pub struct NullCheckExpr {
     col_index: Option<usize>,
 
     /// Column aliases
-    aliases: FxHashMap<String, String>,
+    aliases: KeyMap<String, String>,
     /// Original column name if using alias
     original_column: Option<String>,
 }
@@ -48,7 +48,7 @@ impl NullCheckExpr {
             column: column.into(),
             is_null,
             col_index: None,
-            aliases: FxHashMap::default(),
+            aliases: KeyMap::default(),
             original_column: None,
         }
     }
@@ -99,7 +99,7 @@ impl Expression for NullCheckExpr {
         self.is_null == value_is_null
     }
 
-    fn with_aliases(&self, aliases: &FxHashMap<String, String>) -> Box<dyn Expression> {
+    fn with_aliases(&self, aliases: &KeyMap<String, String>) -> Box<dyn Expression> {
         let resolved = resolve_alias(&self.column, aliases);
         let mut expr = self.clone();
 
@@ -240,7 +240,7 @@ mod tests {
         let schema = test_schema();
         let row = Row::from_values(vec![Value::integer(1), Value::null(DataType::Text)]);
 
-        let mut aliases = FxHashMap::default();
+        let mut aliases = KeyMap::default();
         aliases.insert("n".to_string(), "name".to_string());
 
         let expr = NullCheckExpr::is_null("n");

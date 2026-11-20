@@ -2338,7 +2338,7 @@ impl VolumeMeta {
     }
 }
 
-type UniqueIndexMap = rustc_hash::FxHashMap<Vec<usize>, Arc<Vec<(u64, u32)>>>;
+type UniqueIndexMap = crate::common::KeyMap<Vec<usize>, Arc<Vec<(u64, u32)>>>;
 
 /// A volume's unique indexes and the last eviction pass a lookup used
 /// them in, shared by every form of the volume
@@ -3888,7 +3888,7 @@ impl VolumeBuilder {
                 group_rows: super::column::ROW_GROUP_SIZE,
                 file_identity: std::sync::OnceLock::new(),
             }),
-            unique_indices: Arc::new(UniqueIndexes::new(rustc_hash::FxHashMap::default())),
+            unique_indices: Arc::new(UniqueIndexes::new(crate::common::KeyMap::default())),
             last_access_epoch: std::sync::atomic::AtomicU64::new(
                 GLOBAL_EVICTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed),
             ),

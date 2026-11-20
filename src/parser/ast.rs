@@ -18,8 +18,8 @@
 //! and expressions.
 
 use super::token::{Position, Token, TokenType};
+use crate::common::KeyMap;
 use crate::common::SmartString;
-use rustc_hash::FxHashMap;
 use std::fmt;
 
 use crate::common::CompactArc;
@@ -2353,7 +2353,7 @@ impl GroupByClause {
     /// GROUPING SETS of `sets`, its `columns` the sets' distinct expressions
     /// in the order they first appear, as ROLLUP and CUBE hold theirs
     pub fn grouping_sets(sets: Vec<Vec<Expression>>) -> Self {
-        let mut seen = rustc_hash::FxHashSet::default();
+        let mut seen = crate::common::KeySet::default();
         let columns = sets
             .iter()
             .flatten()
@@ -2567,7 +2567,7 @@ pub struct UpdateStatement {
     /// As on [`SelectStatement`]
     pub param_count: usize,
     pub table_name: Identifier,
-    pub updates: FxHashMap<SmartString, Expression>,
+    pub updates: KeyMap<SmartString, Expression>,
     pub where_clause: Option<Box<Expression>>,
     /// RETURNING clause expressions
     pub returning: Vec<Expression>,

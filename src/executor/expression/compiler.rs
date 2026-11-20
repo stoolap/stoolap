@@ -29,7 +29,7 @@ use std::sync::Arc;
 use crate::common::CompactArc;
 use crate::common::SmartString;
 use crate::common::StringMap;
-use rustc_hash::{FxHashMap, FxHashSet};
+use crate::common::{KeyMap, KeySet};
 
 use super::ops::{CompareOp, IntervalStep, Op, QuantifiedMembers};
 use super::program::{Program, ProgramBuilder};
@@ -167,22 +167,22 @@ pub struct CompileContext<'a> {
     columns2: Option<StringMap<u16>>,
 
     /// Tables that belong to row2 (for tracking which tables are from second row)
-    row2_tables: FxHashSet<String>,
+    row2_tables: KeySet<String>,
 
     /// Function registry
     functions: &'a FunctionRegistry,
 
     /// The aggregated row's slot of each group item and aggregate, by identity
-    expression_aliases: FxHashMap<ExprKey, u16>,
+    expression_aliases: KeyMap<ExprKey, u16>,
 
     /// A prepared plan compiles: a subquery mark compiles to its block's id
     prepared_subqueries: bool,
 
     /// Identifiers read from the second row at a fixed position, by node address
-    row2_bindings: Option<&'a FxHashMap<usize, u16>>,
+    row2_bindings: Option<&'a KeyMap<usize, u16>>,
 
     /// Values read as the type of the column they are compared with, by node address
-    read_as: Option<&'a FxHashMap<usize, DataType>>,
+    read_as: Option<&'a KeyMap<usize, DataType>>,
 
     /// The parameters of the one execution the program serves, which folding reads
     params: Option<&'a [Value]>,
@@ -225,9 +225,9 @@ impl<'a> CompileContext<'a> {
             columns: col_map,
             qualified_columns: qualified_map,
             columns2: None,
-            row2_tables: FxHashSet::default(),
+            row2_tables: KeySet::default(),
             functions,
-            expression_aliases: FxHashMap::default(),
+            expression_aliases: KeyMap::default(),
             prepared_subqueries: false,
             row2_bindings: None,
             read_as: None,
@@ -288,7 +288,7 @@ impl<'a> CompileContext<'a> {
     }
 
     /// Add expression aliases (for HAVING clause)
-    pub(crate) fn with_expression_aliases(mut self, aliases: FxHashMap<ExprKey, u16>) -> Self {
+    pub(crate) fn with_expression_aliases(mut self, aliases: KeyMap<ExprKey, u16>) -> Self {
         self.expression_aliases = aliases;
         self
     }
@@ -302,14 +302,14 @@ impl<'a> CompileContext<'a> {
 
     /// Compile each listed identifier node to the second row's column at
     /// its position, whatever its name; other names resolve as usual
-    pub fn with_row2_bindings(mut self, bindings: &'a FxHashMap<usize, u16>) -> Self {
+    pub fn with_row2_bindings(mut self, bindings: &'a KeyMap<usize, u16>) -> Self {
         self.row2_bindings = Some(bindings);
         self
     }
 
     /// Read each listed expression node's value as the type the scan reads
     /// a value compared with a column of that type as
-    pub fn with_read_as(mut self, read_as: &'a FxHashMap<usize, DataType>) -> Self {
+    pub fn with_read_as(mut self, read_as: &'a KeyMap<usize, DataType>) -> Self {
         self.read_as = Some(read_as);
         self
     }
@@ -2527,7 +2527,7 @@ mod tests {
             let Expression::Infix(infix) = &expr else {
                 panic!("{sql} is a comparison");
             };
-            let mut read_as = FxHashMap::default();
+            let mut read_as = KeyMap::default();
             read_as.insert(
                 &*infix.right as *const Expression as usize,
                 DataType::Integer,
@@ -2556,7 +2556,7 @@ mod tests {
             "ts = CAST('12' || ':00' AS TIMESTAMP)",
         ] {
             let expr = parse(sql);
-            let mut read_as = FxHashMap::default();
+            let mut read_as = KeyMap::default();
             let mut mark = |e: &Expression| {
                 read_as.insert(e as *const Expression as usize, DataType::Timestamp);
             };

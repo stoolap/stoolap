@@ -41,8 +41,8 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 
 use crate::api::params::ParamVec;
+use crate::common::KeyMap;
 use crate::common::{CompactArc, SmartString};
-use rustc_hash::FxHashMap;
 
 use crate::parser::ast::{ParamSlots, SelectStatement, Statement, WithClause};
 use crate::storage::mvcc::version_store::LayoutToken;
@@ -478,8 +478,8 @@ pub struct CachedQueryPlan {
 /// Provides thread-safe caching of parsed SQL queries to avoid
 /// the overhead of parsing the same query multiple times.
 pub struct QueryCache {
-    /// Cached plans indexed by normalized query text (FxHash for fast string hashing)
-    plans: RwLock<FxHashMap<SmartString, TextPlan>>,
+    /// Cached plans indexed by normalized query text
+    plans: RwLock<KeyMap<SmartString, TextPlan>>,
     /// Maximum number of cached plans
     max_size: usize,
     /// Factor to determine how many plans to prune when cache is full (0.0-1.0)
@@ -533,7 +533,7 @@ impl QueryCache {
     pub fn new(max_size: usize) -> Self {
         let capacity = std::num::NonZeroUsize::new(max_size).unwrap_or(std::num::NonZeroUsize::MIN);
         Self {
-            plans: RwLock::new(FxHashMap::default()),
+            plans: RwLock::new(KeyMap::default()),
             max_size,
             prune_factor: 0.2, // Prune 20% of entries when cache is full
             statements: parking_lot::Mutex::new(StatementPlans {
@@ -725,7 +725,7 @@ impl QueryCache {
     }
 
     /// Prune the least recently used entries when the cache is full
-    fn prune_cache(&self, plans: &mut FxHashMap<SmartString, TextPlan>) {
+    fn prune_cache(&self, plans: &mut KeyMap<SmartString, TextPlan>) {
         // Calculate how many entries to remove
         let num_to_remove = ((self.max_size as f64) * self.prune_factor).ceil() as usize;
         let num_to_remove = num_to_remove.max(1);

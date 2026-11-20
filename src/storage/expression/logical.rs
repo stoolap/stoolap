@@ -17,7 +17,7 @@
 
 use std::any::Any;
 
-use rustc_hash::FxHashMap;
+use crate::common::KeyMap;
 
 use super::Expression;
 use crate::core::{Result, Row, Schema};
@@ -119,7 +119,7 @@ impl Expression for AndExpr {
         any_unknown
     }
 
-    fn with_aliases(&self, aliases: &FxHashMap<String, String>) -> Box<dyn Expression> {
+    fn with_aliases(&self, aliases: &KeyMap<String, String>) -> Box<dyn Expression> {
         let aliased_exprs: Vec<Box<dyn Expression>> = self
             .expressions
             .iter()
@@ -222,7 +222,7 @@ impl Expression for OrExpr {
         any_unknown
     }
 
-    fn with_aliases(&self, aliases: &FxHashMap<String, String>) -> Box<dyn Expression> {
+    fn with_aliases(&self, aliases: &KeyMap<String, String>) -> Box<dyn Expression> {
         let aliased_exprs: Vec<Box<dyn Expression>> = self
             .expressions
             .iter()
@@ -307,7 +307,7 @@ impl Expression for NotExpr {
         !self.inner.evaluate_fast(row)
     }
 
-    fn with_aliases(&self, aliases: &FxHashMap<String, String>) -> Box<dyn Expression> {
+    fn with_aliases(&self, aliases: &KeyMap<String, String>) -> Box<dyn Expression> {
         Box::new(NotExpr::new(self.inner.with_aliases(aliases)))
     }
 
@@ -376,7 +376,7 @@ impl Expression for ConstBoolExpr {
         self.value
     }
 
-    fn with_aliases(&self, _aliases: &FxHashMap<String, String>) -> Box<dyn Expression> {
+    fn with_aliases(&self, _aliases: &KeyMap<String, String>) -> Box<dyn Expression> {
         Box::new(self.clone())
     }
 
@@ -605,7 +605,7 @@ mod tests {
         let schema = test_schema();
         let row = test_row();
 
-        let mut aliases = FxHashMap::default();
+        let mut aliases = KeyMap::default();
         aliases.insert("i".to_string(), "id".to_string());
         aliases.insert("n".to_string(), "name".to_string());
 

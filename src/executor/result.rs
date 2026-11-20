@@ -17,9 +17,9 @@
 //! This module provides result types for SQL query execution.
 
 use crate::common::CompactArc;
+use crate::common::{KeyHasher, KeyMap};
 use crate::core::{Result, Row, RowVec, Value};
 use crate::storage::traits::QueryResult;
-use rustc_hash::{FxHashMap, FxHasher};
 
 use super::expression::RowFilter;
 use super::projection::Projection;
@@ -1121,21 +1121,21 @@ pub(crate) struct DistinctRows {
     distinct_column_count: usize,
     /// Seen rows for deduplication: hash -> list of row values (for collision handling)
     /// We only store the distinct columns, not the full row
-    seen: FxHashMap<u64, Vec<Vec<Value>>>,
+    seen: KeyMap<u64, Vec<Vec<Value>>>,
 }
 
 impl DistinctRows {
     pub(crate) fn new(distinct_column_count: usize) -> Self {
         Self {
             distinct_column_count,
-            seen: FxHashMap::default(),
+            seen: KeyMap::default(),
         }
     }
 
     /// Whether `row` is the first row with its values, kept as seen if so
     pub(crate) fn is_new(&mut self, row: &Row) -> bool {
         use std::hash::{Hash, Hasher};
-        let mut hasher = FxHasher::default();
+        let mut hasher = KeyHasher::default();
         for value in row.iter().take(self.distinct_column_count) {
             value.hash(&mut hasher);
         }
@@ -1265,7 +1265,7 @@ pub struct DistinctOnResult {
     /// Column indices that form the DISTINCT ON key
     key_indices: Vec<usize>,
     /// Seen keys: hash -> list of key values (for collision handling)
-    seen: FxHashMap<u64, Vec<Vec<Value>>>,
+    seen: KeyMap<u64, Vec<Vec<Value>>>,
     current_row: Row,
     has_current: bool,
 }
@@ -1277,7 +1277,7 @@ impl DistinctOnResult {
             inner,
             columns,
             key_indices,
-            seen: FxHashMap::default(),
+            seen: KeyMap::default(),
             current_row: Row::new(),
             has_current: false,
         }
@@ -1292,7 +1292,7 @@ impl DistinctOnResult {
 
     fn hash_key_from_row(&self, row: &Row) -> u64 {
         use std::hash::{Hash, Hasher};
-        let mut hasher = FxHasher::default();
+        let mut hasher = KeyHasher::default();
         for &i in &self.key_indices {
             match row.get(i) {
                 Some(v) => v.hash(&mut hasher),
@@ -1381,7 +1381,7 @@ pub struct AliasedResult {
 
 impl AliasedResult {
     /// Create a new aliased result
-    pub fn new(inner: Box<dyn QueryResult>, aliases: FxHashMap<String, String>) -> Self {
+    pub fn new(inner: Box<dyn QueryResult>, aliases: KeyMap<String, String>) -> Self {
         let original_columns = inner.columns().to_vec();
         let aliased_columns = original_columns
             .iter()
@@ -2005,7 +2005,7 @@ mod tests {
 
         let inner = Box::new(ExecutorResult::new(columns, rows));
 
-        let mut aliases = FxHashMap::default();
+        let mut aliases = KeyMap::default();
         aliases.insert("user_name".to_string(), "name".to_string());
 
         let mut result = AliasedResult::new(inner, aliases);

@@ -28,8 +28,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::common::{KeyMap, KeySet};
 use parking_lot::RwLock;
-use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::storage::mvcc::next_write_order;
 use crate::storage::mvcc::version_store::EVERY_WRITE;
@@ -223,8 +223,8 @@ fn clear_dead(bits: &mut [u64], dead: &[u32]) {
 /// Captured segments keep their file owners alive across compaction.
 pub struct ColdSnapshot {
     pub seg_ids: smallvec::SmallVec<[u64; 4]>,
-    pub segs: Arc<FxHashMap<u64, ColdSegment>>,
-    pub ts: Arc<FxHashMap<i64, u64>>,
+    pub segs: Arc<KeyMap<u64, ColdSegment>>,
+    pub ts: Arc<KeyMap<i64, u64>>,
 }
 
 impl ColdSnapshot {
@@ -313,10 +313,10 @@ pub struct TableManifest {
     /// Per segment, the sorted positions of copies a seal built that never
     /// got authority: no reader sees them. Absent for a fully authoritative
     /// segment, and gone with the segment.
-    pub dead_copies: FxHashMap<u64, Arc<[u32]>>,
+    pub dead_copies: KeyMap<u64, Arc<[u32]>>,
     /// Per segment, the identity of the V5 file it was written to (V8); an
     /// open refuses a file that is not that one
-    pub identities: FxHashMap<u64, super::writer::FileIdentity>,
+    pub identities: KeyMap<u64, super::writer::FileIdentity>,
 }
 
 impl TableManifest {
@@ -329,8 +329,8 @@ impl TableManifest {
             checkpoint_lsn: 0,
             column_renames: Vec::new(),
             dropped_columns: Vec::new(),
-            dead_copies: FxHashMap::default(),
-            identities: FxHashMap::default(),
+            dead_copies: KeyMap::default(),
+            identities: KeyMap::default(),
         }
     }
 
@@ -349,14 +349,14 @@ impl TableManifest {
 
     /// Remove segments by ID (after compaction).
     pub fn remove_segments(&mut self, ids: &[u64]) {
-        let id_set: FxHashSet<u64> = ids.iter().copied().collect();
+        let id_set: KeySet<u64> = ids.iter().copied().collect();
         self.segments.retain(|s| !id_set.contains(&s.segment_id));
         self.dead_copies.retain(|id, _| !id_set.contains(id));
     }
 
     /// Serialize the manifest with the table's committed tombstones, as
     /// (row_id, commit_seq), to bytes (V6 format).
-    pub fn serialize(&self, tombstones: &FxHashMap<i64, u64>) -> io::Result<Vec<u8>> {
+    pub fn serialize(&self, tombstones: &KeyMap<i64, u64>) -> io::Result<Vec<u8>> {
         let mut buf = Vec::with_capacity(256);
 
         // Header
@@ -513,7 +513,7 @@ impl TableManifest {
         // variable-length path
         let seg_count = read_u32(data, &mut pos)? as usize;
         let mut segments = Vec::with_capacity(seg_count);
-        let mut identities = FxHashMap::default();
+        let mut identities = KeyMap::default();
         for _ in 0..seg_count {
             let entry = if version >= MANIFEST_VERSION {
                 read_u32(data, &mut pos)? as usize
@@ -671,7 +671,7 @@ impl TableManifest {
         }
 
         // Dead copies: from V7; a V6 manifest's segments are fully authoritative
-        let mut dead_copies: FxHashMap<u64, Arc<[u32]>> = FxHashMap::default();
+        let mut dead_copies: KeyMap<u64, Arc<[u32]>> = KeyMap::default();
         if version >= MANIFEST_VERSION_V7 {
             let count = read_u32(data, &mut pos)? as usize;
             for _ in 0..count {
@@ -711,7 +711,7 @@ impl TableManifest {
 
     /// Write the manifest with the table's committed tombstones to disk
     /// atomically.
-    pub fn write_to_disk(&self, path: &Path, tombstones: &FxHashMap<i64, u64>) -> Result<()> {
+    pub fn write_to_disk(&self, path: &Path, tombstones: &KeyMap<i64, u64>) -> Result<()> {
         let data = self.serialize(tombstones).map_err(|e| {
             crate::core::Error::internal(format!("failed to serialize manifest: {}", e))
         })?;
@@ -798,12 +798,12 @@ fn count_cleanup_visit() {
 /// first searched and copied only when something goes; a map held alone is
 /// walked once. Returns whether anything went.
 fn remove_tombstones_where<I: Iterator<Item = i64>>(
-    ts: &mut Arc<FxHashMap<i64, u64>>,
+    ts: &mut Arc<KeyMap<i64, u64>>,
     candidates_capacity: usize,
     candidates: impl Fn() -> I,
     doomed: impl Fn(i64, u64) -> bool,
 ) -> bool {
-    let hit = |map: &FxHashMap<i64, u64>, rid: i64| {
+    let hit = |map: &KeyMap<i64, u64>, rid: i64| {
         count_cleanup_visit();
         map.get(&rid).is_some_and(|&seq| doomed(rid, seq))
     };
@@ -843,8 +843,8 @@ fn remove_tombstones_where<I: Iterator<Item = i64>>(
 /// manifest: every segment masked by the live copies of the segments after it
 fn compute_visibility_bitmaps(
     seg_order: &[u64],
-    bounds: &rustc_hash::FxHashMap<u64, (i64, i64)>,
-    segments: &mut rustc_hash::FxHashMap<u64, ColdSegment>,
+    bounds: &crate::common::KeyMap<u64, (i64, i64)>,
+    segments: &mut crate::common::KeyMap<u64, ColdSegment>,
 ) {
     mask_segments(seg_order, |_| true, bounds, segments);
 }
@@ -857,8 +857,8 @@ fn compute_visibility_bitmaps(
 fn mask_outputs(
     seg_order: &[u64],
     outputs: &[u64],
-    bounds: &rustc_hash::FxHashMap<u64, (i64, i64)>,
-    segments: &mut rustc_hash::FxHashMap<u64, ColdSegment>,
+    bounds: &crate::common::KeyMap<u64, (i64, i64)>,
+    segments: &mut crate::common::KeyMap<u64, ColdSegment>,
 ) {
     mask_segments(
         seg_order,
@@ -883,8 +883,8 @@ type HeldCopies = Option<(Arc<FrozenVolume>, Option<Arc<[u32]>>)>;
 fn mask_segments(
     seg_order: &[u64],
     target: impl Fn(&u64) -> bool,
-    bounds: &rustc_hash::FxHashMap<u64, (i64, i64)>,
-    segments: &mut rustc_hash::FxHashMap<u64, ColdSegment>,
+    bounds: &crate::common::KeyMap<u64, (i64, i64)>,
+    segments: &mut crate::common::KeyMap<u64, ColdSegment>,
 ) {
     let held: Vec<HeldCopies> = (seg_order.iter())
         .map(|id| (segments.get(id)).map(|cs| (Arc::clone(&cs.volume), cs.dead.clone())))
@@ -1019,7 +1019,7 @@ fn hash_copies(
     older: &[Box<[(i64, i64)]>],
     bits: &mut [Option<Vec<u64>>],
 ) {
-    let mut newer_live: rustc_hash::FxHashSet<i64> = rustc_hash::FxHashSet::default();
+    let mut newer_live: crate::common::KeySet<i64> = crate::common::KeySet::default();
     for (p, held) in held.iter().enumerate().rev() {
         let Some((volume, dead)) = held else {
             continue;
@@ -1133,7 +1133,7 @@ fn within(parts: &[(i64, i64)], id: i64) -> bool {
 /// The id range each manifest entry records, by segment
 fn segment_bounds<'a>(
     metas: impl IntoIterator<Item = &'a SegmentMeta>,
-) -> rustc_hash::FxHashMap<u64, (i64, i64)> {
+) -> crate::common::KeyMap<u64, (i64, i64)> {
     metas
         .into_iter()
         .map(|m| (m.segment_id, (m.min_row_id, m.max_row_id)))
@@ -1145,8 +1145,8 @@ fn segment_bounds<'a>(
 #[cfg(debug_assertions)]
 fn same_as_full_pass(
     seg_order: &[u64],
-    bounds: &rustc_hash::FxHashMap<u64, (i64, i64)>,
-    segments: &rustc_hash::FxHashMap<u64, ColdSegment>,
+    bounds: &crate::common::KeyMap<u64, (i64, i64)>,
+    segments: &crate::common::KeyMap<u64, ColdSegment>,
 ) -> bool {
     let bits_of = |cs: &ColdSegment| match &cs.visible {
         Some(bits) => (**bits).clone(),
@@ -1162,8 +1162,8 @@ fn same_as_full_pass(
 #[cfg(not(debug_assertions))]
 fn same_as_full_pass(
     _: &[u64],
-    _: &rustc_hash::FxHashMap<u64, (i64, i64)>,
-    _: &rustc_hash::FxHashMap<u64, ColdSegment>,
+    _: &crate::common::KeyMap<u64, (i64, i64)>,
+    _: &crate::common::KeyMap<u64, ColdSegment>,
 ) -> bool {
     true
 }
@@ -1198,8 +1198,8 @@ fn search_cost(n: usize) -> usize {
 /// walked; no order is decided. Tombstones too many, or a map too sparse, to
 /// search or sort out cheaper walk them all
 fn tombstoned_visible(
-    segments: &FxHashMap<u64, ColdSegment>,
-    tombstones: &FxHashMap<i64, u64>,
+    segments: &KeyMap<u64, ColdSegment>,
+    tombstones: &KeyMap<i64, u64>,
     bounds: &[(u64, i64, i64)],
 ) -> usize {
     let rows: usize = segments.values().map(|cs| cs.volume.meta.row_count).sum();
@@ -1262,8 +1262,8 @@ fn tombstoned_visible(
 #[cfg(debug_assertions)]
 fn same_as_walk(
     count: usize,
-    segments: &FxHashMap<u64, ColdSegment>,
-    tombstones: &FxHashMap<i64, u64>,
+    segments: &KeyMap<u64, ColdSegment>,
+    tombstones: &KeyMap<i64, u64>,
 ) -> bool {
     let walked: usize = segments
         .values()
@@ -1279,7 +1279,7 @@ fn same_as_walk(
 }
 
 #[cfg(not(debug_assertions))]
-fn same_as_walk(_: usize, _: &FxHashMap<u64, ColdSegment>, _: &FxHashMap<i64, u64>) -> bool {
+fn same_as_walk(_: usize, _: &KeyMap<u64, ColdSegment>, _: &KeyMap<i64, u64>) -> bool {
     true
 }
 
@@ -1332,7 +1332,7 @@ fn mask_shared_ids(
     } else if old.meta.row_order.get().is_none() {
         // Locating in a volume whose order is not decided yet would sort it
         // and keep the permutation, so its ids are walked against a set
-        let shared: rustc_hash::FxHashSet<i64> = new
+        let shared: crate::common::KeySet<i64> = new
             .meta
             .row_ids
             .iter()
@@ -1374,7 +1374,7 @@ fn unmask_dead_ids(hidden: &[(i64, u32)], bits: &mut [u64], dead_ids: &[i64]) {
 /// with the bitmap it replaces
 fn visibility_changes(
     order: impl Iterator<Item = (u64, i64, i64)>,
-    segments: &rustc_hash::FxHashMap<u64, ColdSegment>,
+    segments: &crate::common::KeyMap<u64, ColdSegment>,
     volumes: &[Arc<FrozenVolume>],
 ) -> Vec<VisibilityChange> {
     let mut changes = Vec::new();
@@ -1503,9 +1503,9 @@ impl PreparedReplacement {
 /// A publication built outside the locks: the segments it was built on,
 /// their manifest order then, and the map to swap in
 struct PreparedPublication {
-    snapshot: Arc<FxHashMap<u64, ColdSegment>>,
+    snapshot: Arc<KeyMap<u64, ColdSegment>>,
     order: Vec<u64>,
-    map: FxHashMap<u64, ColdSegment>,
+    map: KeyMap<u64, ColdSegment>,
 }
 
 /// The manifest order after `old` leave and `new` take the first one's place
@@ -1628,9 +1628,9 @@ fn identity_mapping(volume: &FrozenVolume) -> super::writer::ColumnMapping {
 pub struct StatementSnapshot {
     /// Manifest segment ids, newest first, captured with `segs`.
     pub seg_ids_newest_first: Vec<u64>,
-    pub segs: Arc<FxHashMap<u64, ColdSegment>>,
+    pub segs: Arc<KeyMap<u64, ColdSegment>>,
     /// Committed tombstones as of capture.
-    pub tombstones: Arc<FxHashMap<i64, u64>>,
+    pub tombstones: Arc<KeyMap<i64, u64>>,
     /// Whether a captured volume is cold, read with `segs` under one guard
     pub has_cold: bool,
     loads: std::cell::RefCell<StatementLoads>,
@@ -1868,7 +1868,7 @@ pub struct SegmentManager {
     /// writers clone the inner map, modify, and swap the Arc.
     /// The ColumnMapping is computed once at registration and recomputed on ALTER TABLE.
     /// This eliminates per-scan compute_column_mapping overhead and lock contention.
-    segments: RwLock<Arc<FxHashMap<u64, ColdSegment>>>,
+    segments: RwLock<Arc<KeyMap<u64, ColdSegment>>>,
     /// Base directory for volume files (None for memory-only databases).
     volume_dir: Option<PathBuf>,
     /// Fast atomic flag: true if any segments are loaded.
@@ -1886,7 +1886,7 @@ pub struct SegmentManager {
     recluster_done: std::sync::atomic::AtomicU64,
     /// Per segment, the volume columns checked for order and the verdict;
     /// volumes are immutable, so a verdict stands until the segment goes
-    key_order_verdicts: parking_lot::Mutex<FxHashMap<u64, (Vec<usize>, bool)>>,
+    key_order_verdicts: parking_lot::Mutex<KeyMap<u64, (Vec<usize>, bool)>>,
     /// Serializes reload attempts. Concurrent callers block on this mutex
     /// instead of spinning, preventing CPU waste during disk I/O.
     reloading: parking_lot::Mutex<()>,
@@ -1902,7 +1902,7 @@ pub struct SegmentManager {
     /// membership, not mutate. Writers swap the Arc on mutation.
     /// The commit_seq enables snapshot isolation: a snapshot at begin_seq=N
     /// only sees tombstones with commit_seq <= N.
-    tombstones: RwLock<Arc<FxHashMap<i64, u64>>>,
+    tombstones: RwLock<Arc<KeyMap<i64, u64>>>,
     /// Per-transaction pending tombstones: txn_id → list of cold row_ids to tombstone.
     /// Applied to the shared tombstone set on commit, discarded on rollback.
     /// This lives on the SegmentManager (not SegmentedTable) because the commit
@@ -1910,7 +1910,7 @@ pub struct SegmentManager {
     /// access to SegmentedTable state.
     /// Each row_id carries the timestamp it was tombstoned at, so a savepoint
     /// rollback can discard the tombstones made after the savepoint.
-    pending_txn_tombstones: RwLock<FxHashMap<i64, FxHashMap<i64, i64>>>,
+    pending_txn_tombstones: RwLock<KeyMap<i64, KeyMap<i64, i64>>>,
     // Unique constraint checks use per-volume hash indices (on FrozenVolume).
     // No global cache needed. Each volume builds its index lazily on first
     // unique check and never invalidates (volumes are immutable).
@@ -1930,7 +1930,7 @@ pub struct SegmentManager {
     seal_generation: std::sync::atomic::AtomicU64,
     /// Per-txn seal generation at INSERT time. Small map — only active
     /// transactions with pending inserts on this table.
-    txn_seal_gens: parking_lot::Mutex<rustc_hash::FxHashMap<i64, u64>>,
+    txn_seal_gens: parking_lot::Mutex<crate::common::KeyMap<i64, u64>>,
     /// Number of rows currently being sealed (exist in both hot and cold).
     /// Set to N before register_segment, cleared after remove_moved_rows.
     /// Subtracted from row_count() to prevent double-counting during the seal window.
@@ -1966,27 +1966,27 @@ impl SegmentManager {
         Self {
             table_name: RwLock::new(SmartString::from(table_name)),
             manifest: RwLock::new(TableManifest::new(table_name)),
-            segments: RwLock::new(Arc::new(FxHashMap::default())),
+            segments: RwLock::new(Arc::new(KeyMap::default())),
             volume_dir,
             has_segments_flag: std::sync::atomic::AtomicBool::new(false),
             has_cold: std::sync::atomic::AtomicBool::new(false),
             unavailable: std::sync::OnceLock::new(),
             recluster_requested: std::sync::atomic::AtomicU64::new(1),
             recluster_done: std::sync::atomic::AtomicU64::new(0),
-            key_order_verdicts: parking_lot::Mutex::new(FxHashMap::default()),
+            key_order_verdicts: parking_lot::Mutex::new(KeyMap::default()),
             current_eviction_epoch: std::sync::atomic::AtomicU64::new(0),
             reloading: parking_lot::Mutex::new(()),
             persisting: parking_lot::Mutex::new(()),
             retired: std::sync::atomic::AtomicBool::new(false),
-            tombstones: RwLock::new(Arc::new(FxHashMap::default())),
+            tombstones: RwLock::new(Arc::new(KeyMap::default())),
             schema_generation: std::sync::atomic::AtomicU64::new(0),
             definition_epoch: std::sync::atomic::AtomicU64::new(0),
-            pending_txn_tombstones: RwLock::new(FxHashMap::default()),
+            pending_txn_tombstones: RwLock::new(KeyMap::default()),
             count_epoch: std::sync::atomic::AtomicU64::new(0),
             cached_count: parking_lot::Mutex::new(None),
             seal_fence: RwLock::new(()),
             seal_generation: std::sync::atomic::AtomicU64::new(0),
-            txn_seal_gens: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
+            txn_seal_gens: parking_lot::Mutex::new(crate::common::KeyMap::default()),
             seal_overlap_count: std::sync::atomic::AtomicUsize::new(0),
             destruction_count: std::sync::atomic::AtomicUsize::new(0),
             destructions_begun: std::sync::atomic::AtomicU64::new(0),
@@ -2005,19 +2005,19 @@ impl SegmentManager {
             tombstones,
         } = stored;
         let table_name = manifest.table_name.clone();
-        let tombstone_map: FxHashMap<i64, u64> = tombstones.into_iter().collect();
+        let tombstone_map: KeyMap<i64, u64> = tombstones.into_iter().collect();
         let trusted = tombstone_map.is_empty();
         Self {
             table_name: RwLock::new(table_name),
             manifest: RwLock::new(manifest),
-            segments: RwLock::new(Arc::new(FxHashMap::default())),
+            segments: RwLock::new(Arc::new(KeyMap::default())),
             volume_dir,
             has_segments_flag: std::sync::atomic::AtomicBool::new(false),
             has_cold: std::sync::atomic::AtomicBool::new(false),
             unavailable: std::sync::OnceLock::new(),
             recluster_requested: std::sync::atomic::AtomicU64::new(1),
             recluster_done: std::sync::atomic::AtomicU64::new(0),
-            key_order_verdicts: parking_lot::Mutex::new(FxHashMap::default()),
+            key_order_verdicts: parking_lot::Mutex::new(KeyMap::default()),
             current_eviction_epoch: std::sync::atomic::AtomicU64::new(0),
             reloading: parking_lot::Mutex::new(()),
             persisting: parking_lot::Mutex::new(()),
@@ -2025,12 +2025,12 @@ impl SegmentManager {
             tombstones: RwLock::new(Arc::new(tombstone_map)),
             schema_generation: std::sync::atomic::AtomicU64::new(0),
             definition_epoch: std::sync::atomic::AtomicU64::new(0),
-            pending_txn_tombstones: RwLock::new(FxHashMap::default()),
+            pending_txn_tombstones: RwLock::new(KeyMap::default()),
             count_epoch: std::sync::atomic::AtomicU64::new(0),
             cached_count: parking_lot::Mutex::new(None),
             seal_fence: RwLock::new(()),
             seal_generation: std::sync::atomic::AtomicU64::new(0),
-            txn_seal_gens: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
+            txn_seal_gens: parking_lot::Mutex::new(crate::common::KeyMap::default()),
             seal_overlap_count: std::sync::atomic::AtomicUsize::new(0),
             destruction_count: std::sync::atomic::AtomicUsize::new(0),
             destructions_begun: std::sync::atomic::AtomicU64::new(0),
@@ -2337,7 +2337,7 @@ impl SegmentManager {
             return;
         }
         let mut segments = self.segments.write();
-        let replaceable = |map: &FxHashMap<u64, ColdSegment>, l: &LoadedVolume| {
+        let replaceable = |map: &KeyMap<u64, ColdSegment>, l: &LoadedVolume| {
             map.get(&l.seg_id).is_some_and(|cs| {
                 cs.volume.is_cold()
                     && match (&cs.file, &l.file) {
@@ -2456,7 +2456,7 @@ impl SegmentManager {
     fn get_authoritative_value(
         &self,
         seg_ids: &[u64],
-        segments: &FxHashMap<u64, ColdSegment>,
+        segments: &KeyMap<u64, ColdSegment>,
         row_id: i64,
         col_idx: usize,
         stmt: Option<&dyn CapturedVolumes>,
@@ -2495,13 +2495,13 @@ impl SegmentManager {
     fn check_value_exists_impl(
         &self,
         seg_ids: &[u64],
-        segs: &FxHashMap<u64, ColdSegment>,
-        ts: &FxHashMap<i64, u64>,
+        segs: &KeyMap<u64, ColdSegment>,
+        ts: &KeyMap<i64, u64>,
         col_idx: usize,
         value: &crate::core::Value,
         stmt: Option<&dyn CapturedVolumes>,
     ) -> crate::core::Result<Option<i64>> {
-        let mut seen = FxHashSet::default();
+        let mut seen = KeySet::default();
 
         for &seg_id in seg_ids {
             let Some(cold) = segs.get(&seg_id) else {
@@ -2631,8 +2631,8 @@ impl SegmentManager {
     fn find_row_id_by_values_impl(
         &self,
         seg_ids: &[u64],
-        segs: &FxHashMap<u64, ColdSegment>,
-        ts: &FxHashMap<i64, u64>,
+        segs: &KeyMap<u64, ColdSegment>,
+        ts: &KeyMap<i64, u64>,
         col_indices: &[usize],
         values: &[&Value],
         column_defaults: &[Value],
@@ -2652,7 +2652,7 @@ impl SegmentManager {
             .collect();
 
         // Track seen row_ids for newest-first dedup across overlapping volumes.
-        let mut seen = FxHashSet::default();
+        let mut seen = KeySet::default();
 
         for &seg_id in seg_ids {
             let Some(cold) = segs.get(&seg_id) else {
@@ -3616,7 +3616,7 @@ impl SegmentManager {
     /// Remove tombstones only for row_ids that were in the compacted volumes.
     /// Used by partial compaction (merging a subset of volumes) where tombstones
     /// for unmerged volumes must remain.
-    pub fn remove_tombstones_for_rows(&self, row_ids: &FxHashSet<i64>) {
+    pub fn remove_tombstones_for_rows(&self, row_ids: &KeySet<i64>) {
         if row_ids.is_empty() {
             return;
         }
@@ -3642,7 +3642,7 @@ impl SegmentManager {
         }
         let _manifest = self.manifest.write();
         let mut ts_guard = self.tombstones.write();
-        let current = |map: &FxHashMap<i64, u64>, &(rid, seq): &(i64, u64)| {
+        let current = |map: &KeyMap<i64, u64>, &(rid, seq): &(i64, u64)| {
             count_cleanup_visit();
             map.get(&rid) == Some(&seq)
         };
@@ -3664,7 +3664,7 @@ impl SegmentManager {
     /// Get an Arc reference to the tombstone map. O(1) — no data clone.
     /// Use this for read-only access (membership checks, iteration).
     /// Keys are row_ids, values are commit_seq (for snapshot filtering).
-    pub fn tombstone_set_arc(&self) -> Arc<FxHashMap<i64, u64>> {
+    pub fn tombstone_set_arc(&self) -> Arc<KeyMap<i64, u64>> {
         Arc::clone(&*self.tombstones.read())
     }
 
@@ -3699,7 +3699,7 @@ impl SegmentManager {
     pub fn insert_pending_tombstones_into(
         &self,
         of: Pending,
-        dest: &mut rustc_hash::FxHashSet<i64>,
+        dest: &mut crate::common::KeySet<i64>,
     ) {
         if let Some(ids) = self.pending_txn_tombstones.read().get(&of.txn_id) {
             for (&id, &at) in ids {
@@ -3723,7 +3723,7 @@ impl SegmentManager {
     }
 
     /// Check if a specific row_id is a pending tombstone for a transaction.
-    /// O(1) with FxHashSet (was O(n) with Vec).
+    /// O(1) with KeySet (was O(n) with Vec).
     pub fn is_pending_tombstone(&self, of: Pending, row_id: i64) -> bool {
         self.pending_txn_tombstones
             .read()
@@ -4342,7 +4342,7 @@ impl SegmentManager {
                 identities,
                 ..
             } = &mut *manifest;
-            let mut recorded = FxHashMap::default();
+            let mut recorded = KeyMap::default();
             recorded.reserve(segments.len());
             for seg in segments.iter() {
                 let identity = identities.get(&seg.segment_id).copied().or_else(|| {
@@ -4481,13 +4481,13 @@ impl SegmentManager {
             {
                 // The cold flag is written with the map it describes
                 let mut segments = self.segments.write();
-                *segments = Arc::new(FxHashMap::default());
+                *segments = Arc::new(KeyMap::default());
                 self.has_cold
                     .store(false, std::sync::atomic::Ordering::Relaxed);
             }
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::segments_clearing();
-            *self.tombstones.write() = Arc::new(FxHashMap::default());
+            *self.tombstones.write() = Arc::new(KeyMap::default());
         }
         self.key_order_verdicts.lock().clear();
         self.invalidate_count();
@@ -4814,7 +4814,7 @@ impl SegmentManager {
     /// Reloads cold volumes first so column data is available.
     /// Does NOT mark volumes as accessed — callers that need eviction
     /// protection should mark the specific volumes they use.
-    pub fn segments_snapshot(&self) -> crate::core::Result<Arc<FxHashMap<u64, ColdSegment>>> {
+    pub fn segments_snapshot(&self) -> crate::core::Result<Arc<KeyMap<u64, ColdSegment>>> {
         self.ensure_columns();
         let segs = Arc::clone(&*self.segments.read());
         if !segs.values().any(|cs| cs.volume.is_cold()) {
@@ -4844,13 +4844,13 @@ impl SegmentManager {
 
     /// Raw CoW snapshot without ensure_columns. Callers that only need
     /// metadata (row_ids, zone maps) use this to avoid reloading cold volumes.
-    pub fn segments_raw(&self) -> Arc<FxHashMap<u64, ColdSegment>> {
+    pub fn segments_raw(&self) -> Arc<KeyMap<u64, ColdSegment>> {
         Arc::clone(&*self.segments.read())
     }
 
     /// Whether the live segment map is still `segs`, as a snapshot took it:
     /// no publication replaced it since, at the moment of the call
-    pub(crate) fn segments_are(&self, segs: &Arc<FxHashMap<u64, ColdSegment>>) -> bool {
+    pub(crate) fn segments_are(&self, segs: &Arc<KeyMap<u64, ColdSegment>>) -> bool {
         Arc::ptr_eq(&*self.segments.read(), segs)
     }
 
@@ -5150,7 +5150,7 @@ mod tests {
         let walked: (&[i64], &[i64], &[i64]) = (&[1, 2, 3, 4, 5, 6], &[2, 9], &[3, 20]);
         let searched: (&[i64], &[i64], &[i64]) = (&[1, 2, 3], &[2, 9, 10, 11], &[3, 20, 21, 22]);
         for (output, dead_copy, live_copy) in [walked, searched] {
-            let mut segments: rustc_hash::FxHashMap<u64, ColdSegment> = [
+            let mut segments: crate::common::KeyMap<u64, ColdSegment> = [
                 (1, segment_holding(output, None)),
                 (2, segment_holding(dead_copy, Some(&[0]))),
                 (3, segment_holding(live_copy, None)),
@@ -5181,7 +5181,7 @@ mod tests {
         let mut bits = bits_without(1000, &[5]);
         bits[15] |= !((1u64 << 40) - 1);
         shadowed.visible = Some(Arc::new(bits));
-        let segments: FxHashMap<u64, ColdSegment> = [
+        let segments: KeyMap<u64, ColdSegment> = [
             (1, shadowed),
             (2, segment_holding(&[5, 2000, 2001, 2002], None)),
             (3, segment_holding(&[7, 3000, 3001], Some(&[0]))),
@@ -5199,13 +5199,13 @@ mod tests {
             visible, 1011,
             "bits past a volume's last row count for nothing"
         );
-        let walking = |tombstones: &FxHashMap<i64, u64>| {
+        let walking = |tombstones: &KeyMap<i64, u64>| {
             let before = crate::test_failpoints::count_ids_walked();
             let hits = tombstoned_visible(&segments, tombstones, &bounds);
             (hits, crate::test_failpoints::count_ids_walked() - before)
         };
 
-        let few: FxHashMap<i64, u64> = [5, 7, 9_999, 4001, 5001, 50]
+        let few: KeyMap<i64, u64> = [5, 7, 9_999, 4001, 5001, 50]
             .into_iter()
             .map(|id| (id, 1))
             .collect();
@@ -5217,7 +5217,7 @@ mod tests {
         assert!(same_as_walk(1011 - 5, &segments, &few));
         assert!(segments[&4].volume.meta.row_order.get().is_none());
 
-        let dense: FxHashMap<i64, u64> = (0..100).map(|id| (id, 1)).collect();
+        let dense: KeyMap<i64, u64> = (0..100).map(|id| (id, 1)).collect();
         let (dense_hits, dense_walked) = walking(&dense);
         assert_eq!(dense_hits, 100);
         assert!(same_as_walk(1011 - 100, &segments, &dense));
@@ -5230,14 +5230,14 @@ mod tests {
 
     #[test]
     fn a_tombstone_map_mostly_emptied_is_walked_against_not_scanned_per_segment() {
-        let segments: FxHashMap<u64, ColdSegment> = [
+        let segments: KeyMap<u64, ColdSegment> = [
             (1, segment_holding(&(0..1000).collect::<Vec<_>>(), None)),
             (2, segment_holding(&(1000..2000).collect::<Vec<_>>(), None)),
         ]
         .into_iter()
         .collect();
         let bounds = [(1, 0, 999), (2, 1000, 1999)];
-        let mut tombstones: FxHashMap<i64, u64> = (0..100_000).map(|id| (id, 1)).collect();
+        let mut tombstones: KeyMap<i64, u64> = (0..100_000).map(|id| (id, 1)).collect();
         tombstones.retain(|&id, _| id == 5);
         assert!(tombstones.capacity() >= 100_000);
         let before = crate::test_failpoints::count_ids_walked();
@@ -5250,10 +5250,10 @@ mod tests {
             );
         }
 
-        let mut sparse: FxHashMap<i64, u64> = (0..10_000).map(|id| (id, 1)).collect();
+        let mut sparse: KeyMap<i64, u64> = (0..10_000).map(|id| (id, 1)).collect();
         sparse.clear();
         sparse.insert(30_005, 1);
-        let segments: FxHashMap<u64, ColdSegment> = [
+        let segments: KeyMap<u64, ColdSegment> = [
             (1, segment_holding(&(0..30_000).collect::<Vec<_>>(), None)),
             (
                 2,
@@ -5276,7 +5276,7 @@ mod tests {
 
     #[test]
     fn many_small_segments_find_their_ranges_by_search() {
-        let segments: FxHashMap<u64, ColdSegment> = (0..1024u64)
+        let segments: KeyMap<u64, ColdSegment> = (0..1024u64)
             .map(|s| {
                 let lo = s as i64 * 100;
                 (
@@ -5288,7 +5288,7 @@ mod tests {
         let bounds: Vec<(u64, i64, i64)> = (0..1024u64)
             .map(|s| (s, s as i64 * 100, s as i64 * 100 + 99))
             .collect();
-        let tombstones: FxHashMap<i64, u64> = [(5, 1)].into_iter().collect();
+        let tombstones: KeyMap<i64, u64> = [(5, 1)].into_iter().collect();
         let before = crate::test_failpoints::count_bounds_probes();
         assert_eq!(tombstoned_visible(&segments, &tombstones, &bounds), 1);
         if cfg!(feature = "test-failpoints") {
@@ -5353,7 +5353,7 @@ mod tests {
         let mut m = TableManifest::new("my_table");
         m.next_segment_id = 5;
         m.checkpoint_lsn = 42;
-        let tombstones: FxHashMap<i64, u64> = [(10, 0), (20, 3), (30, 0)].into_iter().collect();
+        let tombstones: KeyMap<i64, u64> = [(10, 0), (20, 3), (30, 0)].into_iter().collect();
         m.add_segment(SegmentMeta {
             segment_id: 1,
             file_path: PathBuf::from("seg_0001.vol"),
@@ -5404,7 +5404,7 @@ mod tests {
         m.column_renames
             .push((SmartString::from("a"), SmartString::from("b")));
         m.dropped_columns.push((SmartString::from("c"), 2));
-        let tombstones: FxHashMap<i64, u64> = (0..10_000).map(|id| (id, 1)).collect();
+        let tombstones: KeyMap<i64, u64> = (0..10_000).map(|id| (id, 1)).collect();
         let data = m.serialize(&tombstones).unwrap();
         assert_eq!(
             data.capacity(),
@@ -5437,7 +5437,7 @@ mod tests {
         let path = dir.path().join("manifest.bin");
 
         let mut m = TableManifest::new("disk_test");
-        let tombstones: FxHashMap<i64, u64> = [(5, 0), (10, 0)].into_iter().collect();
+        let tombstones: KeyMap<i64, u64> = [(5, 0), (10, 0)].into_iter().collect();
         m.add_segment(SegmentMeta {
             segment_id: 1,
             file_path: PathBuf::from("vol.vol"),
@@ -5529,7 +5529,7 @@ mod tests {
         mgr.add_tombstones(&ids, 1);
         let snapshot = mgr.tombstone_set_arc();
 
-        let absent: FxHashSet<i64> = [5_000, 5_001].into_iter().collect();
+        let absent: KeySet<i64> = [5_000, 5_001].into_iter().collect();
         mgr.remove_tombstones_for_rows(&absent);
         assert!(
             Arc::ptr_eq(&snapshot, &mgr.tombstone_set_arc()),
@@ -5554,7 +5554,7 @@ mod tests {
         mgr.add_tombstones(&ids, 1);
         let visits = || CLEANUP_VISITS.with(|v| v.get());
 
-        let batch: FxHashSet<i64> = (0..10).collect();
+        let batch: KeySet<i64> = (0..10).collect();
         let before = visits();
         mgr.remove_tombstones_for_rows(&batch);
         assert!(visits() - before <= 20, "visited {}", visits() - before);
@@ -5576,8 +5576,8 @@ mod tests {
             let ts = mgr.tombstone_set_arc();
             (ts.keys().copied().last().unwrap(), ts.capacity())
         };
-        let mut targets: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(capacity, Default::default());
+        let mut targets: KeySet<i64> =
+            KeySet::with_capacity_and_hasher(capacity, Default::default());
         targets.insert(last);
         targets.insert(-1);
         let visits = || CLEANUP_VISITS.with(|v| v.get());
@@ -5612,7 +5612,7 @@ mod tests {
 
             let applied: Vec<(i64, u64)> = (1..=4).map(|rid| (rid, snapshot[&rid])).collect();
             mgr.remove_applied_tombstones(&applied);
-            let rows: FxHashSet<i64> = [5, 99].into_iter().chain(200..200 + extra).collect();
+            let rows: KeySet<i64> = [5, 99].into_iter().chain(200..200 + extra).collect();
             mgr.remove_tombstones_for_rows(&rows);
 
             let mut expected = vec![(3, 5)];
@@ -6169,7 +6169,7 @@ mod tests {
         m.add_segment(meta_for_ids(2, &[4, 5]));
         m.identities.insert(1, identity);
         m.dead_copies.insert(1, Arc::from(vec![0u32, 2]));
-        let bytes = m.serialize(&FxHashMap::default()).unwrap();
+        let bytes = m.serialize(&KeyMap::default()).unwrap();
         assert_eq!(&bytes[4..8], &8u32.to_le_bytes());
         let back = TableManifest::deserialize(&bytes).unwrap().manifest;
         assert_eq!(back.identities.get(&1), Some(&identity));
@@ -6185,7 +6185,7 @@ mod tests {
     fn a_v8_entry_skips_fields_a_later_writer_appended() {
         let mut m = TableManifest::new("t");
         m.add_segment(meta_for_ids(1, &[1, 2, 3]));
-        let bytes = m.serialize(&FxHashMap::default()).unwrap();
+        let bytes = m.serialize(&KeyMap::default()).unwrap();
         // The entry length sits after the header, the name and the count
         let at = 4 + 4 + 8 + 8 + 4 + 1 + 4;
         let mut longer = bytes[..bytes.len() - 4].to_vec();
@@ -6202,7 +6202,7 @@ mod tests {
     fn a_manifest_newer_than_v8_or_with_a_v7_checksum_is_refused() {
         let mut m = TableManifest::new("t");
         m.add_segment(meta_for_ids(1, &[1, 2, 3]));
-        let bytes = m.serialize(&FxHashMap::default()).unwrap();
+        let bytes = m.serialize(&KeyMap::default()).unwrap();
         let mut payload = bytes[..bytes.len() - 4].to_vec();
         payload[4..8].copy_from_slice(&9u32.to_le_bytes());
         let crc = crc32c::crc32c(&payload);

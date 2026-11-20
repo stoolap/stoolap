@@ -22,7 +22,7 @@
 //! - SHOW INDEXES
 //! - DESCRIBE
 
-use rustc_hash::FxHashSet;
+use crate::common::KeySet;
 
 use crate::common::SmartString;
 use crate::core::row_vec::RowVec;
@@ -89,7 +89,7 @@ impl Executor {
         let schema = table.schema();
 
         // Get unique column names from indexes
-        let mut unique_columns: FxHashSet<String> = FxHashSet::default();
+        let mut unique_columns: KeySet<String> = KeySet::default();
         if let Ok(indexes) = self.engine.list_table_indexes(table_name) {
             for index_name in indexes.keys() {
                 if let Some(index) = table.get_index(index_name) {
@@ -312,8 +312,8 @@ impl Executor {
 
         // Build unique/multi-column key sets from indexes (matching MySQL conventions)
         // Single-column UNIQUE -> UNI, composite UNIQUE first col -> MUL
-        let mut unique_columns: FxHashSet<String> = FxHashSet::default();
-        let mut mul_columns: FxHashSet<String> = FxHashSet::default();
+        let mut unique_columns: KeySet<String> = KeySet::default();
+        let mut mul_columns: KeySet<String> = KeySet::default();
         if let Ok(indexes) = self.engine.list_table_indexes(table_name) {
             for index_name in indexes.keys() {
                 if let Some(index) = table.get_index(index_name) {

@@ -515,7 +515,7 @@ impl Expression for SealInsideWhere {
     fn evaluate_fast(&self, row: &Row) -> bool {
         self.inner.evaluate_fast(row)
     }
-    fn with_aliases(&self, _: &rustc_hash::FxHashMap<String, String>) -> Box<dyn Expression> {
+    fn with_aliases(&self, _: &stoolap::common::KeyMap<String, String>) -> Box<dyn Expression> {
         self.clone_box()
     }
     fn prepare_for_schema(&mut self, schema: &Schema) {

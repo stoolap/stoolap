@@ -39,7 +39,7 @@ use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
-use rustc_hash::FxHashMap;
+use crate::common::KeyMap;
 
 use super::id_list::IdList;
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, Value};
@@ -233,9 +233,9 @@ impl std::hash::Hash for CompositeKey {
 /// - Fast INSERT/DELETE (only updates hash index until queries trigger builds)
 ///
 /// ## Implementation:
-/// - `value_to_rows`: FxHashMap<CompositeKey, IdList> for exact lookups (always maintained)
+/// - `value_to_rows`: KeyMap<CompositeKey, IdList> for exact lookups (always maintained)
 /// - `sorted_values`: BTreeMap for RANGE queries (lazy built)
-/// - `prefix_indexes`: Vec of FxHashMaps for partial queries (lazy built)
+/// - `prefix_indexes`: Vec of KeyMaps for partial queries (lazy built)
 pub struct MultiColumnIndex {
     name: String,
     table_name: String,
@@ -256,11 +256,11 @@ pub struct MultiColumnData {
     btree_built: AtomicBool,
 
     /// Hash index for exact lookups (full key) - always maintained
-    value_to_rows: RwLock<FxHashMap<CompositeKey, IdList>>,
+    value_to_rows: RwLock<KeyMap<CompositeKey, IdList>>,
 
     /// Prefix indexes: LAZY built on first partial query
     /// Index 0 = first column, Index 1 = first two columns, etc.
-    prefix_indexes: Vec<RwLock<FxHashMap<CompositeKey, IdList>>>,
+    prefix_indexes: Vec<RwLock<KeyMap<CompositeKey, IdList>>>,
     prefix_built: Vec<AtomicBool>,
 
     /// Per prefix group, its rows ordered by the column after the prefix:
@@ -269,7 +269,7 @@ pub struct MultiColumnData {
     /// Writers touch it last, after the sorted keys a build reads, and a
     /// build holds its write lock from that read to the insert, so a row is
     /// either in the group when it is built or added to it afterwards.
-    walk_orders: RwLock<FxHashMap<CompositeKey, BTreeSet<(Value, i64)>>>,
+    walk_orders: RwLock<KeyMap<CompositeKey, BTreeSet<(Value, i64)>>>,
 }
 
 impl std::ops::Deref for MultiColumnIndex {
@@ -311,7 +311,7 @@ impl MultiColumnIndex {
         let mut prefix_indexes = Vec::with_capacity(num_cols);
         let mut prefix_built = Vec::with_capacity(num_cols);
         for _ in 0..num_cols {
-            prefix_indexes.push(RwLock::new(FxHashMap::default()));
+            prefix_indexes.push(RwLock::new(KeyMap::default()));
             prefix_built.push(AtomicBool::new(false));
         }
 
@@ -327,13 +327,13 @@ impl MultiColumnIndex {
                 sorted_values: RwLock::new(BTreeMap::new()),
                 btree_built: AtomicBool::new(false),
                 value_to_rows: RwLock::new(if expected_rows > 0 {
-                    FxHashMap::with_capacity_and_hasher(expected_rows, Default::default())
+                    KeyMap::with_capacity_and_hasher(expected_rows, Default::default())
                 } else {
-                    FxHashMap::default()
+                    KeyMap::default()
                 }),
                 prefix_indexes,
                 prefix_built,
-                walk_orders: RwLock::new(FxHashMap::default()),
+                walk_orders: RwLock::new(KeyMap::default()),
             }),
         }
     }
@@ -422,7 +422,7 @@ impl MultiColumnIndex {
         // Build prefix index from the full keys (read lock prevents concurrent inserts).
         // Gather each prefix's row ids unsorted, then sort once: a sorted insert per
         // row is quadratic in the rows per key.
-        let mut gathered: FxHashMap<CompositeKey, Vec<i64>> = FxHashMap::default();
+        let mut gathered: KeyMap<CompositeKey, Vec<i64>> = KeyMap::default();
         for (key, rows) in value_to_rows.iter() {
             if key.0.len() >= prefix_len {
                 let prefix_key = CompositeKey(key.0[..prefix_len].to_vec());
@@ -553,7 +553,7 @@ impl MultiColumnIndex {
         &self,
         key: &CompositeKey,
         row_id: i64,
-        value_to_rows: &FxHashMap<CompositeKey, IdList>,
+        value_to_rows: &KeyMap<CompositeKey, IdList>,
     ) -> Result<()> {
         if !self.is_unique {
             return Ok(());
@@ -732,8 +732,8 @@ impl Index for MultiColumnIndex {
         // Pre-check unique constraints if this is a unique index
         if self.is_unique {
             // Build a set of keys in this batch for intra-batch duplicate detection
-            let mut batch_keys: FxHashMap<CompositeKey, i64> =
-                FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
+            let mut batch_keys: KeyMap<CompositeKey, i64> =
+                KeyMap::with_capacity_and_hasher(entries.len(), Default::default());
 
             for &(row_id, values) in entries {
                 // Skip if any value is NULL (NULL doesn't violate uniqueness)

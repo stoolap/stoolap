@@ -541,7 +541,7 @@ fn file_volume(
             file_identity: std::sync::OnceLock::new(),
         }),
         unique_indices: std::sync::Arc::new(super::writer::UniqueIndexes::new(
-            rustc_hash::FxHashMap::default(),
+            crate::common::KeyMap::default(),
         )),
         last_access_epoch: std::sync::atomic::AtomicU64::new(
             super::writer::GLOBAL_EVICTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed),
@@ -640,7 +640,7 @@ pub fn rewrite_volume_with_group_rows(path: &Path, group_rows: usize) -> Result<
         columns: LazyColumns::eager(columns, meta.column_types.clone()),
         meta: Arc::new(meta),
         unique_indices: Arc::new(super::writer::UniqueIndexes::new(
-            rustc_hash::FxHashMap::default(),
+            crate::common::KeyMap::default(),
         )),
         last_access_epoch: std::sync::atomic::AtomicU64::new(0),
     };
