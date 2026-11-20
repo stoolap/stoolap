@@ -4022,11 +4022,16 @@ impl VersionStore {
         };
         let checker = reader.over(&**checker);
         let versions = self.versions.read();
-        dest.reserve(versions.len().saturating_sub(dest.len()));
+        // Gathered first, so the set grows once by the ids it is given
+        let mut seen = Vec::with_capacity(versions.len());
         for (&row_id, chain) in versions.iter() {
             if chain_seen(&checker, reader.txn_id, chain) {
-                dest.insert(row_id);
+                seen.push(row_id);
             }
+        }
+        dest.reserve(seen.len().saturating_sub(dest.len()));
+        for row_id in seen {
+            dest.insert(row_id);
         }
     }
 
@@ -10133,6 +10138,24 @@ mod tests {
         store.collect_seen_row_ids_into(Reader::from(5), &mut dest);
         assert_eq!(dest.capacity(), capacity, "seen ids");
         assert_eq!(dest.len(), 10_000);
+    }
+
+    #[test]
+    fn collecting_ids_a_reader_does_not_see_leaves_the_set_as_it_was() {
+        let store = VersionStore::with_visibility_checker(
+            "t".to_string(),
+            test_schema(),
+            Arc::new(TestVisibilityChecker::new()) as Arc<dyn VisibilityChecker>,
+        );
+        for row_id in 1..=10_000 {
+            store.add_version(
+                row_id,
+                RowVersion::new(9, Row::from(vec![Value::from(row_id)])),
+            );
+        }
+        let mut dest = crate::common::KeySet::<i64>::default();
+        store.collect_seen_row_ids_into(Reader::from(5), &mut dest);
+        assert_eq!((dest.len(), dest.capacity()), (0, 0));
     }
 
     /// Rows 1.. written by `txns` in order, classified under a snapshot:
