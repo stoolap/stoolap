@@ -4014,25 +4014,31 @@ impl VersionStore {
         reader: Reader<'_>,
         dest: &mut crate::common::KeySet<i64>,
     ) {
+        let seen = self.seen_row_ids(reader);
+        dest.reserve(seen.len().saturating_sub(dest.len()));
+        for row_id in seen {
+            dest.insert(row_id);
+        }
+    }
+
+    /// The ids [`Self::collect_seen_row_ids_into`] adds, in a buffer that
+    /// grows only by them, so the set it fills grows once
+    fn seen_row_ids(&self, reader: Reader<'_>) -> Vec<i64> {
+        let mut seen = Vec::new();
         if self.closed.load(Ordering::Acquire) {
-            return;
+            return seen;
         }
         let Some(checker) = self.visibility_checker.as_ref() else {
-            return;
+            return seen;
         };
         let checker = reader.over(&**checker);
         let versions = self.versions.read();
-        // Gathered first, so the set grows once by the ids it is given
-        let mut seen = Vec::with_capacity(versions.len());
         for (&row_id, chain) in versions.iter() {
             if chain_seen(&checker, reader.txn_id, chain) {
                 seen.push(row_id);
             }
         }
-        dest.reserve(seen.len().saturating_sub(dest.len()));
-        for row_id in seen {
-            dest.insert(row_id);
-        }
+        seen
     }
 
     /// Returns all row IDs that are visible to the given transaction
@@ -10153,9 +10159,10 @@ mod tests {
                 RowVersion::new(9, Row::from(vec![Value::from(row_id)])),
             );
         }
+        assert_eq!(store.seen_row_ids(Reader::from(5)).capacity(), 0, "buffer");
         let mut dest = crate::common::KeySet::<i64>::default();
         store.collect_seen_row_ids_into(Reader::from(5), &mut dest);
-        assert_eq!((dest.len(), dest.capacity()), (0, 0));
+        assert_eq!((dest.len(), dest.capacity()), (0, 0), "set");
     }
 
     /// Rows 1.. written by `txns` in order, classified under a snapshot:
