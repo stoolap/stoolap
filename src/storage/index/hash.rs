@@ -42,7 +42,7 @@ use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
-use crate::common::KeyMap;
+use crate::common::HashedMap;
 
 use super::id_list::IdList;
 use crate::common::deadline::{Deadline, DeadlineSite, CHARGE_BEAT};
@@ -105,7 +105,7 @@ pub struct HashData {
     /// Maps hash -> (values as `CompactArc<Value>`, row_ids) for collision resolution
     /// Uses `CompactArc<Value>` to share references with ValueArena (8 bytes per value)
     #[allow(clippy::type_complexity)]
-    hash_to_values: RwLock<KeyMap<u64, Vec<(Vec<CompactArc<Value>>, IdList)>>>,
+    hash_to_values: RwLock<HashedMap<Vec<(Vec<CompactArc<Value>>, IdList)>>>,
 }
 
 impl std::ops::Deref for HashIndex {
@@ -154,9 +154,9 @@ impl HashIndex {
             data: Arc::new(HashData {
                 closed: AtomicBool::new(false),
                 hash_to_values: RwLock::new(if expected_rows > 0 {
-                    KeyMap::with_capacity_and_hasher(expected_rows, Default::default())
+                    HashedMap::with_capacity_and_hasher(expected_rows, Default::default())
                 } else {
-                    KeyMap::default()
+                    HashedMap::default()
                 }),
             }),
         }
@@ -169,7 +169,7 @@ impl HashIndex {
         values: &[Value],
         row_id: i64,
         hash: u64,
-        hash_to_values: &KeyMap<u64, Vec<(Vec<CompactArc<Value>>, IdList)>>,
+        hash_to_values: &HashedMap<Vec<(Vec<CompactArc<Value>>, IdList)>>,
     ) -> Result<()> {
         if !self.is_unique {
             return Ok(());

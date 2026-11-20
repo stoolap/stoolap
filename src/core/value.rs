@@ -1045,135 +1045,46 @@ pub fn f64_ge(a: f64, b: f64) -> bool {
 const I64_SAFE_MAX: i64 = (1_i64 << 53) - 1;
 const I64_SAFE_MIN: i64 = -I64_SAFE_MAX;
 
-/// WyHash-style 128-bit multiply mixing function.
-/// Provides excellent avalanche properties - small input changes produce
-/// completely different outputs. This pre-mixes values before the hasher
-/// sees them, fixing collision problems with simple hashers like FxHash.
-#[inline(always)]
-fn wymix(a: u64, b: u64) -> u64 {
-    let r = (a as u128).wrapping_mul(b as u128);
-    (r as u64) ^ ((r >> 64) as u64)
-}
-
-// WyHash prime constants for mixing
-const WY_P1: u64 = 0xa0761d6478bd642f;
-const WY_P2: u64 = 0xe7037ed1a0b428db;
+/// The words NULL and the booleans write, apart from small integers
+const NULL_WORD: u64 = 0x243f_6a88_85a3_08d3;
+const FALSE_WORD: u64 = 0x1319_8a2e_0370_7344;
+const TRUE_WORD: u64 = 0xa409_3822_299f_31d0;
 
 impl Hash for Value {
+    /// Writes each value's raw word or bytes and leaves the mixing to the
+    /// hasher. Equal values write equal words: a whole Float writes the
+    /// Integer it equals, and integers past 2^53 write their f64 bits
     #[inline(always)]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // Pre-mix strategy: Instead of writing raw values that may have poor
-        // distribution (causing collisions in simple hashers like FxHash),
-        // we pre-mix everything using WyHash-style 128-bit multiply mixing.
-        // This gives ANY hasher well-distributed inputs.
-        //
-        // Constraint: Integer(5) == Float(5.0) must have equal hashes.
-        // We handle this by using the same mixing for whole-number floats.
         match self {
-            Value::Null(_) => {
-                // All NULLs hash the same
-                state.write_u64(0);
-            }
-            Value::Integer(v) => {
-                // Pre-mix integer with discriminant
-                match *v {
-                    I64_SAFE_MIN..=I64_SAFE_MAX => {
-                        state.write_u64(wymix(1 ^ (*v as u64), WY_P1));
-                    }
-                    _ => {
-                        // Large integer: use f64 bits for consistency with Float
-                        state.write_u64(wymix(1 ^ (*v as f64).to_bits(), WY_P1));
-                    }
-                }
-            }
+            Value::Null(_) => state.write_u64(NULL_WORD),
+            Value::Integer(v) => match *v {
+                I64_SAFE_MIN..=I64_SAFE_MAX => state.write_i64(*v),
+                _ => state.write_u64((*v as f64).to_bits()),
+            },
             Value::Float(v) => {
                 if v.is_nan() {
-                    // All NaNs are equal, so they must hash the same
-                    state.write_u64(wymix(6 ^ f64::NAN.to_bits(), WY_P1));
+                    state.write_u64(f64::NAN.to_bits());
                 } else if v.fract() == 0.0 {
-                    // Whole number float - must hash same as equivalent Integer
                     match *v as i64 {
-                        i @ I64_SAFE_MIN..=I64_SAFE_MAX => {
-                            state.write_u64(wymix(1 ^ (i as u64), WY_P1));
-                        }
-                        _ => {
-                            state.write_u64(wymix(1 ^ v.to_bits(), WY_P1));
-                        }
+                        i @ I64_SAFE_MIN..=I64_SAFE_MAX => state.write_i64(i),
+                        _ => state.write_u64(v.to_bits()),
                     }
                 } else {
-                    // Fractional float - use discriminant 6 (can't equal any Integer)
-                    state.write_u64(wymix(6 ^ v.to_bits(), WY_P1));
+                    state.write_u64(v.to_bits());
                 }
             }
-            Value::Text(s) => {
-                // Pre-hash string with WyHash-style mixing, write single u64
-                let bytes = s.as_bytes();
-                let len = bytes.len();
-                let mut h = wymix(2 ^ (len as u64), WY_P1);
-
-                // Process 8 bytes at a time
-                let chunks = len / 8;
-                let ptr = bytes.as_ptr();
-                for i in 0..chunks {
-                    // SAFETY: We iterate i from 0..chunks where chunks = len/8.
-                    // So i*8 is always < len, and we read 8 bytes which is valid
-                    // since (i+1)*8 <= chunks*8 <= len. read_unaligned handles alignment.
-                    let chunk = unsafe { (ptr.add(i * 8) as *const u64).read_unaligned() };
-                    h = wymix(h ^ chunk, WY_P2);
-                }
-
-                // Handle tail bytes (0-7)
-                let tail_start = chunks * 8;
-                if tail_start < len {
-                    let mut tail = 0u64;
-                    for (j, &b) in bytes[tail_start..].iter().enumerate() {
-                        tail |= (b as u64) << (j * 8);
-                    }
-                    h = wymix(h ^ tail, WY_P1);
-                }
-
-                state.write_u64(h);
-            }
-            Value::Boolean(b) => {
-                // Pre-mixed boolean
-                state.write_u64(wymix(if *b { 5 } else { 4 }, WY_P1));
-            }
+            Value::Text(s) => state.write(s.as_bytes()),
+            Value::Boolean(b) => state.write_u64(if *b { TRUE_WORD } else { FALSE_WORD }),
             Value::Timestamp(t) => {
                 // Hash at full nanosecond precision. Volume segments now store
                 // timestamps as i64 nanoseconds, so no precision loss occurs.
                 let nanos = t
                     .timestamp_nanos_opt()
                     .unwrap_or_else(|| t.timestamp().saturating_mul(1_000_000_000));
-                state.write_u64(wymix(3 ^ (nanos as u64), WY_P1));
+                state.write_i64(nanos);
             }
-            Value::Extension(data) => {
-                // Pre-hash extension data with WyHash-style mixing
-                // Tag byte is included in data, so discriminant is embedded
-                let bytes: &[u8] = data;
-                let len = bytes.len();
-                let mut h = wymix(10 ^ (len as u64), WY_P1);
-
-                let chunks = len / 8;
-                let ptr = bytes.as_ptr();
-                for i in 0..chunks {
-                    // SAFETY: We iterate i from 0..chunks where chunks = len/8.
-                    // So i*8 is always < len, and we read 8 bytes which is valid
-                    // since (i+1)*8 <= chunks*8 <= len. read_unaligned handles alignment.
-                    let chunk = unsafe { (ptr.add(i * 8) as *const u64).read_unaligned() };
-                    h = wymix(h ^ chunk, WY_P2);
-                }
-
-                let tail_start = chunks * 8;
-                if tail_start < len {
-                    let mut tail = 0u64;
-                    for (j, &b) in bytes[tail_start..].iter().enumerate() {
-                        tail |= (b as u64) << (j * 8);
-                    }
-                    h = wymix(h ^ tail, WY_P1);
-                }
-
-                state.write_u64(h);
-            }
+            Value::Extension(data) => state.write(data),
         }
     }
 }
@@ -2342,6 +2253,10 @@ mod tests {
             hash_value(&Value::integer(0)),
             hash_value(&Value::float(0.0))
         );
+        assert_eq!(
+            hash_value(&Value::integer(0)),
+            hash_value(&Value::float(-0.0))
+        );
 
         // Fractional floats should NOT hash the same as any integer
         assert_ne!(
@@ -2379,6 +2294,20 @@ mod tests {
             hash_value(&Value::integer(large)),
             hash_value(&Value::float(large_as_f64))
         );
+    }
+
+    #[test]
+    fn an_integer_value_hashes_as_its_integer() {
+        use std::hash::BuildHasher;
+        let state = crate::common::KeyState::default();
+        for v in [0, 1, -1, 1 << 40, (1 << 53) - 1, -((1 << 53) - 1)] {
+            assert_eq!(
+                state.hash_one(Value::integer(v)),
+                state.hash_one(v),
+                "{v}: the hasher mixes, the value only writes its word"
+            );
+            assert_eq!(state.hash_one(Value::float(v as f64)), state.hash_one(v));
+        }
     }
 
     #[test]

@@ -75,7 +75,7 @@
 //! Future enhancement: Per-transaction cache scoping with timestamp-based invalidation
 
 use crate::common::time_compat::Instant;
-use crate::common::{KeyHasher, KeyMap};
+use crate::common::{HashedMap, KeyHasher};
 use parking_lot::RwLock;
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
@@ -250,7 +250,7 @@ pub enum SubsumptionResult {
 pub struct SemanticCache {
     /// Cached results: table_name -> (hash of the column names in order -> `Vec<CachedResult>`)
     /// Nested structure enables O(1) table invalidation
-    cache: RwLock<StringMap<KeyMap<u64, Vec<CachedResult>>>>,
+    cache: RwLock<StringMap<HashedMap<Vec<CachedResult>>>>,
     /// Maximum cache size per table+column combination
     max_size: usize,
     /// Cache TTL
@@ -565,7 +565,7 @@ impl SemanticCache {
     /// Evict entries across all tables using global LRU until rows_to_free rows are freed
     fn evict_global_lru(
         &self,
-        cache: &mut StringMap<KeyMap<u64, Vec<CachedResult>>>,
+        cache: &mut StringMap<HashedMap<Vec<CachedResult>>>,
         mut rows_to_free: usize,
         skip_table: &str,
     ) {

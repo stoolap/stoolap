@@ -191,10 +191,14 @@ impl<V> I64Map<V> {
             return;
         }
 
-        let new_cap = target_cap;
-        let new_mask = new_cap - 1;
+        self.rebuild(target_cap);
+    }
 
-        let new_slots: Vec<Slot<V>> = (0..new_cap)
+    /// Moves every entry into a fresh table of `cap` slots. The keys are
+    /// distinct, so each goes to the first empty slot from its home, with
+    /// none of insert's checks
+    fn rebuild(&mut self, cap: usize) {
+        let new_slots: Vec<Slot<V>> = (0..cap)
             .map(|_| Slot {
                 key: EMPTY,
                 value: MaybeUninit::uninit(),
@@ -202,19 +206,21 @@ impl<V> I64Map<V> {
             .collect();
 
         let old_slots = std::mem::replace(&mut self.slots, new_slots.into_boxed_slice());
-        let old_len = self.len;
-        self.len = 0;
-        self.mask = new_mask;
+        let mask = cap - 1;
+        self.mask = mask;
 
-        for slot in old_slots.iter() {
+        for slot in Vec::from(old_slots) {
             if slot.key != EMPTY {
-                // SAFETY: We are moving valid initialized values
-                let value = unsafe { slot.value.as_ptr().read() };
-                self.insert(slot.key, value);
+                let mut idx = Self::hash(slot.key) & mask;
+                // SAFETY: idx is masked, so in bounds.
+                while unsafe { self.slots.get_unchecked(idx).key } != EMPTY {
+                    idx = (idx + 1) & mask;
+                }
+                // SAFETY: the slot at idx is empty, and slot.key != EMPTY
+                // means the value moved here is initialized.
+                unsafe { *self.slots.get_unchecked_mut(idx) = slot };
             }
         }
-
-        debug_assert_eq!(self.len, old_len);
     }
 
     #[inline(always)]
@@ -422,30 +428,7 @@ impl<V> I64Map<V> {
     }
 
     fn grow(&mut self) {
-        let new_cap = (self.slots.len() * 2).max(MIN_CAPACITY);
-        let new_mask = new_cap - 1;
-
-        let new_slots: Vec<Slot<V>> = (0..new_cap)
-            .map(|_| Slot {
-                key: EMPTY,
-                value: MaybeUninit::uninit(),
-            })
-            .collect();
-
-        let old_slots = std::mem::replace(&mut self.slots, new_slots.into_boxed_slice());
-        let old_len = self.len;
-        self.len = 0;
-        self.mask = new_mask;
-
-        for slot in Vec::from(old_slots) {
-            if slot.key != EMPTY {
-                // SAFETY: slot.key != EMPTY means the value is initialized.
-                let value = unsafe { slot.value.assume_init() };
-                self.insert(slot.key, value);
-            }
-        }
-
-        debug_assert_eq!(self.len, old_len);
+        self.rebuild((self.slots.len() * 2).max(MIN_CAPACITY));
     }
 
     /// Check if we should shrink: len < capacity / SHRINK_DIVISOR
@@ -473,30 +456,7 @@ impl<V> I64Map<V> {
             return; // No need to shrink
         }
         count_slot_visits(self.slots.len());
-
-        let new_mask = new_cap - 1;
-
-        let new_slots: Vec<Slot<V>> = (0..new_cap)
-            .map(|_| Slot {
-                key: EMPTY,
-                value: MaybeUninit::uninit(),
-            })
-            .collect();
-
-        let old_slots = std::mem::replace(&mut self.slots, new_slots.into_boxed_slice());
-        let old_len = self.len;
-        self.len = 0;
-        self.mask = new_mask;
-
-        for slot in Vec::from(old_slots) {
-            if slot.key != EMPTY {
-                // SAFETY: slot.key != EMPTY means the value is initialized.
-                let value = unsafe { slot.value.assume_init() };
-                self.insert(slot.key, value);
-            }
-        }
-
-        debug_assert_eq!(self.len, old_len);
+        self.rebuild(new_cap);
     }
 
     pub fn clear(&mut self) {
@@ -1118,22 +1078,27 @@ impl I64Set {
     }
 
     fn grow(&mut self) {
-        let new_cap = (self.slots.len() * 2).max(MIN_CAPACITY);
-        let new_mask = new_cap - 1;
+        self.rebuild((self.slots.len() * 2).max(MIN_CAPACITY));
+    }
 
-        let new_slots: Vec<i64> = vec![EMPTY; new_cap];
-        let old_slots = std::mem::replace(&mut self.slots, new_slots.into_boxed_slice());
-        let old_len = self.len;
-        self.len = 0;
-        self.mask = new_mask;
+    /// Moves every member into a fresh table of `cap` slots, each to the
+    /// first empty slot from its home, with none of insert's checks
+    fn rebuild(&mut self, cap: usize) {
+        let old_slots = std::mem::replace(&mut self.slots, vec![EMPTY; cap].into_boxed_slice());
+        let mask = cap - 1;
+        self.mask = mask;
 
-        for slot in old_slots.iter() {
-            if *slot != EMPTY {
-                self.insert(*slot);
+        for &key in old_slots.iter() {
+            if key != EMPTY {
+                let mut idx = Self::hash(key) & mask;
+                // SAFETY: idx is masked, so in bounds.
+                while unsafe { *self.slots.get_unchecked(idx) } != EMPTY {
+                    idx = (idx + 1) & mask;
+                }
+                // SAFETY: idx is masked, so in bounds.
+                unsafe { *self.slots.get_unchecked_mut(idx) = key };
             }
         }
-
-        debug_assert_eq!(self.len, old_len);
     }
 
     /// Check if we should shrink: len < capacity / SHRINK_DIVISOR
@@ -1161,22 +1126,7 @@ impl I64Set {
             return; // No need to shrink
         }
         count_slot_visits(self.slots.len());
-
-        let new_mask = new_cap - 1;
-
-        let new_slots: Vec<i64> = vec![EMPTY; new_cap];
-        let old_slots = std::mem::replace(&mut self.slots, new_slots.into_boxed_slice());
-        let old_len = self.len;
-        self.len = 0;
-        self.mask = new_mask;
-
-        for slot in old_slots.iter() {
-            if *slot != EMPTY {
-                self.insert(*slot);
-            }
-        }
-
-        debug_assert_eq!(self.len, old_len);
+        self.rebuild(new_cap);
     }
 
     #[inline]

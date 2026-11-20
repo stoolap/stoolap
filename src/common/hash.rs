@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The engine's hasher for in-memory keys. An integer hashes as `I64Map`
-//! places it; bytes hash as one word of wide multiplies, read at once up to
-//! 8 bytes and 16 at a time beyond. Not for anything written to disk
+//! The engine's hasher for in-memory keys. Every integer word hashes as
+//! `I64Map` places an integer key; bytes hash as one word of wide
+//! multiplies, read at once up to 8 bytes and 16 at a time beyond. Not for
+//! anything written to disk
 
 use std::hash::Hasher;
 
@@ -34,14 +35,6 @@ fn mix(word: u64) -> u64 {
 #[inline(always)]
 fn spread(key: u64) -> u64 {
     key.wrapping_add(mix(key >> 16))
-}
-
-/// A word that is not an integer key, mostly one its type already mixed:
-/// its top half is folded into it, more cheaply than `spread` does
-#[inline(always)]
-fn fold(word: u64) -> u64 {
-    let word = word ^ (word >> 16);
-    word.wrapping_add((word >> 32).wrapping_mul(MIX))
 }
 
 /// The hash of an integer key alone, whose low bits are its slot
@@ -108,7 +101,7 @@ fn long_word(bytes: &[u8]) -> u64 {
     folded_multiply(s0, s1) ^ len as u64
 }
 
-/// Fx's step over words that are folded first
+/// Fx's step over words that are spread first
 #[derive(Clone, Copy, Default)]
 pub struct KeyHasher {
     hash: u64,
@@ -148,12 +141,12 @@ impl Hasher for KeyHasher {
 
     #[inline]
     fn write_u64(&mut self, i: u64) {
-        self.add(fold(i));
+        self.add(spread(i));
     }
 
     #[inline]
     fn write_i64(&mut self, i: i64) {
-        self.add(spread(i as u64));
+        self.write_u64(i as u64);
     }
 
     #[inline]
@@ -165,6 +158,32 @@ impl Hasher for KeyHasher {
     #[inline]
     fn write_usize(&mut self, i: usize) {
         self.write_u64(i as u64);
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
+/// For a `u64` key that already is a mixed hash: the key is its own hash.
+/// Any other input goes through `KeyHasher`
+#[derive(Clone, Copy, Default)]
+pub struct HashedKey {
+    hash: u64,
+}
+
+impl Hasher for HashedKey {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut hasher = KeyHasher { hash: self.hash };
+        hasher.write(bytes);
+        self.hash = hasher.finish();
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.hash = self.hash.rotate_left(5) ^ i;
     }
 
     #[inline]
@@ -193,6 +212,17 @@ mod tests {
     fn an_integer_hashes_as_i64_map_places_it() {
         for key in [0, 1, -1, 7, 1 << 32, i64::MIN, i64::MAX, 1_700_000_000_000] {
             assert_eq!(hash_of(key), slot_hash(key), "{key}");
+            assert_eq!(hash_of(key as u64), slot_hash(key), "{key} as u64");
+            let word = key as usize;
+            assert_eq!(hash_of(word), slot_hash(word as i64), "{key} as usize");
+        }
+    }
+
+    #[test]
+    fn a_hashed_key_is_its_own_hash() {
+        let state = BuildHasherDefault::<HashedKey>::default();
+        for hash in [0u64, 1, u64::MAX, 0x9e37_79b9_7f4a_7c15] {
+            assert_eq!(state.hash_one(hash), hash);
         }
     }
 
