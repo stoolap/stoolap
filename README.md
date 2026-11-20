@@ -117,7 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Stoolap Desktop
 
-[Stoolap Desktop](https://github.com/stoolap/stoolap-desktop) is a native database client for macOS, Linux and Windows with the engine linked in: a SQL editor, schema browser, data grid, vector search, backup/restore, and a SQL assistant that writes and runs Stoolap SQL in your editor. Download it from the [latest release](https://github.com/stoolap/stoolap-desktop/releases/latest).
+[Stoolap Desktop](https://github.com/stoolap/stoolap-desktop) is a visual database management application for macOS, Linux and Windows with the engine linked in: a SQL editor, schema browser, data grid, vector search, backup/restore, and a SQL agent that writes and runs Stoolap SQL in your editor. Download it from the [latest release](https://github.com/stoolap/stoolap-desktop/releases/latest).
 
 <img src="docs/assets/img/desktop/desktop-light.png#gh-light-mode-only" alt="Stoolap Desktop" width="100%">
 <img src="docs/assets/img/desktop/desktop-dark.png#gh-dark-mode-only" alt="Stoolap Desktop" width="100%">
