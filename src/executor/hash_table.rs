@@ -28,7 +28,7 @@
 //! JoinHashTable
 //! ├── bucket_heads: Vec<i32>    [bucket_count]     // First entry index per bucket
 //! ├── entries: Vec<HashEntry>   [row_count]        // One per build row
-//! └── bucket_shift: u32                            // Bucket = top bits of the hash
+//! └── bucket_shift: u32                            // Bucket = top bits of hash * GOLDEN
 //!
 //! HashEntry (16 bytes, cache-aligned)
 //! ├── hash: u64     // Full hash for quick rejection
@@ -47,6 +47,11 @@ const EMPTY: u32 = u32::MAX;
 
 /// Minimum number of buckets (must be power of 2).
 const MIN_BUCKETS: usize = 16;
+
+/// 2^64 over the golden ratio. The hash's own last multiplier is near
+/// 2^64 / pi, whose top bits repeat for small dense keys (1 / pi is close to
+/// 113 / 355), so the bucket is taken from the hash times this one
+const GOLDEN: u64 = 0x9e37_79b9_7f4a_7c15;
 
 /// A hash entry in the join hash table.
 ///
@@ -99,15 +104,14 @@ impl HashEntry {
 /// ```
 pub struct JoinHashTable {
     /// First entry index for each bucket (-1 if empty).
-    /// Sized to a power of 2, indexed by the hash's top bits.
+    /// Sized to a power of 2, indexed by `bucket`.
     bucket_heads: Vec<i32>,
 
     /// Flat storage of all entries.
     /// One entry per build row.
     entries: Vec<HashEntry>,
 
-    /// bucket = hash >> shift: a multiply carries every key bit into the
-    /// top bits only, so they, not the low bits, choose the bucket
+    /// 64 minus the bucket count's log2, see `bucket`
     bucket_shift: u32,
 
     /// Number of entries inserted.
@@ -218,6 +222,13 @@ impl JoinHashTable {
         (table, kinds)
     }
 
+    /// The bucket of `hash`: the top bits of its product with `GOLDEN`,
+    /// which every bit of the hash reaches
+    #[inline(always)]
+    fn bucket(&self, hash: u64) -> usize {
+        (hash.wrapping_mul(GOLDEN) >> self.bucket_shift) as usize
+    }
+
     /// Insert a row index with its pre-computed hash.
     ///
     /// # Arguments
@@ -225,7 +236,7 @@ impl JoinHashTable {
     /// * `row_idx` - The index of the row in the build rows vector
     #[inline]
     pub fn insert(&mut self, hash: u64, row_idx: u32) {
-        let bucket = (hash >> self.bucket_shift) as usize;
+        let bucket = self.bucket(hash);
 
         // Get current head of chain
         let old_head = self.bucket_heads[bucket];
@@ -255,7 +266,7 @@ impl JoinHashTable {
     /// holds a reference to the table.
     #[inline]
     pub fn probe(&self, hash: u64) -> ProbeIter<'_> {
-        let bucket = (hash >> self.bucket_shift) as usize;
+        let bucket = self.bucket(hash);
         let first = self.bucket_heads[bucket];
 
         ProbeIter {
@@ -550,15 +561,12 @@ mod tests {
         assert_ne!(hash_row_keys(&row1, &[0, 2]), hash_row_keys(&row3, &[0, 2]));
     }
 
-    #[test]
-    fn keys_whose_hashes_share_low_bits_still_get_short_chains() {
-        let n = 49_152i64;
-        let mut table = JoinHashTable::with_capacity(n as usize);
-        for k in 0..n {
-            let key = Value::integer(k.wrapping_mul((1 << 29) + (1 << 45)));
-            table.insert(hash_key_value(&key), k as u32);
+    /// Entries a probe walks on average: its whole bucket, per key
+    fn walked_per_probe(keys: &[i64]) -> f64 {
+        let mut table = JoinHashTable::with_capacity(keys.len());
+        for (at, &k) in keys.iter().enumerate() {
+            table.insert(hash_key_value(&Value::integer(k)), at as u32);
         }
-        // A probe walks its whole bucket: on average, the entries per key's bucket
         let mut walked = 0usize;
         for &head in &table.bucket_heads {
             let mut len = 0usize;
@@ -570,8 +578,29 @@ mod tests {
             }
             walked += len * len;
         }
-        let average = walked as f64 / n as f64;
+        walked as f64 / keys.len() as f64
+    }
+
+    #[test]
+    fn keys_whose_hashes_share_low_bits_still_get_short_chains() {
+        let keys: Vec<i64> = (0..49_152i64)
+            .map(|k| k.wrapping_mul((1 << 29) + (1 << 45)))
+            .collect();
+        let average = walked_per_probe(&keys);
         assert!(average < 3.5, "{average:.2} entries walked per probe");
+    }
+
+    #[test]
+    fn small_dense_keys_get_short_chains() {
+        let dense: Vec<i64> = (1..=3000).collect();
+        let picked: Vec<i64> = (1..=10_000).filter(|k| k * 7919 % 10 < 3).collect();
+        for (shape, keys) in [("1..=3000", dense), ("30% of 1..=10000", picked)] {
+            let average = walked_per_probe(&keys);
+            assert!(
+                average < 3.5,
+                "{shape}: {average:.2} entries walked per probe"
+            );
+        }
     }
 
     #[test]
@@ -584,16 +613,14 @@ mod tests {
             len: 0,
         };
 
-        // All these will go to bucket 0 (their top two bits are 0)
-        table.insert(0, 0);
-        table.insert(4, 1);
-        table.insert(8, 2);
-        table.insert(12, 3);
+        let hashes: Vec<u64> = (0..).filter(|&h| table.bucket(h) == 0).take(4).collect();
+        for (idx, &hash) in hashes.iter().enumerate() {
+            table.insert(hash, idx as u32);
+        }
 
         // Probe for each should find exactly one match
-        assert_eq!(table.probe(0).count(), 1);
-        assert_eq!(table.probe(4).count(), 1);
-        assert_eq!(table.probe(8).count(), 1);
-        assert_eq!(table.probe(12).count(), 1);
+        for &hash in &hashes {
+            assert_eq!(table.probe(hash).count(), 1);
+        }
     }
 }
