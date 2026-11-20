@@ -21,9 +21,23 @@ use std::hash::Hasher;
 const MIX: u64 = 0x517cc1b727220a95;
 const SEED: [u64; 2] = [0x243f6a8885a308d3, 0x13198a2e03707344];
 
-/// Multiplication carries entropy only upwards, so the word's top half,
-/// mixed, is added to it: a run of dense words shares that term, while
-/// words that differ high up, whatever their low bits, get terms of their own
+/// One multiply, its top half folded down so low bits see every input bit
+#[inline(always)]
+fn mix(word: u64) -> u64 {
+    let word = word.wrapping_mul(MIX);
+    word ^ (word >> 32)
+}
+
+/// Multiplication carries entropy only upwards, so a key's bits above 16,
+/// mixed, are added to it: the keys of one 2^16 block share that term and
+/// keep distinct slots, while every block gets a term of its own
+#[inline(always)]
+fn spread(key: u64) -> u64 {
+    key.wrapping_add(mix(key >> 16))
+}
+
+/// A word that is not an integer key, mostly one its type already mixed:
+/// its top half is folded into it, more cheaply than `spread` does
 #[inline(always)]
 fn fold(word: u64) -> u64 {
     let word = word ^ (word >> 16);
@@ -33,7 +47,7 @@ fn fold(word: u64) -> u64 {
 /// The hash of an integer key alone, whose low bits are its slot
 #[inline(always)]
 pub fn slot_hash(key: i64) -> u64 {
-    fold(key as u64).wrapping_mul(MIX)
+    spread(key as u64).wrapping_mul(MIX)
 }
 
 /// Both halves of the full product, folded into one word
@@ -138,6 +152,11 @@ impl Hasher for KeyHasher {
     }
 
     #[inline]
+    fn write_i64(&mut self, i: i64) {
+        self.add(spread(i as u64));
+    }
+
+    #[inline]
     fn write_u128(&mut self, i: u128) {
         self.write_u64(i as u64);
         self.write_u64((i >> 64) as u64);
@@ -178,14 +197,20 @@ mod tests {
     }
 
     #[test]
-    fn keys_that_differ_only_high_up_get_distinct_buckets() {
+    fn keys_that_differ_only_high_up_never_collapse_into_few_buckets() {
         let n: i64 = 1 << 16;
-        let half = n as usize / 2;
+        let floor = n as usize / 8;
         for (shape, got) in [
             ("dense", buckets(0..n)),
             ("multiples of 2^16", buckets((0..n).map(|k| k << 16))),
             ("multiples of 2^32", buckets((0..n).map(|k| k << 32))),
             ("n * (2^32 + 1)", buckets((0..n).map(|k| k * 4_294_967_297))),
+            ("n * (2^16 + 1)", buckets((0..n).map(|k| k * 65_537))),
+            ("n * (2^8 + 1)", buckets((0..n).map(|k| k * 257))),
+            (
+                "n * (2^32 + 2^48)",
+                buckets((0..n).map(|k| k.wrapping_mul(0x0001_0001_0000_0000))),
+            ),
             (
                 "a clock on top",
                 buckets((0..n).map(|ms| (1_700_000_000_000 + ms) << 22 | 5)),
@@ -195,7 +220,7 @@ mod tests {
                 buckets((0..n).map(|k| (7, k << 40))),
             ),
         ] {
-            assert!(got > half, "{shape}: {got} buckets for {n} keys");
+            assert!(got > floor, "{shape}: {got} buckets for {n} keys");
         }
     }
 

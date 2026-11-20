@@ -1365,6 +1365,11 @@ mod tests {
             strided > n as usize / 2,
             "multiples of 2^16 share {strided} homes"
         );
+        let repeated = homes((0..n).map(|k| k * 65_537), slots);
+        assert!(
+            repeated > n as usize / 8,
+            "keys repeating their low quarter above it share {repeated} homes"
+        );
         let clock = homes((0..n).map(|ms| (1_700_000_000_000 + ms) << 22 | 5), slots);
         assert!(
             clock > n as usize / 2,

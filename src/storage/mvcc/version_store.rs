@@ -3974,7 +3974,7 @@ impl VersionStore {
         }
         let versions = self.versions.read();
         if self.publish_epoch_if_quiet().is_some() {
-            dest.reserve(versions.len());
+            dest.reserve(versions.len().saturating_sub(dest.len()));
             for key in versions.keys() {
                 dest.insert(key);
             }
@@ -4022,7 +4022,7 @@ impl VersionStore {
         };
         let checker = reader.over(&**checker);
         let versions = self.versions.read();
-        dest.reserve(versions.len());
+        dest.reserve(versions.len().saturating_sub(dest.len()));
         for (&row_id, chain) in versions.iter() {
             if chain_seen(&checker, reader.txn_id, chain) {
                 dest.insert(row_id);
@@ -10111,6 +10111,28 @@ mod tests {
             (1, 0),
             "the stamp is read under the lock that orders the ended records"
         );
+    }
+
+    #[test]
+    fn collecting_hot_ids_into_a_set_holding_them_does_not_grow_it() {
+        let store = VersionStore::with_visibility_checker(
+            "t".to_string(),
+            test_schema(),
+            Arc::new(TestVisibilityChecker::new()) as Arc<dyn VisibilityChecker>,
+        );
+        for row_id in 1..=10_000 {
+            store.add_version(
+                row_id,
+                RowVersion::new(1, Row::from(vec![Value::from(row_id)])),
+            );
+        }
+        let mut dest: crate::common::KeySet<i64> = (1..=10_000).collect();
+        let capacity = dest.capacity();
+        store.collect_decided_row_ids_into(Reader::from(5), &mut dest);
+        assert_eq!(dest.capacity(), capacity, "decided ids");
+        store.collect_seen_row_ids_into(Reader::from(5), &mut dest);
+        assert_eq!(dest.capacity(), capacity, "seen ids");
+        assert_eq!(dest.len(), 10_000);
     }
 
     /// Rows 1.. written by `txns` in order, classified under a snapshot:
