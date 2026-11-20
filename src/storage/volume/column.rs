@@ -417,14 +417,14 @@ impl ColumnData {
         &self,
         positions: impl Iterator<Item = usize>,
     ) -> (Vec<usize>, Option<usize>) {
+        use crate::common::KeySet;
         use ahash::AHashSet;
-        use rustc_hash::FxHashSet;
         /// Stored words seen, the recent ones in a direct-mapped table that
         /// answers a repeat before the set is probed
         #[derive(Default)]
         struct Seen {
             recent: Vec<u64>,
-            set: FxHashSet<u64>,
+            set: KeySet<u64>,
         }
         impl Seen {
             const RECENT: usize = 4096;

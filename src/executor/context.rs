@@ -20,11 +20,11 @@
 use crate::common::deadline::Deadline;
 pub use crate::common::deadline::DeadlineSite;
 use crate::common::time_compat::Instant;
+use crate::common::KeyMap;
 use crate::storage::mvcc::commit_log::HistoricalCut;
 use crate::storage::mvcc::registry::StatementView;
 use crate::storage::traits::transaction::{StatementTable, TableUse};
 use lru::LruCache;
-use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::num::NonZeroUsize;
 use std::sync::atomic::AtomicUsize;
@@ -286,7 +286,7 @@ pub enum ExistsOutcome {
 /// key holds an error
 #[derive(Debug, Default)]
 pub struct ExistsKeys {
-    pub outcomes: FxHashMap<SmallVec<[Value; 1]>, ExistsOutcome>,
+    pub outcomes: KeyMap<SmallVec<[Value; 1]>, ExistsOutcome>,
     pub failed: bool,
     /// The row ids of the keys that passed, which a NOT EXISTS read by the
     /// primary key leaves out, collected once for every run
@@ -369,7 +369,7 @@ fn one_value_against_rows() -> crate::core::Error {
 }
 
 /// A correlated IN block's members grouped by key
-pub type MemberKeys = FxHashMap<SmallVec<[Value; 1]>, KeptMembers>;
+pub type MemberKeys = KeyMap<SmallVec<[Value; 1]>, KeptMembers>;
 
 /// A value block's members as one answer keeps them, and the row ids a
 /// NOT IN read by the primary key leaves out, collected once for every run
@@ -443,7 +443,7 @@ impl BlockOrigin<'_> {
 
     /// The cache key, taken without allocation
     pub fn key(&self) -> u64 {
-        let mut hasher = rustc_hash::FxHasher::default();
+        let mut hasher = crate::common::KeyHasher::default();
         self.block_key.hash(&mut hasher);
         self.scopes.hash(&mut hasher);
         self.read_params().count().hash(&mut hasher);

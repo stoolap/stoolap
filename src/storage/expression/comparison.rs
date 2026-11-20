@@ -20,8 +20,8 @@
 
 use std::any::Any;
 
+use crate::common::KeyMap;
 use chrono::{DateTime, Utc};
-use rustc_hash::FxHashMap;
 
 use super::{find_column_index, resolve_alias, Expression};
 use crate::common::SmartString;
@@ -103,7 +103,7 @@ pub struct ComparisonExpr {
     col_index: Option<usize>,
 
     /// Column aliases
-    aliases: FxHashMap<String, String>,
+    aliases: KeyMap<String, String>,
     /// Original column name if using alias
     original_column: Option<String>,
 }
@@ -117,7 +117,7 @@ impl ComparisonExpr {
             value: ComparisonValue::from_value(&value),
             original_value: value,
             col_index: None,
-            aliases: FxHashMap::default(),
+            aliases: KeyMap::default(),
             original_column: None,
         }
     }
@@ -367,7 +367,7 @@ impl Expression for ComparisonExpr {
         }
     }
 
-    fn with_aliases(&self, aliases: &FxHashMap<String, String>) -> Box<dyn Expression> {
+    fn with_aliases(&self, aliases: &KeyMap<String, String>) -> Box<dyn Expression> {
         let resolved = resolve_alias(&self.column, aliases);
         let mut expr = self.clone();
 
@@ -624,7 +624,7 @@ mod tests {
         let schema = test_schema();
         let row = test_row();
 
-        let mut aliases = FxHashMap::default();
+        let mut aliases = KeyMap::default();
         aliases.insert("n".to_string(), "name".to_string());
 
         let expr = ComparisonExpr::eq("n", Value::text("Alice"));

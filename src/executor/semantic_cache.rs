@@ -75,8 +75,8 @@
 //! Future enhancement: Per-transaction cache scoping with timestamp-based invalidation
 
 use crate::common::time_compat::Instant;
+use crate::common::{KeyHasher, KeyMap};
 use parking_lot::RwLock;
-use rustc_hash::{FxHashMap, FxHasher};
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -250,7 +250,7 @@ pub enum SubsumptionResult {
 pub struct SemanticCache {
     /// Cached results: table_name -> (hash of the column names in order -> `Vec<CachedResult>`)
     /// Nested structure enables O(1) table invalidation
-    cache: RwLock<StringMap<FxHashMap<u64, Vec<CachedResult>>>>,
+    cache: RwLock<StringMap<KeyMap<u64, Vec<CachedResult>>>>,
     /// Maximum cache size per table+column combination
     max_size: usize,
     /// Cache TTL
@@ -565,7 +565,7 @@ impl SemanticCache {
     /// Evict entries across all tables using global LRU until rows_to_free rows are freed
     fn evict_global_lru(
         &self,
-        cache: &mut StringMap<FxHashMap<u64, Vec<CachedResult>>>,
+        cache: &mut StringMap<KeyMap<u64, Vec<CachedResult>>>,
         mut rows_to_free: usize,
         skip_table: &str,
     ) {
@@ -719,7 +719,7 @@ impl SemanticCache {
     /// Returns (table_key, column_key) for the nested cache structure; an
     /// entry's own column names decide a match, so equal hashes may share
     fn cache_keys<'a>(table_name: &'a str, columns: &[String]) -> (Cow<'a, str>, u64) {
-        let mut hasher = FxHasher::default();
+        let mut hasher = KeyHasher::default();
         columns.hash(&mut hasher);
         (to_lowercase_cow(table_name), hasher.finish())
     }
@@ -750,14 +750,14 @@ impl Default for SemanticCache {
 /// This allows matching predicates like:
 /// - `col > 100` and `col > 200` (same structure, different values)
 ///
-/// Uses FxHasher which is 2-5x faster than SipHash for small keys.
+/// Uses KeyHasher which is 2-5x faster than SipHash for small keys.
 fn hash_predicate_structure(expr: &Expression) -> u64 {
-    let mut hasher = FxHasher::default();
+    let mut hasher = KeyHasher::default();
     hash_expr_structure(expr, &mut hasher);
     hasher.finish()
 }
 
-fn hash_expr_structure(expr: &Expression, hasher: &mut FxHasher) {
+fn hash_expr_structure(expr: &Expression, hasher: &mut KeyHasher) {
     match expr {
         Expression::Identifier(ident) => {
             0u8.hash(hasher);

@@ -733,7 +733,7 @@ impl VolumeFileWriter {
         );
         store.check_blocks(crcs);
         store.build_from_row_ids(meta.row_id_column, &meta.row_ids);
-        let mut unique_indices = rustc_hash::FxHashMap::default();
+        let mut unique_indices = crate::common::KeyMap::default();
         for UniqueIndexing {
             columns,
             mut entries,

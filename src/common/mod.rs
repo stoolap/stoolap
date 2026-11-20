@@ -25,6 +25,7 @@ pub mod compact_arc;
 pub mod compact_vec;
 pub mod cow_btree;
 pub(crate) mod deadline;
+pub mod hash;
 pub mod i64_map;
 pub mod maps;
 pub(crate) mod names;
@@ -36,9 +37,11 @@ pub mod version;
 pub use compact_arc::{CompactArc, CompactArcDrop};
 pub use compact_vec::CompactVec;
 pub use cow_btree::{CowBTree, LeafCursor};
+pub use hash::KeyHasher;
 pub use i64_map::{I64Map, I64Set};
 pub use maps::{
-    new_cow_btree_map, new_i64_map, new_i64_map_with_capacity, CowBTreeMap, StringMap, StringSet,
+    new_cow_btree_map, new_i64_map, new_i64_map_with_capacity, CowBTreeMap, KeyMap, KeySet,
+    KeyState, StringMap, StringSet,
 };
 pub use smart_string::SmartString;
 pub use version::{version, version_info, BUILD_TIME, GIT_COMMIT, MAJOR, MINOR, PATCH};

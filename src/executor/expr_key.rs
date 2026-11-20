@@ -18,7 +18,6 @@
 use std::hash::{Hash, Hasher};
 
 use ahash::AHasher;
-use rustc_hash::FxHasher;
 
 use crate::core::Value;
 use crate::parser::ast::{
@@ -104,7 +103,7 @@ impl ExprKey {
 
 /// Feeds every write to two hashers of different families
 struct KeyHasher {
-    fx: FxHasher,
+    fx: crate::common::KeyHasher,
     a: AHasher,
     /// Names keep their quoting and qualification, see [`ExprKey::exact`]
     exact: bool,
@@ -128,7 +127,7 @@ impl Hasher for KeyHasher {
 impl KeyHasher {
     fn new() -> Self {
         KeyHasher {
-            fx: FxHasher::default(),
+            fx: crate::common::KeyHasher::default(),
             a: AHasher::default(),
             exact: false,
             by_column_name: false,

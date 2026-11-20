@@ -37,7 +37,7 @@
 //! )?;
 //! ```
 
-use rustc_hash::FxHashMap;
+use crate::common::KeyMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -309,21 +309,21 @@ macro_rules! params {
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct NamedParams {
-    params: FxHashMap<String, Value>,
+    params: KeyMap<String, Value>,
 }
 
 impl NamedParams {
     /// Create empty named params
     pub fn new() -> Self {
         Self {
-            params: FxHashMap::default(),
+            params: KeyMap::default(),
         }
     }
 
     /// Create empty named params with pre-allocated capacity
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            params: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
+            params: KeyMap::with_capacity_and_hasher(capacity, Default::default()),
         }
     }
 
@@ -338,13 +338,13 @@ impl NamedParams {
         self.params.insert(name.into(), value.to_param());
     }
 
-    /// Get the underlying FxHashMap
-    pub fn into_inner(self) -> FxHashMap<String, Value> {
+    /// Get the underlying KeyMap
+    pub fn into_inner(self) -> KeyMap<String, Value> {
         self.params
     }
 
-    /// Get a reference to the underlying FxHashMap
-    pub fn as_map(&self) -> &FxHashMap<String, Value> {
+    /// Get a reference to the underlying KeyMap
+    pub fn as_map(&self) -> &KeyMap<String, Value> {
         &self.params
     }
 }

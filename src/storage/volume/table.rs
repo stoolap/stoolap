@@ -31,7 +31,7 @@ use std::sync::Arc;
 use crate::common::deadline::{Deadline, DeadlineSite, CHARGE_BEAT};
 use crate::common::names::eq_names;
 use crate::common::{CompactArc, I64Set};
-use rustc_hash::{FxHashMap, FxHashSet};
+use crate::common::{KeyMap, KeySet};
 
 use crate::core::value::compare_floats;
 use crate::core::{
@@ -71,7 +71,7 @@ enum SideDecision {
 /// A sealed row found by its id, with the segment map it was found in, so
 /// the row reads through the mapping of the segment that holds it
 struct SegmentRow {
-    segs: Arc<rustc_hash::FxHashMap<u64, super::manifest::ColdSegment>>,
+    segs: Arc<crate::common::KeyMap<u64, super::manifest::ColdSegment>>,
     seg_id: u64,
     volume: Arc<FrozenVolume>,
     idx: usize,
@@ -88,7 +88,7 @@ impl SegmentRow {
 
 /// The tombstones and the volumes an aggregate reads, taken together
 type ColdView = (
-    Arc<rustc_hash::FxHashMap<i64, u64>>,
+    Arc<crate::common::KeyMap<i64, u64>>,
     Arc<Vec<(u64, super::manifest::ColdSegment)>>,
 );
 
@@ -711,9 +711,9 @@ enum ZoneBound<'z> {
 #[derive(Default)]
 struct ColdPrepare {
     /// The rows the setter ran on, with the volume each was read from
-    visited: FxHashMap<i64, u64>,
+    visited: KeyMap<i64, u64>,
     /// The volumes walked whole at a settled generation
-    seen_segments: FxHashSet<u64>,
+    seen_segments: KeySet<u64>,
     changes: Vec<ColdChange>,
     /// The ids named by the statement that no cold volume holds
     hot_ids: Vec<i64>,
@@ -726,7 +726,7 @@ struct RoundSeen {
     /// The hot store's publish epoch before the round's hot checks
     quiet: Option<u64>,
     /// The committed tombstones the round read with no snapshot filter
-    tombstones: Option<Arc<FxHashMap<i64, u64>>>,
+    tombstones: Option<Arc<KeyMap<i64, u64>>>,
 }
 
 /// What the cold half of an UPDATE prepared, held with the seal fence
@@ -736,7 +736,7 @@ struct PreparedCold<'m> {
     /// The ids named by the statement that no cold volume holds
     hot_ids: Vec<i64>,
     /// Every row the setter ran on, changed or not
-    visited: FxHashMap<i64, u64>,
+    visited: KeyMap<i64, u64>,
 }
 
 /// A sealed row a DELETE takes away, with the volume it was read from and
@@ -779,9 +779,9 @@ fn cold_keys_changed(hot: &dyn Table, changes: &[ColdChange]) -> Result<bool> {
 #[derive(Default)]
 struct ColdDeletes {
     /// The rows earlier rounds prepared, filled only once a round repeats
-    prepared: FxHashSet<i64>,
+    prepared: KeySet<i64>,
     /// The volumes walked whole at a settled generation
-    seen_segments: FxHashSet<u64>,
+    seen_segments: KeySet<u64>,
     deletes: ColdDeleteRows,
     /// The ids named that no cold volume holds, when the caller wants them
     hot_ids: Option<Vec<i64>>,
@@ -895,8 +895,8 @@ impl SegmentedTable {
             let cold_skip = offset.saturating_sub(hot_count);
             // Short of the target, the hot read returned every hot row it
             // shows: those, not the hot store's ids, hide their sealed copies
-            let mut hot_skip: FxHashSet<i64> =
-                FxHashSet::with_capacity_and_hasher(hot_count, Default::default());
+            let mut hot_skip: KeySet<i64> =
+                KeySet::with_capacity_and_hasher(hot_count, Default::default());
             for &(id, _) in &hot_rows {
                 hot_skip.insert(id);
             }
@@ -1073,8 +1073,8 @@ impl SegmentedTable {
             let cut = self.read_cut();
             let hot_rows = self.hot_rows(where_expr, access, deadline)?;
 
-            let mut skip: FxHashSet<i64> =
-                FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
+            let mut skip: KeySet<i64> =
+                KeySet::with_capacity_and_hasher(hot_rows.len(), Default::default());
             for &(id, _) in &hot_rows {
                 skip.insert(id);
             }
@@ -1111,8 +1111,8 @@ impl SegmentedTable {
             let cut = self.read_cut();
             let hot_rows = self.hot_rows(None, ScanAccess::Seq, deadline)?;
 
-            let mut skip: FxHashSet<i64> =
-                FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
+            let mut skip: KeySet<i64> =
+                KeySet::with_capacity_and_hasher(hot_rows.len(), Default::default());
             for &(id, _) in &hot_rows {
                 skip.insert(id);
             }
@@ -1130,7 +1130,7 @@ impl SegmentedTable {
     /// the volumes' row ids; None when a seal moved past `generation`
     fn count_cold_rows(
         &self,
-        hot_skip: &FxHashSet<i64>,
+        hot_skip: &KeySet<i64>,
         generation: u64,
         cut: &CommitCut,
         deadline: Deadline,
@@ -1456,7 +1456,7 @@ impl SegmentedTable {
     /// published, then into `hot_skip` the hot ids that hide sealed copies.
     /// `lazy` leaves cold volumes unloaded. The caller checks the seal
     /// generation after it
-    fn cold_view(&self, hot_skip: &mut FxHashSet<i64>, lazy: bool) -> Result<ColdView> {
+    fn cold_view(&self, hot_skip: &mut KeySet<i64>, lazy: bool) -> Result<ColdView> {
         let tombstones = self.segment_mgr.tombstone_set_arc();
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::cold_view_begun();
@@ -1515,7 +1515,7 @@ impl SegmentedTable {
             }
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::hot_and_cold_reads_split();
-            let mut hot_skip: FxHashSet<i64> = FxHashSet::default();
+            let mut hot_skip: KeySet<i64> = KeySet::default();
             let (tombstones, volumes) = self.cold_view(&mut hot_skip, false)?;
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::merged_read_collected();
@@ -1550,7 +1550,7 @@ impl SegmentedTable {
         cs: &super::manifest::ColdSegment,
         side: Option<&SideIndexDef>,
         (col_idx, data_type, default, with_null): (usize, DataType, &Value, bool),
-        (tombstones, hot_skip, cut): (&FxHashMap<i64, u64>, &FxHashSet<i64>, &CommitCut),
+        (tombstones, hot_skip, cut): (&KeyMap<i64, u64>, &KeySet<i64>, &CommitCut),
         distinct: &mut ValueSet,
         deadline: Deadline,
     ) -> Result<()> {
@@ -1743,8 +1743,8 @@ impl SegmentedTable {
     fn shown_rows(
         &self,
         cs: &super::manifest::ColdSegment,
-        tombstones: &FxHashMap<i64, u64>,
-        hot_skip: &FxHashSet<i64>,
+        tombstones: &KeyMap<i64, u64>,
+        hot_skip: &KeySet<i64>,
         cut: &CommitCut,
         deadline: Deadline,
     ) -> Result<Option<Vec<u64>>> {
@@ -1920,7 +1920,7 @@ impl SegmentedTable {
     #[inline]
     fn is_row_tombstoned(
         &self,
-        tombstones: &FxHashMap<i64, u64>,
+        tombstones: &KeyMap<i64, u64>,
         row_id: i64,
         cut: &CommitCut,
     ) -> bool {
@@ -1938,8 +1938,8 @@ impl SegmentedTable {
         cs: &super::manifest::ColdSegment,
         i: usize,
         row_id: i64,
-        tombstones: &FxHashMap<i64, u64>,
-        hot_skip: &FxHashSet<i64>,
+        tombstones: &KeyMap<i64, u64>,
+        hot_skip: &KeySet<i64>,
         cut: &CommitCut,
     ) -> bool {
         cs.is_visible(i)
@@ -1974,8 +1974,8 @@ impl SegmentedTable {
         if self.seal_moved(generation) {
             return Ok(None);
         }
-        let mut hot_skip: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+        let mut hot_skip: KeySet<i64> =
+            KeySet::with_capacity_and_hasher(10_000, Default::default());
         for id in &hot_ids {
             hot_skip.insert(*id);
         }
@@ -2028,7 +2028,7 @@ impl SegmentedTable {
         &self,
         (seg_id, cs): &(u64, super::manifest::ColdSegment),
         (col_idx, partition_value, default_val): (usize, &Value, &Value),
-        (tombstones, hot_skip, cut): (&FxHashMap<i64, u64>, &FxHashSet<i64>, &CommitCut),
+        (tombstones, hot_skip, cut): (&KeyMap<i64, u64>, &KeySet<i64>, &CommitCut),
         result: &mut RowVec,
         deadline: Deadline,
     ) -> Result<()> {
@@ -2177,8 +2177,8 @@ impl SegmentedTable {
 
         // Build hot_skip: hot row_ids + tombstones + pending tombstones
         // Lazy: prune by zone maps on the partition column before loading cold volumes.
-        let mut hot_skip: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+        let mut hot_skip: KeySet<i64> =
+            KeySet::with_capacity_and_hasher(10_000, Default::default());
         let (tombstones_arc, volumes) = self.cold_view(&mut hot_skip, true)?;
         if self.seal_moved(generation) {
             return Ok(None);
@@ -2212,8 +2212,8 @@ impl SegmentedTable {
         &self,
         cs: &super::manifest::ColdSegment,
         row_ids: &RowIds,
-        tombstones: &FxHashMap<i64, u64>,
-        hot_skip: &FxHashSet<i64>,
+        tombstones: &KeyMap<i64, u64>,
+        hot_skip: &KeySet<i64>,
         cut: &CommitCut,
         deadline: Deadline,
     ) -> Result<bool> {
@@ -2278,8 +2278,8 @@ impl SegmentedTable {
         // Inside an explicit transaction, uncommitted UPDATEs create pending
         // local versions that shadow cold rows. has_row_id only sees committed
         // rows, so we also need pending tombstones to skip rows being modified.
-        let mut hot_skip: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+        let mut hot_skip: KeySet<i64> =
+            KeySet::with_capacity_and_hasher(10_000, Default::default());
         self.hot.collect_hot_row_ids_into(&mut hot_skip);
         self.segment_mgr
             .insert_pending_tombstones_into(self.pending(), &mut hot_skip);
@@ -2582,7 +2582,7 @@ impl SegmentedTable {
                     },
                     changes: Vec::new(),
                     hot_ids: ids.map(<[i64]>::to_vec).unwrap_or_default(),
-                    visited: FxHashMap::default(),
+                    visited: KeyMap::default(),
                 });
             }
             drop(guard);
@@ -2685,7 +2685,7 @@ impl SegmentedTable {
 
     /// The committed tombstones a round that stood read, when this handle
     /// reads them with no snapshot filter and its cut counted every one
-    fn unfiltered_tombstones(&self, held: &HeldRound<'_>) -> Option<Arc<FxHashMap<i64, u64>>> {
+    fn unfiltered_tombstones(&self, held: &HeldRound<'_>) -> Option<Arc<KeyMap<i64, u64>>> {
         if self.snapshot_seq.is_some() || !held.whole {
             return None;
         }
@@ -2801,8 +2801,8 @@ impl SegmentedTable {
         deadline: Deadline,
     ) -> Result<()> {
         let tombstones_arc = Arc::clone(&snap.tombstones);
-        let mut hot_skip: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+        let mut hot_skip: KeySet<i64> =
+            KeySet::with_capacity_and_hasher(10_000, Default::default());
         self.hot.collect_hot_row_ids_into(&mut hot_skip);
         self.segment_mgr
             .insert_pending_tombstones_into(self.pending(), &mut hot_skip);
@@ -4300,8 +4300,8 @@ impl SegmentedTable {
             let cut = self.read_cut();
             let hot_rows = self.hot_rows(where_expr, access, deadline)?;
 
-            let mut skip: FxHashSet<i64> =
-                FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
+            let mut skip: KeySet<i64> =
+                KeySet::with_capacity_and_hasher(hot_rows.len(), Default::default());
             for &(id, _) in &hot_rows {
                 skip.insert(id);
             }
@@ -4341,7 +4341,7 @@ impl SegmentedTable {
         column_indices: &[usize],
         needed: Option<&[bool]>,
         where_expr: Option<&dyn Expression>,
-        hot_skip: FxHashSet<i64>,
+        hot_skip: KeySet<i64>,
         generation: u64,
         cut: CommitCut,
         deadline: Deadline,
@@ -4506,7 +4506,7 @@ impl SegmentedTable {
     fn collect_cold_rows(
         &self,
         where_expr: Option<&dyn Expression>,
-        hot_skip: FxHashSet<i64>,
+        hot_skip: KeySet<i64>,
         generation: u64,
         at: Option<&ReadPoint>,
         cut: &CommitCut,
@@ -5000,7 +5000,7 @@ impl SegmentedTable {
             return Ok(());
         }
         let mut located: Vec<(u64, usize, i64)> = Vec::new();
-        let mut segments: FxHashMap<u64, super::manifest::ColdSegment> = FxHashMap::default();
+        let mut segments: KeyMap<u64, super::manifest::ColdSegment> = KeyMap::default();
         for ids in ids.chunks(CHARGE_BEAT) {
             deadline.charge(DeadlineSite::StorageDelete, ids.len())?;
             for &row_id in ids {
@@ -5054,7 +5054,7 @@ impl SegmentedTable {
     ) -> Result<()> {
         let volumes = snap.volumes_newest_first();
         // Only the volumes read it: without one, gathering every hot row id is waste
-        let mut hot_skip: FxHashSet<i64> = FxHashSet::default();
+        let mut hot_skip: KeySet<i64> = KeySet::default();
         if !volumes.is_empty() {
             hot_skip.reserve(10_000);
             self.hot.collect_hot_row_ids_into(&mut hot_skip);
@@ -6082,15 +6082,15 @@ impl Table for SegmentedTable {
             // Collect hot row_ids from actual hot scan results to prevent the
             // seal race (remove_moved_rows between check and hot scan).
             let tombstones_arc = &view.ts;
-            let mut hot_skip: FxHashSet<i64> =
-                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+            let mut hot_skip: KeySet<i64> =
+                KeySet::with_capacity_and_hasher(10_000, Default::default());
             self.hot.collect_hot_row_ids_into(&mut hot_skip);
             self.segment_mgr
                 .insert_pending_tombstones_into(self.pending(), &mut hot_skip);
 
             let total_cold_rows: usize =
                 view.volumes().map(|(_, cs)| cs.volume.meta.row_count).sum();
-            let mut authority: FxHashMap<i64, usize> = FxHashMap::with_capacity_and_hasher(
+            let mut authority: KeyMap<i64, usize> = KeyMap::with_capacity_and_hasher(
                 total_cold_rows.min(500_000) * 8 / 7 + 16,
                 Default::default(),
             );
@@ -6305,7 +6305,7 @@ impl Table for SegmentedTable {
         })
     }
 
-    fn collect_hot_row_ids_into(&self, dest: &mut FxHashSet<i64>) {
+    fn collect_hot_row_ids_into(&self, dest: &mut KeySet<i64>) {
         self.hot.collect_hot_row_ids_into(dest);
     }
 
@@ -6495,8 +6495,8 @@ impl Table for SegmentedTable {
             }
 
             // Tombstones exist: scan columnar data with dedup (avoids full Row materialization)
-            let mut hot_skip: FxHashSet<i64> =
-                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+            let mut hot_skip: KeySet<i64> =
+                KeySet::with_capacity_and_hasher(10_000, Default::default());
             let (tombstones_arc, volumes) = self.cold_view(&mut hot_skip, false)?;
             if self.seal_moved(generation) {
                 return Ok(None);
@@ -6661,8 +6661,8 @@ impl Table for SegmentedTable {
             // Scan columnar data with dedup (typed direct access, no Value
             // alloc). Zone maps prune the volumes that cannot hold a better
             // candidate: the visible minimum is at least the zone minimum
-            let mut hot_skip: FxHashSet<i64> =
-                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+            let mut hot_skip: KeySet<i64> =
+                KeySet::with_capacity_and_hasher(10_000, Default::default());
             let (tombstones_arc, volumes) = self.cold_view(&mut hot_skip, false)?;
             if self.seal_moved(generation) {
                 return Ok(None);
@@ -6936,8 +6936,8 @@ impl Table for SegmentedTable {
             }
 
             // See min_column: same zone-map + typed scan strategy for MAX.
-            let mut hot_skip: FxHashSet<i64> =
-                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+            let mut hot_skip: KeySet<i64> =
+                KeySet::with_capacity_and_hasher(10_000, Default::default());
             let (tombstones_arc, volumes) = self.cold_view(&mut hot_skip, false)?;
             if self.seal_moved(generation) {
                 return Ok(None);
@@ -7198,8 +7198,8 @@ impl Table for SegmentedTable {
             }
 
             // Build hot_skip: hot row_ids + tombstones + pending tombstones
-            let mut hot_skip: FxHashSet<i64> =
-                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+            let mut hot_skip: KeySet<i64> =
+                KeySet::with_capacity_and_hasher(10_000, Default::default());
             let (tombstones_arc, volumes) = self.cold_view(&mut hot_skip, false)?;
             if self.seal_moved(generation) {
                 return Ok(None);
@@ -7342,8 +7342,8 @@ impl Table for SegmentedTable {
 
             // 2. Build skip set from ALL hot row IDs (no Row materialization).
             //    Hot rows shadow cold rows regardless of whether they're in the merge set.
-            let mut skip: FxHashSet<i64> =
-                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+            let mut skip: KeySet<i64> =
+                KeySet::with_capacity_and_hasher(10_000, Default::default());
             self.hot.collect_hot_row_ids_into(&mut skip);
             self.segment_mgr
                 .insert_pending_tombstones_into(self.pending(), &mut skip);
@@ -7762,8 +7762,8 @@ impl Table for SegmentedTable {
                     .hot
                     .collect_access_rows(ScanAccess::Seq, where_expr, deadline)?,
             };
-            let mut hot_skip: FxHashSet<i64> =
-                FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
+            let mut hot_skip: KeySet<i64> =
+                KeySet::with_capacity_and_hasher(hot_rows.len(), Default::default());
             let mut keep = TopK::new(needed, col_idx, ascending, nulls_first);
             for (row_id, row) in hot_rows {
                 hot_skip.insert(row_id);
@@ -8556,7 +8556,7 @@ impl Table for SegmentedTable {
     fn rows_at(
         &self,
         point: &ReadPoint,
-        authority: Option<&mut FxHashSet<i64>>,
+        authority: Option<&mut KeySet<i64>>,
         deadline: Deadline,
     ) -> Result<RowVec> {
         #[cfg(feature = "test-failpoints")]
@@ -8577,7 +8577,7 @@ impl Table for SegmentedTable {
         self.across_seals(|generation| {
             #[cfg(any(test, feature = "test-failpoints"))]
             crate::test_failpoints::merged_read_began();
-            let mut decided = FxHashSet::default();
+            let mut decided = KeySet::default();
             let hot_rows = self.hot.rows_at(point, Some(&mut decided), deadline)?;
             if let Some(authority) = authority.as_deref_mut() {
                 authority.extend(decided.iter().copied());
@@ -8600,7 +8600,7 @@ impl Table for SegmentedTable {
             // it raised the mark before its rewrite was visible
             self.hot.check_history(point)?;
             // Newest volume first: a row id answers once
-            let mut seen = FxHashSet::default();
+            let mut seen = KeySet::default();
             let mut rows = RowVec::with_capacity(hot_rows.len() + cold_rows.len());
             for (row_id, row) in cold_rows {
                 if seen.insert(row_id) {
@@ -8728,8 +8728,8 @@ impl Table for SegmentedTable {
             let hot_rows =
                 self.hot
                     .collect_access_rows(ScanAccess::Seq, Some(where_expr), deadline)?;
-            let mut hot_skip: FxHashSet<i64> =
-                FxHashSet::with_capacity_and_hasher(hot_rows.len().max(1024), Default::default());
+            let mut hot_skip: KeySet<i64> =
+                KeySet::with_capacity_and_hasher(hot_rows.len().max(1024), Default::default());
             for (row_id, row) in &hot_rows {
                 hot_skip.insert(*row_id);
                 aggregate_row(&mut groups, &[], aggregates, row.as_slice());
@@ -9029,8 +9029,8 @@ impl Table for SegmentedTable {
                         preds: &[PhysPred],
                         walk: &mut super::secondary::SideWalk,
                         (tombstones, hot_skip, cut, deadline): (
-                            &FxHashMap<i64, u64>,
-                            &FxHashSet<i64>,
+                            &KeyMap<i64, u64>,
+                            &KeySet<i64>,
                             &CommitCut,
                             Deadline,
                         ),
@@ -9340,8 +9340,8 @@ impl Table for SegmentedTable {
             }
 
             // ---- Process cold volumes (columnar fast path) ----
-            let mut hot_skip: FxHashSet<i64> =
-                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+            let mut hot_skip: KeySet<i64> =
+                KeySet::with_capacity_and_hasher(10_000, Default::default());
             let (tombstones_arc, volumes) = self.cold_view(&mut hot_skip, false)?;
             if self.seal_moved(generation) {
                 return Ok(None);
@@ -9424,7 +9424,7 @@ impl Table for SegmentedTable {
                                 }
                             }
                         } else {
-                            let mut known: FxHashMap<i64, u32> = FxHashMap::default();
+                            let mut known: KeyMap<i64, u32> = KeyMap::default();
                             let mut null_group: Option<u32> = None;
                             for rows in row_groups(start..end) {
                                 deadline.charge(DeadlineSite::StorageAggregate, rows.len())?;
@@ -9941,7 +9941,7 @@ mod tests {
         fn get_active_row_ids(&self, _: Deadline) -> Result<Vec<i64>> {
             Ok(self.rows.iter().map(|(id, _)| *id).collect())
         }
-        fn collect_hot_row_ids_into(&self, dest: &mut rustc_hash::FxHashSet<i64>) {
+        fn collect_hot_row_ids_into(&self, dest: &mut crate::common::KeySet<i64>) {
             for (id, _) in &self.rows {
                 dest.insert(*id);
             }

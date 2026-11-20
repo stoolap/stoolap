@@ -175,11 +175,11 @@ pub struct VolumeScanner {
     visibility_bitmap: Option<Arc<Vec<u64>>>,
     /// Per-transaction pending cold deletes (deferred, not yet in shared DV).
     /// The owning transaction sees these as deleted; other transactions don't.
-    pending_cold_deletes: Option<Arc<rustc_hash::FxHashSet<i64>>>,
+    pending_cold_deletes: Option<Arc<crate::common::KeySet<i64>>>,
     /// Committed tombstones (shared, immutable Arc reference — no clone).
     /// Kept separate from pending_cold_deletes to avoid cloning the tombstone set.
     /// Map: row_id → commit_seq (for snapshot isolation filtering).
-    committed_tombstones: Option<Arc<rustc_hash::FxHashMap<i64, u64>>>,
+    committed_tombstones: Option<Arc<crate::common::KeyMap<i64, u64>>>,
     /// The next 64 ids of a linear scan, loaded as it reaches them when
     /// tombstones or pending deletes make it read every row's id
     group_ids: super::row_ids::GroupRowIds,
@@ -638,8 +638,8 @@ impl VolumeScanner {
     /// This avoids cloning the potentially large committed tombstone set.
     pub fn set_skip_sets(
         &mut self,
-        committed: Arc<rustc_hash::FxHashMap<i64, u64>>,
-        dynamic: Arc<rustc_hash::FxHashSet<i64>>,
+        committed: Arc<crate::common::KeyMap<i64, u64>>,
+        dynamic: Arc<crate::common::KeySet<i64>>,
     ) {
         // An empty set skips nothing, so a row's id is read only when one is not
         self.committed_tombstones = (!committed.is_empty()).then_some(committed);
@@ -678,7 +678,7 @@ impl VolumeScanner {
                     file_identity: std::sync::OnceLock::new(),
                 }),
                 unique_indices: std::sync::Arc::new(super::writer::UniqueIndexes::new(
-                    rustc_hash::FxHashMap::default(),
+                    crate::common::KeyMap::default(),
                 )),
                 last_access_epoch: std::sync::atomic::AtomicU64::new(0),
             }),

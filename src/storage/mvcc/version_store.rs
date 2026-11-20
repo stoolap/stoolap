@@ -40,6 +40,7 @@ use crate::common::SmartString;
 use crate::common::{
     new_cow_btree_map, new_i64_map, new_i64_map_with_capacity, CompactArc, CowBTreeMap, I64Map,
 };
+use crate::common::{KeyMap, KeySet};
 use crate::core::types::DataType;
 use crate::core::{Error, Row, RowVec, Schema, SumAccumulator, Value, NULL_VALUE};
 use crate::functions::aggregate::{CallTemplate, ColumnsKey, CompiledAggregate, GroupedAggregates};
@@ -56,7 +57,6 @@ use crate::storage::volume::side_index::SideIndexDef;
 use crate::storage::Index;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
-use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::{smallvec, SmallVec};
 
 /// Type alias for version lists - uses SmallVec to avoid heap allocation
@@ -1609,9 +1609,9 @@ pub struct VersionStore {
     table_name: SmartString,
     /// Table schema (Arc for zero-cost cloning on read)
     schema: RwLock<CompactArc<Schema>>,
-    /// Indexes on this table (FxHashMap for fast string key lookups), each
+    /// Indexes on this table (KeyMap for fast string key lookups), each
     /// with its definition's identity
-    indexes: RwLock<FxHashMap<String, IndexEntry>>,
+    indexes: RwLock<KeyMap<String, IndexEntry>>,
     /// Whether this store has been closed
     closed: AtomicBool,
     /// Whether the open left one of the table's listed volumes unloaded; the
@@ -1853,7 +1853,7 @@ impl VersionStore {
             versions,
             table_name: table_name.into(),
             schema: RwLock::new(CompactArc::new(schema)),
-            indexes: RwLock::new(FxHashMap::default()),
+            indexes: RwLock::new(KeyMap::default()),
             closed: AtomicBool::new(false),
             cold_unavailable: AtomicBool::new(false),
             auto_increment_counter: AtomicI64::new(0),
@@ -1900,7 +1900,7 @@ impl VersionStore {
             versions,
             table_name: table_name.into(),
             schema: RwLock::new(CompactArc::new(schema)),
-            indexes: RwLock::new(FxHashMap::default()),
+            indexes: RwLock::new(KeyMap::default()),
             closed: AtomicBool::new(false),
             cold_unavailable: AtomicBool::new(false),
             auto_increment_counter: AtomicI64::new(0),
@@ -2619,7 +2619,7 @@ impl VersionStore {
     pub fn rows_at(
         &self,
         point: &ReadPoint,
-        mut authority: Option<&mut FxHashSet<i64>>,
+        mut authority: Option<&mut KeySet<i64>>,
         deadline: Deadline,
     ) -> Result<RowVec, Error> {
         self.check_history(point)?;
@@ -3967,13 +3967,14 @@ impl VersionStore {
     pub fn collect_decided_row_ids_into(
         &self,
         reader: Reader<'_>,
-        dest: &mut rustc_hash::FxHashSet<i64>,
+        dest: &mut crate::common::KeySet<i64>,
     ) {
         if self.closed.load(Ordering::Acquire) {
             return;
         }
         let versions = self.versions.read();
         if self.publish_epoch_if_quiet().is_some() {
+            dest.reserve(versions.len());
             for key in versions.keys() {
                 dest.insert(key);
             }
@@ -4011,7 +4012,7 @@ impl VersionStore {
     pub fn collect_seen_row_ids_into(
         &self,
         reader: Reader<'_>,
-        dest: &mut rustc_hash::FxHashSet<i64>,
+        dest: &mut crate::common::KeySet<i64>,
     ) {
         if self.closed.load(Ordering::Acquire) {
             return;
@@ -4021,6 +4022,7 @@ impl VersionStore {
         };
         let checker = reader.over(&**checker);
         let versions = self.versions.read();
+        dest.reserve(versions.len());
         for (&row_id, chain) in versions.iter() {
             if chain_seen(&checker, reader.txn_id, chain) {
                 dest.insert(row_id);
@@ -5969,7 +5971,7 @@ impl VersionStore {
 
     /// Notes whether `indexes`, held under their write lock, hold a unique
     /// index that is not the primary key's own
-    fn note_unique_set(&self, indexes: &FxHashMap<String, IndexEntry>) {
+    fn note_unique_set(&self, indexes: &KeyMap<String, IndexEntry>) {
         let unique = indexes.values().any(|entry| {
             entry.index.is_unique()
                 && entry.index.index_type() != crate::core::IndexType::PrimaryKey
@@ -6130,7 +6132,7 @@ impl VersionStore {
         let mut best_match: Option<(Arc<dyn Index>, usize)> = None;
 
         // Create a set of predicate columns for O(1) lookup
-        let pred_set: FxHashSet<&str> = predicate_columns.iter().copied().collect();
+        let pred_set: KeySet<&str> = predicate_columns.iter().copied().collect();
 
         for index in indexes.values().map(|entry| &entry.index) {
             let index_columns = index.column_names();
@@ -6190,7 +6192,7 @@ impl VersionStore {
     #[inline]
     pub(crate) fn indexes_read(
         &self,
-    ) -> parking_lot::RwLockReadGuard<'_, FxHashMap<String, IndexEntry>> {
+    ) -> parking_lot::RwLockReadGuard<'_, KeyMap<String, IndexEntry>> {
         self.indexes.read()
     }
 
@@ -7767,7 +7769,7 @@ type LocalKeys = Vec<(SmallVec<[i32; 4]>, KeyRows)>;
 /// under the hash of the key it was last given
 #[derive(Default)]
 struct KeyRows {
-    by_hash: FxHashMap<u64, SmallVec<[i64; 1]>>,
+    by_hash: KeyMap<u64, SmallVec<[i64; 1]>>,
     /// Each entered row's hash and its place among that hash's rows
     by_row: I64Map<(u64, u32)>,
 }
@@ -7832,7 +7834,7 @@ pub(crate) fn unique_error(index: &dyn Index, values: &[Value], holder: i64) -> 
 /// The hash a unique key is kept under among a transaction's own holders
 pub(crate) fn key_hash<'v>(values: impl IntoIterator<Item = &'v Value>) -> u64 {
     use std::hash::{Hash, Hasher};
-    let mut hasher = rustc_hash::FxHasher::default();
+    let mut hasher = crate::common::KeyHasher::default();
     for value in values {
         value.hash(&mut hasher);
     }

@@ -15,7 +15,7 @@
 //! CAST expression for Stoolap
 //!
 
-use rustc_hash::FxHashMap;
+use crate::common::KeyMap;
 
 use chrono::{DateTime, TimeZone, Utc};
 
@@ -38,7 +38,7 @@ pub struct CastExpr {
     col_index: Option<usize>,
 
     /// Column aliases
-    aliases: FxHashMap<String, String>,
+    aliases: KeyMap<String, String>,
     /// Original column name if using alias
     original_column: Option<String>,
 }
@@ -50,7 +50,7 @@ impl CastExpr {
             column: column.into(),
             target_type,
             col_index: None,
-            aliases: FxHashMap::default(),
+            aliases: KeyMap::default(),
             original_column: None,
         }
     }
@@ -128,7 +128,7 @@ impl Expression for CastExpr {
         self.casts(col_value)
     }
 
-    fn with_aliases(&self, aliases: &FxHashMap<String, String>) -> Box<dyn Expression> {
+    fn with_aliases(&self, aliases: &KeyMap<String, String>) -> Box<dyn Expression> {
         let resolved = resolve_alias(&self.column, aliases);
         let mut expr = self.clone();
 
@@ -346,7 +346,7 @@ impl Expression for CompoundExpr {
         }
     }
 
-    fn with_aliases(&self, aliases: &FxHashMap<String, String>) -> Box<dyn Expression> {
+    fn with_aliases(&self, aliases: &KeyMap<String, String>) -> Box<dyn Expression> {
         let aliased_cast = self.cast_expr.with_aliases(aliases);
         let cast_expr = if let Some(cast) = aliased_cast.as_any().downcast_ref::<CastExpr>() {
             cast.clone()
@@ -739,7 +739,7 @@ mod tests {
             Value::float(3.5),
         ]);
 
-        let mut aliases = FxHashMap::default();
+        let mut aliases = KeyMap::default();
         aliases.insert("v".to_string(), "value".to_string());
 
         let expr = CastExpr::new("v", DataType::Integer);

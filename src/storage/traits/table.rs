@@ -15,7 +15,7 @@
 //! Table trait for database tables
 //!
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use crate::common::{KeyMap, KeySet};
 use std::fmt;
 
 use crate::common::deadline::{Deadline, DeadlineSite};
@@ -252,7 +252,7 @@ pub struct FoundVersions {
     /// The sealed volumes the table held then, sorted
     pub volumes: Vec<u64>,
     /// The version each row judged since was judged in
-    pub judged: FxHashMap<i64, VersionMark>,
+    pub judged: KeyMap<i64, VersionMark>,
 }
 
 impl FoundVersions {
@@ -261,7 +261,7 @@ impl FoundVersions {
         Self {
             cut,
             volumes,
-            judged: FxHashMap::default(),
+            judged: KeyMap::default(),
         }
     }
 
@@ -400,7 +400,7 @@ pub trait Table: Send + Sync {
         _access: ScanAccess<'_>,
         _where_expr: Option<&dyn Expression>,
         _setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
-        _skip: Option<&FxHashMap<i64, u64>>,
+        _skip: Option<&KeyMap<i64, u64>>,
         _plan: &mut PlannedUpdate,
         _deadline: Deadline,
     ) -> Result<()> {
@@ -481,10 +481,10 @@ pub trait Table: Send + Sync {
         active_ids_excluding(self, exclude, limit, deadline)
     }
 
-    /// Populate a FxHashSet with all hot row_ids. Avoids the intermediate Vec
+    /// Populate a KeySet with all hot row_ids. Avoids the intermediate Vec
     /// allocation of get_active_row_ids() when building skip sets. Required
     /// (no default): implementations must stay infallible for hot data.
-    fn collect_hot_row_ids_into(&self, dest: &mut rustc_hash::FxHashSet<i64>);
+    fn collect_hot_row_ids_into(&self, dest: &mut crate::common::KeySet<i64>);
 
     /// Check whether a row ID exists, propagating failures from cold identity reads.
     fn has_row_id(&self, _row_id: i64) -> Result<bool> {
@@ -1484,7 +1484,7 @@ pub trait Table: Send + Sync {
     fn rows_at(
         &self,
         _point: &ReadPoint,
-        _authority: Option<&mut FxHashSet<i64>>,
+        _authority: Option<&mut KeySet<i64>>,
         _deadline: Deadline,
     ) -> Result<RowVec> {
         Err(Error::internal("this table keeps no history"))

@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use rustc_hash::FxHashMap;
+use crate::common::KeyMap;
 use smallvec::SmallVec;
 
 use crate::api::params::ParamVec;
@@ -221,7 +221,7 @@ pub(crate) fn share(
         Statement::Delete(delete) if delete.with.is_none() => delete.where_clause.as_deref()?,
         _ => return None,
     };
-    let at: FxHashMap<u32, usize> = skeleton
+    let at: KeyMap<u32, usize> = skeleton
         .literals
         .iter()
         .enumerate()
@@ -254,7 +254,7 @@ pub(crate) fn share(
     if !shared.contains(&true) {
         return None;
     }
-    let mut slots = FxHashMap::default();
+    let mut slots = KeyMap::default();
     let mut literals = Vec::with_capacity(shared.len());
     for (token, shared) in skeleton.literals.iter().zip(shared) {
         literals.push(match shared {
@@ -357,7 +357,7 @@ fn is_comparison(op: InfixOperator) -> bool {
 
 /// `expr` with each literal starting at an offset of `slots` read as the
 /// parameter of its slot
-fn with_slots(expr: &Expression, slots: &FxHashMap<u32, usize>) -> Result<Expression> {
+fn with_slots(expr: &Expression, slots: &KeyMap<u32, usize>) -> Result<Expression> {
     if let Some(token) = literal_token(expr)
         && let Some(&slot) = slots.get(&token.position.offset)
     {

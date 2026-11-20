@@ -193,7 +193,7 @@ mod tests {
         ];
         let key_indices = vec![0usize];
 
-        // Build bloom filter using same FxHash as hash table
+        // Build bloom filter using the same hash as the hash table
         let mut builder = BloomFilterBuilder::new("id".to_string(), "test".to_string(), 3);
         for row in &build_rows {
             let hash = hash_row_keys(row, &key_indices);

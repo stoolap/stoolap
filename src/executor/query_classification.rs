@@ -27,9 +27,9 @@ use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use crate::common::KeyHasher;
 use lru::LruCache;
 use parking_lot::Mutex;
-use rustc_hash::FxHasher;
 
 use crate::executor::utils::expression_contains_aggregate;
 use crate::executor::volatility::expression_volatility;
@@ -541,7 +541,7 @@ impl QueryClassification {
 
 /// Compute a cache key for a SELECT statement
 /// Only hashes structural elements that affect classification (not literal values)
-/// Uses FxHasher which is 2-5x faster than SipHash for small keys.
+/// Uses KeyHasher which is 2-5x faster than SipHash for small keys.
 fn compute_classification_key(stmt: &SelectStatement) -> ClassificationKey {
     // Two independent algorithms over the same inputs; a single unverified
     // 64-bit hash is not collision-safe as a cache identity (PR #36
@@ -550,7 +550,7 @@ fn compute_classification_key(stmt: &SelectStatement) -> ClassificationKey {
     // The one input of the classification a name decides, over every
     // statement inside it too
     let names_rowid = super::utils::names_rowid(stmt);
-    let mut h1 = FxHasher::default();
+    let mut h1 = KeyHasher::default();
     names_rowid.hash(&mut h1);
     hash_classification_inputs(stmt, &mut h1);
 

@@ -16,8 +16,8 @@
 //! its parent key and a parent's delete or key change holds the key alone,
 //! each until its transaction ends, so the two never both commit
 
+use crate::common::KeyMap;
 use parking_lot::Mutex;
-use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::common::{new_i64_map, I64Map};
@@ -34,7 +34,7 @@ struct Hold {
 struct Holds {
     /// Each referenced column, by its position in the table, which a rename
     /// keeps, with the holds on its keys; a dropped column's is `usize::MAX`
-    columns: SmallVec<[(usize, FxHashMap<Value, Hold>); 1]>,
+    columns: SmallVec<[(usize, KeyMap<Value, Hold>); 1]>,
     /// The keys each transaction holds, by column position, for its release
     by_txn: I64Map<SmallVec<[(usize, Value); 1]>>,
 }
@@ -70,7 +70,7 @@ impl KeyHolds {
         let slot = match holds.columns.iter().position(|(p, _)| *p == at) {
             Some(slot) => slot,
             None => {
-                holds.columns.push((at, FxHashMap::default()));
+                holds.columns.push((at, KeyMap::default()));
                 holds.columns.len() - 1
             }
         };

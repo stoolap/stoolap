@@ -20,9 +20,9 @@
 //! - Grouped aggregation: `SELECT category, SUM(amount) FROM sales GROUP BY category`
 //! - HAVING clause: `SELECT category, SUM(amount) FROM sales GROUP BY category HAVING SUM(amount) > 100`
 
+use crate::common::{KeyMap, KeySet};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
-use rustc_hash::{FxHashMap, FxHashSet};
 // SmallVec removed - Vec is faster due to spilled() check overhead in hot loops
 
 use crate::common::deadline::DeadlineSite;
@@ -171,7 +171,7 @@ pub(crate) fn compile_over_slots(
     expr: &Expression,
     columns: &[String],
     registry: &crate::functions::FunctionRegistry,
-    aliases: Option<&FxHashMap<ExprKey, usize>>,
+    aliases: Option<&KeyMap<ExprKey, usize>>,
     blocks: bool,
     params: Option<&[Value]>,
 ) -> Result<super::expression::SharedProgram> {
@@ -194,7 +194,7 @@ fn compile_over(
     expr: &Expression,
     (columns, repeated): (&[String], &[usize]),
     registry: &crate::functions::FunctionRegistry,
-    aliases: Option<&FxHashMap<ExprKey, usize>>,
+    aliases: Option<&KeyMap<ExprKey, usize>>,
     blocks: bool,
     params: Option<&[Value]>,
 ) -> Result<super::expression::SharedProgram> {
@@ -281,7 +281,7 @@ struct GroupingSet {
 pub(crate) fn grouping_items(stmt: &SelectStatement) -> Vec<&Expression> {
     match &stmt.group_by.modifier {
         GroupByModifier::GroupingSets(sets) => {
-            let mut seen = FxHashSet::default();
+            let mut seen = KeySet::default();
             sets.iter()
                 .flatten()
                 .filter(|expr| seen.insert(ExprKey::of(expr)))
@@ -502,8 +502,8 @@ pub(crate) fn aggregate_slot_keys(
     group_items: &[GroupByItem],
     aggregations: &[SqlAggregateFunction],
     select: &[Expression],
-) -> FxHashMap<ExprKey, usize> {
-    let mut slots = FxHashMap::default();
+) -> KeyMap<ExprKey, usize> {
+    let mut slots = KeyMap::default();
     for (i, item) in group_items.iter().enumerate() {
         slots.entry(group_by_item_key(item)).or_insert(i);
     }
@@ -540,7 +540,7 @@ pub(crate) fn group_item_read(
     reference: &Expression,
     column: usize,
     held: &[Option<usize>],
-    item_keys: &FxHashMap<ExprKey, usize>,
+    item_keys: &KeyMap<ExprKey, usize>,
     item_names: &super::expression::CompileContext<'_>,
 ) -> Option<usize> {
     let holds = |item: &usize| held.get(*item) == Some(&Some(column));
@@ -2680,7 +2680,7 @@ impl Executor {
         source: &[String],
         items: &[GroupByItem],
         names: &[String],
-        slots: &mut FxHashMap<ExprKey, usize>,
+        slots: &mut KeyMap<ExprKey, usize>,
     ) {
         let mut refs = Vec::new();
         let order = stmt.order_by.iter().map(|o| &o.expression);
@@ -2974,7 +2974,7 @@ impl Executor {
             }
         }
         // One slot per distinct call, whichever clause wrote it first
-        let mut seen: FxHashSet<ExprKey> = FxHashSet::default();
+        let mut seen: KeySet<ExprKey> = KeySet::default();
         aggregations.retain(|agg| seen.insert(agg.key));
 
         Ok((aggregations, non_agg_columns))
@@ -3609,7 +3609,7 @@ impl Executor {
         let num_columns = group_by_items.len();
         let mut result = Vec::with_capacity(sets.len());
 
-        let item_to_index: FxHashMap<ExprKey, usize> = group_by_items
+        let item_to_index: KeyMap<ExprKey, usize> = group_by_items
             .iter()
             .enumerate()
             .map(|(i, item)| (group_by_item_key(item), i))
@@ -3682,7 +3682,7 @@ impl Executor {
         result: Box<dyn QueryResult>,
         having: &Expression,
         columns: &[String],
-        slots: &FxHashMap<ExprKey, usize>,
+        slots: &KeyMap<ExprKey, usize>,
         ctx: &ExecutionContext,
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<Box<dyn QueryResult>> {

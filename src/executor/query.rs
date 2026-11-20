@@ -28,8 +28,8 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use crate::common::SmartString;
+use crate::common::{KeyMap, KeySet};
 use crate::storage::traits::transaction::{StatementTable, TableUse};
-use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::common::{CompactArc, CompactVec, StringMap};
 use crate::core::predicate::{kind, KeySide};
@@ -142,11 +142,7 @@ impl OutputLayout {
     /// Each name `stmt`'s sort keys read, into `slots` at the column this
     /// layout gives it; an error for a qualified name no input column
     /// answers, which no output name stands in for
-    fn sort_slots(
-        &self,
-        stmt: &SelectStatement,
-        slots: &mut FxHashMap<ExprKey, usize>,
-    ) -> Result<()> {
+    fn sort_slots(&self, stmt: &SelectStatement, slots: &mut KeyMap<ExprKey, usize>) -> Result<()> {
         let mut missing = None;
         visit_order_by_inputs(stmt, &mut |column, key| {
             if let Some(position) = self.position(&key) {
@@ -809,10 +805,10 @@ fn merged_columns(
 
     if has_star {
         // Create a set for O(1) lookup
-        let excluded_set: FxHashSet<usize> = excluded_column_indices.iter().copied().collect();
+        let excluded_set: KeySet<usize> = excluded_column_indices.iter().copied().collect();
 
         // Create rename map for join columns
-        let rename_map: FxHashMap<usize, (usize, &String)> = join_col_renames
+        let rename_map: KeyMap<usize, (usize, &String)> = join_col_renames
             .iter()
             .map(|(place, read, name)| (*place, (*read, name)))
             .collect();
@@ -1435,7 +1431,7 @@ fn partition_where_for_join(
 
     for pred in predicates {
         let qualifiers = collect_table_qualifiers(&pred);
-        let mut unqualified = FxHashSet::default();
+        let mut unqualified = KeySet::default();
         collect_unqualified_columns(&pred, &mut unqualified);
 
         let mut refs_left = qualifiers.iter().any(|q| left.qualified_by(q));
@@ -8074,7 +8070,7 @@ impl Executor {
         // the second take of the same index would get null (value already moved)
         if all_simple && !simple_column_indices.is_empty() {
             // Check for duplicate indices (can happen with ambiguous column names after JOIN)
-            let mut seen_indices: FxHashSet<usize> = FxHashSet::default();
+            let mut seen_indices: KeySet<usize> = KeySet::default();
             let has_duplicates = simple_column_indices
                 .iter()
                 .any(|&idx| !seen_indices.insert(idx));
@@ -8143,7 +8139,7 @@ impl Executor {
     /// the same name, so only a name the source lacks counts here.
     fn reads_a_select_alias(
         expr: &Expression,
-        aliases: &FxHashSet<String>,
+        aliases: &KeySet<String>,
         source_columns: &crate::common::StringMap<usize>,
     ) -> bool {
         let check = |e: &Expression| Self::reads_a_select_alias(e, aliases, source_columns);
@@ -8554,7 +8550,7 @@ impl Executor {
         all_columns: &[String],
         computes_subqueries: bool,
     ) -> OrderByProjection<'e> {
-        // Build column index map ONCE with FxHashMap for O(1) lookup
+        // Build column index map ONCE with KeyMap for O(1) lookup
         let col_index_map_lower = build_column_index_map(all_columns);
         // The names below are read for the keys only
         let keyed = !order_by.is_empty() || !distinct_on.is_empty();
@@ -8569,7 +8565,7 @@ impl Executor {
         };
 
         // The names the projection alone brings into scope
-        let select_aliases: FxHashSet<String> = select_exprs
+        let select_aliases: KeySet<String> = select_exprs
             .iter()
             .filter(|_| keyed)
             .filter_map(|e| match e {
@@ -8960,7 +8956,7 @@ impl Executor {
         columns: &[String],
         layout: Option<&OutputLayout>,
         set_operation: bool,
-    ) -> (Vec<Option<usize>>, FxHashMap<ExprKey, usize>) {
+    ) -> (Vec<Option<usize>>, KeyMap<ExprKey, usize>) {
         let keys = stmt.order_by.iter().map(|ob| &ob.expression);
         self.key_columns(stmt, keys, columns, layout, set_operation, false)
     }
@@ -8975,14 +8971,14 @@ impl Executor {
         layout: Option<&OutputLayout>,
         set_operation: bool,
         any_item: bool,
-    ) -> (Vec<Option<usize>>, FxHashMap<ExprKey, usize>) {
+    ) -> (Vec<Option<usize>>, KeyMap<ExprKey, usize>) {
         // Each column by the identity of what computed it: the SELECT
         // list in order (unless a star moves the positions), then the
         // aggregates carried only for this sort
-        let mut column_slots: FxHashMap<ExprKey, usize> = FxHashMap::default();
+        let mut column_slots: KeyMap<ExprKey, usize> = KeyMap::default();
         // Only aggregates stand in for themselves inside a sort key: a
         // literal or a name there is read as written
-        let mut aggregate_slots: FxHashMap<ExprKey, usize> = FxHashMap::default();
+        let mut aggregate_slots: KeyMap<ExprKey, usize> = KeyMap::default();
         let star = stmt
             .columns
             .iter()
@@ -9125,7 +9121,7 @@ impl Executor {
 
         *active_tx = Some(ActiveTransaction {
             transaction,
-            tables: FxHashMap::default(),
+            tables: KeyMap::default(),
         });
 
         Ok(Box::new(ExecResult::empty()))
@@ -10151,7 +10147,7 @@ impl Executor {
     pub(super) fn build_alias_map_excluding<'a>(
         columns: &'a [Expression],
         base_columns: Option<&[String]>,
-    ) -> FxHashMap<String, &'a Expression> {
+    ) -> KeyMap<String, &'a Expression> {
         // Count aliases first to pre-size HashMap and avoid rehashing
         let alias_count = columns
             .iter()
@@ -10159,10 +10155,10 @@ impl Executor {
             .count();
 
         if alias_count == 0 {
-            return FxHashMap::default();
+            return KeyMap::default();
         }
 
-        let mut alias_map = FxHashMap::with_capacity_and_hasher(alias_count, Default::default());
+        let mut alias_map = KeyMap::with_capacity_and_hasher(alias_count, Default::default());
         for col_expr in columns {
             if let Expression::Aliased(aliased) = col_expr {
                 let alias_name = aliased.alias.value_lower.to_string();
@@ -10227,7 +10223,7 @@ impl Executor {
     /// Substitute column aliases in an expression with their underlying expressions
     pub(super) fn substitute_aliases(
         expr: &Expression,
-        alias_map: &FxHashMap<String, &Expression>,
+        alias_map: &KeyMap<String, &Expression>,
     ) -> Expression {
         match expr {
             Expression::Identifier(id) => {

@@ -17,8 +17,8 @@
 
 use std::any::Any;
 
+use crate::common::KeyMap;
 use chrono::{DateTime, Utc};
-use rustc_hash::FxHashMap;
 
 use super::{find_column_index, resolve_alias, Expression};
 use crate::core::{Operator, Result, Row, Schema, Value};
@@ -44,7 +44,7 @@ pub struct BetweenExpr {
     col_index: Option<usize>,
 
     /// Column aliases
-    aliases: FxHashMap<String, String>,
+    aliases: KeyMap<String, String>,
     /// Original column name if using alias
     original_column: Option<String>,
 }
@@ -59,7 +59,7 @@ impl BetweenExpr {
             inclusive: true,
             not: false,
             col_index: None,
-            aliases: FxHashMap::default(),
+            aliases: KeyMap::default(),
             original_column: None,
         }
     }
@@ -73,7 +73,7 @@ impl BetweenExpr {
             inclusive: true,
             not: true,
             col_index: None,
-            aliases: FxHashMap::default(),
+            aliases: KeyMap::default(),
             original_column: None,
         }
     }
@@ -400,7 +400,7 @@ impl Expression for BetweenExpr {
         }
     }
 
-    fn with_aliases(&self, aliases: &FxHashMap<String, String>) -> Box<dyn Expression> {
+    fn with_aliases(&self, aliases: &KeyMap<String, String>) -> Box<dyn Expression> {
         let resolved = resolve_alias(&self.column, aliases);
         let mut expr = self.clone();
 
@@ -608,7 +608,7 @@ mod tests {
             Value::text("Alice"),
         ]);
 
-        let mut aliases = FxHashMap::default();
+        let mut aliases = KeyMap::default();
         aliases.insert("i".to_string(), "id".to_string());
 
         let expr = BetweenExpr::new("i", Value::integer(1), Value::integer(10));

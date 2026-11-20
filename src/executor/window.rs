@@ -29,9 +29,9 @@
 //! - OVER (PARTITION BY col) - Partition by column values
 //! - OVER (ORDER BY col) - Order within partition
 
+use crate::common::KeyMap;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::cmp::Ordering;
 use std::sync::{Arc, OnceLock};
@@ -131,7 +131,7 @@ const WINDOW_COLUMN: &str = "\u{0}wf#";
 fn base_column(
     expr: &Expression,
     col_index_map: &StringMap<usize>,
-    group_slots: &FxHashMap<ExprKey, usize>,
+    group_slots: &KeyMap<ExprKey, usize>,
 ) -> Option<usize> {
     if let Some(&slot) = group_slots.get(&ExprKey::of(expr)) {
         return Some(slot);
@@ -151,7 +151,7 @@ fn base_column(
 fn row_program(
     expr: &Expression,
     columns: &[String],
-    slots: Option<&FxHashMap<ExprKey, usize>>,
+    slots: Option<&KeyMap<ExprKey, usize>>,
     ctx: &ExecutionContext,
     blocks: Option<&dyn SubqueryExecutor>,
 ) -> Result<SharedProgram> {
@@ -224,7 +224,7 @@ fn held_program(
     expr: &Expression,
     held: &HeldProgram,
     columns: &[String],
-    slots: Option<&FxHashMap<ExprKey, usize>>,
+    slots: Option<&KeyMap<ExprKey, usize>>,
     ctx: &ExecutionContext,
     blocks: Option<&dyn SubqueryExecutor>,
 ) -> Result<SharedProgram> {
@@ -252,7 +252,7 @@ impl<'a> RowPrograms<'a> {
     fn compile<'e>(
         exprs: impl IntoIterator<Item = &'e Expression>,
         columns: &[String],
-        slots: Option<&FxHashMap<ExprKey, usize>>,
+        slots: Option<&KeyMap<ExprKey, usize>>,
         ctx: &'a ExecutionContext,
         blocks: Option<&'a dyn SubqueryExecutor>,
         held: Option<&[HeldProgram]>,
@@ -393,7 +393,7 @@ impl<'w> RowArg<'w> {
     /// or a parameter, read without one
     fn program(
         &self,
-        (columns, slots): (&[String], &FxHashMap<ExprKey, usize>),
+        (columns, slots): (&[String], &KeyMap<ExprKey, usize>),
         (ctx, blocks): (&ExecutionContext, Option<&dyn SubqueryExecutor>),
     ) -> Result<Option<&Program>> {
         if !matches!(self.source, ArgSource::Program(_)) {
@@ -529,7 +529,7 @@ impl<'w> CallArgs<'w> {
     /// a group item or aggregate read from its slot in `slots`
     fn programs(
         &self,
-        over: (&[String], &FxHashMap<ExprKey, usize>),
+        over: (&[String], &KeyMap<ExprKey, usize>),
         read: (&ExecutionContext, Option<&dyn SubqueryExecutor>),
     ) -> Result<ArgPrograms<'_>> {
         let count = self.count.as_ref().map(|arg| arg.program(over, read));
@@ -1115,8 +1115,8 @@ impl ColumnarOrderByValues {
 /// When rows are fetched grouped by an indexed partition column, we can skip hash-based grouping
 #[derive(Clone)]
 pub struct WindowPreGroupedState {
-    /// Pre-built partition map: partition key -> row indices
-    pub partition_map: FxHashMap<PartitionKey, Vec<usize>>,
+    /// Each partition's row indices, in the order the index gave them
+    pub partitions: Vec<Vec<usize>>,
     /// The column name (lowercase) that the partition map was built from
     pub partition_column: String,
 }
@@ -1243,7 +1243,7 @@ impl Executor {
                             made = self.window_plan(
                                 std::borrow::Cow::Borrowed(stmt),
                                 (columns, columns.len(), stmt.columns.len()),
-                                &FxHashMap::default(),
+                                &KeyMap::default(),
                                 (ctx, None, held),
                             )?;
                             &made
@@ -1262,15 +1262,14 @@ impl Executor {
                     return Ok(None);
                 };
                 let mut rows = RowVec::new();
-                let mut partition_map: FxHashMap<SmallVec<[Value; 4]>, Vec<usize>> =
-                    FxHashMap::default();
-                for (value, partition) in grouped {
+                let mut partitions = Vec::new();
+                for (_, partition) in grouped {
                     let start = rows.len();
                     rows.extend(partition);
-                    partition_map.insert(smallvec::smallvec![value], (start..rows.len()).collect());
+                    partitions.push((start..rows.len()).collect());
                 }
                 let grouped = WindowPreGroupedState {
-                    partition_map,
+                    partitions,
                     partition_column: column.as_str().to_lowercase(),
                 };
                 Ok(Some(WindowRows::Rows(rows, None, Some(grouped))))
@@ -1319,7 +1318,7 @@ impl Executor {
             ctx,
             rows,
             columns,
-            &FxHashMap::default(),
+            &KeyMap::default(),
             sorted,
             grouped,
             run,
@@ -1340,7 +1339,7 @@ impl Executor {
             plan,
             ctx,
             (rows, columns),
-            &FxHashMap::default(),
+            &KeyMap::default(),
             order,
             blocks,
         )
@@ -1371,7 +1370,7 @@ impl Executor {
             ctx,
             base_rows,
             base_columns,
-            &FxHashMap::default(),
+            &KeyMap::default(),
             None,
             None,
             (None, None),
@@ -1386,7 +1385,7 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         (base_rows, base_columns): (&[(i64, Row)], &[String]),
-        group_slots: &FxHashMap<ExprKey, usize>,
+        group_slots: &KeyMap<ExprKey, usize>,
         run: (Option<&dyn SubqueryExecutor>, Option<&HeldWindow>),
     ) -> Result<WindowOutput> {
         self.execute_select_with_window_functions_internal(
@@ -1409,7 +1408,7 @@ impl Executor {
         ctx: &ExecutionContext,
         base_rows: &[(i64, Row)],
         base_columns: &[String],
-        group_slots: &FxHashMap<ExprKey, usize>,
+        group_slots: &KeyMap<ExprKey, usize>,
         pre_sorted: Option<WindowPreSortedState>,
         pre_grouped: Option<WindowPreGroupedState>,
         (blocks, held): (Option<&dyn SubqueryExecutor>, Option<&HeldWindow>),
@@ -1481,7 +1480,7 @@ impl Executor {
         self.window_plan(
             std::borrow::Cow::Owned(extended),
             (columns, columns.len(), stmt.columns.len()),
-            &FxHashMap::default(),
+            &KeyMap::default(),
             (ctx, None, Some(held)),
         )
         .map(Some)
@@ -1495,7 +1494,7 @@ impl Executor {
         &self,
         stmt: std::borrow::Cow<'s, SelectStatement>,
         (base_columns, visible_columns, written_items): (&[String], usize, usize),
-        group_slots: &FxHashMap<ExprKey, usize>,
+        group_slots: &KeyMap<ExprKey, usize>,
         (ctx, blocks, held): (
             &ExecutionContext,
             Option<&dyn SubqueryExecutor>,
@@ -1599,7 +1598,7 @@ impl Executor {
         plan: &WindowPlan<'_>,
         ctx: &ExecutionContext,
         (base_rows, base_columns): (&[(i64, Row)], &[String]),
-        group_slots: &FxHashMap<ExprKey, usize>,
+        group_slots: &KeyMap<ExprKey, usize>,
         (pre_sorted, pre_grouped): (Option<WindowPreSortedState>, Option<WindowPreGroupedState>),
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<WindowOutput> {
@@ -1641,7 +1640,7 @@ impl Executor {
         let col_index_map = &plan.col_index_map;
 
         // Step 1: Compute all window function values upfront
-        // OPTIMIZATION: Use FxHashMap for fastest lookups with trusted keys
+        // OPTIMIZATION: Use KeyMap for fastest lookups with trusted keys
 
         // OPTIMIZATION: Precompute ORDER BY values ONCE for each unique ORDER BY clause
         // This avoids redundant computation when multiple window functions share the same ORDER BY
@@ -1921,7 +1920,7 @@ impl Executor {
         ctx: &ExecutionContext,
         base_rows: &[(i64, Row)],
         base_columns: &[String],
-        group_slots: &FxHashMap<ExprKey, usize>,
+        group_slots: &KeyMap<ExprKey, usize>,
         limit: usize,
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<Box<dyn QueryResult>> {
@@ -2029,9 +2028,7 @@ impl Executor {
         let mut result_rows = RowVec::with_capacity(limit.min(base_rows.len().max(16)));
         let mut result_row_id = 0i64;
 
-        let partitions_vec: Vec<_> = partitions.into_iter().collect();
-
-        for (_partition_key, row_indices) in partitions_vec {
+        for row_indices in partitions {
             if result_rows.len() >= limit {
                 break;
             }
@@ -2072,7 +2069,7 @@ impl Executor {
                     )?;
                     // Remap: sorted_values[pos] corresponds to row sorted_indices[pos].
                     // Build a vec indexed by position within row_indices using an O(n) index map.
-                    let orig_to_local: FxHashMap<usize, usize> = row_indices
+                    let orig_to_local: KeyMap<usize, usize> = row_indices
                         .iter()
                         .enumerate()
                         .map(|(local, &orig)| (orig, local))
@@ -2204,7 +2201,7 @@ impl Executor {
 
         let col_index_map = &plan.col_index_map;
         // Rows read straight from the table: nothing aggregated precedes the window
-        let group_slots = FxHashMap::default();
+        let group_slots = KeyMap::default();
 
         // Resolve window functions from registry
         let mut resolved_wfs: Vec<_> = window_functions
@@ -2452,7 +2449,7 @@ impl Executor {
         base_columns: &[String],
         visible_columns: usize,
         window_functions: &[WindowFunctionInfo],
-        group_slots: &FxHashMap<ExprKey, usize>,
+        group_slots: &KeyMap<ExprKey, usize>,
         mut item_of: Option<&mut Vec<usize>>,
     ) -> Vec<SelectItem> {
         let col_index_map = build_column_index_map(base_columns);
@@ -2995,7 +2992,7 @@ impl Executor {
         rows: &[(i64, Row)],
         columns: &[String],
         col_index_map: &StringMap<usize>,
-        group_slots: &FxHashMap<ExprKey, usize>,
+        group_slots: &KeyMap<ExprKey, usize>,
         ctx: &ExecutionContext,
         pre_grouped: Option<&WindowPreGroupedState>,
         order_by_values: Option<&ColumnarOrderByValues>,
@@ -3015,7 +3012,7 @@ impl Executor {
                 && wf_info.partition_by.len() == wf_info.partition_by_exprs.len()
                 && wf_info.partition_by[0].to_lowercase() == pg.partition_column
         }) {
-            pg.partition_map.values().cloned().collect()
+            pg.partitions.clone()
         } else {
             Self::build_partition_map(
                 wf_info,
@@ -3026,8 +3023,6 @@ impl Executor {
                 ctx,
                 blocks,
             )?
-            .into_values()
-            .collect()
         };
 
         if let Some(order_by) = order_by_values.filter(|v| !v.is_empty()) {
@@ -3103,16 +3098,25 @@ impl Executor {
     /// Build partition map from PARTITION BY expressions.
     /// Handles both simple column references (fast path) and complex expressions like
     /// function calls (e.g., TIME_TRUNC('30m', timestamp)) evaluated per row.
+    /// Partitions come in the order of their first rows, whatever the hash
     fn build_partition_map(
         wf_info: &WindowFunctionInfo,
         rows: &[(i64, Row)],
         columns: &[String],
         col_index_map: &StringMap<usize>,
-        group_slots: &FxHashMap<ExprKey, usize>,
+        group_slots: &KeyMap<ExprKey, usize>,
         ctx: &ExecutionContext,
         blocks: Option<&dyn SubqueryExecutor>,
-    ) -> Result<FxHashMap<PartitionKey, Vec<usize>>> {
-        let mut partitions: FxHashMap<PartitionKey, Vec<usize>> = FxHashMap::default();
+    ) -> Result<Vec<Vec<usize>>> {
+        let mut slots: KeyMap<PartitionKey, usize> = KeyMap::default();
+        let mut partitions: Vec<Vec<usize>> = Vec::new();
+        let mut add = |key: PartitionKey, i: usize| {
+            let at = *slots.entry(key).or_insert_with(|| {
+                partitions.push(Vec::new());
+                partitions.len() - 1
+            });
+            partitions[at].push(i);
+        };
 
         // Each key a column holds, by its name; none when a key is computed
         // or names no column, which the compiled path reports
@@ -3133,7 +3137,7 @@ impl Executor {
                     .iter()
                     .map(|&idx| row.get(idx).cloned().unwrap_or_else(Value::null_unknown))
                     .collect();
-                partitions.entry(key).or_default().push(i);
+                add(key, i);
             }
         } else {
             // Complex path: evaluate the expressions per row
@@ -3152,7 +3156,7 @@ impl Executor {
                     Error::internal(format!("Failed to evaluate PARTITION BY expression: {}", e))
                 })?;
                 let key: PartitionKey = values.drain(..).collect();
-                partitions.entry(key).or_default().push(i);
+                add(key, i);
             }
         }
 
@@ -3170,7 +3174,7 @@ impl Executor {
         rows: &[(i64, Row)],
         columns: &[String],
         col_index_map: &StringMap<usize>,
-        group_slots: &FxHashMap<ExprKey, usize>,
+        group_slots: &KeyMap<ExprKey, usize>,
         ctx: &ExecutionContext,
         pre_sorted: Option<&WindowPreSortedState>,
         pre_grouped: Option<&WindowPreGroupedState>,
@@ -3407,7 +3411,7 @@ impl Executor {
         precomputed_order_by: Option<&ColumnarOrderByValues>,
         columns: &[String],
         col_index_map: &StringMap<usize>,
-        group_slots: &FxHashMap<ExprKey, usize>,
+        group_slots: &KeyMap<ExprKey, usize>,
         (ctx, blocks): (&ExecutionContext, Option<&dyn SubqueryExecutor>),
         args: &CallArgs,
         skip_sorting: bool,
@@ -3464,7 +3468,7 @@ impl Executor {
         row_indices: &[usize],
         order_by_values: &ColumnarOrderByValues,
         col_index_map: &StringMap<usize>,
-        group_slots: &FxHashMap<ExprKey, usize>,
+        group_slots: &KeyMap<ExprKey, usize>,
         (ctx, blocks): (&ExecutionContext, Option<&dyn SubqueryExecutor>),
         mut emit: impl FnMut(usize, Value),
     ) -> Result<()> {
@@ -3622,7 +3626,7 @@ impl Executor {
         precomputed_order_by: Option<&ColumnarOrderByValues>,
         columns: &[String],
         col_index_map: &StringMap<usize>,
-        group_slots: &FxHashMap<ExprKey, usize>,
+        group_slots: &KeyMap<ExprKey, usize>,
         (ctx, blocks): (&ExecutionContext, Option<&dyn SubqueryExecutor>),
         frame: &Frame,
         args: &CallArgs,
@@ -3679,7 +3683,7 @@ impl Executor {
         already_sorted: bool,
         precomputed_order_by: Option<&ColumnarOrderByValues>,
         col_index_map: &StringMap<usize>,
-        group_slots: &FxHashMap<ExprKey, usize>,
+        group_slots: &KeyMap<ExprKey, usize>,
         ctx: &ExecutionContext,
         frame: &Frame,
         args: &CallArgs,
@@ -3921,7 +3925,7 @@ impl Executor {
         rows: &[(i64, Row)],
         columns: &[String],
         col_index_map: &StringMap<usize>,
-        group_slots: &FxHashMap<ExprKey, usize>,
+        group_slots: &KeyMap<ExprKey, usize>,
         ctx: &ExecutionContext,
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<Vec<Value>> {
@@ -3948,7 +3952,7 @@ impl Executor {
         &self,
         expr: &Expression,
         col_index_map: &StringMap<usize>,
-        group_slots: &FxHashMap<ExprKey, usize>,
+        group_slots: &KeyMap<ExprKey, usize>,
     ) -> Option<usize> {
         match expr {
             Expression::Identifier(_) | Expression::QualifiedIdentifier(_) => {
@@ -3975,7 +3979,7 @@ impl Executor {
         rows: &[(i64, Row)],
         columns: &[String],
         col_index_map: &StringMap<usize>,
-        group_slots: &FxHashMap<ExprKey, usize>,
+        group_slots: &KeyMap<ExprKey, usize>,
         ctx: &ExecutionContext,
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<ColumnarOrderByValues> {
@@ -4451,7 +4455,7 @@ impl Executor {
         &self,
         (filter, held): (&Expression, Option<&[HeldProgram]>),
         rows: &[(i64, Row)],
-        (columns, slots): (&[String], &FxHashMap<ExprKey, usize>),
+        (columns, slots): (&[String], &KeyMap<ExprKey, usize>),
         ctx: &ExecutionContext,
         arg_col_idx: Option<usize>,
         expression_values: &[Value],
@@ -4498,7 +4502,7 @@ impl Executor {
         &self,
         wf_info: &WindowFunctionInfo,
         rows: &[(i64, Row)],
-        (columns, slots): (&[String], &FxHashMap<ExprKey, usize>),
+        (columns, slots): (&[String], &KeyMap<ExprKey, usize>),
         ctx: &ExecutionContext,
         blocks: Option<&dyn SubqueryExecutor>,
     ) -> Result<Vec<Vec<Value>>> {
@@ -4536,7 +4540,7 @@ impl Executor {
         rows: &[(i64, Row)],
         columns: &[String],
         col_index_map: &StringMap<usize>,
-        group_slots: &FxHashMap<ExprKey, usize>,
+        group_slots: &KeyMap<ExprKey, usize>,
         ctx: &ExecutionContext,
         pre_sorted: Option<&WindowPreSortedState>,
         cached_order_by: Option<&ColumnarOrderByValues>,
@@ -4653,19 +4657,15 @@ impl Executor {
         // presorted-by-index path keeps unsorted indices, so it bypasses
         // the shared cache
         let owned_partitions: Option<Vec<Vec<usize>>> = if skip_sorting {
-            Some(
-                Self::build_partition_map(
-                    wf_info,
-                    rows,
-                    columns,
-                    col_index_map,
-                    group_slots,
-                    ctx,
-                    blocks,
-                )?
-                .into_values()
-                .collect(),
-            )
+            Some(Self::build_partition_map(
+                wf_info,
+                rows,
+                columns,
+                col_index_map,
+                group_slots,
+                ctx,
+                blocks,
+            )?)
         } else {
             None
         };

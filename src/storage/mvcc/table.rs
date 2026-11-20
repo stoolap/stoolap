@@ -17,7 +17,7 @@
 //! Provides MVCC isolation for table operations.
 //!
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use crate::common::{KeyMap, KeySet};
 use smallvec::SmallVec;
 use std::sync::Arc;
 
@@ -1253,7 +1253,7 @@ impl MVCCTable {
                 // history may be named again, and the rows keep their order
                 if row_ids.len() > probed {
                     let mut seen =
-                        FxHashSet::with_capacity_and_hasher(row_ids.len(), Default::default());
+                        KeySet::with_capacity_and_hasher(row_ids.len(), Default::default());
                     row_ids.retain(|id| seen.insert(*id));
                 }
                 Some(row_ids)
@@ -2920,7 +2920,7 @@ impl MVCCTable {
         access: ScanAccess<'_>,
         where_expr: Option<&dyn Expression>,
         setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
-        skip: Option<&FxHashMap<i64, u64>>,
+        skip: Option<&KeyMap<i64, u64>>,
         plan: &mut PlannedUpdate,
         deadline: Deadline,
     ) -> Result<()> {
@@ -3818,7 +3818,7 @@ impl Table for MVCCTable {
         access: ScanAccess<'_>,
         where_expr: Option<&dyn Expression>,
         setter: &mut dyn FnMut(i64, Row) -> Result<(Row, bool)>,
-        skip: Option<&FxHashMap<i64, u64>>,
+        skip: Option<&KeyMap<i64, u64>>,
         plan: &mut PlannedUpdate,
         deadline: Deadline,
     ) -> Result<()> {
@@ -3901,7 +3901,7 @@ impl Table for MVCCTable {
             .visible_row_ids_excluding(self.reader(), exclude, limit, deadline)
     }
 
-    fn collect_hot_row_ids_into(&self, dest: &mut rustc_hash::FxHashSet<i64>) {
+    fn collect_hot_row_ids_into(&self, dest: &mut crate::common::KeySet<i64>) {
         // Only a hot version the reader sees hides a sealed copy: one a
         // commit still publishes leaves the copy it replaces shown
         if self.view.is_some() {
@@ -5816,7 +5816,7 @@ impl Table for MVCCTable {
     fn rows_at(
         &self,
         point: &ReadPoint,
-        authority: Option<&mut FxHashSet<i64>>,
+        authority: Option<&mut KeySet<i64>>,
         deadline: Deadline,
     ) -> Result<RowVec> {
         let mut rows = self.version_store.rows_at(point, authority, deadline)?;

@@ -146,7 +146,7 @@ impl RowFilter {
 // All fields are Send + Sync:
 // - CompactArc<Program> is Send + Sync (Program is immutable)
 // - CompactArc<Value> is Send + Sync
-// - Arc<FxHashMap<String, Value>> is Send + Sync
+// - Arc<KeyMap<String, Value>> is Send + Sync
 const _: () = {
     const fn assert_send_sync<T: Send + Sync>() {}
     let _ = assert_send_sync::<RowFilter>;

@@ -14,9 +14,9 @@
 
 //! Statement parsing methods for the SQL Parser
 
+use crate::common::KeyMap;
 use crate::common::SmartString;
 use crate::core::ForeignKeyAction;
-use rustc_hash::FxHashMap;
 
 use super::ast::*;
 use super::parser::{Parser, MAX_STATEMENT_DEPTH};
@@ -1598,7 +1598,7 @@ impl Parser<'_> {
         }
 
         // Parse column-value pairs
-        let mut updates = FxHashMap::default();
+        let mut updates = KeyMap::default();
         loop {
             // Accept both identifiers and keywords as column names (e.g., level, key, order)
             if !self.peek_token_is(TokenType::Identifier) && !self.peek_token_is(TokenType::Keyword)

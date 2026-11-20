@@ -26,7 +26,7 @@ use std::any::Any;
 use std::cmp::Ordering;
 use std::fmt::{self, Debug};
 
-use rustc_hash::FxHashMap;
+use crate::common::KeyMap;
 use std::sync::Arc;
 
 use crate::core::predicate::{sql_compare, sql_eq};
@@ -277,7 +277,7 @@ impl Expression for FunctionExpr {
         true
     }
 
-    fn with_aliases(&self, aliases: &FxHashMap<String, String>) -> Box<dyn Expression> {
+    fn with_aliases(&self, aliases: &KeyMap<String, String>) -> Box<dyn Expression> {
         let new_arguments: Vec<FunctionArg> = self
             .arguments
             .iter()

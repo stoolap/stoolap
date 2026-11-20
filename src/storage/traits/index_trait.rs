@@ -354,7 +354,7 @@ pub trait Index: Send + Sync {
             probed += 1;
         }
         if probed > 1 {
-            let mut seen = rustc_hash::FxHashSet::with_capacity_and_hasher(
+            let mut seen = crate::common::KeySet::with_capacity_and_hasher(
                 buffer.len() - start,
                 Default::default(),
             );

@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
-use rustc_hash::FxHashMap;
+use crate::common::KeyMap;
 
 use crate::core::{DataType, Error, Result, Schema, Value};
 
@@ -268,10 +268,10 @@ pub struct Transfer<'a> {
     handles: Vec<Handle<'a>>,
     /// By input: its file reads, for the OS to read ahead of its groups
     reads: Vec<super::writer::ScanReads>,
-    handle_of: FxHashMap<(u32, u32), usize>,
+    handle_of: KeyMap<(u32, u32), usize>,
     /// By (input, group): the position of its last reference, after
     /// which its handle is let go
-    last_use: FxHashMap<(u32, u32), usize>,
+    last_use: KeyMap<(u32, u32), usize>,
     /// References appended so far: the position the next batch starts at
     position: usize,
     /// By reference in the batch: its handle
@@ -350,7 +350,7 @@ impl<'a> Transfer<'a> {
             plans.push(plan);
             needed.push(reads);
         }
-        let mut last_use: FxHashMap<(u32, u32), usize> = FxHashMap::default();
+        let mut last_use: KeyMap<(u32, u32), usize> = KeyMap::default();
         for (position, &(_, input, row)) in refs.iter().enumerate() {
             last_use.insert(
                 (input as u32, group_of(inputs, input, row) as u32),
@@ -363,7 +363,7 @@ impl<'a> Transfer<'a> {
             needed,
             handles: Vec::new(),
             reads: inputs.iter().map(|_| Default::default()).collect(),
-            handle_of: FxHashMap::default(),
+            handle_of: KeyMap::default(),
             last_use,
             position: 0,
             ref_handle: Vec::new(),
@@ -515,7 +515,7 @@ impl<'a> Transfer<'a> {
         }
         if keep.iter().any(|&kept| !kept) {
             let mut kept = Vec::with_capacity(self.handles.len());
-            let mut renumber: FxHashMap<usize, usize> = FxHashMap::default();
+            let mut renumber: KeyMap<usize, usize> = KeyMap::default();
             for (slot, handle) in self.handles.drain(..).enumerate() {
                 if keep[slot] {
                     renumber.insert(slot, kept.len());

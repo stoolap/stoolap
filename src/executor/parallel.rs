@@ -36,9 +36,9 @@
 //! - ORDER BY: 50,000+ rows
 //! - Hash join: 10,000+ build rows
 
+use crate::common::{KeyMap, KeySet};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
-use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::common::deadline::{Deadline, DeadlineSite};
@@ -190,13 +190,13 @@ fn filter_by_workers(rows: &[(i64, Row)], filter: &RowFilter) -> Result<Vec<bool
 
 /// Hash table storage that adapts between sequential and parallel execution
 enum HashTableStorage {
-    /// Sequential execution using FxHashMap (optimized for trusted keys)
-    Sequential(FxHashMap<u64, Vec<usize>>),
+    /// Sequential execution using KeyMap (optimized for trusted keys)
+    Sequential(KeyMap<u64, Vec<usize>>),
     /// Built in parallel: one map per partition, picked by the hash's top
     /// bits, each built by one thread without a lock
     #[cfg(feature = "parallel")]
     Partitioned {
-        maps: Vec<FxHashMap<u64, Vec<usize>>>,
+        maps: Vec<KeyMap<u64, Vec<usize>>>,
         shift: u32,
     },
 }
@@ -299,7 +299,7 @@ pub fn parallel_hash_build(
     if config.should_parallel_join(row_count) {
         let n_threads = num_threads();
         let partitions = n_threads.next_power_of_two().max(2);
-        // FxHasher keeps a usize, so a 32-bit target's hashes have no top half
+        // KeyHasher keeps a usize, so a 32-bit target's hashes have no top half
         let shift = usize::BITS - partitions.trailing_zeros();
         let chunk_size = config.chunk_size.max(row_count / n_threads).max(1000);
 
@@ -321,11 +321,11 @@ pub fn parallel_hash_build(
             .collect::<Result<_>>()?;
 
         // Chunks are taken in order, so each key's rows stay in row order
-        let maps: Vec<FxHashMap<u64, Vec<usize>>> = (0..partitions)
+        let maps: Vec<KeyMap<u64, Vec<usize>>> = (0..partitions)
             .into_par_iter()
             .map(|partition| {
                 let len = chunk_parts.iter().map(|parts| parts[partition].len()).sum();
-                let mut map = FxHashMap::with_capacity_and_hasher(len, Default::default());
+                let mut map = KeyMap::with_capacity_and_hasher(len, Default::default());
                 for parts in &chunk_parts {
                     for &(hash, idx) in &parts[partition] {
                         map.entry(hash).or_insert_with(Vec::new).push(idx);
@@ -342,11 +342,11 @@ pub fn parallel_hash_build(
     }
 
     // Sequential fallback (always compiled)
-    // OPTIMIZATION: Sequential build uses FxHashMap for best performance with trusted keys
-    // FxHashMap is optimized for non-adversarial use cases (embedded database)
+    // OPTIMIZATION: Sequential build uses KeyMap for best performance with trusted keys
+    // KeyMap is optimized for non-adversarial use cases (embedded database)
     let _ = config; // suppress unused warning when parallel feature is disabled
-    let mut table: FxHashMap<u64, Vec<usize>> =
-        FxHashMap::with_capacity_and_hasher(row_count, Default::default());
+    let mut table: KeyMap<u64, Vec<usize>> =
+        KeyMap::with_capacity_and_hasher(row_count, Default::default());
     for (idx, row) in build_rows.iter().enumerate() {
         deadline.charge(DeadlineSite::ParallelJoin, 1)?;
         let hash = hash_composite_key(row, key_indices);
@@ -1152,7 +1152,7 @@ pub fn parallel_topn_vector_search(
                     }
 
                     // Return only the live entries (some slots may have been reused)
-                    let live_indices: FxHashSet<usize> = heap.into_iter().map(|e| e.idx).collect();
+                    let live_indices: KeySet<usize> = heap.into_iter().map(|e| e.idx).collect();
                     entries
                         .into_iter()
                         .enumerate()
@@ -1209,7 +1209,7 @@ pub fn parallel_topn_vector_search(
         }
     }
 
-    let live_indices: FxHashSet<usize> = heap.into_iter().map(|e| e.idx).collect();
+    let live_indices: KeySet<usize> = heap.into_iter().map(|e| e.idx).collect();
     let mut result: Vec<(i64, Row, f64)> = entries
         .into_iter()
         .enumerate()

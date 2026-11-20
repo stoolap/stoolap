@@ -41,7 +41,7 @@
 //! └──────────┴─────────────┴─────────────┘
 //! ```
 
-use rustc_hash::FxHashMap;
+use crate::common::KeyMap;
 
 use crate::core::{Operator, Value};
 
@@ -246,7 +246,7 @@ impl ColumnZoneMap {
 #[derive(Debug, Clone)]
 pub struct TableZoneMap {
     /// Zone maps per column
-    pub columns: FxHashMap<String, ColumnZoneMap>,
+    pub columns: KeyMap<String, ColumnZoneMap>,
     /// Number of rows per segment
     pub segment_size: usize,
     /// Total number of segments
@@ -260,7 +260,7 @@ impl TableZoneMap {
     /// Create a new table zone map
     pub fn new(segment_size: usize) -> Self {
         Self {
-            columns: FxHashMap::default(),
+            columns: KeyMap::default(),
             segment_size,
             segment_count: 0,
             epoch: None,

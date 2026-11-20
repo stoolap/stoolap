@@ -15,8 +15,8 @@
 //! Conversion between FFI `StoolapValue` and Rust `Value`.
 
 use crate::api::ParamVec;
+use crate::common::KeyMap;
 use crate::core::{Error, Result, Value};
-use rustc_hash::FxHashMap;
 
 use super::types::{StoolapNamedParam, StoolapValue};
 use super::{
@@ -152,7 +152,7 @@ pub(crate) unsafe fn ffi_value_of<'a>(
             (!p.name.is_null() && p.name_len > 0)
                 .then(|| std::slice::from_raw_parts(p.name as *const u8, p.name_len as usize))
         };
-        let mut index: Option<FxHashMap<&'a [u8], &'a StoolapNamedParam>> = None;
+        let mut index: Option<KeyMap<&'a [u8], &'a StoolapNamedParam>> = None;
         move |name| {
             let given = if slice.len() <= NAMED_SCAN_MAX {
                 slice

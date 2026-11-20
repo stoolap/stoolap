@@ -21,7 +21,7 @@
 use std::any::Any;
 use std::fmt;
 
-use rustc_hash::FxHashMap;
+use crate::common::KeyMap;
 
 use super::{find_column_index, resolve_alias, Expression};
 use crate::core::pattern::Pattern;
@@ -146,7 +146,7 @@ impl Expression for LikeExpr {
             .is_some_and(Value::is_null)
     }
 
-    fn with_aliases(&self, aliases: &FxHashMap<String, String>) -> Box<dyn Expression> {
+    fn with_aliases(&self, aliases: &KeyMap<String, String>) -> Box<dyn Expression> {
         let resolved = resolve_alias(&self.column, aliases);
         Box::new(LikeExpr {
             column: resolved.to_string(),

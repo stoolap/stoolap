@@ -43,8 +43,8 @@
 //! let count: i64 = db.query_one("SELECT COUNT(*) FROM users", ())?;
 //! ```
 
+use crate::common::KeyMap;
 use parking_lot::RwLock;
-use rustc_hash::FxHashMap;
 use std::sync::{Arc, Weak};
 
 use crate::core::{DataType, Error, IsolationLevel, Result, Value};
@@ -65,8 +65,8 @@ pub const MEMORY_SCHEME: &str = "memory";
 pub const FILE_SCHEME: &str = "file";
 
 /// Global database registry to ensure single engine per DSN
-static DATABASE_REGISTRY: std::sync::LazyLock<RwLock<FxHashMap<String, Weak<SharedEngine>>>> =
-    std::sync::LazyLock::new(|| RwLock::new(FxHashMap::default()));
+static DATABASE_REGISTRY: std::sync::LazyLock<RwLock<KeyMap<String, Weak<SharedEngine>>>> =
+    std::sync::LazyLock::new(|| RwLock::new(KeyMap::default()));
 
 /// An open engine and every handle's claim on it: the engine closes when the
 /// last handle on it drops, whichever handle opened it
@@ -208,7 +208,7 @@ impl Database {
     /// [`Database::clone`].
     pub fn open(dsn: &str) -> Result<Self> {
         // Check if we already have an engine for this DSN
-        let open_engine = |registry: &FxHashMap<String, Weak<SharedEngine>>| {
+        let open_engine = |registry: &KeyMap<String, Weak<SharedEngine>>| {
             registry
                 .get(dsn)
                 .and_then(Weak::upgrade)

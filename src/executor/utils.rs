@@ -28,7 +28,7 @@ use std::hash::{Hash, Hasher};
 pub(crate) use crate::common::names::{eq_folded, eq_names};
 use crate::common::SmartString;
 
-use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
+use crate::common::{KeyHasher, KeyMap, KeySet};
 
 use crate::common::StringMap;
 
@@ -147,7 +147,7 @@ pub fn build_column_index_map(columns: &[String]) -> StringMap<usize> {
     // Add unqualified fallbacks for qualified column names (e.g., "t.val" → "val")
     // Only add when the base name is unambiguous (appears in exactly one table)
     // and doesn't conflict with an existing entry (e.g., an unqualified column)
-    let mut base_count: FxHashMap<&str, u8> = FxHashMap::default();
+    let mut base_count: KeyMap<&str, u8> = KeyMap::default();
     for (base, _) in &bases {
         let entry = base_count.entry(base.as_str()).or_insert(0);
         *entry = entry.saturating_add(1);
@@ -223,10 +223,10 @@ pub(crate) fn qualified_index(
 
 /// Hash multiple key columns into a single hash value.
 /// Used heavily in hash joins - called on every row during build and probe phases.
-/// Uses FxHasher which is optimized for trusted keys in embedded database context.
+/// Uses KeyHasher which is optimized for trusted keys in embedded database context.
 #[inline]
 pub fn hash_composite_key(row: &Row, key_indices: &[usize]) -> u64 {
-    let mut hasher = FxHasher::default();
+    let mut hasher = KeyHasher::default();
 
     for &idx in key_indices {
         if let Some(value) = row.get(idx) {
@@ -313,10 +313,10 @@ pub fn verify_composite_key_equality(
 
 /// Hash all values in a row into a single hash value.
 /// Used for DISTINCT operations and set operations (UNION, INTERSECT, EXCEPT).
-/// Uses FxHasher which is optimized for trusted keys in embedded database context.
+/// Uses KeyHasher which is optimized for trusted keys in embedded database context.
 #[inline]
 pub fn hash_row(row: &Row) -> u64 {
-    let mut hasher = FxHasher::default();
+    let mut hasher = KeyHasher::default();
     for value in row.iter() {
         value.hash(&mut hasher);
     }
@@ -826,13 +826,13 @@ pub fn extract_and_conditions(expr: &Expression) -> Vec<&Expression> {
 
 /// Extract all table qualifiers (aliases) referenced in an expression.
 /// Returns a set of lowercase table names/aliases.
-pub fn collect_table_qualifiers(expr: &Expression) -> FxHashSet<String> {
-    let mut qualifiers = FxHashSet::default();
+pub fn collect_table_qualifiers(expr: &Expression) -> KeySet<String> {
+    let mut qualifiers = KeySet::default();
     collect_table_qualifiers_impl(expr, &mut qualifiers);
     qualifiers
 }
 
-fn collect_table_qualifiers_impl(expr: &Expression, qualifiers: &mut FxHashSet<String>) {
+fn collect_table_qualifiers_impl(expr: &Expression, qualifiers: &mut KeySet<String>) {
     match expr {
         Expression::QualifiedIdentifier(qi) => {
             qualifiers.insert(qi.qualifier.value_lower.to_string());
@@ -944,7 +944,7 @@ pub fn order_by_names_an_alias(expr: &Expression, stmt: &SelectStatement) -> boo
 
 /// Collect the unqualified (bare) column names of an expression, lowercase,
 /// through the same expressions `collect_table_qualifiers` reads
-pub fn collect_unqualified_columns(expr: &Expression, columns: &mut FxHashSet<String>) {
+pub fn collect_unqualified_columns(expr: &Expression, columns: &mut KeySet<String>) {
     match expr {
         Expression::Identifier(id) => {
             columns.insert(id.value_lower.to_string());

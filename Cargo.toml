@@ -71,7 +71,6 @@ tempfile = { version = "3.9", optional = true }
 
 # Utilities
 smallvec = "1.11"
-rustc-hash = "1.1"
 memchr = "2.6"
 regex = "1.10"
 csv = "1.3"  # CSV parsing for COPY FROM

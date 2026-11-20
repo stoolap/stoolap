@@ -2307,9 +2307,9 @@ mod tests {
 
     #[test]
     fn test_hash() {
-        use rustc_hash::FxHashSet;
+        use crate::common::KeySet;
 
-        let mut set = FxHashSet::default();
+        let mut set = KeySet::default();
         set.insert(Value::integer(42));
         set.insert(Value::integer(42)); // Duplicate
         set.insert(Value::integer(43));
@@ -2383,10 +2383,10 @@ mod tests {
 
     #[test]
     fn test_hash_in_hashmap() {
-        use rustc_hash::FxHashMap;
+        use crate::common::KeyMap;
 
         // Test that Integer and Float can be used as equivalent keys
-        let mut map = FxHashMap::default();
+        let mut map = KeyMap::default();
         map.insert(Value::integer(42), "int");
 
         // Looking up with Float(42.0) should find the Integer(42) entry
