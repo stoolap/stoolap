@@ -17,7 +17,7 @@
 //! This module provides result types for SQL query execution.
 
 use crate::common::CompactArc;
-use crate::common::{KeyHasher, KeyMap};
+use crate::common::{HashedMap, KeyHasher, KeyMap};
 use crate::core::{Result, Row, RowVec, Value};
 use crate::storage::traits::QueryResult;
 
@@ -1121,14 +1121,14 @@ pub(crate) struct DistinctRows {
     distinct_column_count: usize,
     /// Seen rows for deduplication: hash -> list of row values (for collision handling)
     /// We only store the distinct columns, not the full row
-    seen: KeyMap<u64, Vec<Vec<Value>>>,
+    seen: HashedMap<Vec<Vec<Value>>>,
 }
 
 impl DistinctRows {
     pub(crate) fn new(distinct_column_count: usize) -> Self {
         Self {
             distinct_column_count,
-            seen: KeyMap::default(),
+            seen: HashedMap::default(),
         }
     }
 
@@ -1265,7 +1265,7 @@ pub struct DistinctOnResult {
     /// Column indices that form the DISTINCT ON key
     key_indices: Vec<usize>,
     /// Seen keys: hash -> list of key values (for collision handling)
-    seen: KeyMap<u64, Vec<Vec<Value>>>,
+    seen: HashedMap<Vec<Vec<Value>>>,
     current_row: Row,
     has_current: bool,
 }
@@ -1277,7 +1277,7 @@ impl DistinctOnResult {
             inner,
             columns,
             key_indices,
-            seen: KeyMap::default(),
+            seen: HashedMap::default(),
             current_row: Row::new(),
             has_current: false,
         }

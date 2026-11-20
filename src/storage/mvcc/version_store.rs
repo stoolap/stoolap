@@ -7780,7 +7780,7 @@ type LocalKeys = Vec<(SmallVec<[i32; 4]>, KeyRows)>;
 /// under the hash of the key it was last given
 #[derive(Default)]
 struct KeyRows {
-    by_hash: KeyMap<u64, SmallVec<[i64; 1]>>,
+    by_hash: crate::common::HashedMap<SmallVec<[i64; 1]>>,
     /// Each entered row's hash and its place among that hash's rows
     by_row: I64Map<(u64, u32)>,
 }

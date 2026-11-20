@@ -28,7 +28,7 @@
 //! JoinHashTable
 //! ├── bucket_heads: Vec<i32>    [bucket_count]     // First entry index per bucket
 //! ├── entries: Vec<HashEntry>   [row_count]        // One per build row
-//! └── bucket_mask: u64                             // For fast modulo
+//! └── bucket_shift: u32                            // Bucket = top bits of the hash
 //!
 //! HashEntry (16 bytes, cache-aligned)
 //! ├── hash: u64     // Full hash for quick rejection
@@ -99,15 +99,16 @@ impl HashEntry {
 /// ```
 pub struct JoinHashTable {
     /// First entry index for each bucket (-1 if empty).
-    /// Sized to power of 2 for fast modulo via bitwise AND.
+    /// Sized to a power of 2, indexed by the hash's top bits.
     bucket_heads: Vec<i32>,
 
     /// Flat storage of all entries.
     /// One entry per build row.
     entries: Vec<HashEntry>,
 
-    /// Mask for computing bucket index: bucket = hash & mask
-    bucket_mask: u64,
+    /// bucket = hash >> shift: a multiply carries every key bit into the
+    /// top bits only, so they, not the low bits, choose the bucket
+    bucket_shift: u32,
 
     /// Number of entries inserted.
     len: usize,
@@ -123,12 +124,10 @@ impl JoinHashTable {
         // This gives us ~75% load factor
         let bucket_count = (row_count * 4 / 3).max(MIN_BUCKETS).next_power_of_two();
 
-        let bucket_mask = (bucket_count - 1) as u64;
-
         Self {
             bucket_heads: vec![-1; bucket_count],
             entries: Vec::with_capacity(row_count),
-            bucket_mask,
+            bucket_shift: 64 - bucket_count.trailing_zeros(),
             len: 0,
         }
     }
@@ -139,7 +138,7 @@ impl JoinHashTable {
         Self {
             bucket_heads: vec![-1; MIN_BUCKETS],
             entries: Vec::new(),
-            bucket_mask: (MIN_BUCKETS - 1) as u64,
+            bucket_shift: 64 - MIN_BUCKETS.trailing_zeros(),
             len: 0,
         }
     }
@@ -226,7 +225,7 @@ impl JoinHashTable {
     /// * `row_idx` - The index of the row in the build rows vector
     #[inline]
     pub fn insert(&mut self, hash: u64, row_idx: u32) {
-        let bucket = (hash & self.bucket_mask) as usize;
+        let bucket = (hash >> self.bucket_shift) as usize;
 
         // Get current head of chain
         let old_head = self.bucket_heads[bucket];
@@ -256,7 +255,7 @@ impl JoinHashTable {
     /// holds a reference to the table.
     #[inline]
     pub fn probe(&self, hash: u64) -> ProbeIter<'_> {
-        let bucket = (hash & self.bucket_mask) as usize;
+        let bucket = (hash >> self.bucket_shift) as usize;
         let first = self.bucket_heads[bucket];
 
         ProbeIter {
@@ -552,16 +551,40 @@ mod tests {
     }
 
     #[test]
+    fn keys_whose_hashes_share_low_bits_still_get_short_chains() {
+        let n = 49_152i64;
+        let mut table = JoinHashTable::with_capacity(n as usize);
+        for k in 0..n {
+            let key = Value::integer(k.wrapping_mul((1 << 29) + (1 << 45)));
+            table.insert(hash_key_value(&key), k as u32);
+        }
+        // A probe walks its whole bucket: on average, the entries per key's bucket
+        let mut walked = 0usize;
+        for &head in &table.bucket_heads {
+            let mut len = 0usize;
+            let mut at = head;
+            while at >= 0 {
+                len += 1;
+                let next = table.entries[at as usize].next;
+                at = if next == EMPTY { -1 } else { next as i32 };
+            }
+            walked += len * len;
+        }
+        let average = walked as f64 / n as f64;
+        assert!(average < 3.5, "{average:.2} entries walked per probe");
+    }
+
+    #[test]
     fn test_chain_collision() {
         // Force collisions by using a small bucket count
         let mut table = JoinHashTable {
             bucket_heads: vec![-1; 4], // Only 4 buckets
             entries: Vec::new(),
-            bucket_mask: 3,
+            bucket_shift: 62,
             len: 0,
         };
 
-        // All these will go to bucket 0 (hash & 3 == 0)
+        // All these will go to bucket 0 (their top two bits are 0)
         table.insert(0, 0);
         table.insert(4, 1);
         table.insert(8, 2);

@@ -20,7 +20,7 @@
 //! - EXCEPT / EXCEPT ALL
 
 use crate::common::deadline::{Deadline, DeadlineSite};
-use crate::common::KeyMap;
+use crate::common::HashedMap;
 use crate::core::row_vec::RowVec;
 use crate::core::{Result, Row};
 use crate::parser::ast::{SelectStatement, SetOperationType};
@@ -168,7 +168,7 @@ impl Executor {
 
                     // Build hash map: hash -> list of (row_index, remaining_count)
                     // Each unique row in right side gets its own counter
-                    let mut right_hash_map: KeyMap<u64, Vec<usize>> = KeyMap::default();
+                    let mut right_hash_map: HashedMap<Vec<usize>> = HashedMap::default();
                     for (idx, (_, row)) in right_rows.iter().enumerate() {
                         deadline.charge(DeadlineSite::SetOp, 1)?;
                         let hash = hash_row(row);
@@ -176,7 +176,7 @@ impl Executor {
                     }
 
                     // For each unique right row, count how many times it appears
-                    let mut right_row_counts: KeyMap<u64, Vec<(usize, usize)>> = KeyMap::default();
+                    let mut right_row_counts: HashedMap<Vec<(usize, usize)>> = HashedMap::default();
                     for (hash, indices) in right_hash_map {
                         let mut unique_rows_in_bucket: Vec<(usize, usize)> = Vec::new();
                         for &idx in &indices {
@@ -222,7 +222,7 @@ impl Executor {
                     let right_rows = Self::materialize_result(right_result, deadline)?;
 
                     // Build hash map: hash -> list of row indices
-                    let mut right_hash_map: KeyMap<u64, Vec<usize>> = KeyMap::default();
+                    let mut right_hash_map: HashedMap<Vec<usize>> = HashedMap::default();
                     for (idx, (_, row)) in right_rows.iter().enumerate() {
                         deadline.charge(DeadlineSite::SetOp, 1)?;
                         let hash = hash_row(row);
@@ -230,7 +230,7 @@ impl Executor {
                     }
 
                     // For each unique right row, count how many times it appears
-                    let mut right_row_counts: KeyMap<u64, Vec<(usize, usize)>> = KeyMap::default();
+                    let mut right_row_counts: HashedMap<Vec<(usize, usize)>> = HashedMap::default();
                     for (hash, indices) in right_hash_map {
                         let mut unique_rows_in_bucket: Vec<(usize, usize)> = Vec::new();
                         for &idx in &indices {
@@ -367,7 +367,7 @@ impl Running {
 #[derive(Default)]
 struct RowSet {
     rows: RowVec,
-    by_hash: KeyMap<u64, SmallVec<[usize; 1]>>,
+    by_hash: HashedMap<SmallVec<[usize; 1]>>,
 }
 
 impl RowSet {

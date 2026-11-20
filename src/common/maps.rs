@@ -43,6 +43,15 @@ pub type KeyMap<K, V> = std::collections::HashMap<K, V, KeyState>;
 /// Hash set for in-memory keys under the engine's hasher
 pub type KeySet<K> = std::collections::HashSet<K, KeyState>;
 
+/// Builds [`crate::common::hash::HashedKey`]
+pub type HashedState = std::hash::BuildHasherDefault<crate::common::hash::HashedKey>;
+
+/// Hash map keyed by a hash the engine already computed, used as is
+pub type HashedMap<V> = std::collections::HashMap<u64, V, HashedState>;
+
+/// Hash set of hashes the engine already computed, used as is
+pub type HashedSet = std::collections::HashSet<u64, HashedState>;
+
 /// Fast hash map for String keys
 ///
 /// Uses AHash which provides ~10% faster lookups than FxHash for String keys
