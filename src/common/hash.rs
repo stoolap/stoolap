@@ -213,7 +213,8 @@ mod tests {
         for key in [0, 1, -1, 7, 1 << 32, i64::MIN, i64::MAX, 1_700_000_000_000] {
             assert_eq!(hash_of(key), slot_hash(key), "{key}");
             assert_eq!(hash_of(key as u64), slot_hash(key), "{key} as u64");
-            assert_eq!(hash_of(key as usize), slot_hash(key), "{key} as usize");
+            let word = key as usize;
+            assert_eq!(hash_of(word), slot_hash(word as i64), "{key} as usize");
         }
     }
 
