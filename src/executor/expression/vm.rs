@@ -28,6 +28,7 @@ use smallvec::SmallVec;
 use super::ops::{row_in, CompareOp, IntervalStep, Op};
 use super::program::Program;
 use crate::common::{CompactArc, SmartString};
+use crate::core::float::{float_op, FloatOp};
 use crate::core::integer::{integer_neg, integer_op, IntegerOp};
 use crate::core::interval::{self, Interval, IntervalUnit};
 use crate::core::pattern::Pattern;
@@ -2465,21 +2466,21 @@ impl ExprVM {
         }
     }
 
+    /// `a op b` over two numbers, an INTEGER pair by `int_op`, any pair
+    /// holding a FLOAT by `float`; NULL for a zero divisor
     #[inline]
-    fn arithmetic_op<FF>(a: &Value, b: &Value, int_op: IntegerOp, float_op: FF) -> Result<Value>
-    where
-        FF: Fn(f64, f64) -> f64,
-    {
-        match (a, b) {
+    fn arithmetic_op(a: &Value, b: &Value, int_op: IntegerOp, float: FloatOp) -> Result<Value> {
+        let floats = match (a, b) {
             (Value::Integer(x), Value::Integer(y)) => {
-                Ok(integer_op(int_op, *x, *y)?.map_or(NULL_VALUE, Value::Integer))
+                return Ok(integer_op(int_op, *x, *y)?.map_or(NULL_VALUE, Value::Integer))
             }
-            (Value::Float(x), Value::Float(y)) => Ok(Value::Float(float_op(*x, *y))),
-            (Value::Integer(x), Value::Float(y)) => Ok(Value::Float(float_op(*x as f64, *y))),
-            (Value::Float(x), Value::Integer(y)) => Ok(Value::Float(float_op(*x, *y as f64))),
-            _ if a.is_null() || b.is_null() => Ok(Value::Null(DataType::Float)),
-            _ => Ok(Value::Null(DataType::Null)),
-        }
+            (Value::Float(x), Value::Float(y)) => (*x, *y),
+            (Value::Integer(x), Value::Float(y)) => (*x as f64, *y),
+            (Value::Float(x), Value::Integer(y)) => (*x, *y as f64),
+            _ if a.is_null() || b.is_null() => return Ok(Value::Null(DataType::Float)),
+            _ => return Ok(NULL_VALUE),
+        };
+        Ok(float_op(float, floats.0, floats.1)?.map_or(NULL_VALUE, Value::Float))
     }
 
     /// `a + b`, with a timestamp plus days or an interval
@@ -2491,7 +2492,7 @@ impl ExprVM {
                 Self::timestamp_add_days(*t, *days, false)
             }
             (Value::Timestamp(_), Value::Text(_)) => Self::timestamp_add_interval(a, b, false),
-            _ => Self::arithmetic_op(a, b, IntegerOp::Add, |x, y| x + y),
+            _ => Self::arithmetic_op(a, b, IntegerOp::Add, FloatOp::Add),
         }
     }
 
@@ -2510,42 +2511,23 @@ impl ExprVM {
                 Self::timestamp_add_days(*t, *days, true)
             }
             (Value::Timestamp(_), Value::Text(_)) => Self::timestamp_add_interval(a, b, true),
-            _ => Self::arithmetic_op(a, b, IntegerOp::Sub, |x, y| x - y),
+            _ => Self::arithmetic_op(a, b, IntegerOp::Sub, FloatOp::Sub),
         }
     }
 
     #[inline]
     fn mul_op(a: &Value, b: &Value) -> Result<Value> {
-        Self::arithmetic_op(a, b, IntegerOp::Mul, |x, y| x * y)
+        Self::arithmetic_op(a, b, IntegerOp::Mul, FloatOp::Mul)
     }
 
     #[inline]
     fn div_op(a: &Value, b: &Value) -> Result<Value> {
-        Ok(match (a, b) {
-            // Division by zero returns NULL
-            (Value::Integer(x), Value::Integer(y)) => {
-                integer_op(IntegerOp::Div, *x, *y)?.map_or(NULL_VALUE, Value::Integer)
-            }
-            (Value::Float(x), Value::Float(y)) if *y != 0.0 => Value::Float(x / y),
-            (Value::Integer(x), Value::Float(y)) if *y != 0.0 => Value::Float(*x as f64 / y),
-            (Value::Float(x), Value::Integer(y)) if *y != 0 => Value::Float(x / *y as f64),
-            _ if a.is_null() || b.is_null() => Value::Null(DataType::Float),
-            _ => Value::Null(DataType::Null),
-        })
+        Self::arithmetic_op(a, b, IntegerOp::Div, FloatOp::Div)
     }
 
     #[inline]
     fn mod_op(a: &Value, b: &Value) -> Result<Value> {
-        Ok(match (a, b) {
-            (Value::Integer(x), Value::Integer(y)) => {
-                integer_op(IntegerOp::Mod, *x, *y)?.map_or(NULL_VALUE, Value::Integer)
-            }
-            (Value::Float(x), Value::Float(y)) if *y != 0.0 => Value::Float(x % y),
-            (Value::Integer(x), Value::Float(y)) if *y != 0.0 => Value::Float(*x as f64 % y),
-            (Value::Float(x), Value::Integer(y)) if *y != 0 => Value::Float(x % *y as f64),
-            _ if a.is_null() || b.is_null() => Value::Null(DataType::Float),
-            _ => Value::Null(DataType::Null),
-        })
+        Self::arithmetic_op(a, b, IntegerOp::Mod, FloatOp::Mod)
     }
 
     /// JSON access helper

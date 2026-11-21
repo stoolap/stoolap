@@ -27,6 +27,7 @@ mod comparison_rule_test;
 mod constant_folding_test;
 mod data_type_validation_test;
 mod family_operators_test;
+mod float_arithmetic_rule_test;
 mod float_int_where_test;
 mod from_row_test;
 mod in_list_duplicate_members_test;

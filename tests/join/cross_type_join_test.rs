@@ -177,9 +177,9 @@ fn float_infinity_self_join() {
         .unwrap();
     db.execute("CREATE TABLE tb (id INTEGER PRIMARY KEY, k FLOAT)", ())
         .unwrap();
-    db.execute("INSERT INTO ta VALUES (1, 1e308 * 10.0)", ())
+    db.execute("INSERT INTO ta VALUES (1, CAST('inf' AS FLOAT))", ())
         .unwrap();
-    db.execute("INSERT INTO tb VALUES (1, 1e308 * 10.0)", ())
+    db.execute("INSERT INTO tb VALUES (1, CAST('inf' AS FLOAT))", ())
         .unwrap();
     let c: i64 = db
         .query_one("SELECT COUNT(*) FROM ta JOIN tb ON ta.k = tb.k", ())
@@ -210,9 +210,9 @@ fn float_zero_and_infinity_parallel_path() {
         .unwrap();
     tx.execute("INSERT INTO tb VALUES (20000, 0.0 / -1.0)", ())
         .unwrap();
-    tx.execute("INSERT INTO ta VALUES (20001, 1e308 * 10.0)", ())
+    tx.execute("INSERT INTO ta VALUES (20001, CAST('inf' AS FLOAT))", ())
         .unwrap();
-    tx.execute("INSERT INTO tb VALUES (20001, 1e308 * 10.0)", ())
+    tx.execute("INSERT INTO tb VALUES (20001, CAST('inf' AS FLOAT))", ())
         .unwrap();
     tx.commit().unwrap();
 
