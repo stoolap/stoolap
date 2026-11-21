@@ -22,7 +22,7 @@ use super::token::{Keyword, Token, TokenType};
 use crate::common::SmartString;
 
 /// Reserved SQL keywords that cannot be used as identifiers
-fn is_reserved(keyword: Keyword) -> bool {
+pub(crate) fn is_reserved(keyword: Keyword) -> bool {
     use Keyword::*;
     matches!(
         keyword,

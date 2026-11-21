@@ -144,6 +144,8 @@ CREATE TABLE order_items (
 );
 ```
 
+A table has one primary key: CREATE TABLE refuses a second PRIMARY KEY, written on a column or on the table, with `table 't' has more than one PRIMARY KEY`.
+
 ## Indexes
 
 Stoolap provides several index types for optimizing queries.

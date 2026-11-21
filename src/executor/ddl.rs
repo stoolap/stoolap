@@ -289,6 +289,25 @@ impl Executor {
         // Collect columns with UNIQUE constraints to create indexes after table creation
         let mut unique_columns: Vec<String> = Vec::new();
 
+        // A table has one row identity: one PRIMARY KEY, on a column or the table
+        let primary_keys = stmt
+            .columns
+            .iter()
+            .flat_map(|c| &c.constraints)
+            .filter(|c| matches!(c, ColumnConstraint::PrimaryKey))
+            .count()
+            + stmt
+                .table_constraints
+                .iter()
+                .filter(|c| matches!(c, TableConstraint::PrimaryKey(_)))
+                .count();
+        if primary_keys > 1 {
+            return Err(Error::Parse(format!(
+                "table '{}' has more than one PRIMARY KEY",
+                table_name
+            )));
+        }
+
         // PRIMARY KEY (col) at table level names the key column the way the
         // column's own constraint would
         let table_level_pk: Option<&str> = stmt.table_constraints.iter().find_map(|c| match c {

@@ -301,7 +301,7 @@ fn a_composite_key_and_cluster_by_name_columns_in_non_ascii_uppercase() {
     let db = Database::open("memory://non_ascii_uppercase_composite").unwrap();
     run(
         &db,
-        "CREATE TABLE u (id INTEGER PRIMARY KEY, \"äb\" INTEGER, c INTEGER, d INTEGER, \
+        "CREATE TABLE u (id INTEGER, \"äb\" INTEGER, c INTEGER, d INTEGER, \
          PRIMARY KEY (\"ÄB\", c)) CLUSTER BY (\"ÄB\")",
     );
     assert!(

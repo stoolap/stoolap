@@ -33,6 +33,7 @@ mod output_column_names_test;
 mod qualifier_scope_test;
 mod quoted_boolean_name_test;
 mod rowid_test;
+mod show_create_round_trip_test;
 mod stored_expression_text_test;
 mod view_column_names_test;
 mod view_join_filter_test;

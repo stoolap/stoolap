@@ -26,7 +26,7 @@ use crate::common::KeySet;
 
 use crate::common::SmartString;
 use crate::core::row_vec::RowVec;
-use crate::core::{Error, Result, Row, Value};
+use crate::core::{DataType, Error, Result, Row, SchemaColumn, Value};
 use crate::parser::ast::*;
 use crate::storage::traits::transaction::{StatementTable, TableUse};
 use crate::storage::traits::{Engine, QueryResult};
@@ -88,27 +88,35 @@ impl Executor {
         let table = tx.get_read_table_at(table_name, None, TableUse::Metadata)?;
         let schema = table.schema();
 
-        // Get unique column names from indexes
+        // A single-column unique index is its column's UNIQUE, a wider one a
+        // table UNIQUE, a composite PRIMARY KEY among them, in name order
         let mut unique_columns: KeySet<String> = KeySet::default();
+        let mut unique_keys: Vec<(String, Vec<String>)> = Vec::new();
         if let Ok(indexes) = self.engine.list_table_indexes(table_name) {
             for index_name in indexes.keys() {
                 if let Some(index) = table.get_index(index_name) {
-                    // Only single-column unique indexes should be shown as UNIQUE constraint on column
                     let col_names = index.column_names();
-                    if index.is_unique() && col_names.len() == 1 {
-                        unique_columns.insert(col_names[0].to_lowercase());
+                    if !index.is_unique() {
+                        continue;
+                    }
+                    match col_names {
+                        [column] => {
+                            unique_columns.insert(column.to_lowercase());
+                        }
+                        _ => unique_keys.push((index_name.clone(), names(col_names))),
                     }
                 }
             }
         }
+        unique_keys.sort_unstable();
 
         // Build CREATE TABLE statement
-        let mut create_sql = format!("CREATE TABLE {} (", table_name);
+        let mut create_sql = format!("CREATE TABLE {} (", SqlName(table_name));
         let col_defs: Vec<String> = schema
             .columns
             .iter()
             .map(|col| {
-                let mut def = format!("{} {:?}", col.name, col.data_type);
+                let mut def = format!("{} {}", SqlName(&col.name), column_type(col));
                 if col.primary_key {
                     def.push_str(" PRIMARY KEY");
                     if col.auto_increment {
@@ -135,20 +143,20 @@ impl Executor {
             })
             .collect();
         create_sql.push_str(&col_defs.join(", "));
+        for (_, columns) in &unique_keys {
+            create_sql.push_str(&format!(", UNIQUE ({})", columns.join(", ")));
+        }
 
         // Add foreign key constraints
         for fk in &schema.foreign_keys {
-            use std::fmt::Write;
-            write!(
-                create_sql,
+            create_sql.push_str(&format!(
                 ", FOREIGN KEY ({}) REFERENCES {}({}) ON DELETE {} ON UPDATE {}",
-                fk.column_name,
-                fk.referenced_table,
-                fk.referenced_column,
+                SqlName(&fk.column_name),
+                SqlName(&fk.referenced_table),
+                SqlName(&fk.referenced_column),
                 fk.on_delete,
                 fk.on_update
-            )
-            .unwrap();
+            ));
         }
         for check in &schema.table_checks {
             create_sql.push_str(&format!(", CHECK ({})", check));
@@ -156,12 +164,11 @@ impl Executor {
 
         create_sql.push(')');
         if !schema.cluster_key.is_empty() {
-            let key: Vec<&str> = schema
+            let key = schema
                 .cluster_key
                 .iter()
-                .map(|&c| schema.columns[c].name.as_str())
-                .collect();
-            create_sql.push_str(&format!(" CLUSTER BY ({})", key.join(", ")));
+                .map(|&c| schema.columns[c].name.as_str());
+            create_sql.push_str(&format!(" CLUSTER BY ({})", names(key).join(", ")));
         }
 
         let columns = vec!["Table".to_string(), "Create Table".to_string()];
@@ -194,7 +201,8 @@ impl Executor {
         // Build CREATE VIEW statement
         let create_sql = format!(
             "CREATE VIEW {} AS {}",
-            view_def.original_name, view_def.query
+            SqlName(&view_def.original_name),
+            view_def.query
         );
 
         let columns = vec!["View".to_string(), "Create View".to_string()];
@@ -266,7 +274,11 @@ impl Executor {
                     };
                     let m = index.hnsw_m().unwrap_or(16);
                     let ef = index.hnsw_ef_construction().unwrap_or(200);
-                    format!("metric={}, m={}, ef_construction={}", metric, m, ef)
+                    let mut options = format!("metric={}, m={}, ef_construction={}", metric, m, ef);
+                    if let Some(ef_search) = index.default_ef_search() {
+                        options.push_str(&format!(", ef_search={}", ef_search));
+                    }
+                    options
                 } else {
                     String::new()
                 };
@@ -332,8 +344,7 @@ impl Executor {
 
         let mut rows = RowVec::with_capacity(schema.columns.len());
         for (i, col) in schema.columns.iter().enumerate() {
-            // Determine type string
-            let type_str = format!("{:?}", col.data_type);
+            let type_str = column_type(col);
 
             // Determine nullability
             let null_str = if col.nullable { "YES" } else { "NO" };
@@ -380,4 +391,23 @@ impl Executor {
 
         Ok(Box::new(ExecutorResult::new(columns, rows)))
     }
+}
+
+/// The type `col` was declared with, as CREATE TABLE reads it back: a
+/// VECTOR with its dimension when it has one
+fn column_type(col: &SchemaColumn) -> String {
+    match col.data_type {
+        DataType::Vector if col.vector_dimensions > 0 => {
+            format!("VECTOR({})", col.vector_dimensions)
+        }
+        data_type => format!("{:?}", data_type),
+    }
+}
+
+/// Each of `columns` as a name CREATE TABLE reads back
+fn names<S: AsRef<str>>(columns: impl IntoIterator<Item = S>) -> Vec<String> {
+    columns
+        .into_iter()
+        .map(|column| SqlName(column.as_ref()).to_string())
+        .collect()
 }
