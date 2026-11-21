@@ -130,15 +130,19 @@ pub(crate) struct Root {
     pub nonce: u64,
 }
 
+/// A section written raw: (kind, encoding, offset, length)
+pub(crate) type RawSection = (u32, u8, u64, u64);
+
 /// Writes the sections, the section table and the footer after the
 /// blocks, which end at `pos`; returns the identity of the file written
+/// and where the sections stored raw lie in it
 pub(crate) fn write_tail<W: Write>(
     out: &mut W,
     mut pos: u64,
     root: &Root,
     meta: Vec<V5Section>,
     blocks: &[BlockEntry],
-) -> io::Result<FileIdentity> {
+) -> io::Result<(FileIdentity, Vec<RawSection>)> {
     let mut root_bytes = Vec::with_capacity(ROOT_LEN);
     root_bytes.extend_from_slice(&(ROOT_LEN as u32).to_le_bytes());
     root_bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
@@ -184,6 +188,7 @@ pub(crate) fn write_tail<W: Write>(
     let mut sections = Vec::with_capacity(8 + all.len() * SECTION_ENTRY);
     sections.extend_from_slice(&(all.len() as u32).to_le_bytes());
     sections.extend_from_slice(&(SECTION_ENTRY as u32).to_le_bytes());
+    let mut raw = Vec::with_capacity(all.len());
     for s in &all {
         let packed;
         let (stored, codec): (&[u8], u8) = if s.compress {
@@ -205,6 +210,9 @@ pub(crate) fn write_tail<W: Write>(
         sections.extend_from_slice(&(s.bytes.len() as u64).to_le_bytes());
         sections.extend_from_slice(&[codec, s.encoding, 0, 0]);
         sections.extend_from_slice(&checksum(stored).to_le_bytes());
+        if codec == CODEC_RAW {
+            raw.push((s.kind, s.encoding, pos, stored.len() as u64));
+        }
         pos += stored.len() as u64;
     }
     out.write_all(&sections)?;
@@ -219,11 +227,12 @@ pub(crate) fn write_tail<W: Write>(
     footer[24..28].copy_from_slice(&footer_crc.to_le_bytes());
     footer[28..32].copy_from_slice(&V5_MAGIC);
     out.write_all(&footer)?;
-    Ok(FileIdentity {
+    let identity = FileIdentity {
         len: pos + sections.len() as u64 + FOOTER_LEN,
         nonce: root.nonce,
         table_crc,
-    })
+    };
+    Ok((identity, raw))
 }
 
 /// What an open reads of a V5 volume besides the blocks
