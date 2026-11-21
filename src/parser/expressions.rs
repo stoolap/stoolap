@@ -2095,8 +2095,7 @@ impl Parser<'_> {
 
         // Additional window definitions separated by comma
         while self.peek_token_is_punctuator(",") {
-            self.next_token(); // consume comma
-            self.next_token(); // move to next window name
+            self.next_token(); // consume comma; the definition moves to its name
             if let Some(def) = self.parse_single_window_definition() {
                 defs.push(def);
             }
