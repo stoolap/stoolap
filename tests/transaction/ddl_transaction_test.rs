@@ -405,19 +405,45 @@ fn a_table_a_transaction_dropped_or_rolled_back_can_be_made_again_under_its_name
     db.execute("BEGIN", ()).unwrap();
     db.execute("DROP TABLE t", ()).unwrap();
     db.execute("CREATE TABLE t AS SELECT 2 AS id", ()).unwrap();
+    db.execute("DROP TABLE t", ()).unwrap();
+    db.execute("CREATE TABLE t AS SELECT 3 AS id", ()).unwrap();
     db.execute("SAVEPOINT s", ()).unwrap();
     db.execute("CREATE TABLE u AS SELECT 3 AS id", ()).unwrap();
     db.execute("ROLLBACK TO SAVEPOINT s", ()).unwrap();
     db.execute("CREATE TABLE u AS SELECT 4 AS id", ()).unwrap();
+    db.execute("INSERT INTO p VALUES (6)", ()).unwrap();
     db.execute("DROP TABLE p", ()).unwrap();
     db.execute("CREATE TABLE p (id INTEGER)", ()).unwrap();
     db.execute("INSERT INTO p VALUES (5)", ()).unwrap();
     db.execute("COMMIT", ()).unwrap();
-    for (table, want) in [("t", 2), ("u", 4), ("p", 5)] {
+    for (table, want) in [("t", 3), ("u", 4), ("p", 5)] {
         assert_eq!(
             ids(&db, &format!("SELECT id FROM {table}")),
             Ok(vec![want]),
             "{table} after COMMIT"
         );
     }
+}
+
+#[test]
+fn a_row_written_through_a_held_handle_commits_to_its_table_renamed_meanwhile() {
+    use stoolap::core::{Row, Value};
+    use stoolap::storage::traits::Engine;
+    let db = Database::open("memory://ddl_held_handle_rename").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER)", ()).unwrap();
+    let mut tx = db.engine().begin_transaction().unwrap();
+    let mut held = tx.get_table("t").unwrap();
+    let other = db.clone();
+    other.execute("ALTER TABLE t RENAME TO u", ()).unwrap();
+    other.execute("CREATE TABLE t (id INTEGER)", ()).unwrap();
+    let _ = tx.get_table("t");
+    held.insert(Row::from_values(vec![Value::Integer(1)]))
+        .unwrap();
+    drop(held);
+    let committed = tx.commit();
+    assert_eq!(
+        (committed.is_ok(), ids(&db, "SELECT id FROM u")),
+        (true, Ok(vec![1])),
+        "(commit succeeded, rows of the renamed table)"
+    );
 }

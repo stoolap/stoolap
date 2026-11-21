@@ -7910,11 +7910,9 @@ impl TxnTableStore {
         self.store.read()
     }
 
-    /// Whether the store was opened over another table than `store` and
-    /// holds no rows or claims, as one over a table the transaction dropped
-    /// or rolled back: a store over `store` takes its place
-    pub(crate) fn left_behind(&self, store: &VersionStore) -> bool {
-        self.parent != store.store_id && !self.read().holds_writes()
+    /// Whether the store was opened over `store`
+    pub(crate) fn is_over(&self, store: &VersionStore) -> bool {
+        self.parent == store.store_id
     }
 
     /// Admits a handle that reads `store` under `layout`: the transaction's
