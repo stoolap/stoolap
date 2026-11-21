@@ -23,7 +23,6 @@
 //! total; the least recently used entries leave when a new one crosses it.
 
 use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 
@@ -49,7 +48,7 @@ struct Entry {
 
 #[derive(Default)]
 struct Inner {
-    entries: HashMap<GroupKey, Entry>,
+    entries: crate::common::KeyMap<GroupKey, Entry>,
     bytes: usize,
     tick: u64,
 }

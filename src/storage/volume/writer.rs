@@ -1464,14 +1464,16 @@ impl CompressedBlockStore {
         )
     }
 
-    /// Decompress a single row group for one column. Returns the ColumnData
-    /// covering only that group's rows (0..group_row_count).
+    /// Decompress a single row group for one column, past the decoded group
+    /// cache. Returns the ColumnData covering only that group's rows
+    /// (0..group_row_count).
     pub fn decompress_single_group(
         &self,
         col_idx: usize,
         group_idx: usize,
     ) -> std::io::Result<ColumnData> {
-        self.decompress_group_in(col_idx, group_idx, None)
+        self.row_id_group(col_idx, group_idx)
+            .unwrap_or_else(|| self.decompress_group_in(col_idx, group_idx, None))
     }
 
     /// `decompress_single_group`, its file read part of `ahead`'s run
@@ -2386,7 +2388,115 @@ impl VolumeMeta {
     }
 }
 
-type UniqueIndexMap = crate::common::KeyMap<Vec<usize>, Arc<Vec<(u64, u32)>>>;
+/// A unique index entry: the top 32 bits of its key's hash over the row
+/// it names. A hash names candidates only, each checked against its row
+pub(crate) type UniqueEntry = u64;
+
+type UniqueIndexMap = crate::common::KeyMap<Vec<usize>, Arc<Vec<UniqueEntry>>>;
+
+/// The hash a unique index files one key cell under: the cell's `Value`
+/// hash, so values that compare equal file alike
+#[inline]
+pub(crate) fn unique_cell_hash(value: &Value) -> u64 {
+    use std::hash::BuildHasher;
+    crate::common::KeyState::default().hash_one(value)
+}
+
+/// The hash of a key whose cells, in column order, hash to `cells`
+#[inline]
+pub(crate) fn unique_key_hash(cells: impl IntoIterator<Item = u64>) -> u64 {
+    use std::hash::Hasher;
+    let mut key = crate::common::KeyHasher::default();
+    for cell in cells {
+        key.write_u64(cell);
+    }
+    key.finish()
+}
+
+/// The entry for row `row` of a key hashing to `hash`
+#[inline]
+pub(crate) fn unique_entry(hash: u64, row: u32) -> UniqueEntry {
+    (hash & !u64::from(u32::MAX)) | u64::from(row)
+}
+
+/// The entries in their key hashes' order, rows ascending within one
+/// hash: a stable radix sort on the hash bits, 8 at a time
+pub(crate) fn sort_unique_entries(entries: Vec<UniqueEntry>) -> Vec<UniqueEntry> {
+    let mut entries = entries;
+    let mut spare = vec![0; entries.len()];
+    for shift in [32, 40, 48, 56] {
+        let mut starts = [0usize; 257];
+        for &entry in &entries {
+            starts[((entry >> shift) & 0xFF) as usize + 1] += 1;
+        }
+        for digit in 0..256 {
+            starts[digit + 1] += starts[digit];
+        }
+        for &entry in &entries {
+            let digit = ((entry >> shift) & 0xFF) as usize;
+            spare[starts[digit]] = entry;
+            starts[digit] += 1;
+        }
+        std::mem::swap(&mut entries, &mut spare);
+    }
+    entries
+}
+
+/// The hashes of `column`'s cells from `start` on, one per slot of `out`,
+/// as `unique_cell_hash` files them, with `null` set for a NULL cell; a
+/// text column's dictionary is hashed once into `dictionary`
+fn unique_cell_hashes(
+    column: &ColumnData,
+    start: usize,
+    out: &mut [u64],
+    null: &mut [bool],
+    dictionary: &mut Option<(Arc<[SmartString]>, Vec<u64>)>,
+) {
+    let cells = out.iter_mut().zip(null.iter_mut()).zip(start..);
+    if let ColumnData::Dictionary {
+        ids,
+        dictionary: entries,
+        nulls,
+    } = column
+    {
+        if !dictionary
+            .as_ref()
+            .is_some_and(|(hashed, _)| Arc::ptr_eq(hashed, entries))
+        {
+            let hashes = entries
+                .iter()
+                .map(|entry| unique_cell_hash(&Value::Text(entry.clone())))
+                .collect();
+            *dictionary = Some((Arc::clone(entries), hashes));
+        }
+        let hashes = dictionary.as_ref().map_or(&[][..], |(_, hashes)| hashes);
+        for ((out, null), row) in cells {
+            match nulls[row] {
+                true => *null = true,
+                false => *out = hashes[ids[row] as usize],
+            }
+        }
+        return;
+    }
+    for ((out, null), row) in cells {
+        match column.is_null(row) {
+            true => *null = true,
+            false => *out = unique_cell_hash(&column.get_value(row)),
+        }
+    }
+}
+
+/// The entries of `entries` whose key hashes to `hash`, rows ascending
+fn unique_matches(entries: &[UniqueEntry], hash: u64) -> &[UniqueEntry] {
+    let top = hash >> 32;
+    let start = entries.partition_point(|&entry| entry >> 32 < top);
+    // A key has one entry or a few, next to each other
+    let count = entries[start..]
+        .iter()
+        .take_while(|&&entry| entry >> 32 == top)
+        .count();
+    &entries[start..start + count]
+}
 
 /// A volume's unique indexes and the last eviction pass a lookup used
 /// them in, shared by every form of the volume
@@ -2479,7 +2589,7 @@ pub struct FrozenVolume {
     pub blooms: Arc<VolumeBlooms>,
     /// Per-volume unique index: lazily built, never invalidated (volume is immutable).
     /// Key: sorted column indices for a UNIQUE constraint.
-    /// Value: shared sorted (hash, row_idx) pairs, 16 bytes per entry.
+    /// Value: shared sorted entries, 8 bytes each (see `UniqueEntry`).
     pub unique_indices: Arc<UniqueIndexes>,
     /// Access epoch counter. Bumped per scan for eviction tracking.
     pub last_access_epoch: std::sync::atomic::AtomicU64,
@@ -4586,7 +4696,6 @@ impl FrozenVolume {
         values: &[&Value],
         max: usize,
     ) -> UniqueCandidates {
-        use std::hash::{Hash, Hasher};
         let entries = {
             let indexes = self.unique_indices.read();
             let Some(entries) = indexes.get(col_indices) else {
@@ -4597,22 +4706,12 @@ impl FrozenVolume {
         };
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::unique_index_taken();
-        let mut hasher = ahash::AHasher::default();
-        for &val in values {
-            val.hash(&mut hasher);
-        }
-        let hash = hasher.finish();
-        let start = entries.partition_point(|&(h, _)| h < hash);
-        let count = entries[start..].partition_point(|&(h, _)| h == hash);
-        if count > max {
+        let hash = unique_key_hash(values.iter().map(|&value| unique_cell_hash(value)));
+        let matches = unique_matches(&entries, hash);
+        if matches.len() > max {
             return UniqueCandidates::TooMany;
         }
-        let mut positions: Vec<usize> = entries[start..start + count]
-            .iter()
-            .map(|&(_, row)| row as usize)
-            .collect();
-        positions.sort_unstable();
-        UniqueCandidates::Positions(positions)
+        UniqueCandidates::Positions(matches.iter().map(|&entry| entry as u32 as usize).collect())
     }
 
     /// Look up a composite unique key in this volume's per-volume hash index.
@@ -4629,40 +4728,22 @@ impl FrozenVolume {
         values: &[&Value],
         mut f: impl FnMut(u32) -> bool, // return true to stop early
     ) -> std::io::Result<()> {
-        use std::hash::{Hash, Hasher};
-
-        // Compute hash of query values
-        let mut hasher = ahash::AHasher::default();
-        for &val in values {
-            val.hash(&mut hasher);
-        }
-        let hash = hasher.finish();
-
+        let hash = unique_key_hash(values.iter().map(|&value| unique_cell_hash(value)));
         let cached = {
             let indices = self.unique_indices.read();
             self.unique_indices.mark_used();
-            if let Some(entries) = indices.get(col_indices) {
-                let pos = entries.partition_point(|&(h, _)| h < hash);
-                if entries.get(pos).is_none_or(|&(h, _)| h != hash) {
-                    return Ok(());
-                }
-                Some((Arc::clone(entries), pos))
-            } else {
-                None
+            match indices.get(col_indices) {
+                Some(entries) if unique_matches(entries, hash).is_empty() => return Ok(()),
+                Some(entries) => Some(Arc::clone(entries)),
+                None => None,
             }
         };
-        let (entries, pos) = match cached {
-            Some(cached) => cached,
-            None => {
-                let entries = self.unique_index(col_indices)?;
-                let pos = entries.partition_point(|&(h, _)| h < hash);
-                (entries, pos)
-            }
+        let entries = match cached {
+            Some(entries) => entries,
+            None => self.unique_index(col_indices)?,
         };
-        for &(h, row_idx) in &entries[pos..] {
-            if h != hash {
-                break;
-            }
+        for &entry in unique_matches(&entries, hash) {
+            let row_idx = entry as u32;
             let mut matches = true;
             for (&ci, &val) in col_indices.iter().zip(values) {
                 let vol_val = self.cell(ci, row_idx as usize)?;
@@ -4769,36 +4850,62 @@ impl FrozenVolume {
         self.unique_index(col_indices).map(|_| ())
     }
 
-    fn unique_index(&self, col_indices: &[usize]) -> std::io::Result<Arc<Vec<(u64, u32)>>> {
-        use std::hash::{Hash, Hasher};
+    /// The unique index over `col_indices`, built from the key columns a
+    /// row group at a time when none is: a column not decoded is read
+    /// past the decoded group cache, and nothing of it is kept
+    fn unique_index(&self, col_indices: &[usize]) -> std::io::Result<Arc<Vec<UniqueEntry>>> {
         let cached = self.unique_indices.read().get(col_indices).cloned();
         if let Some(entries) = cached {
             return Ok(entries);
         }
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::unique_index_built();
-        let columns = col_indices
+        let rows = self.meta.row_count;
+        let resident: smallvec::SmallVec<[Option<&ColumnData>; 4]> = col_indices
             .iter()
-            .map(|&ci| self.columns.get(ci))
-            .collect::<std::io::Result<smallvec::SmallVec<[&ColumnData; 4]>>>()?;
-        let mut entries: Vec<(u64, u32)> = Vec::with_capacity(self.meta.row_count);
-        for row_idx in 0..self.meta.row_count {
-            let mut row_hasher = ahash::AHasher::default();
-            let mut has_null = false;
-            for &col in &columns {
-                if col.is_null(row_idx) {
-                    has_null = true;
-                    break;
-                }
-                col.get_value(row_idx).hash(&mut row_hasher);
+            .map(|&ci| self.columns.resident(ci))
+            .collect();
+        let shift = self.meta.group_shift();
+        let step = match resident.iter().all(Option::is_some) {
+            true => rows.max(1),
+            false => 1 << shift,
+        };
+        let mut hashes = vec![vec![0u64; step.min(rows)]; col_indices.len()];
+        let mut null = vec![false; step.min(rows)];
+        let mut dictionaries = vec![None; col_indices.len()];
+        let mut entries: Vec<UniqueEntry> = Vec::with_capacity(rows);
+        for first in (0..rows).step_by(step) {
+            let len = step.min(rows - first);
+            null[..len].fill(false);
+            for (col, &ci) in col_indices.iter().enumerate() {
+                let group;
+                let (column, start) = match resident[col] {
+                    Some(column) => (column, first),
+                    None => {
+                        let store = self.columns.compressed_store().ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "column data is not loaded",
+                            )
+                        })?;
+                        group = store.decompress_single_group(ci, first >> shift)?;
+                        (&group, 0)
+                    }
+                };
+                unique_cell_hashes(
+                    column,
+                    start,
+                    &mut hashes[col][..len],
+                    &mut null[..len],
+                    &mut dictionaries[col],
+                );
             }
-            if has_null {
-                continue;
+            for (row, _) in null[..len].iter().enumerate().filter(|&(_, &null)| !null) {
+                let hash = unique_key_hash(hashes.iter().map(|column| column[row]));
+                entries.push(unique_entry(hash, (first + row) as u32));
             }
-            entries.push((row_hasher.finish(), row_idx as u32));
         }
-        entries.sort_unstable_by_key(|&(h, _)| h);
-        let entries = Arc::new(entries);
+        let entries = Arc::new(sort_unique_entries(entries));
         let key = col_indices.to_vec();
         let replaced = self
             .unique_indices
@@ -4836,7 +4943,7 @@ impl FrozenVolume {
             .unique_indices
             .read()
             .values()
-            .map(|entries| entries.capacity() * std::mem::size_of::<(u64, u32)>())
+            .map(|entries| entries.capacity() * std::mem::size_of::<UniqueEntry>())
             .sum();
         self.meta.memory_size() + self.blooms.memory_size() + self.columns.memory_size() + unique
     }
@@ -5544,7 +5651,7 @@ mod tests {
         assert!(capacity > len, "capacity {capacity} above length {len}");
         assert_eq!(
             volume.memory_size() - before,
-            capacity * std::mem::size_of::<(u64, u32)>(),
+            capacity * std::mem::size_of::<UniqueEntry>(),
             "the built index is counted by its capacity"
         );
     }

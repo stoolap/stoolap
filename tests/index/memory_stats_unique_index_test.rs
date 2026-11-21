@@ -64,7 +64,7 @@ fn a_sealed_unique_index_is_counted_in_volume_bytes() {
     assert!(plain > 0, "the plain table sealed into a volume");
     assert_eq!(
         volume_bytes(&db, "keyed") - plain,
-        ROWS * 16,
-        "the unique index adds 16 bytes per row"
+        ROWS * 8,
+        "the unique index adds 8 bytes per row"
     );
 }

@@ -214,13 +214,15 @@ pub struct VolumeFileWriter {
     volume_id: u64,
     /// The unique column sets indexed as the rows pass
     unique: Vec<UniqueIndexing>,
+    /// By column, the unique cell hashes of its dictionary's entries so far
+    dictionary_hashes: Vec<Vec<u64>>,
 }
 
-/// One unique column set and its (hash, row) entries, hashed as the
-/// lookup hashes its values
+/// One unique column set and its entries, hashed as the lookup hashes its
+/// values
 struct UniqueIndexing {
     columns: Vec<usize>,
-    entries: Vec<(u64, u32)>,
+    entries: Vec<super::writer::UniqueEntry>,
 }
 
 impl TypedSink for VolumeFileWriter {
@@ -291,6 +293,7 @@ impl VolumeFileWriter {
             expected_rows,
             volume_id,
             unique: Vec::new(),
+            dictionary_hashes: Vec::new(),
         })
     }
 
@@ -398,7 +401,7 @@ impl VolumeFileWriter {
     /// with a null in the set is left out, as the index built over
     /// columns leaves it out
     fn hash_unique(&mut self) -> Result<()> {
-        use std::hash::{Hash, Hasher};
+        use super::writer::{unique_cell_hash, unique_entry, unique_key_hash};
         let builder = self
             .builder
             .as_ref()
@@ -409,6 +412,19 @@ impl VolumeFileWriter {
             .collect();
         let columns = columns.as_slice();
         let rows = builder.group_len();
+        // A text key column's entries interned since the last group, hashed once
+        self.dictionary_hashes.resize_with(columns.len(), Vec::new);
+        for (col, hashes) in self.dictionary_hashes.iter_mut().enumerate() {
+            let keyed = self.unique.iter().any(|set| set.columns.contains(&col));
+            if let Some(dictionary) = builder.dictionary(col).filter(|_| keyed) {
+                let new = dictionary.get(hashes.len()..).unwrap_or_default();
+                hashes.extend(
+                    new.iter()
+                        .map(|entry| unique_cell_hash(&crate::core::Value::Text(entry.clone()))),
+                );
+            }
+        }
+        let dictionary_hashes = &self.dictionary_hashes;
         for UniqueIndexing {
             columns: set,
             entries,
@@ -459,7 +475,7 @@ impl VolumeFileWriter {
                 }
             }
             'rows: for row in 0..rows {
-                let mut hasher = ahash::AHasher::default();
+                let mut key = smallvec::SmallVec::<[u64; 4]>::new();
                 for &col in set.iter() {
                     let cells = columns
                         .get(col)
@@ -493,13 +509,14 @@ impl VolumeFileWriter {
                             if nulls[row] {
                                 continue 'rows;
                             }
-                            let text = builder
-                                .dictionary(col)
-                                .and_then(|dict| dict.get(ids[row] as usize))
+                            let hash = dictionary_hashes
+                                .get(col)
+                                .and_then(|hashes| hashes.get(ids[row] as usize))
                                 .ok_or_else(|| {
                                     Error::internal("dictionary id beyond the dictionary")
                                 })?;
-                            crate::core::Value::Text(text.clone())
+                            key.push(*hash);
+                            continue;
                         }
                         TypedCells::Bytes {
                             data,
@@ -519,9 +536,9 @@ impl VolumeFileWriter {
                             crate::core::Value::Extension(crate::common::CompactArc::from(tagged))
                         }
                     };
-                    value.hash(&mut hasher);
+                    key.push(unique_cell_hash(&value));
                 }
-                entries.push((hasher.finish(), first + row as u32));
+                entries.push(unique_entry(unique_key_hash(key), first + row as u32));
             }
         }
         Ok(())
@@ -748,12 +765,8 @@ impl VolumeFileWriter {
         store.check_blocks(crcs);
         store.build_from_row_ids(meta.row_id_column, &meta.row_ids);
         let mut unique_indices = crate::common::KeyMap::default();
-        for UniqueIndexing {
-            columns,
-            mut entries,
-        } in std::mem::take(&mut self.unique)
-        {
-            entries.sort_unstable_by_key(|&(h, _)| h);
+        for UniqueIndexing { columns, entries } in std::mem::take(&mut self.unique) {
+            let entries = super::writer::sort_unique_entries(entries);
             unique_indices.insert(columns, Arc::new(entries));
         }
         Ok(FrozenVolume {
@@ -927,6 +940,16 @@ mod tests {
         rows: i64,
         batch: usize,
     ) -> (Vec<u8>, FrozenVolume, PathBuf, tempfile::TempDir) {
+        written_indexed(schema, rows, batch, Vec::new())
+    }
+
+    /// `written`, the writer indexing the unique column sets `sets`
+    fn written_indexed(
+        schema: &Schema,
+        rows: i64,
+        batch: usize,
+        sets: Vec<Vec<usize>>,
+    ) -> (Vec<u8>, FrozenVolume, PathBuf, tempfile::TempDir) {
         let mut builder = VolumeBuilder::new(schema);
         for i in 0..rows {
             builder.add_row(i, &row(i));
@@ -937,6 +960,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut writer =
             VolumeFileWriter::new(dir.path(), "t", 7, schema, rows as usize, true).unwrap();
+        writer.index_unique_sets(sets);
         let columns: Vec<&ColumnData> = (0..schema.columns.len())
             .map(|c| by_rows.columns.get(c).unwrap())
             .collect();
@@ -1022,6 +1046,38 @@ mod tests {
             buf.len(),
             "the buffer was grown past its counted length"
         );
+    }
+
+    #[test]
+    fn the_writer_and_a_reader_build_the_same_unique_index() {
+        let schema = schema();
+        // id, an integer with NULLs, a float with NaN, a timestamp, a text,
+        // and an integer with a text
+        let sets = vec![vec![0], vec![1], vec![2], vec![3], vec![5], vec![1, 5]];
+        let rows = 2 * ROW_GROUP_SIZE as i64 + 5_000;
+        let (_, volume, path, _dir) = written_indexed(&schema, rows, 10_000, sets.clone());
+        let reread = read_volume_from_disk(&path).unwrap();
+        for set in &sets {
+            let written = Arc::clone(&volume.unique_indices.read()[set]);
+            reread.prebuild_unique_index(set).unwrap();
+            let built = Arc::clone(&reread.unique_indices.read()[set]);
+            assert!(!written.is_empty(), "set {set:?}");
+            assert!(written == built, "set {set:?}: the indexes differ");
+        }
+    }
+
+    #[test]
+    fn building_a_unique_index_keeps_no_column_decoded() {
+        let schema = schema();
+        let (_, _, path, _dir) = written(&schema, 2 * ROW_GROUP_SIZE as i64 + 5_000, 10_000);
+        let reread = read_volume_from_disk(&path).unwrap();
+        reread.prebuild_unique_index(&[1, 5]).unwrap();
+        for col in [1, 5] {
+            assert!(
+                reread.columns.resident(col).is_none(),
+                "column {col} kept decoded"
+            );
+        }
     }
 
     #[test]

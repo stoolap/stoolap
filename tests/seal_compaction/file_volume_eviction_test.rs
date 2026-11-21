@@ -188,6 +188,8 @@ fn a_lookup_through_a_captured_view_keeps_the_shared_index() {
     let (_, path, schema) = built(dir.path());
     let volume = Arc::new(read_volume_from_disk(&path).unwrap());
     volume.prebuild_unique_index(&[1]).unwrap();
+    // A column read whole has the eviction rewarm the volume
+    volume.columns.get(1).unwrap();
     let manager = SegmentManager::new("t", Some(dir.path().to_path_buf()));
     manager
         .register_segment(
