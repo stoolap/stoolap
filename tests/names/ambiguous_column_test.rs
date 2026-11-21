@@ -364,3 +364,43 @@ fn a_select_alias_spares_a_bare_name_only_where_the_alias_is_read() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+#[test]
+fn a_name_two_columns_of_one_source_carry_is_ambiguous_under_a_window() {
+    let dir = tempfile::tempdir().unwrap();
+    for db in [hot("window_one_source"), sealed(&dir)] {
+        let mut wrong = Vec::new();
+        for (with, source) in [
+            ("", "(SELECT t.a, u.a FROM t JOIN u ON u.id = t.id) AS s"),
+            (
+                "WITH c AS (SELECT t.a, u.a FROM t JOIN u ON u.id = t.id) ",
+                "c AS s",
+            ),
+        ] {
+            for (shape, reference) in [
+                ("SELECT {a}, ROW_NUMBER() OVER () FROM {f}", "a"),
+                ("SELECT {a} + 1, ROW_NUMBER() OVER () FROM {f}", "a"),
+                ("SELECT ROW_NUMBER() OVER (PARTITION BY {a}) FROM {f}", "a"),
+                ("SELECT ROW_NUMBER() OVER (ORDER BY {a}) FROM {f}", "a"),
+                ("SELECT MAX({a}) OVER () FROM {f}", "a"),
+                (
+                    "SELECT ROW_NUMBER() OVER w FROM {f} WINDOW w AS (ORDER BY {a})",
+                    "a",
+                ),
+                ("SELECT ROW_NUMBER() OVER () FROM {f} ORDER BY {a}", "a"),
+                ("SELECT {a}, ROW_NUMBER() OVER () FROM {f}", "s.a"),
+            ] {
+                let sql = format!(
+                    "{with}{}",
+                    shape.replace("{a}", reference).replace("{f}", source)
+                );
+                let got = answer(&db, &sql);
+                let message = format!("column reference '{reference}' is ambiguous");
+                if !got.as_ref().is_err_and(|e| e.contains(&message)) {
+                    wrong.push(format!("{sql}: {got:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+}

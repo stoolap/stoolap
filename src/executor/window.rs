@@ -122,6 +122,16 @@ struct RowPrograms<'a> {
     blocks: Option<&'a dyn SubqueryExecutor>,
 }
 
+/// The column each name of `columns` reads, without a name two of them
+/// carry: a reference to one is compiled, which refuses it as ambiguous
+fn unambiguous_index_map(columns: &[String]) -> StringMap<usize> {
+    let mut map = build_column_index_map(columns);
+    for at in repeated_columns(columns) {
+        map.remove(columns[at].to_lowercase().as_str());
+    }
+    map
+}
+
 /// The prefix of the name a window function's result column carries inside
 /// the executor: unwritable, so no column a statement names shares it
 const WINDOW_COLUMN: &str = "\u{0}wf#";
@@ -155,7 +165,7 @@ fn row_program(
     ctx: &ExecutionContext,
     blocks: Option<&dyn SubqueryExecutor>,
 ) -> Result<SharedProgram> {
-    let program = compile_over_slots(
+    let program = compile_over_rows(
         expr,
         columns,
         global_registry(),
@@ -229,7 +239,7 @@ fn held_program(
     blocks: Option<&dyn SubqueryExecutor>,
 ) -> Result<SharedProgram> {
     let program = held_or_compile(held, || {
-        compile_over_slots(
+        compile_over_rows(
             expr,
             columns,
             global_registry(),
@@ -822,18 +832,20 @@ use crate::functions::{Volatility, WindowFunction};
 use crate::parser::ast::*;
 use crate::storage::traits::{QueryResult, Table};
 
-use super::aggregation::{aggregate_extra_args, compile_over_slots, run_context, slot_params};
+use super::aggregation::{
+    aggregate_extra_args, compile_over_rows, repeated_columns, run_context, slot_params,
+};
 use super::context::ExecutionContext;
 use super::expr_key::ExprKey;
 use super::expression::{
     evaluate_once, execute_once, held_once, held_or_compile, literal_value, ExprVM, HeldOnce,
     Program, SharedProgram, SubqueryExecutor,
 };
-use super::query::{order_by_inputs, ColumnSource, OutputLayout};
+use super::query::{order_by_inputs, refuse_ambiguous_order_inputs, ColumnSource, OutputLayout};
 use super::result::{ColumnarResult, ExecutorResult};
 use super::utils::{
     build_column_index_map, derived_aggregate_column_name, for_each_qualified_star_column,
-    get_table_alias_from_expr, item_name, qualified, qualified_index, split_qualified,
+    get_table_alias_from_expr, item_name, qualified, qualified_index,
 };
 use super::volatility::{expression_volatility, read_once, FRAME_OFFSET};
 use super::Executor;
@@ -1501,6 +1513,7 @@ impl Executor {
             Option<&HeldWindow>,
         ),
     ) -> Result<WindowPlan<'s>> {
+        refuse_ambiguous_order_inputs(&stmt, base_columns)?;
         // Parse window functions from the SELECT list
         let read = held.is_none().then_some((ctx, blocks));
         let window_functions = self.parse_window_functions(&stmt, base_columns, read)?;
@@ -1521,7 +1534,7 @@ impl Executor {
                 .any(|wf| !wf.partition_by_exprs.is_empty())
             && Self::all_partitions_match(&window_functions);
 
-        let col_index_map = build_column_index_map(base_columns);
+        let col_index_map = unambiguous_index_map(base_columns);
 
         // Parse the SELECT list to determine output column order
         let laid_out = !stmt.order_by.is_empty() || !stmt.distinct_on.is_empty();
@@ -2467,7 +2480,7 @@ impl Executor {
         group_slots: &KeyMap<ExprKey, usize>,
         mut item_of: Option<&mut Vec<usize>>,
     ) -> Vec<SelectItem> {
-        let col_index_map = build_column_index_map(base_columns);
+        let col_index_map = unambiguous_index_map(base_columns);
 
         let mut items = Vec::new();
         let mut wf_idx = 0;
@@ -2581,28 +2594,12 @@ impl Executor {
                             source: SelectItemSource::BaseColumn(idx),
                         });
                     } else {
-                        // Column not found directly - try to match against qualified columns (e.g., "name" matches "e.name")
-                        // This handles JOIN cases where columns have table prefixes
-                        let mut found = false;
-                        for (col_name, &idx) in &col_index_map {
-                            if split_qualified(col_name)
-                                .is_some_and(|(_, name)| name == id.value_lower.as_str())
-                            {
-                                items.push(SelectItem {
-                                    output_name: id.value.to_string(),
-                                    source: SelectItemSource::BaseColumn(idx),
-                                });
-                                found = true;
-                                break;
-                            }
-                        }
-                        if !found {
-                            // Still not found - treat as expression and let evaluator handle it
-                            items.push(SelectItem {
-                                output_name: id.value.to_string(),
-                                source: SelectItemSource::Expression(col_expr.clone()),
-                            });
-                        }
+                        // A name no column alone carries is compiled, which
+                        // reads it as every compiled name is read
+                        items.push(SelectItem {
+                            output_name: id.value.to_string(),
+                            source: SelectItemSource::Expression(col_expr.clone()),
+                        });
                     }
                 }
                 Expression::QualifiedIdentifier(_) => {

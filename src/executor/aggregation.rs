@@ -184,6 +184,28 @@ pub(crate) fn compile_over_slots(
     )
 }
 
+/// [`compile_over_slots`] over rows of `columns`, a name that reads a column
+/// another one is also named refused as ambiguous
+pub(crate) fn compile_over_rows(
+    expr: &Expression,
+    columns: &[String],
+    registry: &crate::functions::FunctionRegistry,
+    aliases: Option<&KeyMap<ExprKey, usize>>,
+    blocks: bool,
+    params: Option<&[Value]>,
+) -> Result<super::expression::SharedProgram> {
+    let repeated = repeated_columns(columns);
+    compile_over(
+        expr,
+        (columns, &repeated),
+        registry,
+        aliases,
+        blocks,
+        params,
+        false,
+    )
+}
+
 /// [`compile_over_slots`] over the groups of `stmt`: under its GROUP BY a
 /// GROUPING() call `slots` binds to no flag reads 0
 pub(crate) fn compile_over_groups(

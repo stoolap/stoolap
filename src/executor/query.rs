@@ -273,6 +273,30 @@ pub(crate) fn order_by_inputs(stmt: &SelectStatement, columns: &[String]) -> Vec
     }
 }
 
+/// An error when a sort key of `stmt` reads by name an input column of
+/// `columns` another one is also named, as a compiled name refuses it
+pub(crate) fn refuse_ambiguous_order_inputs(
+    stmt: &SelectStatement,
+    columns: &[String],
+) -> Result<()> {
+    let repeated = super::aggregation::repeated_columns(columns);
+    if repeated.is_empty() {
+        return Ok(());
+    }
+    let names = super::expression::CompileContext::new(columns, global_registry())
+        .refusing_repeated(&repeated);
+    let mut ambiguous = None;
+    visit_order_by_inputs(stmt, &mut |expr, _| {
+        if let Some(super::expression::Reference::Ambiguous(name)) = names.reference(expr) {
+            ambiguous.get_or_insert(name);
+        }
+    });
+    match ambiguous {
+        Some(name) => Err(ambiguous_column(&name)),
+        None => Ok(()),
+    }
+}
+
 /// The input column a plain column reference reads, as the projection finds
 /// it: a qualified name by [`by_qualifier`]; a bare name, then a qualified
 /// column whose last part is the bare name. The names come lowercased
