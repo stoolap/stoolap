@@ -2219,6 +2219,8 @@ impl Parser<'_> {
 
         // Parse constraints
         let mut constraints = Vec::new();
+        // NULL and NOT NULL as written, which may not both stand
+        let (mut null, mut not_null) = (false, false);
         while self.peek_token_is(TokenType::Keyword) {
             let constraint_keyword = self.peek_token.literal.to_uppercase();
             match constraint_keyword.as_str() {
@@ -2234,7 +2236,12 @@ impl Parser<'_> {
                     if !self.expect_keyword(Keyword::Null) {
                         return None;
                     }
+                    not_null = true;
                     constraints.push(ColumnConstraint::NotNull);
+                }
+                "NULL" => {
+                    self.next_token();
+                    null = true;
                 }
                 "UNIQUE" => {
                     self.next_token();
@@ -2243,7 +2250,9 @@ impl Parser<'_> {
                 "DEFAULT" => {
                     self.next_token(); // consume DEFAULT
                     self.next_token();
-                    let expr = self.parse_expression(Precedence::Lowest)?;
+                    // The value ends before NOT, AND and OR, so NOT NULL after it
+                    // is the column's; a value using them is written in parentheses
+                    let expr = self.parse_expression(Precedence::Not)?;
                     constraints.push(ColumnConstraint::Default(expr));
                 }
                 "CHECK" => {
@@ -2294,6 +2303,13 @@ impl Parser<'_> {
                 }
                 _ => break,
             }
+        }
+        if null && not_null {
+            self.add_error(format!(
+                "conflicting NULL and NOT NULL for column '{}'",
+                name.value
+            ));
+            return None;
         }
 
         Some(ColumnDefinition {

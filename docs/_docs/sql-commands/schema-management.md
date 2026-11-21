@@ -34,9 +34,12 @@ When creating tables, you can specify the following constraints:
 - **PRIMARY KEY** - Define a primary key constraint on one or more columns
 - **NOT NULL** - Enforce that a column cannot contain NULL values
 - **UNIQUE** - Enforce uniqueness on a column (also available via `CREATE UNIQUE INDEX`)
-- **DEFAULT** - Specify a default value for a column
+- **DEFAULT** - Specify a default value for a column. The value ends before `NOT`, `AND` and `OR`, so `DEFAULT 0 NOT NULL` is a default and a NOT NULL constraint; a value using them is written in parentheses, `DEFAULT (TRUE AND FALSE)`
+- **NULL** - The column takes NULL, as it does without the keyword; `NULL` and `NOT NULL` on one column are refused
 - **CHECK** - Define a check constraint expression over the row, on a column or on the table (see [CHECK]({% link _docs/data-types/data-types.md %}#check))
 - **REFERENCES** - Define a foreign key constraint referencing another table (see [Foreign Keys]({% link _docs/sql-features/foreign-keys.md %}))
+
+Column constraints may be written in any order, in CREATE TABLE and in ALTER TABLE ADD COLUMN.
 
 ```sql
 CREATE TABLE orders (
