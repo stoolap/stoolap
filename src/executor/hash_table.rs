@@ -113,9 +113,6 @@ pub struct JoinHashTable {
 
     /// 64 minus the bucket count's log2, see `bucket`
     bucket_shift: u32,
-
-    /// Number of entries inserted.
-    len: usize,
 }
 
 impl JoinHashTable {
@@ -132,7 +129,6 @@ impl JoinHashTable {
             bucket_heads: vec![-1; bucket_count],
             entries: Vec::with_capacity(row_count),
             bucket_shift: 64 - bucket_count.trailing_zeros(),
-            len: 0,
         }
     }
 
@@ -143,7 +139,6 @@ impl JoinHashTable {
             bucket_heads: vec![-1; MIN_BUCKETS],
             entries: Vec::new(),
             bucket_shift: 64 - MIN_BUCKETS.trailing_zeros(),
-            len: 0,
         }
     }
 
@@ -242,8 +237,7 @@ impl JoinHashTable {
         let old_head = self.bucket_heads[bucket];
 
         // Create new entry pointing to old head
-        // Use cached len instead of Vec::len() to avoid repeated length checks
-        let entry_idx = self.len as u32;
+        let entry_idx = self.entries.len() as u32;
         let next = if old_head >= 0 {
             old_head as u32
         } else {
@@ -253,7 +247,6 @@ impl JoinHashTable {
 
         // Update bucket head to point to new entry
         self.bucket_heads[bucket] = entry_idx as i32;
-        self.len += 1;
     }
 
     /// Probe the hash table for matching row indices.
@@ -280,14 +273,14 @@ impl JoinHashTable {
     #[cfg(test)]
     #[inline]
     pub fn len(&self) -> usize {
-        self.len
+        self.entries.len()
     }
 
     /// Check if the table is empty.
     #[cfg(test)]
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.entries.is_empty()
     }
 }
 
@@ -610,7 +603,6 @@ mod tests {
             bucket_heads: vec![-1; 4], // Only 4 buckets
             entries: Vec::new(),
             bucket_shift: 62,
-            len: 0,
         };
 
         let hashes: Vec<u64> = (0..).filter(|&h| table.bucket(h) == 0).take(4).collect();
