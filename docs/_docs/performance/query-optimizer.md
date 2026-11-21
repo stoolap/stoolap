@@ -104,6 +104,8 @@ SELECT * FROM _sys_table_stats WHERE table_name = 'users';
 SELECT * FROM _sys_column_stats WHERE table_name = 'users';
 ```
 
+`last_analyzed` is the time `ANALYZE` last wrote the table's statistics. Up to 0.5.0 it held a time on 1970-01-01, the epoch seconds read as nanoseconds; running `ANALYZE` again replaces it with the right time.
+
 `ANALYZE` without a table name analyzes every table, each one on its own. It keeps the query timeout: past it, the statement stops with a query cancelled error, the table it was reading keeps its old statistics, and the tables it finished before keep their new ones.
 
 The statistics are one source of the [row estimates](#row-estimates). `ANALYZE` also builds zone maps: see [Expression Simplification](#expression-simplification).

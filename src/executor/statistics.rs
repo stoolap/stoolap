@@ -18,7 +18,6 @@
 //! about tables and stores them in system tables for query optimization.
 
 use crate::common::deadline::{Deadline, DeadlineSite, CHARGE_BEAT};
-use crate::common::time_compat::SystemTime;
 use crate::storage::traits::transaction::StatementTable;
 
 use crate::common::KeySet;
@@ -431,14 +430,9 @@ impl Executor {
         self.execute_stats_sql(&delete_sql)?;
 
         // Insert new stats
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-
         let insert_sql = format!(
-            "INSERT INTO {} (table_name, row_count, page_count, avg_row_size, last_analyzed) VALUES ('{}', {}, {}, {}, {})",
-            SYS_TABLE_STATS, escaped_table, row_count, page_count, avg_row_size, now
+            "INSERT INTO {} (table_name, row_count, page_count, avg_row_size, last_analyzed) VALUES ('{}', {}, {}, {}, NOW())",
+            SYS_TABLE_STATS, escaped_table, row_count, page_count, avg_row_size
         );
         self.execute_stats_sql(&insert_sql)?;
 

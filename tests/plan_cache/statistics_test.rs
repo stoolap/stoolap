@@ -374,6 +374,33 @@ fn test_analyze_empty_table() {
     assert_eq!(row_count, 0, "Row count should be 0");
 }
 
+#[test]
+fn test_analyze_last_analyzed_is_now() {
+    let db = Database::open("memory://test_analyze_last_analyzed_is_now").expect("open");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .expect("create");
+    db.execute("INSERT INTO t VALUES (1, 1), (2, 2)", ())
+        .expect("insert");
+
+    let before = chrono::Utc::now();
+    db.execute("ANALYZE t", ()).expect("analyze");
+    let after = chrono::Utc::now();
+
+    let last_analyzed: stoolap::Value = db
+        .query_one(
+            "SELECT last_analyzed FROM _sys_table_stats WHERE table_name = 't'",
+            (),
+        )
+        .expect("read last_analyzed");
+    let stoolap::Value::Timestamp(at) = last_analyzed else {
+        panic!("last_analyzed is not a TIMESTAMP: {last_analyzed:?}");
+    };
+    assert!(
+        before <= at && at <= after,
+        "last_analyzed {at} is not between {before} and {after}"
+    );
+}
+
 /// Test ANALYZE handles non-existent table gracefully
 #[test]
 fn test_analyze_nonexistent_table() {
