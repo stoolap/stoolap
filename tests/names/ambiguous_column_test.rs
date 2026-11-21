@@ -364,3 +364,73 @@ fn a_select_alias_spares_a_bare_name_only_where_the_alias_is_read() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+#[test]
+fn a_name_two_columns_of_one_source_carry_is_ambiguous_under_a_window() {
+    let dir = tempfile::tempdir().unwrap();
+    for db in [hot("window_one_source"), sealed(&dir)] {
+        let mut wrong = Vec::new();
+        for (with, source) in [
+            ("", "(SELECT t.a, u.a FROM t JOIN u ON u.id = t.id) AS s"),
+            (
+                "WITH c AS (SELECT t.a, u.a FROM t JOIN u ON u.id = t.id) ",
+                "c AS s",
+            ),
+        ] {
+            for (shape, reference) in [
+                ("SELECT {a}, ROW_NUMBER() OVER () FROM {f}", "a"),
+                ("SELECT {a} + 1, ROW_NUMBER() OVER () FROM {f}", "a"),
+                ("SELECT ROW_NUMBER() OVER (PARTITION BY {a}) FROM {f}", "a"),
+                ("SELECT ROW_NUMBER() OVER (ORDER BY {a}) FROM {f}", "a"),
+                ("SELECT MAX({a}) OVER () FROM {f}", "a"),
+                (
+                    "SELECT ROW_NUMBER() OVER w FROM {f} WINDOW w AS (ORDER BY {a})",
+                    "a",
+                ),
+                ("SELECT ROW_NUMBER() OVER () FROM {f} ORDER BY {a}", "a"),
+                ("SELECT {a}, ROW_NUMBER() OVER () FROM {f}", "s.a"),
+            ] {
+                let sql = format!(
+                    "{with}{}",
+                    shape.replace("{a}", reference).replace("{f}", source)
+                );
+                let got = answer(&db, &sql);
+                let message = format!("column reference '{reference}' is ambiguous");
+                if !got.as_ref().is_err_and(|e| e.contains(&message)) {
+                    wrong.push(format!("{sql}: {got:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+}
+
+#[test]
+fn a_qualifier_keeps_its_source_beside_repeated_names_under_a_window() {
+    let db = hot("window_qualifier_kept");
+    let from = "FROM (SELECT 1 AS a, 2 AS a) AS s CROSS JOIN (SELECT 3 AS b) AS r";
+    let err = answer(&db, &format!("SELECT s.b, ROW_NUMBER() OVER () {from}")).unwrap_err();
+    assert!(err.contains("'s.b' not found"), "{err}");
+    assert_eq!(
+        answer(&db, &format!("SELECT r.b, ROW_NUMBER() OVER () {from}")),
+        Ok(vec![3])
+    );
+}
+
+#[test]
+fn a_name_two_group_slots_carry_is_no_source_ambiguity_under_a_window() {
+    let db = hot("window_group_slot_names");
+    let rows = |sql: &str| -> Vec<Vec<i64>> {
+        db.query(sql, ())
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .map(|r| {
+                let r = r.unwrap();
+                (0..r.len()).map(|i| r.get::<i64>(i).unwrap()).collect()
+            })
+            .collect()
+    };
+    assert_eq!(
+        rows("SELECT a, SUM(b) AS a, SUM(SUM(a)) OVER (ORDER BY a) FROM t GROUP BY a ORDER BY 1"),
+        vec![vec![1, 10, 1], vec![2, 20, 3], vec![3, 30, 6]]
+    );
+}

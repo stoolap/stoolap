@@ -829,11 +829,11 @@ use super::expression::{
     evaluate_once, execute_once, held_once, held_or_compile, literal_value, ExprVM, HeldOnce,
     Program, SharedProgram, SubqueryExecutor,
 };
-use super::query::{order_by_inputs, ColumnSource, OutputLayout};
+use super::query::{order_by_inputs, refuse_ambiguous_inputs, ColumnSource, OutputLayout};
 use super::result::{ColumnarResult, ExecutorResult};
 use super::utils::{
     build_column_index_map, derived_aggregate_column_name, for_each_qualified_star_column,
-    get_table_alias_from_expr, item_name, qualified, qualified_index, split_qualified,
+    get_table_alias_from_expr, item_name, qualified, qualified_index,
 };
 use super::volatility::{expression_volatility, read_once, FRAME_OFFSET};
 use super::Executor;
@@ -1504,6 +1504,18 @@ impl Executor {
         // Parse window functions from the SELECT list
         let read = held.is_none().then_some((ctx, blocks));
         let window_functions = self.parse_window_functions(&stmt, base_columns, read)?;
+        // Over groups each name was bound to its source when the rows were grouped
+        if group_slots.is_empty() {
+            let parts = window_functions.iter().flat_map(|wf| {
+                wf.arguments
+                    .iter()
+                    .chain(&wf.partition_by_exprs)
+                    .chain(wf.order_by.iter().map(|o| &o.expression))
+                    .chain(wf.call_order_by.iter().map(|o| &o.expression))
+                    .chain(wf.filter.as_deref())
+            });
+            refuse_ambiguous_inputs(&stmt, base_columns, parts)?;
+        }
 
         // LIMIT pushdown for PARTITION BY queries is safe only when there is
         // no top-level ORDER BY, when every window function shares the same
@@ -2581,28 +2593,12 @@ impl Executor {
                             source: SelectItemSource::BaseColumn(idx),
                         });
                     } else {
-                        // Column not found directly - try to match against qualified columns (e.g., "name" matches "e.name")
-                        // This handles JOIN cases where columns have table prefixes
-                        let mut found = false;
-                        for (col_name, &idx) in &col_index_map {
-                            if split_qualified(col_name)
-                                .is_some_and(|(_, name)| name == id.value_lower.as_str())
-                            {
-                                items.push(SelectItem {
-                                    output_name: id.value.to_string(),
-                                    source: SelectItemSource::BaseColumn(idx),
-                                });
-                                found = true;
-                                break;
-                            }
-                        }
-                        if !found {
-                            // Still not found - treat as expression and let evaluator handle it
-                            items.push(SelectItem {
-                                output_name: id.value.to_string(),
-                                source: SelectItemSource::Expression(col_expr.clone()),
-                            });
-                        }
+                        // A name no column alone carries is compiled, which
+                        // reads it as every compiled name is read
+                        items.push(SelectItem {
+                            output_name: id.value.to_string(),
+                            source: SelectItemSource::Expression(col_expr.clone()),
+                        });
                     }
                 }
                 Expression::QualifiedIdentifier(_) => {

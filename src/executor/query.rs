@@ -273,6 +273,39 @@ pub(crate) fn order_by_inputs(stmt: &SelectStatement, columns: &[String]) -> Vec
     }
 }
 
+/// An error when `stmt` reads by name an input column of `columns` another
+/// one is also named, in its SELECT list, in `read`, the window parts its
+/// window functions read, or in a sort key bound to its input, as a
+/// compiled name refuses it
+pub(crate) fn refuse_ambiguous_inputs<'e>(
+    stmt: &'e SelectStatement,
+    columns: &[String],
+    read: impl Iterator<Item = &'e Expression>,
+) -> Result<()> {
+    let repeated = super::aggregation::repeated_columns(columns);
+    if repeated.is_empty() {
+        return Ok(());
+    }
+    let names = super::expression::CompileContext::new(columns, global_registry())
+        .refusing_repeated(&repeated);
+    let mut ambiguous = None;
+    let mut check = |expr: &Expression| {
+        if let Some(super::expression::Reference::Ambiguous(name)) = names.reference(expr) {
+            ambiguous.get_or_insert(name);
+        }
+    };
+    let mut refs = Vec::new();
+    for expr in stmt.columns.iter().chain(read) {
+        super::aggregation::column_refs(expr, &mut refs);
+    }
+    refs.into_iter().for_each(&mut check);
+    visit_order_by_inputs(stmt, &mut |expr, _| check(expr));
+    match ambiguous {
+        Some(name) => Err(ambiguous_column(&name)),
+        None => Ok(()),
+    }
+}
+
 /// The input column a plain column reference reads, as the projection finds
 /// it: a qualified name by [`by_qualifier`]; a bare name, then a qualified
 /// column whose last part is the bare name. The names come lowercased

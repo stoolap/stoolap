@@ -690,7 +690,7 @@ pub(crate) fn sort_key_grouping_slots(
 }
 
 /// The column references `expr` writes outside its subqueries, at any depth
-fn column_refs<'e>(expr: &'e Expression, out: &mut Vec<&'e Expression>) {
+pub(crate) fn column_refs<'e>(expr: &'e Expression, out: &mut Vec<&'e Expression>) {
     if let Expression::Identifier(_) | Expression::QualifiedIdentifier(_) = expr {
         return out.push(expr);
     }
