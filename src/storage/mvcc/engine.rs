@@ -10414,6 +10414,7 @@ impl TransactionEngineOperations for EngineOperations {
                     .iter()
                     .find(|(name, _)| name == &*table_name_lower)
                     .map(|(_, cached)| Arc::clone(cached))
+                    .filter(|cached| !cached.left_behind(&version_store))
             } else {
                 None
             };
@@ -10437,24 +10438,31 @@ impl TransactionEngineOperations for EngineOperations {
                 // Upgrade to write lock and re-check (another thread may have inserted)
                 let mut cache = self.txn_version_stores().write();
                 let txn_tables = cache.entry(txn_id).or_default();
-                if let Some((_, cached)) = txn_tables
-                    .iter()
-                    .find(|(name, _)| name == &*table_name_lower)
-                {
-                    (Some(Arc::clone(cached)), None)
-                } else {
-                    let layout = version_store.layout();
-                    let store = TransactionVersionStore::new(Arc::clone(&version_store), txn_id);
-                    let new_store = Arc::new(TxnTableStore::admitted_at(store, layout));
-                    // Built in place first: a store borrowed before it moves is copied
-                    if self.tracks_keys(txn_id) {
-                        new_store.write_store().track_keys();
+                let entry = txn_tables
+                    .iter_mut()
+                    .find(|(name, _)| name == &*table_name_lower);
+                match entry {
+                    Some((_, cached)) if !cached.left_behind(&version_store) => {
+                        (Some(Arc::clone(cached)), None)
                     }
-                    txn_tables.push((
-                        table_name_lower.clone().into_owned().into(),
-                        Arc::clone(&new_store),
-                    ));
-                    (Some(new_store), Some(layout))
+                    entry => {
+                        let layout = version_store.layout();
+                        let store =
+                            TransactionVersionStore::new(Arc::clone(&version_store), txn_id);
+                        let new_store = Arc::new(TxnTableStore::admitted_at(store, layout));
+                        // Built in place first: a store borrowed before it moves is copied
+                        if self.tracks_keys(txn_id) {
+                            new_store.write_store().track_keys();
+                        }
+                        match entry {
+                            Some((_, cached)) => *cached = Arc::clone(&new_store),
+                            None => txn_tables.push((
+                                table_name_lower.clone().into_owned().into(),
+                                Arc::clone(&new_store),
+                            )),
+                        }
+                        (Some(new_store), Some(layout))
+                    }
                 }
             }
         };

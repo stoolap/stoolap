@@ -7910,6 +7910,13 @@ impl TxnTableStore {
         self.store.read()
     }
 
+    /// Whether the store was opened over another table than `store` and
+    /// holds no rows or claims, as one over a table the transaction dropped
+    /// or rolled back: a store over `store` takes its place
+    pub(crate) fn left_behind(&self, store: &VersionStore) -> bool {
+        self.parent != store.store_id && !self.read().holds_writes()
+    }
+
     /// Admits a handle that reads `store` under `layout`: the transaction's
     /// rows must be held in that layout, and from now on no handle under an
     /// older layout writes here

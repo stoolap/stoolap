@@ -395,3 +395,29 @@ fn create_table_as_select_rolled_back_stays_gone_after_reopen() {
         got => panic!("gone after reopen: {got:?}, want table not found"),
     }
 }
+
+#[test]
+fn a_table_a_transaction_dropped_or_rolled_back_can_be_made_again_under_its_name() {
+    let db = Database::open("memory://ddl_recreate_same_name").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER)", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
+    db.execute("CREATE TABLE p (id INTEGER)", ()).unwrap();
+    db.execute("BEGIN", ()).unwrap();
+    db.execute("DROP TABLE t", ()).unwrap();
+    db.execute("CREATE TABLE t AS SELECT 2 AS id", ()).unwrap();
+    db.execute("SAVEPOINT s", ()).unwrap();
+    db.execute("CREATE TABLE u AS SELECT 3 AS id", ()).unwrap();
+    db.execute("ROLLBACK TO SAVEPOINT s", ()).unwrap();
+    db.execute("CREATE TABLE u AS SELECT 4 AS id", ()).unwrap();
+    db.execute("DROP TABLE p", ()).unwrap();
+    db.execute("CREATE TABLE p (id INTEGER)", ()).unwrap();
+    db.execute("INSERT INTO p VALUES (5)", ()).unwrap();
+    db.execute("COMMIT", ()).unwrap();
+    for (table, want) in [("t", 2), ("u", 4), ("p", 5)] {
+        assert_eq!(
+            ids(&db, &format!("SELECT id FROM {table}")),
+            Ok(vec![want]),
+            "{table} after COMMIT"
+        );
+    }
+}
