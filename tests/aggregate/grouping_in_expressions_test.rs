@@ -142,6 +142,11 @@ const OVER_GROUPING_SETS: &[(&str, &[&str])] = &[
          GROUP BY ROLLUP(category) ORDER BY GROUPING(category) DESC",
         &["NULL|3", "A|2"],
     ),
+    (
+        "SELECT category, (SELECT 5) AS x FROM products GROUP BY ROLLUP(category) \
+         ORDER BY GROUPING(category) + (SELECT x) DESC, category",
+        &["NULL|5", "A|5", "B|5"],
+    ),
 ];
 
 const OVER_PLAIN_GROUPS: &[(&str, &[&str])] = &[
@@ -178,6 +183,11 @@ const OVER_PLAIN_GROUPS: &[(&str, &[&str])] = &[
         "SELECT DISTINCT ON (GROUPING(category)) category, COUNT(*) FROM products \
          GROUP BY category ORDER BY GROUPING(category), category DESC",
         &["B|1"],
+    ),
+    (
+        "SELECT category, (SELECT 0) AS x FROM products GROUP BY category \
+         ORDER BY GROUPING(category) + (SELECT x), category DESC",
+        &["B|0", "A|0"],
     ),
 ];
 
