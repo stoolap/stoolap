@@ -2250,33 +2250,13 @@ impl Parser<'_> {
                 "DEFAULT" => {
                     self.next_token(); // consume DEFAULT
                     self.next_token();
-                    // The value ends before NOT, AND and OR, so NOT NULL after it
-                    // is the column's; a value using them is written in parentheses
-                    let mut expr = self.parse_expression(Precedence::Not)?;
-                    // NOT IN, NOT LIKE or NOT BETWEEN negates a predicate of the
-                    // value, as SHOW CREATE TABLE prints one; NOT NULL ends it
-                    let mut then_not_null = false;
-                    while self.peek_token_is_keyword(Keyword::Not) {
-                        self.next_token(); // consume NOT
-                        if self.peek_token_is_keyword(Keyword::Null) {
-                            self.next_token();
-                            then_not_null = true;
-                            break;
-                        }
-                        if !self
-                            .peek_token
-                            .keyword
-                            .is_some_and(super::expressions::negates_after_not)
-                        {
-                            self.add_error(format!(
-                                "expected NULL, IN, BETWEEN or LIKE after NOT at {}",
-                                self.peek_token.position
-                            ));
-                            return None;
-                        }
-                        expr = self.parse_keyword_infix(expr)?;
-                    }
-                    constraints.push(ColumnConstraint::Default(expr));
+                    // The value ends before AND and OR, and on NOT NULL, the
+                    // column's own; a value using AND or OR is written in parentheses
+                    let outer = self.column_default.replace(self.expression_depth + 1);
+                    let expr = self.parse_expression(Precedence::And);
+                    self.column_default = outer;
+                    let then_not_null = std::mem::take(&mut self.default_not_null);
+                    constraints.push(ColumnConstraint::Default(expr?));
                     if then_not_null {
                         not_null = true;
                         constraints.push(ColumnConstraint::NotNull);

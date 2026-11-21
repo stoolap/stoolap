@@ -43,21 +43,6 @@ fn balanced_height(heights: &[usize]) -> usize {
     }
 }
 
-/// The keywords an infix NOT negates: NOT IN, NOT BETWEEN and the NOT LIKE
-/// family `parse_keyword_infix` reads
-pub(super) fn negates_after_not(keyword: Keyword) -> bool {
-    matches!(
-        keyword,
-        Keyword::In
-            | Keyword::Between
-            | Keyword::Like
-            | Keyword::Ilike
-            | Keyword::Glob
-            | Keyword::Regexp
-            | Keyword::Rlike
-    )
-}
-
 /// A run of one balanced operator: the operator, the levels below each
 /// operand, and each operand after the first with the operator before it.
 /// Kept flat until the run ends, so an error inside it drops no deep tree
@@ -100,7 +85,10 @@ impl Parser<'_> {
         let mut height = self.expression_peak - depth;
         let mut run: Option<Run> = None;
 
-        while !self.peek_token_is(TokenType::Eof) && precedence < self.peek_precedence() {
+        while !self.peek_token_is(TokenType::Eof)
+            && precedence < self.peek_precedence()
+            && !self.default_not_null
+        {
             if !self.is_infix_token() {
                 break;
             }
@@ -669,7 +657,7 @@ impl Parser<'_> {
     }
 
     /// Parse a keyword infix expression (AND, OR, LIKE, IS, IN, BETWEEN, AS)
-    pub(super) fn parse_keyword_infix(&mut self, left: Expression) -> Option<Expression> {
+    fn parse_keyword_infix(&mut self, left: Expression) -> Option<Expression> {
         match self.cur_token.keyword {
             Some(Keyword::And | Keyword::Or | Keyword::Xor) => {
                 let token = self.cur_token.clone();
@@ -739,6 +727,18 @@ impl Parser<'_> {
                         crate::common::SmartString::const_new("RLIKE"),
                         true,
                     )
+                } else if self.column_default == Some(self.expression_depth) {
+                    // A column DEFAULT value ends on NOT NULL, the column's own
+                    if !self.peek_token_is_keyword(Keyword::Null) {
+                        self.add_error(format!(
+                            "expected NULL, IN, BETWEEN or LIKE after NOT at {}",
+                            self.peek_token.position
+                        ));
+                        return None;
+                    }
+                    self.next_token();
+                    self.default_not_null = true;
+                    Some(left)
                 } else {
                     let token = self.cur_token.clone();
                     self.next_token();

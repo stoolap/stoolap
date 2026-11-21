@@ -156,7 +156,8 @@ fn a_negated_predicate_default_prints_ddl_that_runs_again() {
     db.execute(
         "CREATE TABLE t (id INTEGER PRIMARY KEY, b BOOLEAN DEFAULT ('a' NOT LIKE 'b'), \
          c BOOLEAN DEFAULT (1 NOT IN (2, 3)) NOT NULL, d BOOLEAN DEFAULT (1 NOT BETWEEN 2 AND 3), \
-         e BOOLEAN DEFAULT 'a' NOT LIKE 'a' ESCAPE '!' NULL)",
+         e BOOLEAN DEFAULT 'a' NOT LIKE 'a' ESCAPE '!' NULL, \
+         f BOOLEAN DEFAULT ((1 NOT IN (2)) IN (TRUE)) NOT NULL)",
         (),
     )
     .unwrap();
@@ -165,7 +166,8 @@ fn a_negated_predicate_default_prints_ddl_that_runs_again() {
         shown,
         "CREATE TABLE t (id Integer PRIMARY KEY, b Boolean DEFAULT 'a' NOT LIKE 'b', \
          c Boolean NOT NULL DEFAULT 1 NOT IN (2, 3), d Boolean DEFAULT 1 NOT BETWEEN 2 AND 3, \
-         e Boolean DEFAULT 'a' NOT LIKE 'a' ESCAPE '!')"
+         e Boolean DEFAULT 'a' NOT LIKE 'a' ESCAPE '!', \
+         f Boolean NOT NULL DEFAULT 1 NOT IN (2) IN (TRUE))"
     );
     again
         .execute(&shown, ())
@@ -173,8 +175,8 @@ fn a_negated_predicate_default_prints_ddl_that_runs_again() {
     assert_eq!(create_table(&again, "t"), shown);
     again.execute("INSERT INTO t (id) VALUES (1)", ()).unwrap();
     assert_eq!(
-        values(&again, "SELECT b, c, d, e FROM t"),
-        "true|true|true|false"
+        values(&again, "SELECT b, c, d, e, f FROM t"),
+        "true|true|true|false|true"
     );
     let err = error(
         &db,
@@ -184,4 +186,21 @@ fn a_negated_predicate_default_prints_ddl_that_runs_again() {
         err.contains("expected NULL, IN, BETWEEN or LIKE after NOT"),
         "{err}"
     );
+}
+
+#[test]
+fn a_default_chain_past_the_expression_depth_is_refused() {
+    let db = Database::open("memory://column_constraint_deep_default").unwrap();
+    let sql = format!(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, b BOOLEAN DEFAULT 0{} NOT NULL)",
+        " NOT IN (1)".repeat(300)
+    );
+    let err = error(&db, &sql);
+    assert!(err.contains("statement nested too deeply"), "{err}");
+    let sql = format!(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, b BOOLEAN DEFAULT 0{} NOT NULL)",
+        " NOT IN (1)".repeat(8)
+    );
+    db.execute(&sql, ())
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
 }
