@@ -4635,9 +4635,14 @@ impl VersionStore {
             let _ = entry.index.clear();
         }
 
-        // 6. Reset auto-increment counter so new rows start at 1
-        //    and the speculative arena probe ((row_id - 1) as usize) stays valid
-        self.auto_increment_counter.store(0, Ordering::Release);
+        // 6. Lower the id counter to the largest id a row took since the
+        //    clear, so new rows start at 1; kept while a transaction holds a
+        //    new row, whose id the lowered counter would hand out again
+        let _ = self.with_inserters_closed(|| {
+            let largest = self.max_live_row_id(|_| true);
+            self.auto_increment_counter
+                .store(largest, Ordering::Release);
+        });
 
         // 7. Invalidate zone maps (stale after truncate)
         *self.zone_maps.write() = None;
