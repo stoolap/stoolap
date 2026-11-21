@@ -4113,9 +4113,7 @@ impl SegmentedTable {
                     crate::core::Operator::Eq => {
                         !zm.may_contain_eq(value, nans)
                             || match bloom_hashes.get(comp_idx).and_then(|h| *h) {
-                                Some(h) => {
-                                    !vol.meta.bloom_filters.might_contain_hash(col_idx, h)?
-                                }
+                                Some(h) => !vol.blooms.might_contain_hash(col_idx, h)?,
                                 None => false,
                             }
                     }

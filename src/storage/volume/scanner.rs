@@ -662,7 +662,6 @@ impl VolumeScanner {
                 columns: super::writer::LazyColumns::empty(),
                 meta: Arc::new(super::writer::VolumeMeta {
                     zone_maps: Vec::new(),
-                    bloom_filters: super::writer::VolumeBlooms::default(),
                     stats: super::stats::VolumeAggregateStats::new(0),
                     row_count: 0,
                     column_names: Vec::new(),
@@ -677,6 +676,7 @@ impl VolumeScanner {
                     group_rows: super::column::ROW_GROUP_SIZE,
                     file_identity: std::sync::OnceLock::new(),
                 }),
+                blooms: Arc::default(),
                 unique_indices: std::sync::Arc::new(super::writer::UniqueIndexes::new(
                     crate::common::KeyMap::default(),
                 )),

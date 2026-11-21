@@ -251,3 +251,58 @@ fn a_file_volume_forgets_a_failed_read_when_idle() {
     );
     assert!(volume.columns.compressed_store().unwrap().is_file_backed());
 }
+
+/// The hash a probe for the integer `value` checks a bloom filter with
+fn bloom_hash(value: i64) -> u64 {
+    stoolap::storage::volume::column::ColumnBloomFilter::hash_value_static(&Value::Integer(value))
+}
+
+#[test]
+fn a_file_volume_lets_go_of_bloom_filters_no_probe_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, path, schema) = built(dir.path());
+    let volume = read_volume_from_disk(&path).unwrap();
+    assert!(volume.blooms.might_contain_hash(1, bloom_hash(20)).unwrap());
+    assert!(volume.blooms.memory_size() > 0);
+    let volume = evicted(volume, dir.path(), &schema);
+    assert_eq!(volume.blooms.memory_size(), 0, "idle filters were kept");
+    assert!(volume.blooms.might_contain_hash(1, bloom_hash(20)).unwrap());
+    assert!(
+        volume.blooms.memory_size() > 0,
+        "the filter was not read again"
+    );
+}
+
+#[test]
+fn a_file_volume_keeps_bloom_filters_a_probe_uses() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, path, schema) = built(dir.path());
+    let manager = SegmentManager::new("t", Some(dir.path().to_path_buf()));
+    manager
+        .register_segment(
+            1,
+            Arc::new(read_volume_from_disk(&path).unwrap()),
+            SegmentMeta {
+                segment_id: 1,
+                file_path: PathBuf::from("vol_0000000000000001.vol"),
+                row_count: 2,
+                min_row_id: 1,
+                max_row_id: 2,
+                creation_lsn: 0,
+                seal_seq: 0,
+                schema_version: 0,
+            },
+            Some(&schema),
+        )
+        .unwrap();
+    for epoch in [0, 3, 6, 9, 12] {
+        let volume = Arc::clone(&manager.segments_raw()[&1].volume);
+        assert!(volume.blooms.might_contain_hash(1, bloom_hash(20)).unwrap());
+        manager.evict_idle_volumes(epoch, false);
+        let volume = Arc::clone(&manager.segments_raw()[&1].volume);
+        assert!(
+            volume.blooms.memory_size() > 0,
+            "a filter in use was let go at epoch {epoch}"
+        );
+    }
+}

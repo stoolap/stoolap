@@ -2716,7 +2716,7 @@ impl SegmentManager {
             let mut bloom_skip = false;
             for (i, &vi) in vol_col_indices.iter().enumerate() {
                 if let Some(h) = bloom_hashes[i]
-                    && !vol.meta.bloom_filters.might_contain_hash(vi, h)?
+                    && !vol.blooms.might_contain_hash(vi, h)?
                 {
                     bloom_skip = true;
                     break;
@@ -2937,7 +2937,8 @@ impl SegmentManager {
         // so their idle counter starts from this cycle.
         let mut has_targets = false;
         let mut idle_indexes = Vec::new();
-        let targets: Vec<(u64, bool, bool)> = {
+        // (segment, to warm, to cold, with its loaded bloom filters let go)
+        let targets: Vec<(u64, bool, bool, bool)> = {
             let segs = self.segments.read();
             segs.iter()
                 .filter_map(|(&seg_id, cs)| {
@@ -2947,6 +2948,8 @@ impl SegmentManager {
                     if indexes.idle_for(current_epoch, MIN_IDLE_CYCLES) {
                         idle_indexes.push(Arc::clone(indexes));
                     }
+                    // Filters no probe used go with the volume's next form
+                    let idle_blooms = cs.volume.blooms.idle_for(current_epoch, MIN_IDLE_CYCLES);
                     let vol_epoch = cs
                         .volume
                         .last_access_epoch
@@ -2969,10 +2972,13 @@ impl SegmentManager {
                     // A file-backed store holds no blocks; cold would only force a reload
                     let is_warm = cs.volume.is_warm() && (file_backed_to_cold || !file_backed);
                     // A file-backed volume drops its cached reads and keeps its store
-                    let rewarm = !is_hot && !is_warm && file_backed && columns.holds_reads();
+                    let rewarm = !is_hot
+                        && !is_warm
+                        && file_backed
+                        && (columns.holds_reads() || idle_blooms);
                     if is_hot || is_warm || rewarm {
                         has_targets = true;
-                        Some((seg_id, is_hot || rewarm, is_warm))
+                        Some((seg_id, is_hot || rewarm, is_warm, idle_blooms))
                     } else {
                         None // already cold
                     }
@@ -2996,16 +3002,20 @@ impl SegmentManager {
             let segments = self.segments.read();
             targets
                 .iter()
-                .filter_map(|&(id, hot, _)| {
+                .filter_map(|&(id, hot, _, idle_blooms)| {
                     let cs = segments.get(&id)?;
-                    hot.then(|| (id, Arc::clone(&cs.volume), cs.file.clone()))
+                    hot.then(|| (id, Arc::clone(&cs.volume), cs.file.clone(), idle_blooms))
                 })
                 .collect()
         };
         let warmed: Vec<_> = warming
             .into_iter()
-            .filter_map(|(id, old, file)| {
-                let warm = Arc::new(old.to_warm()?);
+            .filter_map(|(id, old, file, idle_blooms)| {
+                let mut warm = old.to_warm()?;
+                if idle_blooms {
+                    warm.blooms = Arc::new(old.blooms.unloaded());
+                }
+                let warm = Arc::new(warm);
                 if let Some(file) = file {
                     file.remember(&warm);
                 }
@@ -3024,13 +3034,16 @@ impl SegmentManager {
                 cs.volume = warm;
             }
         }
-        for &(seg_id, _, is_warm) in &targets {
+        for &(seg_id, _, is_warm, idle_blooms) in &targets {
             if is_warm {
                 // Warm → Cold: drop compressed blocks, keep metadata in map.
                 // Zone maps, stats, row_ids stay available for fast paths.
                 // Only column access triggers disk reload via ensure_loaded.
                 if let Some(cs) = new_map.get_mut(&seg_id) {
-                    let cold = cs.volume.to_cold();
+                    let mut cold = cs.volume.to_cold();
+                    if idle_blooms {
+                        cold.blooms = Arc::new(cs.volume.blooms.unloaded());
+                    }
                     cs.volume = Arc::new(cold);
                     self.has_cold
                         .store(true, std::sync::atomic::Ordering::Relaxed);
