@@ -434,7 +434,7 @@ impl CompiledAggregate {
             }
 
             CompiledAggregate::Avg { state } | CompiledAggregate::AvgDistinct { state, .. } => {
-                state.avg()
+                return state.avg();
             }
 
             CompiledAggregate::Min { min_value } => {

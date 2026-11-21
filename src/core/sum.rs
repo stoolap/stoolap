@@ -24,6 +24,8 @@ pub struct SumAccumulator {
     int: i128,
     float: f64,
     has_float: bool,
+    /// A FLOAT added was infinite or NaN, so a sum that is too answers so
+    non_finite: bool,
     count: u64,
 }
 
@@ -40,6 +42,7 @@ impl SumAccumulator {
     pub fn add_float(&mut self, v: f64) {
         self.float += v;
         self.has_float = true;
+        self.non_finite |= !v.is_finite();
         self.count += 1;
     }
 
@@ -55,19 +58,29 @@ impl SumAccumulator {
     }
 
     /// Adds `count` values summed elsewhere: `int` from INTEGER and BOOLEAN
-    /// values, `float` from FLOAT values, `has_float` when any was FLOAT
+    /// values, `float` from FLOAT values, `has_float` when any was FLOAT,
+    /// `non_finite` when any FLOAT was infinite or NaN
     #[inline]
-    pub fn add_parts(&mut self, int: i128, float: f64, has_float: bool, count: u64) {
+    pub fn add_parts(
+        &mut self,
+        int: i128,
+        float: f64,
+        has_float: bool,
+        non_finite: bool,
+        count: u64,
+    ) {
         self.int += int;
         self.float += float;
         self.has_float |= has_float;
+        self.non_finite |= non_finite;
         self.count += count;
     }
 
     /// Adds what another accumulator holds
     #[inline]
     pub fn merge(&mut self, other: &SumAccumulator) {
-        self.add_parts(other.int, other.float, other.has_float, other.count);
+        let (int, float) = (other.int, other.float);
+        self.add_parts(int, float, other.has_float, other.non_finite, other.count);
     }
 
     /// The number of values added
@@ -76,13 +89,13 @@ impl SumAccumulator {
     }
 
     /// The sum: NULL with no value, FLOAT when any value was FLOAT, and
-    /// otherwise the exact INTEGER, or an overflow error outside its range
+    /// otherwise the exact INTEGER; an overflow error outside either range
     pub fn sum(&self) -> Result<Value> {
         if self.count == 0 {
             return Ok(Value::null_unknown());
         }
         if self.has_float {
-            return Ok(Value::Float(self.int as f64 + self.float));
+            return self.float_sum("SUM").map(Value::Float);
         }
         i64::try_from(self.int).map(Value::Integer).map_err(|_| {
             Error::Type(format!(
@@ -94,14 +107,28 @@ impl SumAccumulator {
 
     /// The average as FLOAT: the exact INTEGER sum divided and rounded
     /// once, or the FLOAT sum divided; NULL with no value
-    pub fn avg(&self) -> Value {
+    pub fn avg(&self) -> Result<Value> {
         if self.count == 0 {
-            return Value::null_unknown();
+            return Ok(Value::null_unknown());
         }
         if self.has_float {
-            return Value::Float((self.int as f64 + self.float) / self.count as f64);
+            let sum = self.float_sum("AVG")?;
+            return Ok(Value::Float(sum / self.count as f64));
         }
-        Value::Float(ratio(self.int, self.count))
+        Ok(Value::Float(ratio(self.int, self.count)))
+    }
+
+    /// The FLOAT sum, which finite values take past the FLOAT range only
+    /// as an overflow error of `function`, as `+` refuses one
+    fn float_sum(&self, function: &str) -> Result<f64> {
+        let sum = self.int as f64 + self.float;
+        if !sum.is_finite() && !self.non_finite {
+            return Err(Error::Type(format!(
+                "Float overflow in {function}: the sum of {} values is outside the FLOAT range",
+                self.count
+            )));
+        }
+        Ok(sum)
     }
 }
 
@@ -169,7 +196,7 @@ mod tests {
         assert_eq!(acc.sum().unwrap(), Value::Integer(2));
         assert_eq!(acc.count(), 3);
         assert!(of(&[Value::null_unknown()]).sum().unwrap().is_null());
-        assert!(of(&[]).avg().is_null());
+        assert!(of(&[]).avg().unwrap().is_null());
     }
 
     #[test]
@@ -179,23 +206,23 @@ mod tests {
             Value::Integer(-9_007_199_254_740_992),
             Value::Integer(1),
         ]);
-        assert_eq!(acc.avg(), Value::Float(2.0 / 3.0));
+        assert_eq!(acc.avg().unwrap(), Value::Float(2.0 / 3.0));
         let acc = of(&[Value::Integer(i64::MAX), Value::Integer(i64::MAX)]);
-        assert_eq!(acc.avg(), Value::Float(i64::MAX as f64));
+        assert_eq!(acc.avg().unwrap(), Value::Float(i64::MAX as f64));
         let acc = of(&[Value::Integer(-3), Value::Integer(-4)]);
-        assert_eq!(acc.avg(), Value::Float(-3.5));
+        assert_eq!(acc.avg().unwrap(), Value::Float(-3.5));
         let acc = of(&[
             Value::Integer(9_007_199_254_740_992),
             Value::Integer(9_007_199_254_740_995),
         ]);
-        assert_eq!(acc.avg(), Value::Float(9_007_199_254_740_994.0));
+        assert_eq!(acc.avg().unwrap(), Value::Float(9_007_199_254_740_994.0));
         let acc = of(&[
             Value::Integer(-9_007_199_254_740_992),
             Value::Integer(-9_007_199_254_740_995),
         ]);
-        assert_eq!(acc.avg(), Value::Float(-9_007_199_254_740_994.0));
+        assert_eq!(acc.avg().unwrap(), Value::Float(-9_007_199_254_740_994.0));
         let acc = of(&[Value::Integer(i64::MAX), Value::Integer(i64::MAX - 1)]);
-        assert_eq!(acc.avg(), Value::Float(i64::MAX as f64));
+        assert_eq!(acc.avg().unwrap(), Value::Float(i64::MAX as f64));
     }
 
     #[test]
@@ -205,7 +232,7 @@ mod tests {
             Value::Float(-9_007_199_254_740_989.0),
             Value::Integer(0),
         ]);
-        assert_eq!(acc.avg(), Value::Float(1.0 / 3.0));
+        assert_eq!(acc.avg().unwrap(), Value::Float(1.0 / 3.0));
     }
 
     #[test]

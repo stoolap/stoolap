@@ -6424,9 +6424,13 @@ impl Table for SegmentedTable {
             // missing this column (added via ALTER TABLE ADD COLUMN)
             let default_val = self.column_default(col_idx);
             let add_default = |sum: &mut SumAccumulator, rows: u64| match &default_val {
-                Value::Integer(v) => sum.add_parts(*v as i128 * rows as i128, 0.0, false, rows),
-                Value::Float(v) => sum.add_parts(0, v * rows as f64, true, rows),
-                Value::Boolean(b) => sum.add_parts(*b as i128 * rows as i128, 0.0, false, rows),
+                Value::Integer(v) => {
+                    sum.add_parts(*v as i128 * rows as i128, 0.0, false, false, rows)
+                }
+                Value::Float(v) => sum.add_parts(0, v * rows as f64, true, !v.is_finite(), rows),
+                Value::Boolean(b) => {
+                    sum.add_parts(*b as i128 * rows as i128, 0.0, false, false, rows)
+                }
                 _ => {}
             };
 
@@ -6476,9 +6480,18 @@ impl Table for SegmentedTable {
                             };
                             let stats = &cs.volume.meta.stats.columns[pi];
                             let (int_part, float_part) = stats.sum_parts();
-                            cold.add_parts(int_part, float_part, as_float, stats.numeric_count);
+                            let infinite =
+                                |v: &Value| matches!(v, Value::Float(f) if f.is_infinite());
+                            let non_finite = infinite(&stats.min) || infinite(&stats.max);
+                            cold.add_parts(
+                                int_part,
+                                float_part,
+                                as_float,
+                                non_finite,
+                                stats.numeric_count,
+                            );
                             if nans > 0 {
-                                cold.add_parts(0, f64::NAN, true, nans);
+                                cold.add_parts(0, f64::NAN, true, true, nans);
                             }
                         }
                     } else {
