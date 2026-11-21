@@ -4865,11 +4865,10 @@ impl FrozenVolume {
             .iter()
             .map(|&ci| self.columns.resident(ci))
             .collect();
+        // A group at a time, a decoded column too, so the hashes held at
+        // once are a group's
         let shift = self.meta.group_shift();
-        let step = match resident.iter().all(Option::is_some) {
-            true => rows.max(1),
-            false => 1 << shift,
-        };
+        let step = 1 << shift;
         let mut hashes = vec![vec![0u64; step.min(rows)]; col_indices.len()];
         let mut null = vec![false; step.min(rows)];
         let mut dictionaries = vec![None; col_indices.len()];

@@ -474,8 +474,10 @@ impl VolumeFileWriter {
                     entries.reserve_exact(target - entries.len());
                 }
             }
+            // One buffer for every row's cell hashes, however wide the set
+            let mut key = smallvec::SmallVec::<[u64; 4]>::with_capacity(set.len());
             'rows: for row in 0..rows {
-                let mut key = smallvec::SmallVec::<[u64; 4]>::new();
+                key.clear();
                 for &col in set.iter() {
                     let cells = columns
                         .get(col)
@@ -538,7 +540,8 @@ impl VolumeFileWriter {
                     };
                     key.push(unique_cell_hash(&value));
                 }
-                entries.push(unique_entry(unique_key_hash(key), first + row as u32));
+                let hash = unique_key_hash(key.iter().copied());
+                entries.push(unique_entry(hash, first + row as u32));
             }
         }
         Ok(())
