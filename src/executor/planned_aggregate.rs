@@ -312,7 +312,10 @@ impl Executor {
                     .sum_column(idx, deadline)?
                     .map(|sum| sum.sum())
                     .transpose()?,
-                ("AVG", Some(idx)) => table.avg_column(idx, deadline)?.map(|sum| sum.avg()),
+                ("AVG", Some(idx)) => table
+                    .avg_column(idx, deadline)?
+                    .map(|sum| sum.avg())
+                    .transpose()?,
                 ("MIN", Some(idx)) => table
                     .min_column(idx, deadline)?
                     .map(|min| min.unwrap_or_else(null)),

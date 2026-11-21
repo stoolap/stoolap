@@ -49,7 +49,7 @@ impl AggregateFunction for AvgFunction {
     }
 
     fn result(&self) -> Result<Value> {
-        Ok(self.state.avg())
+        self.state.avg()
     }
 
     fn reset(&mut self) {

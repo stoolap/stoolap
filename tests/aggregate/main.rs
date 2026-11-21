@@ -67,4 +67,5 @@ mod runner_source_aggregate_test;
 mod streaming_group_by_view_test;
 mod string_agg_separator_test;
 mod sum_exact_integer_test;
+mod sum_float_overflow_test;
 mod ungrouped_column_rule_test;
