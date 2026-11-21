@@ -647,8 +647,8 @@ fn grouping_calls<'e>(expr: &'e Expression, out: &mut Vec<&'e FunctionCall>) {
     });
 }
 
-/// The GROUPING() calls `stmt` writes in its SELECT list, HAVING, ORDER BY
-/// and window clauses
+/// The GROUPING() calls `stmt` writes in its SELECT list, HAVING, ORDER BY,
+/// DISTINCT ON and window clauses
 fn statement_grouping_calls(stmt: &SelectStatement) -> Vec<&FunctionCall> {
     let mut calls = Vec::new();
     let order = stmt.order_by.iter().map(|o| &o.expression);
@@ -658,6 +658,7 @@ fn statement_grouping_calls(stmt: &SelectStatement) -> Vec<&FunctionCall> {
         .iter()
         .chain(stmt.having.as_deref())
         .chain(order)
+        .chain(&stmt.distinct_on)
         .chain(windows)
     {
         grouping_calls(expr, &mut calls);
@@ -665,15 +666,16 @@ fn statement_grouping_calls(stmt: &SelectStatement) -> Vec<&FunctionCall> {
     calls
 }
 
-/// Each GROUPING() call `stmt`'s ORDER BY writes that `slots` binds to a
-/// flag, once, with that flag's slot
-pub(crate) fn order_by_grouping_slots(
+/// Each GROUPING() call `stmt`'s ORDER BY or DISTINCT ON writes that `slots`
+/// binds to a flag, once, with that flag's slot
+pub(crate) fn sort_key_grouping_slots(
     stmt: &SelectStatement,
     slots: &KeyMap<ExprKey, usize>,
 ) -> Vec<(ExprKey, usize)> {
     let mut calls = Vec::new();
-    for ob in &stmt.order_by {
-        grouping_calls(&ob.expression, &mut calls);
+    let order = stmt.order_by.iter().map(|ob| &ob.expression);
+    for key in order.chain(&stmt.distinct_on) {
+        grouping_calls(key, &mut calls);
     }
     let mut read: Vec<(ExprKey, usize)> = Vec::new();
     for call in calls {
@@ -2170,7 +2172,7 @@ impl Executor {
         // are appended below and trimmed again after the sort.
         let mut hidden_order_by_columns =
             Self::collect_hidden_order_by_columns(stmt, &having_columns, &having_rows);
-        hidden_order_by_columns.extend(self.order_by_grouping_flags(
+        hidden_order_by_columns.extend(self.sort_key_grouping_flags(
             stmt,
             aggregations.len(),
             &having_columns,
@@ -2272,10 +2274,10 @@ impl Executor {
         Ok(result)
     }
 
-    /// The flag of each GROUPING() call ORDER BY writes over ROLLUP, CUBE or
-    /// grouping sets, per group, in a column named after the call: the sort
-    /// reads it there once the projection has dropped the flags
-    fn order_by_grouping_flags(
+    /// The flag of each GROUPING() call ORDER BY or DISTINCT ON writes over
+    /// ROLLUP, CUBE or grouping sets, per group, in a column named after the
+    /// call: the sort reads it there once the projection has dropped the flags
+    fn sort_key_grouping_flags(
         &self,
         stmt: &SelectStatement,
         aggregations: usize,
@@ -2283,13 +2285,13 @@ impl Executor {
         rows: &RowVec,
     ) -> Result<Vec<(String, Vec<Value>)>> {
         let flags_held = stmt.group_by.modifier != GroupByModifier::None;
-        if !flags_held || stmt.order_by.is_empty() {
+        if !flags_held || (stmt.order_by.is_empty() && stmt.distinct_on.is_empty()) {
             return Ok(Vec::new());
         }
         let group_by = self.parse_group_by(stmt, columns)?;
         let mut flags = KeyMap::default();
         self.bind_grouping_flags(stmt, (&group_by, aggregations), &mut flags, flags_held);
-        Ok(order_by_grouping_slots(stmt, &flags)
+        Ok(sort_key_grouping_slots(stmt, &flags)
             .into_iter()
             .map(|(key, slot)| {
                 let values = rows

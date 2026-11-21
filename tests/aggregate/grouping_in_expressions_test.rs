@@ -127,6 +127,21 @@ const OVER_GROUPING_SETS: &[(&str, &[&str])] = &[
          GROUP BY GROUPING SETS ((category), ()) ORDER BY GROUPING(category), category",
         &["A|0", "B|0", "NULL|1"],
     ),
+    (
+        "SELECT p.category, COUNT(*) FROM products p GROUP BY ROLLUP(p.category) \
+         ORDER BY GROUPING(p.category) DESC, p.category",
+        &["NULL|3", "A|2", "B|1"],
+    ),
+    (
+        "SELECT category, COUNT(*) AS n FROM products GROUP BY ROLLUP(category) \
+         ORDER BY GROUPING(category) * -10 + n, category",
+        &["NULL|3", "B|1", "A|2"],
+    ),
+    (
+        "SELECT DISTINCT ON (GROUPING(category)) category, COUNT(*) FROM products \
+         GROUP BY ROLLUP(category) ORDER BY GROUPING(category) DESC",
+        &["NULL|3", "A|2"],
+    ),
 ];
 
 const OVER_PLAIN_GROUPS: &[(&str, &[&str])] = &[
@@ -148,6 +163,21 @@ const OVER_PLAIN_GROUPS: &[(&str, &[&str])] = &[
         "SELECT category, RANK() OVER (PARTITION BY GROUPING(category) ORDER BY COUNT(*) DESC) \
          FROM products GROUP BY category ORDER BY 1",
         &["A|1", "B|2"],
+    ),
+    (
+        "SELECT p.category, COUNT(*) FROM products p GROUP BY p.category \
+         ORDER BY GROUPING(p.category), p.category DESC",
+        &["B|1", "A|2"],
+    ),
+    (
+        "SELECT category, COUNT(*) AS n FROM products GROUP BY category \
+         ORDER BY GROUPING(category) + n, category",
+        &["B|1", "A|2"],
+    ),
+    (
+        "SELECT DISTINCT ON (GROUPING(category)) category, COUNT(*) FROM products \
+         GROUP BY category ORDER BY GROUPING(category), category DESC",
+        &["B|1"],
     ),
 ];
 
@@ -196,6 +226,8 @@ fn grouping_outside_a_grouped_statement_is_refused() {
         "SELECT id FROM products ORDER BY GROUPING(category), id",
         "SELECT id, ROW_NUMBER() OVER (PARTITION BY GROUPING(category) ORDER BY id) FROM products",
         "SELECT COUNT(*) FROM products HAVING GROUPING(category) = 0",
+        "SELECT category FROM products GROUP BY category UNION ALL SELECT 'z' \
+         ORDER BY GROUPING(category)",
     ] {
         assert_eq!(
             answer(db.query(sql, ())),
