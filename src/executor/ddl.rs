@@ -23,13 +23,16 @@
 //! - CREATE VIEW
 //! - DROP VIEW
 
-use super::dml::StatementRollback;
 use super::utils::eq_names;
 use crate::core::{DataType, Error, ForeignKeyAction, ForeignKeyConstraint, Result, SchemaBuilder};
 use crate::parser::ast::*;
 use crate::storage::mvcc::engine::ViewDefinition;
 use crate::storage::traits::transaction::StatementTable;
 use crate::storage::traits::{Engine, NewIndex, QueryResult};
+
+/// The savepoint a statement that runs in parts takes before its first,
+/// named so no written savepoint meets it
+const STATEMENT_START: &str = "\u{0}statement";
 
 /// Validate a foreign key reference and build a `ForeignKeyConstraint`.
 ///
@@ -631,35 +634,48 @@ impl Executor {
         let rows_count = rows.len();
         let mut active_tx = self.active_transaction.lock();
         match active_tx.as_mut() {
-            // The active transaction's rollback drops the table and its rows
+            // The active transaction's rollback drops the table and its rows,
+            // and a failing row takes the statement back to before it
             Some(tx_state) => {
-                tx_state
+                let lower = table_name.to_lowercase();
+                tx_state.transaction.create_savepoint(STATEMENT_START)?;
+                let made = tx_state
                     .transaction
-                    .create_table_with_indexes(table_name, schema, &[])?;
-                let statement_rollback = StatementRollback::new(&self.engine, Some(&*tx_state));
-                let mut table = tx_state.transaction.get_statement_table(table_name)?;
-                tx_state.tables.insert(
-                    table_name.to_lowercase(),
-                    tx_state.transaction.get_statement_table(table_name)?,
-                );
+                    .create_table_with_indexes(table_name, schema, &[])
+                    .and_then(|_| tx_state.transaction.get_statement_table(table_name))
+                    .and_then(|table| {
+                        let registered = tx_state.transaction.get_statement_table(table_name)?;
+                        tx_state.tables.insert(lower.clone(), registered);
+                        Ok(table)
+                    });
                 drop(active_tx);
-                let inserted = rows
-                    .into_iter()
-                    .try_for_each(|row| table.insert(row).map(drop));
-                statement_rollback.finish(inserted)?;
+                let filled = made.and_then(|mut table| {
+                    rows.into_iter()
+                        .try_for_each(|row| table.insert(row).map(drop))
+                });
+                let mut active_tx = self.active_transaction.lock();
+                if let Some(tx_state) = active_tx.as_mut() {
+                    if filled.is_err() {
+                        tx_state.tables.remove(lower.as_str());
+                        tx_state
+                            .transaction
+                            .rollback_to_savepoint(STATEMENT_START)?;
+                    }
+                    tx_state.transaction.release_savepoint(STATEMENT_START)?;
+                }
+                filled?;
             }
+            // Created in a transaction of its own, which a failing row rolls back
             None => {
                 drop(active_tx);
-                self.engine.create_table(schema)?;
-                if !rows.is_empty() {
-                    let mut tx = self.begin_transaction()?;
-                    let mut table = tx.get_statement_table(table_name)?;
-                    for row in rows {
-                        let _ = table.insert(row)?;
-                    }
-                    // Commit the transaction - it will commit all tables via commit_all_tables()
-                    tx.commit()?;
+                let mut tx = self.begin_transaction()?;
+                tx.create_table_with_indexes(table_name, schema, &[])?;
+                let mut table = tx.get_statement_table(table_name)?;
+                for row in rows {
+                    table.insert(row)?;
                 }
+                drop(table);
+                tx.commit()?;
             }
         }
 
