@@ -81,6 +81,53 @@ const CHECKPOINT_HEADER_SIZE: u16 = 32;
 /// Data smaller than this is unlikely to benefit from LZ4 compression
 const COMPRESSION_THRESHOLD: usize = 64;
 
+/// A payload above this size gives its scratch buffer back once encoded
+const KEPT_SCRATCH_BYTES: usize = 64 * 1024;
+
+/// What one thread reuses to compress WAL payloads: the LZ4 hash table of
+/// 16-bit entries, allocated and zeroed per call otherwise, and the output
+/// buffer
+struct WalCompression {
+    table: lz4_flex::block::CompressTable,
+    packed: Vec<u8>,
+}
+
+impl WalCompression {
+    /// `data` compressed as `lz4_flex::compress_prepend_size` lays it out,
+    /// its length first; None if LZ4 refuses it. A payload too long for
+    /// 16-bit entries gets a table of its own, as that function gives it,
+    /// so the kept one stays the table a shorter payload is hashed with
+    fn compress(&mut self, data: &[u8]) -> Option<&[u8]> {
+        use lz4_flex::block::{compress_into_with_table, CompressTable};
+        let bound = lz4_flex::block::get_maximum_output_size(data.len());
+        self.packed.clear();
+        self.packed.resize(4 + bound, 0);
+        self.packed[..4].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        let out = &mut self.packed[4..];
+        let len = match data.len() < u16::MAX as usize {
+            true => compress_into_with_table(data, out, &mut self.table),
+            false => compress_into_with_table(data, out, &mut CompressTable::large()),
+        }
+        .ok()?;
+        Some(&self.packed[..4 + len])
+    }
+
+    /// Lets the buffer go after an outsized payload
+    fn trim(&mut self) {
+        if self.packed.capacity() > KEPT_SCRATCH_BYTES {
+            self.packed = Vec::new();
+        }
+    }
+}
+
+thread_local! {
+    static WAL_COMPRESSION: std::cell::RefCell<WalCompression> =
+        std::cell::RefCell::new(WalCompression {
+            table: lz4_flex::block::CompressTable::default(),
+            packed: Vec::new(),
+        });
+}
+
 /// Section types for checkpoint data
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -353,26 +400,22 @@ impl WALEntry {
     /// │ CRC32 (4 bytes): checksum of header + data                      │
     /// └─────────────────────────────────────────────────────────────────┘
     pub fn encode(&self) -> Vec<u8> {
-        // Determine if we should compress the data payload.
-        // Avoid cloning self.data for the uncompressed case — write it
-        // directly into buf via extend_from_slice instead.
-        let compressed_data: Option<Vec<u8>>;
-        let use_compression;
-        if self.data.len() >= COMPRESSION_THRESHOLD {
-            let compressed = lz4_flex::compress_prepend_size(&self.data);
-            if compressed.len() < self.data.len() {
-                compressed_data = Some(compressed);
-                use_compression = true;
-            } else {
-                compressed_data = None;
-                use_compression = false;
-            }
-        } else {
-            compressed_data = None;
-            use_compression = false;
+        if self.data.len() < COMPRESSION_THRESHOLD {
+            return self.encode_payload(&self.data, false);
         }
-        let payload: &[u8] = compressed_data.as_deref().unwrap_or(&self.data);
+        WAL_COMPRESSION.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            let encoded = match scratch.compress(&self.data) {
+                Some(packed) if packed.len() < self.data.len() => self.encode_payload(packed, true),
+                _ => self.encode_payload(&self.data, false),
+            };
+            scratch.trim();
+            encoded
+        })
+    }
 
+    /// The entry's bytes with `payload` as its data, compressed or not
+    fn encode_payload(&self, payload: &[u8], use_compression: bool) -> Vec<u8> {
         // Calculate data portion size: txnID(8) + tableNameLen(2) + tableName + rowID(8) + op(1) + ts(8) + dataLen(4) + data
         let data_size = 8 + 2 + self.table_name.len() + 8 + 1 + 8 + 4 + payload.len();
 
@@ -2637,6 +2680,49 @@ mod tests {
         assert!(!WALOperationType::Insert.is_ddl());
         assert!(WALOperationType::Commit.is_transaction_end());
         assert!(!WALOperationType::Insert.is_transaction_end());
+    }
+
+    #[test]
+    fn a_compressed_record_is_laid_out_as_lz4_lays_it_out_whatever_came_before() {
+        let periodic = |len: usize| (0..len).map(|i| (i % 7) as u8).collect::<Vec<u8>>();
+        // Matches that a 4-byte hash finds and a 5-byte hash does not
+        let mut short_matches = b"zABCDxABCDy".to_vec();
+        short_matches.resize(64, 0);
+        // Small, either side of the 16-bit table's limit, past it, then
+        // small again
+        let payloads = [
+            periodic(64),
+            periodic(300),
+            periodic(5_000),
+            periodic(u16::MAX as usize - 1),
+            periodic(u16::MAX as usize),
+            periodic(70_000),
+            short_matches,
+            periodic(300),
+        ];
+        for data in payloads {
+            let len = data.len();
+            let entry = WALEntry::new(
+                1,
+                "t".to_string(),
+                2,
+                WALOperationType::Insert,
+                data.clone(),
+            );
+            let encoded = entry.encode();
+            let packed = lz4_flex::compress_prepend_size(&data);
+            let expected = match packed.len() < data.len() {
+                true => entry.encode_payload(&packed, true),
+                false => entry.encode_payload(&data, false),
+            };
+            assert!(encoded == expected, "{len} bytes: the record differs");
+            let flags = WalFlags::from_byte(encoded[5]);
+            let decoded = WALEntry::decode(0, 0, flags, &encoded[32..]).unwrap();
+            assert!(
+                decoded.data == data,
+                "{len} bytes: the data read back differs"
+            );
+        }
     }
 
     #[test]
