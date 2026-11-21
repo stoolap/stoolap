@@ -780,16 +780,41 @@ impl Identifier {
 }
 
 impl fmt::Display for Identifier {
-    /// The name as the lexer reads it back as one name: quoted, its quotes
-    /// doubled, when it holds a character a bare name cannot
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut chars = self.value.chars();
+        SqlName(&self.value).fmt(f)
+    }
+}
+
+/// A name as the lexer reads it back as one name: quoted, its quotes
+/// doubled, when it holds a character a bare name cannot or spells a
+/// keyword the parser reserves
+pub struct SqlName<'a>(pub &'a str);
+
+impl fmt::Display for SqlName<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut chars = self.0.chars();
         let bare = chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
-            && chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$');
+            && chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+            && !super::token::lookup_keyword(self.0).is_some_and(super::parser::is_reserved);
         if bare {
-            write!(f, "{}", self.value)
+            f.write_str(self.0)
         } else {
-            write!(f, "\"{}\"", self.value.replace('"', "\"\""))
+            write!(f, "\"{}\"", self.0.replace('"', "\"\""))
+        }
+    }
+}
+
+/// A column definition's name as CREATE TABLE reads it back: a [`SqlName`],
+/// quoted too when it spells a keyword that opens a table constraint there
+pub struct ColumnDefinitionName<'a>(pub &'a str);
+
+impl fmt::Display for ColumnDefinitionName<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match super::token::lookup_keyword(self.0)
+            .is_some_and(super::parser::opens_table_constraint)
+        {
+            true => write!(f, "\"{}\"", self.0.replace('"', "\"\"")),
+            false => SqlName(self.0).fmt(f),
         }
     }
 }

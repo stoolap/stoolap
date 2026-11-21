@@ -22,7 +22,7 @@ use super::token::{Keyword, Token, TokenType};
 use crate::common::SmartString;
 
 /// Reserved SQL keywords that cannot be used as identifiers
-fn is_reserved(keyword: Keyword) -> bool {
+pub(crate) fn is_reserved(keyword: Keyword) -> bool {
     use Keyword::*;
     matches!(
         keyword,
@@ -99,6 +99,15 @@ fn is_reserved(keyword: Keyword) -> bool {
             | With
             | Recursive
             | Default
+    )
+}
+
+/// The keywords a CREATE TABLE item opening with reads as a table
+/// constraint, not a column, in `parse_column_or_constraint`
+pub(crate) fn opens_table_constraint(keyword: Keyword) -> bool {
+    matches!(
+        keyword,
+        Keyword::Unique | Keyword::Check | Keyword::Primary | Keyword::Foreign
     )
 }
 

@@ -1930,6 +1930,16 @@ impl Parser<'_> {
 
     /// Parse either a column definition or a table-level constraint
     fn parse_column_or_constraint(&mut self) -> Option<ColumnOrConstraint> {
+        // An item opening with no constraint keyword is a column definition
+        if !self
+            .cur_token
+            .keyword
+            .is_some_and(super::parser::opens_table_constraint)
+        {
+            return self
+                .parse_column_definition()
+                .map(ColumnOrConstraint::Column);
+        }
         // Check if this is a table-level constraint (UNIQUE, CHECK, PRIMARY KEY)
         if self.cur_token_is_keyword(Keyword::Unique) {
             // UNIQUE(col1, col2, ...)

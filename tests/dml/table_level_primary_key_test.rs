@@ -96,3 +96,39 @@ fn test_a_composite_primary_key_takes_no_null() {
     db.execute("INSERT INTO cu VALUES (1, 1, 10)", ()).unwrap();
     assert_eq!(rows(&db, "SELECT COUNT(*) FROM cu"), ["1"]);
 }
+
+#[test]
+fn create_table_refuses_a_second_primary_key() {
+    let db = Database::open("memory://primary_key_count").unwrap();
+    for (name, columns) in [
+        ("pk2", "a INTEGER PRIMARY KEY, b INTEGER PRIMARY KEY"),
+        ("pk3", "a INTEGER PRIMARY KEY, b INTEGER, PRIMARY KEY (b)"),
+        (
+            "pk4",
+            "a INTEGER PRIMARY KEY, b INTEGER, c INTEGER, PRIMARY KEY (b, c)",
+        ),
+        (
+            "pk5",
+            "a INTEGER, b INTEGER, PRIMARY KEY (a), PRIMARY KEY (b)",
+        ),
+    ] {
+        let sql = format!("CREATE TABLE {name} ({columns})");
+        let err = db.execute(&sql, ()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("parse error: table '{name}' has more than one PRIMARY KEY"),
+            "{sql}"
+        );
+        assert!(
+            db.query(&format!("SELECT * FROM {name}"), ()).is_err(),
+            "{sql}"
+        );
+    }
+    for sql in [
+        "CREATE TABLE one (a INTEGER PRIMARY KEY, b INTEGER)",
+        "CREATE TABLE two (a INTEGER, b INTEGER, PRIMARY KEY (a))",
+        "CREATE TABLE three (a INTEGER, b INTEGER, PRIMARY KEY (a, b))",
+    ] {
+        db.execute(sql, ()).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
