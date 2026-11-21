@@ -158,8 +158,6 @@ pub(crate) enum PostProjection {
 pub(crate) enum SlotRead {
     /// The slot's value, NULL for None or past the row
     Slot(Option<usize>),
-    /// A GROUPING() flag's slot, 0 for None or past the row
-    Flag(Option<usize>),
     Program(super::expression::SharedProgram),
 }
 
@@ -602,6 +600,28 @@ fn grouping_calls<'e>(expr: &'e Expression, out: &mut Vec<&'e FunctionCall>) {
     });
 }
 
+/// Each GROUPING() call `stmt`'s ORDER BY writes that `slots` binds to a
+/// flag, once, with that flag's slot
+pub(crate) fn order_by_grouping_slots(
+    stmt: &SelectStatement,
+    slots: &KeyMap<ExprKey, usize>,
+) -> Vec<(ExprKey, usize)> {
+    let mut calls = Vec::new();
+    for ob in &stmt.order_by {
+        grouping_calls(&ob.expression, &mut calls);
+    }
+    let mut read: Vec<(ExprKey, usize)> = Vec::new();
+    for call in calls {
+        let key = ExprKey::of_call(call);
+        if let Some(&slot) = slots.get(&key)
+            && !read.iter().any(|(read, _)| *read == key)
+        {
+            read.push((key, slot));
+        }
+    }
+    read
+}
+
 /// The column references `expr` writes outside its subqueries, at any depth
 fn column_refs<'e>(expr: &'e Expression, out: &mut Vec<&'e Expression>) {
     if let Expression::Identifier(_) | Expression::QualifiedIdentifier(_) = expr {
@@ -666,8 +686,6 @@ enum ColumnSource {
     AggSlot(usize),
     /// Column needs to be evaluated from an expression (boxed to reduce enum size)
     Expression(Box<Expression>),
-    /// GROUPING() function - index is the GROUP BY column position (0-based)
-    GroupingFlag(usize),
 }
 
 /// Represents an aggregate function call in a SELECT list
@@ -1992,8 +2010,9 @@ impl Executor {
         if let Some(blocks) = blocks {
             blocks.rows_asking(rows.len());
         }
-        // HAVING reads every group item and aggregate from its slot
-        let slots = aggregate_slot_keys(group_by_columns, aggregations, &stmt.columns);
+        // HAVING reads every group item, aggregate and GROUPING() flag from its slot
+        let mut slots = aggregate_slot_keys(group_by_columns, aggregations, &stmt.columns);
+        self.bind_grouping_flags(stmt, group_by_columns, aggregations.len(), &mut slots);
         let tmp_result = Box::new(ExecutorResult::new(columns.to_vec(), rows));
         let mut having_result =
             self.apply_having(tmp_result, having, columns, &slots, ctx, blocks)?;
@@ -2082,8 +2101,14 @@ impl Executor {
         // ORDER BY may name a grouped column the SELECT list drops. Capture
         // those columns before projection consumes the aggregate rows; they
         // are appended below and trimmed again after the sort.
-        let hidden_order_by_columns =
+        let mut hidden_order_by_columns =
             Self::collect_hidden_order_by_columns(stmt, &having_columns, &having_rows);
+        hidden_order_by_columns.extend(self.order_by_grouping_flags(
+            stmt,
+            aggregations.len(),
+            &having_columns,
+            &having_rows,
+        )?);
 
         // Check for hidden aggregates (ORDER BY only) BEFORE cloning
         // These will be removed after sorting by the ProjectedResult wrapper
@@ -2178,6 +2203,34 @@ impl Executor {
         let result: Box<dyn QueryResult> = Box::new(ExecutorResult::new(final_columns, final_rows));
 
         Ok(result)
+    }
+
+    /// The flag of each GROUPING() call ORDER BY writes over ROLLUP, CUBE or
+    /// grouping sets, per group, in a column named after the call: the sort
+    /// reads it there once the projection has dropped the flags
+    fn order_by_grouping_flags(
+        &self,
+        stmt: &SelectStatement,
+        aggregations: usize,
+        columns: &[String],
+        rows: &RowVec,
+    ) -> Result<Vec<(String, Vec<Value>)>> {
+        if stmt.group_by.modifier == GroupByModifier::None || stmt.order_by.is_empty() {
+            return Ok(Vec::new());
+        }
+        let group_by = self.parse_group_by(stmt, columns)?;
+        let mut flags = KeyMap::default();
+        self.bind_grouping_flags(stmt, &group_by, aggregations, &mut flags);
+        Ok(order_by_grouping_slots(stmt, &flags)
+            .into_iter()
+            .map(|(key, slot)| {
+                let values = rows
+                    .iter()
+                    .map(|(_, row)| row.get(slot).cloned().unwrap_or_else(Value::null_unknown))
+                    .collect();
+                (key.hidden_column_name(), values)
+            })
+            .collect())
     }
 
     /// The grouped columns ORDER BY reads that no SELECT item copies, paired
@@ -2279,6 +2332,7 @@ impl Executor {
             item_names,
             &mut slot_keys,
         );
+        self.bind_grouping_flags(stmt, &group_by_columns, aggregations.len(), &mut slot_keys);
         let slot_of = |expr: &Expression| slot_keys.get(&ExprKey::of(expr)).copied();
 
         // Check if we have any expressions that need post-processing
@@ -2397,24 +2451,6 @@ impl Executor {
                             Some(slot) => ColumnSource::AggSlot(slot),
                             None => make_source(col_expr),
                         });
-                    } else if func.function.eq_ignore_ascii_case("GROUPING") {
-                        // GROUPING() function - map to the appropriate grouping flag column
-                        if let Some(idx) = self.find_grouping_column_index(func, &group_by_columns)
-                        {
-                            column_sources.push(ColumnSource::GroupingFlag(idx));
-                        } else {
-                            // If column not found, return 0 (treated as regularly grouped)
-                            column_sources.push(ColumnSource::Expression(Box::new(
-                                Expression::IntegerLiteral(crate::parser::ast::IntegerLiteral {
-                                    token: crate::parser::token::Token::new(
-                                        crate::parser::token::TokenType::Integer,
-                                        "0",
-                                        crate::parser::token::Position::new(0, 0, 0),
-                                    ),
-                                    value: 0,
-                                }),
-                            )));
-                        }
                     } else {
                         // Non-aggregate function: a GROUP BY expression column is
                         // read as it is, anything else is evaluated
@@ -2441,29 +2477,6 @@ impl Executor {
                                     // Last resort: evaluate the expression
                                     column_sources.push(ColumnSource::Expression(Box::new(
                                         aliased.expression.as_ref().clone(),
-                                    )));
-                                }
-                            }
-                            Expression::FunctionCall(func)
-                                if func.function.eq_ignore_ascii_case("GROUPING") =>
-                            {
-                                // Aliased GROUPING() function
-                                if let Some(idx) =
-                                    self.find_grouping_column_index(func, &group_by_columns)
-                                {
-                                    column_sources.push(ColumnSource::GroupingFlag(idx));
-                                } else {
-                                    column_sources.push(ColumnSource::Expression(Box::new(
-                                        Expression::IntegerLiteral(
-                                            crate::parser::ast::IntegerLiteral {
-                                                token: crate::parser::token::Token::new(
-                                                    crate::parser::token::TokenType::Integer,
-                                                    "0",
-                                                    crate::parser::token::Position::new(0, 0, 0),
-                                                ),
-                                                value: 0,
-                                            },
-                                        ),
                                     )));
                                 }
                             }
@@ -2523,12 +2536,6 @@ impl Executor {
                         blocks,
                         params,
                     )?),
-                    // The flag sits in a hidden __grouping_N__ column after the aggregates
-                    ColumnSource::GroupingFlag(idx) => SlotRead::Flag(
-                        agg_col_index_map
-                            .get(&format!("__grouping_{}__", idx))
-                            .copied(),
-                    ),
                 })
             })
             .collect::<Result<_>>()?;
@@ -2591,11 +2598,6 @@ impl Executor {
                         let program = programs.get(at).and_then(Option::as_ref).unwrap_or(held);
                         vm.execute(program, &run_context(&row, ctx, blocks))?
                     }
-                    // Fallback: column is grouped normally
-                    SlotRead::Flag(at) => at
-                        .and_then(|at| row.get(at))
-                        .cloned()
-                        .unwrap_or(Value::Integer(0)),
                 };
                 new_values.push(value);
             }
@@ -2797,6 +2799,39 @@ impl Executor {
         self.windows_over_groups(path, stmt, &aggregations, ctx, input, base_columns, run)
     }
 
+    /// Bind each GROUPING() call `stmt` writes to the flag of the item it
+    /// names, held after the `items` and `aggregations` slots; rows of a
+    /// plain GROUP BY hold no flags, and an unbound call there reads 0
+    fn bind_grouping_flags(
+        &self,
+        stmt: &SelectStatement,
+        items: &[GroupByItem],
+        aggregations: usize,
+        slots: &mut KeyMap<ExprKey, usize>,
+    ) {
+        if stmt.group_by.modifier == GroupByModifier::None {
+            return;
+        }
+        let mut calls = Vec::new();
+        let order = stmt.order_by.iter().map(|o| &o.expression);
+        let windows = stmt.window_defs.iter().flat_map(|w| w.expressions());
+        for expr in stmt
+            .columns
+            .iter()
+            .chain(stmt.having.as_deref())
+            .chain(order)
+            .chain(windows)
+        {
+            grouping_calls(expr, &mut calls);
+        }
+        let flags = items.len() + aggregations;
+        for call in calls {
+            if let Some(at) = self.find_grouping_column_index(call, items) {
+                slots.entry(ExprKey::of_call(call)).or_insert(flags + at);
+            }
+        }
+    }
+
     /// The window functions of `stmt` over its groups of `aggregations`,
     /// grouped from the rows of `input` as any aggregation groups them, and
     /// each GROUPING() call read from its group's flag; `path` grouped them,
@@ -2823,20 +2858,7 @@ impl Executor {
         let mut slots = aggregate_slot_keys(&items, aggregations, &stmt.columns);
         let item_names = columns.get(..items.len()).unwrap_or_default();
         Self::bind_group_columns(stmt, base_columns, &items, item_names, &mut slots);
-        if stmt.group_by.modifier != GroupByModifier::None {
-            let mut calls = Vec::new();
-            let order = stmt.order_by.iter().map(|o| &o.expression);
-            let windows = stmt.window_defs.iter().flat_map(|w| w.expressions());
-            for expr in stmt.columns.iter().chain(order).chain(windows) {
-                grouping_calls(expr, &mut calls);
-            }
-            let flags = items.len() + aggregations.len();
-            for call in calls {
-                if let Some(at) = self.find_grouping_column_index(call, &items) {
-                    slots.entry(ExprKey::of_call(call)).or_insert(flags + at);
-                }
-            }
-        }
+        self.bind_grouping_flags(stmt, &items, aggregations.len(), &mut slots);
         path.taken();
         self.execute_select_with_window_functions_over_groups(
             stmt,

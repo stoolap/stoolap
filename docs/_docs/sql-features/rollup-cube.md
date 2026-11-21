@@ -213,6 +213,15 @@ Returns:
 
 The argument names a GROUP BY item as it is written, or by its column, qualified or not: with `GROUP BY ROLLUP(s.region)`, both `GROUPING(s.region)` and `GROUPING(region)` read that item. A bare name two GROUP BY items carry, such as `region` with `ROLLUP(s.region, u.region)`, names neither, and like a column no item names it reads `0`; qualify it to read one of them.
 
+GROUPING() may appear anywhere an expression over the groups may: as a SELECT item or inside one, in HAVING, in ORDER BY whether or not the SELECT list carries it, and in a window's PARTITION BY or ORDER BY. Under a plain GROUP BY every group holds every item, so it reads `0` there.
+
+```sql
+SELECT IIF(GROUPING(category) = 1, '(total)', category) AS label, COUNT(*)
+FROM products
+GROUP BY ROLLUP(category)
+ORDER BY GROUPING(category), category;
+```
+
 ### Example
 
 ```sql
