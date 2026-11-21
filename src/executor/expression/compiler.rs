@@ -1852,6 +1852,25 @@ impl<'a> ExprCompiler<'a> {
                 builder.emit(Op::LoadTransactionId);
                 return Ok(());
             }
+            // A call of several arguments reads each one's flag as a bit,
+            // the first the most significant
+            "GROUPING" if func.arguments.len() > 1 => {
+                let calls = crate::executor::aggregation::grouping_flag_calls(func);
+                for (at, call) in calls.into_iter().enumerate() {
+                    if at > 0 {
+                        builder.emit(Op::LoadConst(Value::Integer(2)));
+                        builder.emit(Op::Mul);
+                    }
+                    self.compile_expr(
+                        &Expression::FunctionCall(Box::new(call.into_owned())),
+                        builder,
+                    )?;
+                    if at > 0 {
+                        builder.emit(Op::Add);
+                    }
+                }
+                return Ok(());
+            }
             // Over grouped rows a GROUPING() call no alias binds to a flag
             // reads a group of every item: ROLLUP, CUBE and grouping sets bind theirs
             "GROUPING" if self.ctx.over_groups => {

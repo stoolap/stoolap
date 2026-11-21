@@ -205,11 +205,14 @@ The GROUPING() function identifies whether a NULL value in the result represents
 
 ```sql
 GROUPING(column)
+GROUPING(column1, column2, ...)
 ```
 
 Returns:
 - `0` if the column is part of the current grouping (normal row)
 - `1` if the column is aggregated (super-aggregate row)
+
+With several arguments it returns one bit per argument, each the value `GROUPING` of that argument alone returns, the first argument the most significant bit: `GROUPING(region, category)` is `GROUPING(region) * 2 + GROUPING(category)`, so with `ROLLUP(region, category)` it reads `0` on a detail row, `1` on a region subtotal and `3` on the grand total.
 
 The argument names a GROUP BY item as it is written, or by its column, qualified or not: with `GROUP BY ROLLUP(s.region)`, both `GROUPING(s.region)` and `GROUPING(region)` read that item. A bare name two GROUP BY items carry, such as `region` with `ROLLUP(s.region, u.region)`, names neither, and like a column no item names it reads `0`; qualify it to read one of them.
 
