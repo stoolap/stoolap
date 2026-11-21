@@ -2219,6 +2219,8 @@ impl Parser<'_> {
 
         // Parse constraints
         let mut constraints = Vec::new();
+        // NULL and NOT NULL as written, which may not both stand
+        let (mut null, mut not_null) = (false, false);
         while self.peek_token_is(TokenType::Keyword) {
             let constraint_keyword = self.peek_token.literal.to_uppercase();
             match constraint_keyword.as_str() {
@@ -2234,7 +2236,12 @@ impl Parser<'_> {
                     if !self.expect_keyword(Keyword::Null) {
                         return None;
                     }
+                    not_null = true;
                     constraints.push(ColumnConstraint::NotNull);
+                }
+                "NULL" => {
+                    self.next_token();
+                    null = true;
                 }
                 "UNIQUE" => {
                     self.next_token();
@@ -2243,8 +2250,17 @@ impl Parser<'_> {
                 "DEFAULT" => {
                     self.next_token(); // consume DEFAULT
                     self.next_token();
-                    let expr = self.parse_expression(Precedence::Lowest)?;
-                    constraints.push(ColumnConstraint::Default(expr));
+                    // The value ends before AND and OR, and on NOT NULL, the
+                    // column's own; a value using AND or OR is written in parentheses
+                    let outer = self.column_default.replace(self.expression_depth + 1);
+                    let expr = self.parse_expression(Precedence::And);
+                    self.column_default = outer;
+                    let then_not_null = std::mem::take(&mut self.default_not_null);
+                    constraints.push(ColumnConstraint::Default(expr?));
+                    if then_not_null {
+                        not_null = true;
+                        constraints.push(ColumnConstraint::NotNull);
+                    }
                 }
                 "CHECK" => {
                     self.next_token(); // consume CHECK
@@ -2294,6 +2310,13 @@ impl Parser<'_> {
                 }
                 _ => break,
             }
+        }
+        if null && not_null {
+            self.add_error(format!(
+                "conflicting NULL and NOT NULL for column '{}'",
+                name.value
+            ));
+            return None;
         }
 
         Some(ColumnDefinition {

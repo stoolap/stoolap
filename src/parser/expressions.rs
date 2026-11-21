@@ -116,6 +116,10 @@ impl Parser<'_> {
                 }
             } else {
                 left = self.parse_infix_expression(left)?;
+                // A column DEFAULT's NOT NULL added no node: the value ends as it was
+                if self.default_not_null {
+                    break;
+                }
             }
             // The operands parsed in this step, one level below `depth`
             let reached = self.expression_peak - depth;
@@ -724,6 +728,18 @@ impl Parser<'_> {
                         crate::common::SmartString::const_new("RLIKE"),
                         true,
                     )
+                } else if self.column_default == Some(self.expression_depth) {
+                    // A column DEFAULT value ends on NOT NULL, the column's own
+                    if !self.peek_token_is_keyword(Keyword::Null) {
+                        self.add_error(format!(
+                            "expected NULL, IN, BETWEEN or LIKE after NOT at {}",
+                            self.peek_token.position
+                        ));
+                        return None;
+                    }
+                    self.next_token();
+                    self.default_not_null = true;
+                    Some(left)
                 } else {
                     let token = self.cur_token.clone();
                     self.next_token();
@@ -1434,7 +1450,7 @@ impl Parser<'_> {
         let escape = if self.peek_token_is_keyword(Keyword::Escape) {
             self.next_token(); // consume ESCAPE
             self.next_token(); // move to escape character
-            Some(Box::new(self.parse_expression(Precedence::Lowest)?))
+            Some(Box::new(self.parse_expression(precedence)?))
         } else {
             None
         };

@@ -198,6 +198,11 @@ pub struct Parser<'a> {
     /// The deepest level the expression being parsed reaches, an operator
     /// chain's levels included
     pub(crate) expression_peak: usize,
+    /// The expression level of a column DEFAULT value being parsed, where a
+    /// NOT NULL after it ends it and is the column's
+    pub(crate) column_default: Option<usize>,
+    /// The column DEFAULT value just parsed ended on NOT NULL
+    pub(crate) default_not_null: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -234,6 +239,8 @@ impl<'a> Parser<'a> {
             expression_depth: 0,
             limited: true,
             expression_peak: 0,
+            column_default: None,
+            default_not_null: false,
         }
     }
 
