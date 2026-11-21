@@ -269,12 +269,9 @@ fn a_truncate_refuses_the_points_before_it() {
     let _guard = FailpointGuard::new();
     let db = memory("as_of_history_truncate");
     let other = db.clone();
-    db.execute("BEGIN", ()).unwrap();
-    db.query("SELECT 1", ()).unwrap();
     other.execute("INSERT INTO t VALUES (1, 10)", ()).unwrap();
     let before = now(&other);
     db.execute("TRUNCATE TABLE t", ()).unwrap();
-    db.execute("COMMIT", ()).unwrap();
     refused(at(&other, &before), "the truncate took the rows away");
     assert_eq!(
         at(&other, &now(&other)),

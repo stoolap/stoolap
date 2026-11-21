@@ -3502,18 +3502,23 @@ impl Executor {
     /// TRUNCATE is equivalent to DELETE without WHERE clause, but more efficient.
     ///
     /// **Non-rollbackable**: Like MySQL and Oracle, TRUNCATE physically destroys
-    /// versions, arena, and indexes immediately. ROLLBACK cannot undo it.
-    /// This is a deliberate trade-off: O(1) truncation vs rollback safety.
+    /// versions, arena, and indexes immediately, so it is refused inside an
+    /// explicit transaction, whose ROLLBACK could not undo it.
     /// Use `DELETE FROM table` if transactional rollback is needed.
     ///
-    /// Fails with `TableHasActiveTransactions` if:
-    /// - The current explicit transaction has already modified this table (INSERT/UPDATE/DELETE)
-    /// - Another transaction holds uncommitted UPDATE/DELETE claims on the table
+    /// Fails with `TableHasActiveTransactions` if another transaction holds
+    /// uncommitted UPDATE/DELETE claims on the table
     pub(crate) fn execute_truncate(
         &self,
         stmt: &TruncateStatement,
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        if self.active_transaction.is_open() {
+            return Err(Error::InvalidArgument(
+                "TRUNCATE cannot be used inside an explicit transaction".to_string(),
+            ));
+        }
+
         // OPTIMIZATION: Use pre-computed lowercase name to avoid allocation per query
         let table_name = &stmt.table_name.value_lower;
 
@@ -3521,37 +3526,8 @@ impl Executor {
         // checkpoint's catalog copies, which carry the counter
         let _ddl = self.engine.ddl_statement_guard()?;
 
-        // Check if there's an active explicit transaction
-        let mut active_tx = self.active_transaction.lock();
-
-        let (mut table, should_auto_commit, standalone_tx) =
-            if let Some(ref mut tx_state) = *active_tx {
-                // Block TRUNCATE if this transaction has already modified the table.
-                // Uncommitted INSERTs live in TransactionVersionStore.local_versions
-                // and would be silently destroyed by truncate_all().
-                if tx_state.tables.contains_key(table_name.as_str()) {
-                    return Err(Error::TableHasActiveTransactions);
-                }
-
-                // Use the active transaction
-                let table = tx_state.transaction.get_statement_table(table_name)?;
-
-                // Register this table for commit/rollback
-                tx_state.tables.insert(
-                    table_name.to_string(),
-                    tx_state.transaction.get_statement_table(table_name)?,
-                );
-
-                (table, false, None)
-            } else {
-                // No active transaction - create a standalone transaction with auto-commit
-                let tx = self.begin_transaction()?;
-                let table = tx.get_statement_table(table_name)?;
-                (table, true, Some(tx))
-            };
-
-        // Drop the lock before doing work
-        drop(active_tx);
+        let mut tx = self.begin_transaction()?;
+        let mut table = tx.get_statement_table(table_name)?;
 
         // FK enforcement: block truncate if child tables reference this table
         // Uses the table's transaction for visibility (sees uncommitted child deletes)
@@ -3577,13 +3553,8 @@ impl Executor {
         // (TRUNCATE always invalidates, regardless of rows_affected, for safety)
         self.semantic_cache.invalidate_table(table_name);
 
-        // Commit if this is a standalone (auto-commit) transaction
-        if should_auto_commit {
-            // Commit the transaction - it will commit all tables via commit_all_tables()
-            if let Some(mut tx) = standalone_tx {
-                tx.commit()?;
-            }
-        }
+        // Commit the transaction - it will commit all tables via commit_all_tables()
+        tx.commit()?;
 
         Ok(Box::new(ExecResult::with_rows_affected(
             rows_affected as i64,

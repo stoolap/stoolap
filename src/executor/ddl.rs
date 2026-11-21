@@ -710,7 +710,7 @@ impl Executor {
                 // WARNING: DROP TABLE within a transaction has limited rollback support.
                 // On rollback, the table schema will be recreated but DATA WILL BE LOST.
                 // This is because table data is immediately deleted and cannot be recovered.
-                // For recoverable data deletion, use DELETE FROM or TRUNCATE instead.
+                // For recoverable data deletion, use DELETE FROM instead.
                 eprintln!(
                     "Warning: DROP TABLE '{}' within transaction - data cannot be recovered on rollback",
                     table_name

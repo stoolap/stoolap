@@ -840,7 +840,7 @@ impl Transaction for MvccTransaction {
     /// PostgreSQL's behavior where certain DDL operations are destructive.
     ///
     /// If you need to safely remove all data with rollback support, use
-    /// `DELETE FROM table_name` or `TRUNCATE TABLE table_name` instead.
+    /// `DELETE FROM table_name` instead.
     fn drop_table(&mut self, name: &str) -> Result<()> {
         self.check_active()?;
 
