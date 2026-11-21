@@ -211,9 +211,17 @@ fn unique_index_name(table: &str, column: &str) -> String {
     format!("unique_{table}_{column}")
 }
 
-/// The name of the index the `i`th table UNIQUE constraint of a new table gets
-fn table_unique_index_name(table: &str, i: usize) -> String {
-    format!("unique_{table}_{i}")
+/// The name of the next table UNIQUE constraint's index of a new table, from
+/// `*next` on: the first `unique_<table>_<n>` none of `taken` has, as a
+/// UNIQUE column named like a number does
+fn table_unique_index_name(table: &str, next: &mut usize, taken: &[NewIndex]) -> String {
+    loop {
+        let name = format!("unique_{table}_{next}");
+        *next += 1;
+        if !taken.iter().any(|index| eq_names(&index.name, &name)) {
+            return name;
+        }
+    }
 }
 
 /// The name of the index a foreign key column of a new table gets
@@ -542,16 +550,15 @@ impl Executor {
                 unique: true,
             })
             .collect();
-        indexes.extend(
-            table_unique_constraints
-                .iter()
-                .enumerate()
-                .map(|(i, columns)| NewIndex {
-                    name: table_unique_index_name(table_name, i),
-                    columns: columns.clone(),
-                    unique: true,
-                }),
-        );
+        let mut next = 0;
+        for columns in &table_unique_constraints {
+            let name = table_unique_index_name(table_name, &mut next, &indexes);
+            indexes.push(NewIndex {
+                name,
+                columns: columns.clone(),
+                unique: true,
+            });
+        }
         indexes.extend(fk_index_columns.iter().map(|c| NewIndex {
             name: fk_index_name(table_name, c),
             columns: vec![c.clone()],

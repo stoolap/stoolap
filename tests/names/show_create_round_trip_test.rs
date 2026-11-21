@@ -68,6 +68,20 @@ const TABLES: &[(&str, &str, &str)] = &[
         "cp",
         "CREATE TABLE cp (a Integer NOT NULL, b Integer NOT NULL, UNIQUE (a, b))",
     ),
+    (
+        "CREATE TABLE \"check\" (id INTEGER PRIMARY KEY, \"unique\" INTEGER, \"check\" INTEGER, \
+         UNIQUE (\"unique\", \"check\"))",
+        "\"check\"",
+        "CREATE TABLE check (id Integer PRIMARY KEY, \"unique\" Integer, \"check\" Integer, \
+         UNIQUE (unique, check))",
+    ),
+    (
+        "CREATE TABLE n (a INTEGER PRIMARY KEY, \"0\" INTEGER UNIQUE, b INTEGER, c INTEGER, \
+         UNIQUE (b, c))",
+        "n",
+        "CREATE TABLE n (a Integer PRIMARY KEY, \"0\" Integer UNIQUE, b Integer, c Integer, \
+         UNIQUE (b, c))",
+    ),
 ];
 
 #[test]

@@ -804,6 +804,21 @@ impl fmt::Display for SqlName<'_> {
     }
 }
 
+/// A column definition's name as CREATE TABLE reads it back: a [`SqlName`],
+/// quoted too when it spells a keyword that opens a table constraint there
+pub struct ColumnDefinitionName<'a>(pub &'a str);
+
+impl fmt::Display for ColumnDefinitionName<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match super::token::lookup_keyword(self.0)
+            .is_some_and(super::parser::opens_table_constraint)
+        {
+            true => write!(f, "\"{}\"", self.0.replace('"', "\"\"")),
+            false => SqlName(self.0).fmt(f),
+        }
+    }
+}
+
 /// Qualified identifier (table.column)
 #[derive(Debug, Clone, PartialEq)]
 pub struct QualifiedIdentifier {

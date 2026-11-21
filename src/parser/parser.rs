@@ -102,6 +102,15 @@ pub(crate) fn is_reserved(keyword: Keyword) -> bool {
     )
 }
 
+/// The keywords a CREATE TABLE item opening with reads as a table
+/// constraint, not a column, in `parse_column_or_constraint`
+pub(crate) fn opens_table_constraint(keyword: Keyword) -> bool {
+    matches!(
+        keyword,
+        Keyword::Unique | Keyword::Check | Keyword::Primary | Keyword::Foreign
+    )
+}
+
 /// Where a parser reads its tokens: a lexer, or the tokens a lexer read
 /// before, up to its end of input
 enum Tokens<'a> {

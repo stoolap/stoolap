@@ -116,7 +116,7 @@ impl Executor {
             .columns
             .iter()
             .map(|col| {
-                let mut def = format!("{} {}", SqlName(&col.name), column_type(col));
+                let mut def = format!("{} {}", ColumnDefinitionName(&col.name), column_type(col));
                 if col.primary_key {
                     def.push_str(" PRIMARY KEY");
                     if col.auto_increment {
