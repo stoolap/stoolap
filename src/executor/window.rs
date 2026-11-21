@@ -122,16 +122,6 @@ struct RowPrograms<'a> {
     blocks: Option<&'a dyn SubqueryExecutor>,
 }
 
-/// The column each name of `columns` reads, without a name two of them
-/// carry: a reference to one is compiled, which refuses it as ambiguous
-fn unambiguous_index_map(columns: &[String]) -> StringMap<usize> {
-    let mut map = build_column_index_map(columns);
-    for at in repeated_columns(columns) {
-        map.remove(columns[at].to_lowercase().as_str());
-    }
-    map
-}
-
 /// The prefix of the name a window function's result column carries inside
 /// the executor: unwritable, so no column a statement names shares it
 const WINDOW_COLUMN: &str = "\u{0}wf#";
@@ -165,7 +155,7 @@ fn row_program(
     ctx: &ExecutionContext,
     blocks: Option<&dyn SubqueryExecutor>,
 ) -> Result<SharedProgram> {
-    let program = compile_over_rows(
+    let program = compile_over_slots(
         expr,
         columns,
         global_registry(),
@@ -239,7 +229,7 @@ fn held_program(
     blocks: Option<&dyn SubqueryExecutor>,
 ) -> Result<SharedProgram> {
     let program = held_or_compile(held, || {
-        compile_over_rows(
+        compile_over_slots(
             expr,
             columns,
             global_registry(),
@@ -832,16 +822,14 @@ use crate::functions::{Volatility, WindowFunction};
 use crate::parser::ast::*;
 use crate::storage::traits::{QueryResult, Table};
 
-use super::aggregation::{
-    aggregate_extra_args, compile_over_rows, repeated_columns, run_context, slot_params,
-};
+use super::aggregation::{aggregate_extra_args, compile_over_slots, run_context, slot_params};
 use super::context::ExecutionContext;
 use super::expr_key::ExprKey;
 use super::expression::{
     evaluate_once, execute_once, held_once, held_or_compile, literal_value, ExprVM, HeldOnce,
     Program, SharedProgram, SubqueryExecutor,
 };
-use super::query::{order_by_inputs, refuse_ambiguous_order_inputs, ColumnSource, OutputLayout};
+use super::query::{order_by_inputs, refuse_ambiguous_inputs, ColumnSource, OutputLayout};
 use super::result::{ColumnarResult, ExecutorResult};
 use super::utils::{
     build_column_index_map, derived_aggregate_column_name, for_each_qualified_star_column,
@@ -1513,10 +1501,21 @@ impl Executor {
             Option<&HeldWindow>,
         ),
     ) -> Result<WindowPlan<'s>> {
-        refuse_ambiguous_order_inputs(&stmt, base_columns)?;
         // Parse window functions from the SELECT list
         let read = held.is_none().then_some((ctx, blocks));
         let window_functions = self.parse_window_functions(&stmt, base_columns, read)?;
+        // Over groups each name was bound to its source when the rows were grouped
+        if group_slots.is_empty() {
+            let parts = window_functions.iter().flat_map(|wf| {
+                wf.arguments
+                    .iter()
+                    .chain(&wf.partition_by_exprs)
+                    .chain(wf.order_by.iter().map(|o| &o.expression))
+                    .chain(wf.call_order_by.iter().map(|o| &o.expression))
+                    .chain(wf.filter.as_deref())
+            });
+            refuse_ambiguous_inputs(&stmt, base_columns, parts)?;
+        }
 
         // LIMIT pushdown for PARTITION BY queries is safe only when there is
         // no top-level ORDER BY, when every window function shares the same
@@ -1534,7 +1533,7 @@ impl Executor {
                 .any(|wf| !wf.partition_by_exprs.is_empty())
             && Self::all_partitions_match(&window_functions);
 
-        let col_index_map = unambiguous_index_map(base_columns);
+        let col_index_map = build_column_index_map(base_columns);
 
         // Parse the SELECT list to determine output column order
         let laid_out = !stmt.order_by.is_empty() || !stmt.distinct_on.is_empty();
@@ -2480,7 +2479,7 @@ impl Executor {
         group_slots: &KeyMap<ExprKey, usize>,
         mut item_of: Option<&mut Vec<usize>>,
     ) -> Vec<SelectItem> {
-        let col_index_map = unambiguous_index_map(base_columns);
+        let col_index_map = build_column_index_map(base_columns);
 
         let mut items = Vec::new();
         let mut wf_idx = 0;
