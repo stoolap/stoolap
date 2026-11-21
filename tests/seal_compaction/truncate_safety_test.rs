@@ -63,6 +63,42 @@ fn a_truncate_inside_an_explicit_transaction_is_refused_and_keeps_the_rows() {
     assert_eq!(count, 2, "ROLLBACK did not keep the rows");
 }
 
+#[test]
+fn a_row_another_transaction_inserted_before_a_truncate_commits_after_it() {
+    let db = Database::open_in_memory().unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY AUTO_INCREMENT, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO t (v) VALUES (10), (20), (30)", ())
+        .unwrap();
+    let other = db.clone();
+    other.execute("BEGIN", ()).unwrap();
+    other.execute("INSERT INTO t (v) VALUES (40)", ()).unwrap();
+    db.execute("TRUNCATE TABLE t", ()).unwrap();
+    for v in [50, 60, 70, 80, 90] {
+        db.execute(&format!("INSERT INTO t (v) VALUES ({v})"), ())
+            .unwrap();
+    }
+    other
+        .execute("COMMIT", ())
+        .expect("the transaction's row took an id the truncate handed out again");
+    let rows: Vec<(i64, i64)> = db
+        .query("SELECT id, v FROM t ORDER BY v", ())
+        .unwrap()
+        .map(|row| {
+            let row = row.unwrap();
+            (row.get(0).unwrap(), row.get(1).unwrap())
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [(4, 40), (5, 50), (6, 60), (7, 70), (8, 80), (9, 90)],
+        "(id, v) after the TRUNCATE and the later commit"
+    );
+}
+
 /// TRUNCATE must fail when another transaction has uncommitted UPDATE.
 #[test]
 fn test_truncate_blocked_by_active_updater() {

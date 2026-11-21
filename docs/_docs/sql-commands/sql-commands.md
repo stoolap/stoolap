@@ -505,7 +505,8 @@ TRUNCATE TABLE logs;
 **Important notes:**
 - TRUNCATE is faster than DELETE because it doesn't log individual row deletions
 - TRUNCATE cannot run inside an explicit transaction, because ROLLBACK could not restore the rows it removes. Use `DELETE FROM table_name` there
-- TRUNCATE will fail if another transaction has uncommitted changes on the table
+- TRUNCATE will fail if another transaction has updated or deleted rows of the table and not committed. A row another transaction inserted and commits after the TRUNCATE is kept
+- TRUNCATE restarts AUTO_INCREMENT at 1, unless another transaction holds an uncommitted inserted row; then numbering continues from where it was, so that row's id is not handed out again
 - TRUNCATE will fail if the table is referenced by foreign key constraints with existing child rows
 
 ### COPY FROM
