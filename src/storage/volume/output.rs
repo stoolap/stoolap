@@ -641,7 +641,7 @@ impl VolumeFileWriter {
             volume_id: self.volume_id,
             nonce: super::v5::new_nonce(),
         };
-        let identity =
+        let (identity, raw_sections) =
             super::v5::write_tail(&mut blocks, self.block_pos, &root, sections, &self.entries)
                 .map_err(|e| io_error("failed to write volume file", e))?;
         let _ = meta.file_identity.set(identity);
@@ -656,7 +656,11 @@ impl VolumeFileWriter {
             .map_err(|e| io_error("failed to rename volume file", e))?;
         // From here the final file exists; whatever fails until the volume
         // is handed over removes it, since nothing has published it
-        let published = self.publish(&kinds, &dict_tables, meta, col_count, num_groups);
+        let blooms = raw_sections
+            .iter()
+            .find(|s| s.0 == super::format::V5_BLOOMS)
+            .map(|&(_, enc, at, len)| (enc, at, len));
+        let published = self.publish(&kinds, &dict_tables, meta, blooms, col_count, num_groups);
         match published {
             Ok(volume) => {
                 self.finished = true;
@@ -670,12 +674,14 @@ impl VolumeFileWriter {
     }
 
     /// Syncs the directory and builds the volume over the file just
-    /// written, its blocks at the positions they were written to
+    /// written, its blocks at the positions they were written to and its
+    /// bloom filters read from the `blooms` section on first probe
     fn publish(
         &mut self,
         kinds: &[(u8, u8)],
         dict_tables: &[Vec<crate::common::SmartString>],
-        meta: super::writer::VolumeMeta,
+        mut meta: super::writer::VolumeMeta,
+        blooms: Option<(u8, u64, u64)>,
         col_count: usize,
         num_groups: usize,
     ) -> Result<FrozenVolume> {
@@ -686,7 +692,13 @@ impl VolumeFileWriter {
                 .map_err(|e| io_error("failed to fsync volume directory", e))?;
         }
         // The volume is handed over only over a file its readers can open
-        File::open(&self.final_path).map_err(|e| io_error("failed to open volume file", e))?;
+        let file =
+            File::open(&self.final_path).map_err(|e| io_error("failed to open volume file", e))?;
+        let handle = super::writer::VolumeFile::shared(&self.final_path);
+        let read_at = |buf: &mut [u8], at: u64| super::writer::read_exact_at(&file, buf, at);
+        meta.bloom_filters =
+            super::writer::VolumeBlooms::from_section(&handle, blooms, col_count, &read_at)
+                .map_err(|e| io_error("failed to read volume bloom section", e))?;
         let mut offsets = Vec::with_capacity(col_count);
         let mut comp_lens = Vec::with_capacity(col_count);
         let mut decomp_lens = Vec::with_capacity(col_count);
@@ -719,8 +731,8 @@ impl VolumeFileWriter {
             }
         }
         let column_types = meta.column_types.clone();
-        let mut store = CompressedBlockStore::from_file(
-            self.final_path.clone(),
+        let mut store = CompressedBlockStore::from_shared_file(
+            handle,
             offsets,
             comp_lens,
             decomp_lens,
@@ -981,27 +993,47 @@ mod tests {
         (bytes, volume, path, dir)
     }
 
-    /// CRC32 of the metadata the serializer wrote for this fixture before
-    /// its buffer was counted; the bytes must not change
-    const METADATA_CRC: u32 = 0x2502_8372;
+    /// CRC32 of the metadata the serializer writes for this fixture, its
+    /// filters those of the file written; the bytes must not change
+    const METADATA_CRC: u32 = 0x125c_4fd0;
 
     #[test]
     fn the_metadata_buffer_is_counted_exactly_and_the_bytes_are_unchanged() {
         let schema = schema();
         // Bloom filters, a text dictionary, JSON and text min and max of
         // varying length, three row groups
-        let (_, volume, _, _dir) = written(&schema, 2 * ROW_GROUP_SIZE as i64 + 5_000, 10_000);
+        let (_, volume, path, _dir) = written(&schema, 2 * ROW_GROUP_SIZE as i64 + 5_000, 10_000);
         let buf = super::super::format::serialize_volume_metadata(&volume).unwrap();
         assert_eq!(
             crc32fast::hash(&buf),
             METADATA_CRC,
             "the metadata bytes changed"
         );
+        let reread = read_volume_from_disk(&path).unwrap();
+        assert!(
+            super::super::format::serialize_volume_metadata(&reread).unwrap() == buf,
+            "the volume read back differs from the one written"
+        );
         assert_eq!(
             buf.capacity(),
             buf.len(),
             "the buffer was grown past its counted length"
         );
+    }
+
+    #[test]
+    fn a_written_volume_reads_its_bloom_filters_from_its_file() {
+        let schema = schema();
+        let (_, volume, _path, _dir) = written(&schema, 500, 64);
+        let blooms = &volume.meta.bloom_filters;
+        let held = blooms.memory_size();
+        assert!(held <= 16, "{held} bytes of filters held after the write");
+        for (col, value) in [(0, Value::Integer(7)), (5, row(7).get(5).unwrap().clone())] {
+            let filter = blooms.filter(col).unwrap().unwrap();
+            assert!(filter.might_contain(&value), "column {col}: {value:?}");
+            assert_eq!(blooms.file_reads(col), 1, "column {col}");
+        }
+        assert!(blooms.memory_size() > held);
     }
 
     #[test]

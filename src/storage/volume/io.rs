@@ -586,14 +586,15 @@ fn read_volume_v5(
             crc,
         });
     // A column's bloom words are read on its first probe
+    let section = opened
+        .deferred
+        .iter()
+        .find(|s| s.0 == V5_BLOOMS)
+        .map(|&(_, enc, at, len, _)| (enc, at, len));
     let cols = meta.col_type_tags.len();
-    let places = match opened.deferred.iter().find(|s| s.0 == V5_BLOOMS) {
-        Some(&(_, enc, at, len, _)) => {
-            super::format::v5_bloom_places(enc, at, len, cols, &read_at).map_err(fail)?
-        }
-        None => (0..cols).map(|_| None).collect(),
-    };
-    meta.bloom_filters = super::writer::VolumeBlooms::in_file(&handle, places);
+    meta.bloom_filters =
+        super::writer::VolumeBlooms::from_section(&handle, section, cols, &read_at)
+            .map_err(fail)?;
     let root = &opened.root;
     // One group spans every row; more tile them at one power-of-two size,
     // which their zone maps' bounds carry

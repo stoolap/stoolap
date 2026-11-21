@@ -903,36 +903,6 @@ impl CompressedBlockStore {
         }
     }
 
-    /// Keep compressed blocks on disk and acquire their shared file owner.
-    /// Offsets and lengths locate each block.
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_file(
-        path: std::path::PathBuf,
-        offsets: Vec<Vec<u64>>,
-        compressed_lens: Vec<Vec<usize>>,
-        decompressed_lens: Vec<Vec<usize>>,
-        col_type_tags: Vec<u8>,
-        col_ext_types: Vec<u8>,
-        shared_dict: Vec<SmartString>,
-        dict_ranges: Vec<(usize, usize, usize)>,
-        group_size: usize,
-        row_count: usize,
-    ) -> Self {
-        let file = VolumeFile::shared(&path);
-        Self::from_shared_file(
-            file,
-            offsets,
-            compressed_lens,
-            decompressed_lens,
-            col_type_tags,
-            col_ext_types,
-            shared_dict,
-            dict_ranges,
-            group_size,
-            row_count,
-        )
-    }
-
     /// Keep compressed blocks on disk using an existing shared file owner.
     #[allow(clippy::too_many_arguments)]
     pub fn from_shared_file(
@@ -2175,7 +2145,23 @@ impl VolumeBlooms {
         }
     }
 
-    pub(crate) fn in_file(file: &Arc<VolumeFile>, places: Vec<Option<BloomPlace>>) -> Self {
+    /// The filters of `file`'s bloom section, given as (encoding, offset,
+    /// length), each read on its column's first probe; a file without the
+    /// section has none
+    pub(crate) fn from_section(
+        file: &Arc<VolumeFile>,
+        section: Option<(u8, u64, u64)>,
+        cols: usize,
+        read_at: &dyn Fn(&mut [u8], u64) -> std::io::Result<()>,
+    ) -> std::io::Result<Self> {
+        let places = match section {
+            Some((enc, at, len)) => super::format::v5_bloom_places(enc, at, len, cols, read_at)?,
+            None => (0..cols).map(|_| None).collect(),
+        };
+        Ok(Self::in_file(file, places))
+    }
+
+    fn in_file(file: &Arc<VolumeFile>, places: Vec<Option<BloomPlace>>) -> Self {
         let columns = places
             .into_iter()
             .map(|place| match place {

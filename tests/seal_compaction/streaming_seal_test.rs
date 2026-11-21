@@ -85,9 +85,13 @@ fn a_sealed_volume_is_published_over_its_file_and_a_unique_insert_reads_no_colum
         1
     );
     let later = volumes(&db);
-    for ((id, tier, _, bytes), (_, _, _, before)) in later.iter().zip(&sealed) {
+    for ((id, tier, rows, bytes), (_, _, _, before)) in later.iter().zip(&sealed) {
         assert_eq!(tier, "file", "volume {id} turned {tier}: {later:?}");
-        assert_eq!(bytes, before, "volume {id} grew: {later:?} from {sealed:?}");
+        // At most the key's bloom filter is read, about 10 bits a row
+        assert!(
+            bytes - before <= rows * 2,
+            "volume {id} grew: {later:?} from {sealed:?}"
+        );
     }
     let count: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
     assert_eq!(count, 100_001);
