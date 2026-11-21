@@ -4636,10 +4636,11 @@ impl VersionStore {
         }
 
         // 6. Lower the id counter to the largest id a row took since the
-        //    clear, so new rows start at 1; kept while a transaction holds a
-        //    new row, whose id the lowered counter would hand out again
+        //    clear, and no lower than 0, so new rows start at 1; kept while a
+        //    transaction holds a new row, whose id the lowered counter would
+        //    hand out again
         let _ = self.with_inserters_closed(|| {
-            let largest = self.max_live_row_id(|_| true);
+            let largest = self.max_live_row_id(|_| true).max(0);
             self.auto_increment_counter
                 .store(largest, Ordering::Release);
         });
