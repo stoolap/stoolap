@@ -447,3 +447,38 @@ fn a_row_written_through_a_held_handle_commits_to_its_table_renamed_meanwhile() 
         "(commit succeeded, rows of the renamed table)"
     );
 }
+
+#[test]
+fn a_create_table_as_select_whose_row_fails_leaves_no_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}", dir.path().display());
+    let failing = "CREATE TABLE c AS SELECT 1 AS id UNION ALL SELECT 'x'";
+    let gone = |db: &Database, when: &str| match ids(db, "SELECT id FROM c") {
+        Err(e) if e.contains("not found") => {}
+        got => panic!("{when}: {got:?}, want table not found"),
+    };
+    {
+        let db = Database::open(&dsn).unwrap();
+        assert!(
+            db.execute(failing, ()).is_err(),
+            "the 'x' row fits no INTEGER"
+        );
+        gone(&db, "after a failing autocommit CTAS");
+        db.execute("BEGIN", ()).unwrap();
+        assert!(
+            db.execute(failing, ()).is_err(),
+            "the 'x' row fits no INTEGER"
+        );
+        gone(&db, "inside the transaction after a failing CTAS");
+        db.execute("CREATE TABLE c AS SELECT 2 AS id", ()).unwrap();
+        db.execute("COMMIT", ()).unwrap();
+        assert_eq!(ids(&db, "SELECT id FROM c"), Ok(vec![2]));
+        db.execute("DROP TABLE c", ()).unwrap();
+        assert!(
+            db.execute(failing, ()).is_err(),
+            "the 'x' row fits no INTEGER"
+        );
+        db.close().unwrap();
+    }
+    gone(&Database::open(&dsn).unwrap(), "after reopening");
+}

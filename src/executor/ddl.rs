@@ -646,20 +646,27 @@ impl Executor {
                 let inserted = rows
                     .into_iter()
                     .try_for_each(|row| table.insert(row).map(drop));
-                statement_rollback.finish(inserted)?;
+                if let Err(e) = statement_rollback.finish(inserted) {
+                    // A statement that fails leaves no table behind, as it leaves no row
+                    let mut active_tx = self.active_transaction.lock();
+                    if let Some(tx_state) = active_tx.as_mut() {
+                        tx_state.tables.remove(table_name.to_lowercase().as_str());
+                        tx_state.transaction.drop_table(table_name)?;
+                    }
+                    return Err(e);
+                }
             }
+            // Created in a transaction of its own, which a failing row rolls back
             None => {
                 drop(active_tx);
-                self.engine.create_table(schema)?;
-                if !rows.is_empty() {
-                    let mut tx = self.begin_transaction()?;
-                    let mut table = tx.get_statement_table(table_name)?;
-                    for row in rows {
-                        let _ = table.insert(row)?;
-                    }
-                    // Commit the transaction - it will commit all tables via commit_all_tables()
-                    tx.commit()?;
+                let mut tx = self.begin_transaction()?;
+                tx.create_table_with_indexes(table_name, schema, &[])?;
+                let mut table = tx.get_statement_table(table_name)?;
+                for row in rows {
+                    table.insert(row)?;
                 }
+                drop(table);
+                tx.commit()?;
             }
         }
 

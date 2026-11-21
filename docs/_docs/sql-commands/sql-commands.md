@@ -700,6 +700,8 @@ FROM orders
 GROUP BY DATE_TRUNC('day', order_date);
 ```
 
+Each column takes the type of its value in the first row, and TEXT when the query returns no row. The statement is one unit: when a row cannot be written, for example a later row whose value does not fit its column's type, the statement fails and leaves no table behind, inside an explicit transaction or outside one.
+
 ### ALTER TABLE
 
 Modifies an existing table.
