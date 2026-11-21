@@ -189,7 +189,7 @@ fn bits_without(row_count: usize, dead: &[u32]) -> Vec<u64> {
 }
 
 /// One built unique index of a volume: its column set and its entries
-type BuiltUniqueIndex = (Vec<usize>, Arc<Vec<(u64, u32)>>);
+type BuiltUniqueIndex = (Vec<usize>, Arc<Vec<super::writer::UniqueEntry>>);
 
 /// Gives `into` every unique index `from` has built that `into` has not,
 /// sharing the entries; the guards are never held together
