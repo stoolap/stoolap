@@ -175,7 +175,7 @@ pub struct CompileContext<'a> {
     /// The aggregated row's slot of each group item and aggregate, by identity
     expression_aliases: KeyMap<ExprKey, u16>,
 
-    /// The rows are aggregated slot rows
+    /// The rows are the groups of a statement with GROUP BY
     over_groups: bool,
 
     /// A prepared plan compiles: a subquery mark compiles to its block's id
@@ -291,10 +291,14 @@ impl<'a> CompileContext<'a> {
         self
     }
 
-    /// Compile over aggregated slot rows, reading each group item and
-    /// aggregate by identity from its slot in `aliases`
+    /// Add expression aliases (for HAVING clause)
     pub(crate) fn with_expression_aliases(mut self, aliases: KeyMap<ExprKey, u16>) -> Self {
         self.expression_aliases = aliases;
+        self
+    }
+
+    /// The rows are the groups of a statement with GROUP BY
+    pub(crate) fn over_groups(mut self) -> Self {
         self.over_groups = true;
         self
     }

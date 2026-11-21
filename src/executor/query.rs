@@ -7576,11 +7576,11 @@ impl Executor {
                 );
                 // Bound after compiling: a value that fails to fold, such as
                 // an invalid pattern, errs only where the run reaches it
-                let program = super::aggregation::compile_over_slots(
+                let program = super::aggregation::compile_over_groups(
                     having,
-                    &result_columns,
+                    (stmt, &result_columns),
                     global_registry(),
-                    Some(&slots),
+                    &slots,
                     false,
                     None,
                 )?;

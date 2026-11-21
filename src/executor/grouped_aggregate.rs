@@ -344,11 +344,11 @@ impl Executor {
                     aggregations,
                     &stmt.columns,
                 );
-                let filter = super::aggregation::compile_over_slots(
+                let filter = super::aggregation::compile_over_groups(
                     having,
-                    &slot_columns,
+                    (stmt, &slot_columns),
                     crate::functions::registry::global_registry(),
-                    Some(&slots),
+                    &slots,
                     false,
                     Some(ctx.params()),
                 )?;

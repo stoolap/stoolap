@@ -7765,7 +7765,10 @@ impl Builder<'_> {
             slots.entry(agg.key).or_insert(slot(items.len() + i)?);
         }
         // A group's values are read by identity alone: no column is in reach
-        let over_slots = CompileContext::new(&[], registry).with_expression_aliases(slots);
+        let mut over_slots = CompileContext::new(&[], registry).with_expression_aliases(slots);
+        if super::aggregation::has_group_by(sq) {
+            over_slots = over_slots.over_groups();
+        }
         let projection = projection
             .iter()
             .map(|expr| compile_with(&over_slots, expr))

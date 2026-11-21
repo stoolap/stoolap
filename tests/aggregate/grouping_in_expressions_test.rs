@@ -186,3 +186,21 @@ fn grouping_in_a_prepared_statement_reads_the_flag() {
         assert_eq!(answer(statement.query(params)), Ok(want), "{params:?}");
     }
 }
+
+#[test]
+fn grouping_outside_a_grouped_statement_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = setup("grouping_in_expressions_ungrouped", &dir, false);
+    for sql in [
+        "SELECT GROUPING(category) + 0 FROM products",
+        "SELECT id FROM products ORDER BY GROUPING(category), id",
+        "SELECT id, ROW_NUMBER() OVER (PARTITION BY GROUPING(category) ORDER BY id) FROM products",
+        "SELECT COUNT(*) FROM products HAVING GROUPING(category) = 0",
+    ] {
+        assert_eq!(
+            answer(db.query(sql, ())),
+            Err("Compile error: Function not found: GROUPING".to_string()),
+            "{sql}"
+        );
+    }
+}
