@@ -60,7 +60,7 @@ pub mod statistics;
 
 mod aggregation;
 mod copy;
-mod cte;
+pub(crate) mod cte;
 mod ddl;
 mod dml;
 mod explain;

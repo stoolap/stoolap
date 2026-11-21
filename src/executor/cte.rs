@@ -420,7 +420,8 @@ impl Executor {
 
         // Taken first, so the body's plans are laid out for the whole body
         let branches = plan.map_or(&[][..], |plan| plan.branches(stmt));
-        let result = self.execute_source_statement(&anchor_stmt, ctx, None, plan)?;
+        let anchor_ctx = ctx.with_cte_data(cte_registry.data());
+        let result = self.execute_source_statement(&anchor_stmt, &anchor_ctx, None, plan)?;
         let anchor_columns = result.columns().to_vec();
 
         // Apply column aliases if provided (for recursive CTE column naming)
@@ -450,7 +451,7 @@ impl Executor {
         let mut recursive_members = Vec::with_capacity(stmt.set_operations.len());
         for (set_op, index) in stmt.set_operations.iter().zip(0..) {
             let branch = branches.get(index);
-            if self.statement_reads_cte(&set_op.right, cte_name) {
+            if statement_reads_cte(&set_op.right, cte_name) {
                 recursive_members.push((&set_op.right, branch));
                 continue;
             }
@@ -476,8 +477,8 @@ impl Executor {
         // Current working set (rows from previous iteration)
         let mut working_rows = all_rows.clone();
 
-        // Iterate until no new rows or max iterations
-        for _iteration in 0..MAX_ITERATIONS {
+        // One pass past the limit tells a finished recursion from a cut one
+        for iteration in 0..=MAX_ITERATIONS {
             if working_rows.is_empty() {
                 break;
             }
@@ -515,6 +516,11 @@ impl Executor {
 
             if new_rows.is_empty() {
                 break;
+            }
+            if iteration == MAX_ITERATIONS {
+                return Err(Error::InvalidArgument(format!(
+                    "recursive CTE '{cte_name}' did not finish within {MAX_ITERATIONS} iterations"
+                )));
             }
 
             // Convert to Shared once: the accumulator extension and the
@@ -731,15 +737,15 @@ impl Executor {
         let mut where_ref_counts: StringMap<usize> = table_ref_counts.clone();
 
         // Count references in table expression (FROM/JOIN)
-        self.count_cte_references_in_expr(table_expr, &mut table_ref_counts);
+        count_cte_references_in_expr(table_expr, &mut table_ref_counts);
 
         // Count references in WHERE clause (including IN/EXISTS subqueries)
         if let Some(ref where_clause) = stmt.where_clause {
-            self.count_cte_references_in_expr(where_clause, &mut where_ref_counts);
+            count_cte_references_in_expr(where_clause, &mut where_ref_counts);
         }
 
         // A reference from any other clause reads the CTE by name as well
-        self.count_cte_references_outside_from(stmt, &mut where_ref_counts);
+        count_cte_references_outside_from(stmt, &mut where_ref_counts);
 
         // Only inline CTEs that:
         // 1. Are used exactly once in table expressions (FROM/JOIN)
@@ -839,208 +845,6 @@ impl Executor {
         }
     }
 
-    /// Whether `stmt` reads the CTE named `name`, in any of its clauses
-    fn statement_reads_cte(&self, stmt: &SelectStatement, name: &str) -> bool {
-        let name = name.to_lowercase();
-        let mut counts: StringMap<usize> = StringMap::new();
-        counts.insert(name.clone(), 0);
-        self.count_cte_references_in_stmt(stmt, &mut counts);
-        counts.get(&name).is_some_and(|&count| count > 0)
-    }
-
-    /// Count CTE references in a SELECT statement
-    fn count_cte_references_in_stmt(
-        &self,
-        stmt: &SelectStatement,
-        ref_counts: &mut StringMap<usize>,
-    ) {
-        // Check table expression
-        if let Some(ref table_expr) = stmt.table_expr {
-            self.count_cte_references_in_expr(table_expr, ref_counts);
-        }
-
-        // Check WHERE clause
-        if let Some(ref where_clause) = stmt.where_clause {
-            self.count_cte_references_in_expr(where_clause, ref_counts);
-        }
-
-        self.count_cte_references_outside_from(stmt, ref_counts);
-    }
-
-    /// Count CTE references in every clause other than FROM and WHERE,
-    /// the nested WITH bodies and the set-operation branches included
-    fn count_cte_references_outside_from(
-        &self,
-        stmt: &SelectStatement,
-        ref_counts: &mut StringMap<usize>,
-    ) {
-        let windows = stmt
-            .window_defs
-            .iter()
-            .flat_map(WindowDefinition::expressions);
-        let grouping_sets = match &stmt.group_by.modifier {
-            GroupByModifier::GroupingSets(sets) => sets.as_slice(),
-            _ => &[],
-        };
-        for expr in stmt
-            .columns
-            .iter()
-            .chain(stmt.distinct_on.iter())
-            .chain(stmt.group_by.columns.iter())
-            .chain(grouping_sets.iter().flatten())
-            .chain(stmt.having.as_deref())
-            .chain(stmt.order_by.iter().map(|o| &o.expression))
-            .chain(stmt.limit.as_deref())
-            .chain(stmt.offset.as_deref())
-            .chain(windows)
-        {
-            self.count_cte_references_in_expr(expr, ref_counts);
-        }
-
-        for cte in stmt.with.iter().flat_map(|w| &w.ctes) {
-            self.count_cte_references_in_stmt(&cte.query, ref_counts);
-        }
-        for set_op in &stmt.set_operations {
-            self.count_cte_references_in_stmt(&set_op.right, ref_counts);
-        }
-    }
-
-    /// Count the CTE references in a function call's arguments, ORDER BY and FILTER
-    fn count_cte_references_in_call(&self, func: &FunctionCall, ref_counts: &mut StringMap<usize>) {
-        for arg in func
-            .arguments
-            .iter()
-            .chain(func.order_by.iter().map(|o| &o.expression))
-            .chain(func.filter.as_deref())
-        {
-            self.count_cte_references_in_expr(arg, ref_counts);
-        }
-    }
-
-    /// Count CTE references in an expression
-    fn count_cte_references_in_expr(&self, expr: &Expression, ref_counts: &mut StringMap<usize>) {
-        match expr {
-            Expression::TableSource(ts) => {
-                let name: &str = ts.name.value_lower.as_str();
-                if let Some(count) = ref_counts.get_mut(name) {
-                    *count += 1;
-                }
-            }
-            // A bare name is a column: a source is parsed as a TableSource
-            Expression::Identifier(_) | Expression::Column(_) => {}
-            Expression::JoinSource(js) => {
-                self.count_cte_references_in_expr(&js.left, ref_counts);
-                self.count_cte_references_in_expr(&js.right, ref_counts);
-                if let Some(condition) = js.condition.as_deref() {
-                    self.count_cte_references_in_expr(condition, ref_counts);
-                }
-            }
-            Expression::SubquerySource(sq) => {
-                self.count_cte_references_in_stmt(&sq.subquery, ref_counts);
-            }
-            Expression::List(list) => {
-                for element in &list.elements {
-                    self.count_cte_references_in_expr(element, ref_counts);
-                }
-            }
-            Expression::ExpressionList(list) => {
-                for element in &list.expressions {
-                    self.count_cte_references_in_expr(element, ref_counts);
-                }
-            }
-            Expression::QuantifiedSet(quantified) => {
-                self.count_cte_references_in_expr(&quantified.left, ref_counts);
-            }
-            Expression::ValuesSource(values) => {
-                for value in values.rows.iter().flatten() {
-                    self.count_cte_references_in_expr(value, ref_counts);
-                }
-            }
-            Expression::FunctionTableSource(source) => {
-                for arg in &source.arguments {
-                    self.count_cte_references_in_expr(arg, ref_counts);
-                }
-            }
-            Expression::ScalarSubquery(sq) => {
-                self.count_cte_references_in_stmt(&sq.subquery, ref_counts);
-            }
-            Expression::In(in_expr) => {
-                self.count_cte_references_in_expr(&in_expr.left, ref_counts);
-                self.count_cte_references_in_expr(&in_expr.right, ref_counts);
-            }
-            Expression::Exists(ex) => {
-                self.count_cte_references_in_stmt(&ex.subquery, ref_counts);
-            }
-            Expression::AllAny(all_any) => {
-                self.count_cte_references_in_expr(&all_any.left, ref_counts);
-                self.count_cte_references_in_stmt(&all_any.subquery, ref_counts);
-            }
-            Expression::Infix(infix) => {
-                self.count_cte_references_in_expr(&infix.left, ref_counts);
-                self.count_cte_references_in_expr(&infix.right, ref_counts);
-            }
-            Expression::Prefix(prefix) => {
-                self.count_cte_references_in_expr(&prefix.right, ref_counts);
-            }
-            Expression::Between(between) => {
-                self.count_cte_references_in_expr(&between.expr, ref_counts);
-                self.count_cte_references_in_expr(&between.lower, ref_counts);
-                self.count_cte_references_in_expr(&between.upper, ref_counts);
-            }
-            Expression::Cast(cast) => {
-                self.count_cte_references_in_expr(&cast.expr, ref_counts);
-            }
-            Expression::Like(like) => {
-                self.count_cte_references_in_expr(&like.left, ref_counts);
-                self.count_cte_references_in_expr(&like.pattern, ref_counts);
-                if let Some(escape) = like.escape.as_deref() {
-                    self.count_cte_references_in_expr(escape, ref_counts);
-                }
-            }
-            Expression::FunctionCall(func) => self.count_cte_references_in_call(func, ref_counts),
-            Expression::Case(case) => {
-                for expr in case
-                    .value
-                    .as_deref()
-                    .into_iter()
-                    .chain(
-                        case.when_clauses
-                            .iter()
-                            .flat_map(|w| [&w.condition, &w.then_result]),
-                    )
-                    .chain(case.else_value.as_deref())
-                {
-                    self.count_cte_references_in_expr(expr, ref_counts);
-                }
-            }
-            Expression::Aliased(aliased) => {
-                self.count_cte_references_in_expr(&aliased.expression, ref_counts);
-            }
-            Expression::Window(window) => {
-                self.count_cte_references_in_call(&window.function, ref_counts);
-                for expr in window
-                    .partition_by
-                    .iter()
-                    .chain(window.order_by.iter().map(|o| &o.expression))
-                    .chain(window.frame_offsets())
-                {
-                    self.count_cte_references_in_expr(expr, ref_counts);
-                }
-            }
-            Expression::QualifiedIdentifier(_)
-            | Expression::IntegerLiteral(_)
-            | Expression::FloatLiteral(_)
-            | Expression::StringLiteral(_)
-            | Expression::BooleanLiteral(_)
-            | Expression::NullLiteral(_)
-            | Expression::IntervalLiteral(_)
-            | Expression::Parameter(_)
-            | Expression::Star(_)
-            | Expression::QualifiedStar(_)
-            | Expression::Default(_) => {}
-        }
-    }
-
     /// Replace CTE references with subqueries in an expression.
     /// Returns Some(new_expr) if any replacement was made, None if no changes needed.
     fn try_inline_cte_references(
@@ -1111,10 +915,10 @@ impl Executor {
     fn cte_read_once(&self, stmt: &SelectStatement, with_clause: &WithClause, name: &str) -> bool {
         let mut counts: StringMap<usize> = StringMap::new();
         counts.insert(name.to_string(), 0);
-        self.count_cte_references_in_stmt(stmt, &mut counts);
+        count_cte_references_in_stmt(stmt, &mut counts);
         for cte in &with_clause.ctes {
             if cte.name.value_lower.as_str() != name {
-                self.count_cte_references_in_stmt(&cte.query, &mut counts);
+                count_cte_references_in_stmt(&cte.query, &mut counts);
             }
         }
         counts.get(name).copied() == Some(1)
@@ -1394,6 +1198,200 @@ impl Executor {
         // Execute with the pushed optimizations
         let ctx = cut_ctx.as_ref().unwrap_or(ctx);
         self.execute_cte_query(&modified_stmt, plan, ctx, cte_registry)
+    }
+}
+
+/// Whether `stmt` reads the CTE named `name`, in any of its clauses
+pub(crate) fn statement_reads_cte(stmt: &SelectStatement, name: &str) -> bool {
+    let name = name.to_lowercase();
+    let mut counts: StringMap<usize> = StringMap::new();
+    counts.insert(name.clone(), 0);
+    count_cte_references_in_stmt(stmt, &mut counts);
+    counts.get(&name).is_some_and(|&count| count > 0)
+}
+
+/// Count CTE references in a SELECT statement
+fn count_cte_references_in_stmt(stmt: &SelectStatement, ref_counts: &mut StringMap<usize>) {
+    // Check table expression
+    if let Some(ref table_expr) = stmt.table_expr {
+        count_cte_references_in_expr(table_expr, ref_counts);
+    }
+
+    // Check WHERE clause
+    if let Some(ref where_clause) = stmt.where_clause {
+        count_cte_references_in_expr(where_clause, ref_counts);
+    }
+
+    count_cte_references_outside_from(stmt, ref_counts);
+}
+
+/// Count CTE references in every clause other than FROM and WHERE,
+/// the nested WITH bodies and the set-operation branches included
+fn count_cte_references_outside_from(stmt: &SelectStatement, ref_counts: &mut StringMap<usize>) {
+    let windows = stmt
+        .window_defs
+        .iter()
+        .flat_map(WindowDefinition::expressions);
+    let grouping_sets = match &stmt.group_by.modifier {
+        GroupByModifier::GroupingSets(sets) => sets.as_slice(),
+        _ => &[],
+    };
+    for expr in stmt
+        .columns
+        .iter()
+        .chain(stmt.distinct_on.iter())
+        .chain(stmt.group_by.columns.iter())
+        .chain(grouping_sets.iter().flatten())
+        .chain(stmt.having.as_deref())
+        .chain(stmt.order_by.iter().map(|o| &o.expression))
+        .chain(stmt.limit.as_deref())
+        .chain(stmt.offset.as_deref())
+        .chain(windows)
+    {
+        count_cte_references_in_expr(expr, ref_counts);
+    }
+
+    for cte in stmt.with.iter().flat_map(|w| &w.ctes) {
+        count_cte_references_in_stmt(&cte.query, ref_counts);
+    }
+    for set_op in &stmt.set_operations {
+        count_cte_references_in_stmt(&set_op.right, ref_counts);
+    }
+}
+
+/// Count the CTE references in a function call's arguments, ORDER BY and FILTER
+fn count_cte_references_in_call(func: &FunctionCall, ref_counts: &mut StringMap<usize>) {
+    for arg in func
+        .arguments
+        .iter()
+        .chain(func.order_by.iter().map(|o| &o.expression))
+        .chain(func.filter.as_deref())
+    {
+        count_cte_references_in_expr(arg, ref_counts);
+    }
+}
+
+/// Count CTE references in an expression
+fn count_cte_references_in_expr(expr: &Expression, ref_counts: &mut StringMap<usize>) {
+    match expr {
+        Expression::TableSource(ts) => {
+            let name: &str = ts.name.value_lower.as_str();
+            if let Some(count) = ref_counts.get_mut(name) {
+                *count += 1;
+            }
+        }
+        // A bare name is a column: a source is parsed as a TableSource
+        Expression::Identifier(_) | Expression::Column(_) => {}
+        Expression::JoinSource(js) => {
+            count_cte_references_in_expr(&js.left, ref_counts);
+            count_cte_references_in_expr(&js.right, ref_counts);
+            if let Some(condition) = js.condition.as_deref() {
+                count_cte_references_in_expr(condition, ref_counts);
+            }
+        }
+        Expression::SubquerySource(sq) => {
+            count_cte_references_in_stmt(&sq.subquery, ref_counts);
+        }
+        Expression::List(list) => {
+            for element in &list.elements {
+                count_cte_references_in_expr(element, ref_counts);
+            }
+        }
+        Expression::ExpressionList(list) => {
+            for element in &list.expressions {
+                count_cte_references_in_expr(element, ref_counts);
+            }
+        }
+        Expression::QuantifiedSet(quantified) => {
+            count_cte_references_in_expr(&quantified.left, ref_counts);
+        }
+        Expression::ValuesSource(values) => {
+            for value in values.rows.iter().flatten() {
+                count_cte_references_in_expr(value, ref_counts);
+            }
+        }
+        Expression::FunctionTableSource(source) => {
+            for arg in &source.arguments {
+                count_cte_references_in_expr(arg, ref_counts);
+            }
+        }
+        Expression::ScalarSubquery(sq) => {
+            count_cte_references_in_stmt(&sq.subquery, ref_counts);
+        }
+        Expression::In(in_expr) => {
+            count_cte_references_in_expr(&in_expr.left, ref_counts);
+            count_cte_references_in_expr(&in_expr.right, ref_counts);
+        }
+        Expression::Exists(ex) => {
+            count_cte_references_in_stmt(&ex.subquery, ref_counts);
+        }
+        Expression::AllAny(all_any) => {
+            count_cte_references_in_expr(&all_any.left, ref_counts);
+            count_cte_references_in_stmt(&all_any.subquery, ref_counts);
+        }
+        Expression::Infix(infix) => {
+            count_cte_references_in_expr(&infix.left, ref_counts);
+            count_cte_references_in_expr(&infix.right, ref_counts);
+        }
+        Expression::Prefix(prefix) => {
+            count_cte_references_in_expr(&prefix.right, ref_counts);
+        }
+        Expression::Between(between) => {
+            count_cte_references_in_expr(&between.expr, ref_counts);
+            count_cte_references_in_expr(&between.lower, ref_counts);
+            count_cte_references_in_expr(&between.upper, ref_counts);
+        }
+        Expression::Cast(cast) => {
+            count_cte_references_in_expr(&cast.expr, ref_counts);
+        }
+        Expression::Like(like) => {
+            count_cte_references_in_expr(&like.left, ref_counts);
+            count_cte_references_in_expr(&like.pattern, ref_counts);
+            if let Some(escape) = like.escape.as_deref() {
+                count_cte_references_in_expr(escape, ref_counts);
+            }
+        }
+        Expression::FunctionCall(func) => count_cte_references_in_call(func, ref_counts),
+        Expression::Case(case) => {
+            for expr in case
+                .value
+                .as_deref()
+                .into_iter()
+                .chain(
+                    case.when_clauses
+                        .iter()
+                        .flat_map(|w| [&w.condition, &w.then_result]),
+                )
+                .chain(case.else_value.as_deref())
+            {
+                count_cte_references_in_expr(expr, ref_counts);
+            }
+        }
+        Expression::Aliased(aliased) => {
+            count_cte_references_in_expr(&aliased.expression, ref_counts);
+        }
+        Expression::Window(window) => {
+            count_cte_references_in_call(&window.function, ref_counts);
+            for expr in window
+                .partition_by
+                .iter()
+                .chain(window.order_by.iter().map(|o| &o.expression))
+                .chain(window.frame_offsets())
+            {
+                count_cte_references_in_expr(expr, ref_counts);
+            }
+        }
+        Expression::QualifiedIdentifier(_)
+        | Expression::IntegerLiteral(_)
+        | Expression::FloatLiteral(_)
+        | Expression::StringLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::NullLiteral(_)
+        | Expression::IntervalLiteral(_)
+        | Expression::Parameter(_)
+        | Expression::Star(_)
+        | Expression::QualifiedStar(_)
+        | Expression::Default(_) => {}
     }
 }
 

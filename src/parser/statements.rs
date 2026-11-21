@@ -974,12 +974,16 @@ impl Parser<'_> {
 
         // A CTE body sits inside the statement that carries the WITH
         self.statement_depth += 1;
-        let query = match is_recursive {
-            true => self.parse_select_parts(),
-            false => self.parse_select_statement(),
-        };
+        let query = self.parse_select_parts();
         self.statement_depth -= 1;
         let query = query?;
+        // Under WITH RECURSIVE, a body that does not read its own name is an ordinary CTE
+        let is_recursive =
+            is_recursive && crate::executor::cte::statement_reads_cte(&query, &name.value);
+        let query = match is_recursive {
+            true => query,
+            false => crate::executor::prepared_select::set_operation_ordered(query),
+        };
 
         // Expect )
         if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {

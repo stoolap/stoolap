@@ -569,17 +569,20 @@ fn test_recursive_cte_requires_union_all() {
 }
 
 #[test]
-fn test_recursive_cte_without_union() {
+fn test_recursive_cte_without_union_is_an_ordinary_cte() {
     let db = create_test_db("rcte_err_no_union");
 
-    // Recursive CTE without UNION ALL should fail
-    let result = db.query(
-        "WITH RECURSIVE cnt(x) AS (
+    let values: Vec<i64> = db
+        .query(
+            "WITH RECURSIVE cnt(x) AS (
             SELECT 1
         )
         SELECT x FROM cnt",
-        (),
-    );
+            (),
+        )
+        .unwrap()
+        .map(|row| row.unwrap().get(0).unwrap())
+        .collect();
 
-    assert!(result.is_err());
+    assert_eq!(values, vec![1]);
 }
