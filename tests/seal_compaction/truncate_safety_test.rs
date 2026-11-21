@@ -37,9 +37,8 @@ fn test_truncate_basic() {
     assert_eq!(count, 1);
 }
 
-/// TRUNCATE inside an explicit transaction (no other writers) should succeed.
 #[test]
-fn test_truncate_in_own_transaction() {
+fn a_truncate_inside_an_explicit_transaction_is_refused_and_keeps_the_rows() {
     let db = Database::open_in_memory().unwrap();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", ())
         .unwrap();
@@ -47,69 +46,21 @@ fn test_truncate_in_own_transaction() {
         .unwrap();
 
     db.execute("BEGIN", ()).unwrap();
-    // The TRUNCATE's own transaction has no uncommitted writes on the *version store*
-    // (it hasn't done any INSERT/UPDATE/DELETE yet), so this should succeed.
-    db.execute("TRUNCATE TABLE t", ()).unwrap();
-    db.execute("COMMIT", ()).unwrap();
+    match db.execute("TRUNCATE TABLE t", ()) {
+        Err(e)
+            if e.to_string()
+                .contains("TRUNCATE cannot be used inside an explicit transaction") => {}
+        got => panic!("TRUNCATE inside BEGIN: {got:?}, want a refusal naming TRUNCATE"),
+    }
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
+    assert_eq!(
+        count, 2,
+        "the refused TRUNCATE took rows inside the transaction"
+    );
+    db.execute("ROLLBACK", ()).unwrap();
 
     let count: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
-    assert_eq!(count, 0);
-}
-
-/// TRUNCATE must fail when another transaction has uncommitted writes.
-///
-/// Scenario:
-///   1. Tx A begins and inserts a row (uncommitted)
-///   2. Tx B (auto-commit) tries TRUNCATE → must fail
-///   3. Tx A commits
-///   4. TRUNCATE now succeeds
-#[test]
-fn test_truncate_blocked_by_active_writer() {
-    let db = Database::open_in_memory().unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", ())
-        .unwrap();
-    db.execute("INSERT INTO t VALUES (1, 10)", ()).unwrap();
-
-    // Start an explicit transaction and insert (uncommitted write)
-    db.execute("BEGIN", ()).unwrap();
-    db.execute("INSERT INTO t VALUES (2, 20)", ()).unwrap();
-
-    // A second connection tries TRUNCATE — should fail because tx A has uncommitted writes.
-    // Since stoolap is embedded (single-process), we use a second Database on the same path.
-    // For in-memory DBs, the same Database object shares the engine, so the active
-    // transaction's uncommitted writes are visible to the TRUNCATE path.
-    //
-    // However, TRUNCATE TABLE goes through the executor which creates its own transaction,
-    // and the same Database's executor shares the version store. So attempting TRUNCATE
-    // while the explicit transaction has uncommitted writes should hit the guard.
-    //
-    // But wait — TRUNCATE and the explicit transaction both go through the same executor.
-    // Let's verify: if we try TRUNCATE while we have an active BEGIN...INSERT:
-    // The executor's execute_truncate creates a new table handle. The version store's
-    // uncommitted_writes will have the INSERT's row claim from our BEGIN transaction.
-    // So truncate_all() should see non-empty uncommitted_writes and fail.
-
-    // Try TRUNCATE — should fail
-    let result = db.execute("TRUNCATE TABLE t", ());
-    assert!(
-        result.is_err(),
-        "TRUNCATE should fail when active transaction has uncommitted writes"
-    );
-    let err = result.unwrap_err();
-    assert!(
-        err.to_string()
-            .contains("active transactions have uncommitted changes"),
-        "Error should mention active transactions, got: {}",
-        err
-    );
-
-    // Commit the active transaction
-    db.execute("COMMIT", ()).unwrap();
-
-    // Now TRUNCATE should succeed
-    db.execute("TRUNCATE TABLE t", ()).unwrap();
-    let count: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
-    assert_eq!(count, 0);
+    assert_eq!(count, 2, "ROLLBACK did not keep the rows");
 }
 
 /// TRUNCATE must fail when another transaction has uncommitted UPDATE.
@@ -122,8 +73,10 @@ fn test_truncate_blocked_by_active_updater() {
         .unwrap();
 
     // Begin transaction and update a row (uncommitted)
-    db.execute("BEGIN", ()).unwrap();
-    db.execute("UPDATE t SET val = 99 WHERE id = 2", ())
+    let other = db.clone();
+    other.execute("BEGIN", ()).unwrap();
+    other
+        .execute("UPDATE t SET val = 99 WHERE id = 2", ())
         .unwrap();
 
     // TRUNCATE should fail
@@ -134,7 +87,7 @@ fn test_truncate_blocked_by_active_updater() {
     );
 
     // Rollback the active transaction
-    db.execute("ROLLBACK", ()).unwrap();
+    other.execute("ROLLBACK", ()).unwrap();
 
     // Now TRUNCATE should succeed
     db.execute("TRUNCATE TABLE t", ()).unwrap();
@@ -151,8 +104,9 @@ fn test_truncate_blocked_by_active_deleter() {
     db.execute("INSERT INTO t VALUES (1, 10), (2, 20)", ())
         .unwrap();
 
-    db.execute("BEGIN", ()).unwrap();
-    db.execute("DELETE FROM t WHERE id = 1", ()).unwrap();
+    let other = db.clone();
+    other.execute("BEGIN", ()).unwrap();
+    other.execute("DELETE FROM t WHERE id = 1", ()).unwrap();
 
     let result = db.execute("TRUNCATE TABLE t", ());
     assert!(
@@ -160,7 +114,7 @@ fn test_truncate_blocked_by_active_deleter() {
         "TRUNCATE should fail when active transaction has uncommitted DELETE"
     );
 
-    db.execute("COMMIT", ()).unwrap();
+    other.execute("COMMIT", ()).unwrap();
 
     db.execute("TRUNCATE TABLE t", ()).unwrap();
     let count: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).unwrap();

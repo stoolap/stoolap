@@ -126,10 +126,10 @@ COMMIT;
 | `CREATE TABLE`, `CREATE TABLE ... AS SELECT` | Table and its rows are removed |
 | `ALTER TABLE`, `CREATE INDEX`, `CREATE VIEW`, `DROP INDEX`, `DROP VIEW` | Change persists |
 | `DROP TABLE` | Table definition returns, but its rows are lost (a warning is printed) |
-| `TRUNCATE TABLE` | Rows are lost |
+| `TRUNCATE TABLE` | Rejected: cannot run inside an explicit transaction |
 | `COPY ... FROM` | Rejected: cannot run inside an explicit transaction |
 
-Run schema changes, TRUNCATE and COPY outside explicit transactions when you need them to be reversible.
+Run schema changes outside explicit transactions when you need them to be reversible. To empty a table inside a transaction, use `DELETE FROM table_name`, which ROLLBACK undoes.
 
 ### Setting Default Isolation Level
 
