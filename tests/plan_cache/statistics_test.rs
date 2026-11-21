@@ -374,6 +374,75 @@ fn test_analyze_empty_table() {
     assert_eq!(row_count, 0, "Row count should be 0");
 }
 
+#[test]
+fn test_analyze_last_analyzed_is_now() {
+    let db = Database::open("memory://test_analyze_last_analyzed_is_now").expect("open");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .expect("create");
+    db.execute("INSERT INTO t VALUES (1, 1), (2, 2)", ())
+        .expect("insert");
+
+    let before = chrono::Utc::now();
+    db.execute("ANALYZE t", ()).expect("analyze");
+    let after = chrono::Utc::now();
+
+    let last_analyzed: stoolap::Value = db
+        .query_one(
+            "SELECT last_analyzed FROM _sys_table_stats WHERE table_name = 't'",
+            (),
+        )
+        .expect("read last_analyzed");
+    let stoolap::Value::Timestamp(at) = last_analyzed else {
+        panic!("last_analyzed is not a TIMESTAMP: {last_analyzed:?}");
+    };
+    assert!(
+        before <= at && at <= after,
+        "last_analyzed {at} is not between {before} and {after}"
+    );
+}
+
+#[test]
+fn test_analyze_sampled_counts_cover_the_table() {
+    let db = Database::open("memory://test_analyze_sampled_counts_cover_the_table").expect("open");
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER, low INTEGER, half INTEGER)",
+        (),
+    )
+    .expect("create");
+    db.execute(
+        "INSERT INTO t SELECT value, value, value % 3, \
+         CASE WHEN value % 2 = 0 THEN NULL ELSE value END \
+         FROM generate_series(1, 20000)",
+        (),
+    )
+    .expect("insert");
+    db.execute("ANALYZE t", ()).expect("analyze");
+
+    let stat = |column: &str, stat: &str| -> i64 {
+        db.query_one(
+            &format!(
+                "SELECT {stat} FROM _sys_column_stats \
+                 WHERE table_name = 't' AND column_name = '{column}'"
+            ),
+            (),
+        )
+        .expect("read column stats")
+    };
+    assert_eq!(stat("id", "distinct_count"), 20000, "unique PK column");
+    assert_eq!(stat("u", "distinct_count"), 20000, "unique column");
+    assert_eq!(stat("low", "distinct_count"), 3, "three-valued column");
+    let nulls = stat("half", "null_count");
+    assert!(
+        (9000..=11000).contains(&nulls),
+        "half of 20000 rows are NULL, null_count is {nulls}"
+    );
+    let distinct = stat("half", "distinct_count");
+    assert!(
+        (9000..=11000).contains(&distinct),
+        "10000 distinct non-NULL values, distinct_count is {distinct}"
+    );
+}
+
 /// Test ANALYZE handles non-existent table gracefully
 #[test]
 fn test_analyze_nonexistent_table() {
