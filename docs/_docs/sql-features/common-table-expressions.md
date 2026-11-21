@@ -217,9 +217,16 @@ SELECT n, fib_n as fibonacci FROM fib;
 ### Recursive CTE Guidelines
 
 1. **Termination Condition**: Always include a WHERE clause in the recursive part to prevent infinite loops
-2. **UNION ALL**: Required between the anchor and recursive members
+2. **UNION ALL**: Required between the anchor and recursive members of a CTE that reads itself
 3. **Anchor Members**: Every branch that does not read the CTE is an anchor and runs once; its rows start the recursion together with the first branch's. Only a branch that reads the CTE runs again on each pass, over the rows the previous pass added
-4. **Iteration Limit**: Recursive CTEs are limited to 10,000 iterations to prevent runaway queries
+4. **Iteration Limit**: A recursive CTE may run 10,000 passes. If a pass after that still adds rows, the statement fails with `recursive CTE '<name>' did not finish within 10000 iterations` rather than returning the rows found so far
+5. **Other Members**: `RECURSIVE` applies to the whole WITH list. A CTE in that list whose body does not read its own name is an ordinary CTE: it needs no UNION ALL and may use any body a CTE allows, ORDER BY and LIMIT included, and later members, recursive ones included, can read it
+
+```sql
+WITH RECURSIVE base AS (SELECT 1 AS x),
+     r(n) AS (SELECT x FROM base UNION ALL SELECT n + 1 FROM r WHERE n < 3)
+SELECT * FROM r;  -- 1, 2, 3
+```
 
 ## Performance Considerations
 

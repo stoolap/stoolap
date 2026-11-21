@@ -31,6 +31,8 @@ mod cte_subquery_test;
 mod cte_test;
 mod join_order_cte_scope_test;
 mod recursive_cte_anchor_test;
+mod recursive_cte_iteration_limit_test;
+mod recursive_cte_list_members_test;
 mod recursive_cte_runner_test;
 mod recursive_cte_test;
 mod view_cte_scope_test;
