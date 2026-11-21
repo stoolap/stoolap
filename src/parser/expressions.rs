@@ -85,10 +85,7 @@ impl Parser<'_> {
         let mut height = self.expression_peak - depth;
         let mut run: Option<Run> = None;
 
-        while !self.peek_token_is(TokenType::Eof)
-            && precedence < self.peek_precedence()
-            && !self.default_not_null
-        {
+        while !self.peek_token_is(TokenType::Eof) && precedence < self.peek_precedence() {
             if !self.is_infix_token() {
                 break;
             }
@@ -119,6 +116,10 @@ impl Parser<'_> {
                 }
             } else {
                 left = self.parse_infix_expression(left)?;
+                // A column DEFAULT's NOT NULL added no node: the value ends as it was
+                if self.default_not_null {
+                    break;
+                }
             }
             // The operands parsed in this step, one level below `depth`
             let reached = self.expression_peak - depth;

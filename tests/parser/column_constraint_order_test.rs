@@ -204,3 +204,36 @@ fn a_default_chain_past_the_expression_depth_is_refused() {
     db.execute(&sql, ())
         .unwrap_or_else(|e| panic!("{sql}: {e}"));
 }
+
+#[test]
+fn not_null_after_a_default_adds_no_expression_depth() {
+    let db = Database::open("memory://column_constraint_default_depth_edge").unwrap();
+    let deep = |n: usize| format!("0{}", " + 0".repeat(n));
+    let before = |n: usize| {
+        format!(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, m INTEGER NOT NULL DEFAULT {})",
+            deep(n)
+        )
+    };
+    let after = |n: usize| {
+        format!(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, m INTEGER DEFAULT {} NOT NULL)",
+            deep(n)
+        )
+    };
+    let longest = (1..200)
+        .take_while(|&n| {
+            let ok = db.execute(&before(n), ()).is_ok();
+            if ok {
+                db.execute("DROP TABLE t", ()).unwrap();
+            }
+            ok
+        })
+        .last()
+        .unwrap();
+    db.execute(&after(longest), ())
+        .unwrap_or_else(|e| panic!("{}: {e}", after(longest)));
+    db.execute("DROP TABLE t", ()).unwrap();
+    let err = error(&db, &after(longest + 1));
+    assert!(err.contains("statement nested too deeply"), "{err}");
+}
