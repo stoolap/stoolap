@@ -7765,7 +7765,10 @@ impl Builder<'_> {
             slots.entry(agg.key).or_insert(slot(items.len() + i)?);
         }
         // A group's values are read by identity alone: no column is in reach
-        let over_slots = CompileContext::new(&[], registry).with_expression_aliases(slots);
+        let mut over_slots = CompileContext::new(&[], registry).with_expression_aliases(slots);
+        if super::aggregation::has_group_by(sq) {
+            over_slots = over_slots.over_groups();
+        }
         let projection = projection
             .iter()
             .map(|expr| compile_with(&over_slots, expr))
@@ -14940,8 +14943,9 @@ impl StatementSource<'_> {
 }
 
 /// The blocks a grouped `key` asks, outside one another, into `blocks`, and
-/// each value of the group it reads outside them, a column or an aggregate
-/// call, whole, into `values`; the left of an ANY or ALL is outside its block
+/// each value of the group it reads outside them, a column, an aggregate
+/// call or a GROUPING() call, whole, into `values`; the left of an ANY or
+/// ALL is outside its block
 fn outside_blocks(key: &Expression, blocks: &mut SmallVec<[u16; 2]>, values: &mut Vec<Expression>) {
     let found = std::cell::RefCell::new((SmallVec::<[u16; 2]>::new(), Vec::new(), Vec::new()));
     let skip = |e: &Expression| {
@@ -14953,7 +14957,10 @@ fn outside_blocks(key: &Expression, blocks: &mut SmallVec<[u16; 2]>, values: &mu
                 lefts.push((*all_any.left).clone());
                 all_any.subquery.prepared
             }
-            Expression::FunctionCall(call) if is_aggregate_function(&call.function) => {
+            Expression::FunctionCall(call)
+                if is_aggregate_function(&call.function)
+                    || call.function.eq_ignore_ascii_case("GROUPING") =>
+            {
                 calls.push(e.clone());
                 return true;
             }

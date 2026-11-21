@@ -1899,6 +1899,21 @@ impl Executor {
                 input: Some(idx),
             });
         }
+        // A GROUPING() call ORDER BY or DISTINCT ON writes reads its group's
+        // flag from a column named after the call
+        for (key, slot) in super::aggregation::sort_key_grouping_slots(stmt, group_slots) {
+            result_columns.push(key.hidden_column_name());
+            column_data.push(
+                base_rows
+                    .iter()
+                    .map(|(_, row)| row.get(slot).cloned().unwrap_or_else(Value::null_unknown))
+                    .collect(),
+            );
+            sources.push(ColumnSource {
+                item: None,
+                input: Some(slot),
+            });
+        }
         let layout = laid_out.then(|| OutputLayout {
             input_columns: crate::common::CompactArc::new(base_columns.to_vec()),
             sources,

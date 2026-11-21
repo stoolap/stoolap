@@ -175,6 +175,9 @@ pub struct CompileContext<'a> {
     /// The aggregated row's slot of each group item and aggregate, by identity
     expression_aliases: KeyMap<ExprKey, u16>,
 
+    /// The rows are the groups of a statement with GROUP BY
+    over_groups: bool,
+
     /// A prepared plan compiles: a subquery mark compiles to its block's id
     prepared_subqueries: bool,
 
@@ -228,6 +231,7 @@ impl<'a> CompileContext<'a> {
             row2_tables: KeySet::default(),
             functions,
             expression_aliases: KeyMap::default(),
+            over_groups: false,
             prepared_subqueries: false,
             row2_bindings: None,
             read_as: None,
@@ -290,6 +294,12 @@ impl<'a> CompileContext<'a> {
     /// Add expression aliases (for HAVING clause)
     pub(crate) fn with_expression_aliases(mut self, aliases: KeyMap<ExprKey, u16>) -> Self {
         self.expression_aliases = aliases;
+        self
+    }
+
+    /// The rows are the groups of a statement with GROUP BY
+    pub(crate) fn over_groups(mut self) -> Self {
+        self.over_groups = true;
         self
     }
 
@@ -1840,6 +1850,12 @@ impl<'a> ExprCompiler<'a> {
             "CURRENT_TRANSACTION_ID" => {
                 // Context-dependent function - loads from ExecuteContext
                 builder.emit(Op::LoadTransactionId);
+                return Ok(());
+            }
+            // Over grouped rows a GROUPING() call no alias binds to a flag
+            // reads a group of every item: ROLLUP, CUBE and grouping sets bind theirs
+            "GROUPING" if self.ctx.over_groups => {
+                builder.emit(Op::LoadConst(Value::Integer(0)));
                 return Ok(());
             }
 

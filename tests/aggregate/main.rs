@@ -56,6 +56,7 @@ mod grouped_output_blocks_test;
 mod grouped_sources_blocks_test;
 mod grouping_float_keys_test;
 mod grouping_identity_rule_test;
+mod grouping_in_expressions_test;
 mod having_aggregates_test;
 mod having_constant_fold_test;
 mod having_without_group_by_test;

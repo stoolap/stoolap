@@ -2352,14 +2352,25 @@ impl Executor {
                                 Some(idx) => (Some(idx), None),
                                 None => (
                                     None,
-                                    Some(super::aggregation::compile_over_slots(
-                                        &ob.expression,
-                                        &columns,
-                                        global_registry(),
-                                        Some(&sort_slots),
-                                        false,
-                                        Some(ctx.params()),
-                                    )?),
+                                    // A set operation's rows are its branches', no groups
+                                    Some(match set_operation {
+                                        false => super::aggregation::compile_over_groups(
+                                            &ob.expression,
+                                            (stmt, &columns),
+                                            global_registry(),
+                                            &sort_slots,
+                                            false,
+                                            Some(ctx.params()),
+                                        ),
+                                        true => super::aggregation::compile_over_slots(
+                                            &ob.expression,
+                                            &columns,
+                                            global_registry(),
+                                            Some(&sort_slots),
+                                            false,
+                                            Some(ctx.params()),
+                                        ),
+                                    }?),
                                 ),
                             })
                         })
@@ -2649,11 +2660,11 @@ impl Executor {
                 )));
             }
             indices.push(width + programs.len());
-            programs.push(super::aggregation::compile_over_slots(
+            programs.push(super::aggregation::compile_over_groups(
                 key,
-                &columns,
+                (stmt, &columns),
                 global_registry(),
-                Some(&slots),
+                &slots,
                 false,
                 Some(ctx.params()),
             )?);
@@ -7576,11 +7587,11 @@ impl Executor {
                 );
                 // Bound after compiling: a value that fails to fold, such as
                 // an invalid pattern, errs only where the run reaches it
-                let program = super::aggregation::compile_over_slots(
+                let program = super::aggregation::compile_over_groups(
                     having,
-                    &result_columns,
+                    (stmt, &result_columns),
                     global_registry(),
-                    Some(&slots),
+                    &slots,
                     false,
                     None,
                 )?;
