@@ -397,6 +397,11 @@ impl Executor {
                 ));
             }
         }
+        if !stmt.order_by.is_empty() || stmt.limit.is_some() || stmt.offset.is_some() {
+            return Err(Error::InvalidArgument(format!(
+                "Recursive CTE '{cte_name}' does not support ORDER BY, LIMIT or OFFSET"
+            )));
+        }
 
         // Execute the anchor member (the first SELECT before UNION ALL)
         let anchor_stmt = SelectStatement {
@@ -746,6 +751,9 @@ impl Executor {
 
         // A reference from any other clause reads the CTE by name as well
         count_cte_references_outside_from(stmt, &mut where_ref_counts);
+        for cte in stmt.with.iter().flat_map(|w| &w.ctes) {
+            count_cte_references_in_stmt(&cte.query, &mut where_ref_counts);
+        }
 
         // Only inline CTEs that:
         // 1. Are used exactly once in table expressions (FROM/JOIN)
@@ -915,7 +923,7 @@ impl Executor {
     fn cte_read_once(&self, stmt: &SelectStatement, with_clause: &WithClause, name: &str) -> bool {
         let mut counts: StringMap<usize> = StringMap::new();
         counts.insert(name.to_string(), 0);
-        count_cte_references_in_stmt(stmt, &mut counts);
+        count_cte_references_in_body(stmt, &mut counts);
         for cte in &with_clause.ctes {
             if cte.name.value_lower.as_str() != name {
                 count_cte_references_in_stmt(&cte.query, &mut counts);
@@ -1210,8 +1218,44 @@ pub(crate) fn statement_reads_cte(stmt: &SelectStatement, name: &str) -> bool {
     counts.get(&name).is_some_and(|&count| count > 0)
 }
 
-/// Count CTE references in a SELECT statement
+/// Count CTE references in a SELECT statement; a WITH of its own hides
+/// each counted name it redefines from the parts that see its CTE
 fn count_cte_references_in_stmt(stmt: &SelectStatement, ref_counts: &mut StringMap<usize>) {
+    let Some(with) = stmt.with.as_ref() else {
+        return count_cte_references_in_body(stmt, ref_counts);
+    };
+    let mut hidden = Vec::new();
+    for cte in &with.ctes {
+        let name = cte.name.value_lower.as_str();
+        // A recursive CTE's first member runs before its name is bound
+        match cte.is_recursive {
+            true => count_cte_references_in_member(&cte.query, ref_counts),
+            false => count_cte_references_in_stmt(&cte.query, ref_counts),
+        }
+        if let Some(entry) = ref_counts.remove_entry(name) {
+            hidden.push(entry);
+        }
+        if cte.is_recursive {
+            for set_op in &cte.query.set_operations {
+                count_cte_references_in_stmt(&set_op.right, ref_counts);
+            }
+        }
+    }
+    count_cte_references_in_body(stmt, ref_counts);
+    ref_counts.extend(hidden);
+}
+
+/// Count CTE references in a SELECT statement's clauses, its WITH aside
+fn count_cte_references_in_body(stmt: &SelectStatement, ref_counts: &mut StringMap<usize>) {
+    count_cte_references_in_member(stmt, ref_counts);
+    for set_op in &stmt.set_operations {
+        count_cte_references_in_stmt(&set_op.right, ref_counts);
+    }
+}
+
+/// Count CTE references in a SELECT statement's first member: its clauses
+/// without its WITH and its set-operation branches
+fn count_cte_references_in_member(stmt: &SelectStatement, ref_counts: &mut StringMap<usize>) {
     // Check table expression
     if let Some(ref table_expr) = stmt.table_expr {
         count_cte_references_in_expr(table_expr, ref_counts);
@@ -1222,12 +1266,21 @@ fn count_cte_references_in_stmt(stmt: &SelectStatement, ref_counts: &mut StringM
         count_cte_references_in_expr(where_clause, ref_counts);
     }
 
-    count_cte_references_outside_from(stmt, ref_counts);
+    count_cte_references_in_clauses(stmt, ref_counts);
 }
 
-/// Count CTE references in every clause other than FROM and WHERE,
-/// the nested WITH bodies and the set-operation branches included
+/// Count CTE references in every clause other than FROM, WHERE and WITH,
+/// the set-operation branches included
 fn count_cte_references_outside_from(stmt: &SelectStatement, ref_counts: &mut StringMap<usize>) {
+    count_cte_references_in_clauses(stmt, ref_counts);
+    for set_op in &stmt.set_operations {
+        count_cte_references_in_stmt(&set_op.right, ref_counts);
+    }
+}
+
+/// Count CTE references in the clauses other than FROM, WHERE and WITH of
+/// a statement's first member
+fn count_cte_references_in_clauses(stmt: &SelectStatement, ref_counts: &mut StringMap<usize>) {
     let windows = stmt
         .window_defs
         .iter()
@@ -1249,13 +1302,6 @@ fn count_cte_references_outside_from(stmt: &SelectStatement, ref_counts: &mut St
         .chain(windows)
     {
         count_cte_references_in_expr(expr, ref_counts);
-    }
-
-    for cte in stmt.with.iter().flat_map(|w| &w.ctes) {
-        count_cte_references_in_stmt(&cte.query, ref_counts);
-    }
-    for set_op in &stmt.set_operations {
-        count_cte_references_in_stmt(&set_op.right, ref_counts);
     }
 }
 

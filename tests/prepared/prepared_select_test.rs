@@ -3192,7 +3192,7 @@ fn test_a_name_two_columns_of_a_set_operation_carry_is_ambiguous_in_its_order_by
 }
 
 #[test]
-fn test_a_recursive_cte_ordered_by_a_subquery_keeps_its_members() {
+fn test_a_recursive_cte_ordered_by_a_subquery_is_refused() {
     let _guard = serial();
     for (db, _dir) in alias_key_tables("prepared_recursive_order_subquery") {
         for sql in [
@@ -3201,7 +3201,11 @@ fn test_a_recursive_cte_ordered_by_a_subquery_keeps_its_members() {
             "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3 \
              ORDER BY 1) SELECT n FROM r ORDER BY n",
         ] {
-            assert_eq!(ids(&db, sql, ()).0, vec![1, 2, 3], "{sql}");
+            assert_eq!(
+                error(&db, sql, ()).0,
+                "invalid argument: Recursive CTE 'r' does not support ORDER BY, LIMIT or OFFSET",
+                "{sql}"
+            );
         }
     }
 }
