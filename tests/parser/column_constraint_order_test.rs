@@ -110,3 +110,78 @@ fn null_and_not_null_on_one_column_are_refused() {
     );
     assert!(err.contains("got 'AND'"), "{err}");
 }
+
+#[test]
+fn a_like_default_with_escape_ends_before_not_null() {
+    let db = Database::open("memory://column_constraint_escape").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, b BOOLEAN DEFAULT 'a' LIKE 'a!%' ESCAPE '!' NOT NULL)",
+        (),
+    )
+    .unwrap();
+    assert_eq!(
+        create_table(&db, "t"),
+        "CREATE TABLE t (id Integer PRIMARY KEY, b Boolean NOT NULL DEFAULT 'a' LIKE 'a!%' ESCAPE '!')"
+    );
+    assert_eq!(
+        error(&db, "INSERT INTO t (id, b) VALUES (1, NULL)"),
+        "NULL value in non-nullable column 'b'"
+    );
+    db.execute("CREATE TABLE z (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO z VALUES (1)", ()).unwrap();
+    db.execute(
+        "ALTER TABLE z ADD COLUMN b BOOLEAN DEFAULT 'a' LIKE 'a' ESCAPE '!' NOT NULL",
+        (),
+    )
+    .unwrap();
+    assert_eq!(values(&db, "SELECT b FROM z"), "true");
+    assert_eq!(
+        error(&db, "UPDATE z SET b = NULL"),
+        "NULL value in non-nullable column 'b'"
+    );
+    assert_eq!(
+        values(
+            &db,
+            "SELECT COUNT(*) FROM z WHERE 'a' LIKE 'a' ESCAPE '!' AND id = 2"
+        ),
+        "0"
+    );
+}
+
+#[test]
+fn a_negated_predicate_default_prints_ddl_that_runs_again() {
+    let db = Database::open("memory://column_constraint_negated").unwrap();
+    let again = Database::open("memory://column_constraint_negated_again").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, b BOOLEAN DEFAULT ('a' NOT LIKE 'b'), \
+         c BOOLEAN DEFAULT (1 NOT IN (2, 3)) NOT NULL, d BOOLEAN DEFAULT (1 NOT BETWEEN 2 AND 3), \
+         e BOOLEAN DEFAULT 'a' NOT LIKE 'a' ESCAPE '!' NULL)",
+        (),
+    )
+    .unwrap();
+    let shown = create_table(&db, "t");
+    assert_eq!(
+        shown,
+        "CREATE TABLE t (id Integer PRIMARY KEY, b Boolean DEFAULT 'a' NOT LIKE 'b', \
+         c Boolean NOT NULL DEFAULT 1 NOT IN (2, 3), d Boolean DEFAULT 1 NOT BETWEEN 2 AND 3, \
+         e Boolean DEFAULT 'a' NOT LIKE 'a' ESCAPE '!')"
+    );
+    again
+        .execute(&shown, ())
+        .unwrap_or_else(|e| panic!("{shown}: {e}"));
+    assert_eq!(create_table(&again, "t"), shown);
+    again.execute("INSERT INTO t (id) VALUES (1)", ()).unwrap();
+    assert_eq!(
+        values(&again, "SELECT b, c, d, e FROM t"),
+        "true|true|true|false"
+    );
+    let err = error(
+        &db,
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, b BOOLEAN DEFAULT 0 NOT UNIQUE)",
+    );
+    assert!(
+        err.contains("expected NULL, IN, BETWEEN or LIKE after NOT"),
+        "{err}"
+    );
+}

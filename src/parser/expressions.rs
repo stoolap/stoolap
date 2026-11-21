@@ -43,6 +43,21 @@ fn balanced_height(heights: &[usize]) -> usize {
     }
 }
 
+/// The keywords an infix NOT negates: NOT IN, NOT BETWEEN and the NOT LIKE
+/// family `parse_keyword_infix` reads
+pub(super) fn negates_after_not(keyword: Keyword) -> bool {
+    matches!(
+        keyword,
+        Keyword::In
+            | Keyword::Between
+            | Keyword::Like
+            | Keyword::Ilike
+            | Keyword::Glob
+            | Keyword::Regexp
+            | Keyword::Rlike
+    )
+}
+
 /// A run of one balanced operator: the operator, the levels below each
 /// operand, and each operand after the first with the operator before it.
 /// Kept flat until the run ends, so an error inside it drops no deep tree
@@ -654,7 +669,7 @@ impl Parser<'_> {
     }
 
     /// Parse a keyword infix expression (AND, OR, LIKE, IS, IN, BETWEEN, AS)
-    fn parse_keyword_infix(&mut self, left: Expression) -> Option<Expression> {
+    pub(super) fn parse_keyword_infix(&mut self, left: Expression) -> Option<Expression> {
         match self.cur_token.keyword {
             Some(Keyword::And | Keyword::Or | Keyword::Xor) => {
                 let token = self.cur_token.clone();
@@ -1434,7 +1449,7 @@ impl Parser<'_> {
         let escape = if self.peek_token_is_keyword(Keyword::Escape) {
             self.next_token(); // consume ESCAPE
             self.next_token(); // move to escape character
-            Some(Box::new(self.parse_expression(Precedence::Lowest)?))
+            Some(Box::new(self.parse_expression(precedence)?))
         } else {
             None
         };

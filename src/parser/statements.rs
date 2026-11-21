@@ -2252,8 +2252,35 @@ impl Parser<'_> {
                     self.next_token();
                     // The value ends before NOT, AND and OR, so NOT NULL after it
                     // is the column's; a value using them is written in parentheses
-                    let expr = self.parse_expression(Precedence::Not)?;
+                    let mut expr = self.parse_expression(Precedence::Not)?;
+                    // NOT IN, NOT LIKE or NOT BETWEEN negates a predicate of the
+                    // value, as SHOW CREATE TABLE prints one; NOT NULL ends it
+                    let mut then_not_null = false;
+                    while self.peek_token_is_keyword(Keyword::Not) {
+                        self.next_token(); // consume NOT
+                        if self.peek_token_is_keyword(Keyword::Null) {
+                            self.next_token();
+                            then_not_null = true;
+                            break;
+                        }
+                        if !self
+                            .peek_token
+                            .keyword
+                            .is_some_and(super::expressions::negates_after_not)
+                        {
+                            self.add_error(format!(
+                                "expected NULL, IN, BETWEEN or LIKE after NOT at {}",
+                                self.peek_token.position
+                            ));
+                            return None;
+                        }
+                        expr = self.parse_keyword_infix(expr)?;
+                    }
                     constraints.push(ColumnConstraint::Default(expr));
+                    if then_not_null {
+                        not_null = true;
+                        constraints.push(ColumnConstraint::NotNull);
+                    }
                 }
                 "CHECK" => {
                     self.next_token(); // consume CHECK
