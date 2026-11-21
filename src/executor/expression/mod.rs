@@ -47,6 +47,7 @@ mod vm;
 
 pub(crate) use compiler::literal_value;
 pub(crate) use compiler::parameter_slot;
+pub(crate) use compiler::Reference;
 pub use compiler::{CompileContext, CompileError, ExprCompiler};
 pub use join_filter::JoinFilter;
 pub(crate) use once::{
