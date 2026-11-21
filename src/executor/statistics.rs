@@ -20,7 +20,7 @@
 use crate::common::deadline::{Deadline, DeadlineSite, CHARGE_BEAT};
 use crate::storage::traits::transaction::StatementTable;
 
-use crate::common::KeySet;
+use crate::common::KeyMap;
 use rand::Rng;
 
 use crate::core::{Error, Result, Row, RowVec, Value};
@@ -190,6 +190,7 @@ impl Executor {
         zone_maps.epoch = epoch.filter(|&epoch| table.publish_epoch_if_quiet() == Some(epoch));
 
         // For statistics, use sampling for large tables
+        let scanned = rows_vec.len();
         let rows = if rows_vec.len() > DEFAULT_SAMPLE_SIZE {
             // Sample from collected rows for statistics
             self.sample_from_rows(rows_vec, DEFAULT_SAMPLE_SIZE, deadline)?
@@ -210,7 +211,7 @@ impl Executor {
         let mut column_stats_list = Vec::new();
         for (col_idx, col_def) in schema.columns.iter().enumerate() {
             deadline.charge(DeadlineSite::Analyze, rows.len())?;
-            let col_stats = self.collect_column_stats(&rows, col_idx);
+            let col_stats = self.collect_column_stats(&rows, col_idx, scanned);
             column_stats_list.push((col_def.name.clone(), col_stats));
         }
 
@@ -320,12 +321,13 @@ impl Executor {
         }
     }
 
-    /// Collect statistics for a single column
+    /// Collect statistics for a single column of `rows`, a sample of `scanned` rows
     /// Returns (null_count, distinct_count, min_value, max_value, avg_width, histogram)
     fn collect_column_stats(
         &self,
         rows: &[Row],
         col_idx: usize,
+        scanned: usize,
     ) -> (
         i64,
         i64,
@@ -335,7 +337,7 @@ impl Executor {
         Option<Histogram>,
     ) {
         let mut null_count = 0i64;
-        let mut distinct_values: KeySet<String> = KeySet::default();
+        let mut distinct_values: KeyMap<String, u32> = KeyMap::default();
         let mut min_value: Option<Value> = None;
         let mut max_value: Option<Value> = None;
         let mut total_width = 0usize;
@@ -347,7 +349,7 @@ impl Executor {
                     null_count += 1;
                 } else {
                     // Track distinct values using string representation
-                    distinct_values.insert(format!("{}", value));
+                    *distinct_values.entry(format!("{}", value)).or_insert(0) += 1;
 
                     // Track min/max
                     let should_update_min = match &min_value {
@@ -378,7 +380,17 @@ impl Executor {
             }
         }
 
-        let distinct_count = distinct_values.len() as i64;
+        // Counts taken from a sample are written for the whole table
+        let share = scanned as f64 / rows.len().max(1) as f64;
+        let null_count = (null_count as f64 * share).round() as i64;
+        let sampled: u64 = distinct_values.values().map(|&n| u64::from(n)).sum();
+        let singletons = distinct_values.values().filter(|&&n| n == 1).count();
+        let distinct_count = duj1_distinct(
+            sampled as f64,
+            sampled as f64 * share,
+            distinct_values.len() as f64,
+            singletons as f64,
+        );
         let avg_width = if !rows.is_empty() {
             (total_width / rows.len()) as i64
         } else {
@@ -484,4 +496,15 @@ impl Executor {
 
         Ok(())
     }
+}
+
+/// Duj1 estimate of a column's distinct values (Haas and Stokes, 1998) from
+/// `sampled` non-NULL values of `total`, holding `distinct` values of which
+/// `singletons` appear once; a full read (`sampled == total`) gives `distinct`.
+fn duj1_distinct(sampled: f64, total: f64, distinct: f64, singletons: f64) -> i64 {
+    if sampled == 0.0 {
+        return 0;
+    }
+    let estimate = sampled * distinct / (sampled - singletons + singletons * sampled / total);
+    estimate.clamp(distinct, total).round() as i64
 }
