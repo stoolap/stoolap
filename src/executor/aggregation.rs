@@ -679,6 +679,30 @@ fn function_calls<'e>(expr: &'e Expression, out: &mut Vec<&'e FunctionCall>) {
     });
 }
 
+/// The one-argument GROUPING() calls whose flags `call` reads: itself, or
+/// one per argument of a GROUPING() call of several, whose value is their
+/// bits; any other call is itself
+pub(crate) fn grouping_flag_calls(
+    call: &FunctionCall,
+) -> smallvec::SmallVec<[std::borrow::Cow<'_, FunctionCall>; 1]> {
+    use std::borrow::Cow;
+    if call.arguments.len() < 2 || !call.function.eq_ignore_ascii_case("GROUPING") {
+        return smallvec::smallvec![Cow::Borrowed(call)];
+    }
+    (call.arguments.iter())
+        .map(|arg| {
+            Cow::Owned(FunctionCall {
+                token: call.token.clone(),
+                function: call.function.clone(),
+                arguments: vec![arg.clone()],
+                is_distinct: false,
+                order_by: Vec::new(),
+                filter: None,
+            })
+        })
+        .collect()
+}
+
 /// Each call `stmt`'s ORDER BY or DISTINCT ON writes whose value `slots`
 /// holds per group, a GROUPING() flag or an aggregate, once, with its slot
 pub(crate) fn sort_key_call_slots(
@@ -691,8 +715,8 @@ pub(crate) fn sort_key_call_slots(
         function_calls(key, &mut calls);
     }
     let mut read: Vec<(ExprKey, usize)> = Vec::new();
-    for call in calls {
-        let key = ExprKey::of_call(call);
+    for call in calls.iter().flat_map(|call| grouping_flag_calls(call)) {
+        let key = ExprKey::of_call(&call);
         if let Some(&slot) = slots.get(&key)
             && !read.iter().any(|(read, _)| *read == key)
         {
@@ -2899,9 +2923,9 @@ impl Executor {
         }
         let calls = statement_grouping_calls(stmt);
         let flags = items.len() + aggregations;
-        for call in calls {
-            if let Some(at) = self.find_grouping_column_index(call, items) {
-                slots.entry(ExprKey::of_call(call)).or_insert(flags + at);
+        for call in calls.iter().flat_map(|call| grouping_flag_calls(call)) {
+            if let Some(at) = self.find_grouping_column_index(&call, items) {
+                slots.entry(ExprKey::of_call(&call)).or_insert(flags + at);
             }
         }
     }
