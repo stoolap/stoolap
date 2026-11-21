@@ -37,6 +37,7 @@ mod window_coverage_test;
 mod window_function_test;
 mod window_named_set_operation_test;
 mod window_over_group_by_aggregate_test;
+mod window_over_groups_order_by_test;
 mod window_over_groups_rule_test;
 mod window_over_key_test;
 mod window_qualified_argument_test;

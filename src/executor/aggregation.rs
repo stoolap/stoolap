@@ -666,16 +666,29 @@ fn statement_grouping_calls(stmt: &SelectStatement) -> Vec<&FunctionCall> {
     calls
 }
 
-/// Each GROUPING() call `stmt`'s ORDER BY or DISTINCT ON writes that `slots`
-/// binds to a flag, once, with that flag's slot
-pub(crate) fn sort_key_grouping_slots(
+/// The function calls `expr` writes, at any depth
+fn function_calls<'e>(expr: &'e Expression, out: &mut Vec<&'e FunctionCall>) {
+    match expr {
+        Expression::FunctionCall(call) => out.push(call),
+        Expression::Aliased(aliased) => return function_calls(&aliased.expression, out),
+        _ => {}
+    }
+    let _ = super::prepared_select::for_each_child(expr, &mut |child| {
+        function_calls(child, out);
+        Ok(())
+    });
+}
+
+/// Each call `stmt`'s ORDER BY or DISTINCT ON writes whose value `slots`
+/// holds per group, a GROUPING() flag or an aggregate, once, with its slot
+pub(crate) fn sort_key_call_slots(
     stmt: &SelectStatement,
     slots: &KeyMap<ExprKey, usize>,
 ) -> Vec<(ExprKey, usize)> {
     let mut calls = Vec::new();
     let order = stmt.order_by.iter().map(|ob| &ob.expression);
     for key in order.chain(&stmt.distinct_on) {
-        grouping_calls(key, &mut calls);
+        function_calls(key, &mut calls);
     }
     let mut read: Vec<(ExprKey, usize)> = Vec::new();
     for call in calls {
@@ -2291,7 +2304,7 @@ impl Executor {
         let group_by = self.parse_group_by(stmt, columns)?;
         let mut flags = KeyMap::default();
         self.bind_grouping_flags(stmt, (&group_by, aggregations), &mut flags, flags_held);
-        Ok(sort_key_grouping_slots(stmt, &flags)
+        Ok(sort_key_call_slots(stmt, &flags)
             .into_iter()
             .map(|(key, slot)| {
                 let values = rows
