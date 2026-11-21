@@ -525,7 +525,6 @@ fn file_volume(
         columns,
         meta: Arc::new(super::writer::VolumeMeta {
             zone_maps: meta.zone_maps,
-            bloom_filters: meta.bloom_filters,
             stats: meta.stats,
             row_count: meta.row_count,
             column_names: meta.column_names,
@@ -540,6 +539,7 @@ fn file_volume(
             group_rows: group_size,
             file_identity: std::sync::OnceLock::new(),
         }),
+        blooms: Arc::new(meta.bloom_filters),
         unique_indices: std::sync::Arc::new(super::writer::UniqueIndexes::new(
             crate::common::KeyMap::default(),
         )),
@@ -640,6 +640,7 @@ pub fn rewrite_volume_with_group_rows(path: &Path, group_rows: usize) -> Result<
     let rewritten = FrozenVolume {
         columns: LazyColumns::eager(columns, meta.column_types.clone()),
         meta: Arc::new(meta),
+        blooms: Arc::clone(&volume.blooms),
         unique_indices: Arc::new(super::writer::UniqueIndexes::new(
             crate::common::KeyMap::default(),
         )),
@@ -1211,14 +1212,14 @@ mod tests {
         let vol = mixed_volume(1_000);
         let path = write_volume_to_disk(dir.path(), "t", 1, &vol).unwrap();
         let read = read_volume_from_disk(&path).unwrap();
-        let blooms = &read.meta.bloom_filters;
+        let blooms = &read.blooms;
         assert_eq!(blooms.memory_size(), 0, "bloom words read at open");
         let store = read.columns.compressed_store().unwrap();
         let at_open = store.memory_size();
 
         let h = super::super::column::ColumnBloomFilter::hash_value_static(&Value::Integer(4));
         assert!(blooms.might_contain_hash(0, h).unwrap());
-        let written = vol.meta.bloom_filters.filter(0).unwrap().unwrap();
+        let written = vol.blooms.filter(0).unwrap().unwrap();
         assert_eq!(blooms.memory_size(), written.memory_size());
         assert_eq!(blooms.filter(0).unwrap().unwrap().bits(), written.bits());
 
@@ -1233,7 +1234,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write_volume_to_disk(dir.path(), "t", 1, &mixed_volume(200_000)).unwrap();
         let read = read_volume_from_disk(&path).unwrap();
-        let blooms = &read.meta.bloom_filters;
+        let blooms = &read.blooms;
         let h = super::super::column::ColumnBloomFilter::hash_value_static(&Value::Integer(4));
         let start = std::sync::Barrier::new(8);
         std::thread::scope(|s| {

@@ -616,12 +616,14 @@ impl VolumeFileWriter {
             .map(|col| builder.column_kind(col))
             .collect();
         // A volume still deciding at its end is one group
-        let (meta, dict_tables) =
+        let (meta, fed_blooms, dict_tables) =
             builder.finish_streamed(self.group_rows.unwrap_or(ROW_GROUP_SIZE))?;
         let dictionaries: Vec<&[crate::common::SmartString]> =
             dict_tables.iter().map(Vec::as_slice).collect();
-        let sections = super::format::v5_metadata_sections(&meta, &kinds, &dictionaries)
-            .map_err(|e| io_error("V5 metadata", e))?;
+        let sections =
+            super::format::v5_metadata_sections(&meta, &fed_blooms, &kinds, &dictionaries)
+                .map_err(|e| io_error("V5 metadata", e))?;
+        drop(fed_blooms);
 
         let col_count = self.index.len();
         let num_groups = self.index.first().map(Vec::len).unwrap_or(0);
@@ -680,7 +682,7 @@ impl VolumeFileWriter {
         &mut self,
         kinds: &[(u8, u8)],
         dict_tables: &[Vec<crate::common::SmartString>],
-        mut meta: super::writer::VolumeMeta,
+        meta: super::writer::VolumeMeta,
         blooms: Option<(u8, u64, u64)>,
         col_count: usize,
         num_groups: usize,
@@ -696,7 +698,7 @@ impl VolumeFileWriter {
             File::open(&self.final_path).map_err(|e| io_error("failed to open volume file", e))?;
         let handle = super::writer::VolumeFile::shared(&self.final_path);
         let read_at = |buf: &mut [u8], at: u64| super::writer::read_exact_at(&file, buf, at);
-        meta.bloom_filters =
+        let blooms =
             super::writer::VolumeBlooms::from_section(&handle, blooms, col_count, &read_at)
                 .map_err(|e| io_error("failed to read volume bloom section", e))?;
         let mut offsets = Vec::with_capacity(col_count);
@@ -757,6 +759,7 @@ impl VolumeFileWriter {
         Ok(FrozenVolume {
             columns: LazyColumns::deferred(store, column_types),
             meta: Arc::new(meta),
+            blooms: Arc::new(blooms),
             unique_indices: Arc::new(super::writer::UniqueIndexes::new(unique_indices)),
             last_access_epoch: std::sync::atomic::AtomicU64::new(
                 super::writer::GLOBAL_EVICTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed),
@@ -1025,7 +1028,7 @@ mod tests {
     fn a_written_volume_reads_its_bloom_filters_from_its_file() {
         let schema = schema();
         let (_, volume, _path, _dir) = written(&schema, 500, 64);
-        let blooms = &volume.meta.bloom_filters;
+        let blooms = &volume.blooms;
         let held = blooms.memory_size();
         assert!(held <= 16, "{held} bytes of filters held after the write");
         for (col, value) in [(0, Value::Integer(7)), (5, row(7).get(5).unwrap().clone())] {

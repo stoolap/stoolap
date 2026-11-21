@@ -2020,8 +2020,6 @@ impl<'a> IntoIterator for &'a LazyColumns {
 pub struct VolumeMeta {
     /// Zone maps per column
     pub zone_maps: Vec<ZoneMap>,
-    /// Bloom filters per column (for fast equality membership testing)
-    pub bloom_filters: VolumeBlooms,
     /// Pre-computed aggregate stats
     pub stats: VolumeAggregateStats,
     /// Number of live rows
@@ -2110,9 +2108,17 @@ pub struct FileIdentity {
 
 /// Each column's bloom filter: resident, or read from the volume's V5 file
 /// on the column's first probe
-#[derive(Clone, Default)]
 pub struct VolumeBlooms {
     columns: Vec<BloomSlot>,
+    /// u64::MAX when probed since the last eviction pass, and at first;
+    /// else that pass's epoch
+    last_use_epoch: std::sync::atomic::AtomicU64,
+}
+
+impl Default for VolumeBlooms {
+    fn default() -> Self {
+        Self::of(Vec::new())
+    }
 }
 
 #[derive(Clone)]
@@ -2139,10 +2145,15 @@ pub(crate) struct BloomPlace {
 }
 
 impl VolumeBlooms {
-    pub fn resident(filters: Vec<super::column::ColumnBloomFilter>) -> Self {
+    fn of(columns: Vec<BloomSlot>) -> Self {
         Self {
-            columns: filters.into_iter().map(BloomSlot::Resident).collect(),
+            columns,
+            last_use_epoch: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
+    }
+
+    pub fn resident(filters: Vec<super::column::ColumnBloomFilter>) -> Self {
+        Self::of(filters.into_iter().map(BloomSlot::Resident).collect())
     }
 
     /// The filters of `file`'s bloom section, given as (encoding, offset,
@@ -2176,7 +2187,50 @@ impl VolumeBlooms {
                 None => BloomSlot::Resident(super::column::ColumnBloomFilter::accept_all()),
             })
             .collect();
-        Self { columns }
+        Self::of(columns)
+    }
+
+    /// The same filters, those in the file not yet read: what an idle
+    /// volume keeps once eviction lets its loaded filters go
+    pub fn unloaded(&self) -> Self {
+        let columns = self
+            .columns
+            .iter()
+            .map(|slot| match slot {
+                BloomSlot::Resident(filter) => BloomSlot::Resident(filter.clone()),
+                BloomSlot::InFile {
+                    place,
+                    file,
+                    #[cfg(test)]
+                    reads,
+                    ..
+                } => BloomSlot::InFile {
+                    place: place.clone(),
+                    file: Arc::clone(file),
+                    loaded: std::sync::OnceLock::new(),
+                    loading: Arc::default(),
+                    #[cfg(test)]
+                    reads: Arc::clone(reads),
+                },
+            })
+            .collect();
+        Self::of(columns)
+    }
+
+    /// Whether filters read from the file went unprobed for `cycles`
+    /// eviction passes up to `epoch`; a probe since the last pass starts
+    /// the count again from this one
+    pub(crate) fn idle_for(&self, epoch: u64, cycles: u64) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let last = self.last_use_epoch.load(Relaxed);
+        if last == u64::MAX {
+            self.last_use_epoch.store(epoch, Relaxed);
+            return false;
+        }
+        epoch.saturating_sub(last) >= cycles
+            && self.columns.iter().any(
+                |slot| matches!(slot, BloomSlot::InFile { loaded, .. } if loaded.get().is_some()),
+            )
     }
 
     pub fn len(&self) -> usize {
@@ -2203,6 +2257,15 @@ impl VolumeBlooms {
                 ..
             } => (place, file, loaded, loading),
         };
+        // Written only when a pass has bound it, so probes share the line
+        if self
+            .last_use_epoch
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != u64::MAX
+        {
+            self.last_use_epoch
+                .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(filter) = loaded.get() {
             return Ok(Some(filter));
         }
@@ -2304,7 +2367,6 @@ impl VolumeMeta {
         }
         // zone_maps: 2 Values (16 bytes each) + 2 u32 per column
         size += self.zone_maps.len() * (16 + 16 + 8);
-        size += self.bloom_filters.memory_size();
         // stats: 16 bytes base + per-column (i128 + f64 + u64 + 2 Values + u64)
         size += 16 + self.stats.columns.len() * (16 + 8 + 8 + 16 + 16 + 8);
         // column_names
@@ -2410,8 +2472,11 @@ pub enum UniqueCandidates {
 pub struct FrozenVolume {
     /// Column data stored as typed arrays with lazy decompression
     pub columns: LazyColumns,
-    /// Shared metadata (zone maps, bloom filters, stats, row IDs, etc.)
+    /// Shared metadata (zone maps, stats, row IDs, etc.)
     pub meta: Arc<VolumeMeta>,
+    /// Bloom filters per column, for equality membership tests; eviction
+    /// gives an idle volume a copy whose filters are read again on use
+    pub blooms: Arc<VolumeBlooms>,
     /// Per-volume unique index: lazily built, never invalidated (volume is immutable).
     /// Key: sorted column indices for a UNIQUE constraint.
     /// Value: shared sorted (hash, row_idx) pairs, 16 bytes per entry.
@@ -3163,14 +3228,14 @@ impl VolumeBuilder {
         }
     }
 
-    /// The volume's metadata and dictionaries once every row has been
-    /// flushed by a streaming producer in groups of `group_rows`: what
-    /// `finish` computes, without the columns. Row groups are kept only
-    /// for a volume of more than one group, as `finish` keeps them
+    /// The volume's metadata, bloom filters and dictionaries once every row
+    /// has been flushed by a streaming producer in groups of `group_rows`:
+    /// what `finish` computes, without the columns. Row groups are kept
+    /// only for a volume of more than one group, as `finish` keeps them
     pub fn finish_streamed(
         mut self,
         group_rows: usize,
-    ) -> Result<(VolumeMeta, Vec<Vec<SmartString>>)> {
+    ) -> Result<(VolumeMeta, VolumeBlooms, Vec<Vec<SmartString>>)> {
         if let Some(e) = self.refused.take() {
             return Err(e);
         }
@@ -3194,7 +3259,6 @@ impl VolumeBuilder {
         };
         let meta = VolumeMeta {
             zone_maps: std::mem::take(&mut self.zone_maps),
-            bloom_filters,
             stats: std::mem::replace(&mut self.stats, VolumeAggregateStats::new(0)),
             row_count: self.row_count,
             column_names,
@@ -3209,7 +3273,7 @@ impl VolumeBuilder {
             group_rows,
             file_identity: std::sync::OnceLock::new(),
         };
-        Ok((meta, std::mem::take(&mut self.dict_tables)))
+        Ok((meta, bloom_filters, std::mem::take(&mut self.dict_tables)))
     }
 
     /// The permutation lookups need when the row ids do not ascend; an
@@ -3859,7 +3923,6 @@ impl VolumeBuilder {
             columns: LazyColumns::eager(columns, column_types.clone()),
             meta: Arc::new(VolumeMeta {
                 zone_maps: self.zone_maps,
-                bloom_filters: VolumeBlooms::resident(bloom_filters),
                 stats: self.stats,
                 row_count: self.row_count,
                 column_names,
@@ -3874,6 +3937,7 @@ impl VolumeBuilder {
                 group_rows: super::column::ROW_GROUP_SIZE,
                 file_identity: std::sync::OnceLock::new(),
             }),
+            blooms: Arc::new(VolumeBlooms::resident(bloom_filters)),
             unique_indices: Arc::new(UniqueIndexes::new(crate::common::KeyMap::default())),
             last_access_epoch: std::sync::atomic::AtomicU64::new(
                 GLOBAL_EVICTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed),
@@ -4774,7 +4838,7 @@ impl FrozenVolume {
             .values()
             .map(|entries| entries.capacity() * std::mem::size_of::<(u64, u32)>())
             .sum();
-        self.meta.memory_size() + self.columns.memory_size() + unique
+        self.meta.memory_size() + self.blooms.memory_size() + self.columns.memory_size() + unique
     }
 
     /// Mark this volume as recently accessed. Stores u64::MAX as a sentinel
@@ -4815,6 +4879,7 @@ impl FrozenVolume {
         Some(FrozenVolume {
             columns: LazyColumns::deferred_shared(store, self.meta.column_types.clone()),
             meta: Arc::clone(&self.meta),
+            blooms: Arc::clone(&self.blooms),
             unique_indices: Arc::clone(&self.unique_indices),
             // Start at current epoch so warm gets MIN_IDLE_CYCLES before cold.
             last_access_epoch: std::sync::atomic::AtomicU64::new(
@@ -4830,6 +4895,7 @@ impl FrozenVolume {
         FrozenVolume {
             columns: LazyColumns::metadata_only(self.meta.column_types.clone()),
             meta: Arc::clone(&self.meta),
+            blooms: Arc::clone(&self.blooms),
             unique_indices: Arc::clone(&self.unique_indices),
             // Start at current epoch so cold gets MIN_IDLE_CYCLES before
             // being considered for reload/re-eviction.
@@ -5109,7 +5175,7 @@ mod tests {
             )
             .unwrap();
         let volume = builder.finish().unwrap();
-        let bloom = |col| volume.meta.bloom_filters.filter(col).unwrap().unwrap();
+        let bloom = |col| volume.blooms.filter(col).unwrap().unwrap();
         assert!(bloom(0).might_contain(&Value::Integer(1)));
         assert!(bloom(0).might_contain(&Value::Integer(2)));
         assert!(bloom(1).might_contain(&Value::text("one")));

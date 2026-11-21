@@ -1180,14 +1180,14 @@ pub(crate) struct VolumeMetadata {
 /// The caller LZ4-compresses the result before writing to disk.
 pub(crate) fn serialize_volume_metadata(vol: &FrozenVolume) -> io::Result<Vec<u8>> {
     let (kinds, dictionaries) = column_kinds(vol)?;
-    serialize_volume_metadata_parts(&vol.meta, &kinds, &dictionaries)
+    serialize_volume_metadata_parts(&vol.meta, &vol.blooms, &kinds, &dictionaries)
 }
 
 /// The V5 metadata sections of a volume with decoded columns
 #[cfg(test)]
 pub(crate) fn v5_volume_sections(vol: &FrozenVolume) -> io::Result<Vec<V5Section>> {
     let (kinds, dictionaries) = column_kinds(vol)?;
-    v5_metadata_sections(&vol.meta, &kinds, &dictionaries)
+    v5_metadata_sections(&vol.meta, &vol.blooms, &kinds, &dictionaries)
 }
 
 /// Every column's (storage type tag, extension type tag), and the text
@@ -1222,13 +1222,14 @@ fn column_kinds(vol: &FrozenVolume) -> io::Result<(Vec<(u8, u8)>, Vec<&[SmartStr
 /// past what the file gets (the bloom filters alone outweigh the row ids).
 pub(crate) fn serialize_volume_metadata_parts(
     meta: &super::writer::VolumeMeta,
+    blooms: &super::writer::VolumeBlooms,
     kinds: &[(u8, u8)],
     dictionaries: &[&[SmartString]],
 ) -> io::Result<Vec<u8>> {
     let mut counter = Counting(0);
-    write_volume_metadata_parts(&mut counter, meta, kinds, dictionaries)?;
+    write_volume_metadata_parts(&mut counter, meta, blooms, kinds, dictionaries)?;
     let mut buf = Vec::with_capacity(counter.0);
-    write_volume_metadata_parts(&mut buf, meta, kinds, dictionaries)?;
+    write_volume_metadata_parts(&mut buf, meta, blooms, kinds, dictionaries)?;
     debug_assert_eq!(buf.len(), counter.0);
     Ok(buf)
 }
@@ -1250,6 +1251,7 @@ impl Write for Counting {
 fn write_volume_metadata_parts<W: Write>(
     buf: &mut W,
     meta: &super::writer::VolumeMeta,
+    blooms: &super::writer::VolumeBlooms,
     kinds: &[(u8, u8)],
     dictionaries: &[&[SmartString]],
 ) -> io::Result<()> {
@@ -1307,9 +1309,9 @@ fn write_volume_metadata_parts<W: Write>(
     }
 
     // Bloom filters
-    buf.write_all(&(meta.bloom_filters.len() as u32).to_le_bytes())?;
-    for i in 0..meta.bloom_filters.len() {
-        let Some(bf) = meta.bloom_filters.filter(i)? else {
+    buf.write_all(&(blooms.len() as u32).to_le_bytes())?;
+    for i in 0..blooms.len() {
+        let Some(bf) = blooms.filter(i)? else {
             continue;
         };
         buf.write_all(&(bf.num_bits() as u64).to_le_bytes())?;
@@ -1685,6 +1687,7 @@ fn u32_at(b: &[u8], at: usize) -> u32 {
 /// metadata is written from
 pub(crate) fn v5_metadata_sections(
     meta: &super::writer::VolumeMeta,
+    blooms: &super::writer::VolumeBlooms,
     kinds: &[(u8, u8)],
     dictionaries: &[&[SmartString]],
 ) -> io::Result<Vec<V5Section>> {
@@ -1808,7 +1811,7 @@ pub(crate) fn v5_metadata_sections(
     let filters: Vec<Option<&super::column::ColumnBloomFilter>> = (0..col_count)
         .map(|i| match kinds[i].0 {
             COL_BYTES => Ok(None),
-            _ => meta.bloom_filters.filter(i),
+            _ => blooms.filter(i),
         })
         .collect::<io::Result<_>>()?;
     let head = V5_BLOOM_HEAD + col_count * V5_BLOOM_ENTRY;
