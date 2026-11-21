@@ -482,3 +482,33 @@ fn a_create_table_as_select_whose_row_fails_leaves_no_table() {
     }
     gone(&Database::open(&dsn).unwrap(), "after reopening");
 }
+
+#[test]
+fn a_failed_create_table_as_select_leaves_nothing_for_a_later_rollback_to_undo() {
+    let failing = "CREATE TABLE c AS SELECT 1 AS id UNION ALL SELECT 'x'";
+    for (n, end) in ["ROLLBACK TO SAVEPOINT s", "ROLLBACK"]
+        .into_iter()
+        .enumerate()
+    {
+        let a = Database::open(&format!("memory://ddl_ctas_failed_then_undo_{n}")).unwrap();
+        let b = a.clone();
+        a.execute("BEGIN", ()).unwrap();
+        a.execute("SAVEPOINT s", ()).unwrap();
+        assert!(
+            a.execute(failing, ()).is_err(),
+            "the 'x' row fits no INTEGER"
+        );
+        b.execute("CREATE TABLE c (id INTEGER)", ()).unwrap();
+        b.execute("INSERT INTO c VALUES (7)", ()).unwrap();
+        a.execute(end, ())
+            .unwrap_or_else(|e| panic!("{end} after the failed CTAS: {e}"));
+        if end != "ROLLBACK" {
+            a.execute("COMMIT", ()).unwrap();
+        }
+        assert_eq!(
+            ids(&a, "SELECT id FROM c"),
+            Ok(vec![7]),
+            "{end}: the other session's table c"
+        );
+    }
+}
