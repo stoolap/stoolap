@@ -1531,6 +1531,17 @@ impl MVCCEngine {
 
             // Volume recovery takes priority over snapshot backup files.
             let volume_lsn = self.load_manifests_from_volumes()?;
+            // New volume ids start above every id an earlier run used, in
+            // a file's name or a manifest's count, whatever the clock reads
+            {
+                let mgrs = self.segment_managers.read();
+                let listed = (mgrs.values())
+                    .map(|mgr| mgr.manifest().next_segment_id.saturating_sub(1))
+                    .max();
+                let named =
+                    crate::storage::volume::io::largest_volume_id_named(&pm.path().join("volumes"));
+                crate::storage::volume::io::keep_volume_ids_above(named.max(listed.unwrap_or(0)));
+            }
             // The schema epoch restarts above every version the
             // manifests carry, before the log is replayed, so a change
             // replayed or made from now on orders after the seals and
