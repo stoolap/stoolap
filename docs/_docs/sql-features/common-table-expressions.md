@@ -220,7 +220,8 @@ SELECT n, fib_n as fibonacci FROM fib;
 2. **UNION ALL**: Required between the anchor and recursive members of a CTE that reads itself
 3. **Anchor Members**: Every branch that does not read the CTE is an anchor and runs once; its rows start the recursion together with the first branch's. Only a branch that reads the CTE runs again on each pass, over the rows the previous pass added
 4. **Iteration Limit**: A recursive CTE may run 10,000 passes. If a pass after that still adds rows, the statement fails with `recursive CTE '<name>' did not finish within 10000 iterations` rather than returning the rows found so far
-5. **Other Members**: `RECURSIVE` applies to the whole WITH list. A CTE in that list whose body does not read its own name is an ordinary CTE: it needs no UNION ALL and may use any body a CTE allows, ORDER BY and LIMIT included, and later members, recursive ones included, can read it
+5. **Other Members**: `RECURSIVE` applies to the whole WITH list. A CTE in that list whose body does not read its own name is an ordinary CTE: it needs no UNION ALL and may use any body a CTE allows, ORDER BY and LIMIT included, and later members, recursive ones included, can read it. A name read inside a subquery whose own WITH redefines it refers to that inner CTE, so it does not make the outer CTE recursive
+6. **No ORDER BY, LIMIT or OFFSET**: A CTE that reads itself cannot carry ORDER BY, LIMIT or OFFSET after its members; the statement fails with `Recursive CTE '<name>' does not support ORDER BY, LIMIT or OFFSET`. Order or cut the rows in the statement that reads the CTE instead, and end the recursion with a WHERE condition
 
 ```sql
 WITH RECURSIVE base AS (SELECT 1 AS x),
