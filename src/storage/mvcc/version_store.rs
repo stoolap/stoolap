@@ -7910,6 +7910,11 @@ impl TxnTableStore {
         self.store.read()
     }
 
+    /// Whether the store was opened over `store`
+    pub(crate) fn is_over(&self, store: &VersionStore) -> bool {
+        self.parent == store.store_id
+    }
+
     /// Admits a handle that reads `store` under `layout`: the transaction's
     /// rows must be held in that layout, and from now on no handle under an
     /// older layout writes here

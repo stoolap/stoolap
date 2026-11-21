@@ -314,3 +314,136 @@ fn test_modify_column_not_null_empty_table() {
     db.execute("ALTER TABLE t_empty MODIFY COLUMN val TEXT NOT NULL", ())
         .expect("Should succeed on empty table");
 }
+
+fn ids(db: &Database, sql: &str) -> Result<Vec<i64>, String> {
+    let rows = db.query(sql, ()).map_err(|e| e.to_string())?;
+    rows.map(|row| row.and_then(|r| r.get::<i64>(0)).map_err(|e| e.to_string()))
+        .collect()
+}
+
+#[test]
+fn create_table_as_select_in_a_transaction_is_undone_by_rollback() {
+    let db = Database::open("memory://ddl_ctas_rollback").unwrap();
+    db.execute("CREATE TABLE src (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO src VALUES (1), (2)", ()).unwrap();
+    db.execute("BEGIN", ()).unwrap();
+    db.execute("INSERT INTO src VALUES (3)", ()).unwrap();
+    db.execute("CREATE TABLE ctas AS SELECT id FROM src", ())
+        .unwrap();
+    assert_eq!(
+        ids(&db, "SELECT id FROM ctas ORDER BY id"),
+        Ok(vec![1, 2, 3]),
+        "the transaction reads the table it made, with its own rows"
+    );
+    db.execute("ROLLBACK", ()).unwrap();
+    match ids(&db, "SELECT id FROM ctas") {
+        Err(e) if e.contains("not found") => {}
+        got => panic!("ctas after ROLLBACK: {got:?}, want table not found"),
+    }
+    assert_eq!(ids(&db, "SELECT id FROM src ORDER BY id"), Ok(vec![1, 2]));
+}
+
+#[test]
+fn create_table_as_select_in_a_transaction_keeps_its_rows_on_commit() {
+    let db = Database::open("memory://ddl_ctas_commit").unwrap();
+    db.execute("BEGIN", ()).unwrap();
+    db.execute("CREATE TABLE ctas AS SELECT 1 AS id UNION ALL SELECT 2", ())
+        .unwrap();
+    db.execute("COMMIT", ()).unwrap();
+    assert_eq!(ids(&db, "SELECT id FROM ctas ORDER BY id"), Ok(vec![1, 2]));
+}
+
+#[test]
+fn create_table_as_select_after_a_savepoint_is_undone_by_rollback_to_it() {
+    let db = Database::open("memory://ddl_ctas_savepoint").unwrap();
+    db.execute("BEGIN", ()).unwrap();
+    db.execute("CREATE TABLE kept AS SELECT 1 AS id", ())
+        .unwrap();
+    db.execute("SAVEPOINT s", ()).unwrap();
+    db.execute("CREATE TABLE gone AS SELECT 2 AS id", ())
+        .unwrap();
+    db.execute("ROLLBACK TO SAVEPOINT s", ()).unwrap();
+    db.execute("COMMIT", ()).unwrap();
+    assert_eq!(ids(&db, "SELECT id FROM kept"), Ok(vec![1]));
+    match ids(&db, "SELECT id FROM gone") {
+        Err(e) if e.contains("not found") => {}
+        got => panic!("gone after ROLLBACK TO SAVEPOINT: {got:?}, want table not found"),
+    }
+}
+
+#[test]
+fn create_table_as_select_rolled_back_stays_gone_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}", dir.path().display());
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute("BEGIN", ()).unwrap();
+        db.execute("CREATE TABLE kept AS SELECT 1 AS id", ())
+            .unwrap();
+        db.execute("COMMIT", ()).unwrap();
+        db.execute("BEGIN", ()).unwrap();
+        db.execute("CREATE TABLE gone AS SELECT 2 AS id", ())
+            .unwrap();
+        db.execute("ROLLBACK", ()).unwrap();
+        db.close().unwrap();
+    }
+    let db = Database::open(&dsn).unwrap();
+    assert_eq!(ids(&db, "SELECT id FROM kept"), Ok(vec![1]));
+    match ids(&db, "SELECT id FROM gone") {
+        Err(e) if e.contains("not found") => {}
+        got => panic!("gone after reopen: {got:?}, want table not found"),
+    }
+}
+
+#[test]
+fn a_table_a_transaction_dropped_or_rolled_back_can_be_made_again_under_its_name() {
+    let db = Database::open("memory://ddl_recreate_same_name").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER)", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
+    db.execute("CREATE TABLE p (id INTEGER)", ()).unwrap();
+    db.execute("BEGIN", ()).unwrap();
+    db.execute("DROP TABLE t", ()).unwrap();
+    db.execute("CREATE TABLE t AS SELECT 2 AS id", ()).unwrap();
+    db.execute("DROP TABLE t", ()).unwrap();
+    db.execute("CREATE TABLE t AS SELECT 3 AS id", ()).unwrap();
+    db.execute("SAVEPOINT s", ()).unwrap();
+    db.execute("CREATE TABLE u AS SELECT 3 AS id", ()).unwrap();
+    db.execute("ROLLBACK TO SAVEPOINT s", ()).unwrap();
+    db.execute("CREATE TABLE u AS SELECT 4 AS id", ()).unwrap();
+    db.execute("INSERT INTO p VALUES (6)", ()).unwrap();
+    db.execute("DROP TABLE p", ()).unwrap();
+    db.execute("CREATE TABLE p (id INTEGER)", ()).unwrap();
+    db.execute("INSERT INTO p VALUES (5)", ()).unwrap();
+    db.execute("COMMIT", ()).unwrap();
+    for (table, want) in [("t", 3), ("u", 4), ("p", 5)] {
+        assert_eq!(
+            ids(&db, &format!("SELECT id FROM {table}")),
+            Ok(vec![want]),
+            "{table} after COMMIT"
+        );
+    }
+}
+
+#[test]
+fn a_row_written_through_a_held_handle_commits_to_its_table_renamed_meanwhile() {
+    use stoolap::core::{Row, Value};
+    use stoolap::storage::traits::Engine;
+    let db = Database::open("memory://ddl_held_handle_rename").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER)", ()).unwrap();
+    let mut tx = db.engine().begin_transaction().unwrap();
+    let mut held = tx.get_table("t").unwrap();
+    let other = db.clone();
+    other.execute("ALTER TABLE t RENAME TO u", ()).unwrap();
+    other.execute("CREATE TABLE t (id INTEGER)", ()).unwrap();
+    let _ = tx.get_table("t");
+    held.insert(Row::from_values(vec![Value::Integer(1)]))
+        .unwrap();
+    drop(held);
+    let committed = tx.commit();
+    assert_eq!(
+        (committed.is_ok(), ids(&db, "SELECT id FROM u")),
+        (true, Ok(vec![1])),
+        "(commit succeeded, rows of the renamed table)"
+    );
+}

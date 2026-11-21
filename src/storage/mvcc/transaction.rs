@@ -140,8 +140,8 @@ pub trait TransactionEngineOperations: Send + Sync {
         creation: u64,
     ) -> Result<Box<dyn Table>>;
 
-    /// Drop a table
-    fn drop_table(&self, name: &str) -> Result<()>;
+    /// Drop a table for transaction `txn_id`, whose store over it goes with it
+    fn drop_table(&self, txn_id: i64, name: &str) -> Result<()>;
 
     /// A creation no table has yet, for a table a transaction creates
     fn new_creation(&self) -> u64;
@@ -150,8 +150,8 @@ pub trait TransactionEngineOperations: Send + Sync {
     fn table_creation(&self, name: &str) -> u64;
 
     /// Drops the table made with `creation`, under whatever name it has
-    /// now; none left is not an error
-    fn drop_created(&self, creation: u64) -> Result<()>;
+    /// now, and transaction `txn_id`'s store over it; none left is not an error
+    fn drop_created(&self, txn_id: i64, creation: u64) -> Result<()>;
 
     /// The guard a DDL statement holds, so an undo of table changes runs
     /// as one: no other DDL lands between its catalog, store and log steps
@@ -467,7 +467,7 @@ impl MvccTransaction {
         let _ddl = (!changes.is_empty()).then(|| ops.ddl_guard());
         for change in changes.iter().rev() {
             let undone = match change {
-                TableChange::Created(creation) => ops.drop_created(*creation),
+                TableChange::Created(creation) => ops.drop_created(txn_id, *creation),
                 TableChange::Dropped {
                     name,
                     schema,
@@ -855,7 +855,7 @@ impl Transaction for MvccTransaction {
 
         let ops = self.get_engine_ops()?;
         let creation = ops.table_creation(name);
-        let dropped = ops.drop_table(name);
+        let dropped = ops.drop_table(self.id, name);
         let name_lower = name.to_lowercase();
         // A drop that fails after the catalog lets go of the table still dropped it
         let gone = dropped.is_ok()

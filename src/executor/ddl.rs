@@ -23,6 +23,7 @@
 //! - CREATE VIEW
 //! - DROP VIEW
 
+use super::dml::StatementRollback;
 use super::utils::eq_names;
 use crate::core::{DataType, Error, ForeignKeyAction, ForeignKeyConstraint, Result, SchemaBuilder};
 use crate::parser::ast::*;
@@ -627,21 +628,39 @@ impl Executor {
 
         let schema = schema_builder.build();
 
-        // Create the table
-        self.engine.create_table(schema)?;
-
-        // Insert the rows into the new table
         let rows_count = rows.len();
-        if !rows.is_empty() {
-            let mut tx = self.begin_transaction()?;
-            let mut table = tx.get_statement_table(table_name)?;
-
-            for row in rows {
-                let _ = table.insert(row)?;
+        let mut active_tx = self.active_transaction.lock();
+        match active_tx.as_mut() {
+            // The active transaction's rollback drops the table and its rows
+            Some(tx_state) => {
+                tx_state
+                    .transaction
+                    .create_table_with_indexes(table_name, schema, &[])?;
+                let statement_rollback = StatementRollback::new(&self.engine, Some(&*tx_state));
+                let mut table = tx_state.transaction.get_statement_table(table_name)?;
+                tx_state.tables.insert(
+                    table_name.to_lowercase(),
+                    tx_state.transaction.get_statement_table(table_name)?,
+                );
+                drop(active_tx);
+                let inserted = rows
+                    .into_iter()
+                    .try_for_each(|row| table.insert(row).map(drop));
+                statement_rollback.finish(inserted)?;
             }
-
-            // Commit the transaction - it will commit all tables via commit_all_tables()
-            tx.commit()?;
+            None => {
+                drop(active_tx);
+                self.engine.create_table(schema)?;
+                if !rows.is_empty() {
+                    let mut tx = self.begin_transaction()?;
+                    let mut table = tx.get_statement_table(table_name)?;
+                    for row in rows {
+                        let _ = table.insert(row)?;
+                    }
+                    // Commit the transaction - it will commit all tables via commit_all_tables()
+                    tx.commit()?;
+                }
+            }
         }
 
         Ok(Box::new(ExecResult::with_rows_affected(rows_count as i64)))

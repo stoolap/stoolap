@@ -9970,9 +9970,10 @@ struct EngineOperations {
 // EngineOperations is Send + Sync because all fields are Arc-wrapped thread-safe types
 
 impl EngineOperations {
-    /// Drops the table named `name`; with `creation`, only the table made
-    /// with it, false when the name holds another table now
-    fn drop_table_of(&self, name: &str, creation: Option<u64>) -> Result<bool> {
+    /// Drops the table named `name` for transaction `txn_id`, whose store
+    /// over it goes with it; with `creation`, only the table made with it,
+    /// false when the name holds another table now
+    fn drop_table_of(&self, txn_id: i64, name: &str, creation: Option<u64>) -> Result<bool> {
         let table_name_lower = name.to_lowercase();
         // A view taken before the rows go, or while they go, is overtaken
         let _destruction = self.registry.begin_destruction();
@@ -9997,11 +9998,10 @@ impl EngineOperations {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::table_unlisted();
         // Close and remove version store
-        {
-            let mut stores = self.version_stores().write();
-            if let Some(store) = stores.remove(&table_name_lower) {
-                store.close();
-            }
+        let dropped = self.version_stores().write().remove(&table_name_lower);
+        if let Some(store) = dropped {
+            store.close();
+            self.let_go_of_store_over(txn_id, &store);
         }
 
         // Record DDL to WAL so the drop survives crash recovery
@@ -10025,6 +10025,18 @@ impl EngineOperations {
         self.ddl
             .changed(&neighbors.iter().map(String::as_str).collect::<Vec<_>>());
         Ok(true)
+    }
+
+    /// Lets go of transaction `txn_id`'s stores over `store`, a table it
+    /// dropped, so a table made again under the name gets a store of its own
+    fn let_go_of_store_over(&self, txn_id: i64, store: &VersionStore) {
+        let mut gone: smallvec::SmallVec<[TxnTableEntry; 1]> = smallvec::SmallVec::new();
+        if let Some(txn_tables) = self.txn_version_stores().write().get_mut(txn_id) {
+            while let Some(at) = txn_tables.iter().position(|(_, s)| s.is_over(store)) {
+                gone.push(txn_tables.remove(at));
+            }
+        }
+        Self::discard_stores(&gone);
     }
 
     /// Lets the rows and claims of stores a handle handed out may hold past
@@ -10561,7 +10573,7 @@ impl TransactionEngineOperations for EngineOperations {
             stores.insert(table_name.clone(), Arc::clone(&version_store));
         }
         if let Err(e) = self.record_created_table(txn_id, name, &schema_data) {
-            let _ = self.drop_table(name);
+            let _ = self.drop_table(txn_id, name);
             return Err(e);
         }
         // The caches keyed by the schema epoch, the foreign key map among them, see the table
@@ -10576,8 +10588,8 @@ impl TransactionEngineOperations for EngineOperations {
         Ok(Box::new(table))
     }
 
-    fn drop_table(&self, name: &str) -> Result<()> {
-        self.drop_table_of(name, None).map(|_| ())
+    fn drop_table(&self, txn_id: i64, name: &str) -> Result<()> {
+        self.drop_table_of(txn_id, name, None).map(|_| ())
     }
 
     fn new_creation(&self) -> u64 {
@@ -10591,7 +10603,7 @@ impl TransactionEngineOperations for EngineOperations {
             .map_or(0, |store| store.creation())
     }
 
-    fn drop_created(&self, creation: u64) -> Result<()> {
+    fn drop_created(&self, txn_id: i64, creation: u64) -> Result<()> {
         loop {
             let name = self
                 .version_stores()
@@ -10603,7 +10615,7 @@ impl TransactionEngineOperations for EngineOperations {
                 return Ok(());
             };
             // A rename between the search and the drop searches again
-            if self.drop_table_of(&name, Some(creation))? {
+            if self.drop_table_of(txn_id, &name, Some(creation))? {
                 return Ok(());
             }
         }
