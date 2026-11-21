@@ -128,6 +128,16 @@ fn a_nested_with_that_redefines_the_name_is_not_a_read_of_it() {
 }
 
 #[test]
+fn a_nested_recursive_cte_s_first_member_reads_the_outer_name() {
+    let db = Database::open("memory://recursive_cte_list_members_inner_anchor").unwrap();
+    let sql = "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n FROM (\
+               WITH RECURSIVE r(n) AS (SELECT n + 1 FROM r WHERE n < 3 \
+               UNION ALL SELECT n FROM r WHERE FALSE) SELECT n FROM r) s) \
+               SELECT n FROM r ORDER BY n";
+    assert_eq!(values(&db, sql), Ok(vec![1, 2, 3]), "{sql}");
+}
+
+#[test]
 fn a_recursive_cte_with_its_own_order_or_cut_is_refused() {
     let db = Database::open("memory://recursive_cte_list_members_order").unwrap();
     for clause in [
