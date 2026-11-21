@@ -84,8 +84,9 @@ const COMPRESSION_THRESHOLD: usize = 64;
 /// A payload above this size gives its scratch buffer back once encoded
 const KEPT_SCRATCH_BYTES: usize = 64 * 1024;
 
-/// What one thread reuses to compress WAL payloads: the LZ4 hash table,
-/// allocated and zeroed per call otherwise, and the output buffer
+/// What one thread reuses to compress WAL payloads: the LZ4 hash table of
+/// 16-bit entries, allocated and zeroed per call otherwise, and the output
+/// buffer
 struct WalCompression {
     table: lz4_flex::block::CompressTable,
     packed: Vec<u8>,
@@ -93,15 +94,21 @@ struct WalCompression {
 
 impl WalCompression {
     /// `data` compressed as `lz4_flex::compress_prepend_size` lays it out,
-    /// its length first; None if LZ4 refuses it
+    /// its length first; None if LZ4 refuses it. A payload too long for
+    /// 16-bit entries gets a table of its own, as that function gives it,
+    /// so the kept one stays the table a shorter payload is hashed with
     fn compress(&mut self, data: &[u8]) -> Option<&[u8]> {
+        use lz4_flex::block::{compress_into_with_table, CompressTable};
         let bound = lz4_flex::block::get_maximum_output_size(data.len());
         self.packed.clear();
         self.packed.resize(4 + bound, 0);
         self.packed[..4].copy_from_slice(&(data.len() as u32).to_le_bytes());
-        let len =
-            lz4_flex::block::compress_into_with_table(data, &mut self.packed[4..], &mut self.table)
-                .ok()?;
+        let out = &mut self.packed[4..];
+        let len = match data.len() < u16::MAX as usize {
+            true => compress_into_with_table(data, out, &mut self.table),
+            false => compress_into_with_table(data, out, &mut CompressTable::large()),
+        }
+        .ok()?;
         Some(&self.packed[..4 + len])
     }
 
@@ -2677,9 +2684,24 @@ mod tests {
 
     #[test]
     fn a_compressed_record_is_laid_out_as_lz4_lays_it_out_whatever_came_before() {
-        // Small, one past the 16-bit table that grows it, then small again
-        for len in [64, 300, 5_000, 70_000, 300, 64] {
-            let data: Vec<u8> = (0..len).map(|i| (i % 7) as u8).collect();
+        let periodic = |len: usize| (0..len).map(|i| (i % 7) as u8).collect::<Vec<u8>>();
+        // Matches that a 4-byte hash finds and a 5-byte hash does not
+        let mut short_matches = b"zABCDxABCDy".to_vec();
+        short_matches.resize(64, 0);
+        // Small, either side of the 16-bit table's limit, past it, then
+        // small again
+        let payloads = [
+            periodic(64),
+            periodic(300),
+            periodic(5_000),
+            periodic(u16::MAX as usize - 1),
+            periodic(u16::MAX as usize),
+            periodic(70_000),
+            short_matches,
+            periodic(300),
+        ];
+        for data in payloads {
+            let len = data.len();
             let entry = WALEntry::new(
                 1,
                 "t".to_string(),
