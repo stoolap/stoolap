@@ -61,6 +61,12 @@ const ANSWERED: &[(&str, &[i64], &[&str])] = &[
         &[],
         &["NULL|6", "1|6", "0|6"],
     ),
+    (
+        "SELECT id % 2, COUNT(*) OVER () FROM t GROUP BY id % 2 \
+         ORDER BY STRING_AGG(CAST(a AS TEXT), ',' ORDER BY a)",
+        &[],
+        &["1|2", "0|2"],
+    ),
 ];
 
 fn open(dir: &tempfile::TempDir, sealed: bool) -> Database {
