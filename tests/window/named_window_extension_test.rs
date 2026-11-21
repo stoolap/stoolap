@@ -95,3 +95,40 @@ fn test_two_extensions_of_one_window_stay_apart() {
         .collect();
     assert_eq!(ids, [2, 3, 6, 1, 5, 4]);
 }
+
+#[test]
+fn test_a_window_clause_defines_every_window_it_lists() {
+    let db = setup("named_window_list");
+    let rows = |sql: &str| -> Vec<Vec<i64>> {
+        db.query(sql, ())
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .map(|r| {
+                let r = r.unwrap();
+                (0..r.len()).map(|i| r.get::<i64>(i).unwrap()).collect()
+            })
+            .collect()
+    };
+    let want: Vec<Vec<i64>> = vec![
+        vec![1, 21, 1, 1],
+        vec![2, 21, 2, 2],
+        vec![3, 50, 3, 1],
+        vec![4, 75, 4, 1],
+        vec![5, 75, 5, 2],
+        vec![6, 75, 6, 3],
+    ];
+    assert_eq!(
+        rows(
+            "SELECT id, SUM(b) OVER w1, COUNT(*) OVER w2, ROW_NUMBER() OVER w3 FROM hx \
+             WINDOW w1 AS (PARTITION BY a), w2 AS (ORDER BY id), w3 AS (PARTITION BY a ORDER BY id) \
+             ORDER BY id"
+        ),
+        want
+    );
+    assert_eq!(
+        rows(
+            "SELECT id, SUM(b) OVER (PARTITION BY a), COUNT(*) OVER (ORDER BY id), \
+             ROW_NUMBER() OVER (PARTITION BY a ORDER BY id) FROM hx ORDER BY id"
+        ),
+        want
+    );
+}
