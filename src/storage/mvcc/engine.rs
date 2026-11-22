@@ -3606,15 +3606,37 @@ impl MVCCEngine {
                     ));
                 }
                 let nullable = data[pos] != 0;
+                pos += 1;
+                // A record of a change that took a DEFAULT or a CHECK ends
+                // with which it took, then each one's length and text
+                let taken = data.get(pos).copied().unwrap_or(0);
+                pos += 1;
+                let mut text = |is_taken: bool| -> Result<Option<String>> {
+                    if !is_taken {
+                        return Ok(None);
+                    }
+                    let truncated = || Error::internal("invalid ModifyColumn data: truncated");
+                    let length = data.get(pos..pos + 4).ok_or_else(truncated)?;
+                    let length = u32::from_le_bytes(length.try_into().unwrap()) as usize;
+                    let bytes = data.get(pos + 4..pos + 4 + length).ok_or_else(truncated)?;
+                    pos += 4 + length;
+                    String::from_utf8(bytes.to_vec())
+                        .map(Some)
+                        .map_err(|e| Error::internal(format!("invalid ModifyColumn text: {e}")))
+                };
+                let default = text(taken & 1 != 0)?;
+                let check = text(taken & 2 != 0)?;
 
-                // Apply the MODIFY COLUMN using engine method
-                self.modify_column_with_dimensions(
-                    &table_name,
-                    &column_name,
+                self.apply_column_change(&ColumnTypeChange {
+                    table: &table_name,
+                    column: &column_name,
                     data_type,
                     nullable,
                     vector_dimensions,
-                )?;
+                    default: default.as_deref(),
+                    check: check.as_deref(),
+                    judge: None,
+                })?;
             }
             ALTER_RENAME_TABLE => {
                 // The table_name read above is the old name
@@ -5327,17 +5349,25 @@ impl MVCCEngine {
         nullable: bool,
         vector_dimensions: u16,
     ) -> Result<()> {
-        if !self.is_open() {
-            return Err(Error::EngineNotOpen);
-        }
-        let _ddl = self.ddl_guard();
-        self.change_column_type(&ColumnTypeChange {
+        self.apply_column_change(&ColumnTypeChange {
             table: table_name,
             column: column_name,
             data_type,
             nullable,
             vector_dimensions,
+            default: None,
+            check: None,
+            judge: None,
         })
+    }
+
+    /// `change` under the DDL guard; WAL replay applies it unrecorded
+    fn apply_column_change(&self, change: &ColumnTypeChange<'_>) -> Result<()> {
+        if !self.is_open() {
+            return Err(Error::EngineNotOpen);
+        }
+        let _ddl = self.ddl_guard();
+        self.change_column_type(change)
     }
 
     /// Changes a column's definition in every layer and records it, except

@@ -1018,6 +1018,9 @@ impl Transaction for MvccTransaction {
             data_type: column.data_type,
             nullable: column.nullable,
             vector_dimensions: column.vector_dimensions,
+            default: None,
+            check: None,
+            judge: None,
         })
     }
 

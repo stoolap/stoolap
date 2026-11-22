@@ -171,16 +171,16 @@ fn validate_fk_reference(
 
 /// An error for the first constraint of `column` that ALTER TABLE
 /// `operation` cannot keep: refused, never accepted and ignored. NOT NULL
-/// is kept by both ADD and MODIFY COLUMN, a DEFAULT only where `default`
+/// and DEFAULT are kept by both ADD and MODIFY COLUMN, a CHECK only where
+/// `check`
 fn refuse_unkept_constraints(
     column: &ColumnDefinition,
     operation: &str,
-    default: bool,
+    check: bool,
 ) -> Result<()> {
     let unkept = column.constraints.iter().find_map(|c| match c {
-        ColumnConstraint::NotNull => None,
-        ColumnConstraint::Default(_) => (!default).then_some("DEFAULT"),
-        ColumnConstraint::Check(_) => Some("CHECK"),
+        ColumnConstraint::NotNull | ColumnConstraint::Default(_) => None,
+        ColumnConstraint::Check(_) => (!check).then_some("CHECK"),
         ColumnConstraint::Unique => Some("UNIQUE"),
         ColumnConstraint::PrimaryKey => Some("PRIMARY KEY"),
         ColumnConstraint::AutoIncrement => Some("AUTO_INCREMENT"),
@@ -1144,7 +1144,7 @@ impl Executor {
         match stmt.operation {
             AlterTableOperation::AddColumn => {
                 if let Some(ref col_def) = stmt.column_def {
-                    refuse_unkept_constraints(col_def, "ADD COLUMN", true)?;
+                    refuse_unkept_constraints(col_def, "ADD COLUMN", false)?;
                     let data_type = self.parse_data_type(&col_def.data_type)?;
                     let nullable = !col_def
                         .constraints
@@ -1370,7 +1370,39 @@ impl Executor {
             },
             AlterTableOperation::ModifyColumn => {
                 if let Some(ref col_def) = stmt.column_def {
-                    refuse_unkept_constraints(col_def, "MODIFY COLUMN", false)?;
+                    refuse_unkept_constraints(col_def, "MODIFY COLUMN", true)?;
+                    let schema = self.engine.get_table_schema(table_name)?;
+                    let (_, column) = schema
+                        .find_column(&col_def.name.value)
+                        .ok_or_else(|| Error::ColumnNotFound(col_def.name.value.to_string()))?;
+                    let names: Vec<String> =
+                        schema.columns.iter().map(|c| c.name.clone()).collect();
+                    let mut default = None;
+                    let mut check = None;
+                    for constraint in &col_def.constraints {
+                        match constraint {
+                            ColumnConstraint::Default(expr) if default.is_none() => {
+                                constraint_expression("DEFAULT", &column.name, expr, None)?;
+                                default = Some(expr.to_string());
+                            }
+                            ColumnConstraint::Check(expr) if check.is_none() => {
+                                constraint_expression("CHECK", &column.name, expr, Some(&names))?;
+                                check = Some(super::dml::compile_check(
+                                    &schema,
+                                    &names,
+                                    Some(&column.name),
+                                    &expr.to_string(),
+                                )?);
+                            }
+                            _ => {}
+                        }
+                    }
+                    // Each row the table holds is judged by the CHECK it takes
+                    let vm = std::cell::RefCell::new(super::expression::ExprVM::new());
+                    let judge = |row: &crate::core::Row| match &check {
+                        Some(check) => super::dml::run_check(&mut vm.borrow_mut(), check, row),
+                        None => Ok(()),
+                    };
                     let data_type = self.parse_data_type(&col_def.data_type)?;
                     let nullable = !col_def
                         .constraints
@@ -1388,6 +1420,9 @@ impl Executor {
                             data_type,
                             nullable,
                             vector_dimensions,
+                            default: default.as_deref(),
+                            check: check.as_ref().map(|check| check.text.as_str()),
+                            judge: check.as_ref().map(|_| &judge as _),
                         },
                     )?;
                 } else {
