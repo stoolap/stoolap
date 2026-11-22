@@ -2468,7 +2468,7 @@ impl ExprVM {
 
     /// `a op b` over two numbers, an INTEGER pair by `int_op`, any pair
     /// holding a FLOAT by `float`; NULL for a zero divisor
-    #[inline]
+    #[inline(always)]
     fn arithmetic_op(a: &Value, b: &Value, int_op: IntegerOp, float: FloatOp) -> Result<Value> {
         let floats = match (a, b) {
             (Value::Integer(x), Value::Integer(y)) => {
