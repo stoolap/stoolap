@@ -2958,6 +2958,10 @@ pub enum AlterTableOperation {
     DropClusterBy,
     /// AUTO_INCREMENT = n: the next generated id is n
     AutoIncrement(i64),
+    /// ALTER COLUMN name DROP DEFAULT: the column's default is NULL
+    DropColumnDefault,
+    /// ALTER COLUMN name DROP CHECK: the column has no CHECK of its own
+    DropColumnCheck,
 }
 
 /// ALTER TABLE statement
@@ -2996,6 +3000,16 @@ impl fmt::Display for AlterTableStatement {
             AlterTableOperation::ModifyColumn => {
                 if let Some(ref col) = self.column_def {
                     result.push_str(&format!("MODIFY COLUMN {}", col));
+                }
+            }
+            AlterTableOperation::DropColumnDefault => {
+                if let Some(ref name) = self.column_name {
+                    result.push_str(&format!("ALTER COLUMN {} DROP DEFAULT", name));
+                }
+            }
+            AlterTableOperation::DropColumnCheck => {
+                if let Some(ref name) = self.column_name {
+                    result.push_str(&format!("ALTER COLUMN {} DROP CHECK", name));
                 }
             }
             AlterTableOperation::RenameTable => {

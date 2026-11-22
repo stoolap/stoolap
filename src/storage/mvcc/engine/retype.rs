@@ -47,7 +47,8 @@ pub struct ColumnTypeChange<'a> {
     pub vector_dimensions: u16,
     /// The DEFAULT the column takes, None keeping its own
     pub default: Option<&'a str>,
-    /// The CHECK the column takes, None keeping its own
+    /// The CHECK the column takes, None keeping its own and an empty text
+    /// leaving it with none
     pub check: Option<&'a str>,
     /// Judges a live row, in the new definition, by the CHECK taken; the
     /// log's replay judges none
@@ -91,7 +92,7 @@ pub(super) fn change_column_type(shared: &Shared<'_>, change: &ColumnTypeChange<
         next.columns[column].default_expr = Some(default.to_string());
     }
     if let Some(check) = change.check {
-        next.columns[column].check_expr = Some(check.to_string());
+        next.columns[column].check_expr = (!check.is_empty()).then(|| check.to_string());
     }
     // A volume sealed before the column was added reads its default
     let default = next.columns[column].default_value.take();
@@ -126,7 +127,14 @@ pub(super) fn change_column_type(shared: &Shared<'_>, change: &ColumnTypeChange<
         name.as_ref(),
     )?;
 
-    let cast = store.prepare_cast(column, CompactArc::clone(&next), retyped)?;
+    // A change of the default or the CHECK alone, judging no row, reads none
+    let rowless = !retyped
+        && (change.nullable || !current.columns[column].nullable)
+        && change.judge.is_none();
+    let cast = match rowless {
+        true => HotCast::of_schema(CompactArc::clone(&next)),
+        false => store.prepare_cast(column, CompactArc::clone(&next), retyped)?,
+    };
     let mgr = if shared.replaying {
         None
     } else {
@@ -148,7 +156,7 @@ pub(super) fn change_column_type(shared: &Shared<'_>, change: &ColumnTypeChange<
         &next,
         column,
         change,
-        retyped || !change.nullable || change.judge.is_some(),
+        !rowless,
         !shared.replaying,
     );
     // The new HNSW objects take the sealed rows before anything is decided

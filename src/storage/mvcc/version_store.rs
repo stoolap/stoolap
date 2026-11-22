@@ -1813,6 +1813,17 @@ struct CastHead {
 }
 
 impl HotCast {
+    /// A cast that publishes `schema` and leaves every row as it is, for a
+    /// change no row's value or validity depends on
+    pub fn of_schema(schema: CompactArc<Schema>) -> Self {
+        Self {
+            schema,
+            heads: Vec::new(),
+            arena: Vec::new(),
+            indexes: Vec::new(),
+        }
+    }
+
     /// The rows the hot store holds live, in the new type
     pub fn live_rows(&self) -> impl Iterator<Item = (i64, &Row)> {
         self.heads

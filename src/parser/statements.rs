@@ -2697,7 +2697,7 @@ impl Parser<'_> {
             && !self.peek_token.literal.eq_ignore_ascii_case("CLUSTER")
         {
             self.add_error(
-                "expected ALTER action (ADD, DROP, RENAME, MODIFY, CLUSTER BY, AUTO_INCREMENT) after table name"
+                "expected ALTER action (ADD, DROP, RENAME, MODIFY, ALTER COLUMN, CLUSTER BY, AUTO_INCREMENT) after table name"
                     .to_string(),
             );
             return None;
@@ -2838,6 +2838,38 @@ impl Parser<'_> {
                         None,
                     )
                 }
+                "ALTER" => {
+                    // ALTER [COLUMN] name DROP DEFAULT | DROP CHECK
+                    if self.peek_token_is_keyword(Keyword::Column) {
+                        self.next_token();
+                    }
+                    if !self.expect_peek_identifier_like() {
+                        return None;
+                    }
+                    let col_name =
+                        Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
+                    self.next_token();
+                    if !self.cur_token.literal.eq_ignore_ascii_case("DROP") {
+                        self.add_error(format!(
+                            "expected DROP DEFAULT or DROP CHECK after ALTER COLUMN {} at {}",
+                            col_name, self.cur_token.position
+                        ));
+                        return None;
+                    }
+                    self.next_token();
+                    let operation = match self.cur_token.literal.to_uppercase().as_str() {
+                        "DEFAULT" => AlterTableOperation::DropColumnDefault,
+                        "CHECK" => AlterTableOperation::DropColumnCheck,
+                        _ => {
+                            self.add_error(format!(
+                                "expected DEFAULT or CHECK after DROP at {}",
+                                self.cur_token.position
+                            ));
+                            return None;
+                        }
+                    };
+                    (operation, None, Some(col_name), None, None)
+                }
                 "AUTO_INCREMENT" | "AUTOINCREMENT" => {
                     if self.peek_token_is_operator("=") {
                         self.next_token();
@@ -2871,7 +2903,7 @@ impl Parser<'_> {
                 }
                 _ => {
                     self.add_error(format!(
-                        "expected ADD, DROP, RENAME, MODIFY, CLUSTER BY or AUTO_INCREMENT at {}",
+                        "expected ADD, DROP, RENAME, MODIFY, ALTER COLUMN, CLUSTER BY or AUTO_INCREMENT at {}",
                         self.cur_token.position
                     ));
                     return None;
