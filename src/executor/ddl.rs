@@ -1412,7 +1412,7 @@ impl Executor {
                 if let Some(ref col_def) = stmt.column_def {
                     refuse_unkept_constraints(col_def, "MODIFY COLUMN")?;
                     let schema = self.engine.get_table_schema(table_name)?;
-                    let (_, column) = schema
+                    let (at, column) = schema
                         .find_column(&col_def.name.value)
                         .ok_or_else(|| Error::ColumnNotFound(col_def.name.value.to_string()))?;
                     let names: Vec<String> =
@@ -1427,22 +1427,11 @@ impl Executor {
                             }
                             ColumnConstraint::Check(expr) if check.is_none() => {
                                 constraint_expression("CHECK", &column.name, expr, Some(&names))?;
-                                check = Some(super::dml::compile_check(
-                                    &schema,
-                                    &names,
-                                    Some(&column.name),
-                                    &expr.to_string(),
-                                )?);
+                                check = Some(expr.to_string());
                             }
                             _ => {}
                         }
                     }
-                    // Each row the table holds is judged by the CHECK it takes
-                    let vm = std::cell::RefCell::new(super::expression::ExprVM::new());
-                    let judge = |row: &crate::core::Row| match &check {
-                        Some(check) => super::dml::run_check(&mut vm.borrow_mut(), check, row),
-                        None => Ok(()),
-                    };
                     let data_type = self.parse_data_type(&col_def.data_type)?;
                     let nullable = !col_def
                         .constraints
@@ -1453,6 +1442,27 @@ impl Executor {
                     } else {
                         0
                     };
+                    // Each row the table holds is judged by the CHECK the
+                    // column takes and, its type changing, by every CHECK
+                    // of the table that reads it
+                    let retyped = data_type != column.data_type
+                        || vector_dimensions != column.vector_dimensions;
+                    let mut next = crate::core::Schema::clone(&schema);
+                    if let Some(text) = &check {
+                        next.columns[at].check_expr = Some(text.clone());
+                    }
+                    let mut judges = super::dml::compile_check_programs(&next)?;
+                    judges.retain(|judged| {
+                        let taken = check.is_some()
+                            && judged.column.as_deref() == Some(column.name.as_str());
+                        taken || (retyped && judged.reads.contains(&at))
+                    });
+                    let vm = std::cell::RefCell::new(super::expression::ExprVM::new());
+                    let judge = |row: &crate::core::Row| {
+                        judges.iter().try_for_each(|judged| {
+                            super::dml::run_check(&mut vm.borrow_mut(), judged, row)
+                        })
+                    };
                     self.engine.change_column_type(
                         &crate::storage::mvcc::engine::ColumnTypeChange {
                             table: table_name,
@@ -1461,8 +1471,8 @@ impl Executor {
                             nullable,
                             vector_dimensions,
                             default: default.as_deref(),
-                            check: check.as_ref().map(|check| check.text.as_str()),
-                            judge: check.as_ref().map(|_| &judge as _),
+                            check: check.as_deref(),
+                            judge: (!judges.is_empty()).then_some(&judge as _),
                         },
                     )?;
                 } else {
