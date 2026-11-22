@@ -2251,6 +2251,10 @@ impl MVCCEngine {
             return None;
         }
 
+        // The id a marker keeps is used again here: no new volume takes it
+        if let Some(volume_id) = marked {
+            crate::storage::volume::io::keep_volume_ids_above(volume_id);
+        }
         let volume_id = marked.unwrap_or_else(crate::storage::volume::io::next_volume_id);
         let dest_name = format!("vol_{:016x}.vol", volume_id);
         let dest_path = table_vol_dir.join(&dest_name);

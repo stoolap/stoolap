@@ -1514,3 +1514,36 @@ fn test_migration_v037_a_promotion_that_failed_part_way_migrates_again_at_the_ne
     assert_eq!(query_i64(&db, "SELECT COUNT(*) FROM orders"), 22);
     db.close().unwrap();
 }
+
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn test_migration_v037_a_seal_takes_no_id_a_promoted_snapshot_volume_kept() {
+    use stoolap::test_failpoints::{self, FailpointGuard};
+
+    let _failpoints = FailpointGuard::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let db_dir = tmp.path().join("kept_id");
+    copy_v037db_with_a_large_snapshot(&db_dir);
+    // The snapshot of big keeps an earlier promotion's id, its copy under
+    // volumes/ gone; the clock reads less at the open and that id after it
+    let kept: u64 = 2_000_000;
+    let marker = "snapshots/big/snapshot-20260321-124840.739.vol.promoted";
+    std::fs::write(db_dir.join(marker), kept.to_string()).unwrap();
+    test_failpoints::forget_volume_ids();
+    test_failpoints::hold_volume_clock(Some(1_000_000));
+
+    let dsn = format!("file://{}?checkpoint_interval=0", db_dir.display());
+    let db = Database::open(&dsn).unwrap();
+    test_failpoints::hold_volume_clock(Some(kept));
+    db.execute("INSERT INTO big VALUES (100001, 'new')", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let rows = "SELECT COUNT(*) FROM big";
+    assert_eq!(query_i64(&db, rows), 100_001, "after the seal");
+    db.close().unwrap();
+
+    test_failpoints::forget_volume_ids();
+    let db = Database::open(&dsn).unwrap();
+    assert_eq!(query_i64(&db, rows), 100_001, "after reopening");
+    db.close().unwrap();
+}

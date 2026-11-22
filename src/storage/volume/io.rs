@@ -889,7 +889,7 @@ pub fn next_volume_id() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_micros() as u64;
-    #[cfg(feature = "test-failpoints")]
+    #[cfg(any(test, feature = "test-failpoints"))]
     let micros = crate::test_failpoints::held_volume_clock().unwrap_or(micros);
     loop {
         let current = NEWEST_VOLUME_ID.load(Ordering::Acquire);
@@ -919,7 +919,7 @@ pub(crate) fn keep_volume_ids_above(id: u64) {
 }
 
 /// Forgets the ids handed out, as a new process does
-#[cfg(feature = "test-failpoints")]
+#[cfg(any(test, feature = "test-failpoints"))]
 pub(crate) fn forget_volume_ids() {
     NEWEST_VOLUME_ID.store(0, std::sync::atomic::Ordering::Release);
 }
