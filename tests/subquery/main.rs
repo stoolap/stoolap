@@ -45,6 +45,7 @@ mod nested_subquery_binding_test;
 mod not_exists_null_scan_test;
 mod not_in_null_once_test;
 mod not_in_subquery_null_test;
+mod point_block_answer_test;
 mod quantified_subquery_bounds_test;
 mod row_count_rule_test;
 mod scalar_subquery_test;

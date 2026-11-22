@@ -168,3 +168,33 @@ fn test_prepared_insert_subqueries_keep_the_compiled_insert() {
          {returning} with a RETURNING subquery, {plain_returning} without"
     );
 }
+
+#[test]
+fn test_a_values_subquery_keyed_by_a_parameter_keeps_no_answer() {
+    let db = table("insert_plan_alloc_parameter_key");
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, x INTEGER)", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO u SELECT value, value FROM generate_series(1, 3000)",
+        (),
+    )
+    .unwrap();
+    let per_run = |sql: &str, first: i64| {
+        let insert = db.prepare(sql).unwrap();
+        insert.execute((first,)).unwrap();
+        let before = allocations();
+        for id in first + 1..=first + ROWS {
+            insert.execute((id,)).unwrap();
+        }
+        (allocations() - before) / ROWS as usize
+    };
+    let plain = per_run("INSERT INTO t VALUES ($1, 1, 'x')", 0);
+    let keyed = per_run(
+        "INSERT INTO t VALUES ($1, (SELECT x FROM u WHERE id = $1), 'x')",
+        1_000,
+    );
+    assert!(
+        keyed <= plain + 2,
+        "{keyed} allocations with a VALUES subquery read by a parameter's key, {plain} without"
+    );
+}
