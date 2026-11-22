@@ -302,7 +302,9 @@ fn a_cached_answer_keeps_the_type_of_an_arithmetic_it_reads() {
     let warm = Database::open("memory://condition_rule_arith_warm").unwrap();
     fill(&warm);
     assert_eq!(all_rows(&warm, "SELECT * FROM t WHERE t.s IS NULL"), Ok(0));
-    assert_eq!(all_rows(&warm, sql), all_rows(&cold, sql));
+    // 'x' * 1 is NULL, so the one row passes on either cache
+    assert_eq!(all_rows(&cold, sql), Ok(1), "cold");
+    assert_eq!(all_rows(&warm, sql), Ok(1), "warm");
 }
 
 #[test]
