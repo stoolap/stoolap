@@ -17290,11 +17290,13 @@ impl<'a> PreparedRunner<'a> {
         Ok(answer)
     }
 
-    /// [`Self::kept`] for a value block. One that reads a row by its key
-    /// and takes a parameter computes its answer each run: a key that
-    /// changes from run to run misses, and the read costs less than keeping
+    /// [`Self::kept`] for value block `index`. A call that reads one row by
+    /// a parameter's key computes its answer and keeps none: a key that
+    /// changes from run to run misses, and the read costs less than keeping.
+    /// A call the key read does not take, as one whose key is no integer, keeps
     fn kept_value(
         &self,
+        index: usize,
         sq: &PreparedSubquery,
         existence: &Kept,
         compute: impl FnOnce() -> Result<BlockAnswer>,
@@ -17303,7 +17305,12 @@ impl<'a> PreparedRunner<'a> {
             .params
             .as_deref()
             .is_none_or(|read| !read.is_empty());
-        match sq.point.is_some() && by_parameter {
+        // The statement's parameters stand in the buffer before its first fill
+        let by_key = by_parameter
+            && sq.grouping.is_none()
+            && sq.order.is_none()
+            && (self.point_key(index, sq, &self.blocks[index].buffer.borrow())).is_some();
+        match by_key {
             true => compute(),
             false => self.kept(existence, compute),
         }
@@ -17554,7 +17561,7 @@ impl PreparedRunner<'_> {
             return Ok(value);
         }
         let answer = self.read_once(index, || {
-            self.kept_value(sq, kept, || {
+            self.kept_value(index, sq, kept, || {
                 self.scalar_value(index, sq, projection, caller, site)
                     .map(BlockAnswer::Value)
             })
