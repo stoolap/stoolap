@@ -1772,7 +1772,8 @@ impl<'a> RowFeed<'a> {
                 })
                 .collect::<Result<_>>()?;
             // A part whose FLOAT sum could pass the range on the way, merged
-            // or alone, adds its rows in order instead, as one run would
+            // or alone, adds its rows in order instead; rounding near the
+            // limit stays order-dependent, as the docs say
             let reads = RowReads {
                 params,
                 transaction_id,
