@@ -16970,25 +16970,19 @@ impl<'a> PreparedRunner<'a> {
             };
         }
         // The conjunction's own steps: only a FALSE skips what follows it,
-        // and each pair of operands meets as the VM's AND meets them
-        let mut acc: Option<Value> = None;
+        // and each operand meets the ones before as the VM's AND meets
+        // them, read as a condition before the next step runs
+        let mut acc = Value::Boolean(true);
         for (program, slots) in &sq.rest {
-            if matches!(acc, Some(Value::Boolean(false))) {
+            if matches!(acc, Value::Boolean(false)) {
                 break;
             }
             if let Some((_, e)) = failed.iter().find(|(slot, _)| slots.contains(slot)) {
                 return Err(e.clone());
             }
-            let value = vm.execute(program, exec)?;
-            acc = Some(match acc {
-                None => value,
-                Some(left) => ExprVM::and(&left, &value)?,
-            });
+            acc = ExprVM::and(&acc, &vm.execute(program, exec)?)?;
         }
-        match &acc {
-            Some(value) => ExprVM::passes(value),
-            None => Ok(true),
-        }
+        ExprVM::passes(&acc)
     }
 
     /// Whether an EXISTS block's candidate passes for the buffer filled:

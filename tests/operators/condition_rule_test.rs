@@ -155,6 +155,7 @@ fn a_condition_whose_type_the_statement_writes_fails_when_it_is_parsed() {
             ("0.5", "FLOAT"),
             ("'true'", "TEXT"),
             ("CAST(1 AS TIMESTAMP)", "TIMESTAMP"),
+            ("INTERVAL '1 day'", "TEXT"),
         ] {
             let sql = place.replace("{c}", literal);
             let got = db.execute(&sql, ()).map(|_| ()).map_err(|e| e.to_string());
@@ -256,4 +257,58 @@ fn a_check_whose_value_is_computed_refuses_the_row_that_reads_another_type() {
         .unwrap_err()
         .to_string();
     assert!(err.contains(&refusal("TEXT")), "{err}");
+}
+
+/// Every row of `sql`, or the error that ends it
+fn all_rows(db: &Database, sql: &str) -> Result<usize, String> {
+    db.query(sql, ())
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        .map(|rows| rows.len())
+        .map_err(|e| e.to_string())
+}
+
+#[test]
+fn a_cached_answer_reads_a_condition_before_the_constant_beside_it() {
+    for warm in [false, true] {
+        let db = Database::open(&format!("memory://condition_rule_cache_{warm}")).unwrap();
+        fill(&db);
+        if warm {
+            assert_eq!(all_rows(&db, "SELECT * FROM t WHERE TRUE"), Ok(1));
+            assert_eq!(all_rows(&db, "SELECT * FROM t WHERE FALSE"), Ok(0));
+        }
+        let sql = "SELECT * FROM t WHERE t.f OR TRUE";
+        let got = all_rows(&db, sql);
+        assert!(
+            matches!(&got, Err(e) if e.contains(&refusal("FLOAT"))),
+            "{sql}, cache warm {warm}: {got:?}"
+        );
+    }
+}
+
+#[test]
+fn a_prepared_conjunction_reads_each_step_before_the_next_runs() {
+    let db = Database::open("memory://condition_rule_conjunction").unwrap();
+    fill(&db);
+    db.execute(
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER, f FLOAT, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO u VALUES (1, 1, 0.5, 2)", ())
+        .unwrap();
+    let sql = "SELECT COUNT(*) FROM t WHERE EXISTS \
+               (SELECT 1 FROM u WHERE u.k = t.id AND u.f AND u.v > $1 * 9223372036854775807)";
+    // With 2 the last step overflows before any row is read; u.f, read
+    // before it, is the statement's error
+    let got = db
+        .prepare(sql)
+        .unwrap()
+        .query((2i64,))
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+        .map(|rows| rows.len())
+        .map_err(|e| e.to_string());
+    assert!(
+        matches!(&got, Err(e) if e.contains(&refusal("FLOAT"))),
+        "{sql} with 2: {got:?}"
+    );
 }

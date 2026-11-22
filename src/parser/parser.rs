@@ -602,7 +602,10 @@ impl<'a> Parser<'a> {
     pub(crate) fn note_condition(&mut self, expr: &Expression) {
         if matches!(
             expr,
-            Expression::FloatLiteral(_) | Expression::StringLiteral(_) | Expression::Cast(_)
+            Expression::FloatLiteral(_)
+                | Expression::StringLiteral(_)
+                | Expression::IntervalLiteral(_)
+                | Expression::Cast(_)
         ) {
             self.scope_checked = true;
         }

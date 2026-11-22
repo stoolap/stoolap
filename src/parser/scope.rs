@@ -640,6 +640,8 @@ fn check_condition(expr: &Expression) -> Check {
             None => (Some(DataType::Text), s.token.position),
         },
         Expression::Cast(c) => (c.type_name.parse().ok(), c.token.position),
+        // An INTERVAL reads as its TEXT form
+        Expression::IntervalLiteral(i) => (Some(DataType::Text), i.token.position),
         _ => return Ok(()),
     };
     match written {

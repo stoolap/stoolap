@@ -239,13 +239,9 @@ impl ExpressionSimplifier {
         if self.is_always_false(right) {
             return Some(left.clone());
         }
-        // TRUE OR x → TRUE
+        // TRUE OR x → TRUE; `x OR TRUE` stays, as x is read first
         if self.is_always_true(left) {
             return Some(left.clone());
-        }
-        // x OR TRUE → TRUE
-        if self.is_always_true(right) {
-            return Some(right.clone());
         }
         // x OR x → x
         if self.expr_equals(left, right) {
