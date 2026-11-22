@@ -387,14 +387,15 @@ impl CompiledAggregate {
         )
     }
 
-    /// Whether a SUM or AVG run went past the FLOAT range on finite values,
-    /// see [`SumAccumulator::overflowed`]
-    pub fn overflowed(&self) -> bool {
-        matches!(
-            self,
-            CompiledAggregate::Sum { state } | CompiledAggregate::Avg { state }
-                if state.overflowed()
-        )
+    /// Whether a SUM or AVG run's FLOAT sum is finite, true for any other
+    /// call, see [`SumAccumulator::sum_finite`]
+    pub fn sums_finite(&self) -> bool {
+        match self {
+            CompiledAggregate::Sum { state } | CompiledAggregate::Avg { state } => {
+                state.sum_finite()
+            }
+            _ => true,
+        }
     }
 
     /// Folds a run of the same aggregate over other rows into this one

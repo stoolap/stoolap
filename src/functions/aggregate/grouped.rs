@@ -309,10 +309,10 @@ impl GroupedAggregates {
         &mut self.aggregates[group * calls..][..calls]
     }
 
-    /// Whether a run of a call went past the FLOAT range on finite values,
-    /// which merging would carry: see [`CompiledAggregate::overflowed`]
-    pub fn overflowed(&self) -> bool {
-        self.aggregates.iter().any(CompiledAggregate::overflowed)
+    /// Whether every run's FLOAT sum is finite, so merging these adds as the
+    /// rows added in order: see [`CompiledAggregate::sums_finite`]
+    pub fn sums_finite(&self) -> bool {
+        self.aggregates.iter().all(CompiledAggregate::sums_finite)
     }
 
     /// Folds the groups of a run over other rows into these, see `can_merge`

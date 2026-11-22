@@ -119,57 +119,95 @@ const FLOAT_ROWS: i64 = 210_000;
 #[cfg(feature = "test-failpoints")]
 const FLOAT_PART_ROWS: usize = 100_000;
 
-/// A part boundary between a negative and two positive values near the
-/// FLOAT limit: in order the sum stays finite, the second part alone would
-/// not
-#[test]
-fn a_float_sum_split_in_parts_adds_as_the_rows_come_in_order() {
-    for sealed in [false, true] {
-        let dir = tempfile::tempdir().unwrap();
-        let dsn = format!("file://{}?checkpoint_interval=0", dir.path().display());
-        let db = Database::open(&dsn).unwrap();
+/// f: a -1e308 in the first part and two +1e308 at the start of the second;
+/// g: the same, then a -Infinity after them
+fn float_tables(sealed: bool) -> (tempfile::TempDir, Database) {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}?checkpoint_interval=0", dir.path().display());
+    let db = Database::open(&dsn).unwrap();
+    for (table, after) in [("f", ""), ("g", "WHEN 100003 THEN CAST('-inf' AS FLOAT) ")] {
         db.execute(
-            "CREATE TABLE f (id INTEGER PRIMARY KEY, a INTEGER, x FLOAT)",
+            &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, a INTEGER, x FLOAT)"),
             (),
         )
         .unwrap();
         db.execute(
             &format!(
-                "INSERT INTO f SELECT value, value, CASE value WHEN 1 THEN -1e308 \
-                 WHEN 100001 THEN 1e308 WHEN 100002 THEN 1e308 ELSE 0.0 END \
+                "INSERT INTO {table} SELECT value, value, CASE value WHEN 1 THEN -1e308 \
+                 WHEN 100001 THEN 1e308 WHEN 100002 THEN 1e308 {after}ELSE 0.0 END \
                  FROM generate_series(1, {FLOAT_ROWS})"
             ),
             (),
         )
         .unwrap();
-        if sealed {
-            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
-        }
-        let sql = "SELECT SUM(x), AVG(x) FROM f WHERE a % 2 >= 0";
-        #[cfg(feature = "test-failpoints")]
-        stoolap::test_failpoints::set_scan_part_rows(FLOAT_PART_ROWS);
-        let got: Result<Vec<(f64, f64)>, String> = db
-            .query(sql, ())
-            .map_err(|e| e.to_string())
-            .and_then(|rows| {
-                rows.map(|row| {
-                    let row = row.map_err(|e| e.to_string())?;
-                    let float = |i| match row.get_value(i).unwrap() {
-                        stoolap::Value::Float(f) => Ok(*f),
-                        other => Err(format!("{other:?}")),
-                    };
-                    Ok((float(0)?, float(1)?))
-                })
-                .collect()
-            });
-        #[cfg(feature = "test-failpoints")]
-        stoolap::test_failpoints::set_scan_part_rows(0);
-        assert_eq!(
-            got,
-            Ok(vec![(1e308, 1e308 / FLOAT_ROWS as f64)]),
-            "sealed {sealed}: {sql}"
-        );
     }
+    if sealed {
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    }
+    (dir, db)
+}
+
+/// SUM and AVG of `table`'s x, read with the parts `FLOAT_PART_ROWS` sets
+fn float_sums(db: &Database, table: &str) -> Result<Vec<(f64, f64)>, String> {
+    let sql = format!("SELECT SUM(x), AVG(x) FROM {table} WHERE a % 2 >= 0");
+    #[cfg(feature = "test-failpoints")]
+    stoolap::test_failpoints::set_scan_part_rows(FLOAT_PART_ROWS);
+    let got = db
+        .query(&sql, ())
+        .map_err(|e| e.to_string())
+        .and_then(|rows| {
+            rows.map(|row| {
+                let row = row.map_err(|e| e.to_string())?;
+                let float = |i| match row.get_value(i).unwrap() {
+                    stoolap::Value::Float(f) => Ok(*f),
+                    other => Err(format!("{other:?}")),
+                };
+                Ok((float(0)?, float(1)?))
+            })
+            .collect()
+        });
+    #[cfg(feature = "test-failpoints")]
+    stoolap::test_failpoints::set_scan_part_rows(0);
+    got
+}
+
+/// A part boundary between a negative and two positive values near the
+/// FLOAT limit: in order the sum stays finite, the second part alone would
+/// not, and an infinite value after them is the sum
+#[test]
+fn a_float_sum_split_in_parts_adds_as_the_rows_come_in_order() {
+    let inf = f64::INFINITY;
+    for sealed in [false, true] {
+        let (_dir, db) = float_tables(sealed);
+        for (table, want) in [
+            ("f", (1e308, 1e308 / FLOAT_ROWS as f64)),
+            ("g", (-inf, -inf)),
+        ] {
+            let got = float_sums(&db, table);
+            assert_eq!(got, Ok(vec![want]), "sealed {sealed}: {table}");
+        }
+    }
+}
+
+/// A part whose sum is not finite adds its rows again, each charged
+/// against the deadline as the aggregation charges every row
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_part_added_again_charges_its_rows_against_the_deadline() {
+    use stoolap::executor::DeadlineSite;
+    use stoolap::test_failpoints::{count_deadline_charges, deadline_charges, keep_deadlines};
+    let _guard = stoolap::test_failpoints::FailpointGuard::new();
+    let (_dir, db) = float_tables(true);
+    db.execute("PRAGMA query_timeout = 3600000", ()).unwrap();
+    count_deadline_charges(DeadlineSite::Aggregate);
+    let got = float_sums(&db, "f");
+    let charges = deadline_charges();
+    keep_deadlines();
+    assert!(got.is_ok(), "{got:?}");
+    assert!(
+        charges > FLOAT_ROWS as usize,
+        "{charges} aggregate charges over {FLOAT_ROWS} rows, one part added again"
+    );
 }
 
 /// A scan the WHERE narrows to a few rows of a large sealed table keeps
