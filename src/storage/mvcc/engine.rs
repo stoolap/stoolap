@@ -1245,6 +1245,9 @@ pub struct MVCCEngine {
     /// Without this, two concurrent seal+compact runs can each read the same old
     /// segments, produce overlapping compacted volumes, and delete each other's data.
     checkpoint_mutex: Mutex<()>,
+    /// Held across a whole close: a second close returns once the first is
+    /// done, not once it has begun
+    close_serial: Mutex<()>,
     /// Seal fence: commits acquire READ (shared, ~5ns), micro-seal acquires WRITE
     /// (exclusive, brief ~100ms) to create a quiet moment where all_hot_empty can
     /// be true. This enables WAL truncation under continuous writes.
@@ -1477,6 +1480,7 @@ impl MVCCEngine {
             force_seal_all: AtomicBool::new(false),
             hot_limits,
             checkpoint_mutex: Mutex::new(()),
+            close_serial: Mutex::new(()),
             seal_fence: Arc::new(parking_lot::RwLock::new(())),
             creating_txns: Arc::new(parking_lot::Mutex::new(KeySet::default())),
             compaction_running: Arc::new(AtomicBool::new(false)),
@@ -3152,26 +3156,36 @@ impl MVCCEngine {
 
     /// Closes the engine (inherent method)
     pub fn close_engine(&self) -> Result<()> {
-        match self.begin_close()? {
+        self.close_engine_holding(|| ())
+    }
+
+    /// Closes the engine, holding what `hold` returns for the steps after
+    /// the engine reads closed. A DDL statement in flight finishes first,
+    /// and a close beside this one returns once this one is done; nothing
+    /// is held from `hold` during either wait
+    pub(crate) fn close_engine_holding<G>(&self, hold: impl FnOnce() -> G) -> Result<()> {
+        self.refuse_inside_ddl_statement("a close")?;
+        let _closing = self.close_serial.lock();
+        let began = {
+            let _ddl = self.ddl.guard();
+            // Use CAS to atomically check and set closed
+            self.open
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        };
+        #[cfg(feature = "test-failpoints")]
+        if began {
+            crate::test_failpoints::close_began();
+        }
+        let _held = hold();
+        match began {
             true => self.finish_close(),
             false => Ok(()), // Already closed
         }
     }
 
-    /// Marks the engine closed once a DDL statement in flight has finished,
-    /// and says whether this call did: its caller then runs `finish_close`
-    pub(crate) fn begin_close(&self) -> Result<bool> {
-        self.refuse_inside_ddl_statement("a close")?;
-        let _ddl = self.ddl.guard();
-        // Use CAS to atomically check and set closed
-        Ok(self
-            .open
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok())
-    }
-
-    /// The rest of the close `begin_close` began
-    pub(crate) fn finish_close(&self) -> Result<()> {
+    /// The rest of a close, once the engine reads closed
+    fn finish_close(&self) -> Result<()> {
         // Stop the cleanup thread first (before stopping transactions)
         {
             let mut cleanup_handle = self.cleanup_handle.lock();

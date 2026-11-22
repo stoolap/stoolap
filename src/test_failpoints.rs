@@ -777,6 +777,20 @@ pub(crate) fn checkpoint_managers_taken() {
     run_hook(&CHECKPOINT_MANAGERS_TAKEN_HOOK);
 }
 
+thread_local! {
+    static CLOSE_BEGAN_HOOK: HookSlot = RefCell::new(None);
+}
+
+/// Run once on this thread when its next close has marked the engine
+/// closed, before the close takes what it holds for the rest
+pub fn after_close_began(hook: impl FnOnce() + 'static) {
+    CLOSE_BEGAN_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn close_began() {
+    run_hook(&CLOSE_BEGAN_HOOK);
+}
+
 /// Run once on this thread when its next index key read took the ids the
 /// index holds for its key, before it reads their rows
 pub fn after_index_get_ids_taken(hook: impl FnOnce() + 'static) {
@@ -4118,6 +4132,7 @@ pub fn reset_all() {
     COLUMN_CHANGE_WAITING_HOOK.with(|slot| *slot.borrow_mut() = None);
     CHECKPOINT_CUT_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     CHECKPOINT_MANAGERS_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
+    CLOSE_BEGAN_HOOK.with(|slot| *slot.borrow_mut() = None);
     INDEX_GET_IDS_TAKEN_HOOK.with(|slot| *slot.borrow_mut() = None);
     INDEX_GET_MANAGER_HOOK.with(|slot| *slot.borrow_mut() = None);
     KEY_READS_OFF.with(|off| off.set(false));

@@ -180,3 +180,65 @@ fn a_column_added_while_another_thread_closes_is_there_at_the_next_open() {
         )
     );
 }
+
+#[test]
+fn a_second_close_returns_once_the_first_is_done() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dsn(dir.path())).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2)", ()).unwrap();
+
+    let (began, begins) = channel();
+    let (release, released) = channel::<()>();
+    let first = db.clone();
+    let first = std::thread::spawn(move || {
+        stoolap::test_failpoints::after_close_began(move || {
+            let _ = began.send(());
+            let _ = released.recv_timeout(PATIENCE);
+        });
+        first.close()
+    });
+    begins
+        .recv_timeout(PATIENCE)
+        .expect("the first close began");
+
+    let (done, dones) = channel();
+    let second = db.clone();
+    let second = std::thread::spawn(move || {
+        let closed = second.close();
+        let _ = done.send(());
+        closed
+    });
+    let early = dones.recv_timeout(Duration::from_millis(500)).is_ok();
+    release.send(()).unwrap();
+    first.join().unwrap().unwrap();
+    second.join().unwrap().unwrap();
+    assert!(
+        !early,
+        "the second close returned while the first had only begun"
+    );
+
+    drop(db);
+    let reopened = Database::open(&dsn(dir.path())).unwrap();
+    let rows: i64 = reopened.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
+    assert_eq!(rows, 2);
+}
+
+#[test]
+fn a_close_forgets_no_database_opened_under_its_dsn_since() {
+    let dsn = "memory://close_beside_alter_reopened";
+    let closed = Database::open(dsn).unwrap();
+    let late = closed.clone();
+    closed.close().unwrap();
+    let opened = Database::open(dsn).unwrap();
+    opened
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    late.close().unwrap();
+    let again = Database::open(dsn).unwrap();
+    again
+        .execute("INSERT INTO t VALUES (1)", ())
+        .expect("the database opened since the close is the one the DSN names");
+}
