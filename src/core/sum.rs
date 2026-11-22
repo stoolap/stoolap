@@ -27,7 +27,13 @@ pub struct SumAccumulator {
     /// A FLOAT added was infinite or NaN, so a sum that is too answers so
     non_finite: bool,
     count: u64,
+    /// The FLOAT values' magnitudes summed, through `add_float` and `merge`
+    magnitude: f64,
 }
+
+/// A sum and the magnitudes merged onto it below this cannot pass the FLOAT
+/// range in any order the values are added in, rounding included
+const MERGE_LIMIT: f64 = f64::MAX / 2.0;
 
 impl SumAccumulator {
     /// Adds an INTEGER, or a BOOLEAN as one or nought
@@ -41,6 +47,7 @@ impl SumAccumulator {
     #[inline]
     pub fn add_float(&mut self, v: f64) {
         self.float += v;
+        self.magnitude += v.abs();
         self.has_float = true;
         if !v.is_finite() {
             self.non_finite = true;
@@ -102,11 +109,27 @@ impl SumAccumulator {
     pub fn merge(&mut self, other: &SumAccumulator) {
         let (int, float) = (other.int, other.float);
         self.add_parts(int, float, other.has_float, other.non_finite, other.count);
+        self.magnitude += other.magnitude;
     }
 
     /// The number of values added
     pub fn count(&self) -> u64 {
         self.count
+    }
+
+    /// Whether a FLOAT value was added
+    #[inline]
+    pub fn holds_float(&self) -> bool {
+        self.has_float
+    }
+
+    /// Whether merging `other`, a sum of values added through `add_float`,
+    /// answers as adding its values in order onto this would: a sum that
+    /// stays far inside the FLOAT range on the way does, while an overflow
+    /// on the way, or an infinite or NaN value on either side, may not
+    #[inline]
+    pub fn merges_in_order(&self, other: &SumAccumulator) -> bool {
+        !other.has_float || self.float.abs() + other.magnitude < MERGE_LIMIT
     }
 
     /// The sum: NULL with no value, FLOAT when any value was FLOAT, and

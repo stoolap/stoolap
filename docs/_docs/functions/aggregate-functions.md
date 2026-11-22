@@ -39,7 +39,7 @@ SELECT SUM(amount) FROM orders;
 SELECT category, SUM(amount) FROM orders GROUP BY category;
 ```
 
-SUM follows the arithmetic of `+`. Over INTEGER values it returns the exact INTEGER sum; a BOOLEAN counts as 1 or 0. A running total may pass beyond the INTEGER range and come back, but a final sum outside it is an `Integer overflow` error, as `a + b` is. Once any value is FLOAT, the sum is FLOAT, and a sum that finite values take past the FLOAT range is a `Float overflow in SUM` error, as `1e308 + 1e308` is; a value that is already infinite or NaN gives that sum, as it does to `+`. NULL values are skipped, and SUM of no values is NULL.
+SUM follows the arithmetic of `+`. Over INTEGER values it returns the exact INTEGER sum; a BOOLEAN counts as 1 or 0. A running total may pass beyond the INTEGER range and come back, but a final sum outside it is an `Integer overflow` error, as `a + b` is. Once any value is FLOAT, the sum is FLOAT, and a sum that finite values take past the FLOAT range is a `Float overflow in SUM` error, as `1e308 + 1e308` is; a value that is already infinite or NaN gives that sum, as it does to `+`. The order in which FLOAT values are added is not specified: a large input is summed in parts, possibly on several threads, and each part rounds on its own. So the last bits of a FLOAT sum may differ from adding the rows one by one, and for a sum within rounding of the FLOAT range's limit, whether it overflows may differ too. NULL values are skipped, and SUM of no values is NULL.
 
 ### AVG
 

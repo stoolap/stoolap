@@ -271,19 +271,24 @@ impl GroupedAggregates {
     #[inline]
     fn find_or_add<K: GroupKey + ?Sized>(&mut self, key: &K) -> Option<usize> {
         let hash = hash_key(key);
-        let width = self.width;
-        let keys = &self.keys;
-        let found = self.table.find(hash, |&group| {
-            let stored = &keys[group as usize * width..][..width];
-            (0..width).all(|i| key.at(i) == &stored[i])
-        });
-        if let Some(&group) = found {
-            return Some(group as usize);
+        if let Some(group) = self.find_hashed(hash, key) {
+            return Some(group);
         }
         if self.groups >= self.cap {
             return None;
         }
         Some(self.add_group(hash, key))
+    }
+
+    /// The group of `key`, whose hash is `hash`, None while it has none
+    #[inline]
+    fn find_hashed<K: GroupKey + ?Sized>(&self, hash: u64, key: &K) -> Option<usize> {
+        let (keys, width) = (&self.keys, self.width);
+        let found = self.table.find(hash, |&group| {
+            let stored = &keys[group as usize * width..][..width];
+            (0..width).all(|i| key.at(i) == &stored[i])
+        });
+        found.map(|&group| group as usize)
     }
 
     #[cold]
@@ -307,6 +312,30 @@ impl GroupedAggregates {
     pub fn aggregates(&mut self, group: usize) -> &mut [CompiledAggregate] {
         let calls = self.calls.len();
         &mut self.aggregates[group * calls..][..calls]
+    }
+
+    /// Whether merging `other` answers as its rows added in order onto these
+    /// would: see [`CompiledAggregate::merges_in_order`]
+    pub fn merges_in_order(&self, other: &GroupedAggregates) -> bool {
+        let calls = self.calls.len();
+        (0..other.groups).all(|group| {
+            let more = &other.aggregates[group * calls..][..calls];
+            if !more.iter().any(CompiledAggregate::sums_float) {
+                return true;
+            }
+            let key = &other.keys[group * other.width..][..other.width];
+            let into = match self.width {
+                0 => (self.groups == 1).then_some(0),
+                _ => self.find_hashed(hash_key(key), key),
+            };
+            let Some(into) = into else {
+                return more.iter().all(CompiledAggregate::starts_in_order);
+            };
+            let runs = &self.aggregates[into * calls..][..calls];
+            runs.iter()
+                .zip(more)
+                .all(|(run, more)| run.merges_in_order(more))
+        })
     }
 
     /// Folds the groups of a run over other rows into these, see `can_merge`

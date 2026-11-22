@@ -1771,8 +1771,24 @@ impl<'a> RowFeed<'a> {
                     Ok(part)
                 })
                 .collect::<Result<_>>()?;
-            for part in parts {
-                groups.merge(part);
+            // A part whose FLOAT sum could pass the range on the way, merged
+            // or alone, adds its rows in order instead; rounding near the
+            // limit stays order-dependent, as the docs say
+            let reads = RowReads {
+                params,
+                transaction_id,
+                blocks: None,
+            };
+            let mut state = FeedState::default();
+            for (part, chunk) in parts.into_iter().zip(rows.chunks(chunk_size)) {
+                if groups.merges_in_order(&part) {
+                    groups.merge(part);
+                    continue;
+                }
+                for (_, row) in chunk {
+                    ctx.charge(DeadlineSite::Aggregate, 1)?;
+                    self.run_one(groups, row, &reads, &mut state)?;
+                }
             }
             return Ok(());
         }

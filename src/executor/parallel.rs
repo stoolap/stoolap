@@ -116,33 +116,34 @@ impl ParallelConfig {
     }
 }
 
-/// The rows `filter` keeps, in their order, each judged on the thread pool
+/// Moves the rows of `rows` that `filter` keeps onto `out`, in their order,
+/// each judged on the thread pool; `rows` keeps its buffer, emptied
 #[cfg(feature = "parallel")]
-pub(crate) fn filter_in_parallel(rows: RowVec, filter: &RowFilter) -> Result<RowVec> {
+pub(crate) fn filter_onto(
+    rows: &mut Vec<(i64, Row)>,
+    filter: &RowFilter,
+    out: &mut Vec<(i64, Row)>,
+) -> Result<()> {
     // Mark-and-extract: compute a parallel boolean mask (1 byte per row),
     // then single-pass extract kept rows in original order.
     // This avoids materializing an N-sized Option<(i64,Row)> intermediate.
-    let mut row_vec: Vec<(i64, Row)> = rows.into_vec();
     let keep: Result<Vec<bool>> = match filter.shares_across_threads() {
-        true => row_vec
+        true => rows
             .par_iter()
             .map(|(_, row)| filter.matches_checked(row))
             .collect(),
-        false => filter_by_workers(&row_vec, filter),
+        false => filter_by_workers(rows, filter),
     };
     let keep = keep?;
 
-    // Single-pass extract: move kept rows into result, preserving order
-    let kept_count = keep.iter().filter(|&&b| b).count();
-    let mut filtered = Vec::with_capacity(kept_count);
-    for (i, entry) in row_vec.drain(..).enumerate() {
+    // Single-pass extract: move kept rows onto `out`, preserving order
+    out.reserve(keep.iter().filter(|&&b| b).count());
+    for (i, entry) in rows.drain(..).enumerate() {
         if keep[i] {
-            filtered.push(entry);
+            out.push(entry);
         }
     }
-
-    // Wrap final result in RowVec (uses main thread's cache)
-    Ok(RowVec::from_vec(filtered))
+    Ok(())
 }
 
 /// Whether each of `rows` passes `filter`, run by one job per thread over

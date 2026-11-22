@@ -54,7 +54,7 @@ use super::aggregation::{
     aggregate_alias_key, aggregate_extra_args, aggregate_group_key, aggregate_slot_keys,
     check_grouped_reads, compile_over_slots, group_item_read, grouped_item, grouping_items,
     ungrouped_column, AggregatePath, CallInputs, FeedInput, GroupByItem, HeldFeed, HeldNames,
-    Modifiers, PostProjection, RowSource, SqlAggregateFunction, COUNT_STAR,
+    Modifiers, PartRun, PostProjection, RowSource, SqlAggregateFunction, COUNT_STAR,
 };
 use super::context::{
     cache_block_answer, get_cached_block_answer, subquery_cache_tables, BlockAnswer, BlockOrigin,
@@ -3966,18 +3966,36 @@ impl<'r, 'a> PassedRows<'r, 'a> {
     }
 }
 
+/// Rows of a scan a split aggregation reads before it judges them, and
+/// passing rows it gathers before it hands them over, as the join's parts
+const SCAN_PART_ROWS: usize = 262_144;
+
+/// `SCAN_PART_ROWS`, or the size a test sets
+fn scan_part_rows() -> usize {
+    #[cfg(feature = "test-failpoints")]
+    if let Some(rows) = crate::test_failpoints::scan_part_rows() {
+        return rows;
+    }
+    SCAN_PART_ROWS
+}
+
 impl RowSource for PassedRows<'_, '_> {
     /// Rows the bound WHERE judges are judged as the drain judges them, on
     /// the thread pool when many
     fn held(mut self) -> Result<RowVec> {
         if let Some(bound) = self.bound {
-            return self.runner.drain(self.scan, Some(bound));
+            let rows = self.runner.drain(self.scan, Some(bound))?;
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::scan_part_held(rows.len());
+            return Ok(rows);
         }
         let mut rows = RowVec::with_capacity(self.scan.estimated_count().unwrap_or(64));
         while self.scan.next() {
             self.ctx.charge(DeadlineSite::Scan, 1)?;
             rows.push((0, self.scan.take_row()));
         }
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::scan_part_held(rows.len());
         match self.scan.err() {
             Some(err) => Err(err.clone()),
             None => Ok(rows),
@@ -4000,6 +4018,45 @@ impl RowSource for PassedRows<'_, '_> {
             }
             return Ok(Some(self.scan.row()));
         }
+    }
+
+    /// Reads and judges the scan a part at a time, and hands over the
+    /// passing rows once a part's worth gathers, in scan order, so the
+    /// aggregation never holds the whole scan: fewer than two parts at
+    /// once, in two buffers kept from part to part
+    fn each_part(mut self, run: &mut PartRun<'_>) -> Result<()> {
+        let size = scan_part_rows();
+        // Grown as rows come: a split goes by the table's rows, and a scan
+        // may read or pass few of them
+        let mut read = RowVec::from_vec(Vec::new());
+        let mut passed = RowVec::from_vec(Vec::new());
+        let mut more = true;
+        while more {
+            while read.len() < size {
+                if !self.scan.next() {
+                    if let Some(err) = self.scan.err() {
+                        return Err(err.clone());
+                    }
+                    more = false;
+                    break;
+                }
+                self.ctx.charge(DeadlineSite::Scan, 1)?;
+                read.push((self.scan.current_row_id(), self.scan.take_row()));
+            }
+            match &self.bound {
+                Some(bound) => self.runner.judge(&mut read, bound, Some(&mut passed))?,
+                None => passed.append(&mut read),
+            }
+            if passed.len() >= size || (!more && !passed.is_empty()) {
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::scan_part_held(passed.len());
+                run(&passed)?;
+                passed.clear();
+            }
+        }
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::scan_part_reserved(read.capacity() + passed.capacity());
+        Ok(())
     }
 }
 
@@ -15854,28 +15911,47 @@ impl<'a> PreparedRunner<'a> {
         if let Some(err) = scan.err() {
             return Err(err.clone());
         }
-        let Some(bound) = bound else {
-            return Ok(rows);
-        };
+        if let Some(bound) = bound {
+            self.judge(&mut rows, &bound, None)?;
+        }
+        Ok(rows)
+    }
+
+    /// Keeps the rows of `rows` that `bound` passes, in order, or moves them
+    /// onto `onto`, leaving `rows` an empty buffer; as many rows as the
+    /// parallel filter takes are judged on the thread pool, as the general
+    /// path judges them
+    fn judge(
+        &self,
+        rows: &mut RowVec,
+        bound: &SharedProgram,
+        onto: Option<&mut RowVec>,
+    ) -> Result<()> {
         // A filter on the pool reads no failed slot, so a run with one judges here
         #[cfg(feature = "parallel")]
         if self.failed_slots.is_none()
             && super::parallel::ParallelConfig::default().should_parallel_filter(rows.len())
         {
-            let mut filter = RowFilter::from_program(bound).with_context(&self.ctx);
+            let mut filter = RowFilter::from_program(bound.clone()).with_context(&self.ctx);
             // The values the run computed once sit past the statement's own
             if self.base.len() > self.ctx.params().len() {
                 filter = filter.with_params(CompactArc::new(self.base.clone()));
             }
             ScanPath::ParallelFilter.taken();
-            return super::parallel::filter_in_parallel(rows, &filter);
+            if let Some(out) = onto {
+                return super::parallel::filter_onto(rows, &filter, out);
+            }
+            let mut kept = Vec::new();
+            super::parallel::filter_onto(rows, &filter, &mut kept)?;
+            std::mem::replace(rows, RowVec::from_vec(kept)).into_vec();
+            return Ok(());
         }
         let mut vm = ExprVM::new();
         let mut failed = None;
         // No row is judged after the first error
         rows.retain(|(_, row)| {
             failed.is_none()
-                && match self.matches(&mut vm, &bound, row) {
+                && match self.matches(&mut vm, bound, row) {
                     Ok(keep) => keep,
                     Err(e) => {
                         failed = Some(e);
@@ -15883,10 +15959,13 @@ impl<'a> PreparedRunner<'a> {
                     }
                 }
         });
-        match failed {
-            Some(e) => Err(e),
-            None => Ok(rows),
+        if let Some(e) = failed {
+            return Err(e);
         }
+        if let Some(out) = onto {
+            out.append(rows);
+        }
+        Ok(())
     }
 
     /// Hand `each` every row of `rows`, a scan's each charged against the

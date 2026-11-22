@@ -387,6 +387,40 @@ impl CompiledAggregate {
         )
     }
 
+    /// Whether a SUM or AVG run merges onto an empty run as its values added
+    /// in order would, true for any other call, see
+    /// [`SumAccumulator::merges_in_order`]
+    pub fn starts_in_order(&self) -> bool {
+        match self {
+            CompiledAggregate::Sum { state } | CompiledAggregate::Avg { state } => {
+                SumAccumulator::default().merges_in_order(state)
+            }
+            _ => true,
+        }
+    }
+
+    /// Whether a SUM or AVG run added a FLOAT value
+    pub fn sums_float(&self) -> bool {
+        matches!(
+            self,
+            CompiledAggregate::Sum { state } | CompiledAggregate::Avg { state }
+                if state.holds_float()
+        )
+    }
+
+    /// Whether folding `other` in answers as its values added in order would,
+    /// true for any call but SUM and AVG, see
+    /// [`SumAccumulator::merges_in_order`]
+    pub fn merges_in_order(&self, other: &CompiledAggregate) -> bool {
+        match (self, other) {
+            (CompiledAggregate::Sum { state }, CompiledAggregate::Sum { state: more })
+            | (CompiledAggregate::Avg { state }, CompiledAggregate::Avg { state: more }) => {
+                state.merges_in_order(more)
+            }
+            _ => true,
+        }
+    }
+
     /// Folds a run of the same aggregate over other rows into this one
     pub fn merge(&mut self, other: &CompiledAggregate) {
         debug_assert!(
