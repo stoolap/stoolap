@@ -663,7 +663,7 @@ pub(crate) fn checks_reading(
     checks
 }
 
-fn compile_check(
+pub(crate) fn compile_check(
     schema: &Schema,
     columns: &[String],
     column: Option<&str>,

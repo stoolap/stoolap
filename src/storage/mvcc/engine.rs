@@ -48,7 +48,7 @@ use crate::storage::volume::manifest::Pending;
 use crate::storage::volume::row_ids::RowIds;
 
 mod retype;
-pub use retype::ColumnTypeChange;
+pub use retype::{ColumnTypeChange, RowJudge};
 
 /// The operation byte of an ALTER TABLE ... MODIFY COLUMN record
 const ALTER_MODIFY_COLUMN: u8 = 4;
@@ -1245,6 +1245,9 @@ pub struct MVCCEngine {
     /// Without this, two concurrent seal+compact runs can each read the same old
     /// segments, produce overlapping compacted volumes, and delete each other's data.
     checkpoint_mutex: Mutex<()>,
+    /// Held across a whole close: a second close returns once the first is
+    /// done, not once it has begun
+    close_serial: Mutex<()>,
     /// Seal fence: commits acquire READ (shared, ~5ns), micro-seal acquires WRITE
     /// (exclusive, brief ~100ms) to create a quiet moment where all_hot_empty can
     /// be true. This enables WAL truncation under continuous writes.
@@ -1477,6 +1480,7 @@ impl MVCCEngine {
             force_seal_all: AtomicBool::new(false),
             hot_limits,
             checkpoint_mutex: Mutex::new(()),
+            close_serial: Mutex::new(()),
             seal_fence: Arc::new(parking_lot::RwLock::new(())),
             creating_txns: Arc::new(parking_lot::Mutex::new(KeySet::default())),
             compaction_running: Arc::new(AtomicBool::new(false)),
@@ -3152,15 +3156,36 @@ impl MVCCEngine {
 
     /// Closes the engine (inherent method)
     pub fn close_engine(&self) -> Result<()> {
-        // Use CAS to atomically check and set closed
-        if self
-            .open
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Ok(()); // Already closed
-        }
+        self.close_engine_holding(|| ())
+    }
 
+    /// Closes the engine, holding what `hold` returns for the steps after
+    /// the engine reads closed. A DDL statement in flight finishes first,
+    /// and a close beside this one returns once this one is done; nothing
+    /// is held from `hold` during either wait
+    pub(crate) fn close_engine_holding<G>(&self, hold: impl FnOnce() -> G) -> Result<()> {
+        self.refuse_inside_ddl_statement("a close")?;
+        let _closing = self.close_serial.lock();
+        let began = {
+            let _ddl = self.ddl.guard();
+            // Use CAS to atomically check and set closed
+            self.open
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        };
+        #[cfg(feature = "test-failpoints")]
+        if began {
+            crate::test_failpoints::close_began();
+        }
+        let _held = hold();
+        match began {
+            true => self.finish_close(),
+            false => Ok(()), // Already closed
+        }
+    }
+
+    /// The rest of a close, once the engine reads closed
+    fn finish_close(&self) -> Result<()> {
         // Stop the cleanup thread first (before stopping transactions)
         {
             let mut cleanup_handle = self.cleanup_handle.lock();
@@ -3482,12 +3507,25 @@ impl MVCCEngine {
                 };
 
                 // The default the existing rows took, in a record that carries it
-                let default_value = data
+                let default_bytes = data
                     .get(pos..pos + 2)
                     .map(|len| u16::from_le_bytes([len[0], len[1]]) as usize)
-                    .filter(|&len| len > 0)
-                    .and_then(|len| data.get(pos + 2..pos + 2 + len))
+                    .and_then(|len| data.get(pos + 2..pos + 2 + len));
+                let default_value = default_bytes
+                    .filter(|bytes| !bytes.is_empty())
                     .and_then(|bytes| super::persistence::deserialize_value(bytes).ok());
+                pos += default_bytes.map_or(0, |bytes| 2 + bytes.len());
+
+                // The column's CHECK, in a record that carries one
+                let check_expr = data
+                    .get(pos..pos + 4)
+                    .map(|len| u32::from_le_bytes([len[0], len[1], len[2], len[3]]) as usize)
+                    .and_then(|len| data.get(pos + 4..pos + 4 + len))
+                    .map(|bytes| {
+                        String::from_utf8(bytes.to_vec())
+                            .map_err(|e| Error::internal(format!("invalid check expr: {e}")))
+                    })
+                    .transpose()?;
 
                 // Apply the ADD COLUMN using engine method
                 self.create_column_with_default(
@@ -3495,7 +3533,7 @@ impl MVCCEngine {
                     &column_name,
                     data_type,
                     nullable,
-                    (default_expr, default_value),
+                    (default_expr, default_value, check_expr),
                     vector_dimensions,
                 )?;
             }
@@ -3606,15 +3644,37 @@ impl MVCCEngine {
                     ));
                 }
                 let nullable = data[pos] != 0;
+                pos += 1;
+                // A record of a change that took a DEFAULT or a CHECK ends
+                // with which it took, then each one's length and text
+                let taken = data.get(pos).copied().unwrap_or(0);
+                pos += 1;
+                let mut text = |is_taken: bool| -> Result<Option<String>> {
+                    if !is_taken {
+                        return Ok(None);
+                    }
+                    let truncated = || Error::internal("invalid ModifyColumn data: truncated");
+                    let length = data.get(pos..pos + 4).ok_or_else(truncated)?;
+                    let length = u32::from_le_bytes(length.try_into().unwrap()) as usize;
+                    let bytes = data.get(pos + 4..pos + 4 + length).ok_or_else(truncated)?;
+                    pos += 4 + length;
+                    String::from_utf8(bytes.to_vec())
+                        .map(Some)
+                        .map_err(|e| Error::internal(format!("invalid ModifyColumn text: {e}")))
+                };
+                let default = text(taken & 1 != 0)?;
+                let check = text(taken & 2 != 0)?;
 
-                // Apply the MODIFY COLUMN using engine method
-                self.modify_column_with_dimensions(
-                    &table_name,
-                    &column_name,
+                self.apply_column_change(&ColumnTypeChange {
+                    table: &table_name,
+                    column: &column_name,
                     data_type,
                     nullable,
                     vector_dimensions,
-                )?;
+                    default: default.as_deref(),
+                    check: check.as_deref(),
+                    judge: None,
+                })?;
             }
             ALTER_RENAME_TABLE => {
                 // The table_name read above is the old name
@@ -4139,15 +4199,16 @@ impl MVCCEngine {
         self.check_column_change(table_name, &added, ColumnEvent::Added)
     }
 
-    /// Creates a column in a table with an optional default expression and
-    /// the value the existing rows take, read from the expression when absent
+    /// Creates a column in a table with an optional default expression, the
+    /// value the existing rows take, read from the expression when absent,
+    /// and an optional CHECK
     pub fn create_column_with_default(
         &self,
         table_name: &str,
         column_name: &str,
         data_type: DataType,
         nullable: bool,
-        (default_expr, default_value): (Option<String>, Option<Value>),
+        (default_expr, default_value, check_expr): (Option<String>, Option<Value>, Option<String>),
         vector_dimensions: u16,
     ) -> Result<()> {
         if !self.is_open() {
@@ -4201,6 +4262,7 @@ impl MVCCEngine {
                     crate::core::value::timestamp_in_range(*t)?;
                 }
                 col.default_expr = default_expr;
+                col.check_expr = check_expr;
                 col.vector_dimensions = vector_dimensions;
                 store.add_column(col)?;
                 store.lay_out_rows();
@@ -4935,14 +4997,27 @@ impl MVCCEngine {
 
     /// The DDL guard for a DDL statement, refused on a thread that holds it:
     /// a function a DDL statement calls runs no DDL statement of its own,
-    /// which would land between that statement's checks and its change
+    /// which would land between that statement's checks and its change.
+    /// Refused too once a close has begun, which waits for no statement after
     pub fn ddl_statement_guard(&self) -> Result<parking_lot::ReentrantMutexGuard<'_, ()>> {
-        if self.ddl.serial.is_owned_by_current_thread() {
-            return Err(Error::NotSupported(
-                "a DDL statement inside a function another DDL statement calls".to_string(),
-            ));
+        self.refuse_inside_ddl_statement("a DDL statement")?;
+        let ddl = self.ddl.guard();
+        if !self.is_open() {
+            return Err(Error::EngineNotOpen);
         }
-        Ok(self.ddl.guard())
+        Ok(ddl)
+    }
+
+    /// An error on a thread that holds the DDL guard: a function a DDL
+    /// statement calls starts no `what`, which would write the catalog as
+    /// that statement has it before its record
+    pub(crate) fn refuse_inside_ddl_statement(&self, what: &str) -> Result<()> {
+        if self.ddl.serial.is_owned_by_current_thread() {
+            return Err(Error::NotSupported(format!(
+                "{what} inside a function another DDL statement calls"
+            )));
+        }
+        Ok(())
     }
 
     /// After an index of `table_name` is dropped: the side file of every
@@ -5127,6 +5202,27 @@ impl MVCCEngine {
         column: crate::core::SchemaColumn,
     ) -> Result<()> {
         self.get_version_store(table_name)?.add_column(column)
+    }
+
+    /// Runs `judge` over each committed row of `table_name`, closed by an
+    /// added column, once every commit that began publishing before the
+    /// close is done: the hot rows before the column, the sealed with it
+    pub(crate) fn judge_added_column_rows(
+        &self,
+        table_name: &str,
+        judge: RowJudge<'_>,
+    ) -> Result<()> {
+        const SETTLE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+        let name = to_lowercase_cow(table_name);
+        let store = self.get_version_store(&name)?;
+        if !store.wait_until_quiet(Instant::now() + SETTLE_WAIT) {
+            return Err(Error::TableHasOpenTransactionRows {
+                table: name.to_string(),
+            });
+        }
+        let mgr = self.segment_managers.read().get(name.as_ref()).cloned();
+        let _seal = mgr.as_ref().map(|mgr| mgr.acquire_seal_read());
+        retype::judge_rows(&store, mgr.as_deref(), judge)
     }
 
     /// Sets `table_name`'s id counter so its next generated id is `next`,
@@ -5327,17 +5423,25 @@ impl MVCCEngine {
         nullable: bool,
         vector_dimensions: u16,
     ) -> Result<()> {
-        if !self.is_open() {
-            return Err(Error::EngineNotOpen);
-        }
-        let _ddl = self.ddl_guard();
-        self.change_column_type(&ColumnTypeChange {
+        self.apply_column_change(&ColumnTypeChange {
             table: table_name,
             column: column_name,
             data_type,
             nullable,
             vector_dimensions,
+            default: None,
+            check: None,
+            judge: None,
         })
+    }
+
+    /// `change` under the DDL guard; WAL replay applies it unrecorded
+    fn apply_column_change(&self, change: &ColumnTypeChange<'_>) -> Result<()> {
+        if !self.is_open() {
+            return Err(Error::EngineNotOpen);
+        }
+        let _ddl = self.ddl_guard();
+        self.change_column_type(change)
     }
 
     /// Changes a column's definition in every layer and records it, except
@@ -9022,15 +9126,18 @@ impl Engine for MVCCEngine {
     }
 
     fn force_checkpoint_cycle(&self) -> Result<()> {
+        self.refuse_inside_ddl_statement("a checkpoint")?;
         MVCCEngine::checkpoint_cycle_inner(self, true)?;
         self.compact_after_checkpoint_forced()
     }
 
     fn create_snapshot(&self) -> Result<()> {
+        self.refuse_inside_ddl_statement("a snapshot")?;
         MVCCEngine::create_backup_snapshot(self)
     }
 
     fn restore_snapshot(&self, timestamp: Option<&str>) -> Result<String> {
+        self.refuse_inside_ddl_statement("a restore")?;
         MVCCEngine::restore_from_snapshot(self, timestamp)
     }
 
@@ -9175,6 +9282,13 @@ impl Engine for MVCCEngine {
         // dropped_columns stays permanent — old volumes have stale data under
         // the dropped name, new volumes get the re-added column at a new position.
         self.refresh_column_mappings(table_name)?;
+
+        // The column's CHECK, last and only when it has one, so a record
+        // without it reads as before: its length(4) and text
+        if let Some(check) = column.check_expr.as_deref() {
+            data.extend_from_slice(&(check.len() as u32).to_le_bytes());
+            data.extend_from_slice(check.as_bytes());
+        }
 
         self.record_ddl(table_name, WALOperationType::AlterTable, &data)
     }
@@ -12172,14 +12286,14 @@ mod tests {
             .build();
         engine.create_table(schema).unwrap();
         engine
-            .create_column_with_default("t", "v", DataType::Integer, true, (None, None), 0)
+            .create_column_with_default("t", "v", DataType::Integer, true, (None, None, None), 0)
             .unwrap();
         assert!(engine.segment_managers.read().is_empty());
 
         let mgr = engine.get_or_create_segment_manager("t");
         let before = mgr.schema_generation();
         engine
-            .create_column_with_default("t", "w", DataType::Integer, true, (None, None), 0)
+            .create_column_with_default("t", "w", DataType::Integer, true, (None, None, None), 0)
             .unwrap();
         assert_eq!(mgr.schema_generation(), before + 2);
         engine.close_engine().unwrap();

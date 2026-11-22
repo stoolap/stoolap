@@ -18,8 +18,10 @@
 #[path = "../oracle/mod.rs"]
 mod oracle;
 
+mod add_column_check_test;
 mod add_column_not_null_test;
 mod alter_auto_increment_test;
+mod alter_column_constraints_test;
 mod auto_increment_test;
 mod block_reads_tables_as_found_test;
 mod bug_composite_unique_upsert_test;
@@ -58,6 +60,8 @@ mod insert_path_test;
 mod insert_select_dataloss_test;
 mod insert_select_test;
 mod literal_write_rule_test;
+mod modify_column_default_check_test;
+mod modify_column_type_checks_test;
 mod on_duplicate_key_update_test;
 mod pk_write_where_test;
 mod plain_dml_family_test;

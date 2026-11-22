@@ -1038,16 +1038,21 @@ impl Database {
     /// Note: The engine is also closed automatically when all Database instances
     /// are dropped.
     pub fn close(&self) -> Result<()> {
-        // Remove from registry
-        let mut registry = DATABASE_REGISTRY.write();
-
-        registry.remove(&self.inner.shared.dsn);
-
-        // Close the engine immediately to release the file lock
-        // This is idempotent - calling close_engine() multiple times is safe
-        self.inner.shared.engine.close_engine()?;
-
-        Ok(())
+        let shared = &self.inner.shared;
+        // Close the engine immediately to release the file lock, the
+        // registry held from the engine reading closed to the lock's release.
+        // This is idempotent: a second close returns once the first is done
+        shared.engine.close_engine_holding(|| {
+            let mut registry = DATABASE_REGISTRY.write();
+            // A database opened under the DSN since is another's to forget
+            if registry
+                .get(&shared.dsn)
+                .is_some_and(|entry| std::ptr::eq(entry.as_ptr(), Arc::as_ptr(shared)))
+            {
+                registry.remove(&shared.dsn);
+            }
+            registry
+        })
     }
 
     /// Get a cached plan for a SQL statement (parse once, execute many times).

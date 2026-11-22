@@ -14,10 +14,12 @@
 
 //! Durability: the WAL, snapshots, recovery and reopening a database
 
+mod alter_check_checkpoint_test;
 mod auto_increment_reopen_test;
 mod bug_manifest_version_fail_closed_test;
 mod bug_unique_lost_after_reopen_test;
 mod checkpoint_catalog_copy_test;
+mod close_beside_alter_test;
 mod dml_lsn_receipt_test;
 mod drop_rename_replay_test;
 mod durability_test;

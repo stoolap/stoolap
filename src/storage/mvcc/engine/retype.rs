@@ -23,7 +23,7 @@ use super::{
 };
 use crate::common::{CompactArc, SmartString};
 use crate::common::{KeyMap, KeySet};
-use crate::core::{DataType, Error, Result, Schema, Value};
+use crate::core::{DataType, Error, Result, Row, Schema, Value};
 use crate::storage::mvcc::version_store::HotCast;
 use crate::storage::traits::Index;
 use crate::storage::volume::manifest::{ColdSnapshot, SegmentManager, SegmentMeta};
@@ -35,6 +35,9 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+/// Whether a row passes a CHECK
+pub type RowJudge<'a> = &'a dyn Fn(&Row) -> Result<()>;
+
 /// The definition a column takes
 pub struct ColumnTypeChange<'a> {
     pub table: &'a str,
@@ -42,6 +45,13 @@ pub struct ColumnTypeChange<'a> {
     pub data_type: DataType,
     pub nullable: bool,
     pub vector_dimensions: u16,
+    /// The DEFAULT the column takes, None keeping its own
+    pub default: Option<&'a str>,
+    /// The CHECK the column takes, None keeping its own
+    pub check: Option<&'a str>,
+    /// Judges a live row, in the new definition, by the CHECK taken; the
+    /// log's replay judges none
+    pub judge: Option<RowJudge<'a>>,
 }
 
 /// What a change reads and writes of the engine, shared by the engine and
@@ -77,6 +87,12 @@ pub(super) fn change_column_type(shared: &Shared<'_>, change: &ColumnTypeChange<
     let mut next = Schema::clone(&current);
     next.modify_column(change.column, Some(change.data_type), Some(change.nullable))?;
     next.columns[column].vector_dimensions = change.vector_dimensions;
+    if let Some(default) = change.default {
+        next.columns[column].default_expr = Some(default.to_string());
+    }
+    if let Some(check) = change.check {
+        next.columns[column].check_expr = Some(check.to_string());
+    }
     // A volume sealed before the column was added reads its default
     let default = next.columns[column].default_value.take();
     next.columns[column].default_value =
@@ -132,7 +148,7 @@ pub(super) fn change_column_type(shared: &Shared<'_>, change: &ColumnTypeChange<
         &next,
         column,
         change,
-        retyped || !change.nullable,
+        retyped || !change.nullable || change.judge.is_some(),
         !shared.replaying,
     );
     // The new HNSW objects take the sealed rows before anything is decided
@@ -216,6 +232,9 @@ pub(super) fn repair_retyped_volumes(shared: &Shared<'_>, table: &str) -> Result
             data_type: definition.data_type,
             nullable: definition.nullable,
             vector_dimensions: definition.vector_dimensions,
+            default: None,
+            check: None,
+            judge: None,
         };
         let checked = validate(
             &store,
@@ -260,6 +279,15 @@ fn record(shared: &Shared<'_>, change: &ColumnTypeChange<'_>) -> Result<()> {
         data.extend_from_slice(&change.vector_dimensions.to_le_bytes());
     }
     data.push(u8::from(change.nullable));
+    // Last, and only when one is taken, so a record without them reads as
+    // before: which are taken(1), then each one's length(4) and text
+    if change.default.is_some() || change.check.is_some() {
+        data.push(u8::from(change.default.is_some()) | u8::from(change.check.is_some()) << 1);
+        for text in [change.default, change.check].into_iter().flatten() {
+            data.extend_from_slice(&(text.len() as u32).to_le_bytes());
+            data.extend_from_slice(text.as_bytes());
+        }
+    }
     pm.record_ddl_operation_synced(change.table, WALOperationType::AlterTable, &data)?;
     Ok(())
 }
@@ -646,10 +674,74 @@ fn validate(
     for (row_id, row) in cast.live_rows() {
         validate_value(row.get(column), change, storable)?;
         unique.insert(row_id, |id| row.get(id).cloned())?;
+        if let Some(judge) = change.judge {
+            judge(row)?;
+        }
     }
     let Some(mgr) = mgr.filter(|_| sealed_too) else {
         return Ok(());
     };
+    let mut wanted = unique.columns();
+    if !wanted.contains(&column) {
+        wanted.push(column);
+    }
+    // A CHECK reads the row at its columns' own positions
+    if change.judge.is_some() {
+        wanted = (0..schema.columns.len()).collect();
+    }
+    each_sealed_row(cast, mgr, cold, schema, &wanted, |row_id, row| {
+        if let Some(judge) = change.judge {
+            judge(row)?;
+        }
+        let value = |id: usize| {
+            wanted
+                .iter()
+                .position(|&w| w == id)
+                .and_then(|at| row.get(at).cloned())
+        };
+        validate_value(value(column).as_ref(), change, storable)?;
+        unique.insert(row_id, value)
+    })
+}
+
+/// Runs `judge` over each live row of a closed table once, its newest
+/// committed copy: the hot rows as they are held, then the sealed rows read
+/// through the table's schema
+pub(super) fn judge_rows(
+    store: &VersionStore,
+    mgr: Option<&SegmentManager>,
+    judge: RowJudge<'_>,
+) -> Result<()> {
+    let heads = store.current_heads();
+    for (_, row) in heads.live_rows() {
+        judge(row)?;
+    }
+    let Some(mgr) = mgr else {
+        return Ok(());
+    };
+    let schema = store.schema();
+    let wanted: Vec<usize> = (0..schema.columns.len()).collect();
+    each_sealed_row(
+        &heads,
+        mgr,
+        &ColdCast::default(),
+        &schema,
+        &wanted,
+        |_, row| judge(row),
+    )
+}
+
+/// Each live sealed row the hot store does not hold, once, its newest copy
+/// (the volumes newest first, read through `cold`'s rewrites), as its
+/// `wanted` columns of `schema`
+fn each_sealed_row(
+    cast: &HotCast,
+    mgr: &SegmentManager,
+    cold: &ColdCast,
+    schema: &Schema,
+    wanted: &[usize],
+    mut each: impl FnMut(i64, &Row) -> Result<()>,
+) -> Result<()> {
     let snapshot = mgr.cold_snapshot();
     let (dropped, renames) = {
         let manifest = mgr.manifest();
@@ -658,10 +750,6 @@ fn validate(
             manifest.column_renames.clone(),
         )
     };
-    let mut wanted = unique.columns();
-    if !wanted.contains(&column) {
-        wanted.push(column);
-    }
     let mut seen = KeySet::default();
     for &seg_id in snapshot.seg_ids.iter().rev() {
         let Some((volume, mapping, dead, nulled)) =
@@ -681,15 +769,8 @@ fn validate(
             if let Ok(at) = nulled.binary_search_by_key(&row_id, |&(id, _)| id) {
                 crate::core::value::timestamp_in_range(nulled[at].1)?;
             }
-            let row = volume.get_row_mapped_projected(i, &mapping, &wanted)?;
-            let value = |id: usize| {
-                wanted
-                    .iter()
-                    .position(|&w| w == id)
-                    .and_then(|at| row.get(at).cloned())
-            };
-            validate_value(value(column).as_ref(), change, storable)?;
-            unique.insert(row_id, value)?;
+            let row = volume.get_row_mapped_projected(i, &mapping, wanted)?;
+            each(row_id, &row)?;
         }
     }
     Ok(())
