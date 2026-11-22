@@ -20,6 +20,7 @@ use smallvec::SmallVec;
 
 use super::ast::*;
 use super::token::Position;
+use crate::core::{is_condition_type, not_a_condition_message, DataType};
 
 /// The message for a qualifier no FROM entry anywhere names
 pub(crate) fn unknown_qualifier(qualifier: &str) -> String {
@@ -125,7 +126,7 @@ fn check_select<'a>(select: &'a SelectStatement, outer: Option<&Scope<'a, '_>>) 
     for expr in select.distinct_on.iter().chain(&select.columns) {
         check_expr(expr, own)?;
     }
-    check_opt(select.where_clause.as_deref(), own)?;
+    check_condition_opt(select.where_clause.as_deref(), own)?;
     for expr in &select.group_by.columns {
         check_expr(expr, own)?;
     }
@@ -134,7 +135,7 @@ fn check_select<'a>(select: &'a SelectStatement, outer: Option<&Scope<'a, '_>>) 
             check_expr(expr, own)?;
         }
     }
-    check_opt(select.having.as_deref(), own)?;
+    check_condition_opt(select.having.as_deref(), own)?;
     for def in &select.window_defs {
         check_window(&def.partition_by, &def.order_by, def.frame.as_ref(), own)?;
     }
@@ -499,7 +500,7 @@ fn check_source<'a>(
                     from_names(source, &mut joined);
                     let mut on = Scope::beside(query, outer);
                     on.visible = joined.visible;
-                    check_expr(condition, Some(&on))
+                    check_condition_opt(Some(condition), Some(&on))
                 }
                 None => Ok(()),
             }
@@ -544,7 +545,7 @@ fn check_insert(insert: &InsertStatement) -> Check {
     for expr in &insert.update_expressions {
         check_expr(expr, Some(&conflict))?;
     }
-    check_opt(insert.update_where.as_deref(), Some(&conflict))?;
+    check_condition_opt(insert.update_where.as_deref(), Some(&conflict))?;
     let mut returning = Scope::under(None);
     returning.visible.push(&insert.table_name.value_lower);
     returning.hidden.push("excluded");
@@ -563,7 +564,7 @@ fn check_update(update: &UpdateStatement) -> Check {
     for expr in update.updates.values() {
         check_expr(expr, target)?;
     }
-    check_opt(update.where_clause.as_deref(), target)?;
+    check_condition_opt(update.where_clause.as_deref(), target)?;
     check_item_aliases(&update.returning)?;
     for expr in &update.returning {
         check_expr(expr, target)?;
@@ -582,7 +583,7 @@ fn check_delete(delete: &DeleteStatement) -> Check {
         None => target.visible.push(&delete.table_name.value_lower),
     }
     let target = Some(&target);
-    check_opt(delete.where_clause.as_deref(), target)?;
+    check_condition_opt(delete.where_clause.as_deref(), target)?;
     check_item_aliases(&delete.returning)?;
     for expr in &delete.returning {
         check_expr(expr, target)?;
@@ -606,7 +607,7 @@ fn check_create_table(create: &CreateTableStatement) -> Check {
     table.visible.push(&create.table_name.value_lower);
     for constraint in &create.table_constraints {
         if let TableConstraint::Check(expr) = constraint {
-            check_expr(expr, Some(&table))?;
+            check_condition_opt(Some(expr), Some(&table))?;
         }
     }
     match &create.as_select {
@@ -621,12 +622,46 @@ fn check_column(def: &ColumnDefinition, table_name: &Identifier) -> Check {
     table.visible.push(&table_name.value_lower);
     for constraint in &def.constraints {
         match constraint {
-            ColumnConstraint::Check(expr) => check_expr(expr, Some(&table))?,
+            ColumnConstraint::Check(expr) => check_condition_opt(Some(expr), Some(&table))?,
             ColumnConstraint::Default(expr) => check_expr(expr, None)?,
             _ => {}
         }
     }
     Ok(())
+}
+
+/// An error when `expr`, read as a condition, is a literal or a CAST whose
+/// type the statement writes and a condition does not take
+fn check_condition(expr: &Expression) -> Check {
+    let (written, position) = match expr {
+        Expression::FloatLiteral(f) => (Some(DataType::Float), f.token.position),
+        Expression::StringLiteral(s) => match &s.type_hint {
+            Some(hint) => (hint.parse().ok(), s.token.position),
+            None => (Some(DataType::Text), s.token.position),
+        },
+        Expression::Cast(c) => (c.type_name.parse().ok(), c.token.position),
+        // An INTERVAL reads as its TEXT form
+        Expression::IntervalLiteral(i) => (Some(DataType::Text), i.token.position),
+        _ => return Ok(()),
+    };
+    match written {
+        Some(data_type) if !is_condition_type(data_type) => Err(ScopeError {
+            message: not_a_condition_message(data_type),
+            position,
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// `check_opt` of a WHERE, HAVING, ON or CHECK, also read as a condition
+fn check_condition_opt<'a>(expr: Option<&'a Expression>, scope: Option<&Scope<'a, '_>>) -> Check {
+    match expr {
+        Some(expr) => {
+            check_condition(expr)?;
+            check_expr(expr, scope)
+        }
+        None => Ok(()),
+    }
 }
 
 fn check_opt<'a>(expr: Option<&'a Expression>, scope: Option<&Scope<'a, '_>>) -> Check {
@@ -659,13 +694,18 @@ fn check_window<'a>(
 }
 
 fn check_function<'a>(call: &'a FunctionCall, scope: Option<&Scope<'a, '_>>) -> Check {
+    if call.function.eq_ignore_ascii_case("IIF")
+        && let Some(condition) = call.arguments.first()
+    {
+        check_condition(condition)?;
+    }
     for expr in &call.arguments {
         check_expr(expr, scope)?;
     }
     for order in &call.order_by {
         check_expr(&order.expression, scope)?;
     }
-    check_opt(call.filter.as_deref(), scope)
+    check_condition_opt(call.filter.as_deref(), scope)
 }
 
 fn check_expr<'a>(expr: &'a Expression, scope: Option<&Scope<'a, '_>>) -> Check {
@@ -680,8 +720,20 @@ fn check_expr<'a>(expr: &'a Expression, scope: Option<&Scope<'a, '_>>) -> Check 
             let lower = star.qualifier.to_lowercase();
             qualifier(&star.qualifier, &lower, star.token.position, scope)
         }
-        Expression::Prefix(p) => check_expr(&p.right, scope),
+        Expression::Prefix(p) => {
+            if p.op_type == PrefixOperator::Not {
+                check_condition(&p.right)?;
+            }
+            check_expr(&p.right, scope)
+        }
         Expression::Infix(i) => {
+            if matches!(
+                i.op_type,
+                InfixOperator::And | InfixOperator::Or | InfixOperator::Xor
+            ) {
+                check_condition(&i.left)?;
+                check_condition(&i.right)?;
+            }
             check_expr(&i.left, scope)?;
             check_expr(&i.right, scope)
         }
@@ -714,6 +766,9 @@ fn check_expr<'a>(expr: &'a Expression, scope: Option<&Scope<'a, '_>>) -> Check 
         Expression::Case(c) => {
             check_opt(c.value.as_deref(), scope)?;
             for when in &c.when_clauses {
+                if c.value.is_none() {
+                    check_condition(&when.condition)?;
+                }
                 check_expr(&when.condition, scope)?;
                 check_expr(&when.then_result, scope)?;
             }

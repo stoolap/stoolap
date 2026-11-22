@@ -24,7 +24,10 @@
 //! - DROP VIEW
 
 use super::utils::eq_names;
-use crate::core::{DataType, Error, ForeignKeyAction, ForeignKeyConstraint, Result, SchemaBuilder};
+use crate::core::{
+    is_condition_type, not_a_condition, DataType, Error, ForeignKeyAction, ForeignKeyConstraint,
+    Result, SchemaBuilder,
+};
 use crate::parser::ast::*;
 use crate::storage::mvcc::engine::ViewDefinition;
 use crate::storage::traits::transaction::StatementTable;
@@ -212,6 +215,35 @@ fn refuse_unkept_constraints(column: &ColumnDefinition, operation: &str) -> Resu
     }
 }
 
+/// An error when `check`, or an operand of its AND, OR, XOR or NOT, is a
+/// column whose declared type, from `type_of`, a condition does not take
+fn check_condition_columns(
+    check: &Expression,
+    type_of: &dyn Fn(&str) -> Option<DataType>,
+) -> Result<()> {
+    let column = match check {
+        Expression::Infix(i)
+            if matches!(
+                i.op_type,
+                InfixOperator::And | InfixOperator::Or | InfixOperator::Xor
+            ) =>
+        {
+            check_condition_columns(&i.left, type_of)?;
+            return check_condition_columns(&i.right, type_of);
+        }
+        Expression::Prefix(p) if p.op_type == PrefixOperator::Not => {
+            return check_condition_columns(&p.right, type_of);
+        }
+        Expression::Identifier(id) => id.value.as_str(),
+        Expression::QualifiedIdentifier(q) => q.name.value.as_str(),
+        _ => return Ok(()),
+    };
+    match type_of(column) {
+        Some(data_type) if !is_condition_type(data_type) => Err(not_a_condition(data_type)),
+        _ => Ok(()),
+    }
+}
+
 /// A DEFAULT or CHECK of `owner` is one value of one row: a subquery, an
 /// aggregate or a window function in it is refused. A CHECK reads the row
 /// through `columns`, and one naming a column the table lacks is refused too
@@ -340,6 +372,13 @@ impl Executor {
             .iter()
             .map(|c| c.name.value.to_string())
             .collect();
+        let declared_type = |name: &str| {
+            let column = stmt
+                .columns
+                .iter()
+                .find(|c| eq_names(&c.name.value, name))?;
+            self.parse_data_type(&column.data_type).ok()
+        };
 
         // Collect columns with UNIQUE constraints to create indexes after table creation
         let mut unique_columns: Vec<String> = Vec::new();
@@ -438,6 +477,7 @@ impl Executor {
             });
             if let Some(expr) = check_expr {
                 constraint_expression("CHECK", col_name, expr, Some(&column_names))?;
+                check_condition_columns(expr, &declared_type)?;
             }
             let check_expr = check_expr.map(|expr| format!("{}", expr));
 
@@ -537,6 +577,7 @@ impl Executor {
                 }
                 TableConstraint::Check(expr) => {
                     constraint_expression("CHECK", table_name, expr, Some(&column_names))?;
+                    check_condition_columns(expr, &declared_type)?;
                     schema_builder = schema_builder.add_table_check(expr.to_string());
                 }
                 _ => {}
@@ -1228,6 +1269,11 @@ impl Executor {
                     let check = match (check_expr, &column.check_expr) {
                         (Some(expr), Some(text)) => {
                             constraint_expression("CHECK", &column.name, expr, Some(&names))?;
+                            let declared_type = |name: &str| {
+                                let column = added.columns.iter().find(|c| eq_names(&c.name, name));
+                                column.map(|c| c.data_type)
+                            };
+                            check_condition_columns(expr, &declared_type)?;
                             Some(super::dml::compile_check(
                                 &added,
                                 &names,
@@ -1450,6 +1496,16 @@ impl Executor {
                             }
                             ColumnConstraint::Check(expr) if check.is_none() => {
                                 constraint_expression("CHECK", &column.name, expr, Some(&names))?;
+                                // The modified column reads as its new type
+                                let declared_type = |name: &str| {
+                                    if eq_names(name, &col_def.name.value) {
+                                        return self.parse_data_type(&col_def.data_type).ok();
+                                    }
+                                    let other =
+                                        schema.columns.iter().find(|c| eq_names(&c.name, name));
+                                    other.map(|c| c.data_type)
+                                };
+                                check_condition_columns(expr, &declared_type)?;
                                 check = Some(expr.to_string());
                             }
                             _ => {}
@@ -1473,6 +1529,25 @@ impl Executor {
                     let mut next = crate::core::Schema::clone(&schema);
                     if let Some(text) = &check {
                         next.columns[at].check_expr = Some(text.clone());
+                    }
+                    // A CHECK the table keeps that reads the column as a
+                    // condition must take its new type
+                    if retyped {
+                        let new_type =
+                            |name: &str| eq_names(name, &col_def.name.value).then_some(data_type);
+                        let column_checks = next
+                            .columns
+                            .iter()
+                            .filter_map(|c| Some((c.check_expr.as_deref()?, c.name.as_str())));
+                        let table_checks = next
+                            .table_checks
+                            .iter()
+                            .map(|t| (t.as_str(), table_name.as_str()));
+                        for (text, owner) in column_checks.chain(table_checks) {
+                            let expr =
+                                crate::parser::parse_stored_expression(text, "CHECK", owner)?;
+                            check_condition_columns(&expr, &new_type)?;
+                        }
                     }
                     let mut judges = super::dml::compile_check_programs(&next)?;
                     judges.retain(|judged| {

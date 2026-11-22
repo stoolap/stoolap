@@ -3108,7 +3108,7 @@ impl Executor {
         let mut passes = true;
         if let Some(where_clause) = &stmt.where_clause {
             let where_result = super::expression::evaluate_once(where_clause, Some(ctx))?;
-            passes = ExprVM::passes(&where_result);
+            passes = ExprVM::passes(&where_result)?;
         }
 
         // Aggregates and windows read the row the WHERE passed, as in

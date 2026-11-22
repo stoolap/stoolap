@@ -51,7 +51,17 @@ A row is compared only with a row of as many values: `(1, 2) = (1, 2, 3)` and `(
 | `XOR` | Exactly one condition true | `WHERE a XOR b` |
 | `NOT` | Negates a condition | `WHERE NOT deleted` |
 
-An error a condition raises on a row, such as an `Integer overflow` from `ABS`, fails the statement, for `SELECT`, `UPDATE` and `DELETE`, on recent and on checkpointed rows alike. `AND` and `OR` evaluate their operands left to right and stop at the first one that decides the result, so `WHERE id = 1 OR ABS(x) >= 0` raises nothing for the row with `id = 1`, while `WHERE ABS(x) >= 0 OR id = 1` fails on it. An operand that is not a boolean decides as it reads as a condition: `0 AND ABS(x) >= 0` is false and `1 OR ABS(x) >= 0` is true, and neither reads `x`. `NOT` passes an error on. A row an index or a `LIMIT` leaves unread is never asked, so it raises nothing. A function of your own that writes to its transaction from inside a WHERE is not covered yet; see [Known Limitations]({{ '/docs/development/known-limitations/' | relative_url }}).
+### Conditions
+
+A value read as a condition is `TRUE`, `FALSE`, `NULL` or an INTEGER, which is true when it is not zero. The rule is the same wherever a condition stands: a `WHERE`, `HAVING` or `ON`, an operand of `AND`, `OR`, `XOR` or `NOT`, a `CASE WHEN`, a `CHECK`, the `FILTER` of an aggregate or a window function, and the first argument of `IIF`. A value of any other type is an error, `a condition must be BOOLEAN or INTEGER, got FLOAT`; write the comparison you mean, such as `WHERE f <> 0` or `WHERE s <> ''`, or `CAST(x AS BOOLEAN)`, which turns a value into a condition by the rules given in [CAST Operations]({% link _docs/sql-features/cast-operations.md %}).
+
+The error comes as early as the type is known:
+
+- a literal or a `CAST` whose type the statement writes, as in `WHERE 0.5`, `CASE WHEN 'yes' THEN ...` or `WHERE CAST(a AS FLOAT)`, fails the statement when it is parsed, before it reads a row;
+- a `CHECK` on a column whose declared type is not a condition's, such as `CHECK (name)` on a TEXT column, fails the `CREATE TABLE` or `ALTER TABLE` that declares it;
+- any other value, such as a column in a `WHERE`, a parameter or a computed value, fails the statement on the first row that reads it, so a statement that reads no row fails nothing.
+
+An error a condition raises on a row, such as an `Integer overflow` from `ABS`, fails the statement, for `SELECT`, `UPDATE` and `DELETE`, on recent and on checkpointed rows alike. `AND` and `OR` evaluate their operands left to right and stop at the first one that decides the result, so `WHERE id = 1 OR ABS(x) >= 0` raises nothing for the row with `id = 1`, while `WHERE ABS(x) >= 0 OR id = 1` fails on it. An INTEGER operand decides as a condition does: `0 AND ABS(x) >= 0` is false and `1 OR ABS(x) >= 0` is true, and neither reads `x`. `NOT` passes an error on. A row an index or a `LIMIT` leaves unread is never asked, so it raises nothing. A function of your own that writes to its transaction from inside a WHERE is not covered yet; see [Known Limitations]({{ '/docs/development/known-limitations/' | relative_url }}).
 
 `XOR` returns true when exactly one operand is true:
 
@@ -306,6 +316,8 @@ SELECT name, salary,
     END AS level
 FROM employees;
 ```
+
+Each `WHEN` of a searched CASE is a condition, read by the rule in [Conditions](#conditions); a simple CASE compares its value with each `WHEN` instead.
 
 ## Operator Precedence
 

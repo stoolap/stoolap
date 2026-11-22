@@ -34,7 +34,7 @@ use crate::core::interval::{self, Interval, IntervalUnit};
 use crate::core::pattern::Pattern;
 use crate::core::predicate::{sql_compare, sql_distinct, sql_eq, sql_rows_distinct};
 use crate::core::value::{f64_eq, f64_ge, f64_gt, f64_le, f64_lt, f64_ne};
-use crate::core::{DataType, Error, Result, Row, Value, NULL_VALUE};
+use crate::core::{condition_truth, DataType, Error, Result, Row, Value, NULL_VALUE};
 use crate::executor::context::KeptMembers;
 use crate::functions::scalar::extreme_position;
 use std::cmp::Ordering;
@@ -975,7 +975,8 @@ impl ExprVM {
                 // =============================================================
                 Op::And(jump_target) => {
                     // Short-circuit AND: a left operand read as false is the answer
-                    if stack.last().and_then(Self::to_tribool) == Some(false) {
+                    let left = stack.last().map(condition_truth);
+                    if left.transpose()?.flatten() == Some(false) {
                         stack.replace_last(Value::Boolean(false));
                         pc = *jump_target as usize;
                     } else {
@@ -985,7 +986,8 @@ impl ExprVM {
 
                 Op::Or(jump_target) => {
                     // Short-circuit OR: a left operand read as true is the answer
-                    if stack.last().and_then(Self::to_tribool) == Some(true) {
+                    let left = stack.last().map(condition_truth);
+                    if left.transpose()?.flatten() == Some(true) {
                         stack.replace_last(Value::Boolean(true));
                         pc = *jump_target as usize;
                     } else {
@@ -996,14 +998,14 @@ impl ExprVM {
                 Op::AndFinalize => {
                     let b = stack.pop();
                     let a = stack.pop();
-                    stack.push(Self::and(&a, &b));
+                    stack.push(Self::and(&a, &b)?);
                     pc += 1;
                 }
 
                 Op::OrFinalize => {
                     let b = stack.pop();
                     let a = stack.pop();
-                    let result = match (Self::to_tribool(&a), Self::to_tribool(&b)) {
+                    let result = match (condition_truth(&a)?, condition_truth(&b)?) {
                         (Some(true), _) | (_, Some(true)) => Value::Boolean(true),
                         (Some(false), Some(false)) => Value::Boolean(false),
                         _ => Value::Null(DataType::Boolean),
@@ -1014,7 +1016,7 @@ impl ExprVM {
 
                 Op::Not => {
                     let v = stack.pop();
-                    let result = match Self::to_tribool(&v) {
+                    let result = match condition_truth(&v)? {
                         Some(b) => Value::Boolean(!b),
                         None => Value::Null(DataType::Boolean),
                     };
@@ -1182,7 +1184,7 @@ impl ExprVM {
 
                 Op::CaseWhen(next_branch) => {
                     let cond = stack.pop();
-                    if !Self::to_bool(&cond) {
+                    if condition_truth(&cond)? != Some(true) {
                         pc = *next_branch as usize;
                     } else {
                         pc += 1;
@@ -1349,7 +1351,7 @@ impl ExprVM {
             Op::Xor => {
                 let b = stack.pop();
                 let a = stack.pop();
-                let result = match (Self::to_tribool(&a), Self::to_tribool(&b)) {
+                let result = match (condition_truth(&a)?, condition_truth(&b)?) {
                     (Some(a), Some(b)) => Value::Boolean(a ^ b),
                     _ => Value::Null(DataType::Boolean),
                 };
@@ -1805,10 +1807,8 @@ impl ExprVM {
         }
 
         // General path: full VM execution
-        match self.execute(program, ctx) {
-            Ok(Value::Boolean(b)) => b,
-            Ok(Value::Integer(i)) => i != 0,
-            Ok(_) => false,
+        match self.execute(program, ctx).and_then(|v| Self::passes(&v)) {
+            Ok(keeps) => keeps,
             Err(e) => self.stash_bool_error(e),
         }
     }
@@ -1852,16 +1852,13 @@ impl ExprVM {
         }
 
         // General path: full VM execution
-        self.execute(program, ctx).map(|v| Self::passes(&v))
+        self.execute(program, ctx).and_then(|v| Self::passes(&v))
     }
 
-    /// Whether a filter's value keeps its row: TRUE or a non-zero integer
-    pub(crate) fn passes(v: &Value) -> bool {
-        match v {
-            Value::Boolean(b) => *b,
-            Value::Integer(i) => *i != 0,
-            _ => false,
-        }
+    /// Whether a filter's value keeps its row, read as a condition
+    #[inline]
+    pub(crate) fn passes(v: &Value) -> Result<bool> {
+        Ok(condition_truth(v)? == Some(true))
     }
 
     /// The ops `eval_single_op_tribool` answers as the full VM does. A bare
@@ -2153,32 +2150,13 @@ impl ExprVM {
     // =========================================================================
 
     #[inline]
-    fn to_bool(v: &Value) -> bool {
-        match v {
-            Value::Boolean(b) => *b,
-            Value::Integer(i) => *i != 0,
-            Value::Null(_) => false,
-            _ => true, // Non-null values are truthy
-        }
-    }
-
-    #[inline]
     /// The right operand of an AND met with its left: FALSE wins over UNKNOWN
-    pub(crate) fn and(a: &Value, b: &Value) -> Value {
-        match (Self::to_tribool(a), Self::to_tribool(b)) {
+    pub(crate) fn and(a: &Value, b: &Value) -> Result<Value> {
+        Ok(match (condition_truth(a)?, condition_truth(b)?) {
             (Some(false), _) | (_, Some(false)) => Value::Boolean(false),
             (Some(true), Some(true)) => Value::Boolean(true),
             _ => Value::Null(DataType::Boolean),
-        }
-    }
-
-    fn to_tribool(v: &Value) -> Option<bool> {
-        match v {
-            Value::Boolean(b) => Some(*b),
-            Value::Integer(i) => Some(*i != 0),
-            Value::Null(_) => None,
-            _ => Some(true),
-        }
+        })
     }
 
     /// The top `width` values tested against block `index`'s members,
@@ -2251,7 +2229,8 @@ impl ExprVM {
             Op::BetweenColumnConst(_, low, high) => truth(between_cell(cell, low, high)),
             _ => return None,
         };
-        Self::to_tribool(&value)
+        // A comparison's answer is BOOLEAN or NULL, never an error
+        condition_truth(&value).ok().flatten()
     }
 
     /// A cell that is not a number or NULL against a numeric constant, by the

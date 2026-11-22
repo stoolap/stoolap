@@ -375,8 +375,8 @@ fn test_a_filter_answers_a_predicate_chain_as_the_full_vm() {
         Row::from_values(vec![Value::null_unknown(); 5]),
         Row::from_values(vec![Value::Integer(1)]),
     ];
-    // Each term, and whether it reads a column; constants fold, so only a
-    // chain of column terms keeps its shape
+    // Each term, and whether it is a column test; constants fold and a bare
+    // column is no test, so only a chain of column tests keeps its shape
     let terms = [
         ("i > 1", true),
         ("i <= 1", true),
@@ -394,8 +394,8 @@ fn test_a_filter_answers_a_predicate_chain_as_the_full_vm() {
         ("TRUE", false),
         ("NULL", false),
         ("0", false),
-        ("'abc'", false),
-        ("1.5", false),
+        ("t", false),
+        ("f", false),
     ];
     let mut vm = ExprVM::new();
     for len in 1..=3u32 {
@@ -426,14 +426,20 @@ fn test_a_filter_answers_a_predicate_chain_as_the_full_vm() {
             );
             for (r, row) in rows.iter().enumerate() {
                 let ctx = ExecuteContext::new(row);
-                let expected = ExprVM::passes(&vm.execute(&program, &ctx).unwrap());
+                let expected = vm
+                    .execute(&program, &ctx)
+                    .and_then(|v| ExprVM::passes(&v))
+                    .map_err(|e| e.to_string());
+                let kept = vm.execute_bool(&program, &ctx);
+                let stashed = vm.take_bool_error().map(|e| e.to_string());
+                let want = match &expected {
+                    Ok(keeps) => (*keeps, None),
+                    Err(e) => (false, Some(e.clone())),
+                };
+                assert_eq!((kept, stashed), want, "{predicate} on row {r}");
                 assert_eq!(
-                    vm.execute_bool(&program, &ctx),
-                    expected,
-                    "{predicate} on row {r}"
-                );
-                assert_eq!(
-                    vm.execute_bool_checked(&program, &ctx).unwrap(),
+                    vm.execute_bool_checked(&program, &ctx)
+                        .map_err(|e| e.to_string()),
                     expected,
                     "{predicate} on row {r}, checked"
                 );
@@ -527,7 +533,7 @@ fn test_a_column_test_against_parameters_answers_as_its_unfused_ops() {
                     let case = format!("{listing} {params:?} on row {r}");
                     let expected = vm.execute(&unfused, &ctx).unwrap();
                     assert_eq!(vm.execute(&fused, &ctx).unwrap(), expected, "{case}");
-                    let passes = ExprVM::passes(&expected);
+                    let passes = ExprVM::passes(&expected).unwrap();
                     assert_eq!(vm.execute_bool(&fused, &ctx), passes, "{case}, chain");
                     let alone = ExecuteContext::new(row);
                     for (form, program) in

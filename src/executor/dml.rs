@@ -708,15 +708,7 @@ pub(crate) fn run_check(
     row: &Row,
 ) -> Result<()> {
     let result = vm.execute(&check.program, &super::expression::ExecuteContext::new(row))?;
-    let passes = match &result {
-        Value::Boolean(b) => *b,
-        Value::Null(_) => true,
-        Value::Integer(i) => *i != 0,
-        Value::Float(f) => *f != 0.0,
-        Value::Text(t) => !t.is_empty(),
-        _ => true, // Timestamp, Extension, etc. are truthy
-    };
-    if passes {
+    if crate::core::condition_truth(&result)? != Some(false) {
         return Ok(());
     }
     Err(match &check.column {

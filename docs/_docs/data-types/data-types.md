@@ -285,7 +285,7 @@ Every write checks the row it stores: `INSERT`, `INSERT ... SELECT`, both branch
 
 `CREATE TABLE` refuses a CHECK that names a column the table does not have, or that holds a subquery, an aggregate or a window function. `RENAME COLUMN` rewrites the CHECKs that read the column, and `DROP COLUMN` refuses a column that another column's CHECK or a table CHECK reads.
 
-A CHECK runs on a NULL value too, and a CHECK whose result is NULL passes: `CHECK(salary > 0)` takes a NULL salary, while `CHECK(salary IS NOT NULL)` refuses it. A CHECK that fails to evaluate, for example on an overflow, fails the statement.
+A CHECK's condition follows the rule every condition follows, given in [Conditions]({% link _docs/sql-features/operators-expressions.md %}#conditions): it is `TRUE`, `FALSE`, `NULL` or an INTEGER, and a CHECK on a column whose declared type is none of these, such as `CHECK (name)` on a TEXT column, is refused by the `CREATE TABLE` or `ALTER TABLE` that declares it. A CHECK runs on a NULL value too, and a CHECK whose result is NULL passes: `CHECK(salary > 0)` takes a NULL salary, while `CHECK(salary IS NOT NULL)` refuses it. A CHECK that fails to evaluate, for example on an overflow, fails the statement.
 
 ## NULL Values
 

@@ -543,6 +543,8 @@ SELECT IIF(5 > 3, 'yes', 'no');            -- Returns 'yes'
 SELECT IIF(quantity > 0, 'In Stock', 'Out of Stock') FROM products;
 ```
 
+The condition is read by the rule every condition follows, given in [Conditions]({% link _docs/sql-features/operators-expressions.md %}#conditions): `TRUE`, or an INTEGER that is not zero, gives the second argument; `FALSE`, zero or `NULL` gives the third; any other type is an error.
+
 ### TYPEOF
 Returns the data type name of a value.
 

@@ -27,7 +27,7 @@ use rayon::prelude::*;
 
 use crate::common::deadline::DeadlineSite;
 use crate::common::{CompactArc, CompactVec, StringMap};
-use crate::core::{Result, Row, RowVec, Value};
+use crate::core::{condition_truth, Result, Row, RowVec, Value};
 use crate::functions::aggregate::{
     AggregateState, CallTemplate, ColumnsKey, CompiledAggregate, GroupKey, GroupedAggregates,
 };
@@ -1200,7 +1200,7 @@ impl CallInputs {
     ) -> Result<()> {
         if let Some(filter) = &self.filter {
             let vm = vm.get_or_insert_with(ExprVM::new);
-            if !matches!(vm.execute(filter, row)?, Value::Boolean(true)) {
+            if condition_truth(&vm.execute(filter, row)?)? != Some(true) {
                 return Ok(());
             }
         }
