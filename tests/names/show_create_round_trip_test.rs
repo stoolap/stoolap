@@ -33,54 +33,65 @@ const TABLES: &[(&str, &str, &str)] = &[
     (
         "CREATE TABLE \"my t\" (\"product id\" INTEGER PRIMARY KEY, \"a\"\"b\" TEXT)",
         "\"my t\"",
-        "CREATE TABLE \"my t\" (\"product id\" Integer PRIMARY KEY, \"a\"\"b\" Text)",
+        "CREATE TABLE \"my t\" (\"product id\" INTEGER PRIMARY KEY, \"a\"\"b\" TEXT)",
     ),
     (
         "CREATE TABLE kw (\"order\" INTEGER PRIMARY KEY, \"select\" TEXT, \"null\" INTEGER, \
          level INTEGER, CHECK (\"null\" > level))",
         "kw",
-        "CREATE TABLE kw (\"order\" Integer PRIMARY KEY, \"select\" Text, \"null\" Integer, \
-         level Integer, CHECK ((\"null\" > level)))",
+        "CREATE TABLE kw (\"order\" INTEGER PRIMARY KEY, \"select\" TEXT, \"null\" INTEGER, \
+         level INTEGER, CHECK (\"null\" > level))",
     ),
     (
         "CREATE TABLE c (id INTEGER PRIMARY KEY, \"parent id\" INTEGER REFERENCES \"my t\"(\"product id\"))",
         "c",
-        "CREATE TABLE c (id Integer PRIMARY KEY, \"parent id\" Integer, FOREIGN KEY (\"parent id\") \
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, \"parent id\" INTEGER, FOREIGN KEY (\"parent id\") \
          REFERENCES \"my t\"(\"product id\") ON DELETE RESTRICT ON UPDATE RESTRICT)",
     ),
     (
         "CREATE TABLE ct (id INTEGER PRIMARY KEY, \"t s\" TIMESTAMP) CLUSTER BY (\"t s\")",
         "ct",
-        "CREATE TABLE ct (id Integer PRIMARY KEY, \"t s\" Timestamp) CLUSTER BY (\"t s\")",
+        "CREATE TABLE ct (id INTEGER PRIMARY KEY, \"t s\" TIMESTAMP) CLUSTER BY (\"t s\")",
     ),
     (
         "CREATE TABLE k (id INTEGER PRIMARY KEY, e VECTOR(3))",
         "k",
-        "CREATE TABLE k (id Integer PRIMARY KEY, e VECTOR(3))",
+        "CREATE TABLE k (id INTEGER PRIMARY KEY, e VECTOR(3))",
     ),
     (
         "CREATE TABLE u (a INTEGER PRIMARY KEY, b INTEGER, \"c d\" INTEGER, UNIQUE (b, \"c d\"))",
         "u",
-        "CREATE TABLE u (a Integer PRIMARY KEY, b Integer, \"c d\" Integer, UNIQUE (b, \"c d\"))",
+        "CREATE TABLE u (a INTEGER PRIMARY KEY, b INTEGER, \"c d\" INTEGER, UNIQUE (b, \"c d\"))",
     ),
     (
         "CREATE TABLE cp (a INTEGER, b INTEGER, PRIMARY KEY (a, b))",
         "cp",
-        "CREATE TABLE cp (a Integer NOT NULL, b Integer NOT NULL, UNIQUE (a, b))",
+        "CREATE TABLE cp (a INTEGER NOT NULL, b INTEGER NOT NULL, UNIQUE (a, b))",
     ),
     (
         "CREATE TABLE \"check\" (id INTEGER PRIMARY KEY, \"unique\" INTEGER, \"check\" INTEGER, \
          UNIQUE (\"unique\", \"check\"))",
         "\"check\"",
-        "CREATE TABLE check (id Integer PRIMARY KEY, \"unique\" Integer, \"check\" Integer, \
+        "CREATE TABLE check (id INTEGER PRIMARY KEY, \"unique\" INTEGER, \"check\" INTEGER, \
          UNIQUE (unique, check))",
     ),
     (
         "CREATE TABLE n (a INTEGER PRIMARY KEY, \"0\" INTEGER UNIQUE, b INTEGER, c INTEGER, \
          UNIQUE (b, c))",
         "n",
-        "CREATE TABLE n (a Integer PRIMARY KEY, \"0\" Integer UNIQUE, b Integer, c Integer, \
+        "CREATE TABLE n (a INTEGER PRIMARY KEY, \"0\" INTEGER UNIQUE, b INTEGER, c INTEGER, \
          UNIQUE (b, c))",
+    ),
+    (
+        "CREATE TABLE ck (id INTEGER PRIMARY KEY AUTO_INCREMENT, \
+         age INTEGER NOT NULL DEFAULT 3 CHECK (age >= 0), ok BOOLEAN CHECK (ok), \
+         s TEXT CHECK (s IN ('a', 'b)')), j JSON, f FLOAT, \
+         CHECK (age > 0 OR ok), CHECK ((age > 1) AND (ok)))",
+        "ck",
+        "CREATE TABLE ck (id INTEGER PRIMARY KEY AUTO_INCREMENT, \
+         age INTEGER NOT NULL DEFAULT 3 CHECK (age >= 0), ok BOOLEAN CHECK (ok), \
+         s TEXT CHECK (s IN ('a', 'b)')), j JSON, f FLOAT, \
+         CHECK ((age > 0) OR ok), CHECK ((age > 1) AND ok))",
     ),
 ];
 
@@ -126,7 +137,28 @@ fn describe_and_show_indexes_print_what_the_table_was_made_with() {
         (),
     )
     .unwrap();
-    assert_eq!(text(&db, "DESCRIBE k", 1), vec!["Integer", "VECTOR(3)"]);
+    assert_eq!(text(&db, "DESCRIBE k", 1), vec!["INTEGER", "VECTOR(3)"]);
+    db.execute(
+        "CREATE TABLE ck (id INTEGER PRIMARY KEY AUTO_INCREMENT CHECK (id > 0), \
+         age INTEGER CHECK (age >= 0), ok BOOLEAN CHECK (ok), \
+         s TEXT CHECK (s IN ('a', 'b)')), f FLOAT, CHECK (age > f))",
+        (),
+    )
+    .unwrap();
+    assert_eq!(
+        text(&db, "DESCRIBE ck", 1),
+        vec!["INTEGER", "INTEGER", "BOOLEAN", "TEXT", "FLOAT"]
+    );
+    assert_eq!(
+        text(&db, "DESCRIBE ck", 5),
+        vec![
+            "auto_increment, CHECK (id > 0)",
+            "CHECK (age >= 0)",
+            "CHECK (ok)",
+            "CHECK (s IN ('a', 'b)'))",
+            "",
+        ]
+    );
     assert_eq!(
         text(&db, "SHOW INDEXES FROM k", 5),
         vec!["metric=l2, m=8, ef_construction=64, ef_search=99"]

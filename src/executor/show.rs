@@ -137,7 +137,7 @@ impl Executor {
                 }
                 // Add CHECK constraint if present
                 if let Some(check) = &col.check_expr {
-                    def.push_str(&format!(" CHECK ({})", check));
+                    def.push_str(&format!(" {}", check_clause(check)));
                 }
                 def
             })
@@ -159,7 +159,7 @@ impl Executor {
             ));
         }
         for check in &schema.table_checks {
-            create_sql.push_str(&format!(", CHECK ({})", check));
+            create_sql.push_str(&format!(", {}", check_clause(check)));
         }
 
         create_sql.push(')');
@@ -369,12 +369,14 @@ impl Executor {
                 .map(|v| v.to_string())
                 .unwrap_or_default();
 
-            // Extra info (e.g., auto_increment equivalent)
-            let extra_str = if col.auto_increment {
-                "auto_increment"
-            } else {
-                ""
-            };
+            // Extra: auto_increment, then the column's CHECK
+            let extra = col.auto_increment.then(|| "auto_increment".to_string());
+            let check = col.check_expr.as_deref().map(check_clause);
+            let extra_str = extra
+                .into_iter()
+                .chain(check)
+                .collect::<Vec<_>>()
+                .join(", ");
 
             rows.push((
                 i as i64,
@@ -384,7 +386,7 @@ impl Executor {
                     Value::Text(SmartString::new(null_str)),
                     Value::Text(SmartString::new(key_str)),
                     Value::Text(SmartString::from_string(default_str)),
-                    Value::Text(SmartString::new(extra_str)),
+                    Value::Text(SmartString::from_string(extra_str)),
                 ]),
             ));
         }
@@ -400,8 +402,43 @@ fn column_type(col: &SchemaColumn) -> String {
         DataType::Vector if col.vector_dimensions > 0 => {
             format!("VECTOR({})", col.vector_dimensions)
         }
-        data_type => format!("{:?}", data_type),
+        data_type => data_type.to_string(),
     }
+}
+
+/// A CHECK clause of `check`, parenthesized once: a stored condition that
+/// one pair of parentheses already wraps is written as it is
+fn check_clause(check: &str) -> String {
+    if wrapped(check) {
+        format!("CHECK {check}")
+    } else {
+        format!("CHECK ({check})")
+    }
+}
+
+/// Whether `sql` opens with a parenthesis that closes at its very end,
+/// parentheses inside quoted text and names not counted
+fn wrapped(sql: &str) -> bool {
+    if !sql.starts_with('(') {
+        return false;
+    }
+    let (mut depth, mut quote) = (0usize, None);
+    for (i, c) in sql.char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"' | '`') => quote = Some(c),
+            (None, '(') => depth += 1,
+            (None, ')') => {
+                depth -= 1;
+                if depth == 0 {
+                    return i == sql.len() - 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Each of `columns` as a name CREATE TABLE reads back

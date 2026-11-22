@@ -50,9 +50,9 @@ fn a_default_followed_by_null_or_not_null_is_two_constraints() {
     .unwrap();
     assert_eq!(
         create_table(&db, "t"),
-        "CREATE TABLE t (id Integer PRIMARY KEY, a Integer NOT NULL DEFAULT 0, \
-         b Integer DEFAULT (1 + 2), c Integer, d Boolean NOT NULL DEFAULT (1 > 0), \
-         e Boolean DEFAULT (TRUE AND FALSE))"
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL DEFAULT 0, \
+         b INTEGER DEFAULT (1 + 2), c INTEGER, d BOOLEAN NOT NULL DEFAULT (1 > 0), \
+         e BOOLEAN DEFAULT (TRUE AND FALSE))"
     );
     db.execute("INSERT INTO t (id) VALUES (1)", ()).unwrap();
     assert_eq!(
@@ -75,8 +75,8 @@ fn a_default_followed_by_null_or_not_null_is_two_constraints() {
         .unwrap();
     assert_eq!(
         create_table(&db, "z"),
-        "CREATE TABLE z (id Integer PRIMARY KEY, m Integer NOT NULL DEFAULT 0, \
-         n Integer DEFAULT 7, o Text)"
+        "CREATE TABLE z (id INTEGER PRIMARY KEY, m INTEGER NOT NULL DEFAULT 0, \
+         n INTEGER DEFAULT 7, o TEXT)"
     );
     assert_eq!(
         values(&db, "SELECT m, n, o FROM z WHERE id = 1"),
@@ -121,7 +121,7 @@ fn a_like_default_with_escape_ends_before_not_null() {
     .unwrap();
     assert_eq!(
         create_table(&db, "t"),
-        "CREATE TABLE t (id Integer PRIMARY KEY, b Boolean NOT NULL DEFAULT 'a' LIKE 'a!%' ESCAPE '!')"
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, b BOOLEAN NOT NULL DEFAULT 'a' LIKE 'a!%' ESCAPE '!')"
     );
     assert_eq!(
         error(&db, "INSERT INTO t (id, b) VALUES (1, NULL)"),
@@ -164,10 +164,10 @@ fn a_negated_predicate_default_prints_ddl_that_runs_again() {
     let shown = create_table(&db, "t");
     assert_eq!(
         shown,
-        "CREATE TABLE t (id Integer PRIMARY KEY, b Boolean DEFAULT 'a' NOT LIKE 'b', \
-         c Boolean NOT NULL DEFAULT 1 NOT IN (2, 3), d Boolean DEFAULT 1 NOT BETWEEN 2 AND 3, \
-         e Boolean DEFAULT 'a' NOT LIKE 'a' ESCAPE '!', \
-         f Boolean NOT NULL DEFAULT 1 NOT IN (2) IN (TRUE))"
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, b BOOLEAN DEFAULT 'a' NOT LIKE 'b', \
+         c BOOLEAN NOT NULL DEFAULT 1 NOT IN (2, 3), d BOOLEAN DEFAULT 1 NOT BETWEEN 2 AND 3, \
+         e BOOLEAN DEFAULT 'a' NOT LIKE 'a' ESCAPE '!', \
+         f BOOLEAN NOT NULL DEFAULT 1 NOT IN (2) IN (TRUE))"
     );
     again
         .execute(&shown, ())

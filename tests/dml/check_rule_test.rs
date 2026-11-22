@@ -318,7 +318,7 @@ fn rename_column_rewrites_the_checks_that_read_it() {
     );
     let create = show_create(&db);
     assert!(
-        create.contains("CHECK ((w > z))") && create.contains("CHECK (((w + z) < 100))"),
+        create.contains("CHECK (w > z)") && create.contains("CHECK ((w + z) < 100)"),
         "{create}"
     );
 }
@@ -387,7 +387,7 @@ fn create_refuses_a_default_or_check_it_cannot_keep() {
 fn show_create_table_carries_a_table_check() {
     let db = table("check_show_create");
     let create = show_create(&db);
-    assert!(create.contains(", CHECK (((w + v) < 100)))"), "{create}");
+    assert!(create.contains(", CHECK ((w + v) < 100))"), "{create}");
 }
 
 fn reopened(name: &str, keep: impl Fn(&Database)) {

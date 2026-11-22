@@ -52,7 +52,7 @@ Output columns:
 | **Table** | The table name |
 | **Create Table** | Full CREATE TABLE statement |
 
-The generated statement includes column types, a VECTOR column's dimension (`VECTOR(3)`), PRIMARY KEY, NOT NULL, UNIQUE, AUTO_INCREMENT, DEFAULT, CHECK, FOREIGN KEY and CLUSTER BY. A unique index over several columns, including the one a composite `PRIMARY KEY (a, b)` is kept by, is printed as a table constraint `UNIQUE (a, b)` beside the NOT NULL of its columns.
+The generated statement includes column types, written in capitals as `INTEGER`, `TEXT` or `VECTOR(3)`, PRIMARY KEY, NOT NULL, UNIQUE, AUTO_INCREMENT, DEFAULT, CHECK, FOREIGN KEY and CLUSTER BY. A unique index over several columns, including the one a composite `PRIMARY KEY (a, b)` is kept by, is printed as a table constraint `UNIQUE (a, b)` beside the NOT NULL of its columns. A CHECK condition is printed in one pair of parentheses: `CHECK (age >= 0)`.
 
 Every name is printed so the statement parses again: a name holding a character a bare name cannot, such as a space or a `"`, or spelling a reserved keyword such as `order` or `select`, is double-quoted, with an embedded `"` doubled. Running the output again creates a table that refuses the same rows.
 
@@ -94,7 +94,7 @@ Multi-column indexes show column names in parentheses: `(col1, col2, col3)`.
 
 ## DESCRIBE
 
-`DESCRIBE products` lists each column with its `Type`, written as CREATE TABLE takes it: a VECTOR column with its dimension, `VECTOR(3)`.
+`DESCRIBE products` lists each column with its `Type`, written as CREATE TABLE takes it: `INTEGER`, or a VECTOR column with its dimension, `VECTOR(3)`. Its `Extra` shows `auto_increment` and the column's CHECK, as [DESCRIBE]({% link _docs/sql-commands/describe.md %}) lists.
 
 ## Example
 
