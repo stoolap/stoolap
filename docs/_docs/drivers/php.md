@@ -14,11 +14,11 @@ High-performance PHP driver for Stoolap. Built as a native PHP extension (C) for
 
 ### Prebuilt Binaries
 
-Download a package matching your PHP version and platform from [GitHub Releases](https://github.com/stoolap/stoolap-php/releases). Packages are built for PHP 8.1 to 8.4 on `linux-x86_64` and `darwin-arm64`. Each archive contains both the PHP extension and the stoolap library.
+Download a package matching your PHP version and platform from [GitHub Releases](https://github.com/stoolap/stoolap-php/releases). Packages are built for PHP 8.1 to 8.6 on `linux-x86_64` and `darwin-arm64`. Each archive contains both the PHP extension and the stoolap library.
 
 ```bash
-tar xzf stoolap-v0.5.0-php8.4-linux-x86_64.tar.gz
-cd stoolap-v0.5.0-php8.4-linux-x86_64
+tar xzf stoolap-v0.5.1-php8.4-linux-x86_64.tar.gz
+cd stoolap-v0.5.1-php8.4-linux-x86_64
 
 # Install the shared library
 sudo cp libstoolap.so /usr/local/lib/
@@ -30,7 +30,7 @@ sudo cp stoolap.so $(php-config --extension-dir)/
 
 ### Using PIE
 
-Requires the stoolap shared library (`libstoolap.so` / `libstoolap.dylib`) installed on your system. Driver 0.5.0 needs the Stoolap 0.5.0 library.
+Requires the stoolap shared library (`libstoolap.so` / `libstoolap.dylib`) installed on your system. Driver 0.5.1 needs the Stoolap 0.5.1 library.
 
 ```bash
 pie install stoolap/stoolap-php
@@ -405,7 +405,7 @@ When not set, daemon mode is auto-detected from the SAPI name (fpm, cgi, apache)
 Requires:
 - [PHP](https://www.php.net) >= 8.1 with development headers (`php-dev` / `php-devel`)
 - C compiler (gcc, clang, or MSVC)
-- The Stoolap 0.5.0 shared library (`libstoolap.dylib` / `libstoolap.so` / `stoolap.dll`), either from [Stoolap releases](https://github.com/stoolap/stoolap/releases) or built from source
+- The Stoolap 0.5.1 shared library (`libstoolap.dylib` / `libstoolap.so` / `stoolap.dll`), either from [Stoolap releases](https://github.com/stoolap/stoolap/releases) or built from source
 
 ```bash
 git clone https://github.com/stoolap/stoolap-php.git
