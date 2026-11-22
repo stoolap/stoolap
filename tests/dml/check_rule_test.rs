@@ -384,16 +384,37 @@ fn create_refuses_a_default_or_check_it_cannot_keep() {
 }
 
 #[test]
-fn a_column_written_with_two_checks_is_refused() {
+fn a_column_written_with_two_checks_or_two_defaults_is_refused() {
     let db = table("check_two_on_a_column");
     let before = show_create(&db);
-    for sql in [
-        "CREATE TABLE d (id INTEGER PRIMARY KEY, w FLOAT CHECK (w) CHECK (TRUE))",
-        "ALTER TABLE c ADD COLUMN x INTEGER CHECK (x > 0) CHECK (x < 9)",
-        "ALTER TABLE c MODIFY COLUMN v INTEGER CHECK (v > 0) CHECK (v < 9)",
+    for (sql, refusal) in [
+        (
+            "CREATE TABLE d (id INTEGER PRIMARY KEY, w FLOAT CHECK (w) CHECK (TRUE))",
+            "takes one CHECK",
+        ),
+        (
+            "ALTER TABLE c ADD COLUMN x INTEGER CHECK (x > 0) CHECK (x < 9)",
+            "takes one CHECK",
+        ),
+        (
+            "ALTER TABLE c MODIFY COLUMN v INTEGER CHECK (v > 0) CHECK (v < 9)",
+            "takes one CHECK",
+        ),
+        (
+            "CREATE TABLE d (id INTEGER PRIMARY KEY, w INTEGER DEFAULT 1 DEFAULT 2)",
+            "takes one DEFAULT",
+        ),
+        (
+            "ALTER TABLE c ADD COLUMN x INTEGER DEFAULT 1 DEFAULT 2",
+            "takes one DEFAULT",
+        ),
+        (
+            "ALTER TABLE c MODIFY COLUMN v INTEGER DEFAULT 1 DEFAULT 2",
+            "takes one DEFAULT",
+        ),
     ] {
         let err = db.execute(sql, ()).unwrap_err().to_string();
-        assert!(err.contains("takes one CHECK"), "{sql}: {err}");
+        assert!(err.contains(refusal), "{sql}: {err}");
     }
     assert!(db.execute("SELECT * FROM d", ()).is_err(), "d was created");
     assert_eq!(show_create(&db), before);

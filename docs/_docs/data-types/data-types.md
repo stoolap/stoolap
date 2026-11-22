@@ -242,7 +242,7 @@ Supported default values:
 - `NULL`
 - `CURRENT_TIMESTAMP` or `NOW()` for timestamps
 
-`CREATE TABLE` and `ALTER TABLE ... ADD COLUMN` refuse a DEFAULT that holds a subquery, an aggregate or a window function.
+`CREATE TABLE` and `ALTER TABLE ... ADD COLUMN` refuse a DEFAULT that holds a subquery, an aggregate or a window function. A column takes one DEFAULT: `CREATE TABLE`, `ALTER TABLE ... ADD COLUMN` and `ALTER TABLE ... MODIFY COLUMN` refuse a column written with two, such as `a INTEGER DEFAULT 1 DEFAULT 2`.
 
 ### CHECK
 
