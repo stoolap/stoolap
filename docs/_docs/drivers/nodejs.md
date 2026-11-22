@@ -99,6 +99,7 @@ const db = await Database.open('file:///absolute/path/to/db');
 | `queryOne(sql, params?)` | `Promise<Object \| null>` | Query single row |
 | `queryRaw(sql, params?)` | `Promise<{columns, rows}>` | Query in columnar format |
 | `iterate(sql, params?)` | `RowCursor` | Cursor over rows, `for await` or `for...of` |
+| `iterateRaw(sql, params?)` | `RowCursor` | Cursor over rows as arrays, with `columns` |
 | `begin()` | `Promise<Transaction>` | Begin a transaction |
 | `close()` | `Promise<void>` | Close the database |
 
@@ -116,6 +117,7 @@ Sync methods run on the main thread. Faster for simple operations but blocks the
 | `queryOneSync(sql, params?)` | `Object \| null` | Query single row |
 | `queryRawSync(sql, params?)` | `{columns, rows}` | Query in columnar format |
 | `iterate(sql, params?)` | `RowCursor` | Cursor over rows, fetched in chunks |
+| `iterateRaw(sql, params?)` | `RowCursor` | Cursor over rows as arrays, with `columns` |
 | `executeBatchSync(sql, paramsArray)` | `RunResult` | Execute with multiple param sets |
 | `beginSync()` | `Transaction` | Begin a transaction |
 | `prepare(sql)` | `PreparedStatement` | Create a prepared statement |
@@ -244,6 +246,14 @@ for (const user of stmt.iterate({ min: 30 })) { /* ... */ }
 
 A cursor opened on a transaction is closed by `commit` and `rollback`; one opened on a database is closed with it. Call `cursor.close()` to end an iteration early without breaking out of a loop.
 
+`iterateRaw` streams the same way but yields each row as an array, the shape `queryRaw` returns, so two columns with the same name stay apart. `cursor.columns` names them; read before the loop, it fetches the first chunk, so an empty result still has its columns.
+
+```js
+const cursor = db.iterateRaw('SELECT a.id, b.id FROM a JOIN b ON b.a_id = a.id');
+console.log(cursor.columns); // ['id', 'id']
+for (const [aId, bId] of cursor) { /* ... */ }
+```
+
 ## Batch Execution
 
 Execute the same SQL with multiple parameter sets in a single call. Automatically wraps in a transaction. Rows are arrays for `$n` placeholders or objects for `:name` placeholders.
@@ -285,10 +295,13 @@ All methods mirror `Database` but without the `sql` parameter (it's bound at pre
 | `queryOne(params?)` | `queryOneSync(params?)` | Query single row |
 | `queryRaw(params?)` | `queryRawSync(params?)` | Query in columnar format |
 | `iterate(params?)` | — | Cursor over rows, `for await` or `for...of` |
+| `iterateRaw(params?)` | — | Cursor over rows as arrays, with `columns` |
 | | `executeBatchSync(paramsArray)` | Execute with multiple param sets |
 | | `finalize()` | Release the prepared statement |
 
 Property: `sql` returns the SQL text of this prepared statement.
+
+Async calls on one statement run one at a time, in the order they were made (`Promise.all` over them is safe). A sync call or `iterate` on a statement with an async call still in flight throws.
 
 ### Async Usage
 
@@ -374,6 +387,7 @@ try {
 | `queryOne(sql, params?)` | `queryOneSync(sql, params?)` | Query single row |
 | `queryRaw(sql, params?)` | `queryRawSync(sql, params?)` | Query in columnar format |
 | `iterate(sql, params?)` | — | Cursor over rows, closed by commit/rollback |
+| `iterateRaw(sql, params?)` | — | Cursor over rows as arrays, with `columns` |
 | `commit()` | `commitSync()` | Commit the transaction |
 | `rollback()` | `rollbackSync()` | Rollback the transaction |
 | | `executeBatchSync(sql, paramsArray)` | Execute with multiple param sets |
@@ -441,13 +455,13 @@ try {
 
 | JavaScript | Stoolap | Notes |
 |-----------|---------|-------|
-| `number` (integer) | `INTEGER` | |
+| `number` (integer) | `INTEGER` | Returned as `number` while it fits 2^53, else as `bigint` |
 | `number` (float) | `FLOAT` | |
 | `string` | `TEXT` | |
 | `boolean` | `BOOLEAN` | |
 | `null` / `undefined` | `NULL` | |
-| `BigInt` | `INTEGER` | |
-| `Date` | `TIMESTAMP` | |
+| `BigInt` | `INTEGER` | Exact over the full 64-bit range |
+| `Date` | `TIMESTAMP` | Milliseconds; the engine's microseconds are floored |
 | `Float32Array` | `VECTOR(N)` | Returned as `Float32Array` |
 | `Buffer` | `TEXT` (UTF-8) | |
 | `Object` / `Array` | `JSON` (stringified) | |
