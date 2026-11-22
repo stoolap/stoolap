@@ -1530,6 +1530,25 @@ impl Executor {
                     if let Some(text) = &check {
                         next.columns[at].check_expr = Some(text.clone());
                     }
+                    // A CHECK the table keeps that reads the column as a
+                    // condition must take its new type
+                    if retyped {
+                        let new_type =
+                            |name: &str| eq_names(name, &col_def.name.value).then_some(data_type);
+                        let column_checks = next
+                            .columns
+                            .iter()
+                            .filter_map(|c| Some((c.check_expr.as_deref()?, c.name.as_str())));
+                        let table_checks = next
+                            .table_checks
+                            .iter()
+                            .map(|t| (t.as_str(), table_name.as_str()));
+                        for (text, owner) in column_checks.chain(table_checks) {
+                            let expr =
+                                crate::parser::parse_stored_expression(text, "CHECK", owner)?;
+                            check_condition_columns(&expr, &new_type)?;
+                        }
+                    }
                     let mut judges = super::dml::compile_check_programs(&next)?;
                     judges.retain(|judged| {
                         let taken = check.is_some()

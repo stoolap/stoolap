@@ -275,6 +275,7 @@ fn a_cached_answer_reads_a_condition_before_the_constant_beside_it() {
         if warm {
             assert_eq!(all_rows(&db, "SELECT * FROM t WHERE TRUE"), Ok(1));
             assert_eq!(all_rows(&db, "SELECT * FROM t WHERE FALSE"), Ok(0));
+            assert_eq!(all_rows(&db, "SELECT * FROM t WHERE 0"), Ok(0));
         }
         for sql in [
             "SELECT * FROM t WHERE t.f OR TRUE",
@@ -282,6 +283,7 @@ fn a_cached_answer_reads_a_condition_before_the_constant_beside_it() {
             "SELECT * FROM t WHERE (t.f AND TRUE) = FALSE",
             "SELECT * FROM t WHERE (FALSE OR t.f) IS NOT NULL",
             "SELECT * FROM t WHERE (NOT NOT t.f) IS NOT NULL",
+            "SELECT * FROM t WHERE 0 / 1.0",
         ] {
             let got = all_rows(&db, sql);
             assert!(
@@ -290,6 +292,37 @@ fn a_cached_answer_reads_a_condition_before_the_constant_beside_it() {
             );
         }
     }
+}
+
+#[test]
+fn a_cached_answer_keeps_the_type_of_an_arithmetic_it_reads() {
+    let sql = "SELECT * FROM t WHERE (t.s * 1) IS NULL";
+    let cold = Database::open("memory://condition_rule_arith_cold").unwrap();
+    fill(&cold);
+    let warm = Database::open("memory://condition_rule_arith_warm").unwrap();
+    fill(&warm);
+    assert_eq!(all_rows(&warm, "SELECT * FROM t WHERE t.s IS NULL"), Ok(0));
+    assert_eq!(all_rows(&warm, sql), all_rows(&cold, sql));
+}
+
+#[test]
+fn a_type_change_refuses_a_kept_check_that_reads_the_column_as_a_condition() {
+    let db = Database::open("memory://condition_rule_retype").unwrap();
+    db.execute(
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, b INTEGER CHECK (b), c INTEGER, \
+         d INTEGER CHECK (d OR c), CHECK (NOT c))",
+        (),
+    )
+    .unwrap();
+    for (sql, kind) in [
+        ("ALTER TABLE r MODIFY COLUMN b TEXT", "TEXT"),
+        ("ALTER TABLE r MODIFY COLUMN c FLOAT", "FLOAT"),
+    ] {
+        let err = db.execute(sql, ()).unwrap_err().to_string();
+        assert!(err.contains(&refusal(kind)), "{sql}: {err}");
+    }
+    db.execute("ALTER TABLE r MODIFY COLUMN d BOOLEAN", ())
+        .unwrap();
 }
 
 #[test]
