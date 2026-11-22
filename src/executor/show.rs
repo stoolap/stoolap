@@ -28,6 +28,8 @@ use crate::common::SmartString;
 use crate::core::row_vec::RowVec;
 use crate::core::{DataType, Error, Result, Row, SchemaColumn, Value};
 use crate::parser::ast::*;
+use crate::parser::token::TokenType;
+use crate::parser::Lexer;
 use crate::storage::traits::transaction::{StatementTable, TableUse};
 use crate::storage::traits::{Engine, QueryResult};
 
@@ -416,29 +418,27 @@ fn check_clause(check: &str) -> String {
     }
 }
 
-/// Whether `sql` opens with a parenthesis that closes at its very end,
-/// parentheses inside quoted text and names not counted
+/// Whether `sql` opens with a parenthesis that closes at its very end, read
+/// with the parser's own tokens so quoted text and names count no parenthesis
 fn wrapped(sql: &str) -> bool {
-    if !sql.starts_with('(') {
-        return false;
-    }
-    let (mut depth, mut quote) = (0usize, None);
-    for (i, c) in sql.char_indices() {
-        match (quote, c) {
-            (Some(q), c) if c == q => quote = None,
-            (Some(_), _) => {}
-            (None, '\'' | '"' | '`') => quote = Some(c),
-            (None, '(') => depth += 1,
-            (None, ')') => {
+    let mut lexer = Lexer::new(sql);
+    let mut depth = 0usize;
+    loop {
+        let token = lexer.next_token();
+        match (token.token_type, token.literal.as_str()) {
+            (TokenType::Comment, _) => {}
+            (TokenType::Punctuator, "(") => depth += 1,
+            (TokenType::Punctuator, ")") if depth > 0 => {
                 depth -= 1;
                 if depth == 0 {
-                    return i == sql.len() - 1;
+                    return lexer.next_token().token_type == TokenType::Eof;
                 }
             }
+            _ if depth == 0 => return false,
+            (TokenType::Eof | TokenType::Error, _) => return false,
             _ => {}
         }
     }
-    false
 }
 
 /// Each of `columns` as a name CREATE TABLE reads back

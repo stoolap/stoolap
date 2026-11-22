@@ -93,6 +93,13 @@ const TABLES: &[(&str, &str, &str)] = &[
          s TEXT CHECK (s IN ('a', 'b)')), j JSON, f FLOAT, \
          CHECK ((age > 0) OR ok), CHECK ((age > 1) AND ok))",
     ),
+    (
+        "CREATE TABLE tq (id INTEGER PRIMARY KEY, \
+         s TEXT CHECK ((s || TIME 'a\\'b') IN (TIME 'a\\'b')))",
+        "tq",
+        "CREATE TABLE tq (id INTEGER PRIMARY KEY, \
+         s TEXT CHECK ((s || TIME 'a\\'b') IN (TIME 'a\\'b')))",
+    ),
 ];
 
 #[test]
