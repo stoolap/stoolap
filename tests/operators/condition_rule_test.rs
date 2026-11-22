@@ -276,12 +276,19 @@ fn a_cached_answer_reads_a_condition_before_the_constant_beside_it() {
             assert_eq!(all_rows(&db, "SELECT * FROM t WHERE TRUE"), Ok(1));
             assert_eq!(all_rows(&db, "SELECT * FROM t WHERE FALSE"), Ok(0));
         }
-        let sql = "SELECT * FROM t WHERE t.f OR TRUE";
-        let got = all_rows(&db, sql);
-        assert!(
-            matches!(&got, Err(e) if e.contains(&refusal("FLOAT"))),
-            "{sql}, cache warm {warm}: {got:?}"
-        );
+        for sql in [
+            "SELECT * FROM t WHERE t.f OR TRUE",
+            "SELECT * FROM t WHERE NOT (t.f AND FALSE)",
+            "SELECT * FROM t WHERE (t.f AND TRUE) = FALSE",
+            "SELECT * FROM t WHERE (FALSE OR t.f) IS NOT NULL",
+            "SELECT * FROM t WHERE (NOT NOT t.f) IS NOT NULL",
+        ] {
+            let got = all_rows(&db, sql);
+            assert!(
+                matches!(&got, Err(e) if e.contains(&refusal("FLOAT"))),
+                "{sql}, cache warm {warm}: {got:?}"
+            );
+        }
     }
 }
 

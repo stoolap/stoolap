@@ -204,47 +204,78 @@ impl ExpressionSimplifier {
         }
     }
 
-    /// Simplify AND expressions
+    /// Whether `expr` answers TRUE, FALSE or NULL, so that reading it as a
+    /// condition, as AND, OR and NOT do, changes neither its answer nor its
+    /// errors; a rule that keeps x alone in place of `x AND TRUE` needs it
+    fn answers_truth(expr: &Expression) -> bool {
+        match expr {
+            Expression::BooleanLiteral(_)
+            | Expression::In(_)
+            | Expression::Between(_)
+            | Expression::Like(_)
+            | Expression::Exists(_)
+            | Expression::AllAny(_)
+            | Expression::QuantifiedSet(_) => true,
+            Expression::Prefix(p) => p.op_type == PrefixOperator::Not,
+            Expression::Infix(i) => matches!(
+                i.op_type,
+                InfixOperator::Equal
+                    | InfixOperator::NotEqual
+                    | InfixOperator::LessThan
+                    | InfixOperator::LessEqual
+                    | InfixOperator::GreaterThan
+                    | InfixOperator::GreaterEqual
+                    | InfixOperator::And
+                    | InfixOperator::Or
+                    | InfixOperator::Xor
+                    | InfixOperator::Is
+                    | InfixOperator::IsNot
+                    | InfixOperator::IsDistinctFrom
+                    | InfixOperator::IsNotDistinctFrom
+            ),
+            _ => false,
+        }
+    }
+
+    /// Simplify AND expressions; x is read first, so a constant on its right
+    /// never drops it
     fn simplify_and(&self, left: &Expression, right: &Expression) -> Option<Expression> {
         // TRUE AND x → x
-        if self.is_always_true(left) {
+        if self.is_always_true(left) && Self::answers_truth(right) {
             return Some(right.clone());
         }
         // x AND TRUE → x
-        if self.is_always_true(right) {
+        if self.is_always_true(right) && Self::answers_truth(left) {
             return Some(left.clone());
         }
         // FALSE AND x → FALSE
         if self.is_always_false(left) {
             return Some(left.clone());
         }
-        // x AND FALSE → FALSE
-        if self.is_always_false(right) {
-            return Some(right.clone());
-        }
         // x AND x → x
-        if self.expr_equals(left, right) {
+        if self.expr_equals(left, right) && Self::answers_truth(left) {
             return Some(left.clone());
         }
         None
     }
 
-    /// Simplify OR expressions
+    /// Simplify OR expressions; x is read first, so a constant on its right
+    /// never drops it
     fn simplify_or(&self, left: &Expression, right: &Expression) -> Option<Expression> {
         // FALSE OR x → x
-        if self.is_always_false(left) {
+        if self.is_always_false(left) && Self::answers_truth(right) {
             return Some(right.clone());
         }
         // x OR FALSE → x
-        if self.is_always_false(right) {
+        if self.is_always_false(right) && Self::answers_truth(left) {
             return Some(left.clone());
         }
-        // TRUE OR x → TRUE; `x OR TRUE` stays, as x is read first
+        // TRUE OR x → TRUE
         if self.is_always_true(left) {
             return Some(left.clone());
         }
         // x OR x → x
-        if self.expr_equals(left, right) {
+        if self.expr_equals(left, right) && Self::answers_truth(left) {
             return Some(left.clone());
         }
         None
@@ -367,7 +398,7 @@ impl ExpressionSimplifier {
                 }
                 // NOT NOT x → x
                 else if let Expression::Prefix(inner) = operand {
-                    if inner.op_type == PrefixOperator::Not {
+                    if inner.op_type == PrefixOperator::Not && Self::answers_truth(&inner.right) {
                         Some((*inner.right).clone())
                     } else {
                         None
@@ -683,17 +714,33 @@ mod tests {
         }
     }
 
+    /// `x > 1`, which answers TRUE, FALSE or NULL
+    fn make_test() -> Expression {
+        make_infix(
+            make_identifier("x"),
+            InfixOperator::GreaterThan,
+            make_int_lit(1),
+        )
+    }
+
     #[test]
     fn test_boolean_and_simplification() {
-        // TRUE AND x → x
-        let x = make_identifier("x");
-        let expr = make_infix(make_bool_lit(true), InfixOperator::And, x.clone());
-        let result = simplify_expression(&expr);
+        // TRUE AND (x > 1) → x > 1, and x > 1 AND TRUE → x > 1
+        let test = make_test();
+        for expr in [
+            make_infix(make_bool_lit(true), InfixOperator::And, test.clone()),
+            make_infix(test.clone(), InfixOperator::And, make_bool_lit(true)),
+        ] {
+            assert_eq!(simplify_expression(&expr), test);
+        }
 
-        if let Expression::Identifier(id) = result {
-            assert_eq!(id.value, "x");
-        } else {
-            panic!("Expected Identifier 'x'");
+        // A bare x stays read as a condition, and x AND FALSE reads x first
+        let x = make_identifier("x");
+        for expr in [
+            make_infix(make_bool_lit(true), InfixOperator::And, x.clone()),
+            make_infix(x.clone(), InfixOperator::And, make_bool_lit(false)),
+        ] {
+            assert_eq!(simplify_expression(&expr), expr);
         }
 
         // FALSE AND x → FALSE
@@ -709,15 +756,22 @@ mod tests {
 
     #[test]
     fn test_boolean_or_simplification() {
-        // FALSE OR x → x
-        let x = make_identifier("x");
-        let expr = make_infix(make_bool_lit(false), InfixOperator::Or, x.clone());
-        let result = simplify_expression(&expr);
+        // FALSE OR (x > 1) → x > 1, and x > 1 OR FALSE → x > 1
+        let test = make_test();
+        for expr in [
+            make_infix(make_bool_lit(false), InfixOperator::Or, test.clone()),
+            make_infix(test.clone(), InfixOperator::Or, make_bool_lit(false)),
+        ] {
+            assert_eq!(simplify_expression(&expr), test);
+        }
 
-        if let Expression::Identifier(id) = result {
-            assert_eq!(id.value, "x");
-        } else {
-            panic!("Expected Identifier 'x'");
+        // A bare x stays read as a condition, and x OR TRUE reads x first
+        let x = make_identifier("x");
+        for expr in [
+            make_infix(make_bool_lit(false), InfixOperator::Or, x.clone()),
+            make_infix(x.clone(), InfixOperator::Or, make_bool_lit(true)),
+        ] {
+            assert_eq!(simplify_expression(&expr), expr);
         }
 
         // TRUE OR x → TRUE
@@ -753,22 +807,24 @@ mod tests {
 
     #[test]
     fn test_idempotent_and() {
+        // (x > 1) AND (x > 1) → x > 1; x AND x keeps x read as a condition
+        let test = make_test();
+        let expr = make_infix(test.clone(), InfixOperator::And, test.clone());
+        assert_eq!(simplify_expression(&expr), test);
         let x = make_identifier("x");
-
-        // x AND x → x
         let expr = make_infix(x.clone(), InfixOperator::And, x.clone());
-        let result = simplify_expression(&expr);
-        assert!(matches!(result, Expression::Identifier(_)));
+        assert_eq!(simplify_expression(&expr), expr);
     }
 
     #[test]
     fn test_idempotent_or() {
+        // (x > 1) OR (x > 1) → x > 1; x OR x keeps x read as a condition
+        let test = make_test();
+        let expr = make_infix(test.clone(), InfixOperator::Or, test.clone());
+        assert_eq!(simplify_expression(&expr), test);
         let x = make_identifier("x");
-
-        // x OR x → x
         let expr = make_infix(x.clone(), InfixOperator::Or, x.clone());
-        let result = simplify_expression(&expr);
-        assert!(matches!(result, Expression::Identifier(_)));
+        assert_eq!(simplify_expression(&expr), expr);
     }
 
     #[test]
