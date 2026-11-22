@@ -18,14 +18,14 @@ The driver is published to Maven Central. The JAR bundles the native library for
 <dependency>
     <groupId>io.stoolap</groupId>
     <artifactId>stoolap-java</artifactId>
-    <version>0.5.0</version>
+    <version>0.5.1</version>
 </dependency>
 ```
 
 Gradle:
 
 ```groovy
-implementation 'io.stoolap:stoolap-java:0.5.0'
+implementation 'io.stoolap:stoolap-java:0.5.1'
 ```
 
 Driver 0.5.x runs the Stoolap 0.5 engine. It opens a database written by 0.4.x and moves its files forward on their own; see the [migration guide]({{ '/docs/development/migration-v042-to-v050/' | relative_url }}) before upgrading.
@@ -42,7 +42,7 @@ The driver searches for `libstoolap_jni.{dylib,so,dll}` in this order:
 
 ```bash
 export STOOLAP_LIB=/path/to/stoolap-java/jni/target/release/libstoolap_jni.dylib
-java -cp stoolap-java-0.5.0.jar:your-app.jar your.Main
+java -cp stoolap-java-0.5.1.jar:your-app.jar your.Main
 ```
 
 ## Quick Start
