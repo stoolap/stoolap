@@ -1040,23 +1040,30 @@ impl MVCCTable {
         })
     }
 
-    /// The ids `plan` reads for `expr`; an index read under a statement view
-    /// only while no change the removal history does not cover ran, with
-    /// every entry a commit the view does not see took out added back from
-    /// the history. Every caller reads the rows through the view and applies
-    /// `expr` again
+    /// The ids `plan` reads for `expr`; an index read only while it names
+    /// every committed row the reader sees: no snapshot older than the
+    /// index, no change meanwhile the epoch or, under a view, the removal
+    /// history does not cover. Every caller reads the rows through its
+    /// snapshot, adds its own rows and applies `expr` again
     fn read_indexes(&self, plan: &IndexPlan, expr: &dyn Expression) -> Option<RowIdVec> {
-        let Some(view) = self.view.as_ref().filter(|_| !plan.names_keys()) else {
+        if plan.names_keys() {
             return self.read_plan(plan, expr, None);
-        };
+        }
         let epoch = self.committed_candidate_epoch()?;
-        let history = HistoryProbe::new(&self.version_store, view);
-        let row_ids = self.read_plan(plan, expr, Some(&history))?;
-        if history.declined() || self.committed_candidate_epoch() != Some(epoch) {
+        let history = self
+            .view
+            .as_ref()
+            .map(|view| HistoryProbe::new(&self.version_store, view));
+        let row_ids = self.read_plan(plan, expr, history.as_ref())?;
+        if history.as_ref().is_some_and(HistoryProbe::declined)
+            || self.committed_candidate_epoch() != Some(epoch)
+        {
             return None;
         }
         #[cfg(feature = "test-failpoints")]
-        crate::test_failpoints::view_index_lookup_answered();
+        if history.is_some() {
+            crate::test_failpoints::view_index_lookup_answered();
+        }
         Some(row_ids)
     }
 
@@ -1329,8 +1336,7 @@ impl MVCCTable {
     }
 
     /// The ids a multi-column index gives for equalities on its first
-    /// `equal` columns and, when `ranged`, the bounds on the next one; an
-    /// empty answer only while it holds every key the statement sees
+    /// `equal` columns and, when `ranged`, the bounds on the next one
     fn read_prefix(
         &self,
         index: &dyn Index,
@@ -1349,7 +1355,6 @@ impl MVCCTable {
             })?;
             values.push(value.clone());
         }
-        let quiet = self.committed_candidate_epoch();
         let bounds = match ranged {
             true => column_bounds(&columns[equal], scope),
             false => (None, None),
@@ -1377,16 +1382,7 @@ impl MVCCTable {
         if let Some(history) = history {
             history.merge(index, &mut row_ids, &|key| starts_with(key, &values));
         }
-        (!row_ids.is_empty() || self.settled(quiet)).then_some(row_ids)
-    }
-
-    /// Whether an empty index answer read since `quiet` means no row: the
-    /// index carried every key the statement can see, as
-    /// `query_index_with_operator` explains
-    fn settled(&self, quiet: Option<u64>) -> bool {
-        quiet.is_some()
-            && self.committed_candidate_epoch() == quiet
-            && !self.local().has_local_changes()
+        Some(row_ids)
     }
 }
 
@@ -1621,24 +1617,11 @@ impl MVCCTable {
 
         match operator {
             Operator::Eq => {
-                let quiet = self.committed_candidate_epoch();
                 let mut row_ids = index.get_row_ids_equal(std::slice::from_ref(value));
                 if let Some(history) = history {
                     history.merge(index, &mut row_ids, &|key| first_equals(key, value));
                 }
-                if !row_ids.is_empty() {
-                    return Some(row_ids);
-                }
-                // An empty probe answers "no committed row" only while the
-                // index carries every key this statement can see: no snapshot
-                // older than the keys the index holds (a commit moves a key out
-                // of it while the snapshot still sees the row under the old
-                // one), and no commit taking an entry out meanwhile (it updates
-                // the index before its versions are visible). Otherwise the
-                // scan decides. Local writes join the index at commit: every
-                // caller adds them or declines while the transaction holds any
-                let settled = quiet.is_some() && self.committed_candidate_epoch() == quiet;
-                settled.then_some(row_ids)
+                Some(row_ids)
             }
             Operator::Gt | Operator::Gte | Operator::Lt | Operator::Lte => {
                 // Use find_with_operator for range queries
@@ -1655,11 +1638,7 @@ impl MVCCTable {
                         key.first().is_some_and(|first| within(first, lower, upper))
                     });
                 }
-                if row_ids.is_empty() {
-                    None
-                } else {
-                    Some(row_ids)
-                }
+                Some(row_ids)
             }
             _ => None,
         }

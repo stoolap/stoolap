@@ -1331,7 +1331,6 @@ fn a_read_past_a_long_history_of_one_row_charges_its_versions() {
         ("SELECT v FROM l ORDER BY id DESC LIMIT 1", 2),
         ("SELECT v FROM l WHERE id = 2", 2),
         ("SELECT v FROM l WHERE id = 2 AND v >= 0 LIMIT 1", 2),
-        ("UPDATE l SET v = v WHERE g = 1 AND v < 0", 100),
         ("DELETE FROM l WHERE g = 1 AND v < 0", 2),
         ("DELETE FROM l WHERE id = 2 AND v < 0", 2),
         // Rows of fewer than 4,096 versions each still add up
@@ -1341,6 +1340,12 @@ fn a_read_past_a_long_history_of_one_row_charges_its_versions() {
     }
     let update = DeadlineSite::StorageUpdate;
     charged(&hot, update, "UPDATE l SET v = v WHERE v < 0", 100);
+    charged(
+        &hot,
+        update,
+        "UPDATE l SET v = v WHERE g = 1 AND v < 0",
+        100,
+    );
     charged(&hot, update, "UPDATE l SET v = v", 100);
     // The hot check of each sealed id walks its row's history
     charged(&cold, rows, "SELECT v FROM s WHERE id IN (1, 2)", 100);
