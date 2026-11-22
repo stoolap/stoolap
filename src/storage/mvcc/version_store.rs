@@ -610,13 +610,14 @@ const SUM_BOOLEAN: u8 = 3;
 
 /// [`SumAccumulator::add`] with the declared type `LEAD` and NULL tested
 /// first and any other value out of line, so the order holds whatever order
-/// a match over every type compiles to
+/// a match over every type compiles to. A FLOAT of a FLOAT column adds in
+/// the caller's run, which settles it
 #[inline(always)]
 fn add_led<const LEAD: u8>(sum: &mut SumAccumulator, val: &Value) {
     match (LEAD, val) {
         (SUM_ANY, _) => sum.add(val),
         (SUM_INTEGER, Value::Integer(i)) => sum.add_int(*i),
-        (SUM_FLOAT, Value::Float(f)) => sum.add_float(*f),
+        (SUM_FLOAT, Value::Float(f)) => sum.add_float_in_run(*f),
         (SUM_BOOLEAN, Value::Boolean(b)) => sum.add_int(*b as i64),
         (_, Value::Null(_)) => {}
         _ => *sum = add_other(*sum, val),
@@ -659,6 +660,14 @@ fn sum_live_heads<const LEAD: u8>(
             add_led::<LEAD>(&mut sum, val);
         }
     }
+    sum.settle_run(|| {
+        meta.iter().zip(data).any(|(meta, row)| {
+            meta.txn_id != 0
+                && meta.deleted_at_txn_id == 0
+                && matches!(row.get(col_idx), Some(Value::Float(f)) if !f.is_finite())
+                && visible(meta.txn_id)
+        })
+    });
     *total = sum;
 }
 

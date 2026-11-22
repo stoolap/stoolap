@@ -107,3 +107,66 @@ fn a_float_sum_past_the_range_fails_and_an_infinite_value_does_not() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+/// Rows past one row group, so a hot scan and a sealed one each add them in
+/// several runs; (table, ids holding 1e308, id holding infinity, answer)
+const RUNS: &[(&str, &[i64], Option<i64>, &str)] = &[
+    ("over_then_inf", &[10, 11], Some(69_000), "Infinity"),
+    ("inf_then_over", &[69_000, 69_001], Some(10), "Infinity"),
+    ("over_apart", &[10, 69_000], None, "overflow"),
+    ("over_only", &[10, 11], None, "overflow"),
+];
+
+#[test]
+fn an_overflow_and_an_infinite_value_in_different_runs_answer_as_in_one() {
+    let mut wrong = Vec::new();
+    for sealed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let dsn = format!("file://{}?checkpoint_interval=0", dir.path().display());
+        let db = Database::open(&dsn).unwrap();
+        for (table, big, inf, _) in RUNS {
+            let big = big
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let inf = inf.unwrap_or(-1);
+            db.execute(
+                &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, x FLOAT)"),
+                (),
+            )
+            .unwrap();
+            db.execute(
+                &format!(
+                    "INSERT INTO {table} SELECT value, CASE WHEN value IN ({big}) THEN 1e308 \
+                     WHEN value = {inf} THEN CAST('inf' AS FLOAT) ELSE 1.0 END \
+                     FROM generate_series(1, 70000)"
+                ),
+                (),
+            )
+            .unwrap();
+        }
+        if sealed {
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        for (table, _, _, want) in RUNS {
+            // A deleted row makes the sealed sum scan its volumes
+            db.execute(&format!("DELETE FROM {table} WHERE id = 5"), ())
+                .unwrap();
+            for sql in [
+                format!("SELECT SUM(x) FROM {table}"),
+                format!("SELECT AVG(x) FROM {table}"),
+            ] {
+                let got = answer(db.query(&sql, ()));
+                let right = match *want {
+                    "overflow" => got.as_ref().is_err_and(|e| e.contains("Float overflow")),
+                    want => got.as_deref() == Ok(&[want.to_string()][..]),
+                };
+                if !right {
+                    wrong.push(format!("sealed {sealed}: {sql}: {got:?}"));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
