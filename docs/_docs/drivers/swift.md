@@ -16,13 +16,13 @@ High-performance Swift driver for Stoolap. Calls the Rust engine directly throug
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/stoolap/stoolap-swift.git", from: "0.5.0")
+    .package(url: "https://github.com/stoolap/stoolap-swift.git", from: "0.5.1")
 ]
 ```
 
 The package links `StoolapC.xcframework`, the engine's C API built as a static library for macOS and iOS, which Swift Package Manager downloads from the [release](https://github.com/stoolap/stoolap-swift/releases). No Rust toolchain is needed.
 
-Driver 0.5.0 is built on Stoolap engine 0.5.0. Requires macOS 12+ or iOS 15+. To build the engine from source instead, see [Building from Source](#building-from-source).
+Driver 0.5.1 is built on Stoolap engine 0.5.1. Requires macOS 12+ or iOS 15+. To build the engine from source instead, see [Building from Source](#building-from-source).
 
 ## Quick Start
 
@@ -85,7 +85,7 @@ See [Connection Strings]({{ '/docs/getting-started/connection-strings/' | relati
 | `prepare(sql)` | `PreparedStatement` | Create a prepared statement |
 | `begin()` | `Transaction` | Begin a transaction |
 | `withTransaction(_:)` | Generic | Auto-commit/rollback closure |
-| `Database.version` | `String` | Engine version, e.g. `"0.5.0"` |
+| `Database.version` | `String` | Engine version, e.g. `"0.5.1"` |
 
 `exec` parses the whole script before it runs anything: a syntax error anywhere runs none of it. After a runtime error, the statements before the failing one stay applied.
 
