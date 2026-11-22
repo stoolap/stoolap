@@ -4974,12 +4974,20 @@ impl MVCCEngine {
     /// a function a DDL statement calls runs no DDL statement of its own,
     /// which would land between that statement's checks and its change
     pub fn ddl_statement_guard(&self) -> Result<parking_lot::ReentrantMutexGuard<'_, ()>> {
-        if self.ddl.serial.is_owned_by_current_thread() {
-            return Err(Error::NotSupported(
-                "a DDL statement inside a function another DDL statement calls".to_string(),
-            ));
-        }
+        self.refuse_inside_ddl_statement("a DDL statement")?;
         Ok(self.ddl.guard())
+    }
+
+    /// An error on a thread that holds the DDL guard: a function a DDL
+    /// statement calls starts no `what`, which would write the catalog as
+    /// that statement has it before its record
+    fn refuse_inside_ddl_statement(&self, what: &str) -> Result<()> {
+        if self.ddl.serial.is_owned_by_current_thread() {
+            return Err(Error::NotSupported(format!(
+                "{what} inside a function another DDL statement calls"
+            )));
+        }
+        Ok(())
     }
 
     /// After an index of `table_name` is dropped: the side file of every
@@ -9088,15 +9096,18 @@ impl Engine for MVCCEngine {
     }
 
     fn force_checkpoint_cycle(&self) -> Result<()> {
+        self.refuse_inside_ddl_statement("a checkpoint")?;
         MVCCEngine::checkpoint_cycle_inner(self, true)?;
         self.compact_after_checkpoint_forced()
     }
 
     fn create_snapshot(&self) -> Result<()> {
+        self.refuse_inside_ddl_statement("a snapshot")?;
         MVCCEngine::create_backup_snapshot(self)
     }
 
     fn restore_snapshot(&self, timestamp: Option<&str>) -> Result<String> {
+        self.refuse_inside_ddl_statement("a restore")?;
         MVCCEngine::restore_from_snapshot(self, timestamp)
     }
 
