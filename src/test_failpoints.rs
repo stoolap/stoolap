@@ -1830,8 +1830,19 @@ pub fn subquery_cache_hits() -> usize {
     SUBQUERY_CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+thread_local! {
+    static SUBQUERY_CACHE_HITS_HERE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The same count for this thread alone, which a test running beside
+/// others in one process reads
+pub fn subquery_cache_hits_here() -> usize {
+    SUBQUERY_CACHE_HITS_HERE.with(std::cell::Cell::get)
+}
+
 pub(crate) fn subquery_cache_hit() {
     SUBQUERY_CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    SUBQUERY_CACHE_HITS_HERE.with(|hits| hits.set(hits.get() + 1));
 }
 
 /// Run once on this thread when its next semantic or subquery cache stamp

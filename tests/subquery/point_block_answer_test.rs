@@ -17,12 +17,11 @@
 
 #![cfg(feature = "test-failpoints")]
 
-use stoolap::test_failpoints::{subquery_cache_hits, FailpointGuard};
+use stoolap::test_failpoints::subquery_cache_hits_here;
 use stoolap::{Database, Value};
 
 #[test]
 fn a_parameter_keyed_block_keeps_its_answer_only_for_a_call_that_scans() {
-    let _guard = FailpointGuard::new();
     let db = Database::open("memory://point_block_answer").unwrap();
     db.execute("CREATE TABLE w (id INTEGER PRIMARY KEY, x INTEGER)", ())
         .unwrap();
@@ -36,11 +35,11 @@ fn a_parameter_keyed_block_keeps_its_answer_only_for_a_call_that_scans() {
     // The same key five times: an integer is read by key, a text is scanned
     let mut hits = Vec::new();
     for (first, key) in [(1, Value::Integer(2)), (11, Value::text("bad"))] {
-        let before = subquery_cache_hits();
+        let before = subquery_cache_hits_here();
         for id in first..first + 5 {
             insert.execute((Value::Integer(id), key.clone())).unwrap();
         }
-        hits.push(subquery_cache_hits() - before);
+        hits.push(subquery_cache_hits_here() - before);
     }
     let written: Vec<Option<i64>> = db
         .query("SELECT v FROM t ORDER BY id", ())
