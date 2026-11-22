@@ -163,7 +163,7 @@ fn a_column_refused_while_another_thread_closes_does_not_come_back() {
             true,
             true,
             false,
-            "CREATE TABLE t (id Integer PRIMARY KEY, v Integer)".to_string()
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)".to_string()
         )
     );
 }
@@ -176,7 +176,7 @@ fn a_column_added_while_another_thread_closes_is_there_at_the_next_open() {
             true,
             true,
             true,
-            "CREATE TABLE t (id Integer PRIMARY KEY, v Integer, z Integer DEFAULT 4 CHECK (ALTER_CHECK_CLOSED_BESIDE(z)))".to_string()
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, z INTEGER DEFAULT 4 CHECK (ALTER_CHECK_CLOSED_BESIDE(z)))".to_string()
         )
     );
 }

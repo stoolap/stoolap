@@ -81,7 +81,7 @@ fn modify_column_takes_a_default_and_keeps_the_rows() {
         );
         assert_eq!(
             text(db, "SHOW CREATE TABLE t"),
-            ["t|CREATE TABLE t (id Integer PRIMARY KEY, v Integer DEFAULT 7 CHECK ((v < 1000)), w Integer DEFAULT (2 + 2))"],
+            ["t|CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER DEFAULT 7 CHECK (v < 1000), w INTEGER DEFAULT (2 + 2))"],
             "{layout}"
         );
         // DEFAULT NULL is the way back to no value
@@ -176,7 +176,7 @@ fn modify_column_takes_a_check_that_then_judges_every_write() {
         }
         assert_eq!(
             text(db, "SHOW CREATE TABLE t"),
-            ["t|CREATE TABLE t (id Integer PRIMARY KEY, v Text NOT NULL DEFAULT 3 CHECK ((LENGTH(v) < 3)), w Integer CHECK ((w < v)))"],
+            ["t|CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL DEFAULT 3 CHECK (LENGTH(v) < 3), w INTEGER CHECK (w < v))"],
             "{layout}"
         );
         let got = [
@@ -237,7 +237,7 @@ fn modify_column_refuses_a_default_or_check_that_is_not_one_rows_value() {
 
 #[test]
 fn a_modified_default_and_check_survive_a_reopen() {
-    let want = "t|CREATE TABLE t (id Integer PRIMARY KEY, v Text DEFAULT 'x' CHECK ((LENGTH(v) < 3)), w Integer DEFAULT 9 CHECK ((w >= 0)))";
+    let want = "t|CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT DEFAULT 'x' CHECK (LENGTH(v) < 3), w INTEGER DEFAULT 9 CHECK (w >= 0))";
     for (sealed, checkpoint_after) in [(false, false), (true, false), (false, true), (true, true)] {
         let layout = format!("sealed {sealed}, checkpoint after the change {checkpoint_after}");
         let dir = tempfile::tempdir().unwrap();
