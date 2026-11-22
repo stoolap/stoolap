@@ -329,17 +329,7 @@ impl ScalarFunction for IifFunction {
         let true_value = &args[1];
         let false_value = &args[2];
 
-        // Check if condition is truthy
-        let is_true = match condition {
-            Value::Boolean(b) => *b,
-            Value::Integer(i) => *i != 0,
-            Value::Float(f) => *f != 0.0,
-            Value::Text(s) => !s.is_empty() && s.to_lowercase() != "false" && s.as_str() != "0",
-            Value::Null(_) => false,
-            _ => false,
-        };
-
-        if is_true {
+        if crate::core::condition_truth(condition)? == Some(true) {
             Ok(true_value.clone())
         } else {
             Ok(false_value.clone())

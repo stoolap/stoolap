@@ -24,6 +24,7 @@
 //! - [`SchemaColumn`] - Column definition
 //! - [`Error`] - Error types for all storage operations
 
+pub mod condition;
 pub mod error;
 pub mod float;
 pub mod integer;
@@ -38,6 +39,7 @@ pub mod types;
 pub mod value;
 
 // Re-export main types for convenience
+pub use condition::{condition_truth, is_condition_type, not_a_condition, not_a_condition_message};
 pub use error::{ConflictValues, Error, Result};
 pub use row::Row;
 pub use row_vec::{KeyRows, RowIdVec, RowVec};

@@ -590,6 +590,24 @@ impl<'a> Parser<'a> {
             .push(ParseError::new(msg, self.cur_token.position));
     }
 
+    /// An expression read as a WHERE, HAVING, ON or CHECK condition
+    pub(crate) fn parse_condition(&mut self) -> Option<Expression> {
+        let expr = self.parse_expression(super::precedence::Precedence::Lowest)?;
+        self.note_condition(&expr);
+        Some(expr)
+    }
+
+    /// Turns the scope pass on for `expr`, read as a condition, when it is a
+    /// literal or a CAST, whose written type the pass checks
+    pub(crate) fn note_condition(&mut self, expr: &Expression) {
+        if matches!(
+            expr,
+            Expression::FloatLiteral(_) | Expression::StringLiteral(_) | Expression::Cast(_)
+        ) {
+            self.scope_checked = true;
+        }
+    }
+
     /// Refuses a qualifier `stmt`, parsed whole without error, writes where
     /// no FROM entry in scope has that name
     pub(crate) fn check_scopes(&mut self, stmt: &Statement) {

@@ -16982,10 +16982,13 @@ impl<'a> PreparedRunner<'a> {
             let value = vm.execute(program, exec)?;
             acc = Some(match acc {
                 None => value,
-                Some(left) => ExprVM::and(&left, &value),
+                Some(left) => ExprVM::and(&left, &value)?,
             });
         }
-        Ok(acc.as_ref().is_none_or(ExprVM::passes))
+        match &acc {
+            Some(value) => ExprVM::passes(value),
+            None => Ok(true),
+        }
     }
 
     /// Whether an EXISTS block's candidate passes for the buffer filled:

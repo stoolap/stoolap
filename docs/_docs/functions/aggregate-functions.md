@@ -358,6 +358,8 @@ SELECT SUM(price) FILTER (WHERE in_stock) FROM products;
 SELECT STRING_AGG(name, ', ' ORDER BY name) FROM products;
 ```
 
+`FILTER` reads its condition by the rule every condition follows, given in [Conditions]({% link _docs/sql-features/operators-expressions.md %}#conditions): a row is read when the condition is `TRUE` or an INTEGER that is not zero, and any other type is an error.
+
 These modifiers belong to aggregate calls, an aggregate used as a window function included. On any other function they are an error, wherever the call stands, since no other call reads rows: `ABS(DISTINCT x)`, `UPPER(s ORDER BY id)` and `ABS(x) FILTER (WHERE x > 0)` each fail with `DISTINCT is allowed only in an aggregate call, and ABS is not an aggregate function` (or `ORDER BY`, `FILTER`, and the function's name). So does `ROW_NUMBER(DISTINCT x) OVER ()`. The statement is checked before it reads a row, so it fails even where the call would never be evaluated: in a branch of an OR its other side decides, in the SELECT list of an EXISTS, in a RETURNING list of a statement that changes no row, or under `LIMIT 0`. A column DEFAULT is checked when an INSERT computes it.
 
 An aggregate call may stand anywhere inside an expression of the SELECT list, HAVING or ORDER BY: as a CASE value or branch, in BETWEEN, IN or LIKE on either side, in a row, or as a function's argument. `SELECT CASE SUM(a) WHEN 0 THEN 'none' END FROM t`, `SELECT COUNT(*) IN (1, 2) FROM t` and `HAVING MIN(name) LIKE 'a%'` each compute the call over the rows, grouped or not.

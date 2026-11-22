@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! AND stops at a left operand read as false and OR at one read as true,
-//! whatever its type, so the right operand is not evaluated
+//! a BOOLEAN or an INTEGER, so the right operand is not evaluated
 
 use stoolap::Database;
 
@@ -54,7 +54,7 @@ fn cases() -> Vec<(&'static str, &'static str)> {
     vec![
         ("SELECT b AND 'x' REGEXP p FROM t", "Some(Boolean(false))"),
         ("SELECT b + 1 OR 'x' REGEXP p FROM t", "Some(Boolean(true))"),
-        ("SELECT 'a' OR 'x' REGEXP p FROM t", "Some(Boolean(true))"),
+        ("SELECT -3 OR 'x' REGEXP p FROM t", "Some(Boolean(true))"),
         (
             "SELECT CASE WHEN b AND 'x' REGEXP p THEN 1 ELSE 2 END FROM t",
             "Some(Integer(2))",
@@ -118,7 +118,7 @@ fn check(db: &Database, rows: usize) -> Vec<String> {
 }
 
 #[test]
-fn a_left_operand_of_any_type_decides_and_and_or() {
+fn a_left_operand_decides_and_and_or() {
     let db = Database::open("memory://short_circuit_hot").unwrap();
     setup(&db);
     let wrong = check(&db, 1);
@@ -126,7 +126,7 @@ fn a_left_operand_of_any_type_decides_and_and_or() {
 }
 
 #[test]
-fn a_left_operand_of_any_type_decides_and_and_or_on_sealed_rows() {
+fn a_left_operand_decides_and_and_or_on_sealed_rows() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(&format!(
         "file://{}?checkpoint_interval=0",

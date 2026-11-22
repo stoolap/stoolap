@@ -213,7 +213,7 @@ impl Parser<'_> {
             self.next_token(); // consume WHERE
             self.current_clause = "WHERE";
             self.next_token();
-            stmt.where_clause = Some(Box::new(self.parse_expression(Precedence::Lowest)?));
+            stmt.where_clause = Some(Box::new(self.parse_condition()?));
         }
 
         // Parse GROUP BY clause
@@ -231,7 +231,7 @@ impl Parser<'_> {
             self.next_token(); // consume HAVING
             self.current_clause = "HAVING";
             self.next_token();
-            stmt.having = Some(Box::new(self.parse_expression(Precedence::Lowest)?));
+            stmt.having = Some(Box::new(self.parse_condition()?));
         }
 
         // Parse WINDOW clause (named window definitions)
@@ -434,7 +434,7 @@ impl Parser<'_> {
             self.next_token(); // consume WHERE
             self.current_clause = "WHERE";
             self.next_token();
-            stmt.where_clause = Some(Box::new(self.parse_expression(Precedence::Lowest)?));
+            stmt.where_clause = Some(Box::new(self.parse_condition()?));
         }
 
         // Parse GROUP BY clause
@@ -452,7 +452,7 @@ impl Parser<'_> {
             self.next_token(); // consume HAVING
             self.current_clause = "HAVING";
             self.next_token();
-            stmt.having = Some(Box::new(self.parse_expression(Precedence::Lowest)?));
+            stmt.having = Some(Box::new(self.parse_condition()?));
         }
 
         self.current_clause = "";
@@ -790,7 +790,7 @@ impl Parser<'_> {
                 if self.peek_token_is_keyword(Keyword::On) {
                     self.next_token(); // consume ON
                     self.next_token();
-                    condition = Some(Box::new(self.parse_expression(Precedence::Lowest)?));
+                    condition = Some(Box::new(self.parse_condition()?));
                 } else if self.peek_token_is_keyword(Keyword::Using) {
                     self.next_token(); // consume USING
                     if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != "(" {
@@ -1200,7 +1200,7 @@ impl Parser<'_> {
                     self.next_token(); // consume WHERE
                     self.current_clause = "WHERE";
                     self.next_token();
-                    match self.parse_expression(Precedence::Lowest) {
+                    match self.parse_condition() {
                         Some(expr) => Some(Box::new(expr)),
                         None => return ConflictClause::default(),
                     }
@@ -1640,7 +1640,7 @@ impl Parser<'_> {
             self.next_token(); // consume WHERE
             self.current_clause = "WHERE";
             self.next_token();
-            Some(Box::new(self.parse_expression(Precedence::Lowest)?))
+            Some(Box::new(self.parse_condition()?))
         } else {
             None
         };
@@ -1711,7 +1711,7 @@ impl Parser<'_> {
             self.next_token(); // consume WHERE
             self.current_clause = "WHERE";
             self.next_token();
-            Some(Box::new(self.parse_expression(Precedence::Lowest)?))
+            Some(Box::new(self.parse_condition()?))
         } else {
             None
         };
@@ -1961,7 +1961,7 @@ impl Parser<'_> {
                 return None;
             }
             self.next_token();
-            let expr = self.parse_expression(Precedence::Lowest)?;
+            let expr = self.parse_condition()?;
             if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {
                 return None;
             }
@@ -2268,7 +2268,7 @@ impl Parser<'_> {
                         return None;
                     }
                     self.next_token();
-                    let expr = self.parse_expression(Precedence::Lowest)?;
+                    let expr = self.parse_condition()?;
                     if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {
                         return None;
                     }

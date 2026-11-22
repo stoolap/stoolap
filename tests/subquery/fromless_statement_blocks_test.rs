@@ -285,37 +285,43 @@ fn a_where_without_from_keeps_its_row_by_the_rule_of_every_where() {
     db.execute("CREATE TABLE one (id INTEGER PRIMARY KEY)", ())
         .unwrap();
     db.execute("INSERT INTO one VALUES (1)", ()).unwrap();
-    let count = |sql: &str, params: Vec<Value>| {
-        db.query(sql, params)
-            .unwrap_or_else(|e| panic!("{sql}: {e}"))
-            .count()
+    // The rows kept, or None for the refusal of a value that is no condition
+    let kept = |sql: &str, params: Vec<Value>| match db
+        .query(sql, params)
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+    {
+        Ok(rows) => Some(rows.len()),
+        Err(e) => {
+            let message = e.to_string();
+            assert!(
+                message.contains("must be BOOLEAN or INTEGER"),
+                "{sql}: {message}"
+            );
+            None
+        }
     };
-    for (literal, param) in [
-        ("TRUE", Value::Boolean(true)),
-        ("FALSE", Value::Boolean(false)),
-        ("NULL", Value::Null(stoolap::core::DataType::Null)),
-        ("2", Value::Integer(2)),
-        ("0", Value::Integer(0)),
-        ("0.5", Value::Float(0.5)),
-        ("'abc'", Value::text("abc")),
+    for (literal, param, want) in [
+        ("TRUE", Value::Boolean(true), Some(1)),
+        ("FALSE", Value::Boolean(false), Some(0)),
+        ("NULL", Value::Null(stoolap::core::DataType::Null), Some(0)),
+        ("2", Value::Integer(2), Some(1)),
+        ("0", Value::Integer(0), Some(0)),
+        ("0.5", Value::Float(0.5), None),
+        ("'abc'", Value::text("abc"), None),
     ] {
-        let table = count(&format!("SELECT 1 FROM one WHERE {literal}"), vec![]);
         for sql in [
+            format!("SELECT 1 FROM one WHERE {literal}"),
             format!("SELECT 1 WHERE {literal}"),
             format!("SELECT (SELECT 1) WHERE {literal}"),
         ] {
-            assert_eq!(count(&sql, vec![]), table, "{sql}");
+            assert_eq!(kept(&sql, vec![]), want, "{sql}");
         }
         for sql in [
             "SELECT 1 WHERE $1",
             "SELECT (SELECT 1) WHERE $1",
             "SELECT 1 FROM one WHERE $1",
         ] {
-            assert_eq!(
-                count(sql, vec![param.clone()]),
-                table,
-                "{sql} with {literal}"
-            );
+            assert_eq!(kept(sql, vec![param.clone()]), want, "{sql} with {literal}");
         }
     }
 }

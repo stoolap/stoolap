@@ -800,7 +800,7 @@ fn expr_is_deterministic(expr: &Expression, registry: &FunctionRegistry) -> bool
     expression_volatility(expr, registry) != Volatility::PerCall
 }
 use crate::core::integer::integer_from;
-use crate::core::{Error, Result, Row, Value};
+use crate::core::{condition_truth, Error, Result, Row, Value};
 
 /// Type alias for partition keys - stack-allocated for common case (up to 4 columns)
 type PartitionKey = SmallVec<[Value; 4]>;
@@ -4477,7 +4477,7 @@ impl Executor {
         let mut kept = Vec::with_capacity(rows.len());
         for (idx, (_, row)) in rows.iter().enumerate() {
             ctx.charge(DeadlineSite::Window, 1)?;
-            let keeps = matches!(eval.eval(row)?, Value::Boolean(true));
+            let keeps = condition_truth(&eval.eval(row)?)? == Some(true);
             values.push(if keeps {
                 window_argument_value(rows, idx, arg_col_idx, expression_values).clone()
             } else {

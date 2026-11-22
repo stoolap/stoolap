@@ -112,10 +112,21 @@ impl Parser<'_> {
                     chained = None;
                     left = self.parse_all_any_expression(left, token, operator)?;
                 } else {
-                    operand = Some((token, operator, self.parse_expression(precedence)?));
+                    let right = self.parse_expression(precedence)?;
+                    if operator.eq_ignore_ascii_case("AND") || operator.eq_ignore_ascii_case("OR") {
+                        self.note_condition(&left);
+                        self.note_condition(&right);
+                    }
+                    operand = Some((token, operator, right));
                 }
             } else {
                 left = self.parse_infix_expression(left)?;
+                if let Expression::Infix(xor) = &left
+                    && xor.op_type == InfixOperator::Xor
+                {
+                    self.note_condition(&xor.left);
+                    self.note_condition(&xor.right);
+                }
                 // A column DEFAULT's NOT NULL added no node: the value ends as it was
                 if self.default_not_null {
                     break;
@@ -966,6 +977,11 @@ impl Parser<'_> {
             self.add_error(format!("expected ')' at {}", self.cur_token.position));
             return None;
         }
+        if call.function == "IIF"
+            && let Some(condition) = call.arguments.first()
+        {
+            self.note_condition(condition);
+        }
 
         // Check for FILTER clause
         if self.peek_token_is_keyword(Keyword::Filter) {
@@ -1004,7 +1020,7 @@ impl Parser<'_> {
 
         // Parse the condition
         self.next_token();
-        let condition = self.parse_expression(Precedence::Lowest)?;
+        let condition = self.parse_condition()?;
 
         // Expect closing parenthesis
         if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {
@@ -1502,6 +1518,7 @@ impl Parser<'_> {
 
             self.next_token();
             let condition = self.parse_expression(Precedence::Lowest)?;
+            self.note_condition(&condition);
 
             if !self.expect_keyword(Keyword::Then) {
                 return None;
@@ -1754,6 +1771,7 @@ impl Parser<'_> {
         // Use Precedence::Not (lower than comparison) so NOT captures the full comparison
         // This makes "NOT category = 'Electronics'" parse as "NOT (category = 'Electronics')"
         let right = self.parse_expression(Precedence::Not)?;
+        self.note_condition(&right);
 
         Some(Expression::Prefix(PrefixExpression::new(
             token,

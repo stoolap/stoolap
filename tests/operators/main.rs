@@ -24,6 +24,7 @@ mod cast_where_clause_test;
 mod column_range_rule_test;
 mod comparison_contract_test;
 mod comparison_rule_test;
+mod condition_rule_test;
 mod constant_folding_test;
 mod data_type_validation_test;
 mod family_operators_test;
