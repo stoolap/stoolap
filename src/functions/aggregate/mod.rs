@@ -63,6 +63,7 @@ pub use statistics::{
 pub use string_agg::{GroupConcatFunction, StringAggFunction};
 pub use sum::SumFunction;
 
+use crate::common::KeyState;
 use crate::core::{Result, Value};
 use crate::functions::{AggregateFunction, AggregateOrder};
 use std::cmp::Ordering;
@@ -95,15 +96,15 @@ pub(crate) fn compare_sort_keys(
 
 /// Helper struct for tracking distinct values
 ///
-/// Uses a seeded hashbrown set so membership and insert share one
-/// lookup, avoiding both the clone-per-duplicate of a plain insert
-/// and the double hash of contains-then-insert.
+/// Uses a hashbrown set under the engine's hasher so membership and insert
+/// share one lookup, avoiding both the clone-per-duplicate of a plain
+/// insert and the double hash of contains-then-insert.
 #[derive(Default, Debug)]
 pub struct DistinctTracker {
-    seen: hashbrown::HashSet<Value, ahash::RandomState>,
+    seen: hashbrown::HashSet<Value, KeyState>,
     /// The value and later arguments of each row seen, for a call that
     /// reads its later arguments for each row
-    rows: Option<Box<hashbrown::HashSet<Box<[Value]>, ahash::RandomState>>>,
+    rows: Option<Box<hashbrown::HashSet<Box<[Value]>, KeyState>>>,
 }
 
 impl DistinctTracker {
