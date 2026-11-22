@@ -22,6 +22,7 @@ mod add_column_check_test;
 mod add_column_not_null_test;
 mod alter_auto_increment_test;
 mod alter_column_constraints_test;
+mod alter_column_drop_test;
 mod auto_increment_test;
 mod block_reads_tables_as_found_test;
 mod bug_composite_unique_upsert_test;

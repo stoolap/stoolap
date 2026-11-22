@@ -1501,6 +1501,38 @@ impl Executor {
                     ));
                 }
             }
+            AlterTableOperation::DropColumnDefault | AlterTableOperation::DropColumnCheck => {
+                let name = stmt.column_name.as_ref().ok_or_else(|| {
+                    Error::InvalidArgument("ALTER COLUMN requires a column name".to_string())
+                })?;
+                let schema = self.engine.get_table_schema(table_name)?;
+                let (_, column) = schema
+                    .find_column(&name.value)
+                    .ok_or_else(|| Error::ColumnNotFound(name.value.to_string()))?;
+                let default = stmt.operation == AlterTableOperation::DropColumnDefault;
+                // A column with none to drop is left as it is
+                let held = match default {
+                    true => column
+                        .default_expr
+                        .as_deref()
+                        .is_some_and(|text| !text.eq_ignore_ascii_case("NULL")),
+                    false => column.check_expr.is_some(),
+                };
+                if held {
+                    self.engine.change_column_type(
+                        &crate::storage::mvcc::engine::ColumnTypeChange {
+                            table: table_name,
+                            column: &column.name,
+                            data_type: column.data_type,
+                            nullable: column.nullable,
+                            vector_dimensions: column.vector_dimensions,
+                            default: default.then_some("NULL"),
+                            check: (!default).then_some(""),
+                            judge: None,
+                        },
+                    )?;
+                }
+            }
             AlterTableOperation::ClusterBy => {
                 // The key names columns of this table; the schema checks that
                 // each exists, appears once and has an order

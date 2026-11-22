@@ -83,6 +83,22 @@ Every existing value is converted to the new type, in memory and in the frozen v
 
 The table is closed while the change runs: other statements on it return `SchemaChanged` until it finishes. Once the statement returns, the change survives a crash whatever the `sync_mode`.
 
+## ALTER COLUMN ... DROP DEFAULT / DROP CHECK
+
+Take a column's default or its CHECK away without restating its type:
+
+```sql
+ALTER TABLE products ALTER COLUMN price DROP DEFAULT;
+ALTER TABLE products ALTER COLUMN price DROP CHECK;
+```
+
+The COLUMN keyword is optional. The column keeps its type, its NOT NULL and its rows; no row is rewritten.
+
+- `DROP DEFAULT` leaves the column with `DEFAULT NULL`, which is how DESCRIBE and SHOW CREATE TABLE then show it: a row inserted without a value gets NULL, and a NOT NULL column needs its value written. Rows that took the old default keep it.
+- `DROP CHECK` removes the CHECK written on the column. A table CHECK and the CHECKs of other columns stay, also those that read this column.
+
+Dropping what the column does not have succeeds and changes nothing. A column the table lacks is an error. Like MODIFY COLUMN, the statement closes the table while it runs and survives a crash once it returns.
+
 ## RENAME TABLE
 
 Rename an entire table:
