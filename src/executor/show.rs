@@ -28,6 +28,8 @@ use crate::common::SmartString;
 use crate::core::row_vec::RowVec;
 use crate::core::{DataType, Error, Result, Row, SchemaColumn, Value};
 use crate::parser::ast::*;
+use crate::parser::token::TokenType;
+use crate::parser::Lexer;
 use crate::storage::traits::transaction::{StatementTable, TableUse};
 use crate::storage::traits::{Engine, QueryResult};
 
@@ -137,7 +139,7 @@ impl Executor {
                 }
                 // Add CHECK constraint if present
                 if let Some(check) = &col.check_expr {
-                    def.push_str(&format!(" CHECK ({})", check));
+                    def.push_str(&format!(" {}", check_clause(check)));
                 }
                 def
             })
@@ -159,7 +161,7 @@ impl Executor {
             ));
         }
         for check in &schema.table_checks {
-            create_sql.push_str(&format!(", CHECK ({})", check));
+            create_sql.push_str(&format!(", {}", check_clause(check)));
         }
 
         create_sql.push(')');
@@ -369,12 +371,14 @@ impl Executor {
                 .map(|v| v.to_string())
                 .unwrap_or_default();
 
-            // Extra info (e.g., auto_increment equivalent)
-            let extra_str = if col.auto_increment {
-                "auto_increment"
-            } else {
-                ""
-            };
+            // Extra: auto_increment, then the column's CHECK
+            let extra = col.auto_increment.then(|| "auto_increment".to_string());
+            let check = col.check_expr.as_deref().map(check_clause);
+            let extra_str = extra
+                .into_iter()
+                .chain(check)
+                .collect::<Vec<_>>()
+                .join(", ");
 
             rows.push((
                 i as i64,
@@ -384,7 +388,7 @@ impl Executor {
                     Value::Text(SmartString::new(null_str)),
                     Value::Text(SmartString::new(key_str)),
                     Value::Text(SmartString::from_string(default_str)),
-                    Value::Text(SmartString::new(extra_str)),
+                    Value::Text(SmartString::from_string(extra_str)),
                 ]),
             ));
         }
@@ -400,7 +404,40 @@ fn column_type(col: &SchemaColumn) -> String {
         DataType::Vector if col.vector_dimensions > 0 => {
             format!("VECTOR({})", col.vector_dimensions)
         }
-        data_type => format!("{:?}", data_type),
+        data_type => data_type.to_string(),
+    }
+}
+
+/// A CHECK clause of `check`, parenthesized once: a stored condition that
+/// one pair of parentheses already wraps is written as it is
+fn check_clause(check: &str) -> String {
+    if wrapped(check) {
+        format!("CHECK {check}")
+    } else {
+        format!("CHECK ({check})")
+    }
+}
+
+/// Whether `sql` opens with a parenthesis that closes at its very end, read
+/// with the parser's own tokens so quoted text and names count no parenthesis
+fn wrapped(sql: &str) -> bool {
+    let mut lexer = Lexer::new(sql);
+    let mut depth = 0usize;
+    loop {
+        let token = lexer.next_token();
+        match (token.token_type, token.literal.as_str()) {
+            (TokenType::Comment, _) => {}
+            (TokenType::Punctuator, "(") => depth += 1,
+            (TokenType::Punctuator, ")") if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    return lexer.next_token().token_type == TokenType::Eof;
+                }
+            }
+            _ if depth == 0 => return false,
+            (TokenType::Eof | TokenType::Error, _) => return false,
+            _ => {}
+        }
     }
 }
 

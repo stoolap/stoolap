@@ -234,30 +234,30 @@ fn test_describe_basic() {
     // Check id column (PRIMARY KEY, NOT NULL)
     assert_eq!(rows_data[0].0, "id", "First column should be 'id'");
     assert!(
-        rows_data[0].1.contains("Integer"),
-        "id should be Integer type"
+        rows_data[0].1.contains("INTEGER"),
+        "id should be INTEGER type"
     );
     assert_eq!(rows_data[0].2, "NO", "id should not be nullable");
     assert_eq!(rows_data[0].3, "PRI", "id should be primary key");
 
     // Check name column (NOT NULL)
     assert_eq!(rows_data[1].0, "name", "Second column should be 'name'");
-    assert!(rows_data[1].1.contains("Text"), "name should be Text type");
+    assert!(rows_data[1].1.contains("TEXT"), "name should be TEXT type");
     assert_eq!(rows_data[1].2, "NO", "name should not be nullable");
 
     // Check price column (nullable)
     assert_eq!(rows_data[2].0, "price", "Third column should be 'price'");
     assert!(
-        rows_data[2].1.contains("Float"),
-        "price should be Float type"
+        rows_data[2].1.contains("FLOAT"),
+        "price should be FLOAT type"
     );
     assert_eq!(rows_data[2].2, "YES", "price should be nullable");
 
     // Check active column (nullable)
     assert_eq!(rows_data[3].0, "active", "Fourth column should be 'active'");
     assert!(
-        rows_data[3].1.contains("Boolean"),
-        "active should be Boolean type"
+        rows_data[3].1.contains("BOOLEAN"),
+        "active should be BOOLEAN type"
     );
     assert_eq!(rows_data[3].2, "YES", "active should be nullable");
 }

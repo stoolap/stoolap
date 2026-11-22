@@ -55,7 +55,7 @@ fn a_column_a_foreign_key_references_does_not_drop() {
             "{sql}: {message}"
         );
     }
-    assert!(shown(&db, "p").contains("k Integer"), "{}", shown(&db, "p"));
+    assert!(shown(&db, "p").contains("k INTEGER"), "{}", shown(&db, "p"));
     assert!(
         db.execute("DELETE FROM p WHERE id = 1", ()).is_err(),
         "a referenced parent row was deleted"
