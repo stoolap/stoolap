@@ -126,12 +126,10 @@ impl SumAccumulator {
     /// Whether merging `other`, a sum of values added through `add_float`,
     /// answers as adding its values in order onto this would: a sum that
     /// stays far inside the FLOAT range on the way does, while an overflow
-    /// on the way, or an infinite or NaN value, may answer otherwise
+    /// on the way, or an infinite or NaN value on either side, may not
     #[inline]
     pub fn merges_in_order(&self, other: &SumAccumulator) -> bool {
-        !other.has_float
-            || !self.float.is_finite()
-            || self.float.abs() + other.magnitude < MERGE_LIMIT
+        !other.has_float || self.float.abs() + other.magnitude < MERGE_LIMIT
     }
 
     /// The sum: NULL with no value, FLOAT when any value was FLOAT, and
