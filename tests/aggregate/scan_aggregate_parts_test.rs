@@ -120,12 +120,31 @@ const FLOAT_ROWS: i64 = 210_000;
 const FLOAT_PART_ROWS: usize = 100_000;
 
 /// f: a -1e308 in the first part and two +1e308 at the start of the second;
-/// g: the same, then a -Infinity after them
+/// g: the same, then a -Infinity after them; h: the largest FLOAT M in the
+/// first part and q, q, -M, M, -q, -q with q = 2^969 in the second, whose sum
+/// alone rounds to 2^970, which M does not hold
 fn float_tables(sealed: bool) -> (tempfile::TempDir, Database) {
     let dir = tempfile::tempdir().unwrap();
     let dsn = format!("file://{}?checkpoint_interval=0", dir.path().display());
     let db = Database::open(&dsn).unwrap();
-    for (table, after) in [("f", ""), ("g", "WHEN 100003 THEN CAST('-inf' AS FLOAT) ")] {
+    let over = "WHEN 1 THEN -1e308 WHEN 100001 THEN 1e308 WHEN 100002 THEN 1e308";
+    let (m, q) = (f64::MAX, 2f64.powi(969));
+    let tables = [
+        ("f", over.to_string()),
+        (
+            "g",
+            format!("{over} WHEN 100003 THEN CAST('-inf' AS FLOAT)"),
+        ),
+        (
+            "h",
+            format!(
+                "WHEN 1 THEN {m:e} WHEN 100001 THEN {q:e} WHEN 100002 THEN {q:e} \
+                 WHEN 100003 THEN -{m:e} WHEN 100004 THEN {m:e} WHEN 100005 THEN -{q:e} \
+                 WHEN 100006 THEN -{q:e}"
+            ),
+        ),
+    ];
+    for (table, arms) in tables {
         db.execute(
             &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, a INTEGER, x FLOAT)"),
             (),
@@ -133,8 +152,7 @@ fn float_tables(sealed: bool) -> (tempfile::TempDir, Database) {
         .unwrap();
         db.execute(
             &format!(
-                "INSERT INTO {table} SELECT value, value, CASE value WHEN 1 THEN -1e308 \
-                 WHEN 100001 THEN 1e308 WHEN 100002 THEN 1e308 {after}ELSE 0.0 END \
+                "INSERT INTO {table} SELECT value, value, CASE value {arms} ELSE 0.0 END \
                  FROM generate_series(1, {FLOAT_ROWS})"
             ),
             (),
@@ -173,7 +191,8 @@ fn float_sums(db: &Database, table: &str) -> Result<Vec<(f64, f64)>, String> {
 
 /// A part boundary between a negative and two positive values near the
 /// FLOAT limit: in order the sum stays finite, the second part alone would
-/// not, and an infinite value after them is the sum
+/// not, and an infinite value after them is the sum; and two finite parts
+/// whose rounded sums together pass the range the rows in order stay in
 #[test]
 fn a_float_sum_split_in_parts_adds_as_the_rows_come_in_order() {
     let inf = f64::INFINITY;
@@ -182,6 +201,7 @@ fn a_float_sum_split_in_parts_adds_as_the_rows_come_in_order() {
         for (table, want) in [
             ("f", (1e308, 1e308 / FLOAT_ROWS as f64)),
             ("g", (-inf, -inf)),
+            ("h", (f64::MAX, f64::MAX / FLOAT_ROWS as f64)),
         ] {
             let got = float_sums(&db, table);
             assert_eq!(got, Ok(vec![want]), "sealed {sealed}: {table}");

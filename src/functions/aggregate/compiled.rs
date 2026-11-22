@@ -398,6 +398,27 @@ impl CompiledAggregate {
         }
     }
 
+    /// Whether a SUM or AVG run added a FLOAT value
+    pub fn sums_float(&self) -> bool {
+        matches!(
+            self,
+            CompiledAggregate::Sum { state } | CompiledAggregate::Avg { state }
+                if state.holds_float()
+        )
+    }
+
+    /// Whether folding `other` in leaves a finite FLOAT sum finite, true for
+    /// any call but SUM and AVG, see [`SumAccumulator::merges_finite`]
+    pub fn merges_finite(&self, other: &CompiledAggregate) -> bool {
+        match (self, other) {
+            (CompiledAggregate::Sum { state }, CompiledAggregate::Sum { state: more })
+            | (CompiledAggregate::Avg { state }, CompiledAggregate::Avg { state: more }) => {
+                state.merges_finite(more)
+            }
+            _ => true,
+        }
+    }
+
     /// Folds a run of the same aggregate over other rows into this one
     pub fn merge(&mut self, other: &CompiledAggregate) {
         debug_assert!(

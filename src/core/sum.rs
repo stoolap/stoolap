@@ -117,6 +117,22 @@ impl SumAccumulator {
         !self.has_float || (self.int as f64 + self.float).is_finite()
     }
 
+    /// Whether a FLOAT value was added
+    #[inline]
+    pub fn holds_float(&self) -> bool {
+        self.has_float
+    }
+
+    /// Whether merging `other` leaves a finite sum finite: two finite sums
+    /// of parts, each rounded on its own, may together pass the range that
+    /// the values added in order stay in
+    #[inline]
+    pub fn merges_finite(&self, other: &SumAccumulator) -> bool {
+        let mut merged = *self;
+        merged.merge(other);
+        merged.sum_finite() || !self.sum_finite()
+    }
+
     /// The sum: NULL with no value, FLOAT when any value was FLOAT, and
     /// otherwise the exact INTEGER; an overflow error outside either range
     #[inline]
