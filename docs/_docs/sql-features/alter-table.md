@@ -56,6 +56,8 @@ ALTER TABLE products MODIFY COLUMN price TEXT;
 ALTER TABLE config MODIFY COLUMN value INTEGER;
 ```
 
+The definition names the type and, with NOT NULL, the nullability. The column keeps the DEFAULT and CHECK it has. A DEFAULT, CHECK, UNIQUE, PRIMARY KEY, AUTO_INCREMENT or REFERENCES constraint in the definition is refused with an error such as `ALTER TABLE MODIFY COLUMN does not take a DEFAULT constraint`, and the table is left unchanged.
+
 Every existing value is converted to the new type, in memory and in the frozen volumes, before the statement returns. A value the new type cannot hold becomes NULL. The change is refused, with the table left as it was, when:
 
 - the column is the primary key, a foreign key column, or a column a foreign key references;

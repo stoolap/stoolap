@@ -169,6 +169,31 @@ fn validate_fk_reference(
     })
 }
 
+/// An error for the first constraint of `column` that ALTER TABLE
+/// `operation` cannot keep: refused, never accepted and ignored. NOT NULL
+/// is kept by both ADD and MODIFY COLUMN, a DEFAULT only where `default`
+fn refuse_unkept_constraints(
+    column: &ColumnDefinition,
+    operation: &str,
+    default: bool,
+) -> Result<()> {
+    let unkept = column.constraints.iter().find_map(|c| match c {
+        ColumnConstraint::NotNull => None,
+        ColumnConstraint::Default(_) => (!default).then_some("DEFAULT"),
+        ColumnConstraint::Check(_) => Some("CHECK"),
+        ColumnConstraint::Unique => Some("UNIQUE"),
+        ColumnConstraint::PrimaryKey => Some("PRIMARY KEY"),
+        ColumnConstraint::AutoIncrement => Some("AUTO_INCREMENT"),
+        ColumnConstraint::References { .. } => Some("REFERENCES"),
+    });
+    match unkept {
+        Some(constraint) => Err(Error::InvalidArgument(format!(
+            "ALTER TABLE {operation} does not take a {constraint} constraint"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// A DEFAULT or CHECK of `owner` is one value of one row: a subquery, an
 /// aggregate or a window function in it is refused. A CHECK reads the row
 /// through `columns`, and one naming a column the table lacks is refused too
@@ -1119,21 +1144,7 @@ impl Executor {
         match stmt.operation {
             AlterTableOperation::AddColumn => {
                 if let Some(ref col_def) = stmt.column_def {
-                    // A constraint the added column cannot keep is refused,
-                    // never accepted and ignored
-                    let unkept = col_def.constraints.iter().find_map(|c| match c {
-                        ColumnConstraint::NotNull | ColumnConstraint::Default(_) => None,
-                        ColumnConstraint::Check(_) => Some("CHECK"),
-                        ColumnConstraint::Unique => Some("UNIQUE"),
-                        ColumnConstraint::PrimaryKey => Some("PRIMARY KEY"),
-                        ColumnConstraint::AutoIncrement => Some("AUTO_INCREMENT"),
-                        ColumnConstraint::References { .. } => Some("REFERENCES"),
-                    });
-                    if let Some(constraint) = unkept {
-                        return Err(Error::InvalidArgument(format!(
-                            "ALTER TABLE ADD COLUMN does not take a {constraint} constraint"
-                        )));
-                    }
+                    refuse_unkept_constraints(col_def, "ADD COLUMN", true)?;
                     let data_type = self.parse_data_type(&col_def.data_type)?;
                     let nullable = !col_def
                         .constraints
@@ -1359,6 +1370,7 @@ impl Executor {
             },
             AlterTableOperation::ModifyColumn => {
                 if let Some(ref col_def) = stmt.column_def {
+                    refuse_unkept_constraints(col_def, "MODIFY COLUMN", false)?;
                     let data_type = self.parse_data_type(&col_def.data_type)?;
                     let nullable = !col_def
                         .constraints
