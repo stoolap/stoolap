@@ -42,7 +42,9 @@ impl SumAccumulator {
     pub fn add_float(&mut self, v: f64) {
         self.float += v;
         self.has_float = true;
-        self.non_finite |= !v.is_finite();
+        if !v.is_finite() {
+            self.non_finite = true;
+        }
         self.count += 1;
     }
 
@@ -90,6 +92,7 @@ impl SumAccumulator {
 
     /// The sum: NULL with no value, FLOAT when any value was FLOAT, and
     /// otherwise the exact INTEGER; an overflow error outside either range
+    #[inline]
     pub fn sum(&self) -> Result<Value> {
         if self.count == 0 {
             return Ok(Value::null_unknown());
@@ -107,6 +110,7 @@ impl SumAccumulator {
 
     /// The average as FLOAT: the exact INTEGER sum divided and rounded
     /// once, or the FLOAT sum divided; NULL with no value
+    #[inline]
     pub fn avg(&self) -> Result<Value> {
         if self.count == 0 {
             return Ok(Value::null_unknown());
@@ -120,16 +124,22 @@ impl SumAccumulator {
 
     /// The FLOAT sum, which finite values take past the FLOAT range only
     /// as an overflow error of `function`, as `+` refuses one
+    #[inline]
     fn float_sum(&self, function: &str) -> Result<f64> {
         let sum = self.int as f64 + self.float;
         if !sum.is_finite() && !self.non_finite {
-            return Err(Error::Type(format!(
-                "Float overflow in {function}: the sum of {} values is outside the FLOAT range",
-                self.count
-            )));
+            return Err(sum_overflow(function, self.count));
         }
         Ok(sum)
     }
+}
+
+#[cold]
+#[inline(never)]
+fn sum_overflow(function: &str, count: u64) -> Error {
+    Error::Type(format!(
+        "Float overflow in {function}: the sum of {count} values is outside the FLOAT range"
+    ))
 }
 
 /// `num / den` rounded once to the nearest f64: the quotient keeps at least
