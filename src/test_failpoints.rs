@@ -2429,6 +2429,21 @@ pub(crate) fn scan_part_held(rows: usize) {
 }
 
 thread_local! {
+    /// The rows a scan split in parts on this thread last kept room for
+    static SCAN_PART_RESERVED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The rows of room the last scan an aggregation split in parts on this
+/// thread kept in its buffers when it ended
+pub fn scan_part_reserved_rows() -> usize {
+    SCAN_PART_RESERVED.with(std::cell::Cell::get)
+}
+
+pub(crate) fn scan_part_reserved(rows: usize) {
+    SCAN_PART_RESERVED.with(|n| n.set(rows));
+}
+
+thread_local! {
     /// The parallel hash join probes made on this thread in fewer chunks
     /// than the threads could take, since the last reset
     static JOIN_PROBES_NARROW: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

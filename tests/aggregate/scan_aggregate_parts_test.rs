@@ -112,3 +112,82 @@ fn an_aggregate_over_a_sealed_scan_with_a_where_reads_it_in_parts() {
         assert_eq!(parted(&db, sql, sealed), grouped, "sealed {sealed}: {sql}");
     }
 }
+
+/// Rows of f, and the part size under `test-failpoints`: parts large enough
+/// that the aggregation splits each over the thread pool
+const FLOAT_ROWS: i64 = 210_000;
+#[cfg(feature = "test-failpoints")]
+const FLOAT_PART_ROWS: usize = 100_000;
+
+/// A part boundary between a negative and two positive values near the
+/// FLOAT limit: in order the sum stays finite, the second part alone would
+/// not
+#[test]
+fn a_float_sum_split_in_parts_adds_as_the_rows_come_in_order() {
+    for sealed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let dsn = format!("file://{}?checkpoint_interval=0", dir.path().display());
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE f (id INTEGER PRIMARY KEY, a INTEGER, x FLOAT)",
+            (),
+        )
+        .unwrap();
+        db.execute(
+            &format!(
+                "INSERT INTO f SELECT value, value, CASE value WHEN 1 THEN -1e308 \
+                 WHEN 100001 THEN 1e308 WHEN 100002 THEN 1e308 ELSE 0.0 END \
+                 FROM generate_series(1, {FLOAT_ROWS})"
+            ),
+            (),
+        )
+        .unwrap();
+        if sealed {
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        let sql = "SELECT SUM(x), AVG(x) FROM f WHERE a % 2 >= 0";
+        #[cfg(feature = "test-failpoints")]
+        stoolap::test_failpoints::set_scan_part_rows(FLOAT_PART_ROWS);
+        let got: Result<Vec<(f64, f64)>, String> = db
+            .query(sql, ())
+            .map_err(|e| e.to_string())
+            .and_then(|rows| {
+                rows.map(|row| {
+                    let row = row.map_err(|e| e.to_string())?;
+                    let float = |i| match row.get_value(i).unwrap() {
+                        stoolap::Value::Float(f) => Ok(*f),
+                        other => Err(format!("{other:?}")),
+                    };
+                    Ok((float(0)?, float(1)?))
+                })
+                .collect()
+            });
+        #[cfg(feature = "test-failpoints")]
+        stoolap::test_failpoints::set_scan_part_rows(0);
+        assert_eq!(
+            got,
+            Ok(vec![(1e308, 1e308 / FLOAT_ROWS as f64)]),
+            "sealed {sealed}: {sql}"
+        );
+    }
+}
+
+/// A scan the WHERE narrows to a few rows of a large sealed table keeps
+/// room for about the rows it read, not for a whole part
+#[test]
+fn a_split_scan_that_reads_few_rows_keeps_little_room() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir, true);
+    let sql = "SELECT COUNT(*), SUM(a) FROM t WHERE id <= 50 AND a % 7 = 3";
+    let ids: Vec<i64> = (1..=50).filter(|id| (id % 1000) % 7 == 3).collect();
+    let want = vec![format!("{}|{}", ids.len(), ids.iter().sum::<i64>())];
+    assert_eq!(rows(&db, sql), want, "{sql}");
+    #[cfg(feature = "test-failpoints")]
+    {
+        let room = stoolap::test_failpoints::scan_part_reserved_rows();
+        assert!(
+            (1..=1024).contains(&room),
+            "{sql}: the scan kept room for {room} rows"
+        );
+    }
+}

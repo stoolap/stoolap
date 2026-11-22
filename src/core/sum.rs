@@ -109,6 +109,14 @@ impl SumAccumulator {
         self.count
     }
 
+    /// Whether finite FLOAT values took this sum past the range: a sum of a
+    /// part of the values that the sum of them all, added in order, may not
+    /// reach
+    #[inline]
+    pub fn overflowed(&self) -> bool {
+        self.has_float && !self.non_finite && !(self.int as f64 + self.float).is_finite()
+    }
+
     /// The sum: NULL with no value, FLOAT when any value was FLOAT, and
     /// otherwise the exact INTEGER; an overflow error outside either range
     #[inline]

@@ -1771,8 +1771,22 @@ impl<'a> RowFeed<'a> {
                     Ok(part)
                 })
                 .collect::<Result<_>>()?;
-            for part in parts {
-                groups.merge(part);
+            // A part whose FLOAT sum finite values took past the range adds
+            // its rows in order instead, as one run over all of them would
+            let reads = RowReads {
+                params,
+                transaction_id,
+                blocks: None,
+            };
+            let mut state = FeedState::default();
+            for (part, chunk) in parts.into_iter().zip(rows.chunks(chunk_size)) {
+                if !part.overflowed() {
+                    groups.merge(part);
+                    continue;
+                }
+                for (_, row) in chunk {
+                    self.run_one(groups, row, &reads, &mut state)?;
+                }
             }
             return Ok(());
         }

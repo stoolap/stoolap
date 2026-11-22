@@ -309,6 +309,12 @@ impl GroupedAggregates {
         &mut self.aggregates[group * calls..][..calls]
     }
 
+    /// Whether a run of a call went past the FLOAT range on finite values,
+    /// which merging would carry: see [`CompiledAggregate::overflowed`]
+    pub fn overflowed(&self) -> bool {
+        self.aggregates.iter().any(CompiledAggregate::overflowed)
+    }
+
     /// Folds the groups of a run over other rows into these, see `can_merge`
     pub fn merge(&mut self, other: GroupedAggregates) {
         debug_assert!(self.can_merge(), "merge needs runs that merge");
