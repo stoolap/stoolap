@@ -48,6 +48,25 @@ impl SumAccumulator {
         self.count += 1;
     }
 
+    /// Adds a FLOAT of a run without noting whether it is finite; the run
+    /// ends with [`Self::settle_run`]
+    #[inline]
+    pub fn add_float_in_run(&mut self, v: f64) {
+        self.float += v;
+        self.has_float = true;
+        self.count += 1;
+    }
+
+    /// Ends a run of [`Self::add_float_in_run`]. An infinite or NaN value
+    /// keeps the sum non-finite, so a sum still finite needs no look; one
+    /// that is not reads the run again through `run_held_non_finite`
+    #[inline]
+    pub fn settle_run(&mut self, run_held_non_finite: impl FnOnce() -> bool) {
+        if !self.non_finite && !self.float.is_finite() && run_held_non_finite() {
+            self.non_finite = true;
+        }
+    }
+
     /// Adds a value; NULL and non-numeric values add nothing
     #[inline]
     pub fn add(&mut self, value: &Value) {
@@ -193,6 +212,34 @@ mod tests {
     fn a_float_makes_the_sum_float() {
         let acc = of(&[Value::Integer(2), Value::Float(3.0)]);
         assert_eq!(acc.sum().unwrap(), Value::Float(5.0));
+    }
+
+    fn in_runs(runs: &[&[f64]]) -> SumAccumulator {
+        let mut acc = SumAccumulator::default();
+        for run in runs {
+            run.iter().for_each(|v| acc.add_float_in_run(*v));
+            acc.settle_run(|| run.iter().any(|v| !v.is_finite()));
+        }
+        acc
+    }
+
+    #[test]
+    fn runs_tell_an_overflow_from_an_infinite_value_wherever_each_falls() {
+        let inf = f64::INFINITY;
+        assert!(in_runs(&[&[1e308, 1e308], &[1.0]]).sum().is_err());
+        assert!(in_runs(&[&[1.0], &[1e308, 1e308]]).avg().is_err());
+        for runs in [
+            &[&[1e308, 1e308, inf][..]][..],
+            &[&[inf][..], &[1e308, 1e308][..]][..],
+            &[&[1e308, 1e308][..], &[inf][..]][..],
+            &[&[1e308][..], &[1e308][..], &[1.0][..], &[inf][..]][..],
+        ] {
+            assert_eq!(in_runs(runs).sum().unwrap(), Value::Float(inf), "{runs:?}");
+        }
+        assert_eq!(
+            in_runs(&[&[1.0, 2.0], &[3.0]]).sum().unwrap(),
+            Value::Float(6.0)
+        );
     }
 
     #[test]

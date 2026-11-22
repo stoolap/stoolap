@@ -6540,7 +6540,7 @@ impl Table for SegmentedTable {
                 let column = phys.map(|pi| vol.columns.get(pi)).transpose()?;
                 for rows in row_groups(start..vol.meta.row_count) {
                     deadline.charge(DeadlineSite::StorageAggregate, rows.len())?;
-                    for i in rows {
+                    for i in rows.clone() {
                         if !shown.has(i) {
                             continue;
                         }
@@ -6552,7 +6552,7 @@ impl Table for SegmentedTable {
                                 crate::storage::volume::column::ColumnData::Int64 {
                                     values,
                                     ..
-                                } if as_float => total.add_float(values[i] as f64),
+                                } if as_float => total.add_float_in_run(values[i] as f64),
                                 crate::storage::volume::column::ColumnData::Int64 {
                                     values,
                                     ..
@@ -6560,7 +6560,7 @@ impl Table for SegmentedTable {
                                 crate::storage::volume::column::ColumnData::Float64 {
                                     values,
                                     ..
-                                } => total.add_float(values[i]),
+                                } => total.add_float_in_run(values[i]),
                                 crate::storage::volume::column::ColumnData::Boolean {
                                     values,
                                     ..
@@ -6571,6 +6571,16 @@ impl Table for SegmentedTable {
                             add_default(&mut total, 1);
                         }
                     }
+                    total.settle_run(|| match column {
+                        Some(
+                            col @ crate::storage::volume::column::ColumnData::Float64 {
+                                values, ..
+                            },
+                        ) => rows
+                            .clone()
+                            .any(|i| shown.has(i) && !col.is_null(i) && !values[i].is_finite()),
+                        _ => false,
+                    });
                 }
             }
             self.check_cold()?;
