@@ -184,7 +184,7 @@ fn an_added_column_whose_check_tried_a_checkpoint_recovers_once() {
         after_a_crash(ADD, true),
         (
             true,
-            vec!["t|CREATE TABLE t (id Integer PRIMARY KEY, v Integer, z Integer DEFAULT 4 CHECK (ALTER_CHECK_WRITES_THE_CATALOG(z)))".to_string()],
+            vec!["t|CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, z INTEGER DEFAULT 4 CHECK (ALTER_CHECK_WRITES_THE_CATALOG(z)))".to_string()],
             vec!["1|5|4".to_string(), "2|50|4".to_string()],
         )
     );
@@ -196,7 +196,7 @@ fn a_refused_column_whose_check_tried_a_checkpoint_does_not_come_back() {
         after_a_crash(ADD, false),
         (
             false,
-            vec!["t|CREATE TABLE t (id Integer PRIMARY KEY, v Integer)".to_string()],
+            vec!["t|CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)".to_string()],
             vec!["1|5".to_string(), "2|50".to_string()],
         )
     );
@@ -208,7 +208,7 @@ fn a_modified_column_whose_check_tried_a_checkpoint_recovers_as_changed() {
         after_a_crash(MODIFY, true),
         (
             true,
-            vec!["t|CREATE TABLE t (id Integer PRIMARY KEY, v Text CHECK (ALTER_CHECK_WRITES_THE_CATALOG(v)))".to_string()],
+            vec!["t|CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT CHECK (ALTER_CHECK_WRITES_THE_CATALOG(v)))".to_string()],
             vec!["1|5".to_string(), "2|50".to_string()],
         )
     );
@@ -220,7 +220,7 @@ fn a_refused_modify_whose_check_tried_a_checkpoint_recovers_unchanged() {
         after_a_crash(MODIFY, false),
         (
             false,
-            vec!["t|CREATE TABLE t (id Integer PRIMARY KEY, v Integer)".to_string()],
+            vec!["t|CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)".to_string()],
             vec!["1|5".to_string(), "2|50".to_string()],
         )
     );

@@ -80,7 +80,7 @@ fn add_column_takes_a_check_the_rows_pass_and_it_judges_every_write() {
         }
         assert_eq!(
             text(db, "SHOW CREATE TABLE t"),
-            ["t|CREATE TABLE t (id Integer PRIMARY KEY, v Integer, w Integer, z Integer DEFAULT 40 CHECK (((z < 100) AND (z > (v - 20)))), n Integer CHECK ((n > 0)))"],
+            ["t|CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, w INTEGER, z INTEGER DEFAULT 40 CHECK ((z < 100) AND (z > (v - 20))), n INTEGER CHECK (n > 0))"],
             "{layout}"
         );
         let got = [
@@ -236,7 +236,7 @@ fn a_row_an_open_transaction_holds_does_not_commit_past_the_added_check() {
 
 #[test]
 fn an_added_check_survives_a_reopen() {
-    let want = "t|CREATE TABLE t (id Integer PRIMARY KEY, v Integer, w Integer, z Integer DEFAULT 40 CHECK ((z > w)), n Text CHECK ((LENGTH(n) < 3)))";
+    let want = "t|CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, w INTEGER, z INTEGER DEFAULT 40 CHECK (z > w), n TEXT CHECK (LENGTH(n) < 3))";
     for (sealed, checkpoint_after) in [(false, false), (true, false), (false, true), (true, true)] {
         let layout = format!("sealed {sealed}, checkpoint after the change {checkpoint_after}");
         let dir = tempfile::tempdir().unwrap();
