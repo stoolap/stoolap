@@ -88,7 +88,8 @@ const KEPT_SCRATCH_BYTES: usize = 64 * 1024;
 /// 16-bit entries, allocated and zeroed per call otherwise, and the output
 /// buffer
 struct WalCompression {
-    table: lz4_flex::block::CompressTable,
+    /// Boxed: a thread-local slot is not always placed at the table's 64-byte alignment
+    table: Box<lz4_flex::block::CompressTable>,
     packed: Vec<u8>,
 }
 
@@ -123,7 +124,7 @@ impl WalCompression {
 thread_local! {
     static WAL_COMPRESSION: std::cell::RefCell<WalCompression> =
         std::cell::RefCell::new(WalCompression {
-            table: lz4_flex::block::CompressTable::default(),
+            table: Box::default(),
             packed: Vec::new(),
         });
 }
