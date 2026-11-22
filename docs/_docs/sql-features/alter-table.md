@@ -69,7 +69,7 @@ ALTER TABLE products MODIFY COLUMN price FLOAT CHECK (price >= 0);
 
 A DEFAULT or CHECK the definition does not write stays as it is, so a change of type keeps both. A DEFAULT written replaces the column's default (`DEFAULT NULL` leaves it without one), and a CHECK written replaces the column's CHECK. The CHECK may read other columns of the row, as in CREATE TABLE. Before it is taken it is run over every row the table holds, in memory and in the frozen volumes, with the column already in its new type; a row that fails it refuses the statement with `CHECK constraint failed` and the table is left unchanged. A UNIQUE, PRIMARY KEY, AUTO_INCREMENT or REFERENCES constraint in the definition is refused with an error such as `ALTER TABLE MODIFY COLUMN does not take a UNIQUE constraint`.
 
-A function a CHECK calls runs while ADD COLUMN or MODIFY COLUMN judges the rows. A DDL statement, `PRAGMA CHECKPOINT`, `PRAGMA SNAPSHOT` or `PRAGMA RESTORE` it starts through another handle of the same database is refused with `... inside a function another DDL statement calls`.
+A function a CHECK calls runs while ADD COLUMN or MODIFY COLUMN judges the rows. A DDL statement, `PRAGMA CHECKPOINT`, `PRAGMA SNAPSHOT`, `PRAGMA RESTORE` or a close of the database it starts through another handle of the same database is refused with `... inside a function another DDL statement calls`.
 
 Every existing value is converted to the new type, in memory and in the frozen volumes, before the statement returns. A value the new type cannot hold becomes NULL. The change is refused, with the table left as it was, when:
 

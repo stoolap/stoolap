@@ -3152,6 +3152,7 @@ impl MVCCEngine {
 
     /// Closes the engine (inherent method)
     pub fn close_engine(&self) -> Result<()> {
+        self.refuse_inside_ddl_statement("a close")?;
         // Use CAS to atomically check and set closed
         if self
             .open
@@ -4981,7 +4982,7 @@ impl MVCCEngine {
     /// An error on a thread that holds the DDL guard: a function a DDL
     /// statement calls starts no `what`, which would write the catalog as
     /// that statement has it before its record
-    fn refuse_inside_ddl_statement(&self, what: &str) -> Result<()> {
+    pub(crate) fn refuse_inside_ddl_statement(&self, what: &str) -> Result<()> {
         if self.ddl.serial.is_owned_by_current_thread() {
             return Err(Error::NotSupported(format!(
                 "{what} inside a function another DDL statement calls"

@@ -1038,6 +1038,11 @@ impl Database {
     /// Note: The engine is also closed automatically when all Database instances
     /// are dropped.
     pub fn close(&self) -> Result<()> {
+        // Refused before the registry forgets the database
+        self.inner
+            .shared
+            .engine
+            .refuse_inside_ddl_statement("a close")?;
         // Remove from registry
         let mut registry = DATABASE_REGISTRY.write();
 

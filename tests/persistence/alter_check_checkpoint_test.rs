@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A function an ALTER TABLE's CHECK calls starts no checkpoint, snapshot
-//! or restore, so the catalog is never written as the statement has it
-//! before its record: a crash after the statement recovers what it answered
+//! A function an ALTER TABLE's CHECK calls starts no checkpoint, snapshot,
+//! restore or close, so the catalog is never written as the statement has
+//! it before its record: a crash or a reopen finds what it answered
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,9 +37,14 @@ static ANSWERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// Whether the function lets the row pass
 static PASSES: AtomicBool = AtomicBool::new(true);
 
-const WRITES: [&str; 3] = ["PRAGMA CHECKPOINT", "PRAGMA SNAPSHOT", "PRAGMA RESTORE"];
+const WRITES: [&str; 4] = [
+    "PRAGMA CHECKPOINT",
+    "PRAGMA SNAPSHOT",
+    "PRAGMA RESTORE",
+    "close",
+];
 
-/// Tries a checkpoint, a snapshot and a restore, then judges its row
+/// Tries a checkpoint, a snapshot, a restore and a close, then judges its row
 #[derive(Default)]
 struct WritesTheCatalog;
 
@@ -60,8 +65,12 @@ impl ScalarFunction for WritesTheCatalog {
         let mut answers = ANSWERS.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(db) = nested.as_ref() {
             for sql in WRITES {
-                answers.push(match db.execute(sql, ()) {
-                    Ok(_) => format!("{sql} ran"),
+                let ran = match sql {
+                    "close" => db.close(),
+                    sql => db.execute(sql, ()).map(|_| ()),
+                };
+                answers.push(match ran {
+                    Ok(()) => format!("{sql} ran"),
                     Err(error) => error.to_string(),
                 });
             }
@@ -108,8 +117,9 @@ fn text(db: &Database, sql: &str) -> Vec<String> {
 }
 
 /// Runs `alter` over a sealed table whose CHECK function lets the rows pass
-/// or not, and returns what the statement answered and what a crash right
-/// after it recovers: the table's definition and its rows
+/// or not, and returns what the statement answered and the table's
+/// definition and rows, which a crash right after it and a close and
+/// reopen both find
 fn after_a_crash(alter: &str, passes: bool) -> (bool, Vec<String>, Vec<String>) {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let _ = global_registry().register_scalar::<WritesTheCatalog>();
@@ -145,11 +155,23 @@ fn after_a_crash(alter: &str, passes: bool) -> (bool, Vec<String>, Vec<String>) 
     crash_image(&first, &crashed);
     let recovered = Database::open(&dsn(&crashed))
         .unwrap_or_else(|e| panic!("{alter}, passes {passes}: the crash does not recover: {e}"));
-    (
+    let found = (
         passes,
         text(&recovered, "SHOW CREATE TABLE t"),
         text(&recovered, "SELECT * FROM t ORDER BY id"),
-    )
+    );
+    recovered.close().unwrap();
+
+    db.close().unwrap();
+    let reopened = Database::open(&dsn(&first))
+        .unwrap_or_else(|e| panic!("{alter}, passes {passes}: the database does not reopen: {e}"));
+    let after_reopen = (
+        passes,
+        text(&reopened, "SHOW CREATE TABLE t"),
+        text(&reopened, "SELECT * FROM t ORDER BY id"),
+    );
+    assert_eq!(after_reopen, found, "{alter}: a reopen and a crash differ");
+    found
 }
 
 const ADD: &str =
