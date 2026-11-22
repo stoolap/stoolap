@@ -28,6 +28,7 @@ pub enum FloatOp {
 }
 
 /// `x op y`; None for a zero divisor, which reads as NULL
+#[inline]
 pub fn float_op(op: FloatOp, x: f64, y: f64) -> Result<Option<f64>> {
     let result = match op {
         FloatOp::Add => x + y,
@@ -39,13 +40,19 @@ pub fn float_op(op: FloatOp, x: f64, y: f64) -> Result<Option<f64>> {
         FloatOp::Mod => x % y,
     };
     if !result.is_finite() && x.is_finite() && y.is_finite() {
-        return Err(Error::Type(format!(
-            "Float overflow in arithmetic operation: {} and {}",
-            Value::Float(x),
-            Value::Float(y)
-        )));
+        return Err(float_overflow(x, y));
     }
     Ok(Some(result))
+}
+
+#[cold]
+#[inline(never)]
+fn float_overflow(x: f64, y: f64) -> Error {
+    Error::Type(format!(
+        "Float overflow in arithmetic operation: {} and {}",
+        Value::Float(x),
+        Value::Float(y)
+    ))
 }
 
 #[cfg(test)]
