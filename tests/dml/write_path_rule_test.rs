@@ -32,7 +32,6 @@ fn add_column_refuses_the_constraints_it_cannot_keep() {
     db.execute("INSERT INTO c VALUES (1, 1)", ()).unwrap();
     let mut wrong = Vec::new();
     for constraint in [
-        "CHECK (w < 3)",
         "UNIQUE",
         "PRIMARY KEY",
         "AUTO_INCREMENT",

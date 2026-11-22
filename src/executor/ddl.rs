@@ -170,17 +170,13 @@ fn validate_fk_reference(
 }
 
 /// An error for the first constraint of `column` that ALTER TABLE
-/// `operation` cannot keep: refused, never accepted and ignored. NOT NULL
-/// and DEFAULT are kept by both ADD and MODIFY COLUMN, a CHECK only where
-/// `check`
-fn refuse_unkept_constraints(
-    column: &ColumnDefinition,
-    operation: &str,
-    check: bool,
-) -> Result<()> {
+/// `operation` cannot keep: refused, never accepted and ignored. ADD and
+/// MODIFY COLUMN keep NOT NULL, DEFAULT and CHECK
+fn refuse_unkept_constraints(column: &ColumnDefinition, operation: &str) -> Result<()> {
     let unkept = column.constraints.iter().find_map(|c| match c {
-        ColumnConstraint::NotNull | ColumnConstraint::Default(_) => None,
-        ColumnConstraint::Check(_) => (!check).then_some("CHECK"),
+        ColumnConstraint::NotNull | ColumnConstraint::Default(_) | ColumnConstraint::Check(_) => {
+            None
+        }
         ColumnConstraint::Unique => Some("UNIQUE"),
         ColumnConstraint::PrimaryKey => Some("PRIMARY KEY"),
         ColumnConstraint::AutoIncrement => Some("AUTO_INCREMENT"),
@@ -1144,7 +1140,7 @@ impl Executor {
         match stmt.operation {
             AlterTableOperation::AddColumn => {
                 if let Some(ref col_def) = stmt.column_def {
-                    refuse_unkept_constraints(col_def, "ADD COLUMN", false)?;
+                    refuse_unkept_constraints(col_def, "ADD COLUMN")?;
                     let data_type = self.parse_data_type(&col_def.data_type)?;
                     let nullable = !col_def
                         .constraints
@@ -1181,6 +1177,10 @@ impl Executor {
                     if let Some(crate::core::Value::Timestamp(t)) = &default_value {
                         crate::core::value::timestamp_in_range(*t)?;
                     }
+                    let check_expr = col_def.constraints.iter().find_map(|c| match c {
+                        ColumnConstraint::Check(expr) => Some(expr),
+                        _ => None,
+                    });
 
                     let mut change = self.engine.begin_column_change(table_name)?;
                     let previous_schema = self.engine.get_table_schema(table_name)?;
@@ -1195,11 +1195,25 @@ impl Executor {
                         false,
                         default_expr.clone(),
                         default_value,
-                        None,
+                        check_expr.map(|expr| expr.to_string()),
                     );
                     // Refused before anything changes when a volume would not map
                     let mut added = crate::core::Schema::clone(&previous_schema);
                     added.add_column(column.clone())?;
+                    // The CHECK reads the row with the column in it
+                    let names: Vec<String> = added.columns.iter().map(|c| c.name.clone()).collect();
+                    let check = match (check_expr, &column.check_expr) {
+                        (Some(expr), Some(text)) => {
+                            constraint_expression("CHECK", &column.name, expr, Some(&names))?;
+                            Some(super::dml::compile_check(
+                                &added,
+                                &names,
+                                Some(&column.name),
+                                text,
+                            )?)
+                        }
+                        _ => None,
+                    };
                     self.engine.check_column_change(
                         table_name,
                         &added,
@@ -1222,6 +1236,32 @@ impl Executor {
                             Err(error) => Err(error),
                         };
                         if let Err(error) = refused {
+                            self.engine
+                                .reopen_after_refused_add(table_name, previous_schema)?;
+                            change.finish();
+                            return Err(error);
+                        }
+                    }
+
+                    // Each row already there passes the CHECK, the column
+                    // holding what the row takes for it
+                    if let Some(check) = &check {
+                        let filler = column
+                            .default_value
+                            .clone()
+                            .unwrap_or_else(|| crate::core::Value::null(data_type));
+                        let vm = std::cell::RefCell::new(super::expression::ExprVM::new());
+                        let judge = |row: &crate::core::Row| {
+                            if row.len() == names.len() {
+                                return super::dml::run_check(&mut vm.borrow_mut(), check, row);
+                            }
+                            let mut values: Vec<_> = row.iter().cloned().collect();
+                            values.push(filler.clone());
+                            let row = crate::core::Row::from_values(values);
+                            super::dml::run_check(&mut vm.borrow_mut(), check, &row)
+                        };
+                        if let Err(error) = self.engine.judge_added_column_rows(table_name, &judge)
+                        {
                             self.engine
                                 .reopen_after_refused_add(table_name, previous_schema)?;
                             change.finish();
@@ -1370,7 +1410,7 @@ impl Executor {
             },
             AlterTableOperation::ModifyColumn => {
                 if let Some(ref col_def) = stmt.column_def {
-                    refuse_unkept_constraints(col_def, "MODIFY COLUMN", true)?;
+                    refuse_unkept_constraints(col_def, "MODIFY COLUMN")?;
                     let schema = self.engine.get_table_schema(table_name)?;
                     let (_, column) = schema
                         .find_column(&col_def.name.value)

@@ -262,8 +262,8 @@ fn the_engine_refuses_an_added_column_whose_default_is_past_the_range() {
         .unwrap()
         .with_timezone(&chrono::Utc);
     for default in [
-        (None, Some(Value::Timestamp(far))),
-        (Some("'9999-12-31'".to_string()), None),
+        (None, Some(Value::Timestamp(far)), None),
+        (Some("'9999-12-31'".to_string()), None, None),
     ] {
         let added = db.engine().create_column_with_default(
             "t",

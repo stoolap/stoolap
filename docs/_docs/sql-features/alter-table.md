@@ -16,9 +16,10 @@ Add a new column to an existing table:
 ```sql
 ALTER TABLE users ADD COLUMN last_login TIMESTAMP;
 ALTER TABLE users ADD COLUMN score INTEGER;
+ALTER TABLE users ADD COLUMN level INTEGER NOT NULL DEFAULT 1 CHECK (level BETWEEN 1 AND 10);
 ```
 
-Existing rows receive the column's DEFAULT, or NULL without one, whether they are still in memory or already in a frozen volume. The new column takes NOT NULL and DEFAULT; a CHECK, UNIQUE, PRIMARY KEY, AUTO_INCREMENT or REFERENCES constraint is refused with an error, and so is a DEFAULT holding a subquery, an aggregate or a window function, or a TIMESTAMP outside the range a table stores (`1677-09-21` to `2262-04-11`); the table is left unchanged. Subsequent inserts can provide values for the new column:
+Existing rows receive the column's DEFAULT, or NULL without one, whether they are still in memory or already in a frozen volume. The new column takes NOT NULL, DEFAULT and CHECK. The CHECK may read other columns of the row, as in CREATE TABLE. Before the column is added the CHECK is run over every row the table holds, with the new column holding the value the row receives; a row that fails it refuses the statement with `CHECK constraint failed`. A table with no rows takes any CHECK. A UNIQUE, PRIMARY KEY, AUTO_INCREMENT or REFERENCES constraint is refused with an error, and so is a DEFAULT or CHECK holding a subquery, an aggregate or a window function, or a TIMESTAMP default outside the range a table stores (`1677-09-21` to `2262-04-11`). A refused statement leaves the table unchanged. Subsequent inserts can provide values for the new column:
 
 ```sql
 INSERT INTO users (id, name, score) VALUES (1, 'Alice', 100);

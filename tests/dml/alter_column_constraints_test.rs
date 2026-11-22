@@ -21,10 +21,6 @@ use stoolap::Database;
 /// the constraint the error names
 const REFUSED: &[(&str, &str)] = &[
     (
-        "ADD COLUMN z INTEGER CHECK (z < 100)",
-        "ADD COLUMN does not take a CHECK",
-    ),
-    (
         "ADD COLUMN z TEXT UNIQUE",
         "ADD COLUMN does not take a UNIQUE",
     ),
@@ -41,8 +37,8 @@ const REFUSED: &[(&str, &str)] = &[
         "ADD COLUMN does not take a REFERENCES",
     ),
     (
-        "ADD COLUMN z INTEGER DEFAULT 1 CHECK (z < 100)",
-        "ADD COLUMN does not take a CHECK",
+        "ADD COLUMN z INTEGER DEFAULT 1 CHECK (z < 100) UNIQUE",
+        "ADD COLUMN does not take a UNIQUE",
     ),
     (
         "MODIFY COLUMN v INTEGER UNIQUE",
