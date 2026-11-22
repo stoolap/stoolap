@@ -59,6 +59,7 @@ mod insert_path_test;
 mod insert_select_dataloss_test;
 mod insert_select_test;
 mod literal_write_rule_test;
+mod modify_column_default_check_test;
 mod on_duplicate_key_update_test;
 mod pk_write_where_test;
 mod plain_dml_family_test;

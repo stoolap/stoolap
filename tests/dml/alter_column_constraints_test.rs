@@ -45,14 +45,6 @@ const REFUSED: &[(&str, &str)] = &[
         "ADD COLUMN does not take a CHECK",
     ),
     (
-        "MODIFY COLUMN v INTEGER DEFAULT 7",
-        "MODIFY COLUMN does not take a DEFAULT",
-    ),
-    (
-        "MODIFY COLUMN v INTEGER CHECK (v < 10)",
-        "MODIFY COLUMN does not take a CHECK",
-    ),
-    (
         "MODIFY COLUMN v INTEGER UNIQUE",
         "MODIFY COLUMN does not take a UNIQUE",
     ),
@@ -69,8 +61,8 @@ const REFUSED: &[(&str, &str)] = &[
         "MODIFY COLUMN does not take a REFERENCES",
     ),
     (
-        "MODIFY COLUMN v TEXT NOT NULL DEFAULT 'x'",
-        "MODIFY COLUMN does not take a DEFAULT",
+        "MODIFY COLUMN v INTEGER DEFAULT 7 CHECK (v < 2000) UNIQUE",
+        "MODIFY COLUMN does not take a UNIQUE",
     ),
 ];
 

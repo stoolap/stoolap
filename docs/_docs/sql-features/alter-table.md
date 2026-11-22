@@ -56,7 +56,17 @@ ALTER TABLE products MODIFY COLUMN price TEXT;
 ALTER TABLE config MODIFY COLUMN value INTEGER;
 ```
 
-The definition names the type and, with NOT NULL, the nullability. The column keeps the DEFAULT and CHECK it has. A DEFAULT, CHECK, UNIQUE, PRIMARY KEY, AUTO_INCREMENT or REFERENCES constraint in the definition is refused with an error such as `ALTER TABLE MODIFY COLUMN does not take a DEFAULT constraint`, and the table is left unchanged.
+The definition names the type and, with NOT NULL, the nullability. It may also carry a DEFAULT and a CHECK:
+
+```sql
+-- New rows take 0 when no price is written; the rows already there are not touched
+ALTER TABLE products MODIFY COLUMN price FLOAT DEFAULT 0;
+
+-- Taken only when every row of the table passes it
+ALTER TABLE products MODIFY COLUMN price FLOAT CHECK (price >= 0);
+```
+
+A DEFAULT or CHECK the definition does not write stays as it is, so a change of type keeps both. A DEFAULT written replaces the column's default (`DEFAULT NULL` leaves it without one), and a CHECK written replaces the column's CHECK. The CHECK may read other columns of the row, as in CREATE TABLE. Before it is taken it is run over every row the table holds, in memory and in the frozen volumes, with the column already in its new type; a row that fails it refuses the statement with `CHECK constraint failed` and the table is left unchanged. A UNIQUE, PRIMARY KEY, AUTO_INCREMENT or REFERENCES constraint in the definition is refused with an error such as `ALTER TABLE MODIFY COLUMN does not take a UNIQUE constraint`.
 
 Every existing value is converted to the new type, in memory and in the frozen volumes, before the statement returns. A value the new type cannot hold becomes NULL. The change is refused, with the table left as it was, when:
 
