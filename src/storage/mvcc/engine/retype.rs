@@ -127,7 +127,14 @@ pub(super) fn change_column_type(shared: &Shared<'_>, change: &ColumnTypeChange<
         name.as_ref(),
     )?;
 
-    let cast = store.prepare_cast(column, CompactArc::clone(&next), retyped)?;
+    // A change of the default or the CHECK alone, judging no row, reads none
+    let rowless = !retyped
+        && (change.nullable || !current.columns[column].nullable)
+        && change.judge.is_none();
+    let cast = match rowless {
+        true => HotCast::of_schema(CompactArc::clone(&next)),
+        false => store.prepare_cast(column, CompactArc::clone(&next), retyped)?,
+    };
     let mgr = if shared.replaying {
         None
     } else {
@@ -149,7 +156,7 @@ pub(super) fn change_column_type(shared: &Shared<'_>, change: &ColumnTypeChange<
         &next,
         column,
         change,
-        retyped || (current.columns[column].nullable && !change.nullable) || change.judge.is_some(),
+        !rowless,
         !shared.replaying,
     );
     // The new HNSW objects take the sealed rows before anything is decided

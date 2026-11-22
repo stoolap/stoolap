@@ -31,8 +31,13 @@ fn text(db: &Database, sql: &str) -> Vec<String> {
         .collect()
 }
 
+/// No checkpoint but the ones a test asks for: a close leaves the log to
+/// be replayed
 fn dsn(dir: &tempfile::TempDir) -> String {
-    format!("file://{}?checkpoint_interval=0", dir.path().display())
+    format!(
+        "file://{}?checkpoint_interval=0&checkpoint_on_close=off",
+        dir.path().display()
+    )
 }
 
 const CREATE: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, \

@@ -31,8 +31,13 @@ fn text(db: &Database, sql: &str) -> Vec<String> {
         .collect()
 }
 
+/// No checkpoint but the ones a test asks for: a close leaves the log to
+/// be replayed
 fn dsn(dir: &tempfile::TempDir) -> String {
-    format!("file://{}?checkpoint_interval=0", dir.path().display())
+    format!(
+        "file://{}?checkpoint_interval=0&checkpoint_on_close=off",
+        dir.path().display()
+    )
 }
 
 /// `t (id, v DEFAULT 3 CHECK (v < 1000), w)` holding (1, 5, 1) and
