@@ -696,6 +696,25 @@ pub(crate) fn truncate_cold_cleared() {
     }
 }
 
+thread_local! {
+    static HELD_VOLUME_CLOCK: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Reads the clock a new volume id is taken from as `micros` on this
+/// thread, or as it is with None
+pub fn hold_volume_clock(micros: Option<u64>) {
+    HELD_VOLUME_CLOCK.with(|held| held.set(micros));
+}
+
+pub(crate) fn held_volume_clock() -> Option<u64> {
+    HELD_VOLUME_CLOCK.with(|held| held.get())
+}
+
+/// Forgets the volume ids this process handed out, as a restart does
+pub fn forget_volume_ids() {
+    crate::storage::volume::io::forget_volume_ids();
+}
+
 /// Run once on this thread when its next segment set clearing is halfway:
 /// one of its segments and its tombstones is emptied, the other not yet
 pub fn during_segments_clearing(hook: impl FnOnce() + 'static) {
@@ -4074,6 +4093,7 @@ pub fn reset_all() {
     BETWEEN_COUNT_CAPTURES_HOOK.with(|slot| *slot.borrow_mut() = None);
     SEGMENTS_CLEARING_HOOK.with(|slot| *slot.borrow_mut() = None);
     TRUNCATE_COLD_CLEARED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    hold_volume_clock(None);
     DESTRUCTION_WAIT_HOOK.with(|slot| *slot.borrow_mut() = None);
     HOT_COLD_READS_HOOK.with(|slot| *slot.borrow_mut() = None);
     COLD_VIEW_BEGUN_HOOK.with(|slot| *slot.borrow_mut() = None);

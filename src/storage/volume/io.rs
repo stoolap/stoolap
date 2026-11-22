@@ -877,30 +877,72 @@ pub fn delete_all_volumes(dir: &Path, table_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The newest volume id handed out, or the largest an open found in use
+static NEWEST_VOLUME_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Generate a new volume ID. Monotonically increasing, unique across calls.
 /// Uses microseconds since epoch + CAS loop for uniqueness.
 pub fn next_volume_id() -> u64 {
     use crate::common::time_compat::{SystemTime, UNIX_EPOCH};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    use std::sync::atomic::Ordering;
     let micros = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_micros() as u64;
+    #[cfg(any(test, feature = "test-failpoints"))]
+    let micros = crate::test_failpoints::held_volume_clock().unwrap_or(micros);
     loop {
-        let current = COUNTER.load(Ordering::Acquire);
+        let current = NEWEST_VOLUME_ID.load(Ordering::Acquire);
         // New ID is at least micros, or current+1 if clock hasn't advanced
         let candidate = if micros > current {
             micros
         } else {
             current + 1
         };
-        match COUNTER.compare_exchange_weak(current, candidate, Ordering::AcqRel, Ordering::Relaxed)
-        {
+        match NEWEST_VOLUME_ID.compare_exchange_weak(
+            current,
+            candidate,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
             Ok(_) => return candidate,
             Err(_) => continue,
         }
     }
+}
+
+/// Hands out no volume id at or below `id` from now on: an open passes the
+/// largest id its files and manifests use, which a clock set back since
+/// would otherwise hand out again
+pub(crate) fn keep_volume_ids_above(id: u64) {
+    NEWEST_VOLUME_ID.fetch_max(id, std::sync::atomic::Ordering::AcqRel);
+}
+
+/// Forgets the ids handed out, as a new process does
+#[cfg(any(test, feature = "test-failpoints"))]
+pub(crate) fn forget_volume_ids() {
+    NEWEST_VOLUME_ID.store(0, std::sync::atomic::Ordering::Release);
+}
+
+/// The largest volume id a file under `volumes_dir` is named after, in any
+/// table's directory: a volume or a side file, loaded or left behind. A
+/// `.tmp` file is a write that never finished and names none
+pub(crate) fn largest_volume_id_named(volumes_dir: &Path) -> u64 {
+    let named = |entry: std::fs::DirEntry| {
+        let name = entry.file_name();
+        let name = name.to_str().filter(|name| !name.ends_with(".tmp"))?;
+        let hex = name.strip_prefix("vol_")?.split('.').next()?;
+        u64::from_str_radix(hex, 16).ok()
+    };
+    let tables = std::fs::read_dir(volumes_dir)
+        .into_iter()
+        .flatten()
+        .flatten();
+    tables
+        .filter_map(|table| std::fs::read_dir(table.path()).ok())
+        .flat_map(|files| files.flatten().filter_map(named))
+        .max()
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

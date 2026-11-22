@@ -49,6 +49,7 @@ mod transaction_table_replay_test;
 mod vacuum_test;
 mod volume_checkpoint_test;
 mod volume_format_test;
+mod volume_id_restart_test;
 mod wal_acknowledged_commit_test;
 mod wal_path_test;
 mod wal_replay_unapplied_test;
