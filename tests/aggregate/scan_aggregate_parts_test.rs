@@ -122,7 +122,8 @@ const FLOAT_PART_ROWS: usize = 100_000;
 /// f: a -1e308 in the first part and two +1e308 at the start of the second;
 /// g: the same, then a -Infinity after them; h: the largest FLOAT M in the
 /// first part and q, q, -M, M, -q, -q with q = 2^969 in the second, whose sum
-/// alone rounds to 2^970, which M does not hold
+/// alone rounds to 2^970, which M does not hold; i: a 1e308 in the first part
+/// and -1e308, 1e308, 1e308, -1e308 in the second, which overflow in order
 fn float_tables(sealed: bool) -> (tempfile::TempDir, Database) {
     let dir = tempfile::tempdir().unwrap();
     let dsn = format!("file://{}?checkpoint_interval=0", dir.path().display());
@@ -142,6 +143,12 @@ fn float_tables(sealed: bool) -> (tempfile::TempDir, Database) {
                  WHEN 100003 THEN -{m:e} WHEN 100004 THEN {m:e} WHEN 100005 THEN -{q:e} \
                  WHEN 100006 THEN -{q:e}"
             ),
+        ),
+        (
+            "i",
+            "WHEN 1 THEN 1e308 WHEN 100001 THEN -1e308 WHEN 100002 THEN 1e308 \
+             WHEN 100003 THEN 1e308 WHEN 100004 THEN -1e308"
+                .to_string(),
         ),
     ];
     for (table, arms) in tables {
@@ -192,7 +199,8 @@ fn float_sums(db: &Database, table: &str) -> Result<Vec<(f64, f64)>, String> {
 /// A part boundary between a negative and two positive values near the
 /// FLOAT limit: in order the sum stays finite, the second part alone would
 /// not, and an infinite value after them is the sum; and two finite parts
-/// whose rounded sums together pass the range the rows in order stay in
+/// whose rounded sums together pass the range the rows in order stay in; and
+/// a finite part whose rows pass the range on the way, added in order
 #[test]
 fn a_float_sum_split_in_parts_adds_as_the_rows_come_in_order() {
     let inf = f64::INFINITY;
@@ -206,6 +214,11 @@ fn a_float_sum_split_in_parts_adds_as_the_rows_come_in_order() {
             let got = float_sums(&db, table);
             assert_eq!(got, Ok(vec![want]), "sealed {sealed}: {table}");
         }
+        let got = float_sums(&db, "i");
+        assert!(
+            matches!(&got, Err(e) if e.contains("Float overflow in SUM")),
+            "sealed {sealed}: i gave {got:?}"
+        );
     }
 }
 

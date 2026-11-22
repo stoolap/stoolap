@@ -387,12 +387,13 @@ impl CompiledAggregate {
         )
     }
 
-    /// Whether a SUM or AVG run's FLOAT sum is finite, true for any other
-    /// call, see [`SumAccumulator::sum_finite`]
-    pub fn sums_finite(&self) -> bool {
+    /// Whether a SUM or AVG run merges onto an empty run as its values added
+    /// in order would, true for any other call, see
+    /// [`SumAccumulator::merges_in_order`]
+    pub fn starts_in_order(&self) -> bool {
         match self {
             CompiledAggregate::Sum { state } | CompiledAggregate::Avg { state } => {
-                state.sum_finite()
+                SumAccumulator::default().merges_in_order(state)
             }
             _ => true,
         }
@@ -407,13 +408,14 @@ impl CompiledAggregate {
         )
     }
 
-    /// Whether folding `other` in leaves a finite FLOAT sum finite, true for
-    /// any call but SUM and AVG, see [`SumAccumulator::merges_finite`]
-    pub fn merges_finite(&self, other: &CompiledAggregate) -> bool {
+    /// Whether folding `other` in answers as its values added in order would,
+    /// true for any call but SUM and AVG, see
+    /// [`SumAccumulator::merges_in_order`]
+    pub fn merges_in_order(&self, other: &CompiledAggregate) -> bool {
         match (self, other) {
             (CompiledAggregate::Sum { state }, CompiledAggregate::Sum { state: more })
             | (CompiledAggregate::Avg { state }, CompiledAggregate::Avg { state: more }) => {
-                state.merges_finite(more)
+                state.merges_in_order(more)
             }
             _ => true,
         }

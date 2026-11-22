@@ -314,15 +314,9 @@ impl GroupedAggregates {
         &mut self.aggregates[group * calls..][..calls]
     }
 
-    /// Whether every run's FLOAT sum is finite, so merging these adds as the
-    /// rows added in order: see [`CompiledAggregate::sums_finite`]
-    pub fn sums_finite(&self) -> bool {
-        self.aggregates.iter().all(CompiledAggregate::sums_finite)
-    }
-
-    /// Whether merging `other` leaves every finite FLOAT sum of these
-    /// finite: see [`CompiledAggregate::merges_finite`]
-    pub fn merges_finite(&self, other: &GroupedAggregates) -> bool {
+    /// Whether merging `other` answers as its rows added in order onto these
+    /// would: see [`CompiledAggregate::merges_in_order`]
+    pub fn merges_in_order(&self, other: &GroupedAggregates) -> bool {
         let calls = self.calls.len();
         (0..other.groups).all(|group| {
             let more = &other.aggregates[group * calls..][..calls];
@@ -335,12 +329,12 @@ impl GroupedAggregates {
                 _ => self.find_hashed(hash_key(key), key),
             };
             let Some(into) = into else {
-                return true;
+                return more.iter().all(CompiledAggregate::starts_in_order);
             };
             let runs = &self.aggregates[into * calls..][..calls];
             runs.iter()
                 .zip(more)
-                .all(|(run, more)| run.merges_finite(more))
+                .all(|(run, more)| run.merges_in_order(more))
         })
     }
 

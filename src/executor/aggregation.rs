@@ -1771,9 +1771,8 @@ impl<'a> RowFeed<'a> {
                     Ok(part)
                 })
                 .collect::<Result<_>>()?;
-            // A part whose FLOAT sum is not finite, or would leave the
-            // groups' finite sum so, adds its rows in order instead, as one
-            // run over all of them would
+            // A part whose FLOAT sum could pass the range on the way, merged
+            // or alone, adds its rows in order instead, as one run would
             let reads = RowReads {
                 params,
                 transaction_id,
@@ -1781,7 +1780,7 @@ impl<'a> RowFeed<'a> {
             };
             let mut state = FeedState::default();
             for (part, chunk) in parts.into_iter().zip(rows.chunks(chunk_size)) {
-                if part.sums_finite() && groups.merges_finite(&part) {
+                if groups.merges_in_order(&part) {
                     groups.merge(part);
                     continue;
                 }
