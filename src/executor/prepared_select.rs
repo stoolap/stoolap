@@ -17290,6 +17290,25 @@ impl<'a> PreparedRunner<'a> {
         Ok(answer)
     }
 
+    /// [`Self::kept`] for a value block. One that reads a row by its key
+    /// and takes a parameter computes its answer each run: a key that
+    /// changes from run to run misses, and the read costs less than keeping
+    fn kept_value(
+        &self,
+        sq: &PreparedSubquery,
+        existence: &Kept,
+        compute: impl FnOnce() -> Result<BlockAnswer>,
+    ) -> Result<BlockAnswer> {
+        let by_parameter = existence
+            .params
+            .as_deref()
+            .is_none_or(|read| !read.is_empty());
+        match sq.point.is_some() && by_parameter {
+            true => compute(),
+            false => self.kept(existence, compute),
+        }
+    }
+
     /// What the block's answer is kept under across runs, with the stamp
     /// taken now, None where the run keeps none
     fn kept_origin<'k>(
@@ -17535,7 +17554,7 @@ impl PreparedRunner<'_> {
             return Ok(value);
         }
         let answer = self.read_once(index, || {
-            self.kept(kept, || {
+            self.kept_value(sq, kept, || {
                 self.scalar_value(index, sq, projection, caller, site)
                     .map(BlockAnswer::Value)
             })
