@@ -14,7 +14,7 @@ It works with any MCP client that speaks stdio: Claude Desktop, Claude Code, Cur
 
 The server provides 14 tools, 2 resources and 1 prompt. On connection it sends built-in instructions, so the assistant writes correct Stoolap SQL from the first query. Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`), so a client can approve the read-only ones automatically.
 
-This page describes `@stoolap/mcp` 0.5.0, which runs the Stoolap 0.5 engine through [`@stoolap/node`](https://github.com/stoolap/stoolap-node) 0.5. Server 0.4.x has a read-only bypass (see [Upgrading from 0.4](#upgrading-from-04)); use 0.5.0 or later if you rely on `--read-only`.
+This page describes `@stoolap/mcp` 0.5.1, which runs the Stoolap 0.5.1 engine through [`@stoolap/node`](https://github.com/stoolap/stoolap-node) 0.5.1. Server 0.4.x has a read-only bypass (see [Upgrading from 0.4](#upgrading-from-04)); use 0.5.0 or later if you rely on `--read-only`.
 
 ## Installation
 
@@ -182,7 +182,7 @@ Parameter values are strings, numbers, booleans or null. JSON and VECTOR values 
 
 Two limits come from the Node.js driver, and the instructions tell the assistant about both:
 
-- INTEGER values travel as JavaScript numbers, which are exact only up to 2^53. A larger parameter is refused with a hint to pass it as a string, which the engine converts exactly; read large values with `CAST(x AS TEXT)`.
+- INTEGER parameters travel as JavaScript numbers, which are exact only up to 2^53. A larger parameter is refused with a hint to pass it as a string, which the engine converts exactly. A result value of magnitude 2^53 or more comes back as a JSON string holding its exact digits.
 - TIMESTAMP values come back as ISO 8601 strings to the millisecond. `CAST(ts AS TEXT)` gives all nine digits.
 
 ## Usage Examples
@@ -306,9 +306,9 @@ Call `verify` on a file database to check every block of its column volumes.
 - **SQL is read the way the engine reads it.** The checks tokenize SQL like the engine lexer: string escapes, quoted identifiers, `--`, `#` and `/* */` comments, and every Unicode whitespace character. They judge the statement that is actually sent, after EXPLAIN [ANALYZE], and find the main verb of a WITH at its own depth. A NUL character or a byte order mark is refused.
 - **One statement per call.** The engine runs every statement of a multi-statement string and reports only the last, so a second statement is refused.
 - **Tool routing.** `query` takes only reads and `execute` only writes. Transaction control statements (BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE) are refused in SQL and run only through the transaction tools, so the server always knows whether a transaction is open.
-- **DDL inside a transaction.** The engine rolls back a CREATE TABLE made in a transaction, with or without AS SELECT, and refuses TRUNCATE there, but ALTER TABLE, CREATE INDEX and CREATE VIEW persist after ROLLBACK, and DROP TABLE loses rows. The server refuses all of those but the plain CREATE TABLE while a transaction is open.
+- **DDL inside a transaction.** The engine rolls back a CREATE TABLE made in a transaction, with or without AS SELECT, and refuses TRUNCATE there, but ALTER TABLE, CREATE INDEX and CREATE VIEW persist after ROLLBACK, and DROP TABLE loses rows. The server refuses all DDL but CREATE TABLE while a transaction is open.
 - **Isolation.** `begin_transaction` always names its level, so a `SET isolation_level` run earlier cannot change what it opens.
-- **Limits.** The row limit keeps one call from returning millions of rows, and the query timeout keeps it from running forever. A cancelled statement changes nothing and the connection stays usable. The driver has no raw cursor yet, so the server still reads the whole result before cutting it; the timeout bounds that work.
+- **Limits.** The row limit keeps one call from returning millions of rows, and the query timeout keeps it from running forever. A cancelled statement changes nothing and the connection stays usable. The driver's row cursor still opens its result on the main thread ([stoolap-node#12](https://github.com/stoolap/stoolap-node/issues/12)), so the server reads the whole result off the main thread before cutting it; the timeout bounds that work.
 - **One call at a time.** Clients may send requests concurrently; the server runs them one after another, so statements of one transaction never interleave.
 - **COPY ... FROM reads files on the host** with the server process's permissions, so an assistant can load any file the process can read. Run with `--read-only` when that is not acceptable.
 - **Names and values.** Table names are quoted, savepoint names must be plain identifiers, and pragma names and values are checked before they reach SQL.
