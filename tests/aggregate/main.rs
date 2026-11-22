@@ -65,6 +65,7 @@ mod rollup_cube_test;
 mod runner_global_aggregate_test;
 mod runner_grouped_aggregate_test;
 mod runner_source_aggregate_test;
+mod scan_aggregate_parts_test;
 mod streaming_group_by_view_test;
 mod string_agg_separator_test;
 mod sum_exact_integer_test;

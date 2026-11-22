@@ -2397,6 +2397,38 @@ pub(crate) fn join_part_held(rows: usize) {
 }
 
 thread_local! {
+    /// The part size a test sets for a scan an aggregation splits on this
+    /// thread, 0 for the engine's own, and the most rows of such a scan it
+    /// has held at once since the last reset
+    static SCAN_PART_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SCAN_PART_LARGEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Parts of at most `rows` rows for each scan an aggregation splits on this
+/// thread; 0 restores the engine's own size
+pub fn set_scan_part_rows(rows: usize) {
+    SCAN_PART_ROWS.with(|n| n.set(rows));
+}
+
+pub(crate) fn scan_part_rows() -> Option<usize> {
+    Some(SCAN_PART_ROWS.with(std::cell::Cell::get)).filter(|&rows| rows > 0)
+}
+
+/// The most rows of a scan an aggregation splitting it has held at once on
+/// this thread since the last reset
+pub fn scan_part_largest() -> usize {
+    SCAN_PART_LARGEST.with(std::cell::Cell::get)
+}
+
+pub fn reset_scan_part_largest() {
+    SCAN_PART_LARGEST.with(|n| n.set(0));
+}
+
+pub(crate) fn scan_part_held(rows: usize) {
+    SCAN_PART_LARGEST.with(|n| n.set(n.get().max(rows)));
+}
+
+thread_local! {
     /// The parallel hash join probes made on this thread in fewer chunks
     /// than the threads could take, since the last reset
     static JOIN_PROBES_NARROW: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
