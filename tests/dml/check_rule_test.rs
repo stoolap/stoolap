@@ -384,6 +384,22 @@ fn create_refuses_a_default_or_check_it_cannot_keep() {
 }
 
 #[test]
+fn a_column_written_with_two_checks_is_refused() {
+    let db = table("check_two_on_a_column");
+    let before = show_create(&db);
+    for sql in [
+        "CREATE TABLE d (id INTEGER PRIMARY KEY, w FLOAT CHECK (w) CHECK (TRUE))",
+        "ALTER TABLE c ADD COLUMN x INTEGER CHECK (x > 0) CHECK (x < 9)",
+        "ALTER TABLE c MODIFY COLUMN v INTEGER CHECK (v > 0) CHECK (v < 9)",
+    ] {
+        let err = db.execute(sql, ()).unwrap_err().to_string();
+        assert!(err.contains("takes one CHECK"), "{sql}: {err}");
+    }
+    assert!(db.execute("SELECT * FROM d", ()).is_err(), "d was created");
+    assert_eq!(show_create(&db), before);
+}
+
+#[test]
 fn show_create_table_carries_a_table_check() {
     let db = table("check_show_create");
     let create = show_create(&db);

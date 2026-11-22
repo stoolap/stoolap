@@ -169,10 +169,29 @@ fn validate_fk_reference(
     })
 }
 
+/// An error for a column written with more than one CHECK: a column keeps
+/// one, and joining them by AND would judge a value as AND does, not as
+/// CHECK does
+fn refuse_a_second_check(column: &ColumnDefinition) -> Result<()> {
+    let checks = column
+        .constraints
+        .iter()
+        .filter(|c| matches!(c, ColumnConstraint::Check(_)))
+        .count();
+    if checks > 1 {
+        return Err(Error::InvalidArgument(format!(
+            "column {} takes one CHECK: join its conditions in one CHECK or write table CHECKs",
+            column.name.value
+        )));
+    }
+    Ok(())
+}
+
 /// An error for the first constraint of `column` that ALTER TABLE
 /// `operation` cannot keep: refused, never accepted and ignored. ADD and
 /// MODIFY COLUMN keep NOT NULL, DEFAULT and CHECK
 fn refuse_unkept_constraints(column: &ColumnDefinition, operation: &str) -> Result<()> {
+    refuse_a_second_check(column)?;
     let unkept = column.constraints.iter().find_map(|c| match c {
         ColumnConstraint::NotNull | ColumnConstraint::Default(_) | ColumnConstraint::Check(_) => {
             None
@@ -406,6 +425,7 @@ impl Executor {
             let default_expr = default_expr.map(|expr| format!("{}", expr));
 
             // Extract CHECK expression, which reads the row
+            refuse_a_second_check(col_def)?;
             let check_expr = col_def.constraints.iter().find_map(|c| {
                 if let ColumnConstraint::Check(expr) = c {
                     Some(expr)
