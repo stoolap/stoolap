@@ -3153,6 +3153,8 @@ impl MVCCEngine {
     /// Closes the engine (inherent method)
     pub fn close_engine(&self) -> Result<()> {
         self.refuse_inside_ddl_statement("a close")?;
+        // A DDL statement in flight finishes before the engine reads closed
+        let ddl = self.ddl.guard();
         // Use CAS to atomically check and set closed
         if self
             .open
@@ -3161,6 +3163,7 @@ impl MVCCEngine {
         {
             return Ok(()); // Already closed
         }
+        drop(ddl);
 
         // Stop the cleanup thread first (before stopping transactions)
         {
