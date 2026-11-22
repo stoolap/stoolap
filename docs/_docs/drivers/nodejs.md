@@ -100,6 +100,8 @@ const db = await Database.open('file:///absolute/path/to/db');
 | `queryRaw(sql, params?)` | `Promise<{columns, rows}>` | Query in columnar format |
 | `iterate(sql, params?)` | `RowCursor` | Cursor over rows, `for await` or `for...of` |
 | `iterateRaw(sql, params?)` | `RowCursor` | Cursor over rows as arrays, with `columns` |
+| `iterateAsync(sql, params?)` | `Promise<RowCursor>` | Cursor opened on the threadpool |
+| `iterateRawAsync(sql, params?)` | `Promise<RowCursor>` | Raw cursor opened on the threadpool |
 | `begin()` | `Promise<Transaction>` | Begin a transaction |
 | `close()` | `Promise<void>` | Close the database |
 
@@ -254,6 +256,13 @@ console.log(cursor.columns); // ['id', 'id']
 for (const [aId, bId] of cursor) { /* ... */ }
 ```
 
+`iterate` and `iterateRaw` run the query's start on the calling thread. A plain scan starts at once, but a query that works before its first row, such as an ORDER BY, a GROUP BY or a join build, blocks the event loop for that long. `iterateAsync` and `iterateRawAsync` (0.5.2) start the query on the threadpool and resolve to the same cursor; on a `PreparedStatement` or a `Transaction` they join its queue of async calls, so a commit queued after the open still closes the cursor.
+
+```js
+const cursor = await db.iterateRawAsync('SELECT v, COUNT(*) FROM t GROUP BY v ORDER BY v');
+for await (const [v, n] of cursor) { /* ... */ }
+```
+
 ## Batch Execution
 
 Execute the same SQL with multiple parameter sets in a single call. Automatically wraps in a transaction. Rows are arrays for `$n` placeholders or objects for `:name` placeholders.
@@ -296,6 +305,8 @@ All methods mirror `Database` but without the `sql` parameter (it's bound at pre
 | `queryRaw(params?)` | `queryRawSync(params?)` | Query in columnar format |
 | `iterate(params?)` | — | Cursor over rows, `for await` or `for...of` |
 | `iterateRaw(params?)` | — | Cursor over rows as arrays, with `columns` |
+| `iterateAsync(params?)` | — | Cursor opened on the threadpool |
+| `iterateRawAsync(params?)` | — | Raw cursor opened on the threadpool |
 | | `executeBatchSync(paramsArray)` | Execute with multiple param sets |
 | | `finalize()` | Release the prepared statement |
 
@@ -388,6 +399,8 @@ try {
 | `queryRaw(sql, params?)` | `queryRawSync(sql, params?)` | Query in columnar format |
 | `iterate(sql, params?)` | — | Cursor over rows, closed by commit/rollback |
 | `iterateRaw(sql, params?)` | — | Cursor over rows as arrays, with `columns` |
+| `iterateAsync(sql, params?)` | — | Cursor opened on the threadpool |
+| `iterateRawAsync(sql, params?)` | — | Raw cursor opened on the threadpool |
 | `commit()` | `commitSync()` | Commit the transaction |
 | `rollback()` | `rollbackSync()` | Rollback the transaction |
 | | `executeBatchSync(sql, paramsArray)` | Execute with multiple param sets |
