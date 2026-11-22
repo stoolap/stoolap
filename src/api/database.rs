@@ -1038,19 +1038,19 @@ impl Database {
     /// Note: The engine is also closed automatically when all Database instances
     /// are dropped.
     pub fn close(&self) -> Result<()> {
-        // Refused before the registry forgets the database
-        self.inner
-            .shared
-            .engine
-            .refuse_inside_ddl_statement("a close")?;
+        // Waits for a DDL statement in flight, and is refused inside one,
+        // before the registry is held and forgets the database
+        let closing = self.inner.shared.engine.begin_close()?;
         // Remove from registry
         let mut registry = DATABASE_REGISTRY.write();
 
         registry.remove(&self.inner.shared.dsn);
 
         // Close the engine immediately to release the file lock
-        // This is idempotent - calling close_engine() multiple times is safe
-        self.inner.shared.engine.close_engine()?;
+        // This is idempotent: a database closed already has nothing to finish
+        if closing {
+            self.inner.shared.engine.finish_close()?;
+        }
 
         Ok(())
     }

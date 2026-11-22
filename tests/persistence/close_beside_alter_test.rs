@@ -12,11 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A close from another thread waits for a DDL statement in flight, so the
-//! next open finds what the statement answered
+//! A close from another thread waits for a DDL statement in flight, holding
+//! no lock an open needs, so the next open finds what the statement answered
+
+#![cfg(feature = "test-failpoints")]
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::channel;
 use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -35,10 +38,19 @@ static SERIAL: Mutex<()> = Mutex::new(());
 static CLOSED_BESIDE: Mutex<Option<Database>> = Mutex::new(None);
 /// The closing thread, once the CHECK's function has started it
 static CLOSER: Mutex<Option<JoinHandle<stoolap::Result<()>>>> = Mutex::new(None);
+/// The thread that opens another database from inside the statement
+static OPENER: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 /// Whether the function lets the row pass
 static PASSES: AtomicBool = AtomicBool::new(true);
+/// Whether the close was seen waiting for the DDL guard before the function
+/// went on, and whether an open of another database then returned
+static WAITED: AtomicBool = AtomicBool::new(false);
+static OPENED: AtomicBool = AtomicBool::new(false);
 
-/// Starts a close on another thread, gives it time to begin, then judges
+const PATIENCE: Duration = Duration::from_secs(20);
+
+/// Starts a close on another thread, goes on once that thread waits for the
+/// DDL guard, opens another database, then judges
 #[derive(Default)]
 struct ClosedBeside;
 
@@ -60,9 +72,25 @@ impl ScalarFunction for ClosedBeside {
             .unwrap_or_else(|e| e.into_inner())
             .take();
         if let Some(db) = handle {
-            let closer = std::thread::spawn(move || db.close());
+            let (waiting, waits) = channel();
+            let closer = std::thread::spawn(move || {
+                stoolap::test_failpoints::on_ddl_guard_waiting(move || {
+                    let _ = waiting.send(());
+                });
+                db.close()
+            });
             *CLOSER.lock().unwrap_or_else(|e| e.into_inner()) = Some(closer);
-            std::thread::sleep(Duration::from_millis(300));
+            WAITED.store(waits.recv_timeout(PATIENCE).is_ok(), Ordering::SeqCst);
+            let (opened, opens) = channel();
+            let opener = std::thread::spawn(move || {
+                let other = Database::open("memory://close_beside_alter_other");
+                let _ = opened.send(other.is_ok());
+            });
+            *OPENER.lock().unwrap_or_else(|e| e.into_inner()) = Some(opener);
+            OPENED.store(
+                opens.recv_timeout(PATIENCE).unwrap_or(false),
+                Ordering::SeqCst,
+            );
         }
         Ok(Value::Boolean(PASSES.load(Ordering::SeqCst)))
     }
@@ -79,9 +107,10 @@ fn dsn(dir: &Path) -> String {
 }
 
 /// Runs `alter` over a sealed table while another thread closes the
-/// database, and returns whether the statement was taken and the table's
-/// definition at the next open
-fn reopened_after(alter: &str, passes: bool) -> (bool, String) {
+/// database, and returns whether the close waited for the statement, an
+/// open inside the statement returned, the statement was taken, and the
+/// table's definition at the next open
+fn reopened_after(alter: &str, passes: bool) -> (bool, bool, bool, String) {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let _ = global_registry().register_scalar::<ClosedBeside>();
     let dir = tempfile::tempdir().unwrap();
@@ -94,6 +123,8 @@ fn reopened_after(alter: &str, passes: bool) -> (bool, String) {
         db.execute(sql, ()).unwrap();
     }
     PASSES.store(passes, Ordering::SeqCst);
+    WAITED.store(false, Ordering::SeqCst);
+    OPENED.store(false, Ordering::SeqCst);
     *CLOSED_BESIDE.lock().unwrap_or_else(|e| e.into_inner()) = Some(db.clone());
     let taken = db.execute(alter, ()).is_ok();
     let closer = CLOSER.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -102,6 +133,8 @@ fn reopened_after(alter: &str, passes: bool) -> (bool, String) {
         .join()
         .unwrap()
         .unwrap();
+    let opener = OPENER.lock().unwrap_or_else(|e| e.into_inner()).take();
+    opener.expect("the opener never started").join().unwrap();
     drop(db);
 
     let reopened = Database::open(&dsn(dir.path())).unwrap();
@@ -111,7 +144,12 @@ fn reopened_after(alter: &str, passes: bool) -> (bool, String) {
         .map(|row| row.unwrap().get_value(1).unwrap().to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    (taken, definition)
+    (
+        WAITED.load(Ordering::SeqCst),
+        OPENED.load(Ordering::SeqCst),
+        taken,
+        definition,
+    )
 }
 
 const ADD: &str =
@@ -122,6 +160,8 @@ fn a_column_refused_while_another_thread_closes_does_not_come_back() {
     assert_eq!(
         reopened_after(ADD, false),
         (
+            true,
+            true,
             false,
             "CREATE TABLE t (id Integer PRIMARY KEY, v Integer)".to_string()
         )
@@ -133,6 +173,8 @@ fn a_column_added_while_another_thread_closes_is_there_at_the_next_open() {
     assert_eq!(
         reopened_after(ADD, true),
         (
+            true,
+            true,
             true,
             "CREATE TABLE t (id Integer PRIMARY KEY, v Integer, z Integer DEFAULT 4 CHECK (ALTER_CHECK_CLOSED_BESIDE(z)))".to_string()
         )

@@ -3152,19 +3152,26 @@ impl MVCCEngine {
 
     /// Closes the engine (inherent method)
     pub fn close_engine(&self) -> Result<()> {
+        match self.begin_close()? {
+            true => self.finish_close(),
+            false => Ok(()), // Already closed
+        }
+    }
+
+    /// Marks the engine closed once a DDL statement in flight has finished,
+    /// and says whether this call did: its caller then runs `finish_close`
+    pub(crate) fn begin_close(&self) -> Result<bool> {
         self.refuse_inside_ddl_statement("a close")?;
-        // A DDL statement in flight finishes before the engine reads closed
-        let ddl = self.ddl.guard();
+        let _ddl = self.ddl.guard();
         // Use CAS to atomically check and set closed
-        if self
+        Ok(self
             .open
             .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Ok(()); // Already closed
-        }
-        drop(ddl);
+            .is_ok())
+    }
 
+    /// The rest of the close `begin_close` began
+    pub(crate) fn finish_close(&self) -> Result<()> {
         // Stop the cleanup thread first (before stopping transactions)
         {
             let mut cleanup_handle = self.cleanup_handle.lock();
@@ -4976,10 +4983,15 @@ impl MVCCEngine {
 
     /// The DDL guard for a DDL statement, refused on a thread that holds it:
     /// a function a DDL statement calls runs no DDL statement of its own,
-    /// which would land between that statement's checks and its change
+    /// which would land between that statement's checks and its change.
+    /// Refused too once a close has begun, which waits for no statement after
     pub fn ddl_statement_guard(&self) -> Result<parking_lot::ReentrantMutexGuard<'_, ()>> {
         self.refuse_inside_ddl_statement("a DDL statement")?;
-        Ok(self.ddl.guard())
+        let ddl = self.ddl.guard();
+        if !self.is_open() {
+            return Err(Error::EngineNotOpen);
+        }
+        Ok(ddl)
     }
 
     /// An error on a thread that holds the DDL guard: a function a DDL
