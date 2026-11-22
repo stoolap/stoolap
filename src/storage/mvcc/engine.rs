@@ -48,7 +48,7 @@ use crate::storage::volume::manifest::Pending;
 use crate::storage::volume::row_ids::RowIds;
 
 mod retype;
-pub use retype::ColumnTypeChange;
+pub use retype::{ColumnTypeChange, RowJudge};
 
 /// The operation byte of an ALTER TABLE ... MODIFY COLUMN record
 const ALTER_MODIFY_COLUMN: u8 = 4;
@@ -3482,12 +3482,25 @@ impl MVCCEngine {
                 };
 
                 // The default the existing rows took, in a record that carries it
-                let default_value = data
+                let default_bytes = data
                     .get(pos..pos + 2)
                     .map(|len| u16::from_le_bytes([len[0], len[1]]) as usize)
-                    .filter(|&len| len > 0)
-                    .and_then(|len| data.get(pos + 2..pos + 2 + len))
+                    .and_then(|len| data.get(pos + 2..pos + 2 + len));
+                let default_value = default_bytes
+                    .filter(|bytes| !bytes.is_empty())
                     .and_then(|bytes| super::persistence::deserialize_value(bytes).ok());
+                pos += default_bytes.map_or(0, |bytes| 2 + bytes.len());
+
+                // The column's CHECK, in a record that carries one
+                let check_expr = data
+                    .get(pos..pos + 4)
+                    .map(|len| u32::from_le_bytes([len[0], len[1], len[2], len[3]]) as usize)
+                    .and_then(|len| data.get(pos + 4..pos + 4 + len))
+                    .map(|bytes| {
+                        String::from_utf8(bytes.to_vec())
+                            .map_err(|e| Error::internal(format!("invalid check expr: {e}")))
+                    })
+                    .transpose()?;
 
                 // Apply the ADD COLUMN using engine method
                 self.create_column_with_default(
@@ -3495,7 +3508,7 @@ impl MVCCEngine {
                     &column_name,
                     data_type,
                     nullable,
-                    (default_expr, default_value),
+                    (default_expr, default_value, check_expr),
                     vector_dimensions,
                 )?;
             }
@@ -4161,15 +4174,16 @@ impl MVCCEngine {
         self.check_column_change(table_name, &added, ColumnEvent::Added)
     }
 
-    /// Creates a column in a table with an optional default expression and
-    /// the value the existing rows take, read from the expression when absent
+    /// Creates a column in a table with an optional default expression, the
+    /// value the existing rows take, read from the expression when absent,
+    /// and an optional CHECK
     pub fn create_column_with_default(
         &self,
         table_name: &str,
         column_name: &str,
         data_type: DataType,
         nullable: bool,
-        (default_expr, default_value): (Option<String>, Option<Value>),
+        (default_expr, default_value, check_expr): (Option<String>, Option<Value>, Option<String>),
         vector_dimensions: u16,
     ) -> Result<()> {
         if !self.is_open() {
@@ -4223,6 +4237,7 @@ impl MVCCEngine {
                     crate::core::value::timestamp_in_range(*t)?;
                 }
                 col.default_expr = default_expr;
+                col.check_expr = check_expr;
                 col.vector_dimensions = vector_dimensions;
                 store.add_column(col)?;
                 store.lay_out_rows();
@@ -5149,6 +5164,27 @@ impl MVCCEngine {
         column: crate::core::SchemaColumn,
     ) -> Result<()> {
         self.get_version_store(table_name)?.add_column(column)
+    }
+
+    /// Runs `judge` over each committed row of `table_name`, closed by an
+    /// added column, once every commit that began publishing before the
+    /// close is done: the hot rows before the column, the sealed with it
+    pub(crate) fn judge_added_column_rows(
+        &self,
+        table_name: &str,
+        judge: RowJudge<'_>,
+    ) -> Result<()> {
+        const SETTLE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+        let name = to_lowercase_cow(table_name);
+        let store = self.get_version_store(&name)?;
+        if !store.wait_until_quiet(Instant::now() + SETTLE_WAIT) {
+            return Err(Error::TableHasOpenTransactionRows {
+                table: name.to_string(),
+            });
+        }
+        let mgr = self.segment_managers.read().get(name.as_ref()).cloned();
+        let _seal = mgr.as_ref().map(|mgr| mgr.acquire_seal_read());
+        retype::judge_rows(&store, mgr.as_deref(), judge)
     }
 
     /// Sets `table_name`'s id counter so its next generated id is `next`,
@@ -9206,6 +9242,13 @@ impl Engine for MVCCEngine {
         // the dropped name, new volumes get the re-added column at a new position.
         self.refresh_column_mappings(table_name)?;
 
+        // The column's CHECK, last and only when it has one, so a record
+        // without it reads as before: its length(4) and text
+        if let Some(check) = column.check_expr.as_deref() {
+            data.extend_from_slice(&(check.len() as u32).to_le_bytes());
+            data.extend_from_slice(check.as_bytes());
+        }
+
         self.record_ddl(table_name, WALOperationType::AlterTable, &data)
     }
 
@@ -12202,14 +12245,14 @@ mod tests {
             .build();
         engine.create_table(schema).unwrap();
         engine
-            .create_column_with_default("t", "v", DataType::Integer, true, (None, None), 0)
+            .create_column_with_default("t", "v", DataType::Integer, true, (None, None, None), 0)
             .unwrap();
         assert!(engine.segment_managers.read().is_empty());
 
         let mgr = engine.get_or_create_segment_manager("t");
         let before = mgr.schema_generation();
         engine
-            .create_column_with_default("t", "w", DataType::Integer, true, (None, None), 0)
+            .create_column_with_default("t", "w", DataType::Integer, true, (None, None, None), 0)
             .unwrap();
         assert_eq!(mgr.schema_generation(), before + 2);
         engine.close_engine().unwrap();

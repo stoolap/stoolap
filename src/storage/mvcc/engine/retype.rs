@@ -681,14 +681,6 @@ fn validate(
     let Some(mgr) = mgr.filter(|_| sealed_too) else {
         return Ok(());
     };
-    let snapshot = mgr.cold_snapshot();
-    let (dropped, renames) = {
-        let manifest = mgr.manifest();
-        (
-            manifest.dropped_columns.clone(),
-            manifest.column_renames.clone(),
-        )
-    };
     let mut wanted = unique.columns();
     if !wanted.contains(&column) {
         wanted.push(column);
@@ -697,6 +689,67 @@ fn validate(
     if change.judge.is_some() {
         wanted = (0..schema.columns.len()).collect();
     }
+    each_sealed_row(cast, mgr, cold, schema, &wanted, |row_id, row| {
+        if let Some(judge) = change.judge {
+            judge(row)?;
+        }
+        let value = |id: usize| {
+            wanted
+                .iter()
+                .position(|&w| w == id)
+                .and_then(|at| row.get(at).cloned())
+        };
+        validate_value(value(column).as_ref(), change, storable)?;
+        unique.insert(row_id, value)
+    })
+}
+
+/// Runs `judge` over each live row of a closed table once, its newest
+/// committed copy: the hot rows as they are held, then the sealed rows read
+/// through the table's schema
+pub(super) fn judge_rows(
+    store: &VersionStore,
+    mgr: Option<&SegmentManager>,
+    judge: RowJudge<'_>,
+) -> Result<()> {
+    let heads = store.current_heads();
+    for (_, row) in heads.live_rows() {
+        judge(row)?;
+    }
+    let Some(mgr) = mgr else {
+        return Ok(());
+    };
+    let schema = store.schema();
+    let wanted: Vec<usize> = (0..schema.columns.len()).collect();
+    each_sealed_row(
+        &heads,
+        mgr,
+        &ColdCast::default(),
+        &schema,
+        &wanted,
+        |_, row| judge(row),
+    )
+}
+
+/// Each live sealed row the hot store does not hold, once, its newest copy
+/// (the volumes newest first, read through `cold`'s rewrites), as its
+/// `wanted` columns of `schema`
+fn each_sealed_row(
+    cast: &HotCast,
+    mgr: &SegmentManager,
+    cold: &ColdCast,
+    schema: &Schema,
+    wanted: &[usize],
+    mut each: impl FnMut(i64, &Row) -> Result<()>,
+) -> Result<()> {
+    let snapshot = mgr.cold_snapshot();
+    let (dropped, renames) = {
+        let manifest = mgr.manifest();
+        (
+            manifest.dropped_columns.clone(),
+            manifest.column_renames.clone(),
+        )
+    };
     let mut seen = KeySet::default();
     for &seg_id in snapshot.seg_ids.iter().rev() {
         let Some((volume, mapping, dead, nulled)) =
@@ -716,18 +769,8 @@ fn validate(
             if let Ok(at) = nulled.binary_search_by_key(&row_id, |&(id, _)| id) {
                 crate::core::value::timestamp_in_range(nulled[at].1)?;
             }
-            let row = volume.get_row_mapped_projected(i, &mapping, &wanted)?;
-            if let Some(judge) = change.judge {
-                judge(&row)?;
-            }
-            let value = |id: usize| {
-                wanted
-                    .iter()
-                    .position(|&w| w == id)
-                    .and_then(|at| row.get(at).cloned())
-            };
-            validate_value(value(column).as_ref(), change, storable)?;
-            unique.insert(row_id, value)?;
+            let row = volume.get_row_mapped_projected(i, &mapping, wanted)?;
+            each(row_id, &row)?;
         }
     }
     Ok(())
