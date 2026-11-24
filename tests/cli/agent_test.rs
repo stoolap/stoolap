@@ -596,3 +596,14 @@ fn a_command_follows_a_block_comment_closed_on_a_later_line() {
         r#"{"stmt":1,"line":3,"ok":true,"command":".schema","tables":[],"views":[]}"#
     );
 }
+
+#[test]
+fn a_warmup_that_fails_counts_only_the_runs_that_passed() {
+    let (out, _, _) = first_run_passing(&["--agent", "--warmup", "10"]);
+    let line: serde_json::Value = serde_json::from_str(out.lines().nth(1).unwrap()).unwrap();
+    let repeat = &line["repeat"];
+    // With no measured run, the failure came within the ten warmup runs
+    if repeat.get("min_us").is_none() {
+        assert!(repeat["warmup"].as_u64().unwrap() < 10, "{out}");
+    }
+}

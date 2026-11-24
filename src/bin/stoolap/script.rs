@@ -507,7 +507,7 @@ pub struct Output<W: Write> {
 /// and printing none: their engine times, and the error that stopped them
 pub struct Repeats {
     pub first: Duration,
-    /// Runs after the first that were run and not measured
+    /// Runs after the first that were run, not measured, and passed
     pub warmup: usize,
     /// The measured runs' engine times, sorted
     pub warm: Vec<Duration>,
@@ -615,10 +615,11 @@ pub fn repeat(
 ) -> Repeats {
     let mut warm = Vec::with_capacity(times);
     let mut failed = None;
+    let mut warmed = 0;
     for run_number in 0..warmup + times {
         match run(session, sql, params.to_vec(), 0, &mut Drain) {
             Ok((_, took)) if run_number >= warmup => warm.push(took.engine),
-            Ok(_) => {}
+            Ok(_) => warmed += 1,
             Err(failure) => {
                 failed = Some(failure);
                 break;
@@ -628,7 +629,7 @@ pub fn repeat(
     warm.sort();
     Repeats {
         first,
-        warmup,
+        warmup: warmed,
         warm,
         failed,
     }
