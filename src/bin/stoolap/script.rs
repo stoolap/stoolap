@@ -131,16 +131,21 @@ impl Splitter {
             let at = base + token.position.offset as usize;
             let line = self.resume_line + token.position.line as usize - 1;
             if let Some((mut statement, semicolon_line)) = cut.take() {
-                let trailing =
-                    match token.token_type == TokenType::Comment && line == semicolon_line {
-                        true => params_of(&token.literal),
-                        false => None,
-                    };
-                // Only a PARAMS comment is taken here; any other token, an
-                // open block comment among them, is read as below
-                if let Some(params) = trailing {
-                    statement.params = params;
-                    out.push(statement);
+                // Comments closed on the semicolon's line are passed over,
+                // and the first PARAMS comment among them is the statement's;
+                // any other token, an open block comment among them, is read
+                // as below
+                if token.token_type == TokenType::Comment
+                    && line == semicolon_line
+                    && !open_block(&token.literal)
+                {
+                    match params_of(&token.literal) {
+                        Some(params) => {
+                            statement.params = params;
+                            out.push(statement);
+                        }
+                        None => cut = Some((statement, semicolon_line)),
+                    }
                     continue;
                 }
                 out.push(statement);
@@ -154,15 +159,16 @@ impl Splitter {
                 // The lexer gives a block comment that runs to the end of
                 // the text as a comment, not an error: what follows in later
                 // lines is still inside it
-                TokenType::Comment
-                    if !at_end
-                        && token.literal.starts_with("/*")
-                        && (token.literal.len() < 4 || !token.literal.ends_with("*/")) =>
-                {
+                TokenType::Comment if !at_end && open_block(&token.literal) => {
                     self.open = Some(Open::Comment);
                     self.resume = at;
                     self.resume_line = line;
                     break;
+                }
+                // Still open at the end of the input, it is a statement of
+                // its own or the end of one, and the engine reports it
+                TokenType::Comment if open_block(&token.literal) => {
+                    self.first_line.get_or_insert(line);
                 }
                 TokenType::Comment => {
                     if let Some(params) = params_of(&token.literal) {
@@ -223,6 +229,32 @@ impl Splitter {
     }
 }
 
+/// Whether a comment token is a block comment the text ended inside
+fn open_block(comment: &str) -> bool {
+    comment.starts_with("/*") && (comment.len() < 4 || !comment.ends_with("*/"))
+}
+
+/// `sql` with its comments taken out, as the lexer reads them
+fn without_comments(sql: &str) -> String {
+    let mut lexer = Lexer::new(sql);
+    let mut text = String::with_capacity(sql.len());
+    let mut from = 0;
+    loop {
+        let token = lexer.next_token();
+        match token.token_type {
+            TokenType::Eof => break,
+            TokenType::Comment => {
+                let at = token.position.offset as usize;
+                text.push_str(&sql[from..at]);
+                from = at + token.literal.len();
+            }
+            _ => {}
+        }
+    }
+    text.push_str(&sql[from..]);
+    text
+}
+
 /// The parameters a `-- PARAMS: 1, 'a'` comment gives its statement
 fn params_of(comment: &str) -> Option<Vec<Value>> {
     let list = comment
@@ -268,9 +300,15 @@ pub fn command(sql: &str) -> Command {
         && matches!(first.token_type, TokenType::Identifier | TokenType::Keyword)
         && sql.as_bytes()[from].is_ascii_alphabetic();
     let word = |words: &[&str]| words.iter().any(|w| first.literal.eq_ignore_ascii_case(w));
-    // The backslash forms are no SQL tokens: they are read as written
-    let rest = sql[from..].trim().trim_end_matches(';').trim();
-    let slash = |forms: &[&str]| forms.iter().any(|f| rest.eq_ignore_ascii_case(f));
+    // The backslash forms are no SQL tokens: they are read as written, with
+    // their comments taken out, when the first token is a backslash
+    let slash = |forms: &[&str]| {
+        sql.as_bytes()[from] == b'\\' && {
+            let text = without_comments(sql);
+            let text = text.trim().trim_end_matches(';').trim();
+            forms.iter().any(|f| text.eq_ignore_ascii_case(f))
+        }
+    };
     match first.keyword {
         Some(Keyword::Begin) => Command::Begin,
         Some(Keyword::Explain) => Command::Explain,
@@ -938,6 +976,14 @@ mod tests {
                 ("SELECT 'x -- PARAMS: y'".to_string(), vec![]),
             ]
         );
+        assert_eq!(
+            params("SELECT $1; /* note */ # more\n"),
+            vec![("SELECT $1".to_string(), vec![])]
+        );
+        assert_eq!(
+            params("SELECT $1; /* note */ -- PARAMS: 7"),
+            vec![("SELECT $1".to_string(), vec![Value::Integer(7)])]
+        );
     }
 
     #[test]
@@ -1020,6 +1066,8 @@ mod tests {
             ("/* note */ \\h;", Command::Help),
             ("\\H", Command::Help),
             ("\\Q;", Command::Exit),
+            ("\\h /* note */;", Command::Help),
+            ("\\q -- bye", Command::Exit),
             ("-- bye\nquit", Command::Exit),
             ("'help'", Command::Other),
         ];

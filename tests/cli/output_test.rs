@@ -131,14 +131,34 @@ fn a_statement_without_rows_prints_its_count() {
 
 #[test]
 fn a_params_comment_after_the_semicolon_gives_the_statement_its_parameters() {
-    assert_eq!(
-        cli(&["-q", "-e", "SELECT $1 AS v; -- PARAMS: 7"], ""),
-        ("v\n----\n7\n".into(), "".into(), 0)
-    );
+    for sql in [
+        "SELECT $1 AS v; -- PARAMS: 7",
+        "SELECT $1 AS v; /* note */ -- PARAMS: 7",
+    ] {
+        assert_eq!(
+            cli(&["-q", "-e", sql], ""),
+            ("v\n----\n7\n".into(), "".into(), 0),
+            "{sql}"
+        );
+    }
     assert_eq!(
         cli(&["-q", "-e", "SELECT 'x -- PARAMS: y' AS v"], "").0,
         "v\n----\nx -- PARAMS: y\n"
     );
+}
+
+#[test]
+fn a_block_comment_the_input_leaves_open_fails_the_run() {
+    for (sql, out) in [
+        ("/* never closed", ""),
+        ("SELECT 1 AS a; /* never closed", "a\n----\n1\n"),
+    ] {
+        let (stdout, stderr, code) = cli(&["-q", "-e", sql], "");
+        assert!(
+            stdout == out && code == 1 && stderr.contains("unterminated block comment"),
+            "{sql}: {stdout:?} {stderr:?} {code}"
+        );
+    }
 }
 
 #[test]
