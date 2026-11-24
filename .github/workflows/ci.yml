@@ -194,6 +194,7 @@ jobs:
     - name: Allocation counts (system allocator)
       run: |
         cargo test --no-default-features --features parallel --lib storage::volume::secondary
+        cargo test --no-default-features --features parallel,cli --bin stoolap alloc_tests
         alloc=$(grep -l '^#\[global_allocator\]' tests/*.rs)
         plain=$(grep -L 'test-failpoints' $alloc | xargs -n1 basename -s .rs | sed 's/^/--test /')
         failpoint=$(grep -l 'test-failpoints' $alloc | xargs -n1 basename -s .rs | sed 's/^/--test /')

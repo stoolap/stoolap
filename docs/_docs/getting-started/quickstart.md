@@ -36,7 +36,17 @@ Stoolap includes a command-line interface (CLI) for interactive use:
 
 # Execute a query directly
 ./target/release/stoolap -e "SELECT 1 + 1"
+
+# Run a script from a file, or from standard input
+./target/release/stoolap -f setup.sql
+cat setup.sql | ./target/release/stoolap -q
 ```
+
+`-e`, `-f` and standard input run each statement in turn and print each result. A statement ends at a semicolon outside a string, a quoted name or a comment, read as the SQL parser reads them, or at the end of the input; from standard input a statement runs as soon as its semicolon arrives. A statement that fails prints `Error (statement 2, line 5): ...` on standard error, the run goes on with the next statement, and the CLI exits with status 1 when any statement failed.
+
+A result shows its first 40 rows (`-l N` for another number, `-l 0` for all) and ends with `(N more rows, M in total)` when rows were left out; a plan from EXPLAIN is shown whole. A statement without rows prints its count, `2 rows affected`. In the table, NULL is `NULL`, and a text that could be read as another value or that would break the row, such as `'NULL'`, `'1'`, `''`, `'x|y'` or a text holding a newline, is printed in single quotes with `''`, `\n`, `\r`, `\t` and `\\` for those characters. A FLOAT is printed in the shortest form that reads back as the same number, with `.0` on a whole number. `-j` prints one JSON object per result, `{"columns":[...],"rows":[...],"count":N}`, with `"shown"` when the limit left rows out, and NaN and the infinities as the strings `"NaN"`, `"Infinity"` and `"-Infinity"`.
+
+Without `-q`, the CLI prints how long it took to open the database, `Query executed in 1.234 ms (output 2.1 µs)` after each statement, and `Database closed in ...` at the end. A statement's time is the time the engine took to run it and produce its rows. The time the CLI took to print the rows it showed is measured on its own and given after it, so a large result does not count its printing as query time; rows past the limit are counted without being timed one by one. Opening a file database reads its volumes and closing it seals the rows still in memory, so either can take longer than the statements did, most of all after writes: the time of a whole `stoolap -e ...` process, as `time` reports it, is open, statements and close together. A debug build says so after each of these times, since it runs many times slower than a release build.
 
 ## Creating a Table
 

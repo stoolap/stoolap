@@ -15,9 +15,12 @@
 //! Stoolap CLI - Interactive SQL database command-line interface
 //!
 
+#[path = "stoolap/script.rs"]
+mod script;
+
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, IsTerminal};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, ContentArrangement, Table};
@@ -27,7 +30,9 @@ use rustyline::{Config, DefaultEditor, EditMode, Editor};
 
 use stoolap::api::{Database, Transaction as ApiTransaction};
 use stoolap::common::version::{MAJOR, MINOR, PATCH};
-use stoolap::Value;
+use stoolap::{Row, Value};
+
+use script::{Format, Output, Ran, Session, Sink, Splitter, Timing};
 
 /// Version string constant
 const VERSION: &str = concat!(
@@ -175,8 +180,23 @@ struct Cli {
     quiet: bool,
     timeout_ms: u64,
     editor: Editor<(), DefaultHistory>,
+    /// The lines of the statement being typed, for the history
     current_query: String,
-    in_multi_line: bool,
+    splitter: Splitter,
+}
+
+/// The first rows of a result, kept to lay out the interactive table
+struct Collect(Vec<Vec<Value>>);
+
+impl Sink for Collect {
+    fn begin(&mut self, _columns: &[String]) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn row(&mut self, row: &Row) -> io::Result<()> {
+        self.0.push(row.as_slice().to_vec());
+        Ok(())
+    }
 }
 
 impl Cli {
@@ -211,12 +231,12 @@ impl Cli {
             timeout_ms,
             editor,
             current_query: String::new(),
-            in_multi_line: false,
+            splitter: Splitter::default(),
         })
     }
 
     fn get_prompt(&self) -> &'static str {
-        if self.in_multi_line {
+        if self.splitter.is_pending() {
             if self.in_transaction {
                 "\x1b[1;33m[TXN]->\x1b[0m "
             } else {
@@ -245,12 +265,12 @@ impl Cli {
                     let line = line.trim();
 
                     // Handle empty line
-                    if !self.in_multi_line && line.is_empty() {
+                    if !self.splitter.is_pending() && line.is_empty() {
                         continue;
                     }
 
                     // Handle special commands (only when not in multi-line mode)
-                    if !self.in_multi_line {
+                    if !self.splitter.is_pending() {
                         match line.to_lowercase().as_str() {
                             "exit" | "quit" | "\\q" => {
                                 if self.in_transaction {
@@ -269,18 +289,14 @@ impl Cli {
 
                     // Check for transaction control statements
                     let upper_line = line.to_uppercase();
-                    if upper_line == "BEGIN"
-                        || upper_line == "COMMIT"
-                        || upper_line == "ROLLBACK"
-                        || upper_line.starts_with("BEGIN ")
+                    if !self.splitter.is_pending()
+                        && (upper_line == "BEGIN"
+                            || upper_line == "COMMIT"
+                            || upper_line == "ROLLBACK"
+                            || upper_line.starts_with("BEGIN "))
                     {
                         let _ = self.editor.add_history_entry(line);
-                        let start = Instant::now();
-                        if let Err(e) = self.execute_query(line) {
-                            eprintln!("\x1b[1;31mError:\x1b[0m {}", e);
-                        } else {
-                            println!("\x1b[1;32mQuery executed in {:?}\x1b[0m", start.elapsed());
-                        }
+                        self.run_statement(line);
                         continue;
                     }
 
@@ -290,37 +306,15 @@ impl Cli {
                     }
                     self.current_query.push_str(line);
 
-                    // Check if query ends with semicolon
-                    let full_query = self.current_query.trim().to_string();
-                    if full_query.ends_with(';') {
-                        // Add to history
-                        let history_entry = full_query.replace('\n', "\\n");
+                    let mut statements = Vec::new();
+                    self.splitter.push_line(line, &mut statements);
+                    if !self.splitter.is_pending() {
+                        let history_entry = self.current_query.replace('\n', "\\n");
                         let _ = self.editor.add_history_entry(&history_entry);
-
-                        self.in_multi_line = false;
-
-                        // Split and execute statements
-                        let statements = split_sql_statements(&full_query);
-                        for stmt in statements {
-                            let stmt = stmt.trim();
-                            if stmt.is_empty() {
-                                continue;
-                            }
-
-                            let start = Instant::now();
-                            if let Err(e) = self.execute_query(stmt) {
-                                eprintln!("\x1b[1;31mError:\x1b[0m {}", e);
-                            } else {
-                                println!(
-                                    "\x1b[1;32mQuery executed in {:?}\x1b[0m",
-                                    start.elapsed()
-                                );
-                            }
-                        }
-
                         self.current_query.clear();
-                    } else {
-                        self.in_multi_line = true;
+                    }
+                    for statement in statements {
+                        self.run_statement(&statement.sql);
                     }
                 }
                 Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
@@ -346,45 +340,70 @@ impl Cli {
         Ok(())
     }
 
-    fn execute_query(&mut self, query: &str) -> Result<(), String> {
-        let upper_query = query.to_uppercase();
-        let upper_query = upper_query.trim();
+    /// Runs one statement and prints its result and its time
+    fn run_statement(&mut self, sql: &str) {
+        match self.execute_query(sql) {
+            Ok(took) => println!("\x1b[1;32m{}\x1b[0m", script::timing_line(took)),
+            Err(e) => eprintln!("\x1b[1;31mError:\x1b[0m {}", e),
+        }
+    }
+
+    fn execute_query(&mut self, query: &str) -> Result<Timing, String> {
+        let upper_query = query.trim_end_matches(';').trim().to_uppercase();
+        let upper_query = upper_query.as_str();
 
         // Handle special commands
-        match upper_query {
-            "HELP" | "\\H" | "\\?" => {
-                self.print_help();
-                return Ok(());
-            }
-            _ => {}
+        if matches!(upper_query, "HELP" | "\\H" | "\\?") {
+            self.print_help();
+            return Ok(Timing::default());
         }
 
         // Handle transaction commands
-        if upper_query.starts_with("BEGIN") {
-            return self.begin_transaction();
+        let start = Instant::now();
+        let control = if upper_query.starts_with("BEGIN") {
+            Some(self.begin_transaction())
         } else if upper_query == "COMMIT" {
-            return self.commit_transaction();
+            Some(self.commit_transaction())
         } else if upper_query == "ROLLBACK" {
-            return self.rollback_transaction();
+            Some(self.rollback_transaction())
+        } else {
+            None
+        };
+        if let Some(done) = control {
+            return done.map(|()| Timing {
+                engine: start.elapsed(),
+                output: Duration::ZERO,
+            });
         }
 
-        // Check if it's a query that returns rows
-        // Include statements with RETURNING clause (INSERT/UPDATE/DELETE RETURNING)
-        if upper_query.starts_with("SELECT")
-            || upper_query.starts_with("WITH")
-            || upper_query.starts_with("SHOW")
-            || upper_query.starts_with("DESCRIBE")
-            || upper_query.starts_with("DESC ")
-            || upper_query.starts_with("EXPLAIN")
-            || upper_query.starts_with("VACUUM")
-            || (upper_query.starts_with("PRAGMA") && !upper_query.contains('='))
-            || upper_query.contains(" RETURNING ")
-            || upper_query.ends_with(" RETURNING")
-        {
-            self.execute_read_query(query)
-        } else {
-            self.execute_write_query(query)
+        let mut session = match self.tx.as_mut() {
+            Some(tx) if self.in_transaction => Session::Transaction(tx),
+            _ => Session::Database(&self.db),
+        };
+        if self.json_output {
+            let mut out = Output {
+                out: io::BufWriter::new(io::stdout().lock()),
+                format: Format::Json,
+                limit: self.limit,
+                quiet: true,
+                timing: false,
+            };
+            return script::print_statement(&mut session, query, &mut out, self.timeout_ms);
         }
+        let mut shown = Collect(Vec::new());
+        let (ran, mut took) =
+            script::run(&mut session, query, self.timeout_ms, self.limit, &mut shown)?;
+        let render = Instant::now();
+        match ran {
+            Ran::Affected(n) => println!(
+                "\x1b[1;32m{} {} affected\x1b[0m",
+                n,
+                script::plural(n, "row")
+            ),
+            Ran::Rows { columns, total } => self.output_table(&columns, &shown.0, total),
+        }
+        took.output += render.elapsed();
+        Ok(took)
     }
 
     fn begin_transaction(&mut self) -> Result<(), String> {
@@ -428,95 +447,7 @@ impl Cli {
         Ok(())
     }
 
-    fn execute_read_query(&mut self, query: &str) -> Result<(), String> {
-        let rows_result = if self.in_transaction {
-            if let Some(ref mut tx) = self.tx {
-                tx.query(query, ()).map_err(|e| e.to_string())?
-            } else {
-                return Err("Transaction not available".to_string());
-            }
-        } else if self.timeout_ms > 0 {
-            self.db
-                .query_with_timeout(query, (), self.timeout_ms)
-                .map_err(|e| e.to_string())?
-        } else {
-            self.db.query(query, ()).map_err(|e| e.to_string())?
-        };
-
-        let columns: Vec<String> = rows_result.columns().to_vec();
-
-        // Collect all rows
-        let mut all_rows: Vec<Vec<Value>> = Vec::new();
-        for row_result in rows_result {
-            let row = row_result.map_err(|e| e.to_string())?;
-            let mut values = Vec::new();
-            for i in 0..row.len() {
-                values.push(row.get_value(i).cloned().unwrap_or(Value::null_unknown()));
-            }
-            all_rows.push(values);
-        }
-
-        let row_count = all_rows.len();
-
-        if self.json_output {
-            self.output_json(&columns, &all_rows, row_count)?;
-        } else {
-            self.output_table(&columns, &all_rows, row_count)?;
-        }
-
-        Ok(())
-    }
-
-    fn execute_write_query(&mut self, query: &str) -> Result<(), String> {
-        let rows_affected = if self.in_transaction {
-            if let Some(ref mut tx) = self.tx {
-                tx.execute(query, ()).map_err(|e| e.to_string())?
-            } else {
-                return Err("Transaction not available".to_string());
-            }
-        } else if self.timeout_ms > 0 {
-            self.db
-                .execute_with_timeout(query, (), self.timeout_ms)
-                .map_err(|e| e.to_string())?
-        } else {
-            self.db.execute(query, ()).map_err(|e| e.to_string())?
-        };
-
-        if self.json_output {
-            println!(r#"{{"rows_affected":{}}}"#, rows_affected);
-        } else {
-            let row_text = if rows_affected == 1 { "row" } else { "rows" };
-            println!("\x1b[1;32m{} {} affected\x1b[0m", rows_affected, row_text);
-        }
-
-        Ok(())
-    }
-
-    fn output_json(
-        &self,
-        columns: &[String],
-        rows: &[Vec<Value>],
-        row_count: usize,
-    ) -> Result<(), String> {
-        let json_rows: Vec<Vec<serde_json::Value>> = rows
-            .iter()
-            .map(|row| row.iter().map(value_to_json).collect())
-            .collect();
-
-        let result = serde_json::json!({
-            "columns": columns,
-            "rows": json_rows,
-            "count": row_count
-        });
-
-        println!(
-            "{}",
-            serde_json::to_string(&result).map_err(|e| e.to_string())?
-        );
-        Ok(())
-    }
-
-    fn output_explain_plan(&self, rows: &[Vec<Value>], row_count: usize) -> Result<(), String> {
+    fn output_explain_plan(&self, rows: &[Vec<Value>], row_count: u64) {
         println!();
         for row in rows {
             if let Some(Value::Text(line)) = row.first() {
@@ -526,79 +457,40 @@ impl Cli {
         println!();
         let line_text = if row_count == 1 { "line" } else { "lines" };
         println!("\x1b[2m({} {} in plan)\x1b[0m", row_count, line_text);
-        Ok(())
     }
 
-    fn output_table(
-        &self,
-        columns: &[String],
-        rows: &[Vec<Value>],
-        row_count: usize,
-    ) -> Result<(), String> {
+    /// Lays out the first rows of a result of `total` rows
+    fn output_table(&self, columns: &[String], rows: &[Vec<Value>], total: u64) {
         // Render EXPLAIN output without table borders, with color highlighting.
         // Verify first row starts with a known statement keyword to avoid false positives
         // from queries that alias a column as "plan".
         if columns.len() == 1 && columns[0] == "plan" && is_explain_output(rows) {
-            return self.output_explain_plan(rows, row_count);
+            return self.output_explain_plan(rows, total);
         }
 
         let mut table = Table::new();
         table
             .load_preset(UTF8_FULL_CONDENSED)
             .set_content_arrangement(ContentArrangement::Dynamic);
-
-        // Add header
         table.set_header(columns.iter().map(Cell::new));
-
-        // Smart truncation with limit
-        if self.limit > 0 && row_count > self.limit {
-            let top_rows = self.limit / 2;
-            let bottom_rows = self.limit - top_rows;
-
-            // Add top rows
-            for row in rows.iter().take(top_rows) {
-                table.add_row(row.iter().map(|v| Cell::new(format_value(v))));
-            }
-
-            // Add truncation indicator
-            let hidden_rows = row_count - self.limit;
-            let mut truncation_row: Vec<Cell> = Vec::new();
-            let message = format!("... ({} more rows) ...", hidden_rows);
-            for (i, _) in columns.iter().enumerate() {
-                if i == columns.len() / 2 {
-                    truncation_row.push(Cell::new(&message));
-                } else {
-                    truncation_row.push(Cell::new(""));
-                }
-            }
-            table.add_row(truncation_row);
-
-            // Add bottom rows
-            let start_idx = row_count.saturating_sub(bottom_rows).max(top_rows);
-            for row in rows.iter().skip(start_idx) {
-                table.add_row(row.iter().map(|v| Cell::new(format_value(v))));
-            }
-        } else {
-            // Add all rows
-            for row in rows {
-                table.add_row(row.iter().map(|v| Cell::new(format_value(v))));
-            }
+        for row in rows {
+            table.add_row(row.iter().map(|v| Cell::new(script::value_text(v))));
         }
-
         println!("{table}");
 
-        // Print summary
-        let row_text = if row_count == 1 { "row" } else { "rows" };
-        if self.limit > 0 && row_count > self.limit {
+        let row_text = script::plural(total as i64, "row");
+        let shown = rows.len() as u64;
+        if shown < total {
             println!(
-                "\x1b[1;32m{} {} in set (showing {})\x1b[0m",
-                row_count, row_text, self.limit
+                "\x1b[1;32m{} {} in set (showing the first {}, {} more)\x1b[0m",
+                total,
+                row_text,
+                shown,
+                total - shown
             );
         } else {
-            println!("\x1b[1;32m{} {} in set\x1b[0m", row_count, row_text);
+            println!("\x1b[1;32m{} {} in set\x1b[0m", total, row_text);
         }
-
-        Ok(())
     }
 
     fn print_help(&self) {
@@ -1120,6 +1012,7 @@ fn main() {
     // --reset-volumes already handled above (before --restore).
 
     // Open the database
+    let opening = Instant::now();
     let db = match Database::open(&db_path) {
         Ok(db) => db,
         Err(e) => {
@@ -1127,9 +1020,15 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let opened = opening.elapsed();
 
     if !args.quiet {
-        println!("Connected to database: {}", db_path);
+        println!(
+            "Connected to database: {} (opened in {}){}",
+            db_path,
+            script::duration(opened),
+            script::BUILD_NOTE
+        );
         // Show persistence info for file databases
         if db_path.starts_with("file://") {
             print_persistence_info(&args);
@@ -1155,57 +1054,27 @@ fn main() {
         return;
     }
 
-    // Handle execute flag - run single query and exit
+    // Handle execute flag - run its statements and exit
     if let Some(ref sql) = args.execute {
-        if let Err(e) = execute_query_with_options(
-            &db,
-            sql,
-            args.json_output,
-            args.quiet,
-            args.limit,
-            args.timeout_ms,
-        ) {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-        return;
+        run_script_and_exit(db, sql.lines().map(|l| Ok(l.to_string())), &args);
     }
 
     // Handle file flag - execute SQL from file
     if let Some(ref filename) = args.file {
-        let result = execute_from_file(
-            &db,
-            filename,
-            args.json_output,
-            args.quiet,
-            args.limit,
-            args.timeout_ms,
-        );
-        drop(db); // ensure close_engine() runs before exit
-        if let Err(e) = result {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-        return;
+        let file = match File::open(filename) {
+            Ok(file) => file,
+            Err(e) => {
+                drop(db);
+                eprintln!("Error opening file {}: {}", filename, e);
+                std::process::exit(1);
+            }
+        };
+        run_script_and_exit(db, BufReader::new(file).lines(), &args);
     }
 
-    // Check if we're getting input from a pipe
-    let is_pipe = !std::io::stdin().is_terminal();
-
-    if is_pipe {
-        let result = execute_piped_input(
-            &db,
-            args.json_output,
-            args.quiet,
-            args.limit,
-            args.timeout_ms,
-        );
-        drop(db); // ensure close_engine() runs before exit
-        if let Err(e) = result {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-        return;
+    // Input from a pipe runs as a script, each statement as it arrives
+    if !std::io::stdin().is_terminal() {
+        run_script_and_exit(db, io::stdin().lock().lines(), &args);
     }
 
     // Interactive mode
@@ -1223,414 +1092,57 @@ fn main() {
         }
     };
 
-    if let Err(e) = cli.run() {
-        // Drop cli (and db) before exiting so close_engine() runs
-        drop(cli);
+    let ran = cli.run();
+    // Drop cli (and db) before exiting so close_engine() runs
+    close(cli, &args);
+    if let Err(e) = ran {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
 }
 
-fn execute_from_file(
-    db: &Database,
-    filename: &str,
-    json_output: bool,
-    quiet: bool,
-    row_limit: usize,
-    timeout_ms: u64,
-) -> Result<(), String> {
-    let file =
-        File::open(filename).map_err(|e| format!("Error opening file {}: {}", filename, e))?;
-    let reader = BufReader::new(file);
-    let mut current_statement = String::new();
-
-    for line_result in reader.lines() {
-        let line = line_result.map_err(|e| format!("Error reading file: {}", e))?;
-
-        // Skip shell-style comment lines
-        let trimmed = line.trim();
-        if trimmed.starts_with('#') {
-            continue;
-        }
-
-        // Skip SQL-style comment lines
-        if trimmed.starts_with("--") || (trimmed.starts_with("/*") && trimmed.ends_with("*/")) {
-            continue;
-        }
-
-        // If blank line and we have a statement, execute it
-        if trimmed.is_empty() && !current_statement.is_empty() {
-            let q = current_statement.trim().to_string();
-            current_statement.clear();
-
-            if !q.is_empty() {
-                let statements = split_sql_statements(&q);
-                for stmt in statements {
-                    let stmt = stmt.trim();
-                    if stmt.is_empty() {
-                        continue;
-                    }
-
-                    if let Err(e) = execute_query_with_options(
-                        db,
-                        stmt,
-                        json_output,
-                        quiet,
-                        row_limit,
-                        timeout_ms,
-                    ) {
-                        eprintln!("Error: {}", e);
-                    }
-                }
-            }
-        } else {
-            current_statement.push_str(&line);
-            current_statement.push('\n');
-        }
+/// Closes the database `held` owns and, unless quiet, says how long the
+/// close took: it seals the rows still in memory, so after writes it can
+/// take longer than the statements did
+fn close<T>(held: T, args: &Args) {
+    let closing = Instant::now();
+    drop(held);
+    if !args.quiet {
+        println!(
+            "Database closed in {}{}",
+            script::duration(closing.elapsed()),
+            script::BUILD_NOTE
+        );
     }
-
-    // Execute any remaining statement
-    if !current_statement.is_empty() {
-        let q = current_statement.trim().to_string();
-        if !q.is_empty() {
-            let statements = split_sql_statements(&q);
-            for stmt in statements {
-                let stmt = stmt.trim();
-                if stmt.is_empty() {
-                    continue;
-                }
-
-                if let Err(e) =
-                    execute_query_with_options(db, stmt, json_output, quiet, row_limit, timeout_ms)
-                {
-                    eprintln!("Error: {}", e);
-                }
-            }
-        }
-    }
-
-    Ok(())
 }
 
-fn execute_piped_input(
-    db: &Database,
-    json_output: bool,
-    quiet: bool,
-    row_limit: usize,
-    timeout_ms: u64,
-) -> Result<(), String> {
-    let stdin = io::stdin();
-    let reader = stdin.lock();
-    let mut current_statement = String::new();
-
-    for line_result in reader.lines() {
-        let line = line_result.map_err(|e| format!("Error reading input: {}", e))?;
-
-        // Skip shell-style comment lines
-        let trimmed = line.trim();
-        if trimmed.starts_with('#') {
-            continue;
-        }
-
-        // Skip SQL-style comment lines
-        if trimmed.starts_with("--") || (trimmed.starts_with("/*") && trimmed.ends_with("*/")) {
-            continue;
-        }
-
-        // If blank line and we have a statement, execute it
-        if trimmed.is_empty() && !current_statement.is_empty() {
-            let q = current_statement.trim().to_string();
-            current_statement.clear();
-
-            if !q.is_empty() {
-                let statements = split_sql_statements(&q);
-                for stmt in statements {
-                    let stmt = stmt.trim();
-                    if stmt.is_empty() {
-                        continue;
-                    }
-
-                    let start = Instant::now();
-                    if let Err(e) = execute_query_with_options(
-                        db,
-                        stmt,
-                        json_output,
-                        quiet,
-                        row_limit,
-                        timeout_ms,
-                    ) {
-                        eprintln!("Error: {}", e);
-                    } else if !json_output && !quiet {
-                        println!("Query executed in {:?}", start.elapsed());
-                    }
-                }
-            }
-        } else {
-            current_statement.push_str(&line);
-            current_statement.push('\n');
+/// Runs a script on `db`, closes it, and exits with 1 when a statement failed
+fn run_script_and_exit(
+    db: Database,
+    lines: impl Iterator<Item = io::Result<String>>,
+    args: &Args,
+) -> ! {
+    let mut output = Output {
+        out: io::BufWriter::new(io::stdout().lock()),
+        format: match args.json_output {
+            true => Format::Json,
+            false => Format::Table,
+        },
+        limit: args.limit,
+        quiet: args.quiet,
+        timing: !args.json_output && !args.quiet,
+    };
+    let result = script::run_script(&db, lines, &mut output, args.timeout_ms);
+    drop(output);
+    close(db, args);
+    match result {
+        Ok(0) => std::process::exit(0),
+        Ok(_) => std::process::exit(1),
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1)
         }
     }
-
-    // Execute any remaining statement
-    if !current_statement.is_empty() {
-        let q = current_statement.trim().to_string();
-        if !q.is_empty() {
-            let statements = split_sql_statements(&q);
-            for stmt in statements {
-                let stmt = stmt.trim();
-                if stmt.is_empty() {
-                    continue;
-                }
-
-                let start = Instant::now();
-                if let Err(e) =
-                    execute_query_with_options(db, stmt, json_output, quiet, row_limit, timeout_ms)
-                {
-                    eprintln!("Error: {}", e);
-                } else if !json_output && !quiet {
-                    println!("Query executed in {:?}", start.elapsed());
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn execute_query_with_options(
-    db: &Database,
-    query: &str,
-    json_output: bool,
-    quiet: bool,
-    row_limit: usize,
-    timeout_ms: u64,
-) -> Result<(), String> {
-    let upper_query = query.to_uppercase();
-    let upper_query = upper_query.trim();
-
-    // Handle special commands
-    match upper_query {
-        "HELP" | "\\H" | "\\?" => {
-            print_help_main();
-            return Ok(());
-        }
-        "EXIT" | "QUIT" | "\\Q" => {
-            return Err("exit requested".to_string());
-        }
-        _ => {}
-    }
-
-    // Handle parameter syntax: "SELECT ... -- PARAMS: val1, val2"
-    let (sql, params) = parse_params(query);
-
-    // Check if it's a query that returns rows
-    // Include statements with RETURNING clause (INSERT/UPDATE/DELETE RETURNING)
-    if upper_query.starts_with("SELECT")
-        || upper_query.starts_with("WITH")
-        || upper_query.starts_with("SHOW")
-        || upper_query.starts_with("DESCRIBE")
-        || upper_query.starts_with("DESC ")
-        || upper_query.starts_with("EXPLAIN")
-        || upper_query.starts_with("VACUUM")
-        || (upper_query.starts_with("PRAGMA") && !upper_query.contains('='))
-        || upper_query.contains(" RETURNING ")
-        || upper_query.ends_with(" RETURNING")
-    {
-        let rows_result = if timeout_ms > 0 {
-            db.query_with_timeout(&sql, params, timeout_ms)
-                .map_err(|e| e.to_string())?
-        } else {
-            db.query(&sql, params).map_err(|e| e.to_string())?
-        };
-
-        let columns: Vec<String> = rows_result.columns().to_vec();
-
-        // Collect all rows
-        let mut all_rows: Vec<Vec<Value>> = Vec::new();
-        for row_result in rows_result {
-            let row = row_result.map_err(|e| e.to_string())?;
-            let mut values = Vec::new();
-            for i in 0..row.len() {
-                values.push(row.get_value(i).cloned().unwrap_or(Value::null_unknown()));
-            }
-            all_rows.push(values);
-        }
-
-        let row_count = all_rows.len();
-
-        if json_output {
-            output_json(&columns, &all_rows, row_count)?;
-        } else {
-            output_table(&columns, &all_rows, row_count, row_limit, quiet)?;
-        }
-    } else {
-        // Execute a non-query statement
-        let rows_affected = if timeout_ms > 0 {
-            db.execute_with_timeout(&sql, params, timeout_ms)
-                .map_err(|e| e.to_string())?
-        } else {
-            db.execute(&sql, params).map_err(|e| e.to_string())?
-        };
-
-        if json_output {
-            println!(r#"{{"rows_affected":{}}}"#, rows_affected);
-        } else if !quiet {
-            println!("{} rows affected", rows_affected);
-        }
-    }
-
-    Ok(())
-}
-
-fn parse_params(query: &str) -> (String, Vec<Value>) {
-    let parts: Vec<&str> = query.split(" -- PARAMS: ").collect();
-
-    if parts.len() <= 1 {
-        // Remove trailing semicolon
-        let sql = parts[0].trim().trim_end_matches(';').to_string();
-        return (sql, Vec::new());
-    }
-
-    let sql = parts[0].trim().trim_end_matches(';').to_string();
-    let param_string = parts[1].trim();
-
-    let mut params = Vec::new();
-    for val in param_string.split(',') {
-        params.push(convert_param_value(val.trim()));
-    }
-
-    (sql, params)
-}
-
-fn convert_param_value(value: &str) -> Value {
-    // Try to convert to integer
-    if let Ok(i) = value.parse::<i64>() {
-        return Value::Integer(i);
-    }
-
-    // Try to convert to float (only if contains '.')
-    if value.contains('.')
-        && let Ok(f) = value.parse::<f64>()
-    {
-        return Value::Float(f);
-    }
-
-    // Try to convert to boolean
-    if value == "true" {
-        return Value::Boolean(true);
-    }
-    if value == "false" {
-        return Value::Boolean(false);
-    }
-
-    // Check for null
-    if value.eq_ignore_ascii_case("null") {
-        return Value::null_unknown();
-    }
-
-    // Default to string
-    Value::text(value)
-}
-
-fn output_json(columns: &[String], rows: &[Vec<Value>], row_count: usize) -> Result<(), String> {
-    let json_rows: Vec<Vec<serde_json::Value>> = rows
-        .iter()
-        .map(|row| row.iter().map(value_to_json).collect())
-        .collect();
-
-    let result = serde_json::json!({
-        "columns": columns,
-        "rows": json_rows,
-        "count": row_count
-    });
-
-    println!(
-        "{}",
-        serde_json::to_string(&result).map_err(|e| e.to_string())?
-    );
-    Ok(())
-}
-
-fn output_table(
-    columns: &[String],
-    rows: &[Vec<Value>],
-    row_count: usize,
-    row_limit: usize,
-    quiet: bool,
-) -> Result<(), String> {
-    // Print the column names
-    for (i, column) in columns.iter().enumerate() {
-        if i > 0 {
-            print!(" | ");
-        }
-        print!("{}", column);
-    }
-    println!();
-
-    // Print a separator
-    for (i, _) in columns.iter().enumerate() {
-        if i > 0 {
-            print!("-+-");
-        }
-        print!("----");
-    }
-    println!();
-
-    // Display rows with smart truncation
-    if row_limit == 0 || row_count <= row_limit {
-        for row in rows {
-            for (i, value) in row.iter().enumerate() {
-                if i > 0 {
-                    print!(" | ");
-                }
-                print!("{}", format_value(value));
-            }
-            println!();
-        }
-
-        if !quiet {
-            println!("{} rows in set", row_count);
-        }
-    } else {
-        // Smart truncation
-        let top_rows = row_limit / 2;
-        let bottom_rows = row_limit - top_rows;
-
-        // Show top rows
-        for row in rows.iter().take(top_rows) {
-            for (i, value) in row.iter().enumerate() {
-                if i > 0 {
-                    print!(" | ");
-                }
-                print!("{}", format_value(value));
-            }
-            println!();
-        }
-
-        // Show truncation indicator
-        let hidden_rows = row_count - row_limit;
-        println!();
-        println!("    \x1b[2m... ({} more rows) ...\x1b[0m", hidden_rows);
-        println!();
-
-        // Show bottom rows
-        let start_idx = row_count.saturating_sub(bottom_rows).max(top_rows);
-        for row in rows.iter().skip(start_idx) {
-            for (i, value) in row.iter().enumerate() {
-                if i > 0 {
-                    print!(" | ");
-                }
-                print!("{}", format_value(value));
-            }
-            println!();
-        }
-
-        if !quiet {
-            println!("{} rows in set (showing {})", row_count, row_limit);
-        }
-    }
-
-    Ok(())
 }
 
 // ============================================================================
@@ -1799,220 +1311,6 @@ fn colorize_detail(line: &str, result: &mut String) {
 
     // No recognized label — render as-is
     result.push_str(line);
-}
-
-fn format_value(value: &Value) -> String {
-    match value {
-        Value::Null(_) => "NULL".to_string(),
-        Value::Integer(i) => i.to_string(),
-        Value::Float(f) => format_float(*f),
-        Value::Text(s) => s.to_string(),
-        Value::Boolean(b) => if *b { "true" } else { "false" }.to_string(),
-        Value::Timestamp(ts) => format_timestamp(ts),
-        Value::Extension(data) if data.first() == Some(&(stoolap::DataType::Json as u8)) => {
-            std::str::from_utf8(&data[1..]).unwrap_or("").to_string()
-        }
-        Value::Extension(data) if data.first() == Some(&(stoolap::DataType::Vector as u8)) => {
-            stoolap::core::value::format_vector_bytes(&data[1..])
-        }
-        Value::Extension(_) => "<extension>".to_string(),
-    }
-}
-
-/// Format a timestamp preserving sub-second precision.
-/// Omits fractional part when zero, trims trailing zeros otherwise.
-fn format_timestamp(ts: &chrono::DateTime<chrono::Utc>) -> String {
-    let nanos = ts.timestamp_subsec_nanos();
-    if nanos == 0 {
-        return ts.format("%Y-%m-%dT%H:%M:%SZ").to_string();
-    }
-    // Format with 9-digit nanoseconds, then trim trailing zeros
-    let s = ts.format("%Y-%m-%dT%H:%M:%S.%9fZ").to_string();
-    // Find the 'Z' and trim zeros before it
-    if let Some(z_pos) = s.rfind('Z') {
-        let trimmed = s[..z_pos].trim_end_matches('0');
-        format!("{}Z", trimmed)
-    } else {
-        s
-    }
-}
-
-/// Format a float value consistently, using scientific notation for extreme values
-fn format_float(v: f64) -> String {
-    // Handle special cases
-    if v.is_nan() {
-        return "NaN".to_string();
-    }
-    if v.is_infinite() {
-        return if v.is_sign_positive() {
-            "Infinity"
-        } else {
-            "-Infinity"
-        }
-        .to_string();
-    }
-
-    let abs_v = v.abs();
-
-    // Use scientific notation for very large or very small numbers
-    if abs_v != 0.0 && !(1e-4..1e15).contains(&abs_v) {
-        let s = format!("{:e}", v);
-        // Clean up trailing zeros in mantissa
-        if let Some(e_pos) = s.find('e') {
-            let (mantissa, exp) = s.split_at(e_pos);
-            let clean_mantissa = if mantissa.contains('.') {
-                mantissa
-                    .trim_end_matches('0')
-                    .trim_end_matches('.')
-                    .to_string()
-            } else {
-                mantissa.to_string()
-            };
-            return format!("{}{}", clean_mantissa, exp);
-        }
-        return s;
-    }
-
-    // Integer-like float
-    if v == v.trunc() {
-        format!("{:.1}", v)
-    } else {
-        // Normal range - show reasonable precision
-        format!("{:.6}", v)
-            .trim_end_matches('0')
-            .trim_end_matches('.')
-            .to_string()
-    }
-}
-
-fn value_to_json(value: &Value) -> serde_json::Value {
-    match value {
-        Value::Null(_) => serde_json::Value::Null,
-        Value::Integer(i) => serde_json::json!(i),
-        Value::Float(f) => serde_json::json!(f),
-        Value::Text(s) => serde_json::json!(s.as_str()),
-        Value::Boolean(b) => serde_json::json!(b),
-        Value::Timestamp(ts) => serde_json::json!(format_timestamp(ts)),
-        Value::Extension(data) if data.first() == Some(&(stoolap::DataType::Json as u8)) => {
-            serde_json::json!(std::str::from_utf8(&data[1..]).unwrap_or(""))
-        }
-        Value::Extension(data) if data.first() == Some(&(stoolap::DataType::Vector as u8)) => {
-            serde_json::json!(stoolap::core::value::format_vector_bytes(&data[1..]))
-        }
-        Value::Extension(_) => serde_json::Value::Null,
-    }
-}
-
-/// Split SQL statements by semicolons, handling quotes and comments
-fn split_sql_statements(input: &str) -> Vec<String> {
-    let mut statements = Vec::new();
-    let mut current_statement = String::new();
-
-    let mut in_single_quotes = false;
-    let mut in_double_quotes = false;
-    let mut in_line_comment = false;
-    let mut in_block_comment = false;
-
-    let chars: Vec<char> = input.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() {
-        let char = chars[i];
-
-        // Handle end of line comment
-        if in_line_comment {
-            if char == '\n' {
-                in_line_comment = false;
-                current_statement.push(char);
-            }
-            i += 1;
-            continue;
-        }
-
-        // Handle start of line comment
-        // Only treat -- as comment if followed by whitespace/newline/EOF
-        // Otherwise, it's double negation (--val or --5)
-        if !in_single_quotes
-            && !in_double_quotes
-            && !in_block_comment
-            && char == '-'
-            && i + 1 < chars.len()
-            && chars[i + 1] == '-'
-        {
-            // Check what follows the second dash
-            let after_second_dash = if i + 2 < chars.len() {
-                chars[i + 2]
-            } else {
-                '\0' // End of input
-            };
-            // Only treat as comment if followed by whitespace, newline, or EOF
-            if after_second_dash == '\0'
-                || after_second_dash == ' '
-                || after_second_dash == '\t'
-                || after_second_dash == '\n'
-                || after_second_dash == '\r'
-            {
-                in_line_comment = true;
-                i += 2;
-                continue;
-            }
-            // Otherwise, fall through and treat as two minus operators
-        }
-
-        // Handle end of block comment
-        if in_block_comment {
-            if char == '*' && i + 1 < chars.len() && chars[i + 1] == '/' {
-                in_block_comment = false;
-                i += 2;
-                continue;
-            }
-            i += 1;
-            continue;
-        }
-
-        // Handle start of block comment
-        if !in_single_quotes
-            && !in_double_quotes
-            && char == '/'
-            && i + 1 < chars.len()
-            && chars[i + 1] == '*'
-        {
-            in_block_comment = true;
-            i += 2;
-            continue;
-        }
-
-        // Handle quotes
-        if !in_block_comment && !in_line_comment {
-            if char == '\'' && (i == 0 || chars[i - 1] != '\\') {
-                in_single_quotes = !in_single_quotes;
-            } else if char == '"' && (i == 0 || chars[i - 1] != '\\') {
-                in_double_quotes = !in_double_quotes;
-            }
-        }
-
-        // If we find a semicolon outside of quotes and comments, it's a statement delimiter
-        if char == ';'
-            && !in_single_quotes
-            && !in_double_quotes
-            && !in_block_comment
-            && !in_line_comment
-        {
-            statements.push(current_statement.clone());
-            current_statement.clear();
-        } else {
-            current_statement.push(char);
-        }
-
-        i += 1;
-    }
-
-    // Add any remaining statement
-    if !current_statement.is_empty() {
-        statements.push(current_statement);
-    }
-
-    statements
 }
 
 fn print_help_main() {
