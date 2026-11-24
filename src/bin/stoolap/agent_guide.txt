@@ -32,8 +32,8 @@ MEASURE
   --warmup M            adds M unmeasured runs after the first
   The line adds "repeat":{"runs","warmup","first_us","min_us","p50_us","p90_us",
   "max_us"}: first_us is the cold run, the rest the warm ones; with --timing,
-  elapsed_us is the cold run too. A statement that is not repeated, a write or
-  EXPLAIN, says so: "repeat":{"runs":1,"skipped":"not_read_only"}.
+  elapsed_us is the cold run too. A statement that is not repeated says why:
+  "repeat":{"runs":1,"skipped":"not_read_only"} for a write, "explain" for EXPLAIN.
   The gap between first_us and p50_us is the cold parse, plan and caches.
   Times are microseconds to the nanosecond: 7.625.
 

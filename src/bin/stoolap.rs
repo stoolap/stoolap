@@ -21,7 +21,7 @@ mod agent;
 mod script;
 
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, IsTerminal};
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -1182,8 +1182,10 @@ fn main() {
 fn close<T>(held: T, args: &Args) {
     let closing = Instant::now();
     drop(held);
+    // A reader that stopped reading misses only this line
     if !args.quiet {
-        println!(
+        let _ = writeln!(
+            io::stdout(),
             "Database closed in {}{}",
             script::duration(closing.elapsed()),
             script::BUILD_NOTE

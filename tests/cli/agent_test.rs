@@ -698,7 +698,7 @@ fn the_agent_guide_example_gives_the_lines_it_shows() {
 
 #[test]
 fn a_reader_that_stops_reading_ends_the_run_quietly() {
-    for args in [&["--agent"][..], &["-q"], &["-q", "-j"]] {
+    for args in [&["--agent"][..], &["-q"], &["-q", "-j"], &[], &["-j"]] {
         let mut child = Command::new(env!("CARGO_BIN_EXE_stoolap"))
             .args(args)
             .args([
