@@ -19,7 +19,7 @@ use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 use stoolap::parser::lexer::Lexer;
-use stoolap::parser::token::{Token, TokenType};
+use stoolap::parser::token::{Keyword, Token, TokenType};
 use stoolap::{ApiTransaction, Database, Row, Rows, Value};
 
 /// A statement of a script, the line its first token is on, and the
@@ -44,9 +44,20 @@ pub struct Splitter {
     first_line: Option<usize>,
     /// Parameters a comment in the statement being read gave
     params: Option<Vec<Value>>,
-    /// The byte that can close the string, name or comment left open at
-    /// `resume`, and whether a line since holds it
-    open: Option<(u8, bool)>,
+    /// What the text is left open in at `resume`, and whether a line since
+    /// closed it
+    open: Option<Open>,
+    closed: bool,
+    /// A line with the quote of an open string before it, lexed alone
+    probe: String,
+}
+
+/// A string, quoted name or block comment that runs to the end of the text
+#[derive(Clone, Copy)]
+enum Open {
+    Quote(char),
+    Comment,
+    Other,
 }
 
 impl Default for Splitter {
@@ -58,6 +69,8 @@ impl Default for Splitter {
             first_line: None,
             params: None,
             open: None,
+            closed: false,
+            probe: String::new(),
         }
     }
 }
@@ -68,10 +81,27 @@ impl Splitter {
     pub fn push_line(&mut self, line: &str, out: &mut Vec<Statement>) {
         self.pending.push_str(line);
         self.pending.push('\n');
-        if let Some((closer, seen)) = &mut self.open {
-            *seen |= line.as_bytes().contains(closer);
+        if let Some(open) = self.open
+            && !self.closed
+        {
+            self.closed = match open {
+                // A line starts inside the string with nothing pending, so
+                // the line lexed after the quote alone says whether it ends
+                // the string, by the lexer's own escapes
+                Open::Quote(quote) => {
+                    self.probe.clear();
+                    self.probe.push(quote);
+                    self.probe.push_str(line);
+                    self.probe.push('\n');
+                    let mut lexer = Lexer::new(&self.probe);
+                    lexer.next_token().token_type != TokenType::Error
+                        || lexer.next_token().token_type != TokenType::Eof
+                }
+                Open::Comment => line.contains("*/"),
+                Open::Other => true,
+            };
         }
-        if line.contains(';') && self.open.is_none_or(|(_, seen)| seen) {
+        if line.contains(';') && (self.open.is_none() || self.closed) {
             self.cut(false, out);
         }
     }
@@ -95,6 +125,7 @@ impl Splitter {
         let mut cut: Option<(Statement, usize)> = None;
         let mut start = 0;
         self.open = None;
+        self.closed = false;
         loop {
             let token = held.take().unwrap_or_else(|| lexer.next_token());
             let at = base + token.position.offset as usize;
@@ -112,6 +143,19 @@ impl Splitter {
             match token.token_type {
                 TokenType::Eof => {
                     self.resume = self.pending.len();
+                    self.resume_line = line;
+                    break;
+                }
+                // The lexer gives a block comment that runs to the end of
+                // the text as a comment, not an error: what follows in later
+                // lines is still inside it
+                TokenType::Comment
+                    if !at_end
+                        && token.literal.starts_with("/*")
+                        && (token.literal.len() < 4 || !token.literal.ends_with("*/")) =>
+                {
+                    self.open = Some(Open::Comment);
+                    self.resume = at;
                     self.resume_line = line;
                     break;
                 }
@@ -141,12 +185,10 @@ impl Splitter {
                     // is lexed again from here once a line can close it
                     let next = lexer.next_token();
                     if next.token_type == TokenType::Eof {
-                        let closer = match self.pending.as_bytes()[at] {
-                            quote @ (b'\'' | b'"' | b'`') => quote,
-                            b'/' => b'/',
-                            _ => b';',
-                        };
-                        self.open = Some((closer, false));
+                        self.open = Some(match self.pending.as_bytes()[at] {
+                            quote @ (b'\'' | b'"' | b'`') => Open::Quote(quote as char),
+                            _ => Open::Other,
+                        });
                         self.resume = at;
                         self.resume_line = line;
                         break;
@@ -197,40 +239,39 @@ pub enum Command {
     Other,
 }
 
+/// What `sql` is: the transaction commands and EXPLAIN by their keyword
+/// token, so a quoted name spelling one is not it, and the CLI's own exit
+/// and help by the bare word alone
 pub fn command(sql: &str) -> Command {
-    let word = sql.trim().trim_end_matches(';').trim();
-    if ["exit", "quit", "\\q"]
-        .iter()
-        .any(|w| word.eq_ignore_ascii_case(w))
-    {
-        return Command::Exit;
-    }
-    if ["help", "\\h", "\\?"]
-        .iter()
-        .any(|w| word.eq_ignore_ascii_case(w))
-    {
-        return Command::Help;
-    }
     let mut lexer = Lexer::new(sql);
-    let mut words = std::iter::from_fn(|| loop {
+    let mut tokens = std::iter::from_fn(|| loop {
         let token = lexer.next_token();
         match token.token_type {
             TokenType::Eof => return None,
             TokenType::Comment => {}
             TokenType::Punctuator if token.literal == ";" => {}
-            _ => return Some(token.literal),
+            _ => return Some(token),
         }
     });
-    let Some(first) = words.next() else {
+    let Some(first) = tokens.next() else {
         return Command::Other;
     };
-    let alone = words.next().is_none();
-    match first.as_str() {
-        w if w.eq_ignore_ascii_case("BEGIN") => Command::Begin,
-        w if w.eq_ignore_ascii_case("EXPLAIN") => Command::Explain,
-        w if alone && w.eq_ignore_ascii_case("COMMIT") => Command::Commit,
-        w if alone && w.eq_ignore_ascii_case("ROLLBACK") => Command::Rollback,
-        _ => Command::Other,
+    let alone = tokens.next().is_none();
+    let bare = alone && !first.quoted && first.token_type != TokenType::String;
+    let word = |words: &[&str]| words.iter().any(|w| first.literal.eq_ignore_ascii_case(w));
+    match first.keyword {
+        Some(Keyword::Begin) => Command::Begin,
+        Some(Keyword::Explain) => Command::Explain,
+        Some(Keyword::Commit) if alone => Command::Commit,
+        Some(Keyword::Rollback) if alone => Command::Rollback,
+        _ if bare && word(&["exit", "quit"]) => Command::Exit,
+        _ if bare && word(&["help"]) => Command::Help,
+        // The backslash forms are no SQL tokens: they are read as written
+        _ => match sql.trim().trim_end_matches(';').trim() {
+            "\\q" => Command::Exit,
+            "\\h" | "\\?" => Command::Help,
+            _ => Command::Other,
+        },
     }
 }
 
@@ -909,14 +950,37 @@ mod tests {
         let mut out = Vec::new();
         splitter.push_line("SELECT 1; SELECT 'a;", &mut out);
         let open_at = splitter.resume;
-        for _ in 0..1000 {
-            splitter.push_line("text; more;", &mut out);
-            assert_eq!(splitter.resume, open_at, "no line could close the string");
+        for line in [
+            "text; more;",
+            "it''s; a doubled quote;",
+            "a \\' quote; escaped",
+        ]
+        .repeat(500)
+        {
+            splitter.push_line(line, &mut out);
+            assert!(
+                !splitter.closed && splitter.resume == open_at,
+                "{line} does not close the string"
+            );
         }
         splitter.push_line("end';", &mut out);
         let sql: Vec<_> = out.iter().map(|s| s.sql.len()).collect();
         assert_eq!((out.len(), sql[0]), (2, "SELECT 1".len()));
         assert!(!splitter.is_pending());
+    }
+
+    #[test]
+    fn statements_inside_an_open_block_comment_stay_in_it() {
+        assert_eq!(
+            split("/* start;\nSELECT 0;\nDROP TABLE t;\n*/ SELECT 1;\nSELECT 2;"),
+            vec![
+                (
+                    4,
+                    "/* start;\nSELECT 0;\nDROP TABLE t;\n*/ SELECT 1".to_string()
+                ),
+                (5, "SELECT 2".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -931,6 +995,11 @@ mod tests {
             ("SELECT value AS plan FROM t", Command::Other),
             ("exit", Command::Exit),
             ("\\?", Command::Help),
+            ("\"COMMIT\"", Command::Other),
+            ("\"ROLLBACK\";", Command::Other),
+            ("/* note */ help;", Command::Help),
+            ("-- bye\nquit", Command::Exit),
+            ("'help'", Command::Other),
         ];
         for (sql, expected) in cases {
             assert!(command(sql) == expected, "{sql}");
