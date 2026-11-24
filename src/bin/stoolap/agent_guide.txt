@@ -38,9 +38,10 @@ MEASURE
   Times are microseconds to the nanosecond: 7.625.
 
 PARAMETERS
-  SELECT * FROM t WHERE id = $1 AND name = $2; -- PARAMS: 42, alice
-  On the statement's line or the line before. Integers, floats with a dot, true,
-  false and NULL are typed; anything else is text as written, without quotes.
+  SELECT * FROM t WHERE id = $1 AND name = $2; -- PARAMS: 42, 'alice'
+  On the statement's line or the line before. The values are SQL literals, read
+  as SELECT reads them: text in single quotes ('it''s', 'a, b'), -5, 1.5, TRUE,
+  NULL. Anything else fails the statement with kind "params".
 
 SCENARIOS
   A line "-- @case <name>" starts a case: the statements after it run in a fresh

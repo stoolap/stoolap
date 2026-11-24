@@ -726,3 +726,22 @@ fn a_reader_that_stops_reading_ends_the_run_quietly() {
         );
     }
 }
+
+#[test]
+fn a_params_list_is_read_as_sql_values() {
+    let (lines, code) = agent(
+        &[],
+        "SELECT $1 AS a, $2 AS b, $3 AS c; -- PARAMS: 3, 'x, y', 'it''s'\n\
+         SELECT $1 AS a; -- PARAMS: alice\n",
+    );
+    assert_eq!(
+        (&lines[..2], code),
+        (
+            &[
+                r#"{"stmt":1,"line":1,"ok":true,"columns":["a","b","c"],"types":["INTEGER","TEXT","TEXT"],"rows":[[3,"x, y","it's"]],"row_count":1}"#.to_string(),
+                r#"{"stmt":2,"line":2,"ok":false,"error":{"kind":"params","message":"PARAMS, read as SQL values: column 'alice' not found"}}"#.to_string(),
+            ][..],
+            1
+        )
+    );
+}

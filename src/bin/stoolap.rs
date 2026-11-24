@@ -331,7 +331,7 @@ impl Cli {
                                 if !line.contains(';') =>
                             {
                                 let _ = self.editor.add_history_entry(line);
-                                self.run_statement(line, Vec::new());
+                                self.run_statement(line, None);
                                 continue;
                             }
                             _ => {}
@@ -352,7 +352,7 @@ impl Cli {
                         self.current_query.clear();
                     }
                     for statement in statements {
-                        self.run_statement(&statement.sql, statement.params);
+                        self.run_statement(&statement.sql, statement.params.as_deref());
                     }
                 }
                 Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
@@ -379,14 +379,14 @@ impl Cli {
     }
 
     /// Runs one statement and prints its result and its time
-    fn run_statement(&mut self, sql: &str, params: Vec<Value>) {
+    fn run_statement(&mut self, sql: &str, params: Option<&str>) {
         match self.execute_query(sql, params) {
             Ok(took) => println!("\x1b[1;32m{}\x1b[0m", script::timing_line(took)),
             Err(e) => eprintln!("\x1b[1;31mError:\x1b[0m {}", e),
         }
     }
 
-    fn execute_query(&mut self, query: &str, params: Vec<Value>) -> Result<Timing, String> {
+    fn execute_query(&mut self, query: &str, params: Option<&str>) -> Result<Timing, String> {
         let start = Instant::now();
         let control = match script::command(query) {
             Command::Help => {
@@ -422,6 +422,7 @@ impl Cli {
             return script::print_statement(&mut session, query, params, &mut out)
                 .map_err(|e| e.to_string());
         }
+        let params = script::param_values(&mut session, params).map_err(|e| e.to_string())?;
         let mut shown = Collect(Vec::new());
         let (ran, mut took) = script::run(&mut session, query, params, self.limit, &mut shown)
             .map_err(|e| e.to_string())?;
