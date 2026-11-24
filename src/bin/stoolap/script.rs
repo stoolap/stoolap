@@ -402,12 +402,14 @@ pub fn param_values(session: &mut Session, list: Option<&str>) -> Result<Vec<Val
     read(session).map_err(Failure::Params)
 }
 
-/// `SELECT <list>` rebuilt from its parse when the list is one statement of
-/// literals and nothing else, a sign before a number allowed
+/// `SELECT <list>` when its parse is one statement of literals and nothing
+/// else, a sign before a number allowed; the text runs as written, as a
+/// literal's printed form can lose its sign
 fn literal_select(list: &str) -> stoolap::Result<String> {
     use stoolap::parser::ast::{Expression, Statement as Parsed};
     let not_values = || stoolap::Error::invalid_argument(format!("not a list of values: {list}"));
-    let mut parsed = stoolap::parser::parse_sql(&format!("SELECT {list}"))
+    let text = format!("SELECT {list}");
+    let mut parsed = stoolap::parser::parse_sql(&text)
         .map_err(|e| stoolap::Error::invalid_argument(e.to_string()))?;
     let (Some(Parsed::Select(select)), None) = (parsed.pop(), parsed.pop()) else {
         return Err(not_values());
@@ -420,6 +422,7 @@ fn literal_select(list: &str) -> stoolap::Result<String> {
                 | Expression::StringLiteral(_)
                 | Expression::BooleanLiteral(_)
                 | Expression::NullLiteral(_)
+                | Expression::IntervalLiteral(_)
         )
     };
     let value = |e: &Expression| match e {
@@ -430,12 +433,12 @@ fn literal_select(list: &str) -> stoolap::Result<String> {
         e => literal(e),
     };
     let columns: Vec<String> = select.columns.iter().map(|c| c.to_string()).collect();
-    let rebuilt = format!("SELECT {}", columns.join(", "));
-    // Any clause past the columns, FROM or WHERE among them, shows in the text
-    if !select.columns.iter().all(value) || select.to_string() != rebuilt {
+    // Any clause past the columns, FROM or WHERE among them, shows in the printed form
+    let only_columns = select.to_string() == format!("SELECT {}", columns.join(", "));
+    if !select.columns.iter().all(value) || !only_columns {
         return Err(not_values());
     }
-    Ok(rebuilt)
+    Ok(text)
 }
 
 /// What a statement is, read from its tokens with comments passed over
@@ -1521,6 +1524,20 @@ mod tests {
                 Value::Boolean(true),
                 Value::null_unknown(),
             ]
+        );
+        assert_eq!(
+            values("-1.5, -1e3, +2.5, INTERVAL '1 day', INTERVAL 1 DAY").unwrap(),
+            vec![
+                Value::Float(-1.5),
+                Value::Float(-1000.0),
+                Value::Float(2.5),
+                Value::text("1 day"),
+                Value::text("1 day"),
+            ]
+        );
+        assert!(
+            matches!(values("-0.0").unwrap()[..], [Value::Float(z)] if z.is_sign_negative()),
+            "-0.0 keeps its sign"
         );
         assert_eq!(values("").unwrap(), Vec::<Value>::new(), "an empty list");
         for wrong in [
