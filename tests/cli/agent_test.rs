@@ -549,3 +549,50 @@ fn a_command_line_is_one_only_between_statements() {
         ]
     );
 }
+
+/// A run of `args` whose first run of a SLEEP that fails half the time
+/// succeeded, so its failure, nearly sure among 29 more, is a repeat's
+fn first_run_passing(args: &[&str]) -> (String, String, i32) {
+    let sql = "SELECT SLEEP(CASE WHEN RANDOM() < 0.5 THEN 0 ELSE -1 END) AS s";
+    let mut all = args.to_vec();
+    all.extend_from_slice(&["--repeat", "30", "-e", sql]);
+    (0..20)
+        .map(|_| run(&all, &[], ""))
+        .find(|(out, _, _)| out.contains("\"s\"") || out.starts_with("s\n"))
+        .expect("a first run passed")
+}
+
+#[test]
+fn a_repeat_that_fails_fails_the_statement() {
+    let (out, _, code) = first_run_passing(&["--agent"]);
+    let lines: Vec<serde_json::Value> = out
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let failed = lines[1]["repeat"]["failed"].as_str().unwrap_or("");
+    assert!(
+        lines[1]["ok"] == true
+            && failed.contains("SLEEP duration cannot be negative")
+            && lines[2]["failed"] == 1
+            && lines[2]["first_failed"] == 1
+            && code == 1,
+        "{out}"
+    );
+    let (out, err, code) = first_run_passing(&["-q"]);
+    assert!(
+        out.starts_with("s\n----\n0\nRan ")
+            && out.contains("; stopped: invalid argument: SLEEP duration cannot be negative")
+            && err.starts_with("Error (statement 1, line 1): ")
+            && code == 1,
+        "{out}{err}"
+    );
+}
+
+#[test]
+fn a_command_follows_a_block_comment_closed_on_a_later_line() {
+    let (lines, _) = agent(&[], "/* ;\n*/\n.schema\n");
+    assert_eq!(
+        lines[0],
+        r#"{"stmt":1,"line":3,"ok":true,"command":".schema","tables":[],"views":[]}"#
+    );
+}

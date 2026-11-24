@@ -170,6 +170,17 @@ fn open_transaction(db: &Database) -> &'static str {
 }
 
 impl Run<'_> {
+    /// Counts the statement running as failed, in the run and its case,
+    /// and under `--on-error stop` skips the rest of the case
+    fn count_failure(&mut self) {
+        self.failed += 1;
+        if let Some(case) = &mut self.case {
+            case.failed += 1;
+        }
+        self.first_failed.get_or_insert(self.number);
+        self.stopped = self.options.stop_on_error;
+    }
+
     fn db(&self) -> &Database {
         self.case_db.as_ref().unwrap_or(self.first)
     }
@@ -258,12 +269,7 @@ impl Run<'_> {
         write!(w, "\"line\":{},", statement.line)?;
         let took = match ran {
             Err(failure) => {
-                self.failed += 1;
-                if let Some(case) = &mut self.case {
-                    case.failed += 1;
-                }
-                self.first_failed.get_or_insert(self.number);
-                self.stopped = self.options.stop_on_error;
+                self.count_failure();
                 write!(w, "\"ok\":false,\"error\":")?;
                 write_error(w, &failure, &statement)?;
                 return writeln!(w, "}}");
@@ -298,6 +304,10 @@ impl Run<'_> {
                     );
                     w.write_all(b",\"repeat\":")?;
                     repeats.write_json(w)?;
+                    // A run after the first that failed fails the statement
+                    if repeats.failed.is_some() {
+                        self.count_failure();
+                    }
                 }
                 took
             }
@@ -379,12 +389,7 @@ impl Run<'_> {
                 w.write_all(&body)?;
             }
             Err((kind, message)) => {
-                self.failed += 1;
-                if let Some(case) = &mut self.case {
-                    case.failed += 1;
-                }
-                self.first_failed.get_or_insert(self.number);
-                self.stopped = self.options.stop_on_error;
+                self.count_failure();
                 write!(
                     w,
                     "\"ok\":false,\"error\":{{\"kind\":\"{kind}\",\"message\":"

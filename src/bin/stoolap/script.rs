@@ -144,7 +144,8 @@ impl Splitter {
     /// Whether a statement, or a block comment, has begun and not ended:
     /// what is waiting is more than blanks and closed comments
     pub fn in_statement(&self) -> bool {
-        if self.first_line.is_some() || self.open.is_some() {
+        // A construct a later line closed is lexed again below, from its start
+        if self.first_line.is_some() || (self.open.is_some() && !self.closed) {
             return true;
         }
         let mut lexer = Lexer::new(&self.pending[self.resume..]);
@@ -178,6 +179,8 @@ impl Splitter {
         self.pending.clear();
         self.resume = 0;
         self.resume_line = self.origin.0;
+        self.open = None;
+        self.closed = false;
         self.params = None;
         self.case.take()
     }
@@ -984,7 +987,12 @@ pub fn print_statement<W: Write>(
         writeln!(w, "{}", repeats.line())?;
     }
     w.flush()?;
-    Ok(took)
+    // A run after the first that failed fails the statement, after its
+    // result and the runs before it are printed
+    match repeats.and_then(|r| r.failed) {
+        Some(failure) => Err(failure),
+        None => Ok(took),
+    }
 }
 
 /// Said after every time a debug build prints, which runs many times slower
