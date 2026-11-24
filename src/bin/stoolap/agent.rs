@@ -37,17 +37,25 @@ pub struct Options {
     pub timing: bool,
 }
 
-/// Runs a script in agent mode; true when no statement failed
+/// Opens the database the `n`th case runs in
+pub type OpenCase<'a> = &'a dyn Fn(usize) -> Result<Database, String>;
+
+/// Runs a script in agent mode; true when no statement failed. Statements
+/// before the first `-- @case` line run in `db`, each case in a database
+/// `open_case` gives
 pub fn run_script<W: Write>(
     db: &Database,
     dsn: &str,
+    open_case: OpenCase,
     lines: impl Iterator<Item = io::Result<String>>,
     w: &mut W,
     options: &Options,
 ) -> io::Result<bool> {
     write_build_line(w, dsn)?;
     let mut run = Run {
-        db,
+        first: db,
+        case_db: None,
+        open_case,
         options,
         sink: AgentSink::default(),
         number: 0,
@@ -56,6 +64,8 @@ pub fn run_script<W: Write>(
         skipped: 0,
         stopped: false,
         exited: false,
+        case: None,
+        cases: Vec::new(),
     };
     let mut splitter = Splitter::default();
     let mut ready = Vec::new();
@@ -102,24 +112,88 @@ fn write_build_line(w: &mut impl Write, dsn: &str) -> io::Result<()> {
 
 /// The state of a script run in agent mode
 struct Run<'a> {
-    db: &'a Database,
+    /// The database of the statements before the first case
+    first: &'a Database,
+    /// The database of the case running, closed when the next starts
+    case_db: Option<Database>,
+    open_case: OpenCase<'a>,
     options: &'a Options,
     sink: AgentSink,
     number: usize,
     failed: usize,
     first_failed: Option<usize>,
     skipped: usize,
+    /// Under `--on-error stop`, a statement of the case failed
     stopped: bool,
     exited: bool,
+    case: Option<Case>,
+    cases: Vec<Case>,
+}
+
+/// A case's name and counts, and whether it left a transaction open
+struct Case {
+    name: String,
+    statements: usize,
+    failed: usize,
+    open_transaction: &'static str,
+}
+
+/// Whether `db`'s session has an explicit transaction open, read with
+/// CURRENT_TRANSACTION_ID(), NULL outside one: `true`, `false` or `null`
+fn open_transaction(db: &Database) -> &'static str {
+    match db.query("SELECT CURRENT_TRANSACTION_ID()", ()) {
+        Ok(mut rows) => match rows.next() {
+            Some(Ok(row)) => match row.get_value(0) {
+                Some(Value::Null(_)) | None => "false",
+                Some(_) => "true",
+            },
+            _ => "null",
+        },
+        Err(_) => "null",
+    }
 }
 
 impl Run<'_> {
+    fn db(&self) -> &Database {
+        self.case_db.as_ref().unwrap_or(self.first)
+    }
+
+    /// Ends the case running, noting whether it left a transaction open
+    fn end_case(&mut self) {
+        if let Some(mut case) = self.case.take() {
+            case.open_transaction = open_transaction(self.db());
+            self.cases.push(case);
+        }
+    }
+
+    /// Starts case `name` in a database of its own
+    fn start_case(&mut self, name: String) -> io::Result<()> {
+        self.end_case();
+        self.case_db = None;
+        let db = (self.open_case)(self.cases.len() + 1).map_err(io::Error::other)?;
+        self.case_db = Some(db);
+        self.stopped = false;
+        self.case = Some(Case {
+            name,
+            statements: 0,
+            failed: 0,
+            open_transaction: "false",
+        });
+        Ok(())
+    }
+
     fn statements(&mut self, ready: &mut Vec<Statement>, w: &mut impl Write) -> io::Result<()> {
-        for statement in ready.drain(..) {
+        for mut statement in ready.drain(..) {
             if self.exited {
                 break;
             }
+            if let Some(name) = statement.case.take() {
+                self.start_case(name)?;
+            }
             self.number += 1;
+            if let Some(case) = &mut self.case {
+                case.statements += 1;
+            }
             if self.stopped {
                 self.skipped += 1;
                 continue;
@@ -145,18 +219,30 @@ impl Run<'_> {
 
     fn statement(&mut self, statement: Statement, w: &mut impl Write) -> io::Result<()> {
         let explain = script::command(&statement.sql) == Command::Explain;
-        self.sink.reset(explain, self.options.full);
+        let ordered = !explain && script::orders_rows(&statement.sql);
+        self.sink
+            .reset(explain, self.options.full, ordered, self.options.timing);
+        let db = self.case_db.as_ref().unwrap_or(self.first);
         let ran = script::run(
-            &mut Session::Database(self.db),
+            &mut Session::Database(db),
             &statement.sql,
             statement.params.clone(),
             self.options.limit,
             &mut self.sink,
         );
-        write!(w, "{{\"stmt\":{},\"line\":{},", self.number, statement.line)?;
+        write!(w, "{{\"stmt\":{},", self.number)?;
+        if let Some(case) = &self.case {
+            write!(w, "\"case\":")?;
+            serde_json::to_writer(&mut *w, &case.name)?;
+            write!(w, ",")?;
+        }
+        write!(w, "\"line\":{},", statement.line)?;
         let took = match ran {
             Err(failure) => {
                 self.failed += 1;
+                if let Some(case) = &mut self.case {
+                    case.failed += 1;
+                }
                 self.first_failed.get_or_insert(self.number);
                 self.stopped = self.options.stop_on_error;
                 write!(w, "\"ok\":false,\"error\":")?;
@@ -192,18 +278,9 @@ impl Run<'_> {
         writeln!(w, "}}")
     }
 
-    fn summary(&self, w: &mut impl Write) -> io::Result<()> {
-        // NULL outside an explicit transaction, its id inside one
-        let open = match self.db.query("SELECT CURRENT_TRANSACTION_ID()", ()) {
-            Ok(mut rows) => match rows.next() {
-                Some(Ok(row)) => match row.get_value(0) {
-                    Some(Value::Null(_)) | None => "false",
-                    Some(_) => "true",
-                },
-                _ => "null",
-            },
-            Err(_) => "null",
-        };
+    fn summary(&mut self, w: &mut impl Write) -> io::Result<()> {
+        let open = open_transaction(self.db());
+        self.end_case();
         write!(
             w,
             "{{\"done\":true,\"statements\":{},\"failed\":{}",
@@ -215,7 +292,24 @@ impl Run<'_> {
         if self.options.stop_on_error {
             write!(w, ",\"skipped\":{}", self.skipped)?;
         }
-        writeln!(w, ",\"open_transaction\":{open}}}")?;
+        write!(w, ",\"open_transaction\":{open}")?;
+        if !self.cases.is_empty() {
+            w.write_all(b",\"cases\":[")?;
+            for (i, case) in self.cases.iter().enumerate() {
+                if i > 0 {
+                    w.write_all(b",")?;
+                }
+                w.write_all(b"{\"name\":")?;
+                serde_json::to_writer(&mut *w, &case.name)?;
+                write!(
+                    w,
+                    ",\"statements\":{},\"failed\":{},\"open_transaction\":{}}}",
+                    case.statements, case.failed, case.open_transaction
+                )?;
+            }
+            w.write_all(b"]")?;
+        }
+        writeln!(w, "}}")?;
         w.flush()
     }
 }
@@ -240,7 +334,79 @@ fn write_error(w: &mut impl Write, failure: &Failure, statement: &Statement) -> 
     write!(w, "}}")
 }
 
-/// The type a column's shown values have
+/// A result's hash, stable from build to build: every row's values and
+/// their types, summed for a result in no order, folded in order for one
+/// with an ORDER BY, so two builds with the same hash gave the same answer
+#[derive(Default)]
+struct ResultHash {
+    acc: u64,
+    ordered: bool,
+}
+
+/// "STOOLAP1", the start of every row's hash
+const SEED: u64 = 0x5354_4f4f_4c41_5031;
+
+fn mix(h: u64, word: u64) -> u64 {
+    (h ^ word)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .rotate_left(29)
+}
+
+/// MurmurHash3's 64-bit finalizer
+fn finish(mut h: u64) -> u64 {
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^ (h >> 33)
+}
+
+fn mix_bytes(mut h: u64, bytes: &[u8]) -> u64 {
+    h = mix(h, bytes.len() as u64);
+    for chunk in bytes.chunks(8) {
+        let mut word = [0u8; 8];
+        word[..chunk.len()].copy_from_slice(chunk);
+        h = mix(h, u64::from_le_bytes(word));
+    }
+    h
+}
+
+/// A value with a tag of its type, so `1` and `'1'`, NULL and `'NULL'`
+/// differ; a NaN is one NaN whatever its bits
+fn mix_value(h: u64, value: &Value) -> u64 {
+    match value {
+        Value::Null(_) => mix(h, 0),
+        Value::Integer(i) => mix(mix(h, 1), *i as u64),
+        Value::Float(f) if f.is_nan() => mix(mix(h, 2), 0x7ff8_0000_0000_0000),
+        Value::Float(f) => mix(mix(h, 2), f.to_bits()),
+        Value::Text(s) => mix_bytes(mix(h, 3), s.as_bytes()),
+        Value::Boolean(b) => mix(mix(h, 4), *b as u64),
+        Value::Timestamp(ts) => mix(
+            mix(h, 5),
+            ts.timestamp_nanos_opt().unwrap_or(ts.timestamp()) as u64,
+        ),
+        Value::Extension(data) => match data.split_first() {
+            Some((&kind, bytes)) => mix_bytes(mix(h, 16 + kind as u64), bytes),
+            None => mix(h, 16),
+        },
+    }
+}
+
+impl ResultHash {
+    fn add(&mut self, row: &Row) {
+        let row = finish(row.as_slice().iter().fold(SEED, mix_value));
+        self.acc = match self.ordered {
+            true => mix(self.acc, row),
+            false => self.acc.wrapping_add(row),
+        };
+    }
+
+    fn value(&self, rows: u64) -> u64 {
+        finish(mix(self.acc, rows))
+    }
+}
+
+/// The type a column's values have
 #[derive(Clone, Copy, PartialEq)]
 enum ColumnType {
     /// No value other than NULL yet
@@ -266,10 +432,15 @@ struct AgentSink {
     /// Whether the statement is EXPLAIN, whose lines go to `plan`
     explain: bool,
     plan: String,
+    /// Every row, the shown ones and the rest
+    hash: ResultHash,
+    /// `--timing`: the engine's time is measured apart from the sink's
+    timed: bool,
 }
 
 impl AgentSink {
-    fn reset(&mut self, explain: bool, full: bool) {
+    fn reset(&mut self, explain: bool, full: bool, ordered: bool, timed: bool) {
+        self.timed = timed;
         self.cells.clear();
         self.spans.clear();
         self.types.clear();
@@ -278,6 +449,23 @@ impl AgentSink {
         self.full = full;
         self.explain = explain;
         self.plan.clear();
+        self.hash = ResultHash { acc: 0, ordered };
+    }
+
+    /// Notes the types of a row's values: a column holding more than one
+    /// type, NULL aside, is MIXED
+    fn see_types(&mut self, row: &Row) {
+        for (seen, value) in self.types.iter_mut().zip(row.as_slice()) {
+            if let Value::Null(_) = value {
+                continue;
+            }
+            let t = value.data_type();
+            *seen = match *seen {
+                ColumnType::Unknown => ColumnType::Single(t),
+                ColumnType::Single(s) if s == t => *seen,
+                _ => ColumnType::Mixed,
+            };
+        }
     }
 
     fn write_result(&self, w: &mut impl Write, total: u64, shown: u64) -> io::Result<()> {
@@ -319,6 +507,12 @@ impl AgentSink {
             w.write_all(b"]")?;
         }
         write!(w, "],\"row_count\":{total}")?;
+        let order = match self.hash.ordered {
+            true => "ordered",
+            false => "unordered",
+        };
+        let hash = self.hash.value(total);
+        write!(w, ",\"hash\":\"{hash:016x}\",\"order\":\"{order}\"")?;
         if shown < total {
             write!(w, ",\"shown\":{shown},\"truncated\":true")?;
         }
@@ -401,22 +595,33 @@ impl Sink for AgentSink {
             }
             return Ok(());
         }
-        for (column, value) in row.as_slice().iter().enumerate() {
+        for value in row.as_slice() {
             self.write_value(value)?;
             let t = match value {
                 Value::Null(_) => DataType::Null,
                 _ => value.data_type(),
             };
             self.spans.push((self.cells.len(), t));
-            if t != DataType::Null {
-                let seen = &mut self.types[column];
-                *seen = match *seen {
-                    ColumnType::Unknown => ColumnType::Single(t),
-                    ColumnType::Single(s) if s == t => *seen,
-                    _ => ColumnType::Mixed,
-                };
-            }
         }
+        self.see_types(row);
+        self.hash.add(row);
         Ok(())
+    }
+
+    /// The rows past the limit count in the types and the hash
+    fn wants_rest(&self) -> bool {
+        !self.explain
+    }
+
+    fn rest(&mut self, row: &Row) -> io::Result<()> {
+        self.see_types(row);
+        self.hash.add(row);
+        Ok(())
+    }
+
+    /// Without `--timing` the output holds no times, so no row pays for
+    /// reading the clock
+    fn timed(&self) -> bool {
+        self.timed
     }
 }

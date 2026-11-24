@@ -31,6 +31,9 @@ pub struct Statement {
     /// Line and column (from 1, in characters) of the first byte of `sql`, so a
     /// position inside the statement maps to the input
     pub text_at: (usize, usize),
+    /// The name of the case a `-- @case <name>` line before the statement
+    /// starts with it
+    pub case: Option<String>,
 }
 
 impl Statement {
@@ -65,6 +68,8 @@ pub struct Splitter {
     probe: String,
     /// Line and column of the first byte of `pending`
     origin: (usize, usize),
+    /// A case a `-- @case` line between statements started, for the next
+    case: Option<String>,
 }
 
 /// A byte of `pending` with its line and column
@@ -90,6 +95,7 @@ impl Default for Splitter {
             closed: false,
             probe: String::new(),
             origin: (1, 1),
+            case: None,
         }
     }
 }
@@ -157,16 +163,17 @@ impl Splitter {
         cursor: &mut Cursor,
         (start, end): (usize, usize),
         line: usize,
-        params: Vec<Value>,
+        (params, case): (Vec<Value>, Option<String>),
     ) -> Statement {
         let raw = &self.pending[start..end];
-        let sql = raw.trim();
-        *cursor = self.advance(*cursor, start + (raw.len() - raw.trim_start().len()));
+        let lead = raw.len() - raw.trim_start().len();
+        *cursor = self.advance(*cursor, start + lead);
         Statement {
             line,
-            sql: sql.to_string(),
+            sql: raw.trim().to_string(),
             params,
             text_at: cursor.1,
+            case,
         }
     }
 
@@ -199,7 +206,12 @@ impl Splitter {
                             statement.params = params;
                             out.push(statement);
                         }
-                        None => cut = Some((statement, semicolon_line)),
+                        None => {
+                            if let Some(name) = case_of(&token.literal) {
+                                self.case = Some(name);
+                            }
+                            cut = Some((statement, semicolon_line));
+                        }
                     }
                     continue;
                 }
@@ -228,12 +240,17 @@ impl Splitter {
                 TokenType::Comment => {
                     if let Some(params) = params_of(&token.literal) {
                         self.params = Some(params);
+                    } else if self.first_line.is_none()
+                        && let Some(name) = case_of(&token.literal)
+                    {
+                        self.case = Some(name);
                     }
                 }
                 TokenType::Punctuator if token.literal == ";" => {
                     let params = self.params.take().unwrap_or_default();
                     if let Some(first) = self.first_line.take() {
-                        let statement = self.statement(&mut cursor, (start, at), first, params);
+                        let with = (params, self.case.take());
+                        let statement = self.statement(&mut cursor, (start, at), first, with);
                         cut = Some((statement, line));
                     }
                     start = at + 1;
@@ -262,9 +279,9 @@ impl Splitter {
         }
         if at_end {
             if let Some(first) = self.first_line.take() {
-                let params = self.params.take().unwrap_or_default();
+                let with = (self.params.take().unwrap_or_default(), self.case.take());
                 let end = self.pending.len();
-                out.push(self.statement(&mut cursor, (start, end), first, params));
+                out.push(self.statement(&mut cursor, (start, end), first, with));
             }
             start = self.pending.len();
         }
@@ -300,6 +317,16 @@ fn without_comments(sql: &str) -> String {
     text
 }
 
+/// The name a `-- @case <name>` comment gives the case it starts
+fn case_of(comment: &str) -> Option<String> {
+    let rest = comment
+        .strip_prefix("--")?
+        .trim_start()
+        .strip_prefix("@case")?;
+    let name = rest.trim();
+    (rest.starts_with(char::is_whitespace) && !name.is_empty()).then(|| name.to_string())
+}
+
 /// The parameters a `-- PARAMS: 1, 'a'` comment gives its statement
 fn params_of(comment: &str) -> Option<Vec<Value>> {
     let list = comment
@@ -319,6 +346,30 @@ pub enum Command {
     Exit,
     Help,
     Other,
+}
+
+/// Whether `sql` orders the rows it returns: an ORDER BY outside every
+/// parenthesis, where a window's, a subquery's or an aggregate's are not
+pub fn orders_rows(sql: &str) -> bool {
+    let mut lexer = Lexer::new(sql);
+    let mut depth = 0i32;
+    let mut after_order = false;
+    loop {
+        let token = lexer.next_token();
+        match token.token_type {
+            TokenType::Eof => return false,
+            TokenType::Comment => continue,
+            TokenType::Punctuator if token.literal == "(" => depth += 1,
+            TokenType::Punctuator if token.literal == ")" => depth -= 1,
+            _ if after_order && token.keyword == Some(Keyword::By) => return true,
+            _ if depth == 0 && token.keyword == Some(Keyword::Order) => {
+                after_order = true;
+                continue;
+            }
+            _ => {}
+        }
+        after_order = false;
+    }
 }
 
 /// What `sql` is: the transaction commands and EXPLAIN by their keyword
@@ -472,6 +523,22 @@ impl From<io::Error> for Failure {
 pub trait Sink {
     fn begin(&mut self, columns: &[String]) -> io::Result<()>;
     fn row(&mut self, row: &Row) -> io::Result<()>;
+
+    /// Whether the sink reads the rows past the limit too, through `rest`
+    fn wants_rest(&self) -> bool {
+        false
+    }
+
+    /// A row past the limit, for a sink that reads every row
+    fn rest(&mut self, _row: &Row) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Whether the time the sink takes is measured apart from the engine's,
+    /// at two clock readings a row it takes
+    fn timed(&self) -> bool {
+        true
+    }
 }
 
 /// The single place a statement is run, for every mode of the CLI: hands
@@ -504,14 +571,28 @@ pub fn run(
     let mut output = shown.elapsed();
     let mut total = 0u64;
     let mut timed = 0u64;
+    let mut shown = 0u64;
+    let rest = sink.wants_rest();
+    let clocked = sink.timed();
     while rows.advance() {
-        if limit == 0 || total < limit as u64 {
-            let shown = Instant::now();
-            sink.row(rows.current_row())?;
-            output += shown.elapsed();
+        let row = rows.current_row();
+        let show = limit == 0 || total < limit as u64;
+        total += 1;
+        if !show && !rest {
+            continue;
+        }
+        let start = clocked.then(Instant::now);
+        match show {
+            true => {
+                sink.row(row)?;
+                shown += 1;
+            }
+            false => sink.rest(row)?,
+        }
+        if let Some(start) = start {
+            output += start.elapsed();
             timed += 1;
         }
-        total += 1;
     }
     let elapsed = start.elapsed();
     // A timed row leaves about one clock reading outside its span
@@ -524,7 +605,7 @@ pub fn run(
     let ran = Ran::Rows {
         columns,
         total,
-        shown: timed,
+        shown,
     };
     Ok((ran, Timing { engine, output }))
 }
@@ -978,7 +1059,8 @@ mod alloc_tests {
         };
         let lines = std::iter::once(Ok(sql.to_string()));
         let before = ALLOCATIONS.with(Cell::get);
-        crate::agent::run_script(db, "memory://", lines, &mut out, &options).unwrap();
+        let no_cases = |_: usize| Err("no cases".to_string());
+        crate::agent::run_script(db, "memory://", &no_cases, lines, &mut out, &options).unwrap();
         ALLOCATIONS.with(Cell::get) - before
     }
 
@@ -1152,6 +1234,40 @@ mod tests {
                     "/* start;\nSELECT 0;\nDROP TABLE t;\n*/ SELECT 2".to_string()
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn only_an_order_by_outside_parentheses_orders_the_rows() {
+        let cases = [
+            ("SELECT a FROM t ORDER BY a", true),
+            ("SELECT a FROM t ORDER /* c */ BY a", true),
+            ("SELECT a FROM t UNION SELECT b FROM u ORDER BY 1", true),
+            ("SELECT a FROM (SELECT a FROM t ORDER BY a) s", false),
+            ("SELECT ROW_NUMBER() OVER (ORDER BY a) FROM t", false),
+            ("SELECT STRING_AGG(a, ',' ORDER BY a) FROM t", false),
+            ("SELECT 'ORDER BY' FROM t", false),
+            ("SELECT \"order\", \"by\" FROM t", false),
+        ];
+        for (sql, ordered) in cases {
+            assert_eq!(orders_rows(sql), ordered, "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_case_line_between_statements_starts_a_case() {
+        let mut splitter = Splitter::default();
+        let mut out = Vec::new();
+        let text = "SELECT 1;\n-- @case first one\nSELECT 2;\nSELECT 3; -- @case second\n\
+                    SELECT 4 -- @case not here\n;\n--@casex\nSELECT 5;";
+        for line in text.split('\n') {
+            splitter.push_line(line, &mut out);
+        }
+        splitter.finish(&mut out);
+        let cases: Vec<_> = out.iter().map(|s| s.case.as_deref()).collect();
+        assert_eq!(
+            cases,
+            vec![None, Some("first one"), None, Some("second"), None]
         );
     }
 

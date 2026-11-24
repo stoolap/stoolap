@@ -1092,6 +1092,7 @@ fn main() {
     let mode = Mode {
         agent,
         dsn: &db_path,
+        case_timeout_ms: args.timeout_ms.unwrap_or(30_000),
     };
     if let Some(ref sql) = args.execute {
         run_script_and_exit(db, sql.split('\n').map(|l| Ok(l.to_string())), &args, mode);
@@ -1162,6 +1163,8 @@ fn lines_of(input: impl BufRead) -> impl Iterator<Item = io::Result<String>> {
 struct Mode<'a> {
     agent: bool,
     dsn: &'a str,
+    /// The timeout of each case's database in agent mode, 0 for none
+    case_timeout_ms: u64,
 }
 
 /// Runs a script on `db`, closes it, and exits with 1 when a statement failed
@@ -1179,7 +1182,18 @@ fn run_script_and_exit(
             timing: args.timing,
         };
         let mut out = io::BufWriter::new(io::stdout().lock());
-        let result = agent::run_script(&db, mode.dsn, lines, &mut out, &options);
+        // Each case gets a database of its own, named so no other open
+        // database shares it, with the run's timeout
+        let open_case = |n: usize| -> Result<Database, String> {
+            let dsn = format!("memory://stoolap-agent-case-{}-{n}", std::process::id());
+            let db = Database::open(&dsn).map_err(|e| e.to_string())?;
+            if mode.case_timeout_ms > 0 {
+                let pragma = format!("PRAGMA query_timeout = {}", mode.case_timeout_ms);
+                db.execute(&pragma, ()).map_err(|e| e.to_string())?;
+            }
+            Ok(db)
+        };
+        let result = agent::run_script(&db, mode.dsn, &open_case, lines, &mut out, &options);
         drop(out);
         close(db, args);
         match result {
