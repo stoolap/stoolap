@@ -141,6 +141,47 @@ impl Splitter {
         self.cut(true, out);
     }
 
+    /// Whether a statement, or a block comment, has begun and not ended:
+    /// what is waiting is more than blanks and closed comments
+    pub fn in_statement(&self) -> bool {
+        if self.first_line.is_some() || self.open.is_some() {
+            return true;
+        }
+        let mut lexer = Lexer::new(&self.pending[self.resume..]);
+        loop {
+            let token = lexer.next_token();
+            match token.token_type {
+                TokenType::Eof => return false,
+                TokenType::Comment if !open_block(&token.literal) => {}
+                _ => return true,
+            }
+        }
+    }
+
+    /// Before a line that is not SQL, with no statement begun: lets the
+    /// comments waiting go and gives the case a marker among them started
+    pub fn take_case(&mut self) -> Option<String> {
+        let mut lexer = Lexer::new(&self.pending[self.resume..]);
+        loop {
+            let token = lexer.next_token();
+            match token.token_type {
+                TokenType::Eof => break,
+                TokenType::Comment => {
+                    if let Some(name) = case_of(&token.literal) {
+                        self.case = Some(name);
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.origin = self.advance((0, self.origin), self.pending.len()).1;
+        self.pending.clear();
+        self.resume = 0;
+        self.resume_line = self.origin.0;
+        self.params = None;
+        self.case.take()
+    }
+
     /// The cursor at byte `to` of `pending`, read on from `from`; columns
     /// count characters, as the lexer's positions do
     fn advance(&self, (from, (line, column)): Cursor, to: usize) -> Cursor {
@@ -453,6 +494,155 @@ pub struct Output<W: Write> {
     pub quiet: bool,
     /// Print the time of each statement after its result
     pub timing: bool,
+    /// Runs of a statement that only reads, the first printed, 1 for once
+    pub repeat: usize,
+}
+
+/// The runs of a statement after the one printed, each reading every row
+/// and printing none: their engine times, and the error that stopped them
+pub struct Repeats {
+    pub first: Duration,
+    pub warm: Vec<Duration>,
+    pub failed: Option<Failure>,
+}
+
+impl Repeats {
+    /// `{"runs":..,"first_us":..,"min_us":..,"median_us":..,"max_us":..}`
+    pub fn write_json(&self, w: &mut impl Write) -> io::Result<()> {
+        write!(
+            w,
+            "{{\"runs\":{},\"first_us\":{}",
+            self.warm.len() + 1,
+            self.first.as_micros()
+        )?;
+        if let (Some(min), Some(max)) = (self.warm.first(), self.warm.last()) {
+            let median = self.warm[self.warm.len() / 2];
+            write!(
+                w,
+                ",\"min_us\":{},\"median_us\":{},\"max_us\":{}",
+                min.as_micros(),
+                median.as_micros(),
+                max.as_micros()
+            )?;
+        }
+        if let Some(failure) = &self.failed {
+            w.write_all(b",\"failed\":")?;
+            serde_json::to_writer(&mut *w, &failure.to_string())?;
+        }
+        w.write_all(b"}")
+    }
+
+    /// `Ran 10 times: first 1.2 ms, then min .., median .., max ..`
+    fn line(&self) -> String {
+        let mut line = format!(
+            "Ran {} times: first {}",
+            self.warm.len() + 1,
+            duration(self.first)
+        );
+        if let (Some(min), Some(max)) = (self.warm.first(), self.warm.last()) {
+            let median = self.warm[self.warm.len() / 2];
+            line += &format!(
+                ", then min {}, median {}, max {}",
+                duration(*min),
+                duration(median),
+                duration(*max)
+            );
+        }
+        if let Some(failure) = &self.failed {
+            line += &format!("; stopped: {failure}");
+        }
+        line + BUILD_NOTE
+    }
+}
+
+/// Takes every row and keeps none, reading no clock
+struct Drain;
+
+impl Sink for Drain {
+    fn begin(&mut self, _columns: &[String]) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn row(&mut self, _row: &Row) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn timed(&self) -> bool {
+        false
+    }
+}
+
+/// Runs `sql` `times` more after a first run whose engine time was `first`,
+/// each to its last row, the times sorted; stops at a run that fails
+pub fn repeat(
+    session: &mut Session,
+    sql: &str,
+    params: &[Value],
+    first: Duration,
+    times: usize,
+) -> Repeats {
+    let mut warm = Vec::with_capacity(times);
+    let mut failed = None;
+    for _ in 0..times {
+        match run(session, sql, params.to_vec(), 0, &mut Drain) {
+            Ok((_, took)) => warm.push(took.engine),
+            Err(failure) => {
+                failed = Some(failure);
+                break;
+            }
+        }
+    }
+    warm.sort();
+    Repeats {
+        first,
+        warm,
+        failed,
+    }
+}
+
+/// Whether running `sql` again leaves the data as it was: it starts with
+/// SELECT, WITH, VALUES, SHOW or DESCRIBE and has no INSERT, UPDATE or
+/// DELETE outside parentheses. EXPLAIN is not, as EXPLAIN ANALYZE runs
+/// what it explains
+pub fn reads_only(sql: &str) -> bool {
+    let mut lexer = Lexer::new(sql);
+    let mut depth = 0i32;
+    let mut first = true;
+    loop {
+        let token = lexer.next_token();
+        match token.token_type {
+            TokenType::Eof => return !first,
+            TokenType::Comment => continue,
+            _ if first => {
+                first = false;
+                let reads = matches!(
+                    token.keyword,
+                    Some(
+                        Keyword::Select
+                            | Keyword::With
+                            | Keyword::Values
+                            | Keyword::Show
+                            | Keyword::Describe
+                            | Keyword::Desc
+                    )
+                );
+                if !reads {
+                    return false;
+                }
+            }
+            TokenType::Punctuator if token.literal == "(" => depth += 1,
+            TokenType::Punctuator if token.literal == ")" => depth -= 1,
+            _ if depth == 0
+                && matches!(
+                    token.keyword,
+                    Some(Keyword::Insert | Keyword::Update | Keyword::Delete)
+                ) =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+    }
 }
 
 /// What a statement runs against
@@ -695,7 +885,9 @@ pub fn print_statement<W: Write>(
         limit,
         quiet,
         timing,
+        repeat,
     } = out;
+    let again = (*repeat > 1 && reads_only(sql)).then(|| params.clone());
     let ran = match format {
         Format::Table => run(session, sql, params, *limit, &mut TableSink(w)),
         Format::Json => {
@@ -713,13 +905,34 @@ pub fn print_statement<W: Write>(
         }
     };
     let (ran, took) = ran?;
+    let repeats = match (&ran, again) {
+        (Ran::Rows { .. }, Some(params)) => Some(self::repeat(
+            session,
+            sql,
+            &params,
+            took.engine,
+            *repeat - 1,
+        )),
+        _ => None,
+    };
     let footer = match (ran, *format) {
         (Ran::Affected(n), Format::Json) => writeln!(w, "{{\"rows_affected\":{n}}}"),
         (Ran::Affected(n), Format::Table) => writeln!(w, "{n} {} affected", plural(n, "row")),
-        (Ran::Rows { total, shown, .. }, Format::Json) => match shown < total {
-            true => writeln!(w, "],\"count\":{total},\"shown\":{shown}}}"),
-            false => writeln!(w, "],\"count\":{total}}}"),
-        },
+        (Ran::Rows { total, shown, .. }, Format::Json) => {
+            let counts = match shown < total {
+                true => write!(w, "],\"count\":{total},\"shown\":{shown}"),
+                false => write!(w, "],\"count\":{total}"),
+            };
+            counts
+                .and_then(|()| match &repeats {
+                    Some(repeats) => {
+                        w.write_all(b",\"repeat\":")?;
+                        repeats.write_json(w)
+                    }
+                    None => Ok(()),
+                })
+                .and_then(|()| writeln!(w, "}}"))
+        }
         (Ran::Rows { total, shown, .. }, Format::Table) => {
             let cut = match shown < total {
                 true => writeln!(w, "({} more rows, {total} in total)", total - shown),
@@ -734,6 +947,9 @@ pub fn print_statement<W: Write>(
     footer?;
     if *timing {
         writeln!(w, "{}", timing_line(took))?;
+    }
+    if let (Format::Table, Some(repeats)) = (*format, &repeats) {
+        writeln!(w, "{}", repeats.line())?;
     }
     w.flush()?;
     Ok(took)
@@ -1042,6 +1258,7 @@ mod alloc_tests {
             limit,
             quiet: false,
             timing: false,
+            repeat: 1,
         };
         let before = ALLOCATIONS.with(Cell::get);
         print_statement(&mut Session::Database(db), sql, Vec::new(), &mut out).unwrap();
@@ -1056,6 +1273,7 @@ mod alloc_tests {
             full: false,
             stop_on_error: false,
             timing: false,
+            repeat: 1,
         };
         let lines = std::iter::once(Ok(sql.to_string()));
         let before = ALLOCATIONS.with(Cell::get);
@@ -1235,6 +1453,28 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn only_a_statement_that_reads_runs_again() {
+        let cases = [
+            ("SELECT a FROM t", true),
+            ("/* c */ WITH x AS (SELECT 1) SELECT * FROM x", true),
+            ("VALUES (1)", true),
+            ("SHOW TABLES", true),
+            ("DESCRIBE t", true),
+            ("SELECT a FROM t WHERE a IN (SELECT b FROM u)", true),
+            ("WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x", false),
+            ("INSERT INTO t VALUES (1) RETURNING *", false),
+            ("UPDATE t SET a = 1 RETURNING a", false),
+            ("EXPLAIN ANALYZE SELECT a FROM t", false),
+            ("(SELECT a FROM t)", false),
+            ("PRAGMA query_timeout", false),
+            ("", false),
+        ];
+        for (sql, reads) in cases {
+            assert_eq!(reads_only(sql), reads, "{sql}");
+        }
     }
 
     #[test]

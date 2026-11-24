@@ -195,6 +195,12 @@ struct Args {
     /// Agent mode: add each statement's engine time as elapsed_us
     #[arg(long = "timing")]
     timing: bool,
+
+    /// Run each statement that only reads N times, -e, -f, piped input and
+    /// agent mode: the first prints, and the spread of the engine times of
+    /// the others is given after it
+    #[arg(long = "repeat", value_name = "N", default_value = "1", value_parser = clap::value_parser!(u64).range(1..))]
+    repeat: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum, Debug)]
@@ -399,6 +405,7 @@ impl Cli {
                 limit: self.limit,
                 quiet: true,
                 timing: false,
+                repeat: 1,
             };
             return script::print_statement(&mut session, query, params, &mut out)
                 .map_err(|e| e.to_string());
@@ -1187,6 +1194,7 @@ fn run_script_and_exit(
             full: args.full,
             stop_on_error: args.on_error == OnError::Stop,
             timing: args.timing,
+            repeat: args.repeat as usize,
         };
         let mut out = io::BufWriter::new(io::stdout().lock());
         // Each case gets a database of its own, named so no other open
@@ -1221,6 +1229,7 @@ fn run_script_and_exit(
         limit: args.limit,
         quiet: args.quiet,
         timing: !args.json_output && !args.quiet,
+        repeat: args.repeat as usize,
     };
     let result = script::run_script(&db, lines, &mut output);
     drop(output);

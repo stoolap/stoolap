@@ -50,6 +50,8 @@ Without `-q`, the CLI prints how long it took to open the database, `Query execu
 
 `-t MS` (`--timeout`) sets the connection's `query_timeout`, so it bounds every statement the CLI runs, those inside a transaction included; a statement past it fails with `query cancelled`. `-t 0` turns it off. Without `-t` there is no timeout, or the one the connection string gives.
 
+`--repeat N` runs each statement that only reads N times: one starting with SELECT, WITH, VALUES, SHOW or DESCRIBE with no INSERT, UPDATE or DELETE outside parentheses. Others, EXPLAIN among them since EXPLAIN ANALYZE runs what it explains, run once. The first run prints; the others read every row and print none, and after the result the CLI prints `Ran 10 times: first 3.1 ms, then min 2.4 ms, median 2.5 ms, max 2.9 ms`: the engine's time of the first run, which pays for planning and cold caches, and the spread of the others. Those reuse what the engine keeps from one statement to the next, the plan cache and the decoded row groups among them, as any repeated statement does. With `-j` the result's object adds `"repeat"` with the same figures in microseconds.
+
 ### Agent mode
 
 `--agent`, or the environment variable `STOOLAP_AGENT=1`, writes output for a program to read: JSON Lines on standard output and nothing else there. It is never turned on by detecting a pipe or another tool; `--no-agent` turns it off whatever the variable says. In agent mode the CLI never prompts: it reads `-e`, `-f` or standard input as a script.
@@ -75,6 +77,8 @@ stoolap --agent -e "SELECT 1 AS a; SELECT nope"
 - The last line sums up the run: the statements, the failed ones, the first that failed, and whether a transaction was still open at the end, which the close rolls back.
 - A failed statement does not stop the run; `--on-error stop` stops at the first, and the summary counts the statements it skipped. The exit status is 1 when a statement failed.
 - Every statement has a timeout of 30 seconds unless `-t` or the connection string gives one. `--timing` adds `"elapsed_us"`, the engine's time for each statement; without it the output holds no times.
+- With `--repeat N` a result adds `"repeat":{"runs":N,"first_us":..,"min_us":..,"median_us":..,"max_us":..}`, and `"failed"` with the message when a later run failed and stopped the repeats.
+- A line starting with a dot between statements is a command of the CLI, written as a statement's line with `"command"`: `.schema` gives every table with its CREATE TABLE, its indexes and its row count, and the views; `.schema <table>` gives one table; `.stats` gives `PRAGMA MEMORY_STATS`, `VOLUME_STATS` and `INDEX_STATS` as rows of objects. An unknown command fails with kind `unknown_command`.
 
 ## Creating a Table
 

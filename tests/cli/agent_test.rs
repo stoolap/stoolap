@@ -422,3 +422,109 @@ fn a_case_runs_with_the_timeout_of_the_run() {
     );
     assert_eq!(timeouts(&["-d", "memory://?query_timeout=0"]), ["0", "0"]);
 }
+
+#[test]
+fn repeat_runs_a_reading_statement_again_and_gives_the_spread() {
+    let (lines, code) = agent_lines(
+        &["--repeat", "4"],
+        "CREATE TABLE t (id INTEGER PRIMARY KEY);\nINSERT INTO t VALUES (1);\nSELECT id FROM t;\n",
+    );
+    let parsed: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(code, 0);
+    assert!(parsed[0].get("repeat").is_none() && parsed[1].get("repeat").is_none());
+    let repeat = &parsed[2]["repeat"];
+    let us = |key: &str| repeat[key].as_u64().unwrap();
+    assert_eq!(repeat["runs"], 4, "{}", lines[2]);
+    assert!(
+        us("min_us") <= us("median_us") && us("median_us") <= us("max_us"),
+        "{}",
+        lines[2]
+    );
+    assert!(repeat.get("first_us").is_some() && repeat.get("failed").is_none());
+    assert_eq!(parsed[2]["rows"], serde_json::json!([[1]]), "printed once");
+}
+
+#[test]
+fn repeat_in_the_table_and_json_outputs() {
+    let (out, _, code) = run(&["-q", "--repeat", "3", "-e", "SELECT 1 AS a"], &[], "");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!((&lines[..3], code), (&["a", "----", "1"][..], 0), "{out}");
+    assert!(
+        lines[3].starts_with("Ran 3 times: first ") && lines[3].contains(", then min "),
+        "{out}"
+    );
+    let (out, _, _) = run(
+        &["-q", "-j", "--repeat", "3", "-e", "SELECT 1 AS a"],
+        &[],
+        "",
+    );
+    let json: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(
+        (
+            json["rows"].clone(),
+            json["count"].clone(),
+            json["repeat"]["runs"].clone()
+        ),
+        (
+            serde_json::json!([[1]]),
+            serde_json::json!(1),
+            serde_json::json!(3)
+        )
+    );
+}
+
+#[test]
+fn schema_gives_every_table_in_one_line() {
+    let script = "CREATE TABLE \"my t\" (id INTEGER PRIMARY KEY, a INTEGER UNIQUE, b TEXT);\n\
+                  CREATE INDEX ib ON \"my t\"(b);\n\
+                  INSERT INTO \"my t\" VALUES (1, 2, 'x');\n\
+                  CREATE VIEW v AS SELECT id FROM \"my t\";\n\
+                  .schema\n\
+                  .schema nope\n\
+                  .tables\n";
+    let (lines, code) = agent(&[], script);
+    assert_eq!(
+        (&lines[4..], code),
+        (
+            &[
+                r#"{"stmt":5,"line":5,"ok":true,"command":".schema","tables":[{"table":"my t","create":"CREATE TABLE \"my t\" (id INTEGER PRIMARY KEY, a INTEGER UNIQUE, b TEXT)","indexes":[{"table_name":"my t","index_name":"unique_my t_a","column_name":"a","index_type":"BTREE","is_unique":true,"options":""},{"table_name":"my t","index_name":"ib","column_name":"b","index_type":"BTREE","is_unique":false,"options":""}],"row_count":1}],"views":["v"]}"#.to_string(),
+                r#"{"stmt":6,"line":6,"ok":false,"error":{"kind":"table_not_found","message":"table 'nope' not found"}}"#.to_string(),
+                r#"{"stmt":7,"line":7,"ok":false,"error":{"kind":"unknown_command","message":"unknown command: .tables"}}"#.to_string(),
+                r#"{"done":true,"statements":7,"failed":2,"first_failed":6,"open_transaction":false}"#.to_string(),
+            ][..],
+            1
+        )
+    );
+}
+
+#[test]
+fn stats_gives_the_three_statistics() {
+    let (lines, _) = agent(&[], "CREATE TABLE t (id INTEGER PRIMARY KEY);\n.stats\n");
+    let stats: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+    assert!(
+        stats["ok"] == true
+            && stats["memory_stats"].is_array()
+            && stats["volume_stats"].is_array()
+            && stats["index_stats"].is_array(),
+        "{}",
+        lines[1]
+    );
+}
+
+#[test]
+fn a_command_line_is_one_only_between_statements() {
+    let script = "-- @case c\n.schema\nCREATE TABLE u (id INTEGER PRIMARY KEY);\n\
+                  /* x\n.schema\n*/ SELECT 2 AS c;\n";
+    let (lines, _) = agent(&[], script);
+    assert_eq!(
+        &lines[..3],
+        [
+            r#"{"stmt":1,"case":"c","line":2,"ok":true,"command":".schema","tables":[],"views":[]}"#,
+            r#"{"stmt":2,"case":"c","line":3,"ok":true,"rows_affected":0}"#,
+            r#"{"stmt":3,"case":"c","line":6,"ok":true,"columns":["c"],"types":["INTEGER"],"rows":[[2]],"row_count":1}"#,
+        ]
+    );
+}
