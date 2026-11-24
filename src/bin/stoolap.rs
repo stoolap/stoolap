@@ -32,7 +32,7 @@ use stoolap::api::{Database, Transaction as ApiTransaction};
 use stoolap::common::version::{MAJOR, MINOR, PATCH};
 use stoolap::{Row, Value};
 
-use script::{Format, Output, Ran, Session, Sink, Splitter, Timing};
+use script::{Command, Format, Output, Ran, Session, Sink, Splitter, Timing};
 
 /// Version string constant
 const VERSION: &str = concat!(
@@ -269,35 +269,30 @@ impl Cli {
                         continue;
                     }
 
-                    // Handle special commands (only when not in multi-line mode)
+                    // Special commands and transaction control run without
+                    // a semicolon (only when not in multi-line mode)
                     if !self.splitter.is_pending() {
-                        match line.to_lowercase().as_str() {
-                            "exit" | "quit" | "\\q" => {
+                        match script::command(line) {
+                            Command::Exit => {
                                 if self.in_transaction {
                                     eprintln!("\x1b[1;33mWarning: Exiting with active transaction. Rolling back...\x1b[0m");
                                     let _ = self.rollback_transaction();
                                 }
                                 break;
                             }
-                            "help" | "\\h" | "\\?" => {
+                            Command::Help => {
                                 self.print_help();
+                                continue;
+                            }
+                            Command::Begin | Command::Commit | Command::Rollback
+                                if !line.contains(';') =>
+                            {
+                                let _ = self.editor.add_history_entry(line);
+                                self.run_statement(line, Vec::new());
                                 continue;
                             }
                             _ => {}
                         }
-                    }
-
-                    // Check for transaction control statements
-                    let upper_line = line.to_uppercase();
-                    if !self.splitter.is_pending()
-                        && (upper_line == "BEGIN"
-                            || upper_line == "COMMIT"
-                            || upper_line == "ROLLBACK"
-                            || upper_line.starts_with("BEGIN "))
-                    {
-                        let _ = self.editor.add_history_entry(line);
-                        self.run_statement(line);
-                        continue;
                     }
 
                     // Add line to current query
@@ -314,7 +309,7 @@ impl Cli {
                         self.current_query.clear();
                     }
                     for statement in statements {
-                        self.run_statement(&statement.sql);
+                        self.run_statement(&statement.sql, statement.params);
                     }
                 }
                 Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
@@ -341,33 +336,24 @@ impl Cli {
     }
 
     /// Runs one statement and prints its result and its time
-    fn run_statement(&mut self, sql: &str) {
-        match self.execute_query(sql) {
+    fn run_statement(&mut self, sql: &str, params: Vec<Value>) {
+        match self.execute_query(sql, params) {
             Ok(took) => println!("\x1b[1;32m{}\x1b[0m", script::timing_line(took)),
             Err(e) => eprintln!("\x1b[1;31mError:\x1b[0m {}", e),
         }
     }
 
-    fn execute_query(&mut self, query: &str) -> Result<Timing, String> {
-        let upper_query = query.trim_end_matches(';').trim().to_uppercase();
-        let upper_query = upper_query.as_str();
-
-        // Handle special commands
-        if matches!(upper_query, "HELP" | "\\H" | "\\?") {
-            self.print_help();
-            return Ok(Timing::default());
-        }
-
-        // Handle transaction commands
+    fn execute_query(&mut self, query: &str, params: Vec<Value>) -> Result<Timing, String> {
         let start = Instant::now();
-        let control = if upper_query.starts_with("BEGIN") {
-            Some(self.begin_transaction())
-        } else if upper_query == "COMMIT" {
-            Some(self.commit_transaction())
-        } else if upper_query == "ROLLBACK" {
-            Some(self.rollback_transaction())
-        } else {
-            None
+        let control = match script::command(query) {
+            Command::Help => {
+                self.print_help();
+                return Ok(Timing::default());
+            }
+            Command::Begin => Some(self.begin_transaction()),
+            Command::Commit => Some(self.commit_transaction()),
+            Command::Rollback => Some(self.rollback_transaction()),
+            _ => None,
         };
         if let Some(done) = control {
             return done.map(|()| Timing {
@@ -388,11 +374,17 @@ impl Cli {
                 quiet: true,
                 timing: false,
             };
-            return script::print_statement(&mut session, query, &mut out, self.timeout_ms);
+            return script::print_statement(&mut session, query, params, &mut out, self.timeout_ms);
         }
         let mut shown = Collect(Vec::new());
-        let (ran, mut took) =
-            script::run(&mut session, query, self.timeout_ms, self.limit, &mut shown)?;
+        let (ran, mut took) = script::run(
+            &mut session,
+            query,
+            params,
+            self.timeout_ms,
+            self.limit,
+            &mut shown,
+        )?;
         let render = Instant::now();
         match ran {
             Ran::Affected(n) => println!(
@@ -400,7 +392,7 @@ impl Cli {
                 n,
                 script::plural(n, "row")
             ),
-            Ran::Rows { columns, total } => self.output_table(&columns, &shown.0, total),
+            Ran::Rows { columns, total, .. } => self.output_table(&columns, &shown.0, total),
         }
         took.output += render.elapsed();
         Ok(took)
@@ -1056,7 +1048,7 @@ fn main() {
 
     // Handle execute flag - run its statements and exit
     if let Some(ref sql) = args.execute {
-        run_script_and_exit(db, sql.lines().map(|l| Ok(l.to_string())), &args);
+        run_script_and_exit(db, sql.split('\n').map(|l| Ok(l.to_string())), &args);
     }
 
     // Handle file flag - execute SQL from file
@@ -1069,12 +1061,12 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        run_script_and_exit(db, BufReader::new(file).lines(), &args);
+        run_script_and_exit(db, lines_of(BufReader::new(file)), &args);
     }
 
     // Input from a pipe runs as a script, each statement as it arrives
     if !std::io::stdin().is_terminal() {
-        run_script_and_exit(db, io::stdin().lock().lines(), &args);
+        run_script_and_exit(db, lines_of(io::stdin().lock()), &args);
     }
 
     // Interactive mode
@@ -1114,6 +1106,14 @@ fn close<T>(held: T, args: &Args) {
             script::BUILD_NOTE
         );
     }
+}
+
+/// The lines of `input` without their `\n`, keeping a `\r` before it, which
+/// may be part of a string literal
+fn lines_of(input: impl BufRead) -> impl Iterator<Item = io::Result<String>> {
+    input.split(b'\n').map(|line| {
+        String::from_utf8(line?).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    })
 }
 
 /// Runs a script on `db`, closes it, and exits with 1 when a statement failed

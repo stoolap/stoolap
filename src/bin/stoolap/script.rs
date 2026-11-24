@@ -22,28 +22,56 @@ use stoolap::parser::lexer::Lexer;
 use stoolap::parser::token::{Token, TokenType};
 use stoolap::{ApiTransaction, Database, Row, Rows, Value};
 
-/// A statement of a script and the line its first token is on
+/// A statement of a script, the line its first token is on, and the
+/// parameters a `-- PARAMS: 1, 'a'` comment gives it
 pub struct Statement {
     pub line: usize,
     pub sql: String,
+    pub params: Vec<Value>,
 }
 
 /// Cuts SQL text into statements at the semicolons the engine's lexer
-/// reads, so quotes and comments follow the parser's own rules
-#[derive(Default)]
+/// reads, so quotes and comments follow the parser's own rules. Text is
+/// lexed once: a cut resumes where the last one stopped
 pub struct Splitter {
-    /// Text read since the last statement was cut
+    /// Text of the statement being read, from its first byte
     pending: String,
-    /// Lines before the first byte of `pending`
-    pending_line: usize,
+    /// `pending` before this offset is lexed and holds no semicolon
+    resume: usize,
+    /// Line of the byte at `resume`, from 1
+    resume_line: usize,
+    /// Line of the first token of the statement being read
+    first_line: Option<usize>,
+    /// Parameters a comment in the statement being read gave
+    params: Option<Vec<Value>>,
+    /// The byte that can close the string, name or comment left open at
+    /// `resume`, and whether a line since holds it
+    open: Option<(u8, bool)>,
+}
+
+impl Default for Splitter {
+    fn default() -> Self {
+        Self {
+            pending: String::new(),
+            resume: 0,
+            resume_line: 1,
+            first_line: None,
+            params: None,
+            open: None,
+        }
+    }
 }
 
 impl Splitter {
-    /// Adds one line of input and hands out the statements it completes
+    /// Adds one line of input, without its `\n`, and hands out the
+    /// statements it completes
     pub fn push_line(&mut self, line: &str, out: &mut Vec<Statement>) {
         self.pending.push_str(line);
         self.pending.push('\n');
-        if line.contains(';') {
+        if let Some((closer, seen)) = &mut self.open {
+            *seen |= line.as_bytes().contains(closer);
+        }
+        if line.contains(';') && self.open.is_none_or(|(_, seen)| seen) {
             self.cut(false, out);
         }
     }
@@ -59,52 +87,150 @@ impl Splitter {
     }
 
     fn cut(&mut self, at_end: bool, out: &mut Vec<Statement>) {
-        let mut lexer = Lexer::new(&self.pending);
+        let base = self.resume;
+        let mut lexer = Lexer::new(&self.pending[base..]);
         let mut held: Option<Token> = None;
+        // A statement cut at a semicolon, and that semicolon's line: a
+        // PARAMS comment after it on that line is its own
+        let mut cut: Option<(Statement, usize)> = None;
         let mut start = 0;
-        let mut first_line = None;
+        self.open = None;
         loop {
             let token = held.take().unwrap_or_else(|| lexer.next_token());
-            match token.token_type {
-                TokenType::Eof => break,
-                TokenType::Comment => {}
-                TokenType::Punctuator if token.literal == ";" => {
-                    let end = token.position.offset as usize;
-                    if let Some(line) = first_line.take() {
-                        out.push(self.statement(line, start, end));
+            let at = base + token.position.offset as usize;
+            let line = self.resume_line + token.position.line as usize - 1;
+            if let Some((mut statement, semicolon_line)) = cut.take() {
+                if token.token_type == TokenType::Comment && line == semicolon_line {
+                    if let Some(params) = params_of(&token.literal) {
+                        statement.params = params;
                     }
-                    start = end + 1;
+                    out.push(statement);
+                    continue;
+                }
+                out.push(statement);
+            }
+            match token.token_type {
+                TokenType::Eof => {
+                    self.resume = self.pending.len();
+                    self.resume_line = line;
+                    break;
+                }
+                TokenType::Comment => {
+                    if let Some(params) = params_of(&token.literal) {
+                        self.params = Some(params);
+                    }
+                }
+                TokenType::Punctuator if token.literal == ";" => {
+                    let params = self.params.take().unwrap_or_default();
+                    if let Some(first) = self.first_line.take() {
+                        let sql = self.pending[start..at].trim().to_string();
+                        cut = Some((
+                            Statement {
+                                line: first,
+                                sql,
+                                params,
+                            },
+                            line,
+                        ));
+                    }
+                    start = at + 1;
                 }
                 TokenType::Error if !at_end => {
                     // An unclosed string, name or comment runs to the end of
-                    // the text: the statement goes on in the next line
+                    // the text: the statement goes on in a later line, and
+                    // is lexed again from here once a line can close it
                     let next = lexer.next_token();
                     if next.token_type == TokenType::Eof {
+                        let closer = match self.pending.as_bytes()[at] {
+                            quote @ (b'\'' | b'"' | b'`') => quote,
+                            b'/' => b'/',
+                            _ => b';',
+                        };
+                        self.open = Some((closer, false));
+                        self.resume = at;
+                        self.resume_line = line;
                         break;
                     }
-                    first_line.get_or_insert(token.position.line);
+                    self.first_line.get_or_insert(line);
                     held = Some(next);
                 }
                 _ => {
-                    first_line.get_or_insert(token.position.line);
+                    self.first_line.get_or_insert(line);
                 }
             }
         }
         if at_end {
-            if let Some(line) = first_line {
-                out.push(self.statement(line, start, self.pending.len()));
+            if let Some(first) = self.first_line.take() {
+                let sql = self.pending[start..].trim().to_string();
+                let params = self.params.take().unwrap_or_default();
+                out.push(Statement {
+                    line: first,
+                    sql,
+                    params,
+                });
             }
             start = self.pending.len();
         }
-        self.pending_line += self.pending[..start].matches('\n').count();
         self.pending.drain(..start);
+        self.resume -= start;
     }
+}
 
-    fn statement(&self, line: u32, start: usize, end: usize) -> Statement {
-        Statement {
-            line: self.pending_line + line as usize,
-            sql: self.pending[start..end].trim().to_string(),
+/// The parameters a `-- PARAMS: 1, 'a'` comment gives its statement
+fn params_of(comment: &str) -> Option<Vec<Value>> {
+    let list = comment
+        .strip_prefix("--")?
+        .trim_start()
+        .strip_prefix("PARAMS:")?;
+    Some(list.split(',').map(|v| param_value(v.trim())).collect())
+}
+
+/// What a statement is, read from its tokens with comments passed over
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Command {
+    Begin,
+    Commit,
+    Rollback,
+    Explain,
+    Exit,
+    Help,
+    Other,
+}
+
+pub fn command(sql: &str) -> Command {
+    let word = sql.trim().trim_end_matches(';').trim();
+    if ["exit", "quit", "\\q"]
+        .iter()
+        .any(|w| word.eq_ignore_ascii_case(w))
+    {
+        return Command::Exit;
+    }
+    if ["help", "\\h", "\\?"]
+        .iter()
+        .any(|w| word.eq_ignore_ascii_case(w))
+    {
+        return Command::Help;
+    }
+    let mut lexer = Lexer::new(sql);
+    let mut words = std::iter::from_fn(|| loop {
+        let token = lexer.next_token();
+        match token.token_type {
+            TokenType::Eof => return None,
+            TokenType::Comment => {}
+            TokenType::Punctuator if token.literal == ";" => {}
+            _ => return Some(token.literal),
         }
+    });
+    let Some(first) = words.next() else {
+        return Command::Other;
+    };
+    let alone = words.next().is_none();
+    match first.as_str() {
+        w if w.eq_ignore_ascii_case("BEGIN") => Command::Begin,
+        w if w.eq_ignore_ascii_case("EXPLAIN") => Command::Explain,
+        w if alone && w.eq_ignore_ascii_case("COMMIT") => Command::Commit,
+        w if alone && w.eq_ignore_ascii_case("ROLLBACK") => Command::Rollback,
+        _ => Command::Other,
     }
 }
 
@@ -152,9 +278,14 @@ pub struct Timing {
     pub output: Duration,
 }
 
-/// What a statement gave: rows, or the count of a statement without them
+/// What a statement gave: rows, of which the sink took `shown`, or the
+/// count of a statement without them
 pub enum Ran {
-    Rows { columns: Vec<String>, total: u64 },
+    Rows {
+        columns: Vec<String>,
+        total: u64,
+        shown: u64,
+    },
     Affected(i64),
 }
 
@@ -170,14 +301,19 @@ pub trait Sink {
 pub fn run(
     session: &mut Session,
     sql: &str,
+    params: Vec<Value>,
     timeout_ms: u64,
     limit: usize,
     sink: &mut impl Sink,
 ) -> Result<(Ran, Timing), String> {
-    let (sql, params) = parse_params(sql);
+    // A plan is shown whole whatever the limit
+    let limit = match command(sql) {
+        Command::Explain => 0,
+        _ => limit,
+    };
     let start = Instant::now();
     let mut rows = session
-        .query(&sql, params, timeout_ms)
+        .query(sql, params, timeout_ms)
         .map_err(|e| e.to_string())?;
     if rows.columns().is_empty() {
         let timing = Timing {
@@ -188,11 +324,6 @@ pub fn run(
     }
     let shown = Instant::now();
     let columns = rows.columns().to_vec();
-    // A plan is shown whole whatever the limit
-    let limit = match columns.len() == 1 && columns[0] == "plan" {
-        true => 0,
-        false => limit,
-    };
     sink.begin(&columns).map_err(|e| e.to_string())?;
     let mut output = shown.elapsed();
     let mut total = 0u64;
@@ -214,7 +345,12 @@ pub fn run(
     if let Some(err) = rows.error() {
         return Err(err.to_string());
     }
-    Ok((Ran::Rows { columns, total }, Timing { engine, output }))
+    let ran = Ran::Rows {
+        columns,
+        total,
+        shown: timed,
+    };
+    Ok((ran, Timing { engine, output }))
 }
 
 /// What one reading of the clock costs, measured once per process
@@ -264,21 +400,21 @@ fn run_ready<W: Write>(
 ) -> Result<bool, String> {
     for statement in ready.drain(..) {
         *number += 1;
-        let word = statement.sql.trim_end_matches(';').trim();
-        if ["exit", "quit", "\\q"]
-            .iter()
-            .any(|w| word.eq_ignore_ascii_case(w))
-        {
-            return Ok(false);
+        match command(&statement.sql) {
+            Command::Exit => return Ok(false),
+            Command::Help => {
+                super::print_help_main();
+                continue;
+            }
+            _ => {}
         }
-        if ["help", "\\h", "\\?"]
-            .iter()
-            .any(|w| word.eq_ignore_ascii_case(w))
-        {
-            super::print_help_main();
-            continue;
-        }
-        let printed = print_statement(&mut Session::Database(db), &statement.sql, out, timeout_ms);
+        let printed = print_statement(
+            &mut Session::Database(db),
+            &statement.sql,
+            statement.params,
+            out,
+            timeout_ms,
+        );
         if let Err(message) = printed {
             // The rows printed before the error come first
             out.out.flush().map_err(|e| e.to_string())?;
@@ -296,6 +432,7 @@ fn run_ready<W: Write>(
 pub fn print_statement<W: Write>(
     session: &mut Session,
     sql: &str,
+    params: Vec<Value>,
     out: &mut Output<W>,
     timeout_ms: u64,
 ) -> Result<Timing, String> {
@@ -307,14 +444,14 @@ pub fn print_statement<W: Write>(
         timing,
     } = out;
     let ran = match format {
-        Format::Table => run(session, sql, timeout_ms, *limit, &mut TableSink(w)),
+        Format::Table => run(session, sql, params, timeout_ms, *limit, &mut TableSink(w)),
         Format::Json => {
             let mut sink = JsonSink {
                 w,
                 begun: false,
                 rows: 0,
             };
-            let ran = run(session, sql, timeout_ms, *limit, &mut sink);
+            let ran = run(session, sql, params, timeout_ms, *limit, &mut sink);
             // Rows already written stay readable: the object is closed
             if ran.is_err() && sink.begun {
                 let _ = sink.w.write_all(b"]}\n");
@@ -326,15 +463,11 @@ pub fn print_statement<W: Write>(
     let footer = match (ran, *format) {
         (Ran::Affected(n), Format::Json) => writeln!(w, "{{\"rows_affected\":{n}}}"),
         (Ran::Affected(n), Format::Table) => writeln!(w, "{n} {} affected", plural(n, "row")),
-        (Ran::Rows { columns, total }, Format::Json) => {
-            let shown = shown_rows(&columns, total, *limit);
-            match shown < total {
-                true => writeln!(w, "],\"count\":{total},\"shown\":{shown}}}"),
-                false => writeln!(w, "],\"count\":{total}}}"),
-            }
-        }
-        (Ran::Rows { columns, total }, Format::Table) => {
-            let shown = shown_rows(&columns, total, *limit);
+        (Ran::Rows { total, shown, .. }, Format::Json) => match shown < total {
+            true => writeln!(w, "],\"count\":{total},\"shown\":{shown}}}"),
+            false => writeln!(w, "],\"count\":{total}}}"),
+        },
+        (Ran::Rows { total, shown, .. }, Format::Table) => {
             let cut = match shown < total {
                 true => writeln!(w, "({} more rows, {total} in total)", total - shown),
                 false => Ok(()),
@@ -351,14 +484,6 @@ pub fn print_statement<W: Write>(
     }
     w.flush().map_err(|e| e.to_string())?;
     Ok(took)
-}
-
-/// How many of `total` rows a result with these columns showed
-fn shown_rows(columns: &[String], total: u64, limit: usize) -> u64 {
-    match limit == 0 || (columns.len() == 1 && columns[0] == "plan") {
-        true => total,
-        false => total.min(limit as u64),
-    }
 }
 
 /// Said after every time a debug build prints, which runs many times slower
@@ -544,9 +669,15 @@ fn write_float(w: &mut impl Write, f: f64) -> io::Result<()> {
     }
 }
 
-/// RFC 3339 in UTC, with the fraction of a second only as long as it needs
+/// RFC 3339 in UTC, with the fraction of a second only as long as it needs;
+/// a leap second, which chrono keeps as second 59 with a billion
+/// nanoseconds or more, is second 60
 fn write_timestamp(w: &mut impl Write, ts: &chrono::DateTime<chrono::Utc>) -> io::Result<()> {
     use chrono::{Datelike, Timelike};
+    let (second, mut nanos) = match ts.timestamp_subsec_nanos() {
+        n if n >= 1_000_000_000 => (ts.second() + 1, n - 1_000_000_000),
+        n => (ts.second(), n),
+    };
     write!(
         w,
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
@@ -555,9 +686,8 @@ fn write_timestamp(w: &mut impl Write, ts: &chrono::DateTime<chrono::Utc>) -> io
         ts.day(),
         ts.hour(),
         ts.minute(),
-        ts.second()
+        second
     )?;
-    let mut nanos = ts.timestamp_subsec_nanos();
     if nanos > 0 {
         let mut digits = 9;
         while nanos.is_multiple_of(10) {
@@ -599,22 +729,6 @@ fn write_json_value(w: &mut impl Write, value: &Value) -> io::Result<()> {
             serde_json::to_writer(&mut *w, text.as_str()).map_err(io::Error::from)
         }
     }
-}
-
-/// `SELECT ... -- PARAMS: 1, 'a'` runs the statement with those parameters
-fn parse_params(query: &str) -> (String, Vec<Value>) {
-    let mut parts = query.splitn(2, " -- PARAMS: ");
-    let sql = parts
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .trim_end_matches(';')
-        .to_string();
-    let params = parts
-        .next()
-        .map(|list| list.split(',').map(|v| param_value(v.trim())).collect())
-        .unwrap_or_default();
-    (sql, params)
 }
 
 fn param_value(value: &str) -> Value {
@@ -677,7 +791,7 @@ mod alloc_tests {
             timing: false,
         };
         let before = ALLOCATIONS.with(Cell::get);
-        print_statement(&mut Session::Database(db), sql, &mut out, 0).unwrap();
+        print_statement(&mut Session::Database(db), sql, Vec::new(), &mut out, 0).unwrap();
         ALLOCATIONS.with(Cell::get) - before
     }
 
@@ -749,6 +863,88 @@ mod tests {
                 (4, "/* x;\ny */ SELECT 3".to_string()),
             ]
         );
+    }
+
+    fn params(text: &str) -> Vec<(String, Vec<Value>)> {
+        let mut splitter = Splitter::default();
+        let mut out = Vec::new();
+        for line in text.split('\n') {
+            splitter.push_line(line, &mut out);
+        }
+        splitter.finish(&mut out);
+        out.into_iter().map(|s| (s.sql, s.params)).collect()
+    }
+
+    #[test]
+    fn a_params_comment_belongs_to_its_statement() {
+        assert_eq!(
+            params(
+                "SELECT $1; -- PARAMS: 7\nSELECT $1 -- PARAMS: 'b', 2\n;\nSELECT 'x -- PARAMS: y'"
+            ),
+            vec![
+                ("SELECT $1".to_string(), vec![Value::Integer(7)]),
+                (
+                    "-- PARAMS: 7\nSELECT $1 -- PARAMS: 'b', 2".to_string(),
+                    vec![Value::text("'b'"), Value::Integer(2)]
+                ),
+                ("SELECT 'x -- PARAMS: y'".to_string(), vec![]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_carriage_return_inside_a_string_is_kept() {
+        assert_eq!(
+            params("SELECT 'a\r\nb';\r\nSELECT 2\r"),
+            vec![
+                ("SELECT 'a\r\nb'".to_string(), vec![]),
+                ("SELECT 2".to_string(), vec![])
+            ]
+        );
+    }
+
+    #[test]
+    fn a_string_left_open_is_lexed_again_only_once_a_line_can_close_it() {
+        let mut splitter = Splitter::default();
+        let mut out = Vec::new();
+        splitter.push_line("SELECT 1; SELECT 'a;", &mut out);
+        let open_at = splitter.resume;
+        for _ in 0..1000 {
+            splitter.push_line("text; more;", &mut out);
+            assert_eq!(splitter.resume, open_at, "no line could close the string");
+        }
+        splitter.push_line("end';", &mut out);
+        let sql: Vec<_> = out.iter().map(|s| s.sql.len()).collect();
+        assert_eq!((out.len(), sql[0]), (2, "SELECT 1".len()));
+        assert!(!splitter.is_pending());
+    }
+
+    #[test]
+    fn a_command_is_read_past_its_comments() {
+        let cases = [
+            ("/* done */ COMMIT", Command::Commit),
+            ("-- start\nBEGIN", Command::Begin),
+            ("BEGIN TRANSACTION", Command::Begin),
+            ("rollback", Command::Rollback),
+            ("ROLLBACK TO SAVEPOINT s", Command::Other),
+            ("/* c */ EXPLAIN SELECT 1", Command::Explain),
+            ("SELECT value AS plan FROM t", Command::Other),
+            ("exit", Command::Exit),
+            ("\\?", Command::Help),
+        ];
+        for (sql, expected) in cases {
+            assert!(command(sql) == expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_leap_second_prints_as_second_sixty() {
+        let ts = chrono::NaiveDate::from_ymd_opt(2016, 12, 31)
+            .unwrap()
+            .and_hms_nano_opt(23, 59, 59, 1_500_000_000)
+            .unwrap()
+            .and_utc();
+        assert_eq!(value_text(&Value::Timestamp(ts)), "2016-12-31T23:59:60.5Z");
     }
 
     #[test]

@@ -130,6 +130,62 @@ fn a_statement_without_rows_prints_its_count() {
 }
 
 #[test]
+fn a_params_comment_after_the_semicolon_gives_the_statement_its_parameters() {
+    assert_eq!(
+        cli(&["-q", "-e", "SELECT $1 AS v; -- PARAMS: 7"], ""),
+        ("v\n----\n7\n".into(), "".into(), 0)
+    );
+    assert_eq!(
+        cli(&["-q", "-e", "SELECT 'x -- PARAMS: y' AS v"], "").0,
+        "v\n----\nx -- PARAMS: y\n"
+    );
+}
+
+#[test]
+fn a_carriage_return_in_a_string_reaches_the_engine() {
+    assert_eq!(
+        cli(&["-q", "-e", "SELECT LENGTH('a\r\nb') AS n"], "").0,
+        "n\n----\n4\n"
+    );
+    assert_eq!(
+        cli(&["-q"], "SELECT LENGTH('a\r\nb') AS n;\r\n").0,
+        "n\n----\n4\n"
+    );
+}
+
+#[test]
+fn only_explain_is_shown_past_the_limit() {
+    assert_eq!(
+        cli(
+            &[
+                "-q",
+                "-l",
+                "1",
+                "-e",
+                "SELECT value AS plan FROM GENERATE_SERIES(1, 3) g"
+            ],
+            ""
+        )
+        .0,
+        "plan\n----\n1\n(2 more rows, 3 in total)\n"
+    );
+    let (plan, _, code) = cli(
+        &[
+            "-q",
+            "-l",
+            "1",
+            "-e",
+            "EXPLAIN SELECT * FROM GENERATE_SERIES(1, 3) g",
+        ],
+        "",
+    );
+    assert!(
+        code == 0 && plan.lines().count() > 3 && !plan.contains("more rows"),
+        "{plan}"
+    );
+}
+
+#[test]
 fn without_quiet_the_open_each_statement_and_the_close_are_timed_apart() {
     let note = match cfg!(debug_assertions) {
         true => " [debug build: times are not those of a release build]",
