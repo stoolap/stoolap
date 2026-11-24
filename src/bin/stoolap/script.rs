@@ -309,7 +309,7 @@ pub fn command(sql: &str) -> Command {
             forms.iter().any(|f| text.eq_ignore_ascii_case(f))
         }
     };
-    match first.keyword {
+    let command = match first.keyword {
         Some(Keyword::Begin) => Command::Begin,
         Some(Keyword::Explain) => Command::Explain,
         Some(Keyword::Commit) if alone => Command::Commit,
@@ -317,7 +317,28 @@ pub fn command(sql: &str) -> Command {
         _ if bare && word(&["exit", "quit"]) || slash(&["\\q"]) => Command::Exit,
         _ if bare && word(&["help"]) || slash(&["\\h", "\\?"]) => Command::Help,
         _ => Command::Other,
+    };
+    // A command the CLI runs itself is not one while a block comment is
+    // still open: the text goes on in later lines
+    match command {
+        Command::Explain | Command::Other => command,
+        _ if ends_in_open_comment(sql) => Command::Other,
+        _ => command,
     }
+}
+
+/// Whether `sql` ends inside a block comment
+fn ends_in_open_comment(sql: &str) -> bool {
+    let mut lexer = Lexer::new(sql);
+    let mut last = None;
+    loop {
+        let token = lexer.next_token();
+        if token.token_type == TokenType::Eof {
+            break;
+        }
+        last = Some(token);
+    }
+    last.is_some_and(|t| t.token_type == TokenType::Comment && open_block(&t.literal))
 }
 
 /// How results are printed
@@ -1067,6 +1088,12 @@ mod tests {
             ("\\H", Command::Help),
             ("\\Q;", Command::Exit),
             ("\\h /* note */;", Command::Help),
+            ("COMMIT /* never closed", Command::Other),
+            ("ROLLBACK /* never closed", Command::Other),
+            ("BEGIN TRANSACTION /* never closed", Command::Other),
+            ("\\q /* never closed", Command::Other),
+            ("help /* never closed", Command::Other),
+            ("COMMIT /* closed */", Command::Commit),
             ("\\q -- bye", Command::Exit),
             ("-- bye\nquit", Command::Exit),
             ("'help'", Command::Other),
