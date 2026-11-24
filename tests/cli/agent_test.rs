@@ -141,11 +141,12 @@ fn a_cut_says_what_it_left_out() {
 fn a_json_cell_is_valid_json_on_one_line() {
     let (lines, _) = agent(
         &[],
-        "SELECT CAST('{\n  \"a\": [1,\n 2]\n}' AS JSON) AS j, CAST(CAST('NaN' AS FLOAT) AS JSON) AS n;\n",
+        "SELECT CAST('{\n  \"n\": 18446744073709551617,\n  \"s\": \"x  y\"\n}' AS JSON) AS j, \
+         CAST(CAST('NaN' AS FLOAT) AS JSON) AS n;\n",
     );
     assert_eq!(
         lines[0],
-        r#"{"stmt":1,"line":1,"ok":true,"columns":["j","n"],"types":["JSON","JSON"],"rows":[[{"a":[1,2]},"NaN"]],"row_count":1}"#
+        r#"{"stmt":1,"line":1,"ok":true,"columns":["j","n"],"types":["JSON","JSON"],"rows":[[{   "n": 18446744073709551617,   "s": "x  y" },"NaN"]],"row_count":1}"#
     );
 }
 
