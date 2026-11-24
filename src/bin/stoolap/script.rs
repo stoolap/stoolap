@@ -503,6 +503,16 @@ pub struct Output<W: Write> {
     pub warmup: usize,
 }
 
+/// A time in microseconds to the nanosecond, `121.375`, as a JSON number
+pub struct Micros(pub Duration);
+
+impl std::fmt::Display for Micros {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let nanos = self.0.as_nanos();
+        write!(f, "{}.{:03}", nanos / 1000, nanos % 1000)
+    }
+}
+
 /// The runs of a statement after the one printed, each reading every row
 /// and printing none: their engine times, and the error that stopped them
 pub struct Repeats {
@@ -539,16 +549,16 @@ impl Repeats {
             "{{\"runs\":{},\"warmup\":{},\"first_us\":{}",
             self.warm.len() + 1,
             self.warmup,
-            self.first.as_micros()
+            Micros(self.first)
         )?;
         if let Some([min, p50, p90, max]) = self.spread() {
             write!(
                 w,
                 ",\"min_us\":{},\"p50_us\":{},\"p90_us\":{},\"max_us\":{}",
-                min.as_micros(),
-                p50.as_micros(),
-                p90.as_micros(),
-                max.as_micros()
+                Micros(min),
+                Micros(p50),
+                Micros(p90),
+                Micros(max)
             )?;
         }
         if let Some(failure) = &self.failed {
@@ -853,13 +863,13 @@ pub fn run_script<W: Write>(
     db: &Database,
     lines: impl Iterator<Item = io::Result<String>>,
     out: &mut Output<W>,
-) -> Result<usize, String> {
+) -> io::Result<usize> {
     let mut splitter = Splitter::default();
     let mut ready = Vec::new();
     let mut failed = 0;
     let mut number = 0;
     for line in lines {
-        let line = line.map_err(|e| format!("reading input: {e}"))?;
+        let line = line.map_err(|e| io::Error::new(e.kind(), format!("reading input: {e}")))?;
         splitter.push_line(&line, &mut ready);
         if !run_ready(db, &mut ready, &mut number, &mut failed, out)? {
             return Ok(failed);
@@ -877,7 +887,7 @@ fn run_ready<W: Write>(
     number: &mut usize,
     failed: &mut usize,
     out: &mut Output<W>,
-) -> Result<bool, String> {
+) -> io::Result<bool> {
     for statement in ready.drain(..) {
         *number += 1;
         match command(&statement.sql) {
@@ -894,14 +904,19 @@ fn run_ready<W: Write>(
             statement.params,
             out,
         );
-        if let Err(message) = printed {
-            // The rows printed before the error come first
-            out.out.flush().map_err(|e| e.to_string())?;
-            *failed += 1;
-            eprintln!(
-                "Error (statement {}, line {}): {}",
-                number, statement.line, message
-            );
+        match printed {
+            // Output that cannot be written ends the script
+            Err(Failure::Output(e)) => return Err(e),
+            Err(message) => {
+                // The rows printed before the error come first
+                out.out.flush()?;
+                *failed += 1;
+                eprintln!(
+                    "Error (statement {}, line {}): {}",
+                    number, statement.line, message
+                );
+            }
+            Ok(_) => {}
         }
     }
     Ok(true)
@@ -1307,12 +1322,14 @@ mod alloc_tests {
         ALLOCATIONS.with(Cell::get) - before
     }
 
-    /// Allocations of agent mode running `sql` with `limit`
-    fn agent_allocations(db: &Database, sql: &str, limit: usize) -> usize {
+    /// Allocations of agent mode running `sql` with `limit`, the rows
+    /// written or not
+    fn agent_allocations(db: &Database, sql: &str, limit: usize, no_rows: bool) -> usize {
         let mut out = Vec::with_capacity(1 << 22);
         let options = crate::agent::Options {
             limit,
             full: false,
+            no_rows,
             stop_on_error: false,
             timing: false,
             repeat: 1,
@@ -1355,12 +1372,17 @@ mod alloc_tests {
             );
         }
         // Agent mode keeps the shown cells in buffers that grow by doubling
-        let one = agent_allocations(&db, sql, 1);
-        let all = agent_allocations(&db, sql, 0);
+        let one = agent_allocations(&db, sql, 1, false);
+        let all = agent_allocations(&db, sql, 0, false);
         assert!(
             all <= one + 48,
             "agent mode printing 1,999 more rows allocated {} times more",
             all - one
+        );
+        let none = agent_allocations(&db, sql, 0, true);
+        assert!(
+            none <= one,
+            "--no-rows over 2,000 rows allocated {none}, one shown row {one}"
         );
     }
 }

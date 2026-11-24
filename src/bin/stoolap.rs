@@ -193,6 +193,11 @@ struct Args {
     #[arg(long = "full")]
     full: bool,
 
+    /// Agent mode: leave every result's rows out; row_count, types, hash and
+    /// times stay
+    #[arg(long = "no-rows")]
+    no_rows: bool,
+
     /// Agent mode: add each statement's engine time as elapsed_us
     #[arg(long = "timing")]
     timing: bool,
@@ -1214,6 +1219,7 @@ fn run_script_and_exit(
         let options = agent::Options {
             limit: args.limit,
             full: args.full,
+            no_rows: args.no_rows,
             stop_on_error: args.on_error == OnError::Stop,
             timing: args.timing,
             repeat: args.repeat as usize,
@@ -1237,10 +1243,7 @@ fn run_script_and_exit(
         match result {
             Ok(true) => std::process::exit(0),
             Ok(false) => std::process::exit(1),
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                std::process::exit(1)
-            }
+            Err(e) => output_failed(e),
         }
     }
     let mut output = Output {
@@ -1261,11 +1264,17 @@ fn run_script_and_exit(
     match result {
         Ok(0) => std::process::exit(0),
         Ok(_) => std::process::exit(1),
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1)
-        }
+        Err(e) => output_failed(e),
     }
+}
+
+/// Exits after the output or the input failed; a reader that stopped
+/// reading, as `| head` does, ends the run without a word
+fn output_failed(e: io::Error) -> ! {
+    if e.kind() != io::ErrorKind::BrokenPipe {
+        eprintln!("Error: {}", e);
+    }
+    std::process::exit(1)
 }
 
 // ============================================================================

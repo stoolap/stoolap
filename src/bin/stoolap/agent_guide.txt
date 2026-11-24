@@ -13,9 +13,10 @@ OUTPUT (standard output holds nothing else)
 
   The first line names the build: times mean something only from "build":"release".
   A write gives "rows_affected" (an upsert counts the rows it wrote), EXPLAIN gives
-  "plan" as one string with \n between lines, a failure gives "error" with a "kind"
-  such as parse, table_not_found, unique_constraint or query_cancelled.
-  "rows" holds the first 40 rows (-l N, -l 0 for all); "row_count" counts every row.
+  "plan" as an array of its lines, a failure gives "error" with a "kind" such as
+  parse, table_not_found, unique_constraint or query_cancelled; a timeout adds
+  "timeout_ms". "rows" holds the first 40 rows (-l N, -l 0 for all, --no-rows
+  none); "row_count" counts every row.
   Exit status: 0 all passed, 1 a statement failed, 2 bad arguments.
 
 COMPARE ANSWERS
@@ -26,11 +27,15 @@ COMPARE ANSWERS
 MEASURE
   --timing              adds "elapsed_us": the engine's time for the statement, its
                         parse, plan and every row, without writing the output
+  --no-rows             leaves the rows out: row_count, types, hash and times stay
   --repeat N            runs each statement that only reads N times in the process
   --warmup M            adds M unmeasured runs after the first
   The line adds "repeat":{"runs","warmup","first_us","min_us","p50_us","p90_us",
-  "max_us"}: first_us is the cold run, the rest the warm ones. Writes run once.
-  Use -l 1 while measuring: every row is still produced and hashed.
+  "max_us"}: first_us is the cold run, the rest the warm ones; with --timing,
+  elapsed_us is the cold run too. A statement that is not repeated, a write or
+  EXPLAIN, says so: "repeat":{"runs":1,"skipped":"not_read_only"}.
+  The gap between first_us and p50_us is the cold parse, plan and caches.
+  Times are microseconds to the nanosecond: 7.625.
 
 PARAMETERS
   SELECT * FROM t WHERE id = $1 AND name = $2; -- PARAMS: 42, alice

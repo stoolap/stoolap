@@ -189,16 +189,14 @@ fn maintenance_does_not_run_in_agent_mode() {
 }
 
 #[test]
-fn a_plan_is_one_string() {
+fn a_plan_is_its_lines() {
     let (lines, _) = agent(
         &["-l", "1"],
-        "CREATE TABLE t (id INTEGER PRIMARY KEY);\nEXPLAIN SELECT * FROM t WHERE id = 1;\n",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY);\nEXPLAIN SELECT id FROM t WHERE id > 5;\n",
     );
-    let plan: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
-    assert!(
-        plan["plan"].as_str().is_some_and(|p| p.lines().count() > 1) && plan.get("rows").is_none(),
-        "{}",
-        lines[1]
+    assert_eq!(
+        lines[1],
+        r#"{"stmt":2,"line":2,"ok":true,"plan":["Project id","  IndexScan t (id > 5)","    Index __pk_t_id (id range)"]}"#
     );
 }
 
@@ -262,13 +260,38 @@ fn agent_mode_bounds_every_statement_by_default() {
     assert_eq!(timeout(&["-d", "memory://?query_timeout=1234"]), line(1234));
     assert_eq!(timeout(&["-d", "memory://?query_timeout=0"]), line(0));
     assert_eq!(timeout(&["-d", "memory://query_timeout=0"]), line(30000));
+    let slow = "SELECT COUNT(*) FROM GENERATE_SERIES(1, 3000) a, GENERATE_SERIES(1, 3000) b;\n";
     let (lines, _) = agent(
         &["-t", "50"],
-        "BEGIN;\nSELECT COUNT(*) FROM GENERATE_SERIES(1, 3000) a, GENERATE_SERIES(1, 3000) b;\n",
+        &format!("BEGIN;\n{slow}ROLLBACK;\nPRAGMA query_timeout = 40;\n{slow}"),
+    );
+    let cancelled = |stmt: u32, ms: u32| {
+        format!(
+            r#"{{"stmt":{stmt},"line":{stmt},"ok":false,"error":{{"kind":"query_cancelled","message":"query cancelled","timeout_ms":{ms},"hint":"the statement timeout of {ms} ms was reached; -t MS sets it, -t 0 turns it off"}}}}"#
+        )
+    };
+    assert_eq!(
+        (&lines[1], &lines[4]),
+        (&cancelled(2, 50), &cancelled(5, 40))
+    );
+}
+
+#[test]
+fn no_rows_leaves_the_rows_out_and_keeps_the_rest() {
+    let (lines, code) = agent_lines(
+        &["--no-rows", "-l", "1"],
+        "SELECT * FROM GENERATE_SERIES(1, 100) g;\nSELECT 1 AS a, 'x' AS b;\n",
     );
     assert_eq!(
-        lines[1],
-        r#"{"stmt":2,"line":2,"ok":false,"error":{"kind":"query_cancelled","message":"query cancelled"}}"#
+        (lines, code),
+        (
+            vec![
+                r#"{"stmt":1,"line":1,"ok":true,"columns":["value"],"types":["INTEGER"],"row_count":100,"hash":"f84e4355aeca41cc","order":"unordered"}"#.to_string(),
+                r#"{"stmt":2,"line":2,"ok":true,"columns":["a","b"],"types":["INTEGER","TEXT"],"row_count":1,"hash":"797a862bc8256c7a","order":"unordered"}"#.to_string(),
+                r#"{"done":true,"statements":2,"failed":0,"open_transaction":false}"#.to_string(),
+            ],
+            0
+        )
     );
 }
 
@@ -427,16 +450,33 @@ fn a_case_runs_with_the_timeout_of_the_run() {
 fn repeat_runs_a_reading_statement_again_and_gives_the_spread() {
     let (lines, code) = agent_lines(
         &["--repeat", "4", "--warmup", "2"],
-        "CREATE TABLE t (id INTEGER PRIMARY KEY);\nINSERT INTO t VALUES (1);\nSELECT id FROM t;\n",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY);\nINSERT INTO t VALUES (1);\nSELECT id FROM t;\nEXPLAIN SELECT id FROM t;\n",
     );
     let parsed: Vec<serde_json::Value> = lines
         .iter()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
     assert_eq!(code, 0);
-    assert!(parsed[0].get("repeat").is_none() && parsed[1].get("repeat").is_none());
+    let skipped = |why: &str| serde_json::json!({"runs": 1, "skipped": why});
+    assert_eq!(
+        [
+            &parsed[0]["repeat"],
+            &parsed[1]["repeat"],
+            &parsed[3]["repeat"]
+        ],
+        [
+            &skipped("not_read_only"),
+            &skipped("not_read_only"),
+            &skipped("explain")
+        ]
+    );
     let repeat = &parsed[2]["repeat"];
-    let us = |key: &str| repeat[key].as_u64().unwrap();
+    let us = |key: &str| repeat[key].as_f64().unwrap();
+    assert!(
+        lines[2].contains(&format!("\"first_us\":{:.3},", us("first_us"))),
+        "microseconds to the nanosecond: {}",
+        lines[2]
+    );
     assert_eq!(
         (&repeat["runs"], &repeat["warmup"]),
         (&4.into(), &2.into()),
@@ -654,4 +694,35 @@ fn the_agent_guide_example_gives_the_lines_it_shows() {
         .map(str::trim)
         .collect();
     assert_eq!((out.lines().skip(1).collect::<Vec<_>>(), code), (shown, 1));
+}
+
+#[test]
+fn a_reader_that_stops_reading_ends_the_run_quietly() {
+    for args in [&["--agent"][..], &["-q"], &["-q", "-j"]] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_stoolap"))
+            .args(args)
+            .args([
+                "-l",
+                "0",
+                "-e",
+                "SELECT * FROM GENERATE_SERIES(1, 1000000) g; SELECT 1",
+            ])
+            .env_remove("STOOLAP_AGENT")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut first = [0u8; 16];
+        std::io::Read::read_exact(child.stdout.as_mut().unwrap(), &mut first).unwrap();
+        drop(child.stdout.take());
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(
+            (
+                String::from_utf8_lossy(&out.stderr).as_ref(),
+                out.status.code()
+            ),
+            ("", Some(1)),
+            "{args:?}"
+        );
+    }
 }
