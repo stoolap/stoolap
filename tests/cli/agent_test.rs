@@ -607,3 +607,51 @@ fn a_warmup_that_fails_counts_only_the_runs_that_passed() {
         assert!(repeat["warmup"].as_u64().unwrap() < 10, "{out}");
     }
 }
+
+const GUIDE: &str = include_str!("../../src/bin/stoolap/agent_guide.txt");
+
+#[test]
+fn help_in_agent_mode_gives_the_agent_guide() {
+    let (out, err, code) = run(&["--agent", "--help"], &[], "");
+    assert_eq!((out.as_str(), err.as_str(), code), (GUIDE, "", 0));
+    let (out, _, _) = run(&["-h"], &[("STOOLAP_AGENT", "1")], "");
+    assert_eq!(out, GUIDE, "the variable turns it on");
+    let (out, _, code) = run(&["--help"], &[], "");
+    assert!(
+        out.contains("run `stoolap --agent --help` for agent mode")
+            && !out.contains("COMPARE ANSWERS")
+            && code == 0,
+        "{out}"
+    );
+    let (out, _, _) = run(&["--agent", "--no-agent", "--help"], &[], "");
+    assert!(!out.contains("COMPARE ANSWERS"), "{out}");
+}
+
+#[test]
+fn the_agent_guide_names_only_flags_that_exist() {
+    let (help, _, _) = run(&["--help"], &[], "");
+    let flags: Vec<&str> = GUIDE
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .filter(|w| w.starts_with("--") && w.len() > 2)
+        .collect();
+    assert!(flags.len() >= 8, "{flags:?}");
+    for flag in flags {
+        assert!(
+            help.contains(&format!("{flag} ")) || help.contains(&format!("{flag}\n")),
+            "{flag} is not a flag"
+        );
+    }
+}
+
+#[test]
+fn the_agent_guide_example_gives_the_lines_it_shows() {
+    let (out, _, code) = run(&["--agent", "-e", "SELECT 1 AS a; SELECT nope"], &[], "");
+    let shown: Vec<&str> = GUIDE
+        .lines()
+        .skip_while(|l| !l.starts_with("OUTPUT"))
+        .skip(2)
+        .take(3)
+        .map(str::trim)
+        .collect();
+    assert_eq!((out.lines().skip(1).collect::<Vec<_>>(), code), (shown, 1));
+}

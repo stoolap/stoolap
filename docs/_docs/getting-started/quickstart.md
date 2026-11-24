@@ -54,7 +54,7 @@ Without `-q`, the CLI prints how long it took to open the database, `Query execu
 
 ### Agent mode
 
-`--agent`, or the environment variable `STOOLAP_AGENT=1`, writes output for a program to read: JSON Lines on standard output and nothing else there. It is never turned on by detecting a pipe or another tool; `--no-agent` turns it off whatever the variable says. In agent mode the CLI never prompts: it reads `-e`, `-f` or standard input as a script.
+`--agent`, or the environment variable `STOOLAP_AGENT=1`, writes output for a program to read: JSON Lines on standard output and nothing else there. It is never turned on by detecting a pipe or another tool; `--no-agent` turns it off whatever the variable says. In agent mode the CLI never prompts: it reads `-e`, `-f` or standard input as a script. `stoolap --agent --help` prints a short guide to agent mode in place of the general help, for an agent to read before its first run.
 
 ```bash
 stoolap --agent -e "SELECT 1 AS a; SELECT nope"

@@ -53,7 +53,8 @@ const VERSION: &str = concat!(
 #[command(about = "High-performance embedded SQL database with MVCC")]
 #[command(
     long_about = "Stoolap is a high-performance embedded SQL database with MVCC transactions.\n\
-This CLI provides an interactive interface to execute SQL queries and manage your database.\n\n\
+This CLI provides an interactive interface to execute SQL queries and manage your database.\n\
+A program or an AI agent: run `stoolap --agent --help` for agent mode, JSON lines out.\n\n\
 PERSISTENCE DSN PARAMETERS:\n\
   file:///path/to/db?param=value&param2=value2\n\n\
   sync_mode=none|normal|full   Fsync mode (default: normal)\n\
@@ -710,11 +711,26 @@ fn print_persistence_info(args: &Args) {
     }
 }
 
+/// Agent mode is turned on only by asking, never by what the environment
+/// looks like
+fn agent_mode(agent: bool, no_agent: bool) -> bool {
+    !no_agent && (agent || std::env::var("STOOLAP_AGENT").is_ok_and(|v| v == "1"))
+}
+
 fn main() {
-    let mut args = Args::parse();
-    // Turned on only by asking, never by what the environment looks like
-    let agent =
-        !args.no_agent && (args.agent || std::env::var("STOOLAP_AGENT").is_ok_and(|v| v == "1"));
+    let mut args = match Args::try_parse() {
+        Ok(args) => args,
+        Err(e) if e.kind() == clap::error::ErrorKind::DisplayHelp => {
+            let given = |flag: &str| std::env::args().any(|a| a == flag);
+            if agent_mode(given("--agent"), given("--no-agent")) {
+                print!("{}", include_str!("stoolap/agent_guide.txt"));
+                std::process::exit(0);
+            }
+            e.exit()
+        }
+        Err(e) => e.exit(),
+    };
+    let agent = agent_mode(args.agent, args.no_agent);
     if agent {
         args.quiet = true;
     }
