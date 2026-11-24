@@ -31,6 +31,8 @@ pub struct Options {
     pub limit: usize,
     /// Keep cells whole
     pub full: bool,
+    /// Leave every result's rows out
+    pub no_rows: bool,
     /// Skip the statements after the first that fails
     pub stop_on_error: bool,
     /// Add each statement's engine time
@@ -251,7 +253,7 @@ impl Run<'_> {
         // A first run the warm ones are set against is timed apart from
         // the sink's hash and types, as they run without them
         let timed = self.options.timing || repeating;
-        self.sink.reset(explain, self.options.full, ordered, timed);
+        self.sink.reset(explain, self.options, ordered, timed);
         let db = self.case_db.as_ref().unwrap_or(self.first);
         let ran = script::run(
             &mut Session::Database(db),
@@ -269,9 +271,9 @@ impl Run<'_> {
         write!(w, "\"line\":{},", statement.line)?;
         let took = match ran {
             Err(failure) => {
-                self.count_failure();
                 write!(w, "\"ok\":false,\"error\":")?;
-                write_error(w, &failure, &statement)?;
+                write_error(w, &failure, &statement, db)?;
+                self.count_failure();
                 return writeln!(w, "}}");
             }
             Ok((Ran::Affected(n), took)) => {
@@ -312,8 +314,12 @@ impl Run<'_> {
                 took
             }
         };
+        if self.options.repeat > 1 && !repeating {
+            let why = if explain { "explain" } else { "not_read_only" };
+            write!(w, ",\"repeat\":{{\"runs\":1,\"skipped\":\"{why}\"}}")?;
+        }
         if self.options.timing {
-            write!(w, ",\"elapsed_us\":{}", took.engine.as_micros())?;
+            write!(w, ",\"elapsed_us\":{}", script::Micros(took.engine))?;
         }
         writeln!(w, "}}")
     }
@@ -513,7 +519,12 @@ fn stats(db: &Database) -> Result<Vec<u8>, CommandError> {
     Ok(out)
 }
 
-fn write_error(w: &mut impl Write, failure: &Failure, statement: &Statement) -> io::Result<()> {
+fn write_error(
+    w: &mut impl Write,
+    failure: &Failure,
+    statement: &Statement,
+    db: &Database,
+) -> io::Result<()> {
     let kind = match failure {
         Failure::Engine(e) => e.kind(),
         Failure::Output(_) => "output",
@@ -527,6 +538,17 @@ fn write_error(w: &mut impl Write, failure: &Failure, statement: &Statement) -> 
         let at = (error.position.line as usize, error.position.column as usize);
         let (line, column) = statement.input_position(at);
         write!(w, ",\"line\":{line},\"column\":{column}")?;
+    }
+    // The connection's timeout now, which the script may have set itself
+    if let Failure::Engine(stoolap::Error::QueryCancelled) = failure
+        && let Ok(timeout) = db.query_one::<i64, _>("PRAGMA query_timeout", ())
+        && timeout > 0
+    {
+        write!(
+            w,
+            ",\"timeout_ms\":{timeout},\"hint\":\"the statement timeout of {timeout} ms was \
+             reached; -t MS sets it, -t 0 turns it off\""
+        )?;
     }
     write!(w, "}}")
 }
@@ -628,9 +650,11 @@ struct AgentSink {
     columns: usize,
     cells_cut: bool,
     full: bool,
+    /// Write the rows; without, `--no-rows`, they count in the types and the hash only
+    keep_rows: bool,
     /// Whether the statement is EXPLAIN, whose lines go to `plan`
     explain: bool,
-    plan: String,
+    plan: Vec<String>,
     /// Every row, the shown ones and the rest
     hash: ResultHash,
     /// `--timing`: the engine's time is measured apart from the sink's
@@ -638,14 +662,15 @@ struct AgentSink {
 }
 
 impl AgentSink {
-    fn reset(&mut self, explain: bool, full: bool, ordered: bool, timed: bool) {
+    fn reset(&mut self, explain: bool, options: &Options, ordered: bool, timed: bool) {
         self.timed = timed;
         self.cells.clear();
         self.spans.clear();
         self.types.clear();
         self.columns = 0;
         self.cells_cut = false;
-        self.full = full;
+        self.full = options.full;
+        self.keep_rows = !options.no_rows;
         self.explain = explain;
         self.plan.clear();
         self.hash = ResultHash { acc: 0, ordered };
@@ -679,7 +704,11 @@ impl AgentSink {
                 ColumnType::Mixed => w.write_all(b"\"MIXED\"")?,
             }
         }
-        w.write_all(b"],\"rows\":[")?;
+        w.write_all(b"]")?;
+        debug_assert!(self.keep_rows || self.spans.is_empty());
+        if self.keep_rows {
+            w.write_all(b",\"rows\":[")?;
+        }
         let mut from = 0;
         for (i, &(end, t)) in self.spans.iter().enumerate() {
             let column = i % self.columns;
@@ -705,14 +734,17 @@ impl AgentSink {
         if !self.spans.is_empty() {
             w.write_all(b"]")?;
         }
-        write!(w, "],\"row_count\":{total}")?;
+        if self.keep_rows {
+            w.write_all(b"]")?;
+        }
+        write!(w, ",\"row_count\":{total}")?;
         let order = match self.hash.ordered {
             true => "ordered",
             false => "unordered",
         };
         let hash = self.hash.value(total);
         write!(w, ",\"hash\":\"{hash:016x}\",\"order\":\"{order}\"")?;
-        if shown < total {
+        if self.keep_rows && shown < total {
             write!(w, ",\"shown\":{shown},\"truncated\":true")?;
         }
         if self.cells_cut {
@@ -787,12 +819,12 @@ impl Sink for AgentSink {
     fn row(&mut self, row: &Row) -> io::Result<()> {
         if self.explain {
             if let Some(Value::Text(line)) = row.as_slice().first() {
-                if !self.plan.is_empty() {
-                    self.plan.push('\n');
-                }
-                self.plan.push_str(line);
+                self.plan.push(line.to_string());
             }
             return Ok(());
+        }
+        if !self.keep_rows {
+            return self.rest(row);
         }
         for value in row.as_slice() {
             self.write_value(value)?;
