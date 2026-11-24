@@ -28,7 +28,7 @@ pub struct Statement {
     pub line: usize,
     pub sql: String,
     pub params: Vec<Value>,
-    /// Line and column (from 1, in bytes) of the first byte of `sql`, so a
+    /// Line and column (from 1, in characters) of the first byte of `sql`, so a
     /// position inside the statement maps to the input
     pub text_at: (usize, usize),
 }
@@ -135,14 +135,18 @@ impl Splitter {
         self.cut(true, out);
     }
 
-    /// The cursor at byte `to` of `pending`, read on from `from`
+    /// The cursor at byte `to` of `pending`, read on from `from`; columns
+    /// count characters, as the lexer's positions do
     fn advance(&self, (from, (line, column)): Cursor, to: usize) -> Cursor {
         let text = &self.pending[from..to];
         match text.rfind('\n') {
-            None => (to, (line, column + text.len())),
+            None => (to, (line, column + text.chars().count())),
             Some(newline) => (
                 to,
-                (line + text.matches('\n').count(), text.len() - newline),
+                (
+                    line + text.matches('\n').count(),
+                    text[newline + 1..].chars().count() + 1,
+                ),
             ),
         }
     }

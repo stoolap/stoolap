@@ -705,6 +705,11 @@ fn main() {
     if agent {
         args.quiet = true;
     }
+    // Maintenance prints plain text and changes files: refused before either
+    if agent && (args.snapshot || args.restore.is_some() || args.reset_volumes) {
+        eprintln!("Error: --snapshot, --restore and --reset-volumes do not run in agent mode");
+        std::process::exit(2);
+    }
 
     // Build the DSN with optional query parameters
     let db_path = build_dsn(&args);
@@ -1043,7 +1048,7 @@ fn main() {
 
     // The connection's own timeout bounds every statement it runs, those of
     // a transaction too; agent mode never waits on a statement for ever
-    let default_timeout = agent && !db_path.contains("query_timeout=");
+    let default_timeout = agent && matches!(Database::dsn_query_timeout(&db_path), Ok(None));
     if let Some(ms) = args.timeout_ms.or(default_timeout.then_some(30_000))
         && let Err(e) = db.execute(&format!("PRAGMA query_timeout = {ms}"), ())
     {

@@ -138,6 +138,38 @@ fn a_cut_says_what_it_left_out() {
 }
 
 #[test]
+fn a_json_cell_is_valid_json_on_one_line() {
+    let (lines, _) = agent(
+        &[],
+        "SELECT CAST('{\n  \"a\": [1,\n 2]\n}' AS JSON) AS j, CAST(CAST('NaN' AS FLOAT) AS JSON) AS n;\n",
+    );
+    assert_eq!(
+        lines[0],
+        r#"{"stmt":1,"line":1,"ok":true,"columns":["j","n"],"types":["JSON","JSON"],"rows":[[{"a":[1,2]},"NaN"]],"row_count":1}"#
+    );
+}
+
+#[test]
+fn a_parse_error_column_counts_characters() {
+    let (lines, _) = agent(&[], "SELECT 'é'; SELECT * FROM t WHERE;\n");
+    assert_eq!(
+        lines[1],
+        r#"{"stmt":2,"line":1,"ok":false,"error":{"kind":"parse","message":"parse error: expected expression after WHERE at position line 1, column 22","line":1,"column":34}}"#
+    );
+}
+
+#[test]
+fn maintenance_does_not_run_in_agent_mode() {
+    let refused = |args: &[&str], env: &[(&str, &str)]| {
+        let (out, err, code) = run(args, env, "");
+        out.is_empty() && code == 2 && err.contains("do not run in agent mode")
+    };
+    assert!(refused(&["--agent", "--snapshot"], &[]));
+    assert!(refused(&["--reset-volumes"], &[("STOOLAP_AGENT", "1")]));
+    assert!(refused(&["--restore"], &[("STOOLAP_AGENT", "1")]));
+}
+
+#[test]
 fn a_plan_is_one_string() {
     let (lines, _) = agent(
         &["-l", "1"],
@@ -209,6 +241,8 @@ fn agent_mode_bounds_every_statement_by_default() {
     assert_eq!(timeout(&[]), line(30000));
     assert_eq!(timeout(&["-t", "0"]), line(0));
     assert_eq!(timeout(&["-d", "memory://?query_timeout=1234"]), line(1234));
+    assert_eq!(timeout(&["-d", "memory://?query_timeout=0"]), line(0));
+    assert_eq!(timeout(&["-d", "memory://query_timeout=0"]), line(30000));
     let (lines, _) = agent(
         &["-t", "50"],
         "BEGIN;\nSELECT COUNT(*) FROM GENERATE_SERIES(1, 3000) a, GENERATE_SERIES(1, 3000) b;\n",

@@ -15,6 +15,7 @@
 //! Agent mode: a build line, one JSON line per statement and a summary,
 //! written over the same run as every other mode of the CLI
 
+use std::borrow::Cow;
 use std::io::{self, Write};
 
 use stoolap::common::version::{GIT_COMMIT, VERSION};
@@ -339,10 +340,19 @@ impl AgentSink {
             }
             Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
                 let json = std::str::from_utf8(&data[1..]).unwrap_or("");
-                match self.full || json.chars().count() <= CELL_LIMIT {
-                    true => self.cells.extend_from_slice(json.as_bytes()),
+                // Written as JSON only when it reads as JSON, NaN does not,
+                // and on one line: a value laid out over lines is written
+                // again, which is the only case that allocates
+                let valid = serde_json::from_str::<serde::de::IgnoredAny>(json).is_ok();
+                let line = match valid && json.contains(['\n', '\r']) {
+                    true => serde_json::from_str::<serde_json::Value>(json)
+                        .map_or(Cow::Borrowed(json), |v| Cow::Owned(v.to_string())),
+                    false => Cow::Borrowed(json),
+                };
+                match valid && (self.full || line.chars().count() <= CELL_LIMIT) {
+                    true => self.cells.extend_from_slice(line.as_bytes()),
                     false => {
-                        let text = self.cut(json);
+                        let text = self.cut(&line);
                         serde_json::to_writer(&mut self.cells, text)?;
                     }
                 }
