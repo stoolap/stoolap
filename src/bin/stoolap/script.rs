@@ -494,34 +494,57 @@ pub struct Output<W: Write> {
     pub quiet: bool,
     /// Print the time of each statement after its result
     pub timing: bool,
-    /// Runs of a statement that only reads, the first printed, 1 for once
+    /// Runs of a statement that only reads, the first printed, 1 for once,
+    /// and the unmeasured runs between the first and the measured ones
     pub repeat: usize,
+    pub warmup: usize,
 }
 
 /// The runs of a statement after the one printed, each reading every row
 /// and printing none: their engine times, and the error that stopped them
 pub struct Repeats {
     pub first: Duration,
+    /// Runs after the first that were run and not measured
+    pub warmup: usize,
+    /// The measured runs' engine times, sorted
     pub warm: Vec<Duration>,
     pub failed: Option<Failure>,
 }
 
 impl Repeats {
-    /// `{"runs":..,"first_us":..,"min_us":..,"median_us":..,"max_us":..}`
+    /// The nearest-rank `q` quantile of the measured runs
+    fn quantile(&self, q: f64) -> Option<Duration> {
+        let rank = (q * self.warm.len() as f64).ceil() as usize;
+        self.warm.get(rank.saturating_sub(1)).copied()
+    }
+
+    /// The measured runs' min, p50, p90 and max
+    fn spread(&self) -> Option<[Duration; 4]> {
+        Some([
+            *self.warm.first()?,
+            self.quantile(0.5)?,
+            self.quantile(0.9)?,
+            *self.warm.last()?,
+        ])
+    }
+
+    /// `{"runs":..,"warmup":..,"first_us":..,"min_us":..,"p50_us":..,
+    /// "p90_us":..,"max_us":..}`
     pub fn write_json(&self, w: &mut impl Write) -> io::Result<()> {
         write!(
             w,
-            "{{\"runs\":{},\"first_us\":{}",
+            "{{\"runs\":{},\"warmup\":{},\"first_us\":{}",
             self.warm.len() + 1,
+            self.warmup,
             self.first.as_micros()
         )?;
-        if let (Some(min), Some(max)) = (self.warm.first(), self.warm.last()) {
-            let median = self.warm[self.warm.len() / 2];
+        if let Some([min, p50, p90, max]) = self.spread() {
             write!(
                 w,
-                ",\"min_us\":{},\"median_us\":{},\"max_us\":{}",
+                ",\"min_us\":{},\"p50_us\":{},\"p90_us\":{},\"max_us\":{}",
                 min.as_micros(),
-                median.as_micros(),
+                p50.as_micros(),
+                p90.as_micros(),
                 max.as_micros()
             )?;
         }
@@ -532,20 +555,25 @@ impl Repeats {
         w.write_all(b"}")
     }
 
-    /// `Ran 10 times: first 1.2 ms, then min .., median .., max ..`
+    /// `Ran 10 times after 2 warmup runs: first 1.2 ms, then min ..,
+    /// p50 .., p90 .., max ..`
     fn line(&self) -> String {
-        let mut line = format!(
-            "Ran {} times: first {}",
-            self.warm.len() + 1,
-            duration(self.first)
-        );
-        if let (Some(min), Some(max)) = (self.warm.first(), self.warm.last()) {
-            let median = self.warm[self.warm.len() / 2];
+        let mut line = format!("Ran {} times", self.warm.len() + 1);
+        if self.warmup > 0 {
             line += &format!(
-                ", then min {}, median {}, max {}",
-                duration(*min),
-                duration(median),
-                duration(*max)
+                " after {} warmup {}",
+                self.warmup,
+                plural(self.warmup as i64, "run")
+            );
+        }
+        line += &format!(": first {}", duration(self.first));
+        if let Some([min, p50, p90, max]) = self.spread() {
+            line += &format!(
+                ", then min {}, p50 {}, p90 {}, max {}",
+                duration(min),
+                duration(p50),
+                duration(p90),
+                duration(max)
             );
         }
         if let Some(failure) = &self.failed {
@@ -572,20 +600,22 @@ impl Sink for Drain {
     }
 }
 
-/// Runs `sql` `times` more after a first run whose engine time was `first`,
-/// each to its last row, the times sorted; stops at a run that fails
+/// After a first run whose engine time was `first`, runs `sql` `warmup`
+/// times unmeasured and `times` times measured, each to its last row;
+/// stops at a run that fails
 pub fn repeat(
     session: &mut Session,
     sql: &str,
     params: &[Value],
     first: Duration,
-    times: usize,
+    (warmup, times): (usize, usize),
 ) -> Repeats {
     let mut warm = Vec::with_capacity(times);
     let mut failed = None;
-    for _ in 0..times {
+    for run_number in 0..warmup + times {
         match run(session, sql, params.to_vec(), 0, &mut Drain) {
-            Ok((_, took)) => warm.push(took.engine),
+            Ok((_, took)) if run_number >= warmup => warm.push(took.engine),
+            Ok(_) => {}
             Err(failure) => {
                 failed = Some(failure);
                 break;
@@ -595,6 +625,7 @@ pub fn repeat(
     warm.sort();
     Repeats {
         first,
+        warmup,
         warm,
         failed,
     }
@@ -886,6 +917,7 @@ pub fn print_statement<W: Write>(
         quiet,
         timing,
         repeat,
+        warmup,
     } = out;
     let again = (*repeat > 1 && reads_only(sql)).then(|| params.clone());
     let ran = match format {
@@ -911,7 +943,7 @@ pub fn print_statement<W: Write>(
             sql,
             &params,
             took.engine,
-            *repeat - 1,
+            (*warmup, *repeat - 1),
         )),
         _ => None,
     };
@@ -1259,6 +1291,7 @@ mod alloc_tests {
             quiet: false,
             timing: false,
             repeat: 1,
+            warmup: 0,
         };
         let before = ALLOCATIONS.with(Cell::get);
         print_statement(&mut Session::Database(db), sql, Vec::new(), &mut out).unwrap();
@@ -1274,6 +1307,7 @@ mod alloc_tests {
             stop_on_error: false,
             timing: false,
             repeat: 1,
+            warmup: 0,
         };
         let lines = std::iter::once(Ok(sql.to_string()));
         let before = ALLOCATIONS.with(Cell::get);
@@ -1453,6 +1487,28 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn the_spread_takes_nearest_rank_quantiles() {
+        let ms = |n: u64| Duration::from_millis(n);
+        let repeats = Repeats {
+            first: ms(50),
+            warmup: 0,
+            warm: (1..=10).map(ms).collect(),
+            failed: None,
+        };
+        assert_eq!(repeats.spread(), Some([ms(1), ms(5), ms(9), ms(10)]));
+        let one = Repeats {
+            warm: vec![ms(3)],
+            ..repeats
+        };
+        assert_eq!(one.spread(), Some([ms(3); 4]));
+        let none = Repeats {
+            warm: Vec::new(),
+            ..one
+        };
+        assert_eq!(none.spread(), None);
     }
 
     #[test]

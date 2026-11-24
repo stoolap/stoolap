@@ -426,7 +426,7 @@ fn a_case_runs_with_the_timeout_of_the_run() {
 #[test]
 fn repeat_runs_a_reading_statement_again_and_gives_the_spread() {
     let (lines, code) = agent_lines(
-        &["--repeat", "4"],
+        &["--repeat", "4", "--warmup", "2"],
         "CREATE TABLE t (id INTEGER PRIMARY KEY);\nINSERT INTO t VALUES (1);\nSELECT id FROM t;\n",
     );
     let parsed: Vec<serde_json::Value> = lines
@@ -437,9 +437,16 @@ fn repeat_runs_a_reading_statement_again_and_gives_the_spread() {
     assert!(parsed[0].get("repeat").is_none() && parsed[1].get("repeat").is_none());
     let repeat = &parsed[2]["repeat"];
     let us = |key: &str| repeat[key].as_u64().unwrap();
-    assert_eq!(repeat["runs"], 4, "{}", lines[2]);
+    assert_eq!(
+        (&repeat["runs"], &repeat["warmup"]),
+        (&4.into(), &2.into()),
+        "{}",
+        lines[2]
+    );
     assert!(
-        us("min_us") <= us("median_us") && us("median_us") <= us("max_us"),
+        us("min_us") <= us("p50_us")
+            && us("p50_us") <= us("p90_us")
+            && us("p90_us") <= us("max_us"),
         "{}",
         lines[2]
     );
@@ -449,11 +456,25 @@ fn repeat_runs_a_reading_statement_again_and_gives_the_spread() {
 
 #[test]
 fn repeat_in_the_table_and_json_outputs() {
-    let (out, _, code) = run(&["-q", "--repeat", "3", "-e", "SELECT 1 AS a"], &[], "");
+    let (out, _, code) = run(
+        &[
+            "-q",
+            "--repeat",
+            "3",
+            "--warmup",
+            "1",
+            "-e",
+            "SELECT 1 AS a",
+        ],
+        &[],
+        "",
+    );
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!((&lines[..3], code), (&["a", "----", "1"][..], 0), "{out}");
     assert!(
-        lines[3].starts_with("Ran 3 times: first ") && lines[3].contains(", then min "),
+        lines[3].starts_with("Ran 3 times after 1 warmup run: first ")
+            && lines[3].contains(", then min ")
+            && lines[3].contains(", p90 "),
         "{out}"
     );
     let (out, _, _) = run(

@@ -201,6 +201,11 @@ struct Args {
     /// the others is given after it
     #[arg(long = "repeat", value_name = "N", default_value = "1", value_parser = clap::value_parser!(u64).range(1..))]
     repeat: u64,
+
+    /// With --repeat: runs after the first, before the measured ones, that
+    /// are run and not measured
+    #[arg(long = "warmup", value_name = "M", default_value = "0")]
+    warmup: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum, Debug)]
@@ -406,6 +411,7 @@ impl Cli {
                 quiet: true,
                 timing: false,
                 repeat: 1,
+                warmup: 0,
             };
             return script::print_statement(&mut session, query, params, &mut out)
                 .map_err(|e| e.to_string());
@@ -1195,6 +1201,7 @@ fn run_script_and_exit(
             stop_on_error: args.on_error == OnError::Stop,
             timing: args.timing,
             repeat: args.repeat as usize,
+            warmup: args.warmup as usize,
         };
         let mut out = io::BufWriter::new(io::stdout().lock());
         // Each case gets a database of its own, named so no other open
@@ -1230,6 +1237,7 @@ fn run_script_and_exit(
         quiet: args.quiet,
         timing: !args.json_output && !args.quiet,
         repeat: args.repeat as usize,
+        warmup: args.warmup as usize,
     };
     let result = script::run_script(&db, lines, &mut output);
     drop(output);

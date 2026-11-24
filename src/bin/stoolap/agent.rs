@@ -35,8 +35,10 @@ pub struct Options {
     pub stop_on_error: bool,
     /// Add each statement's engine time
     pub timing: bool,
-    /// Runs of a statement that only reads, the first written, 1 for once
+    /// Runs of a statement that only reads, the first written, 1 for once,
+    /// and the unmeasured runs between the first and the measured ones
     pub repeat: usize,
+    pub warmup: usize,
 }
 
 /// Opens the database the `n`th case runs in
@@ -292,7 +294,7 @@ impl Run<'_> {
                         &statement.sql,
                         &statement.params,
                         took.engine,
-                        self.options.repeat - 1,
+                        (self.options.warmup, self.options.repeat - 1),
                     );
                     w.write_all(b",\"repeat\":")?;
                     repeats.write_json(w)?;
