@@ -44,14 +44,32 @@ fn run(args: &[&str], env: &[(&str, &str)], input: &str) -> (String, String, i32
     )
 }
 
-/// The lines after the build line
-fn agent(args: &[&str], input: &str) -> (Vec<String>, i32) {
+/// The lines after the build line, as written
+fn agent_lines(args: &[&str], input: &str) -> (Vec<String>, i32) {
     let mut all = vec!["--agent"];
     all.extend_from_slice(args);
     let (out, err, code) = run(&all, &[], input);
     assert_eq!(err, "", "nothing on stderr");
     let lines = out.lines().skip(1).map(str::to_string).collect();
     (lines, code)
+}
+
+/// The lines after the build line without each result's hash and order,
+/// which the hash tests check
+fn agent(args: &[&str], input: &str) -> (Vec<String>, i32) {
+    let (lines, code) = agent_lines(args, input);
+    (lines.iter().map(|l| without_hash(l)).collect(), code)
+}
+
+fn without_hash(line: &str) -> String {
+    let Some(at) = line.find(",\"hash\":\"") else {
+        return line.to_string();
+    };
+    let rest = &line[at..];
+    let end = rest
+        .find("ordered\"")
+        .map_or(rest.len(), |i| i + "ordered\"".len());
+    format!("{}{}", &line[..at], &rest[end..])
 }
 
 #[test]
@@ -252,4 +270,155 @@ fn agent_mode_bounds_every_statement_by_default() {
         lines[1],
         r#"{"stmt":2,"line":2,"ok":false,"error":{"kind":"query_cancelled","message":"query cancelled"}}"#
     );
+}
+
+/// Each result's hash and order, by statement
+fn hashes(args: &[&str], input: &str) -> Vec<(String, String)> {
+    let (lines, _) = agent_lines(args, input);
+    lines
+        .iter()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v.get("hash").is_some())
+        .map(|v| {
+            (
+                v["hash"].as_str().unwrap().into(),
+                v["order"].as_str().unwrap().into(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_result_hash_is_the_same_in_every_build() {
+    let pinned = |hash: &str| (hash.to_string(), "unordered".to_string());
+    assert_eq!(
+        hashes(
+            &[],
+            "SELECT 1 AS x;\nSELECT * FROM GENERATE_SERIES(1, 100) g;\n"
+        ),
+        vec![pinned("ff4ea0efc5072510"), pinned("f84e4355aeca41cc")]
+    );
+}
+
+#[test]
+fn a_hash_tells_equal_answers_from_different_ones() {
+    let script = "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);\n\
+                  INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, NULL);\n\
+                  SELECT id, v FROM t;\n\
+                  SELECT id, v FROM (SELECT * FROM t ORDER BY id DESC) s;\n\
+                  SELECT id, v FROM t ORDER BY id;\n\
+                  SELECT id, v FROM t ORDER BY id DESC;\n\
+                  SELECT 1 AS x;\nSELECT '1' AS x;\nSELECT NULL AS x;\nSELECT 'NULL' AS x;\n";
+    let h = hashes(&["-l", "1"], script);
+    let order: Vec<&str> = h.iter().map(|(_, o)| o.as_str()).collect();
+    assert_eq!(
+        order,
+        [
+            "unordered",
+            "unordered",
+            "ordered",
+            "ordered",
+            "unordered",
+            "unordered",
+            "unordered",
+            "unordered"
+        ]
+    );
+    assert_eq!(
+        h[0].0, h[1].0,
+        "the same rows in another order, no ORDER BY"
+    );
+    assert_ne!(h[2].0, h[3].0, "ORDER BY in the two directions");
+    let typed: std::collections::HashSet<&str> = h[4..].iter().map(|(x, _)| x.as_str()).collect();
+    assert_eq!(typed.len(), 4, "1, '1', NULL and 'NULL' differ: {h:?}");
+}
+
+#[test]
+fn the_hash_and_the_types_cover_the_rows_the_cut_left_out() {
+    let sql = "SELECT CASE WHEN g.value = 1 THEN 1 ELSE 'x' END AS m FROM GENERATE_SERIES(1, 2) g";
+    let (cut, _) = agent_lines(&["-l", "1", "-e", sql], "");
+    let (all, _) = agent_lines(&["-l", "0", "-e", sql], "");
+    assert_eq!(
+        cut[0],
+        r#"{"stmt":1,"line":1,"ok":true,"columns":["m"],"types":["MIXED"],"rows":[[{"t":"INTEGER","v":1}]],"row_count":2,"hash":"2acdec8968fb1c27","order":"unordered","shown":1,"truncated":true}"#
+    );
+    assert_eq!(
+        all[0],
+        r#"{"stmt":1,"line":1,"ok":true,"columns":["m"],"types":["MIXED"],"rows":[[{"t":"INTEGER","v":1}],[{"t":"TEXT","v":"x"}]],"row_count":2,"hash":"2acdec8968fb1c27","order":"unordered"}"#
+    );
+}
+
+#[test]
+fn each_case_runs_in_a_database_of_its_own() {
+    let script = "CREATE TABLE t (id INTEGER PRIMARY KEY);\n\
+                  -- @case first\n\
+                  CREATE TABLE t (id INTEGER PRIMARY KEY);\n\
+                  INSERT INTO t VALUES (1);\n\
+                  -- @case second\n\
+                  SELECT COUNT(*) AS n FROM t;\n\
+                  BEGIN;\n";
+    assert_eq!(
+        agent(&[], script),
+        (
+            vec![
+                r#"{"stmt":1,"line":1,"ok":true,"rows_affected":0}"#.to_string(),
+                r#"{"stmt":2,"case":"first","line":3,"ok":true,"rows_affected":0}"#.to_string(),
+                r#"{"stmt":3,"case":"first","line":4,"ok":true,"rows_affected":1}"#.to_string(),
+                r#"{"stmt":4,"case":"second","line":6,"ok":false,"error":{"kind":"table_or_view_not_found","message":"table or view 't' not found"}}"#.to_string(),
+                r#"{"stmt":5,"case":"second","line":7,"ok":true,"rows_affected":0}"#.to_string(),
+                r#"{"done":true,"statements":5,"failed":1,"first_failed":4,"open_transaction":true,"cases":[{"name":"first","statements":2,"failed":0,"open_transaction":false},{"name":"second","statements":2,"failed":1,"open_transaction":true}]}"#.to_string(),
+            ],
+            1
+        )
+    );
+}
+
+#[test]
+fn stop_on_error_skips_the_rest_of_the_case_only() {
+    let script = "-- @case a\nSELECT nope;\nSELECT 2 AS b;\n-- @case b\nSELECT 3 AS c;\n";
+    assert_eq!(
+        agent(&["--on-error", "stop"], script),
+        (
+            vec![
+                r#"{"stmt":1,"case":"a","line":2,"ok":false,"error":{"kind":"column_not_found","message":"column 'nope' not found"}}"#.to_string(),
+                r#"{"stmt":3,"case":"b","line":5,"ok":true,"columns":["c"],"types":["INTEGER"],"rows":[[3]],"row_count":1}"#.to_string(),
+                r#"{"done":true,"statements":3,"failed":1,"first_failed":1,"skipped":1,"open_transaction":false,"cases":[{"name":"a","statements":2,"failed":1,"open_transaction":false},{"name":"b","statements":1,"failed":0,"open_transaction":false}]}"#.to_string(),
+            ],
+            1
+        )
+    );
+}
+
+#[test]
+fn a_time_past_the_nanosecond_range_keeps_its_fraction_in_the_hash() {
+    let h = hashes(
+        &[],
+        "SELECT TIMESTAMP '2500-01-01 00:00:00.1' AS t;\nSELECT TIMESTAMP '2500-01-01 00:00:00.2' AS t;\n",
+    );
+    assert_eq!(h.len(), 2);
+    assert_ne!(h[0].0, h[1].0, "{h:?}");
+}
+
+#[test]
+fn a_case_runs_with_the_timeout_of_the_run() {
+    let timeouts = |args: &[&str]| -> Vec<String> {
+        let (lines, _) = agent(
+            args,
+            "PRAGMA query_timeout;\n-- @case a\nPRAGMA query_timeout;\n",
+        );
+        lines[..2]
+            .iter()
+            .map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                v["rows"][0][0].to_string()
+            })
+            .collect()
+    };
+    assert_eq!(timeouts(&[]), ["30000", "30000"]);
+    assert_eq!(timeouts(&["-t", "50"]), ["50", "50"]);
+    assert_eq!(
+        timeouts(&["-d", "memory://?query_timeout=1234"]),
+        ["1234", "1234"]
+    );
+    assert_eq!(timeouts(&["-d", "memory://?query_timeout=0"]), ["0", "0"]);
 }
