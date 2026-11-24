@@ -131,10 +131,15 @@ impl Splitter {
             let at = base + token.position.offset as usize;
             let line = self.resume_line + token.position.line as usize - 1;
             if let Some((mut statement, semicolon_line)) = cut.take() {
-                if token.token_type == TokenType::Comment && line == semicolon_line {
-                    if let Some(params) = params_of(&token.literal) {
-                        statement.params = params;
-                    }
+                let trailing =
+                    match token.token_type == TokenType::Comment && line == semicolon_line {
+                        true => params_of(&token.literal),
+                        false => None,
+                    };
+                // Only a PARAMS comment is taken here; any other token, an
+                // open block comment among them, is read as below
+                if let Some(params) = trailing {
+                    statement.params = params;
                     out.push(statement);
                     continue;
                 }
@@ -257,21 +262,23 @@ pub fn command(sql: &str) -> Command {
         return Command::Other;
     };
     let alone = tokens.next().is_none();
-    let bare = alone && !first.quoted && first.token_type != TokenType::String;
+    let from = first.position.offset as usize;
+    // Written as a word, not quoted with double quotes or backticks
+    let bare = alone
+        && matches!(first.token_type, TokenType::Identifier | TokenType::Keyword)
+        && sql.as_bytes()[from].is_ascii_alphabetic();
     let word = |words: &[&str]| words.iter().any(|w| first.literal.eq_ignore_ascii_case(w));
+    // The backslash forms are no SQL tokens: they are read as written
+    let rest = sql[from..].trim().trim_end_matches(';').trim();
+    let slash = |forms: &[&str]| forms.iter().any(|f| rest.eq_ignore_ascii_case(f));
     match first.keyword {
         Some(Keyword::Begin) => Command::Begin,
         Some(Keyword::Explain) => Command::Explain,
         Some(Keyword::Commit) if alone => Command::Commit,
         Some(Keyword::Rollback) if alone => Command::Rollback,
-        _ if bare && word(&["exit", "quit"]) => Command::Exit,
-        _ if bare && word(&["help"]) => Command::Help,
-        // The backslash forms are no SQL tokens: they are read as written
-        _ => match sql.trim().trim_end_matches(';').trim() {
-            "\\q" => Command::Exit,
-            "\\h" | "\\?" => Command::Help,
-            _ => Command::Other,
-        },
+        _ if bare && word(&["exit", "quit"]) || slash(&["\\q"]) => Command::Exit,
+        _ if bare && word(&["help"]) || slash(&["\\h", "\\?"]) => Command::Help,
+        _ => Command::Other,
     }
 }
 
@@ -981,6 +988,16 @@ mod tests {
                 (5, "SELECT 2".to_string()),
             ]
         );
+        assert_eq!(
+            split("SELECT 1; /* start;\nSELECT 0;\nDROP TABLE t;\n*/ SELECT 2;"),
+            vec![
+                (1, "SELECT 1".to_string()),
+                (
+                    4,
+                    "/* start;\nSELECT 0;\nDROP TABLE t;\n*/ SELECT 2".to_string()
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -998,6 +1015,11 @@ mod tests {
             ("\"COMMIT\"", Command::Other),
             ("\"ROLLBACK\";", Command::Other),
             ("/* note */ help;", Command::Help),
+            ("`quit`", Command::Other),
+            ("\"exit\";", Command::Other),
+            ("/* note */ \\h;", Command::Help),
+            ("\\H", Command::Help),
+            ("\\Q;", Command::Exit),
             ("-- bye\nquit", Command::Exit),
             ("'help'", Command::Other),
         ];

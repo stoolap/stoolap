@@ -143,21 +143,25 @@ fn a_params_comment_after_the_semicolon_gives_the_statement_its_parameters() {
 
 #[test]
 fn nothing_inside_an_open_block_comment_runs() {
-    let script = "CREATE TABLE t (id INTEGER PRIMARY KEY);\n\
-                  INSERT INTO t VALUES (1);\n\
-                  /* start;\n\
-                  SELECT 0;\n\
-                  DROP TABLE t;\n\
-                  */\n\
-                  SELECT COUNT(*) AS n FROM t;\n";
-    assert_eq!(
-        cli(&["-q"], script),
-        (
-            "0 rows affected\n1 row affected\nn\n----\n1\n".into(),
-            "".into(),
-            0
-        )
-    );
+    for opening in ["\n/* start;", " /* start;"] {
+        let script = format!(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY);\n\
+             INSERT INTO t VALUES (1);{opening}\n\
+             SELECT 0;\n\
+             DROP TABLE t;\n\
+             */\n\
+             SELECT COUNT(*) AS n FROM t;\n"
+        );
+        assert_eq!(
+            cli(&["-q"], &script),
+            (
+                "0 rows affected\n1 row affected\nn\n----\n1\n".into(),
+                "".into(),
+                0
+            ),
+            "{script}"
+        );
+    }
 }
 
 #[test]
