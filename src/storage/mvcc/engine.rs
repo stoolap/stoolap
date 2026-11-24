@@ -1775,8 +1775,11 @@ impl MVCCEngine {
                     && !stop_flag_clone.load(Ordering::Acquire)
                     && !engine.hot_limits.seal_requested.load(Ordering::Acquire)
                 {
-                    thread::sleep(check_interval);
-                    elapsed += check_interval;
+                    // `CleanupHandle::stop` unparks the thread, so a close
+                    // does not wait out the step
+                    let step = std::time::Instant::now();
+                    thread::park_timeout(check_interval);
+                    elapsed += step.elapsed();
                     // The allocator returns freed memory only as threads
                     // allocate; this keeps it going while the engine waits
                     #[cfg(feature = "jemalloc")]
@@ -9998,6 +10001,7 @@ impl CleanupHandle {
         self.stop_flag.store(true, Ordering::Release);
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(handle) = self.thread.take() {
+            handle.thread().unpark();
             let _ = handle.join();
         }
     }
