@@ -388,3 +388,37 @@ fn stop_on_error_skips_the_rest_of_the_case_only() {
         )
     );
 }
+
+#[test]
+fn a_time_past_the_nanosecond_range_keeps_its_fraction_in_the_hash() {
+    let h = hashes(
+        &[],
+        "SELECT TIMESTAMP '2500-01-01 00:00:00.1' AS t;\nSELECT TIMESTAMP '2500-01-01 00:00:00.2' AS t;\n",
+    );
+    assert_eq!(h.len(), 2);
+    assert_ne!(h[0].0, h[1].0, "{h:?}");
+}
+
+#[test]
+fn a_case_runs_with_the_timeout_of_the_run() {
+    let timeouts = |args: &[&str]| -> Vec<String> {
+        let (lines, _) = agent(
+            args,
+            "PRAGMA query_timeout;\n-- @case a\nPRAGMA query_timeout;\n",
+        );
+        lines[..2]
+            .iter()
+            .map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                v["rows"][0][0].to_string()
+            })
+            .collect()
+    };
+    assert_eq!(timeouts(&[]), ["30000", "30000"]);
+    assert_eq!(timeouts(&["-t", "50"]), ["50", "50"]);
+    assert_eq!(
+        timeouts(&["-d", "memory://?query_timeout=1234"]),
+        ["1234", "1234"]
+    );
+    assert_eq!(timeouts(&["-d", "memory://?query_timeout=0"]), ["0", "0"]);
+}

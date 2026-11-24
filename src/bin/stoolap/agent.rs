@@ -381,9 +381,11 @@ fn mix_value(h: u64, value: &Value) -> u64 {
         Value::Float(f) => mix(mix(h, 2), f.to_bits()),
         Value::Text(s) => mix_bytes(mix(h, 3), s.as_bytes()),
         Value::Boolean(b) => mix(mix(h, 4), *b as u64),
+        // Seconds and the nanoseconds within them apart: a time past the
+        // range of i64 nanoseconds keeps its fraction
         Value::Timestamp(ts) => mix(
-            mix(h, 5),
-            ts.timestamp_nanos_opt().unwrap_or(ts.timestamp()) as u64,
+            mix(mix(h, 5), ts.timestamp() as u64),
+            ts.timestamp_subsec_nanos() as u64,
         ),
         Value::Extension(data) => match data.split_first() {
             Some((&kind, bytes)) => mix_bytes(mix(h, 16 + kind as u64), bytes),

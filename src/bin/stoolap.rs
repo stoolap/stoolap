@@ -1047,10 +1047,17 @@ fn main() {
     let opened = opening.elapsed();
 
     // The connection's own timeout bounds every statement it runs, those of
-    // a transaction too; agent mode never waits on a statement for ever
-    let default_timeout = agent && matches!(Database::dsn_query_timeout(&db_path), Ok(None));
-    if let Some(ms) = args.timeout_ms.or(default_timeout.then_some(30_000))
-        && let Err(e) = db.execute(&format!("PRAGMA query_timeout = {ms}"), ())
+    // a transaction too: -t, else the connection string's, else 30 seconds
+    // in agent mode, which never waits on a statement for ever. Resolved
+    // once, it is the timeout of every case's database as well
+    let dsn_timeout_ms = Database::dsn_query_timeout(&db_path).ok().flatten();
+    let run_timeout_ms =
+        args.timeout_ms
+            .or(dsn_timeout_ms)
+            .unwrap_or(if agent { 30_000 } else { 0 });
+    // The open already gave the connection the connection string's
+    if run_timeout_ms != dsn_timeout_ms.unwrap_or(0)
+        && let Err(e) = db.execute(&format!("PRAGMA query_timeout = {run_timeout_ms}"), ())
     {
         eprintln!("Error setting the timeout: {}", e);
         std::process::exit(1);
@@ -1092,7 +1099,7 @@ fn main() {
     let mode = Mode {
         agent,
         dsn: &db_path,
-        case_timeout_ms: args.timeout_ms.unwrap_or(30_000),
+        case_timeout_ms: run_timeout_ms,
     };
     if let Some(ref sql) = args.execute {
         run_script_and_exit(db, sql.split('\n').map(|l| Ok(l.to_string())), &args, mode);
