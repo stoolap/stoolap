@@ -381,13 +381,15 @@ fn params_of(comment: &str) -> Option<String> {
 }
 
 /// The values a PARAMS list holds, read as the engine reads `SELECT <list>`:
-/// SQL literals, text in single quotes
+/// SQL literals, text in single quotes. The list is parsed first and only a
+/// list of literals runs, so nothing in it reads a table or changes one
 pub fn param_values(session: &mut Session, list: Option<&str>) -> Result<Vec<Value>, Failure> {
     let Some(list) = list.filter(|list| !list.is_empty()) else {
         return Ok(Vec::new());
     };
+    let select = literal_select(list).map_err(Failure::Params)?;
     let read = |session: &mut Session| -> stoolap::Result<Vec<Value>> {
-        let mut rows = session.query(&format!("SELECT {list}"), Vec::new())?;
+        let mut rows = session.query(&select, Vec::new())?;
         let values = match rows.advance() {
             true => rows.current_row().as_slice().to_vec(),
             false => Vec::new(),
@@ -398,6 +400,42 @@ pub fn param_values(session: &mut Session, list: Option<&str>) -> Result<Vec<Val
         }
     };
     read(session).map_err(Failure::Params)
+}
+
+/// `SELECT <list>` rebuilt from its parse when the list is one statement of
+/// literals and nothing else, a sign before a number allowed
+fn literal_select(list: &str) -> stoolap::Result<String> {
+    use stoolap::parser::ast::{Expression, Statement as Parsed};
+    let not_values = || stoolap::Error::invalid_argument(format!("not a list of values: {list}"));
+    let mut parsed = stoolap::parser::parse_sql(&format!("SELECT {list}"))
+        .map_err(|e| stoolap::Error::invalid_argument(e.to_string()))?;
+    let (Some(Parsed::Select(select)), None) = (parsed.pop(), parsed.pop()) else {
+        return Err(not_values());
+    };
+    let literal = |e: &Expression| {
+        matches!(
+            e,
+            Expression::IntegerLiteral(_)
+                | Expression::FloatLiteral(_)
+                | Expression::StringLiteral(_)
+                | Expression::BooleanLiteral(_)
+                | Expression::NullLiteral(_)
+        )
+    };
+    let value = |e: &Expression| match e {
+        Expression::Prefix(p) if matches!(p.operator.as_str(), "-" | "+") => matches!(
+            *p.right,
+            Expression::IntegerLiteral(_) | Expression::FloatLiteral(_)
+        ),
+        e => literal(e),
+    };
+    let columns: Vec<String> = select.columns.iter().map(|c| c.to_string()).collect();
+    let rebuilt = format!("SELECT {}", columns.join(", "));
+    // Any clause past the columns, FROM or WHERE among them, shows in the text
+    if !select.columns.iter().all(value) || select.to_string() != rebuilt {
+        return Err(not_values());
+    }
+    Ok(rebuilt)
 }
 
 /// What a statement is, read from its tokens with comments passed over
@@ -1485,7 +1523,19 @@ mod tests {
             ]
         );
         assert_eq!(values("").unwrap(), Vec::<Value>::new(), "an empty list");
-        for wrong in ["alice", "[3, 'x']", "'a',"] {
+        for wrong in [
+            "alice",
+            "[3, 'x']",
+            "'a',",
+            "1; DELETE FROM t",
+            "1 FROM t",
+            "1 WHERE TRUE",
+            "DISTINCT 1",
+            "1 AS a",
+            "NOW()",
+            "(SELECT 1)",
+            "-'a'",
+        ] {
             assert!(
                 matches!(values(wrong), Err(Failure::Params(_))),
                 "{wrong} is not a list of values"

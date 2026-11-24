@@ -41,7 +41,8 @@ PARAMETERS
   SELECT * FROM t WHERE id = $1 AND name = $2; -- PARAMS: 42, 'alice'
   On the statement's line or the line before. The values are SQL literals, read
   as SELECT reads them: text in single quotes ('it''s', 'a, b'), -5, 1.5, TRUE,
-  NULL. Anything else fails the statement with kind "params".
+  NULL, DATE '2024-01-02'. Anything else, a word, a function or a second
+  statement, fails the statement with kind "params" and does not run.
 
 SCENARIOS
   A line "-- @case <name>" starts a case: the statements after it run in a fresh
