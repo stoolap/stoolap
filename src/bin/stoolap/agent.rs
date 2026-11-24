@@ -255,13 +255,20 @@ impl Run<'_> {
         let timed = self.options.timing || repeating;
         self.sink.reset(explain, self.options, ordered, timed);
         let db = self.case_db.as_ref().unwrap_or(self.first);
-        let ran = script::run(
-            &mut Session::Database(db),
-            &statement.sql,
-            statement.params.clone(),
-            self.options.limit,
-            &mut self.sink,
-        );
+        let (params, ran) =
+            match script::param_values(&mut Session::Database(db), statement.params.as_deref()) {
+                Ok(params) => {
+                    let ran = script::run(
+                        &mut Session::Database(db),
+                        &statement.sql,
+                        params.clone(),
+                        self.options.limit,
+                        &mut self.sink,
+                    );
+                    (params, ran)
+                }
+                Err(failure) => (Vec::new(), Err(failure)),
+            };
         write!(w, "{{\"stmt\":{},", self.number)?;
         if let Some(case) = &self.case {
             write!(w, "\"case\":")?;
@@ -300,7 +307,7 @@ impl Run<'_> {
                     let repeats = script::repeat(
                         &mut Session::Database(db),
                         &statement.sql,
-                        &statement.params,
+                        &params,
                         took.engine,
                         (self.options.warmup, self.options.repeat - 1),
                     );
@@ -527,6 +534,7 @@ fn write_error(
 ) -> io::Result<()> {
     let kind = match failure {
         Failure::Engine(e) => e.kind(),
+        Failure::Params(_) => "params",
         Failure::Output(_) => "output",
     };
     write!(w, "{{\"kind\":\"{kind}\",\"message\":")?;

@@ -726,3 +726,49 @@ fn a_reader_that_stops_reading_ends_the_run_quietly() {
         );
     }
 }
+
+#[test]
+fn a_params_list_is_read_as_sql_values() {
+    let (lines, code) = agent(
+        &[],
+        "SELECT $1 AS a, $2 AS b, $3 AS c; -- PARAMS: 3, 'x, y', 'it''s'\n\
+         SELECT $1 AS a; -- PARAMS: alice\n",
+    );
+    assert_eq!(
+        (&lines[..2], code),
+        (
+            &[
+                r#"{"stmt":1,"line":1,"ok":true,"columns":["a","b","c"],"types":["INTEGER","TEXT","TEXT"],"rows":[[3,"x, y","it's"]],"row_count":1}"#.to_string(),
+                r#"{"stmt":2,"line":2,"ok":false,"error":{"kind":"params","message":"PARAMS, read as SQL values: invalid argument: not a list of values: alice"}}"#.to_string(),
+            ][..],
+            1
+        )
+    );
+}
+
+#[test]
+fn a_params_list_runs_nothing_but_its_values() {
+    let (lines, _) = agent(
+        &[],
+        "CREATE TABLE t (id INTEGER PRIMARY KEY);\nINSERT INTO t VALUES (1), (2);\n\
+         SELECT $1 AS v; -- PARAMS: 7; DELETE FROM t; SELECT 7\n\
+         SELECT $1 AS v; -- PARAMS: 7; BEGIN; SELECT 7\n\
+         SELECT $1 AS v; -- PARAMS: id FROM t\n\
+         SELECT COUNT(*) AS n FROM t;\n",
+    );
+    let refused = |stmt: usize, list: &str| {
+        format!(
+            r#"{{"stmt":{stmt},"line":{stmt},"ok":false,"error":{{"kind":"params","message":"PARAMS, read as SQL values: invalid argument: not a list of values: {list}"}}}}"#
+        )
+    };
+    assert_eq!(
+        &lines[2..],
+        &[
+            refused(3, "7; DELETE FROM t; SELECT 7"),
+            refused(4, "7; BEGIN; SELECT 7"),
+            refused(5, "id FROM t"),
+            r#"{"stmt":6,"line":6,"ok":true,"columns":["n"],"types":["INTEGER"],"rows":[[2]],"row_count":1}"#.to_string(),
+            r#"{"done":true,"statements":6,"failed":3,"first_failed":3,"open_transaction":false}"#.to_string(),
+        ]
+    );
+}

@@ -22,12 +22,12 @@ use stoolap::parser::lexer::Lexer;
 use stoolap::parser::token::{Keyword, Token, TokenType};
 use stoolap::{ApiTransaction, Database, Row, Rows, Value};
 
-/// A statement of a script, the line its first token is on, and the
-/// parameters a `-- PARAMS: 1, 'a'` comment gives it
+/// A statement of a script, the line its first token is on, and the list
+/// of values a `-- PARAMS: 1, 'a'` comment gives it
 pub struct Statement {
     pub line: usize,
     pub sql: String,
-    pub params: Vec<Value>,
+    pub params: Option<String>,
     /// Line and column (from 1, in characters) of the first byte of `sql`, so a
     /// position inside the statement maps to the input
     pub text_at: (usize, usize),
@@ -58,8 +58,8 @@ pub struct Splitter {
     resume_line: usize,
     /// Line of the first token of the statement being read
     first_line: Option<usize>,
-    /// Parameters a comment in the statement being read gave
-    params: Option<Vec<Value>>,
+    /// The PARAMS list a comment in the statement being read gave
+    params: Option<String>,
     /// What the text is left open in at `resume`, and whether a line since
     /// closed it
     open: Option<Open>,
@@ -207,7 +207,7 @@ impl Splitter {
         cursor: &mut Cursor,
         (start, end): (usize, usize),
         line: usize,
-        (params, case): (Vec<Value>, Option<String>),
+        (params, case): (Option<String>, Option<String>),
     ) -> Statement {
         let raw = &self.pending[start..end];
         let lead = raw.len() - raw.trim_start().len();
@@ -247,7 +247,7 @@ impl Splitter {
                 {
                     match params_of(&token.literal) {
                         Some(params) => {
-                            statement.params = params;
+                            statement.params = Some(params);
                             out.push(statement);
                         }
                         None => {
@@ -291,7 +291,7 @@ impl Splitter {
                     }
                 }
                 TokenType::Punctuator if token.literal == ";" => {
-                    let params = self.params.take().unwrap_or_default();
+                    let params = self.params.take();
                     if let Some(first) = self.first_line.take() {
                         let with = (params, self.case.take());
                         let statement = self.statement(&mut cursor, (start, at), first, with);
@@ -323,7 +323,7 @@ impl Splitter {
         }
         if at_end {
             if let Some(first) = self.first_line.take() {
-                let with = (self.params.take().unwrap_or_default(), self.case.take());
+                let with = (self.params.take(), self.case.take());
                 let end = self.pending.len();
                 out.push(self.statement(&mut cursor, (start, end), first, with));
             }
@@ -371,13 +371,74 @@ fn case_of(comment: &str) -> Option<String> {
     (rest.starts_with(char::is_whitespace) && !name.is_empty()).then(|| name.to_string())
 }
 
-/// The parameters a `-- PARAMS: 1, 'a'` comment gives its statement
-fn params_of(comment: &str) -> Option<Vec<Value>> {
+/// The list of values a `-- PARAMS: 1, 'a'` comment gives its statement
+fn params_of(comment: &str) -> Option<String> {
     let list = comment
         .strip_prefix("--")?
         .trim_start()
         .strip_prefix("PARAMS:")?;
-    Some(list.split(',').map(|v| param_value(v.trim())).collect())
+    Some(list.trim().to_string())
+}
+
+/// The values a PARAMS list holds, read as the engine reads `SELECT <list>`:
+/// SQL literals, text in single quotes. The list is parsed first and only a
+/// list of literals runs, so nothing in it reads a table or changes one
+pub fn param_values(session: &mut Session, list: Option<&str>) -> Result<Vec<Value>, Failure> {
+    let Some(list) = list.filter(|list| !list.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let select = literal_select(list).map_err(Failure::Params)?;
+    let read = |session: &mut Session| -> stoolap::Result<Vec<Value>> {
+        let mut rows = session.query(&select, Vec::new())?;
+        let values = match rows.advance() {
+            true => rows.current_row().as_slice().to_vec(),
+            false => Vec::new(),
+        };
+        match rows.error() {
+            Some(e) => Err(e),
+            None => Ok(values),
+        }
+    };
+    read(session).map_err(Failure::Params)
+}
+
+/// `SELECT <list>` when its parse is one statement of literals and nothing
+/// else, a sign before a number allowed; the text runs as written, as a
+/// literal's printed form can lose its sign
+fn literal_select(list: &str) -> stoolap::Result<String> {
+    use stoolap::parser::ast::{Expression, Statement as Parsed};
+    let not_values = || stoolap::Error::invalid_argument(format!("not a list of values: {list}"));
+    let text = format!("SELECT {list}");
+    let mut parsed = stoolap::parser::parse_sql(&text)
+        .map_err(|e| stoolap::Error::invalid_argument(e.to_string()))?;
+    let (Some(Parsed::Select(select)), None) = (parsed.pop(), parsed.pop()) else {
+        return Err(not_values());
+    };
+    let literal = |e: &Expression| {
+        matches!(
+            e,
+            Expression::IntegerLiteral(_)
+                | Expression::FloatLiteral(_)
+                | Expression::StringLiteral(_)
+                | Expression::BooleanLiteral(_)
+                | Expression::NullLiteral(_)
+                | Expression::IntervalLiteral(_)
+        )
+    };
+    let value = |e: &Expression| match e {
+        Expression::Prefix(p) if matches!(p.operator.as_str(), "-" | "+") => matches!(
+            *p.right,
+            Expression::IntegerLiteral(_) | Expression::FloatLiteral(_)
+        ),
+        e => literal(e),
+    };
+    let columns: Vec<String> = select.columns.iter().map(|c| c.to_string()).collect();
+    // Any clause past the columns, FROM or WHERE among them, shows in the printed form
+    let only_columns = select.to_string() == format!("SELECT {}", columns.join(", "));
+    if !select.columns.iter().all(value) || !only_columns {
+        return Err(not_values());
+    }
+    Ok(text)
 }
 
 /// What a statement is, read from its tokens with comments passed over
@@ -726,10 +787,12 @@ pub enum Ran {
     Affected(i64),
 }
 
-/// Why a statement gave no result: the engine's error, or the output's
+/// Why a statement gave no result: the engine's error, its PARAMS list's,
+/// or the output's
 #[derive(Debug)]
 pub enum Failure {
     Engine(stoolap::Error),
+    Params(stoolap::Error),
     Output(io::Error),
 }
 
@@ -737,6 +800,7 @@ impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Failure::Engine(e) => write!(f, "{e}"),
+            Failure::Params(e) => write!(f, "PARAMS, read as SQL values: {e}"),
             Failure::Output(e) => write!(f, "writing output: {e}"),
         }
     }
@@ -901,7 +965,7 @@ fn run_ready<W: Write>(
         let printed = print_statement(
             &mut Session::Database(db),
             &statement.sql,
-            statement.params,
+            statement.params.as_deref(),
             out,
         );
         match printed {
@@ -926,9 +990,10 @@ fn run_ready<W: Write>(
 pub fn print_statement<W: Write>(
     session: &mut Session,
     sql: &str,
-    params: Vec<Value>,
+    params: Option<&str>,
     out: &mut Output<W>,
 ) -> Result<Timing, Failure> {
+    let params = param_values(session, params)?;
     let Output {
         out: w,
         format,
@@ -1256,23 +1321,6 @@ pub fn write_json_value(w: &mut impl Write, value: &Value) -> io::Result<()> {
     }
 }
 
-fn param_value(value: &str) -> Value {
-    if let Ok(i) = value.parse::<i64>() {
-        return Value::Integer(i);
-    }
-    if value.contains('.')
-        && let Ok(f) = value.parse::<f64>()
-    {
-        return Value::Float(f);
-    }
-    match value {
-        "true" => Value::Boolean(true),
-        "false" => Value::Boolean(false),
-        _ if value.eq_ignore_ascii_case("null") => Value::null_unknown(),
-        _ => Value::text(value),
-    }
-}
-
 // The jemalloc feature, on by default, sets the library's own global allocator
 #[cfg(all(test, not(feature = "jemalloc")))]
 mod alloc_tests {
@@ -1318,7 +1366,7 @@ mod alloc_tests {
             warmup: 0,
         };
         let before = ALLOCATIONS.with(Cell::get);
-        print_statement(&mut Session::Database(db), sql, Vec::new(), &mut out).unwrap();
+        print_statement(&mut Session::Database(db), sql, None, &mut out).unwrap();
         ALLOCATIONS.with(Cell::get) - before
     }
 
@@ -1425,7 +1473,7 @@ mod tests {
         );
     }
 
-    fn params(text: &str) -> Vec<(String, Vec<Value>)> {
+    fn params(text: &str) -> Vec<(String, Option<String>)> {
         let mut splitter = Splitter::default();
         let mut out = Vec::new();
         for line in text.split('\n') {
@@ -1437,27 +1485,79 @@ mod tests {
 
     #[test]
     fn a_params_comment_belongs_to_its_statement() {
+        let list = |list: &str| Some(list.to_string());
         assert_eq!(
             params(
                 "SELECT $1; -- PARAMS: 7\nSELECT $1 -- PARAMS: 'b', 2\n;\nSELECT 'x -- PARAMS: y'"
             ),
             vec![
-                ("SELECT $1".to_string(), vec![Value::Integer(7)]),
+                ("SELECT $1".to_string(), list("7")),
                 (
                     "-- PARAMS: 7\nSELECT $1 -- PARAMS: 'b', 2".to_string(),
-                    vec![Value::text("'b'"), Value::Integer(2)]
+                    list("'b', 2")
                 ),
-                ("SELECT 'x -- PARAMS: y'".to_string(), vec![]),
+                ("SELECT 'x -- PARAMS: y'".to_string(), None),
             ]
         );
         assert_eq!(
             params("SELECT $1; /* note */ # more\n"),
-            vec![("SELECT $1".to_string(), vec![])]
+            vec![("SELECT $1".to_string(), None)]
         );
         assert_eq!(
             params("SELECT $1; /* note */ -- PARAMS: 7"),
-            vec![("SELECT $1".to_string(), vec![Value::Integer(7)])]
+            vec![("SELECT $1".to_string(), list("7"))]
         );
+    }
+
+    #[test]
+    fn a_params_list_holds_sql_values() {
+        let db = Database::open("memory://cli_params_list_holds_sql_values").unwrap();
+        let values = |list: &str| param_values(&mut Session::Database(&db), Some(list));
+        assert_eq!(
+            values("3, 'x, y', 'it''s', -5, 1.5, TRUE, NULL").unwrap(),
+            vec![
+                Value::Integer(3),
+                Value::text("x, y"),
+                Value::text("it's"),
+                Value::Integer(-5),
+                Value::Float(1.5),
+                Value::Boolean(true),
+                Value::null_unknown(),
+            ]
+        );
+        assert_eq!(
+            values("-1.5, -1e3, +2.5, INTERVAL '1 day', INTERVAL 1 DAY").unwrap(),
+            vec![
+                Value::Float(-1.5),
+                Value::Float(-1000.0),
+                Value::Float(2.5),
+                Value::text("1 day"),
+                Value::text("1 day"),
+            ]
+        );
+        assert!(
+            matches!(values("-0.0").unwrap()[..], [Value::Float(z)] if z.is_sign_negative()),
+            "-0.0 keeps its sign"
+        );
+        assert_eq!(values("").unwrap(), Vec::<Value>::new(), "an empty list");
+        for wrong in [
+            "alice",
+            "[3, 'x']",
+            "'a',",
+            "1; DELETE FROM t",
+            "1 FROM t",
+            "1 WHERE TRUE",
+            "DISTINCT 1",
+            "1 AS a",
+            "NOW()",
+            "(SELECT 1)",
+            "-'a'",
+        ] {
+            assert!(
+                matches!(values(wrong), Err(Failure::Params(_))),
+                "{wrong} is not a list of values"
+            );
+        }
     }
 
     #[test]
@@ -1465,8 +1565,8 @@ mod tests {
         assert_eq!(
             params("SELECT 'a\r\nb';\r\nSELECT 2\r"),
             vec![
-                ("SELECT 'a\r\nb'".to_string(), vec![]),
-                ("SELECT 2".to_string(), vec![])
+                ("SELECT 'a\r\nb'".to_string(), None),
+                ("SELECT 2".to_string(), None)
             ]
         );
     }
