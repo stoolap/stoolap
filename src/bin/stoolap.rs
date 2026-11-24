@@ -53,7 +53,8 @@ const VERSION: &str = concat!(
 #[command(about = "High-performance embedded SQL database with MVCC")]
 #[command(
     long_about = "Stoolap is a high-performance embedded SQL database with MVCC transactions.\n\
-This CLI provides an interactive interface to execute SQL queries and manage your database.\n\n\
+This CLI provides an interactive interface to execute SQL queries and manage your database.\n\
+A program or an AI agent: run `stoolap --agent --help` for agent mode, JSON lines out.\n\n\
 PERSISTENCE DSN PARAMETERS:\n\
   file:///path/to/db?param=value&param2=value2\n\n\
   sync_mode=none|normal|full   Fsync mode (default: normal)\n\
@@ -195,6 +196,17 @@ struct Args {
     /// Agent mode: add each statement's engine time as elapsed_us
     #[arg(long = "timing")]
     timing: bool,
+
+    /// Run each statement that only reads N times, -e, -f, piped input and
+    /// agent mode: the first prints, and the spread of the engine times of
+    /// the others is given after it
+    #[arg(long = "repeat", value_name = "N", default_value = "1", value_parser = clap::value_parser!(u64).range(1..))]
+    repeat: u64,
+
+    /// With --repeat: runs after the first, before the measured ones, that
+    /// are run and not measured
+    #[arg(long = "warmup", value_name = "M", default_value = "0")]
+    warmup: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum, Debug)]
@@ -399,6 +411,8 @@ impl Cli {
                 limit: self.limit,
                 quiet: true,
                 timing: false,
+                repeat: 1,
+                warmup: 0,
             };
             return script::print_statement(&mut session, query, params, &mut out)
                 .map_err(|e| e.to_string());
@@ -697,11 +711,26 @@ fn print_persistence_info(args: &Args) {
     }
 }
 
+/// Agent mode is turned on only by asking, never by what the environment
+/// looks like
+fn agent_mode(agent: bool, no_agent: bool) -> bool {
+    !no_agent && (agent || std::env::var("STOOLAP_AGENT").is_ok_and(|v| v == "1"))
+}
+
 fn main() {
-    let mut args = Args::parse();
-    // Turned on only by asking, never by what the environment looks like
-    let agent =
-        !args.no_agent && (args.agent || std::env::var("STOOLAP_AGENT").is_ok_and(|v| v == "1"));
+    let mut args = match Args::try_parse() {
+        Ok(args) => args,
+        Err(e) if e.kind() == clap::error::ErrorKind::DisplayHelp => {
+            let given = |flag: &str| std::env::args().any(|a| a == flag);
+            if agent_mode(given("--agent"), given("--no-agent")) {
+                print!("{}", include_str!("stoolap/agent_guide.txt"));
+                std::process::exit(0);
+            }
+            e.exit()
+        }
+        Err(e) => e.exit(),
+    };
+    let agent = agent_mode(args.agent, args.no_agent);
     if agent {
         args.quiet = true;
     }
@@ -1187,6 +1216,8 @@ fn run_script_and_exit(
             full: args.full,
             stop_on_error: args.on_error == OnError::Stop,
             timing: args.timing,
+            repeat: args.repeat as usize,
+            warmup: args.warmup as usize,
         };
         let mut out = io::BufWriter::new(io::stdout().lock());
         // Each case gets a database of its own, named so no other open
@@ -1221,6 +1252,8 @@ fn run_script_and_exit(
         limit: args.limit,
         quiet: args.quiet,
         timing: !args.json_output && !args.quiet,
+        repeat: args.repeat as usize,
+        warmup: args.warmup as usize,
     };
     let result = script::run_script(&db, lines, &mut output);
     drop(output);

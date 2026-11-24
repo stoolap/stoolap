@@ -422,3 +422,236 @@ fn a_case_runs_with_the_timeout_of_the_run() {
     );
     assert_eq!(timeouts(&["-d", "memory://?query_timeout=0"]), ["0", "0"]);
 }
+
+#[test]
+fn repeat_runs_a_reading_statement_again_and_gives_the_spread() {
+    let (lines, code) = agent_lines(
+        &["--repeat", "4", "--warmup", "2"],
+        "CREATE TABLE t (id INTEGER PRIMARY KEY);\nINSERT INTO t VALUES (1);\nSELECT id FROM t;\n",
+    );
+    let parsed: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(code, 0);
+    assert!(parsed[0].get("repeat").is_none() && parsed[1].get("repeat").is_none());
+    let repeat = &parsed[2]["repeat"];
+    let us = |key: &str| repeat[key].as_u64().unwrap();
+    assert_eq!(
+        (&repeat["runs"], &repeat["warmup"]),
+        (&4.into(), &2.into()),
+        "{}",
+        lines[2]
+    );
+    assert!(
+        us("min_us") <= us("p50_us")
+            && us("p50_us") <= us("p90_us")
+            && us("p90_us") <= us("max_us"),
+        "{}",
+        lines[2]
+    );
+    assert!(repeat.get("first_us").is_some() && repeat.get("failed").is_none());
+    assert_eq!(parsed[2]["rows"], serde_json::json!([[1]]), "printed once");
+}
+
+#[test]
+fn repeat_in_the_table_and_json_outputs() {
+    let (out, _, code) = run(
+        &[
+            "-q",
+            "--repeat",
+            "3",
+            "--warmup",
+            "1",
+            "-e",
+            "SELECT 1 AS a",
+        ],
+        &[],
+        "",
+    );
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!((&lines[..3], code), (&["a", "----", "1"][..], 0), "{out}");
+    assert!(
+        lines[3].starts_with("Ran 3 times after 1 warmup run: first ")
+            && lines[3].contains(", then min ")
+            && lines[3].contains(", p90 "),
+        "{out}"
+    );
+    let (out, _, _) = run(
+        &["-q", "-j", "--repeat", "3", "-e", "SELECT 1 AS a"],
+        &[],
+        "",
+    );
+    let json: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(
+        (
+            json["rows"].clone(),
+            json["count"].clone(),
+            json["repeat"]["runs"].clone()
+        ),
+        (
+            serde_json::json!([[1]]),
+            serde_json::json!(1),
+            serde_json::json!(3)
+        )
+    );
+}
+
+#[test]
+fn schema_gives_every_table_in_one_line() {
+    let script = "CREATE TABLE \"my t\" (id INTEGER PRIMARY KEY, a INTEGER UNIQUE, b TEXT);\n\
+                  CREATE INDEX ib ON \"my t\"(b);\n\
+                  INSERT INTO \"my t\" VALUES (1, 2, 'x');\n\
+                  CREATE VIEW v AS SELECT id FROM \"my t\";\n\
+                  .schema\n\
+                  .schema nope\n\
+                  .tables\n";
+    let (lines, code) = agent(&[], script);
+    assert_eq!(
+        (&lines[4..], code),
+        (
+            &[
+                r#"{"stmt":5,"line":5,"ok":true,"command":".schema","tables":[{"table":"my t","create":"CREATE TABLE \"my t\" (id INTEGER PRIMARY KEY, a INTEGER UNIQUE, b TEXT)","indexes":[{"table_name":"my t","index_name":"unique_my t_a","column_name":"a","index_type":"BTREE","is_unique":true,"options":""},{"table_name":"my t","index_name":"ib","column_name":"b","index_type":"BTREE","is_unique":false,"options":""}],"row_count":1}],"views":["v"]}"#.to_string(),
+                r#"{"stmt":6,"line":6,"ok":false,"error":{"kind":"table_not_found","message":"table 'nope' not found"}}"#.to_string(),
+                r#"{"stmt":7,"line":7,"ok":false,"error":{"kind":"unknown_command","message":"unknown command: .tables"}}"#.to_string(),
+                r#"{"done":true,"statements":7,"failed":2,"first_failed":6,"open_transaction":false}"#.to_string(),
+            ][..],
+            1
+        )
+    );
+}
+
+#[test]
+fn stats_gives_the_three_statistics() {
+    let (lines, _) = agent(&[], "CREATE TABLE t (id INTEGER PRIMARY KEY);\n.stats\n");
+    let stats: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+    assert!(
+        stats["ok"] == true
+            && stats["memory_stats"].is_array()
+            && stats["volume_stats"].is_array()
+            && stats["index_stats"].is_array(),
+        "{}",
+        lines[1]
+    );
+}
+
+#[test]
+fn a_command_line_is_one_only_between_statements() {
+    let script = "-- @case c\n.schema\nCREATE TABLE u (id INTEGER PRIMARY KEY);\n\
+                  /* x\n.schema\n*/ SELECT 2 AS c;\n";
+    let (lines, _) = agent(&[], script);
+    assert_eq!(
+        &lines[..3],
+        [
+            r#"{"stmt":1,"case":"c","line":2,"ok":true,"command":".schema","tables":[],"views":[]}"#,
+            r#"{"stmt":2,"case":"c","line":3,"ok":true,"rows_affected":0}"#,
+            r#"{"stmt":3,"case":"c","line":6,"ok":true,"columns":["c"],"types":["INTEGER"],"rows":[[2]],"row_count":1}"#,
+        ]
+    );
+}
+
+/// A run of `args` whose first run of a SLEEP that fails half the time
+/// succeeded, so its failure, nearly sure among 29 more, is a repeat's
+fn first_run_passing(args: &[&str]) -> (String, String, i32) {
+    let sql = "SELECT SLEEP(CASE WHEN RANDOM() < 0.5 THEN 0 ELSE -1 END) AS s";
+    let mut all = args.to_vec();
+    all.extend_from_slice(&["--repeat", "30", "-e", sql]);
+    (0..20)
+        .map(|_| run(&all, &[], ""))
+        .find(|(out, _, _)| out.contains("\"s\"") || out.starts_with("s\n"))
+        .expect("a first run passed")
+}
+
+#[test]
+fn a_repeat_that_fails_fails_the_statement() {
+    let (out, _, code) = first_run_passing(&["--agent"]);
+    let lines: Vec<serde_json::Value> = out
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let failed = lines[1]["repeat"]["failed"].as_str().unwrap_or("");
+    assert!(
+        lines[1]["ok"] == true
+            && failed.contains("SLEEP duration cannot be negative")
+            && lines[2]["failed"] == 1
+            && lines[2]["first_failed"] == 1
+            && code == 1,
+        "{out}"
+    );
+    let (out, err, code) = first_run_passing(&["-q"]);
+    assert!(
+        out.starts_with("s\n----\n0\nRan ")
+            && out.contains("; stopped: invalid argument: SLEEP duration cannot be negative")
+            && err.starts_with("Error (statement 1, line 1): ")
+            && code == 1,
+        "{out}{err}"
+    );
+}
+
+#[test]
+fn a_command_follows_a_block_comment_closed_on_a_later_line() {
+    let (lines, _) = agent(&[], "/* ;\n*/\n.schema\n");
+    assert_eq!(
+        lines[0],
+        r#"{"stmt":1,"line":3,"ok":true,"command":".schema","tables":[],"views":[]}"#
+    );
+}
+
+#[test]
+fn a_warmup_that_fails_counts_only_the_runs_that_passed() {
+    let (out, _, _) = first_run_passing(&["--agent", "--warmup", "10"]);
+    let line: serde_json::Value = serde_json::from_str(out.lines().nth(1).unwrap()).unwrap();
+    let repeat = &line["repeat"];
+    // With no measured run, the failure came within the ten warmup runs
+    if repeat.get("min_us").is_none() {
+        assert!(repeat["warmup"].as_u64().unwrap() < 10, "{out}");
+    }
+}
+
+const GUIDE: &str = include_str!("../../src/bin/stoolap/agent_guide.txt");
+
+#[test]
+fn help_in_agent_mode_gives_the_agent_guide() {
+    let (out, err, code) = run(&["--agent", "--help"], &[], "");
+    assert_eq!((out.as_str(), err.as_str(), code), (GUIDE, "", 0));
+    let (out, _, _) = run(&["-h"], &[("STOOLAP_AGENT", "1")], "");
+    assert_eq!(out, GUIDE, "the variable turns it on");
+    let (out, _, code) = run(&["--help"], &[], "");
+    assert!(
+        out.contains("run `stoolap --agent --help` for agent mode")
+            && !out.contains("COMPARE ANSWERS")
+            && code == 0,
+        "{out}"
+    );
+    let (out, _, _) = run(&["--agent", "--no-agent", "--help"], &[], "");
+    assert!(!out.contains("COMPARE ANSWERS"), "{out}");
+}
+
+#[test]
+fn the_agent_guide_names_only_flags_that_exist() {
+    let (help, _, _) = run(&["--help"], &[], "");
+    let flags: Vec<&str> = GUIDE
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .filter(|w| w.starts_with("--") && w.len() > 2)
+        .collect();
+    assert!(flags.len() >= 8, "{flags:?}");
+    for flag in flags {
+        assert!(
+            help.contains(&format!("{flag} ")) || help.contains(&format!("{flag}\n")),
+            "{flag} is not a flag"
+        );
+    }
+}
+
+#[test]
+fn the_agent_guide_example_gives_the_lines_it_shows() {
+    let (out, _, code) = run(&["--agent", "-e", "SELECT 1 AS a; SELECT nope"], &[], "");
+    let shown: Vec<&str> = GUIDE
+        .lines()
+        .skip_while(|l| !l.starts_with("OUTPUT"))
+        .skip(2)
+        .take(3)
+        .map(str::trim)
+        .collect();
+    assert_eq!((out.lines().skip(1).collect::<Vec<_>>(), code), (shown, 1));
+}

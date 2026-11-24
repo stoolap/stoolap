@@ -35,6 +35,10 @@ pub struct Options {
     pub stop_on_error: bool,
     /// Add each statement's engine time
     pub timing: bool,
+    /// Runs of a statement that only reads, the first written, 1 for once,
+    /// and the unmeasured runs between the first and the measured ones
+    pub repeat: usize,
+    pub warmup: usize,
 }
 
 /// Opens the database the `n`th case runs in
@@ -69,9 +73,21 @@ pub fn run_script<W: Write>(
     };
     let mut splitter = Splitter::default();
     let mut ready = Vec::new();
-    for line in lines {
-        splitter.push_line(&line?, &mut ready);
-        run.statements(&mut ready, w)?;
+    for (number, line) in lines.enumerate() {
+        let line = line?;
+        // A line starting with a dot between statements is a command of
+        // the CLI; the splitter takes an empty line in its place to keep
+        // counting lines
+        if line.trim_start().starts_with('.') && !splitter.in_statement() {
+            if let Some(name) = splitter.take_case() {
+                run.start_case(name)?;
+            }
+            splitter.push_line("", &mut ready);
+            run.dot_command(line.trim(), number + 1, w)?;
+        } else {
+            splitter.push_line(&line, &mut ready);
+            run.statements(&mut ready, w)?;
+        }
         if run.exited {
             break;
         }
@@ -154,6 +170,17 @@ fn open_transaction(db: &Database) -> &'static str {
 }
 
 impl Run<'_> {
+    /// Counts the statement running as failed, in the run and its case,
+    /// and under `--on-error stop` skips the rest of the case
+    fn count_failure(&mut self) {
+        self.failed += 1;
+        if let Some(case) = &mut self.case {
+            case.failed += 1;
+        }
+        self.first_failed.get_or_insert(self.number);
+        self.stopped = self.options.stop_on_error;
+    }
+
     fn db(&self) -> &Database {
         self.case_db.as_ref().unwrap_or(self.first)
     }
@@ -220,8 +247,11 @@ impl Run<'_> {
     fn statement(&mut self, statement: Statement, w: &mut impl Write) -> io::Result<()> {
         let explain = script::command(&statement.sql) == Command::Explain;
         let ordered = !explain && script::orders_rows(&statement.sql);
-        self.sink
-            .reset(explain, self.options.full, ordered, self.options.timing);
+        let repeating = self.options.repeat > 1 && !explain && script::reads_only(&statement.sql);
+        // A first run the warm ones are set against is timed apart from
+        // the sink's hash and types, as they run without them
+        let timed = self.options.timing || repeating;
+        self.sink.reset(explain, self.options.full, ordered, timed);
         let db = self.case_db.as_ref().unwrap_or(self.first);
         let ran = script::run(
             &mut Session::Database(db),
@@ -239,12 +269,7 @@ impl Run<'_> {
         write!(w, "\"line\":{},", statement.line)?;
         let took = match ran {
             Err(failure) => {
-                self.failed += 1;
-                if let Some(case) = &mut self.case {
-                    case.failed += 1;
-                }
-                self.first_failed.get_or_insert(self.number);
-                self.stopped = self.options.stop_on_error;
+                self.count_failure();
                 write!(w, "\"ok\":false,\"error\":")?;
                 write_error(w, &failure, &statement)?;
                 return writeln!(w, "}}");
@@ -269,6 +294,21 @@ impl Run<'_> {
                 write!(w, "\"ok\":true,\"columns\":")?;
                 serde_json::to_writer(&mut *w, &columns)?;
                 self.sink.write_result(w, total, shown)?;
+                if repeating {
+                    let repeats = script::repeat(
+                        &mut Session::Database(db),
+                        &statement.sql,
+                        &statement.params,
+                        took.engine,
+                        (self.options.warmup, self.options.repeat - 1),
+                    );
+                    w.write_all(b",\"repeat\":")?;
+                    repeats.write_json(w)?;
+                    // A run after the first that failed fails the statement
+                    if repeats.failed.is_some() {
+                        self.count_failure();
+                    }
+                }
                 took
             }
         };
@@ -316,6 +356,163 @@ impl Run<'_> {
 
 /// `{"kind":...,"message":...}`, with the line and column in the input of
 /// a parse error
+impl Run<'_> {
+    /// `.schema [table]` or `.stats`, written as a statement's line is
+    fn dot_command(&mut self, text: &str, line: usize, w: &mut impl Write) -> io::Result<()> {
+        self.number += 1;
+        if let Some(case) = &mut self.case {
+            case.statements += 1;
+        }
+        if self.stopped {
+            self.skipped += 1;
+            return Ok(());
+        }
+        let text = text.trim_end_matches(';').trim();
+        let (name, arg) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+        let arg = arg.trim();
+        let db = self.case_db.as_ref().unwrap_or(self.first);
+        let body = match name {
+            ".schema" => schema(db, (!arg.is_empty()).then_some(arg)),
+            ".stats" if arg.is_empty() => stats(db),
+            _ => Err(("unknown_command", format!("unknown command: {text}"))),
+        };
+        write!(w, "{{\"stmt\":{},", self.number)?;
+        if let Some(case) = &self.case {
+            write!(w, "\"case\":")?;
+            serde_json::to_writer(&mut *w, &case.name)?;
+            write!(w, ",")?;
+        }
+        write!(w, "\"line\":{line},")?;
+        match body {
+            Ok(body) => {
+                write!(w, "\"ok\":true,\"command\":\"{name}\",")?;
+                w.write_all(&body)?;
+            }
+            Err((kind, message)) => {
+                self.count_failure();
+                write!(
+                    w,
+                    "\"ok\":false,\"error\":{{\"kind\":\"{kind}\",\"message\":"
+                )?;
+                serde_json::to_writer(&mut *w, &message)?;
+                w.write_all(b"}")?;
+            }
+        }
+        writeln!(w, "}}")?;
+        w.flush()
+    }
+}
+
+/// A command's failure: its kind and its message
+type CommandError = (&'static str, String);
+
+fn engine_error(e: stoolap::Error) -> CommandError {
+    (e.kind(), e.to_string())
+}
+
+fn output_error(e: io::Error) -> CommandError {
+    ("output", e.to_string())
+}
+
+/// A name in double quotes, as SQL reads it whatever it holds
+fn quoted(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// The first column of every row `sql` returns, as text
+fn first_column(db: &Database, sql: &str) -> Result<Vec<String>, CommandError> {
+    let rows = db.query(sql, ()).map_err(engine_error)?;
+    rows.map(|row| row.and_then(|r| r.get::<String>(0)).map_err(engine_error))
+        .collect()
+}
+
+/// `"tables":[{"table":..,"create":..,"indexes":[..],"row_count":..}]`,
+/// for every table or the one named, and `"views"` for every table
+fn schema(db: &Database, table: Option<&str>) -> Result<Vec<u8>, CommandError> {
+    let tables = match table {
+        Some(table) => vec![table.to_string()],
+        None => first_column(db, "SHOW TABLES")?,
+    };
+    let mut out = Vec::new();
+    out.extend_from_slice(b"\"tables\":[");
+    for (i, table) in tables.iter().enumerate() {
+        let name = quoted(table);
+        let create = db
+            .query(&format!("SHOW CREATE TABLE {name}"), ())
+            .and_then(|mut rows| match rows.next() {
+                Some(row) => row.and_then(|r| r.get::<String>(1)),
+                None => Ok(String::new()),
+            })
+            .map_err(engine_error)?;
+        let count: i64 = db
+            .query_one(&format!("SELECT COUNT(*) FROM {name}"), ())
+            .map_err(engine_error)?;
+        if i > 0 {
+            out.push(b',');
+        }
+        out.extend_from_slice(b"{\"table\":");
+        serde_json::to_writer(&mut out, table).map_err(|e| output_error(e.into()))?;
+        out.extend_from_slice(b",\"create\":");
+        serde_json::to_writer(&mut out, &create).map_err(|e| output_error(e.into()))?;
+        out.extend_from_slice(b",\"indexes\":");
+        write_objects(&mut out, db, &format!("SHOW INDEXES FROM {name}"))?;
+        write!(out, ",\"row_count\":{count}}}").map_err(output_error)?;
+    }
+    out.push(b']');
+    if table.is_none() {
+        out.extend_from_slice(b",\"views\":");
+        let views = first_column(db, "SHOW VIEWS")?;
+        serde_json::to_writer(&mut out, &views).map_err(|e| output_error(e.into()))?;
+    }
+    Ok(out)
+}
+
+/// The rows `sql` returns as objects keyed by column name
+fn write_objects(out: &mut Vec<u8>, db: &Database, sql: &str) -> Result<(), CommandError> {
+    let rows = db.query(sql, ()).map_err(engine_error)?;
+    let columns = rows.columns().to_vec();
+    out.push(b'[');
+    for (i, row) in rows.enumerate() {
+        let row = row.map_err(engine_error)?;
+        if i > 0 {
+            out.push(b',');
+        }
+        out.push(b'{');
+        for (c, column) in columns.iter().enumerate() {
+            if c > 0 {
+                out.push(b',');
+            }
+            serde_json::to_writer(&mut *out, column).map_err(|e| output_error(e.into()))?;
+            out.push(b':');
+            let value = row.get_value(c).cloned().unwrap_or(Value::null_unknown());
+            script::write_json_value(out, &value).map_err(output_error)?;
+        }
+        out.push(b'}');
+    }
+    out.push(b']');
+    Ok(())
+}
+
+/// The memory, volume and index statistics, each as its rows of objects
+fn stats(db: &Database) -> Result<Vec<u8>, CommandError> {
+    let mut out = Vec::new();
+    for (i, (key, pragma)) in [
+        ("memory_stats", "PRAGMA MEMORY_STATS"),
+        ("volume_stats", "PRAGMA VOLUME_STATS"),
+        ("index_stats", "PRAGMA INDEX_STATS"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if i > 0 {
+            out.push(b',');
+        }
+        write!(out, "\"{key}\":").map_err(output_error)?;
+        write_objects(&mut out, db, pragma)?;
+    }
+    Ok(out)
+}
+
 fn write_error(w: &mut impl Write, failure: &Failure, statement: &Statement) -> io::Result<()> {
     let kind = match failure {
         Failure::Engine(e) => e.kind(),
