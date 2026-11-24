@@ -233,7 +233,7 @@ impl Database {
 
         // Parse the DSN
         let (scheme, path) = Self::parse_dsn(dsn)?;
-        let query_timeout_ms = Self::parse_query_timeout(&path)?;
+        let query_timeout_ms = Self::dsn_query_timeout(&path)?.unwrap_or(0);
 
         // test-filedb: track temp dir so it lives as long as the engine
         #[cfg(feature = "test-filedb")]
@@ -382,21 +382,23 @@ impl Database {
         Ok((scheme, path))
     }
 
-    /// The DSN's `query_timeout` in milliseconds, of either scheme; 0 when absent
-    fn parse_query_timeout(path: &str) -> Result<u64> {
-        let Some((_, query)) = path.split_once('?') else {
-            return Ok(0);
+    /// The `query_timeout` a connection string gives, in milliseconds, of
+    /// either scheme, as `open` reads it; None when it gives none
+    pub fn dsn_query_timeout(dsn: &str) -> Result<Option<u64>> {
+        let Some((_, query)) = dsn.split_once('?') else {
+            return Ok(None);
         };
         let Some(value) = query
             .split('&')
             .find_map(|param| param.strip_prefix("query_timeout="))
         else {
-            return Ok(0);
+            return Ok(None);
         };
         value
             .parse::<i64>()
             .ok()
             .and_then(|ms| u64::try_from(ms).ok())
+            .map(Some)
             .ok_or_else(|| Error::invalid_argument(format!("invalid query_timeout: '{}'", value)))
     }
 

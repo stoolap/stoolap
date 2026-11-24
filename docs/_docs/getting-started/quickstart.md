@@ -48,6 +48,32 @@ A result shows its first 40 rows (`-l N` for another number, `-l 0` for all) and
 
 Without `-q`, the CLI prints how long it took to open the database, `Query executed in 1.234 ms (output 2.1 µs)` after each statement, and `Database closed in ...` at the end. A statement's time is the time the engine took to run it and produce its rows. The time the CLI took to print the rows it showed is measured on its own and given after it, so a large result does not count its printing as query time; rows past the limit are counted without being timed one by one. Opening a file database reads its volumes and closing it seals the rows still in memory, so either can take longer than the statements did, most of all after writes: the time of a whole `stoolap -e ...` process, as `time` reports it, is open, statements and close together. A debug build says so after each of these times, since it runs many times slower than a release build.
 
+`-t MS` (`--timeout`) sets the connection's `query_timeout`, so it bounds every statement the CLI runs, those inside a transaction included; a statement past it fails with `query cancelled`. `-t 0` turns it off. Without `-t` there is no timeout, or the one the connection string gives.
+
+### Agent mode
+
+`--agent`, or the environment variable `STOOLAP_AGENT=1`, writes output for a program to read: JSON Lines on standard output and nothing else there. It is never turned on by detecting a pipe or another tool; `--no-agent` turns it off whatever the variable says. In agent mode the CLI never prompts: it reads `-e`, `-f` or standard input as a script.
+
+```bash
+stoolap --agent -e "SELECT 1 AS a; SELECT nope"
+```
+
+```
+{"stoolap":"0.5.1","commit":"91f751ec...","build":"release","features":["parallel","jemalloc"],"dsn":"memory://"}
+{"stmt":1,"line":1,"ok":true,"columns":["a"],"types":["INTEGER"],"rows":[[1]],"row_count":1}
+{"stmt":2,"line":1,"ok":false,"error":{"kind":"column_not_found","message":"column 'nope' not found"}}
+{"done":true,"statements":2,"failed":1,"first_failed":2,"open_transaction":false}
+```
+
+- The first line names the version, the commit, whether the build is a debug or a release build, its features and the connection string.
+- Each statement gives one line, in input order, with its number and the line of the input it starts on. A statement without rows gives `"rows_affected"`, EXPLAIN gives its plan as one `"plan"` string, and a query gives `"columns"`, `"types"`, `"rows"` and `"row_count"`, the number of rows it produced.
+- Values are JSON: NULL is `null`, a JSON value is written as itself, a VECTOR as an array, a TIMESTAMP as an RFC 3339 string, and a FLOAT's NaN and infinities as the strings `"NaN"`, `"Infinity"` and `"-Infinity"`. `"types"` gives each column's type over the rows shown, `null` when they hold only NULL. A column whose shown values have more than one type is `"MIXED"`, and only its values are written with their type, `{"t":"TEXT","v":"x"}`.
+- The first 40 rows are shown (`-l N`, `-l 0` for all); when rows were left out the line adds `"shown"` and `"truncated":true`. A text or JSON value longer than 1,000 characters is cut, and the line adds `"cells_truncated":true`; `--full` keeps them whole. The limit is applied to the rows the statement produced: it does not change the statement.
+- A failed statement gives `"ok":false` and an `"error"` with its `"kind"`, one word per kind of engine error, such as `parse`, `column_not_found`, `unique_constraint` or `query_cancelled`, and its `"message"`; a parse error adds the `"line"` and `"column"` of the input it is at.
+- The last line sums up the run: the statements, the failed ones, the first that failed, and whether a transaction was still open at the end, which the close rolls back.
+- A failed statement does not stop the run; `--on-error stop` stops at the first, and the summary counts the statements it skipped. The exit status is 1 when a statement failed.
+- Every statement has a timeout of 30 seconds unless `-t` or the connection string gives one. `--timing` adds `"elapsed_us"`, the engine's time for each statement; without it the output holds no times.
+
 ## Creating a Table
 
 Let's create a simple table to store product information:

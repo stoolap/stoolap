@@ -360,6 +360,71 @@ pub enum Error {
 }
 
 impl Error {
+    /// The error's kind as one stable snake_case word, for output a program
+    /// reads; every variant names its own, so a new one must name one too
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Error::TableNotFound(_) => "table_not_found",
+            Error::TableAlreadyExists(_) => "table_already_exists",
+            Error::TableClosed => "table_closed",
+            Error::SchemaChanged { .. } => "schema_changed",
+            Error::ViewOvertaken => "view_overtaken",
+            Error::TableColumnsNotMatch { .. } => "table_columns_not_match",
+            Error::TableHasActiveTransactions => "table_has_active_transactions",
+            Error::TableHasOpenTransactionRows { .. } => "table_has_open_transaction_rows",
+            Error::ColumnNotFound(_) => "column_not_found",
+            Error::InvalidColumnType => "invalid_column_type",
+            Error::VectorDimensionMismatch { .. } => "vector_dimension_mismatch",
+            Error::DuplicateColumn => "duplicate_column",
+            Error::InvalidValue => "invalid_value",
+            Error::InvalidArgument(_) => "invalid_argument",
+            Error::ValueTooLong { .. } => "value_too_long",
+            Error::NotNullConstraint { .. } => "not_null_constraint",
+            Error::PrimaryKeyConstraint { .. } => "primary_key_constraint",
+            Error::UniqueConstraint { .. } => "unique_constraint",
+            Error::CheckConstraintViolation { .. } => "check_constraint_violation",
+            Error::TableCheckViolation { .. } => "table_check_violation",
+            Error::ForeignKeyViolation { .. } => "foreign_key_violation",
+            Error::TransactionNotStarted => "transaction_not_started",
+            Error::TransactionAlreadyStarted => "transaction_already_started",
+            Error::TransactionEnded => "transaction_ended",
+            Error::TransactionAborted => "transaction_aborted",
+            Error::TransactionCommitted => "transaction_committed",
+            Error::TransactionClosed => "transaction_closed",
+            Error::IndexNotFound(_) => "index_not_found",
+            Error::IndexAlreadyExists(_) => "index_already_exists",
+            Error::IndexColumnNotFound => "index_column_not_found",
+            Error::IndexClosed => "index_closed",
+            Error::EngineNotOpen => "engine_not_open",
+            Error::EngineAlreadyOpen => "engine_already_open",
+            Error::ViewAlreadyExists(_) => "view_already_exists",
+            Error::ViewNotFound(_) => "view_not_found",
+            Error::NoRowsReturned => "no_rows_returned",
+            Error::NoStatementsToExecute => "no_statements_to_execute",
+            Error::ColumnIndexOutOfBounds { .. } => "column_index_out_of_bounds",
+            Error::WalNotRunning => "wal_not_running",
+            Error::WalFileClosed => "wal_file_closed",
+            Error::WalNotInitialized => "wal_not_initialized",
+            Error::DatabaseLocked => "database_locked",
+            Error::CannotDropPrimaryKey => "cannot_drop_primary_key",
+            Error::NullComparison => "null_comparison",
+            Error::IncomparableTypes => "incomparable_types",
+            Error::NotSupported(_) => "not_supported",
+            Error::SegmentNotFound => "segment_not_found",
+            Error::ExpressionEvaluation => "expression_evaluation",
+            Error::ExpressionEvaluationWithMessage { .. } => "expression_evaluation",
+            Error::TypeConversion { .. } => "type_conversion",
+            Error::Parse(_) => "parse",
+            Error::Io { .. } => "io",
+            Error::Internal { .. } => "internal",
+            Error::WalOutcomeUnknown { .. } => "wal_outcome_unknown",
+            Error::TableOrViewNotFound(_) => "table_or_view_not_found",
+            Error::Type(_) => "type",
+            Error::DivisionByZero => "division_by_zero",
+            Error::QueryCancelled => "query_cancelled",
+        }
+    }
+
     /// Create a new TableColumnsNotMatch error
     pub fn table_columns_not_match(expected: usize, got: usize) -> Self {
         Error::TableColumnsNotMatch { expected, got }
@@ -514,6 +579,23 @@ impl From<std::io::Error> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_error_kind_is_its_variant_in_snake_case() {
+        let cases = [
+            (Error::ColumnNotFound("c".into()), "column_not_found"),
+            (Error::Parse("p".into()), "parse"),
+            (Error::QueryCancelled, "query_cancelled"),
+            (
+                Error::table_columns_not_match(1, 2),
+                "table_columns_not_match",
+            ),
+            (Error::DivisionByZero, "division_by_zero"),
+        ];
+        for (error, kind) in cases {
+            assert_eq!(error.kind(), kind, "{error}");
+        }
+    }
 
     #[test]
     fn test_error_display() {

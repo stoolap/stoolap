@@ -15,4 +15,5 @@
 //! The command-line binary, run as a process
 #![cfg(feature = "cli")]
 
+mod agent_test;
 mod output_test;

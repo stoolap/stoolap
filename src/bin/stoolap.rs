@@ -15,6 +15,8 @@
 //! Stoolap CLI - Interactive SQL database command-line interface
 //!
 
+#[path = "stoolap/agent.rs"]
+mod agent;
 #[path = "stoolap/script.rs"]
 mod script;
 
@@ -163,10 +165,42 @@ struct Args {
     #[arg(long = "reset-volumes")]
     reset_volumes: bool,
 
-    /// Query timeout in milliseconds (0 for no timeout, default: 0)
-    /// Long-running queries will be cancelled after this time.
-    #[arg(short = 't', long = "timeout", value_name = "MS", default_value = "0")]
-    timeout_ms: u64,
+    /// Statement timeout in milliseconds, set as the connection's
+    /// query_timeout so it bounds every statement, inside a transaction too
+    /// (0 for none; default: none, or 30000 in agent mode)
+    #[arg(short = 't', long = "timeout", value_name = "MS")]
+    timeout_ms: Option<u64>,
+
+    /// Agent mode: a build line, one JSON line per statement and a summary,
+    /// for a program to read (also STOOLAP_AGENT=1)
+    #[arg(long = "agent", conflicts_with = "no_agent")]
+    agent: bool,
+
+    /// Turn agent mode off, whatever STOOLAP_AGENT says
+    #[arg(long = "no-agent")]
+    no_agent: bool,
+
+    /// Agent mode: what a failed statement does to the rest of the script
+    #[arg(
+        long = "on-error",
+        value_name = "continue|stop",
+        default_value = "continue"
+    )]
+    on_error: OnError,
+
+    /// Agent mode: keep cells longer than 1,000 characters whole
+    #[arg(long = "full")]
+    full: bool,
+
+    /// Agent mode: add each statement's engine time as elapsed_us
+    #[arg(long = "timing")]
+    timing: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum, Debug)]
+enum OnError {
+    Continue,
+    Stop,
 }
 
 /// CLI state for interactive mode
@@ -178,7 +212,6 @@ struct Cli {
     limit: usize,
     #[allow(dead_code)]
     quiet: bool,
-    timeout_ms: u64,
     editor: Editor<(), DefaultHistory>,
     /// The lines of the statement being typed, for the history
     current_query: String,
@@ -200,13 +233,7 @@ impl Sink for Collect {
 }
 
 impl Cli {
-    fn new(
-        db: Database,
-        json_output: bool,
-        limit: usize,
-        quiet: bool,
-        timeout_ms: u64,
-    ) -> io::Result<Self> {
+    fn new(db: Database, json_output: bool, limit: usize, quiet: bool) -> io::Result<Self> {
         let config = Config::builder()
             .history_ignore_space(true)
             .edit_mode(EditMode::Emacs)
@@ -228,7 +255,6 @@ impl Cli {
             json_output,
             limit,
             quiet,
-            timeout_ms,
             editor,
             current_query: String::new(),
             splitter: Splitter::default(),
@@ -374,17 +400,12 @@ impl Cli {
                 quiet: true,
                 timing: false,
             };
-            return script::print_statement(&mut session, query, params, &mut out, self.timeout_ms);
+            return script::print_statement(&mut session, query, params, &mut out)
+                .map_err(|e| e.to_string());
         }
         let mut shown = Collect(Vec::new());
-        let (ran, mut took) = script::run(
-            &mut session,
-            query,
-            params,
-            self.timeout_ms,
-            self.limit,
-            &mut shown,
-        )?;
+        let (ran, mut took) = script::run(&mut session, query, params, self.limit, &mut shown)
+            .map_err(|e| e.to_string())?;
         let render = Instant::now();
         match ran {
             Ran::Affected(n) => println!(
@@ -677,7 +698,18 @@ fn print_persistence_info(args: &Args) {
 }
 
 fn main() {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    // Turned on only by asking, never by what the environment looks like
+    let agent =
+        !args.no_agent && (args.agent || std::env::var("STOOLAP_AGENT").is_ok_and(|v| v == "1"));
+    if agent {
+        args.quiet = true;
+    }
+    // Maintenance prints plain text and changes files: refused before either
+    if agent && (args.snapshot || args.restore.is_some() || args.reset_volumes) {
+        eprintln!("Error: --snapshot, --restore and --reset-volumes do not run in agent mode");
+        std::process::exit(2);
+    }
 
     // Build the DSN with optional query parameters
     let db_path = build_dsn(&args);
@@ -1014,6 +1046,16 @@ fn main() {
     };
     let opened = opening.elapsed();
 
+    // The connection's own timeout bounds every statement it runs, those of
+    // a transaction too; agent mode never waits on a statement for ever
+    let default_timeout = agent && matches!(Database::dsn_query_timeout(&db_path), Ok(None));
+    if let Some(ms) = args.timeout_ms.or(default_timeout.then_some(30_000))
+        && let Err(e) = db.execute(&format!("PRAGMA query_timeout = {ms}"), ())
+    {
+        eprintln!("Error setting the timeout: {}", e);
+        std::process::exit(1);
+    }
+
     if !args.quiet {
         println!(
             "Connected to database: {} (opened in {}){}",
@@ -1047,8 +1089,12 @@ fn main() {
     }
 
     // Handle execute flag - run its statements and exit
+    let mode = Mode {
+        agent,
+        dsn: &db_path,
+    };
     if let Some(ref sql) = args.execute {
-        run_script_and_exit(db, sql.split('\n').map(|l| Ok(l.to_string())), &args);
+        run_script_and_exit(db, sql.split('\n').map(|l| Ok(l.to_string())), &args, mode);
     }
 
     // Handle file flag - execute SQL from file
@@ -1061,22 +1107,17 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        run_script_and_exit(db, lines_of(BufReader::new(file)), &args);
+        run_script_and_exit(db, lines_of(BufReader::new(file)), &args, mode);
     }
 
-    // Input from a pipe runs as a script, each statement as it arrives
-    if !std::io::stdin().is_terminal() {
-        run_script_and_exit(db, lines_of(io::stdin().lock()), &args);
+    // Input from a pipe runs as a script, each statement as it arrives, and
+    // agent mode reads its input so whatever it comes from: it never prompts
+    if agent || !std::io::stdin().is_terminal() {
+        run_script_and_exit(db, lines_of(io::stdin().lock()), &args, mode);
     }
 
     // Interactive mode
-    let mut cli = match Cli::new(
-        db,
-        args.json_output,
-        args.limit,
-        args.quiet,
-        args.timeout_ms,
-    ) {
+    let mut cli = match Cli::new(db, args.json_output, args.limit, args.quiet) {
         Ok(cli) => cli,
         Err(e) => {
             eprintln!("Error initializing CLI: {}", e);
@@ -1116,12 +1157,40 @@ fn lines_of(input: impl BufRead) -> impl Iterator<Item = io::Result<String>> {
     })
 }
 
+/// How a script's results are written
+#[derive(Clone, Copy)]
+struct Mode<'a> {
+    agent: bool,
+    dsn: &'a str,
+}
+
 /// Runs a script on `db`, closes it, and exits with 1 when a statement failed
 fn run_script_and_exit(
     db: Database,
     lines: impl Iterator<Item = io::Result<String>>,
     args: &Args,
+    mode: Mode,
 ) -> ! {
+    if mode.agent {
+        let options = agent::Options {
+            limit: args.limit,
+            full: args.full,
+            stop_on_error: args.on_error == OnError::Stop,
+            timing: args.timing,
+        };
+        let mut out = io::BufWriter::new(io::stdout().lock());
+        let result = agent::run_script(&db, mode.dsn, lines, &mut out, &options);
+        drop(out);
+        close(db, args);
+        match result {
+            Ok(true) => std::process::exit(0),
+            Ok(false) => std::process::exit(1),
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1)
+            }
+        }
+    }
     let mut output = Output {
         out: io::BufWriter::new(io::stdout().lock()),
         format: match args.json_output {
@@ -1132,7 +1201,7 @@ fn run_script_and_exit(
         quiet: args.quiet,
         timing: !args.json_output && !args.quiet,
     };
-    let result = script::run_script(&db, lines, &mut output, args.timeout_ms);
+    let result = script::run_script(&db, lines, &mut output);
     drop(output);
     close(db, args);
     match result {

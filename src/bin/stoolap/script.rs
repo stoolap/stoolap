@@ -28,6 +28,19 @@ pub struct Statement {
     pub line: usize,
     pub sql: String,
     pub params: Vec<Value>,
+    /// Line and column (from 1, in characters) of the first byte of `sql`, so a
+    /// position inside the statement maps to the input
+    pub text_at: (usize, usize),
+}
+
+impl Statement {
+    /// The input's line and column of `(line, column)` inside `sql`
+    pub fn input_position(&self, (line, column): (usize, usize)) -> (usize, usize) {
+        match line {
+            1 => (self.text_at.0, self.text_at.1 + column - 1),
+            _ => (self.text_at.0 + line - 1, column),
+        }
+    }
 }
 
 /// Cuts SQL text into statements at the semicolons the engine's lexer
@@ -50,7 +63,12 @@ pub struct Splitter {
     closed: bool,
     /// A line with the quote of an open string before it, lexed alone
     probe: String,
+    /// Line and column of the first byte of `pending`
+    origin: (usize, usize),
 }
+
+/// A byte of `pending` with its line and column
+type Cursor = (usize, (usize, usize));
 
 /// A string, quoted name or block comment that runs to the end of the text
 #[derive(Clone, Copy)]
@@ -71,6 +89,7 @@ impl Default for Splitter {
             open: None,
             closed: false,
             probe: String::new(),
+            origin: (1, 1),
         }
     }
 }
@@ -116,6 +135,41 @@ impl Splitter {
         self.cut(true, out);
     }
 
+    /// The cursor at byte `to` of `pending`, read on from `from`; columns
+    /// count characters, as the lexer's positions do
+    fn advance(&self, (from, (line, column)): Cursor, to: usize) -> Cursor {
+        let text = &self.pending[from..to];
+        match text.rfind('\n') {
+            None => (to, (line, column + text.chars().count())),
+            Some(newline) => (
+                to,
+                (
+                    line + text.matches('\n').count(),
+                    text[newline + 1..].chars().count() + 1,
+                ),
+            ),
+        }
+    }
+
+    /// The statement whose text, trimmed, is `pending[start..end]`
+    fn statement(
+        &self,
+        cursor: &mut Cursor,
+        (start, end): (usize, usize),
+        line: usize,
+        params: Vec<Value>,
+    ) -> Statement {
+        let raw = &self.pending[start..end];
+        let sql = raw.trim();
+        *cursor = self.advance(*cursor, start + (raw.len() - raw.trim_start().len()));
+        Statement {
+            line,
+            sql: sql.to_string(),
+            params,
+            text_at: cursor.1,
+        }
+    }
+
     fn cut(&mut self, at_end: bool, out: &mut Vec<Statement>) {
         let base = self.resume;
         let mut lexer = Lexer::new(&self.pending[base..]);
@@ -124,6 +178,7 @@ impl Splitter {
         // PARAMS comment after it on that line is its own
         let mut cut: Option<(Statement, usize)> = None;
         let mut start = 0;
+        let mut cursor: Cursor = (0, self.origin);
         self.open = None;
         self.closed = false;
         loop {
@@ -178,15 +233,8 @@ impl Splitter {
                 TokenType::Punctuator if token.literal == ";" => {
                     let params = self.params.take().unwrap_or_default();
                     if let Some(first) = self.first_line.take() {
-                        let sql = self.pending[start..at].trim().to_string();
-                        cut = Some((
-                            Statement {
-                                line: first,
-                                sql,
-                                params,
-                            },
-                            line,
-                        ));
+                        let statement = self.statement(&mut cursor, (start, at), first, params);
+                        cut = Some((statement, line));
                     }
                     start = at + 1;
                 }
@@ -214,16 +262,13 @@ impl Splitter {
         }
         if at_end {
             if let Some(first) = self.first_line.take() {
-                let sql = self.pending[start..].trim().to_string();
                 let params = self.params.take().unwrap_or_default();
-                out.push(Statement {
-                    line: first,
-                    sql,
-                    params,
-                });
+                let end = self.pending.len();
+                out.push(self.statement(&mut cursor, (start, end), first, params));
             }
             start = self.pending.len();
         }
+        self.origin = self.advance(cursor, start).1;
         self.pending.drain(..start);
         self.resume -= start;
     }
@@ -366,11 +411,10 @@ pub enum Session<'a> {
 }
 
 impl Session<'_> {
-    fn query(&mut self, sql: &str, params: Vec<Value>, timeout_ms: u64) -> stoolap::Result<Rows> {
+    /// Runs `sql` under the connection's `query_timeout`, which the CLI's
+    /// `--timeout` sets once for every statement
+    fn query(&mut self, sql: &str, params: Vec<Value>) -> stoolap::Result<Rows> {
         match self {
-            Session::Database(db) if timeout_ms > 0 => {
-                db.query_with_timeout(sql, params, timeout_ms)
-            }
             Session::Database(db) => db.query(sql, params),
             Session::Transaction(tx) => tx.query(sql, params),
         }
@@ -396,6 +440,34 @@ pub enum Ran {
     Affected(i64),
 }
 
+/// Why a statement gave no result: the engine's error, or the output's
+#[derive(Debug)]
+pub enum Failure {
+    Engine(stoolap::Error),
+    Output(io::Error),
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Failure::Engine(e) => write!(f, "{e}"),
+            Failure::Output(e) => write!(f, "writing output: {e}"),
+        }
+    }
+}
+
+impl From<stoolap::Error> for Failure {
+    fn from(e: stoolap::Error) -> Self {
+        Failure::Engine(e)
+    }
+}
+
+impl From<io::Error> for Failure {
+    fn from(e: io::Error) -> Self {
+        Failure::Output(e)
+    }
+}
+
 /// Takes the rows a statement shows
 pub trait Sink {
     fn begin(&mut self, columns: &[String]) -> io::Result<()>;
@@ -409,19 +481,16 @@ pub fn run(
     session: &mut Session,
     sql: &str,
     params: Vec<Value>,
-    timeout_ms: u64,
     limit: usize,
     sink: &mut impl Sink,
-) -> Result<(Ran, Timing), String> {
+) -> Result<(Ran, Timing), Failure> {
     // A plan is shown whole whatever the limit
     let limit = match command(sql) {
         Command::Explain => 0,
         _ => limit,
     };
     let start = Instant::now();
-    let mut rows = session
-        .query(sql, params, timeout_ms)
-        .map_err(|e| e.to_string())?;
+    let mut rows = session.query(sql, params)?;
     if rows.columns().is_empty() {
         let timing = Timing {
             engine: start.elapsed(),
@@ -431,14 +500,14 @@ pub fn run(
     }
     let shown = Instant::now();
     let columns = rows.columns().to_vec();
-    sink.begin(&columns).map_err(|e| e.to_string())?;
+    sink.begin(&columns)?;
     let mut output = shown.elapsed();
     let mut total = 0u64;
     let mut timed = 0u64;
     while rows.advance() {
         if limit == 0 || total < limit as u64 {
             let shown = Instant::now();
-            sink.row(rows.current_row()).map_err(|e| e.to_string())?;
+            sink.row(rows.current_row())?;
             output += shown.elapsed();
             timed += 1;
         }
@@ -450,7 +519,7 @@ pub fn run(
     let engine = elapsed.saturating_sub(output).saturating_sub(readings);
     output += readings;
     if let Some(err) = rows.error() {
-        return Err(err.to_string());
+        return Err(err.into());
     }
     let ran = Ran::Rows {
         columns,
@@ -478,7 +547,6 @@ pub fn run_script<W: Write>(
     db: &Database,
     lines: impl Iterator<Item = io::Result<String>>,
     out: &mut Output<W>,
-    timeout_ms: u64,
 ) -> Result<usize, String> {
     let mut splitter = Splitter::default();
     let mut ready = Vec::new();
@@ -487,12 +555,12 @@ pub fn run_script<W: Write>(
     for line in lines {
         let line = line.map_err(|e| format!("reading input: {e}"))?;
         splitter.push_line(&line, &mut ready);
-        if !run_ready(db, &mut ready, &mut number, &mut failed, out, timeout_ms)? {
+        if !run_ready(db, &mut ready, &mut number, &mut failed, out)? {
             return Ok(failed);
         }
     }
     splitter.finish(&mut ready);
-    run_ready(db, &mut ready, &mut number, &mut failed, out, timeout_ms)?;
+    run_ready(db, &mut ready, &mut number, &mut failed, out)?;
     Ok(failed)
 }
 
@@ -503,7 +571,6 @@ fn run_ready<W: Write>(
     number: &mut usize,
     failed: &mut usize,
     out: &mut Output<W>,
-    timeout_ms: u64,
 ) -> Result<bool, String> {
     for statement in ready.drain(..) {
         *number += 1;
@@ -520,7 +587,6 @@ fn run_ready<W: Write>(
             &statement.sql,
             statement.params,
             out,
-            timeout_ms,
         );
         if let Err(message) = printed {
             // The rows printed before the error come first
@@ -541,8 +607,7 @@ pub fn print_statement<W: Write>(
     sql: &str,
     params: Vec<Value>,
     out: &mut Output<W>,
-    timeout_ms: u64,
-) -> Result<Timing, String> {
+) -> Result<Timing, Failure> {
     let Output {
         out: w,
         format,
@@ -551,14 +616,14 @@ pub fn print_statement<W: Write>(
         timing,
     } = out;
     let ran = match format {
-        Format::Table => run(session, sql, params, timeout_ms, *limit, &mut TableSink(w)),
+        Format::Table => run(session, sql, params, *limit, &mut TableSink(w)),
         Format::Json => {
             let mut sink = JsonSink {
                 w,
                 begun: false,
                 rows: 0,
             };
-            let ran = run(session, sql, params, timeout_ms, *limit, &mut sink);
+            let ran = run(session, sql, params, *limit, &mut sink);
             // Rows already written stay readable: the object is closed
             if ran.is_err() && sink.begun {
                 let _ = sink.w.write_all(b"]}\n");
@@ -585,11 +650,11 @@ pub fn print_statement<W: Write>(
             })
         }
     };
-    footer.map_err(|e| e.to_string())?;
+    footer?;
     if *timing {
-        writeln!(w, "{}", timing_line(took)).map_err(|e| e.to_string())?;
+        writeln!(w, "{}", timing_line(took))?;
     }
-    w.flush().map_err(|e| e.to_string())?;
+    w.flush()?;
     Ok(took)
 }
 
@@ -808,7 +873,7 @@ fn write_timestamp(w: &mut impl Write, ts: &chrono::DateTime<chrono::Utc>) -> io
 
 /// A value in JSON; NaN and the infinities, which JSON has no number for,
 /// are strings rather than null
-fn write_json_value(w: &mut impl Write, value: &Value) -> io::Result<()> {
+pub fn write_json_value(w: &mut impl Write, value: &Value) -> io::Result<()> {
     match value {
         Value::Null(_) => w.write_all(b"null"),
         Value::Integer(i) => write!(w, "{i}"),
@@ -898,7 +963,22 @@ mod alloc_tests {
             timing: false,
         };
         let before = ALLOCATIONS.with(Cell::get);
-        print_statement(&mut Session::Database(db), sql, Vec::new(), &mut out, 0).unwrap();
+        print_statement(&mut Session::Database(db), sql, Vec::new(), &mut out).unwrap();
+        ALLOCATIONS.with(Cell::get) - before
+    }
+
+    /// Allocations of agent mode running `sql` with `limit`
+    fn agent_allocations(db: &Database, sql: &str, limit: usize) -> usize {
+        let mut out = Vec::with_capacity(1 << 22);
+        let options = crate::agent::Options {
+            limit,
+            full: false,
+            stop_on_error: false,
+            timing: false,
+        };
+        let lines = std::iter::once(Ok(sql.to_string()));
+        let before = ALLOCATIONS.with(Cell::get);
+        crate::agent::run_script(db, "memory://", lines, &mut out, &options).unwrap();
         ALLOCATIONS.with(Cell::get) - before
     }
 
@@ -931,6 +1011,14 @@ mod alloc_tests {
                 all - one
             );
         }
+        // Agent mode keeps the shown cells in buffers that grow by doubling
+        let one = agent_allocations(&db, sql, 1);
+        let all = agent_allocations(&db, sql, 0);
+        assert!(
+            all <= one + 48,
+            "agent mode printing 1,999 more rows allocated {} times more",
+            all - one
+        );
     }
 }
 
