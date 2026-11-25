@@ -176,3 +176,107 @@ fn update_and_delete_by_pk_on_a_sealed_table_are_correct() {
     drop(db);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A child pointing at `t` (the parent), its rows still sealed
+fn add_child(db: &Database) {
+    db.execute(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY AUTO_INCREMENT, t_id INTEGER REFERENCES t(id))",
+        (),
+    )
+    .unwrap();
+}
+
+#[test]
+fn foreign_key_check_cost_does_not_grow_with_sealed_parent_rows() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (small, small_dir) = sealed_table("pk_fk_small", 2_000);
+    let (big, big_dir) = sealed_table("pk_fk_big", 20_000);
+    add_child(&small);
+    add_child(&big);
+    // Keys at the end of the volume: a walk to the matching row reads them last
+    let sql = "INSERT INTO c (t_id) VALUES (?)";
+    let per_small = allocs_per_statement(&small, sql, 1_980..2_000);
+    let per_big = allocs_per_statement(&big, sql, 19_980..20_000);
+    assert!(
+        per_big <= per_small * 2.0,
+        "allocations per foreign key check scale with the parent: {per_small:.0} at 2k rows, {per_big:.0} at 20k"
+    );
+    drop((small, big));
+    let _ = std::fs::remove_dir_all(small_dir);
+    let _ = std::fs::remove_dir_all(big_dir);
+}
+
+#[test]
+fn foreign_key_check_on_a_sealed_parent_is_correct() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let (db, dir) = sealed_table("pk_fk_correct", 3_000);
+    add_child(&db);
+    let insert = |id: i64| db.execute(&format!("INSERT INTO c (t_id) VALUES ({id})"), ());
+
+    insert(2_999).unwrap();
+    assert!(insert(1_000_000).is_err(), "an unknown parent is refused");
+
+    db.execute("BEGIN", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (5000, 'new', 0)", ())
+        .unwrap();
+    insert(5_000).expect("a parent inserted earlier in the transaction is seen");
+    db.execute("DELETE FROM t WHERE id = 2500", ()).unwrap();
+    assert!(
+        insert(2_500).is_err(),
+        "a sealed parent deleted earlier in the transaction is refused"
+    );
+    db.execute("ROLLBACK", ()).unwrap();
+    assert!(insert(5_000).is_err(), "a rolled back parent is refused");
+    insert(2_500).expect("a rolled back delete leaves the parent");
+
+    db.execute("UPDATE t SET v = -1 WHERE id = 2600", ())
+        .unwrap();
+    insert(2_600).expect("a parent updated into the hot store is found there");
+    assert_eq!(scalar(&db, "SELECT COUNT(*) FROM c"), 3);
+
+    drop(db);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn foreign_key_check_of_a_parent_written_in_the_transaction_keeps_its_single_row_read() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("pk_fk_local_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let db = Database::open(&format!(
+        "file://{}?checkpoint_interval=3600",
+        dir.display()
+    ))
+    .unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT NOT NULL, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    add_child(&db);
+    // The same insert with no key to check
+    db.execute(
+        "CREATE TABLE d (id INTEGER PRIMARY KEY AUTO_INCREMENT, t_id INTEGER)",
+        (),
+    )
+    .unwrap();
+    // No volume yet: the parent's rows are this transaction's own
+    db.execute("BEGIN", ()).unwrap();
+    db.execute(
+        "INSERT INTO t SELECT value, 'k', value FROM GENERATE_SERIES(0, 199)",
+        (),
+    )
+    .unwrap();
+    let checked = allocs_per_statement(&db, "INSERT INTO c (t_id) VALUES (?)", 100..120);
+    let plain = allocs_per_statement(&db, "INSERT INTO d (t_id) VALUES (?)", 100..120);
+    db.execute("COMMIT", ()).unwrap();
+    // The hot store's single-row read of the key: 2.2 allocations per check
+    // here, one more when the check went through the batch fetch
+    assert!(
+        checked - plain <= 2.5,
+        "a check of a parent with no volume costs {:.1} allocations over an unchecked insert",
+        checked - plain
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(dir);
+}
