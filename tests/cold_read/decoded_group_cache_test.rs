@@ -346,16 +346,14 @@ fn a_statement_with_expressions_decodes_only_the_columns_it_names() {
         .map(|i| i * (i % 3))
         .sum();
     assert_eq!(rows[0][1], sum.to_string());
-    // COUNT(*) alone takes the deferred aggregation over the volume's own
-    // arrays, outside the group cache
-    let count: i64 = db
-        .query_one("SELECT COUNT(*) FROM t WHERE k >= 1", ())
-        .unwrap();
-    assert_eq!(count, 43);
-    // So does a grouped count under a filter the storage runs whole
+    // COUNT(*) alone reads the filter's k through the group cache
+    let rows = expect("SELECT COUNT(*) FROM t WHERE k >= 1", 1);
+    assert_eq!(rows[0][0], "43");
+    // A grouped count under a filter the storage runs whole reads its one
+    // column, the filter's and the key's, through the group cache
     let rows = expect(
         "SELECT k, COUNT(*) FROM t WHERE k >= 0 GROUP BY k ORDER BY k",
-        0,
+        1,
     );
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0], vec!["0".to_string(), "21".to_string()]);
@@ -364,10 +362,10 @@ fn a_statement_with_expressions_decodes_only_the_columns_it_names() {
     assert_eq!(rows.len(), 21);
     assert_eq!(rows[0][0], "124");
     // An uncorrelated subquery in the SELECT list is read as a value, and
-    // the count beside it takes the volume's arrays as it does alone
+    // the count beside it reads k as it does alone
     let rows = expect(
         "SELECT COUNT(*), (SELECT MAX(k) FROM t) FROM t WHERE k >= 1",
-        0,
+        1,
     );
     assert_eq!(rows[0], vec!["43".to_string(), "2".to_string()]);
     // A correlated subquery in the filter reads every column

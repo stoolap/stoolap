@@ -9088,22 +9088,33 @@ impl Table for SegmentedTable {
                     };
 
                     // Feeds each shown row that passes to the calls of its
-                    // group, built once per kind of key; false when the
-                    // volume lacks a call's column and the statement reads the rows
+                    // group, built once per kind of key, a row group at a
+                    // time; false when the volume lacks a call's column or
+                    // the key's layout, and the statement reads the rows
                     fn scan<'v, K: GroupOf>(
                         (vol, mapping, aggregates): (
                             &'v FrozenVolume,
-                            &super::writer::ColumnMapping,
+                            &'v super::writer::ColumnMapping,
                             &[(AggregateOp, usize)],
                         ),
                         (preds, skips, shown, deadline): (&[PhysPred], &[bool], &ShownRows, Deadline),
-                        key: K,
+                        mut key: K,
                         part: &mut GroupedAggregates,
                     ) -> Result<bool> {
                         let row_count = vol.meta.row_count;
                         let rg_size = vol.meta.group_rows;
-                        // The calls' inputs are resolved at the first row that passes
-                        let mut state: (K, Option<Vec<ColdInput<'v>>>) = (key, None);
+                        let sources = CallSource::of(mapping, aggregates);
+                        let called = sources.iter().flatten().filter_map(|source| match source {
+                            CallSource::Column(col) => Some(*col),
+                            _ => None,
+                        });
+                        let read = preds
+                            .iter()
+                            .map(|pp| pp.phys_col)
+                            .chain(key.columns().iter().copied())
+                            .chain(called);
+                        let reads = ColumnReads::of(vol, read);
+                        let mut scan_reads = super::writer::ScanReads::default();
                         let mut candidates: Vec<usize> = Vec::new();
                         for gi in 0..row_count.div_ceil(rg_size) {
                             if skips.get(gi) == Some(&true) {
@@ -9112,6 +9123,13 @@ impl Table for SegmentedTable {
                             let g_start = gi * rg_size;
                             let g_end = ((gi + 1) * rg_size).min(row_count);
                             deadline.charge(DeadlineSite::StorageAggregate, g_end - g_start)?;
+                            let base = reads.base(g_start);
+                            let held: smallvec::SmallVec<[HeldColumn<'v>; 4]> = preds
+                                .iter()
+                                .map(|pp| reads.column(&mut scan_reads, pp.phys_col, gi))
+                                .collect::<std::io::Result<_>>()?;
+                            let columns: smallvec::SmallVec<[&super::column::ColumnData; 4]> =
+                                held.iter().map(|column| &**column).collect();
 
                             // Dictionary equalities are answered for the whole group in
                             // one pass over the raw ids; the other predicates run per
@@ -9119,15 +9137,12 @@ impl Table for SegmentedTable {
                             let dict_preds: smallvec::SmallVec<[super::column::DictFilter<'_>; 4]> =
                                 preds
                                     .iter()
-                                    .filter(|pp| matches!(pp.target, TypedTarget::DictEq(_)))
-                                    .map(|pp| {
-                                        Ok((
-                                            vol.columns.get(pp.phys_col)?,
-                                            g_start,
-                                            pp.dict_id.unwrap_or(u32::MAX),
-                                        ))
+                                    .zip(&columns)
+                                    .filter(|(pp, _)| matches!(pp.target, TypedTarget::DictEq(_)))
+                                    .map(|(pp, column)| {
+                                        (*column, g_start - base, pp.dict_id.unwrap_or(u32::MAX))
                                     })
-                                    .collect::<std::io::Result<_>>()?;
+                                    .collect();
                             candidates.clear();
                             let prefiltered = !dict_preds.is_empty()
                                 && super::column::ColumnData::dict_matching_offsets(
@@ -9136,99 +9151,135 @@ impl Table for SegmentedTable {
                                     &mut candidates,
                                 )
                                 .is_some();
-                            let calls = (vol, mapping, aggregates);
-                            let rows = (preds, prefiltered, shown);
+                            let group = (reads, &mut scan_reads, gi, base);
+                            let rows = (preds, &columns[..], prefiltered, shown);
+                            let calls = (&mut key, sources.as_deref(), aggregates);
                             let fed = match prefiltered {
                                 true => feed(
                                     candidates.iter().map(|&at| g_start + at),
-                                    calls,
+                                    group,
                                     rows,
-                                    state,
+                                    calls,
                                     part,
                                 )?,
-                                false => feed(g_start..g_end, calls, rows, state, part)?,
+                                false => feed(g_start..g_end, group, rows, calls, part)?,
                             };
-                            let Some(fed) = fed else {
+                            if !fed {
                                 return Ok(false);
-                            };
-                            state = fed;
+                            }
                         }
                         Ok(true)
                     }
-                    // The rows of one row group, out of line and with the key
-                    // and the inputs its own, so the loop keeps them in
-                    // registers; they come back for the next row group
-                    #[inline(never)]
+                    /// The rows of `preds` over `columns`, by the predicates'
+                    /// order, in one row group
+                    type GroupRows<'r> = (
+                        &'r [PhysPred],
+                        &'r [&'r super::column::ColumnData],
+                        bool,
+                        &'r ShownRows,
+                    );
+                    // Whether row `i` of the volume is shown and passes every
+                    // predicate, read at `i - base` in its row group
+                    #[inline(always)]
+                    fn passes(
+                        (preds, columns, prefiltered, shown): GroupRows<'_>,
+                        i: usize,
+                        base: usize,
+                    ) -> bool {
+                        if !shown.has(i) {
+                            return false;
+                        }
+                        for (pp, column) in preds.iter().zip(columns) {
+                            if prefiltered && matches!(pp.target, TypedTarget::DictEq(_)) {
+                                continue;
+                            }
+                            if !pred_passes(pp, column, i - base) {
+                                return false;
+                            }
+                        }
+                        true
+                    }
+                    // One row group's rows: the key's and the calls' columns
+                    // are read at its first row that passes
                     #[allow(clippy::type_complexity)]
-                    fn feed<'v, K: GroupOf>(
-                        positions: impl Iterator<Item = usize>,
-                        (vol, mapping, aggregates): (
-                            &'v FrozenVolume,
-                            &super::writer::ColumnMapping,
+                    fn feed<K: GroupOf>(
+                        mut positions: impl Iterator<Item = usize>,
+                        (reads, scan_reads, gi, base): (
+                            ColumnReads<'_>,
+                            &mut super::writer::ScanReads,
+                            usize,
+                            usize,
+                        ),
+                        rows: GroupRows<'_>,
+                        (key, sources, aggregates): (
+                            &mut K,
+                            Option<&[CallSource<'_>]>,
                             &[(AggregateOp, usize)],
                         ),
-                        (preds, prefiltered, shown): (&[PhysPred], bool, &ShownRows),
-                        (mut key, inputs): (K, Option<Vec<ColdInput<'v>>>),
                         part: &mut GroupedAggregates,
-                    ) -> Result<Option<(K, Option<Vec<ColdInput<'v>>>)>> {
-                        // Whether row `i` is shown and passes every predicate
-                        #[inline(always)]
-                        fn passes(
-                            vol: &FrozenVolume,
-                            (preds, prefiltered, shown): (&[PhysPred], bool, &ShownRows),
-                            i: usize,
-                        ) -> std::io::Result<bool> {
-                            if !shown.has(i) {
-                                return Ok(false);
-                            }
-                            for pp in preds {
-                                if prefiltered && matches!(pp.target, TypedTarget::DictEq(_)) {
-                                    continue;
-                                }
-                                if !pred_passes(pp, vol.columns.get(pp.phys_col)?, i) {
-                                    return Ok(false);
-                                }
-                            }
-                            Ok(true)
-                        }
-                        let rows = (preds, prefiltered, shown);
-                        let mut positions = positions;
-                        let inputs = match inputs {
-                            Some(inputs) => inputs,
-                            None => loop {
-                                let Some(i) = positions.next() else {
-                                    return Ok(Some((key, None)));
-                                };
-                                if !passes(vol, rows, i)? {
-                                    continue;
-                                }
-                                let Some(inputs) = ColdInput::resolve(vol, mapping, aggregates)?
-                                else {
-                                    return Ok(None);
-                                };
-                                if let Some(group) = key.group(part, i) {
-                                    accumulate_columnar(part.aggregates(group), &inputs, i);
-                                }
-                                break inputs;
-                            },
+                    ) -> Result<bool> {
+                        let Some(first) = positions.find(|&i| passes(rows, i, base)) else {
+                            return Ok(true);
                         };
+                        let Some(sources) = sources else {
+                            return Ok(false);
+                        };
+                        let keyed: smallvec::SmallVec<[HeldColumn<'_>; 4]> = key
+                            .columns()
+                            .iter()
+                            .map(|&col| reads.column(scan_reads, col, gi))
+                            .collect::<std::io::Result<_>>()?;
+                        let called: smallvec::SmallVec<[Option<HeldColumn<'_>>; 8]> = sources
+                            .iter()
+                            .map(|source| match source {
+                                CallSource::Column(col) => reads.column(scan_reads, *col, gi).map(Some),
+                                _ => Ok(None),
+                            })
+                            .collect::<std::io::Result<_>>()?;
+                        let inputs: smallvec::SmallVec<[ColdInput<'_>; 8]> = sources
+                            .iter()
+                            .zip(&called)
+                            .zip(aggregates)
+                            .map(|((source, held), &(op, _))| match (source, held) {
+                                (CallSource::Default(value), _) => ColdInput::Default(value),
+                                (_, Some(column)) => ColdInput::of(op, column),
+                                (_, None) => ColdInput::Star,
+                            })
+                            .collect();
+                        let Some(at) = key.at(&keyed) else {
+                            return Ok(false);
+                        };
+                        run(std::iter::once(first).chain(positions), rows, base, at, &inputs, part);
+                        Ok(true)
+                    }
+                    // The rows of one row group, out of line and with the key
+                    // and the inputs its own, so the loop keeps them in registers
+                    #[inline(never)]
+                    fn run<A: GroupAt>(
+                        positions: impl Iterator<Item = usize>,
+                        rows: GroupRows<'_>,
+                        base: usize,
+                        mut key: A,
+                        inputs: &[ColdInput<'_>],
+                        part: &mut GroupedAggregates,
+                    ) {
+                        let (preds, _, _, shown) = rows;
                         // A new key past the group cap drops its row
                         if preds.is_empty() {
                             for i in positions.filter(|&i| shown.has(i)) {
-                                if let Some(group) = key.group(part, i) {
-                                    accumulate_columnar(part.aggregates(group), &inputs, i);
+                                if let Some(group) = key.group(part, i - base) {
+                                    accumulate_columnar(part.aggregates(group), inputs, i - base);
                                 }
                             }
                         } else {
                             for i in positions {
-                                if passes(vol, rows, i)?
-                                    && let Some(group) = key.group(part, i)
+                                if passes(rows, i, base)
+                                    && let Some(group) = key.group(part, i - base)
                                 {
-                                    accumulate_columnar(part.aggregates(group), &inputs, i);
+                                    accumulate_columnar(part.aggregates(group), inputs, i - base);
                                 }
                             }
                         }
-                        Ok(Some((key, Some(inputs))))
                     }
                     // The side file names the candidates; each passes every
                     // predicate, read from its row group, before the calls
@@ -9247,7 +9298,7 @@ impl Table for SegmentedTable {
                             Deadline,
                         ),
                         (mapping, aggregates, bail): (
-                            &super::writer::ColumnMapping,
+                            &'v super::writer::ColumnMapping,
                             &[(AggregateOp, usize)],
                             &std::sync::atomic::AtomicBool,
                         ),
@@ -9320,7 +9371,7 @@ impl Table for SegmentedTable {
                                             Call::Column(*phys, None)
                                         }
                                         (_, Some(super::writer::ColSource::Default(value))) => {
-                                            Call::Fixed(ColdInput::Default(value.clone()))
+                                            Call::Fixed(ColdInput::Default(value))
                                         }
                                         (_, None) => {
                                             bail.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -9393,30 +9444,25 @@ impl Table for SegmentedTable {
                     let calls = (&**vol, mapping, aggregates);
                     let rows =(&phys_preds[..], &row_group_skips[..], &shown, deadline);
                     // Each row's group: the one group, a value the volume holds
-                    // for every row, or the volume's group column read whole
+                    // for every row, or the volume's group column
                     let answered = match group_column {
                         GroupColumn::None => scan(calls, rows, FixedGroup(None, None), &mut part)?,
                         GroupColumn::Text(at) | GroupColumn::Integer(at) => {
                             match mapping.sources.get(at) {
                                 Some(super::writer::ColSource::Volume(phys)) => {
-                                    match (group_column, vol.columns.get(*phys)?) {
-                                        (
-                                            GroupColumn::Text(_),
-                                            super::column::ColumnData::Dictionary {
-                                                ids,
-                                                dictionary,
-                                                nulls,
-                                            },
-                                        ) => {
-                                            let key = TextGroups {
-                                                ids,
-                                                dictionary,
-                                                nulls,
-                                                known: vec![u32::MAX; dictionary.len() + 1],
-                                            };
-                                            scan(calls, rows, key, &mut part)?
+                                    let column = [*phys];
+                                    match group_column {
+                                        GroupColumn::Text(_) => {
+                                            match vol.get_column_dictionary(*phys)? {
+                                                Some(dictionary) => {
+                                                    let known = vec![u32::MAX; dictionary.len() + 1];
+                                                    let key = TextGroups { column, known };
+                                                    scan(calls, rows, key, &mut part)?
+                                                }
+                                                None => false,
+                                            }
                                         }
-                                        (GroupColumn::Integer(_), column) => {
+                                        _ => {
                                             let key = IntegerGroups {
                                                 column,
                                                 known: KeyMap::default(),
@@ -9424,7 +9470,6 @@ impl Table for SegmentedTable {
                                             };
                                             scan(calls, rows, key, &mut part)?
                                         }
-                                        _ => false,
                                     }
                                 }
                                 Some(super::writer::ColSource::Default(value)) => {
@@ -9506,16 +9551,109 @@ enum GroupColumn {
     Integer(usize),
 }
 
-/// How one volume's rows find their group, each key's group cached once found
+/// How a volume's read takes its columns: decoded whole when every column
+/// it reads is resident, else a row group at a time through the decoded
+/// group cache
+#[derive(Clone, Copy)]
+enum ColumnReads<'v> {
+    Whole(&'v FrozenVolume),
+    Groups(&'v super::writer::CompressedBlockStore),
+}
+
+/// A column a read holds for one row group
+enum HeldColumn<'v> {
+    Whole(&'v super::column::ColumnData),
+    Group(Arc<super::column::ColumnData>),
+}
+
+impl std::ops::Deref for HeldColumn<'_> {
+    type Target = super::column::ColumnData;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Whole(column) => column,
+            Self::Group(column) => column,
+        }
+    }
+}
+
+impl<'v> ColumnReads<'v> {
+    /// How `vol` gives `columns`, its physical columns a read takes
+    fn of(vol: &'v FrozenVolume, mut columns: impl Iterator<Item = usize>) -> Self {
+        match vol.columns.compressed_store() {
+            Some(store) if !columns.all(|col| vol.columns.resident(col).is_some()) => {
+                Self::Groups(store)
+            }
+            _ => Self::Whole(vol),
+        }
+    }
+
+    /// Column `col` for row group `group`, read in order through `reads`
+    fn column(
+        self,
+        reads: &mut super::writer::ScanReads,
+        col: usize,
+        group: usize,
+    ) -> std::io::Result<HeldColumn<'v>> {
+        match self {
+            Self::Whole(vol) => vol.columns.get(col).map(HeldColumn::Whole),
+            Self::Groups(store) => store
+                .group_column_in(col, group, reads)
+                .map(HeldColumn::Group),
+        }
+    }
+
+    /// Where row `i` of a held column is, for the row group from `start`
+    fn base(self, start: usize) -> usize {
+        match self {
+            Self::Whole(_) => 0,
+            Self::Groups(_) => start,
+        }
+    }
+}
+
+/// How one volume's rows find their group, each key's group kept across
+/// its row groups once found
 trait GroupOf {
-    /// The group of row `i` in `part`; None for a new key past its group cap
+    /// The key read in one row group
+    type At<'c>: GroupAt
+    where
+        Self: 'c;
+
+    /// The physical columns the key reads, in order
+    fn columns(&self) -> &[usize];
+
+    /// The key over `held`, its columns in one row group; None when one is
+    /// not of the layout the key reads
+    fn at<'c>(&'c mut self, held: &'c [HeldColumn<'_>]) -> Option<Self::At<'c>>;
+}
+
+/// A key's rows in one row group
+trait GroupAt {
+    /// The group of row `i` of the row group in `part`; None for a new key
+    /// past its group cap
     fn group(&mut self, part: &mut GroupedAggregates, i: usize) -> Option<usize>;
 }
 
 /// The one group, of no key or of a value the volume holds for every row
 struct FixedGroup<'v>(Option<&'v Value>, Option<usize>);
 
-impl GroupOf for FixedGroup<'_> {
+impl<'v> GroupOf for FixedGroup<'v> {
+    type At<'c>
+        = &'c mut FixedGroup<'v>
+    where
+        Self: 'c;
+
+    fn columns(&self) -> &[usize] {
+        &[]
+    }
+
+    fn at<'c>(&'c mut self, _: &'c [HeldColumn<'_>]) -> Option<Self::At<'c>> {
+        Some(self)
+    }
+}
+
+impl GroupAt for &mut FixedGroup<'_> {
     #[inline(always)]
     fn group(&mut self, part: &mut GroupedAggregates, _: usize) -> Option<usize> {
         if self.1.is_none() {
@@ -9526,15 +9664,45 @@ impl GroupOf for FixedGroup<'_> {
 }
 
 /// A text group column, read by its dictionary ids
-struct TextGroups<'v> {
-    ids: &'v [u32],
-    dictionary: &'v [crate::common::SmartString],
-    nulls: &'v [bool],
+struct TextGroups {
+    column: [usize; 1],
     /// Each entry's group, NULL's last, `u32::MAX` while it has none
     known: Vec<u32>,
 }
 
-impl GroupOf for TextGroups<'_> {
+/// A text group column's ids in one row group
+struct TextAt<'c> {
+    ids: &'c [u32],
+    dictionary: &'c [crate::common::SmartString],
+    nulls: &'c [bool],
+    known: &'c mut [u32],
+}
+
+impl GroupOf for TextGroups {
+    type At<'c> = TextAt<'c>;
+
+    fn columns(&self) -> &[usize] {
+        &self.column
+    }
+
+    fn at<'c>(&'c mut self, held: &'c [HeldColumn<'_>]) -> Option<Self::At<'c>> {
+        match held.first().map(|column| &**column) {
+            Some(super::column::ColumnData::Dictionary {
+                ids,
+                dictionary,
+                nulls,
+            }) if dictionary.len() + 1 == self.known.len() => Some(TextAt {
+                ids,
+                dictionary,
+                nulls,
+                known: &mut self.known,
+            }),
+            _ => None,
+        }
+    }
+}
+
+impl GroupAt for TextAt<'_> {
     #[inline(always)]
     fn group(&mut self, part: &mut GroupedAggregates, i: usize) -> Option<usize> {
         let slot = match self.nulls[i] {
@@ -9553,18 +9721,41 @@ impl GroupOf for TextGroups<'_> {
 }
 
 /// An INTEGER or TIMESTAMP group column, read by its integers
-struct IntegerGroups<'v> {
-    column: &'v super::column::ColumnData,
+struct IntegerGroups {
+    column: [usize; 1],
     known: KeyMap<i64, u32>,
     null: Option<u32>,
 }
 
-impl GroupOf for IntegerGroups<'_> {
+/// An integer group column in one row group
+struct IntegerAt<'c> {
+    column: &'c super::column::ColumnData,
+    known: &'c mut KeyMap<i64, u32>,
+    null: &'c mut Option<u32>,
+}
+
+impl GroupOf for IntegerGroups {
+    type At<'c> = IntegerAt<'c>;
+
+    fn columns(&self) -> &[usize] {
+        &self.column
+    }
+
+    fn at<'c>(&'c mut self, held: &'c [HeldColumn<'_>]) -> Option<Self::At<'c>> {
+        Some(IntegerAt {
+            column: held.first()?,
+            known: &mut self.known,
+            null: &mut self.null,
+        })
+    }
+}
+
+impl GroupAt for IntegerAt<'_> {
     #[inline(always)]
     fn group(&mut self, part: &mut GroupedAggregates, i: usize) -> Option<usize> {
         let is_null = self.column.is_null(i);
         let found = match is_null {
-            true => self.null,
+            true => *self.null,
             false => self.known.get(&self.column.get_i64(i)).copied(),
         };
         if let Some(group) = found {
@@ -9573,7 +9764,7 @@ impl GroupOf for IntegerGroups<'_> {
         let key = self.column.get_value(i);
         let group = part.group(std::slice::from_ref(&key))? as u32;
         match is_null {
-            true => self.null = Some(group),
+            true => *self.null = Some(group),
             false => {
                 self.known.insert(self.column.get_i64(i), group);
             }
@@ -9590,7 +9781,35 @@ enum ColdInput<'a> {
     Integer(&'a [i64], &'a [bool]),
     Float(&'a [f64], &'a [bool]),
     Value(&'a super::column::ColumnData),
-    Default(Value),
+    Default(&'a Value),
+}
+
+/// Where one aggregate call reads a volume's rows
+#[derive(Clone, Copy)]
+enum CallSource<'v> {
+    Star,
+    Default(&'v Value),
+    Column(usize),
+}
+
+impl<'v> CallSource<'v> {
+    /// The sources of `aggregates` in a volume of `mapping`; None when its
+    /// layout lacks one
+    fn of(
+        mapping: &'v super::writer::ColumnMapping,
+        aggregates: &[(AggregateOp, usize)],
+    ) -> Option<smallvec::SmallVec<[Self; 8]>> {
+        aggregates
+            .iter()
+            .map(|&(op, col_idx)| match op {
+                AggregateOp::CountStar => Some(Self::Star),
+                _ => match mapping.sources.get(col_idx)? {
+                    super::writer::ColSource::Volume(phys) => Some(Self::Column(*phys)),
+                    super::writer::ColSource::Default(value) => Some(Self::Default(value)),
+                },
+            })
+            .collect()
+    }
 }
 
 /// What COUNT is fed for a row it counts
@@ -9607,31 +9826,6 @@ impl<'a> ColdInput<'a> {
             (_, ColumnData::Float64 { values, nulls }) => ColdInput::Float(values, nulls),
             _ => ColdInput::Value(col),
         }
-    }
-
-    /// The inputs of `aggregates` in `vol`; None when its layout lacks one
-    fn resolve(
-        vol: &'a FrozenVolume,
-        mapping: &super::writer::ColumnMapping,
-        aggregates: &[(AggregateOp, usize)],
-    ) -> Result<Option<Vec<ColdInput<'a>>>> {
-        let mut inputs = Vec::with_capacity(aggregates.len());
-        for &(op, col_idx) in aggregates {
-            if op == AggregateOp::CountStar {
-                inputs.push(ColdInput::Star);
-                continue;
-            }
-            let Some(source) = mapping.sources.get(col_idx) else {
-                return Ok(None);
-            };
-            inputs.push(match source {
-                super::writer::ColSource::Volume(phys_idx) => {
-                    ColdInput::of(op, vol.columns.get(*phys_idx)?)
-                }
-                super::writer::ColSource::Default(val) => ColdInput::Default(val.clone()),
-            });
-        }
-        Ok(Some(inputs))
     }
 }
 
@@ -9906,6 +10100,76 @@ mod tests {
         )
         .unwrap();
         mgr
+    }
+
+    #[test]
+    fn the_volumes_aggregate_a_deferred_volume_a_row_group_at_a_time() {
+        use crate::storage::expression::ComparisonExpr;
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("g", DataType::Text, true, false)
+            .column("v", DataType::Integer, true, false)
+            .build();
+        let mut builder = VolumeBuilder::with_capacity(&schema, 70000);
+        for id in 0..70000 {
+            let g = Value::text(["a", "b"][id as usize % 2]);
+            builder.add_row(
+                id,
+                &Row::from_values(vec![Value::Integer(id), g, Value::Integer(id)]),
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let written =
+            super::super::io::write_volume_to_disk(dir.path(), "t", 1, &builder.finish().unwrap())
+                .unwrap();
+        let vol = Arc::new(super::super::io::read_volume_from_disk(&written).unwrap());
+        let mgr = Arc::new(SegmentManager::new("t", None));
+        let meta = SegmentMeta {
+            segment_id: 1,
+            file_path: written,
+            row_count: 70000,
+            min_row_id: 0,
+            max_row_id: 69999,
+            schema_version: 0,
+            creation_lsn: 0,
+            seal_seq: 0,
+        };
+        mgr.register_segment(1, Arc::clone(&vol), meta, None)
+            .unwrap();
+        let table = SegmentedTable::new(Box::new(MockHotTable::new(schema, Vec::new())), mgr);
+        let calls = [(AggregateOp::CountStar, 0), (AggregateOp::Sum, 2)];
+        let over = ComparisonExpr::new("v", crate::core::Operator::Gt, Value::Integer(69899));
+        type Case<'c> = (&'c [usize], Option<&'c dyn Expression>, &'c [&'c str]);
+        let cases: [Case<'_>; 3] = [
+            (&[], None, &["70000, 2449965000"]),
+            (
+                &[1],
+                None,
+                &["a, 35000, 1224965000", "b, 35000, 1225000000"],
+            ),
+            (&[], Some(&over), &["100, 6994950"]),
+        ];
+        for (groups, filter, want) in cases {
+            let answer = table
+                .compute_grouped_aggregates(groups, &calls, filter, Deadline::NONE)
+                .unwrap()
+                .expect("the volumes answer");
+            let mut got: Vec<String> = answer
+                .into_rows()
+                .unwrap()
+                .iter()
+                .map(|(_, row)| {
+                    let values: Vec<String> = row.iter().map(|v| v.to_string()).collect();
+                    values.join(", ")
+                })
+                .collect();
+            got.sort();
+            assert_eq!(got, want, "{groups:?}");
+            assert!(
+                (0..3).all(|col| vol.columns.resident(col).is_none()),
+                "{groups:?}: no column of a deferred volume is held decoded"
+            );
+        }
     }
 
     /// Minimal test table for the hot buffer
