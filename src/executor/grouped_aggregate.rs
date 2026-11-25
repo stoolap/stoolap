@@ -210,6 +210,10 @@ impl Executor {
         ),
         all_columns: &[String],
     ) -> Result<Option<Box<dyn QueryResult>>> {
+        // The rows a WHERE passes in the hot store alone are the scan's
+        if stmt.where_clause.is_some() && !table.has_sealed_rows() {
+            return Ok(None);
+        }
         let columns = Self::call_columns(aggregations, all_columns);
         let stored = match (source, stmt.where_clause.is_some()) {
             (GroupedSource::Storage, filtered) => {
