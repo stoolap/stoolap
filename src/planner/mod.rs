@@ -447,7 +447,11 @@ fn read_lines(read: &Read, text: &PlanText<'_>, lines: &mut Vec<String>) {
             let table = text.table;
             match source {
                 GroupedSource::Storage => {
-                    alternative(lines, format!("StorageGrouped {table} ({group})"));
+                    let line = match text.pushed {
+                        Some(pushed) => format!("StorageGrouped {table} ({group}) {pushed}"),
+                        None => format!("StorageGrouped {table} ({group})"),
+                    };
+                    alternative(lines, line);
                     if *walks {
                         alternative(lines, format!("SortedStream {table} ({group})"));
                     }

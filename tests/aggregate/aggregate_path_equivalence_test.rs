@@ -844,6 +844,43 @@ const CASES: &[(&str, &str, &str, &str)] = &[
         "SELECT g AS k FROM t GROUP BY g ORDER BY k DESC LIMIT 1",
         "SELECT g AS k FROM t WHERE id + 0 = id GROUP BY g ORDER BY k DESC LIMIT 1",
     ),
+    (
+        "sealed",
+        "storage_grouped",
+        "SELECT g, COUNT(*), SUM(a), MIN(a), MAX(a) FROM t WHERE a > 1 GROUP BY g",
+        "SELECT g, COUNT(*), SUM(a), MIN(a), MAX(a) FROM t WHERE a > 1 AND id + 0 = id GROUP BY g",
+    ),
+    (
+        "sealed",
+        "storage_grouped",
+        "SELECT s, COUNT(a), AVG(a) FROM t WHERE g = 2 GROUP BY s",
+        "SELECT s, COUNT(a), AVG(a) FROM t WHERE g = 2 AND id + 0 = id GROUP BY s",
+    ),
+    (
+        "sealed",
+        "storage_grouped",
+        "SELECT g, COUNT(*) FROM t WHERE s = '1' GROUP BY g",
+        "SELECT g, COUNT(*) FROM t WHERE s = '1' AND id + 0 = id GROUP BY g",
+    ),
+    (
+        "sealed",
+        "storage_grouped",
+        "SELECT g, SUM(a) FROM t WHERE a > 100 GROUP BY g",
+        "SELECT g, SUM(a) FROM t WHERE a > 100 AND id + 0 = id GROUP BY g",
+    ),
+    (
+        "sealed",
+        "storage_grouped",
+        "SELECT g FROM t WHERE a > 1 GROUP BY g",
+        "SELECT g FROM t WHERE a > 1 AND id + 0 = id GROUP BY g",
+    ),
+    (
+        "sealed",
+        "storage_grouped",
+        "SELECT g, SUM(a) FROM t WHERE a >= 1 GROUP BY g HAVING COUNT(*) > 1 ORDER BY g DESC LIMIT 1",
+        "SELECT g, SUM(a) FROM t WHERE a >= 1 AND id + 0 = id GROUP BY g \
+         HAVING COUNT(*) > 1 ORDER BY g DESC LIMIT 1",
+    ),
 ];
 
 fn open(db: Database, seal: bool, rows: bool) -> Database {

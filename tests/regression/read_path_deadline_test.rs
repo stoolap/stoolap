@@ -104,20 +104,11 @@ const CASES: &[(&str, Case)] = &[
         Stops(Sealed, false, "SELECT * FROM t LIMIT 10", StorageRead),
     ),
     (
-        "seg.compute_filtered_aggregates",
-        Stops(
-            Sealed,
-            false,
-            "SELECT COUNT(*) FROM t WHERE v > 10",
-            StorageAggregate,
-        ),
-    ),
-    (
         "seg.compute_grouped_aggregates",
         Stops(
             Sealed,
             false,
-            "SELECT k, SUM(v) FROM t GROUP BY k",
+            "SELECT k, SUM(v) FROM t WHERE v > 10 GROUP BY k",
             StorageAggregate,
         ),
     ),

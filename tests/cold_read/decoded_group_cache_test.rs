@@ -102,8 +102,9 @@ fn warm_table(dir: &tempfile::TempDir, name: &str) -> Database {
 }
 
 const LATEST: &str = "SELECT id FROM c WHERE k = 'k7' ORDER BY t DESC LIMIT 50";
-const SUMMARY: &str =
-    "SELECT k, MAX(v), MIN(v) FROM c WHERE t >= '2024-03-03 00:00:00' GROUP BY k ORDER BY k";
+/// Its filter is one the storage cannot run whole, so the rows are read
+const SUMMARY: &str = "SELECT k, MAX(v), MIN(v) FROM c WHERE t >= '2024-03-03 00:00:00' \
+     AND v + 0 >= 0 GROUP BY k ORDER BY k";
 
 #[test]
 fn test_cache_keeps_decoded_groups_and_answers_the_same_rows() {
@@ -351,13 +352,14 @@ fn a_statement_with_expressions_decodes_only_the_columns_it_names() {
         .query_one("SELECT COUNT(*) FROM t WHERE k >= 1", ())
         .unwrap();
     assert_eq!(count, 43);
-    // GROUP BY and ORDER BY name their columns
+    // So does a grouped count under a filter the storage runs whole
     let rows = expect(
         "SELECT k, COUNT(*) FROM t WHERE k >= 0 GROUP BY k ORDER BY k",
-        1,
+        0,
     );
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0], vec!["0".to_string(), "21".to_string()]);
+    // ORDER BY names its columns
     let rows = expect("SELECT id * 2 AS d FROM t WHERE k = 2 ORDER BY d DESC", 2);
     assert_eq!(rows.len(), 21);
     assert_eq!(rows[0][0], "124");
