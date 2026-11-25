@@ -237,3 +237,46 @@ fn foreign_key_check_on_a_sealed_parent_is_correct() {
     drop(db);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn foreign_key_check_of_a_parent_written_in_the_transaction_keeps_its_single_row_read() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("pk_fk_local_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let db = Database::open(&format!(
+        "file://{}?checkpoint_interval=3600",
+        dir.display()
+    ))
+    .unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT NOT NULL, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    add_child(&db);
+    // The same insert with no key to check
+    db.execute(
+        "CREATE TABLE d (id INTEGER PRIMARY KEY AUTO_INCREMENT, t_id INTEGER)",
+        (),
+    )
+    .unwrap();
+    // No volume yet: the parent's rows are this transaction's own
+    db.execute("BEGIN", ()).unwrap();
+    db.execute(
+        "INSERT INTO t SELECT value, 'k', value FROM GENERATE_SERIES(0, 199)",
+        (),
+    )
+    .unwrap();
+    let checked = allocs_per_statement(&db, "INSERT INTO c (t_id) VALUES (?)", 100..120);
+    let plain = allocs_per_statement(&db, "INSERT INTO d (t_id) VALUES (?)", 100..120);
+    db.execute("COMMIT", ()).unwrap();
+    // The hot store's single-row read of the key: 2.2 allocations per check
+    // here, one more when the check went through the batch fetch
+    assert!(
+        checked - plain <= 2.5,
+        "a check of a parent with no volume costs {:.1} allocations over an unchecked insert",
+        checked - plain
+    );
+    drop(db);
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -6267,6 +6267,16 @@ impl Table for SegmentedTable {
         offset: usize,
         deadline: Deadline,
     ) -> Result<RowVec> {
+        // With no volumes the hot store answers alone, a key by its own
+        // single-row read
+        let hot_rows = |hot: &dyn Table| {
+            hot.collect_access_rows_with_limit_unordered(
+                access, where_expr, limit, offset, deadline,
+            )
+        };
+        if let Some(result) = self.unsealed(hot_rows) {
+            return result;
+        }
         // A bare `pk = k` names one row: fetched by its id, as a point read
         // is, instead of walking the cold rows until one matches (a foreign
         // key's check of its parent reads this way)
