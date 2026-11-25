@@ -1457,6 +1457,13 @@ impl SegmentedTable {
     /// `lazy` leaves cold volumes unloaded. The caller checks the seal
     /// generation after it
     fn cold_view(&self, hot_skip: &mut KeySet<i64>, lazy: bool) -> Result<ColdView> {
+        let view = self.cold_volumes(lazy)?;
+        self.hide_hot_copies(hot_skip);
+        Ok(view)
+    }
+
+    /// The tombstones, then the volumes, of `cold_view`, with no hot ids
+    fn cold_volumes(&self, lazy: bool) -> Result<ColdView> {
         let tombstones = self.segment_mgr.tombstone_set_arc();
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::cold_view_begun();
@@ -1467,10 +1474,15 @@ impl SegmentedTable {
         };
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::cold_view_taken();
+        Ok((tombstones, volumes))
+    }
+
+    /// Adds to `hot_skip` the hot ids and pending tombstones that hide
+    /// sealed copies, read after the volumes they hide rows of
+    fn hide_hot_copies(&self, hot_skip: &mut KeySet<i64>) {
         self.hot.collect_hot_row_ids_into(hot_skip);
         self.segment_mgr
             .insert_pending_tombstones_into(self.pending(), hot_skip);
-        Ok((tombstones, volumes))
     }
 
     /// Cold rows read through this handle's mappings are in its schema
@@ -8774,9 +8786,11 @@ impl Table for SegmentedTable {
                 ),
                 _ => grouped_aggregates(group_by_indices, aggregates),
             };
-            let hot_rows = self
-                .hot
-                .collect_access_rows(ScanAccess::Seq, filter, deadline)?;
+            // The hot rows a WHERE passes are read through the indexes the
+            // access rule picks for it, as the statement's scan would
+            let plan = filter.and_then(|filter| self.hot.index_plan(filter));
+            let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+            let hot_rows = self.hot.collect_access_rows(access, filter, deadline)?;
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::hot_and_cold_reads_split();
             let mut hot_skip: KeySet<i64> =
@@ -8787,11 +8801,7 @@ impl Table for SegmentedTable {
             }
 
             // --- Cold volumes (THE FAST PATH) ------------------------------------
-            // The remaining hot ids join the skip set
-            let (tombstones_arc, volumes) = self.cold_view(&mut hot_skip, false)?;
-            if self.seal_moved(generation) {
-                return Ok(None);
-            }
+            let (tombstones_arc, volumes) = self.cold_volumes(false)?;
 
             // Physical-predicate and physical-aggregate structs used per volume.
             struct PhysPred {
@@ -8851,9 +8861,41 @@ impl Table for SegmentedTable {
                         .is_none_or(|col| col.data_type != DataType::Timestamp)
                 })
                 .collect();
+            // Whether the volume's zone maps let a row pass every predicate
+            fn zones_may_pass(
+                vol: &FrozenVolume,
+                mapping: &super::writer::ColumnMapping,
+                preds: &[ResolvedPred],
+            ) -> bool {
+                preds.iter().all(|pred| {
+                    let Some(super::writer::ColSource::Volume(phys)) =
+                        mapping.sources.get(pred.schema_col_idx)
+                    else {
+                        return true;
+                    };
+                    let Some(zm) = vol.meta.zone_maps.get(*phys) else {
+                        return true;
+                    };
+                    let probe = zm_probe_value(&pred.target, pred.is_timestamp);
+                    let nans = vol.meta.nan_count(*phys) != Some(0);
+                    match pred.op {
+                        crate::core::Operator::Eq => zm.may_contain_eq(&probe, nans),
+                        crate::core::Operator::Gt | crate::core::Operator::Gte => {
+                            zm.may_contain_gte(&probe, nans)
+                        }
+                        crate::core::Operator::Lt | crate::core::Operator::Lte => {
+                            zm.may_contain_lte(&probe, nans)
+                        }
+                        _ => true,
+                    }
+                })
+            }
             let bloom_hashes = Self::precompute_bloom_hashes(&comparisons_for_prune);
             let mut pruned_volumes = Vec::with_capacity(volumes.len());
             for volume in volumes.iter() {
+                if !zones_may_pass(&volume.1.volume, &volume.1.mapping, &preds) {
+                    continue;
+                }
                 if comparisons_for_prune.is_empty()
                     || !volume.1.mapping.is_identity
                     || !Self::prune_volume(
@@ -8868,6 +8910,13 @@ impl Table for SegmentedTable {
                 }
             }
             let volumes = pruned_volumes;
+            // The hot ids hide sealed copies only in a volume left to read
+            if !volumes.is_empty() {
+                self.hide_hot_copies(&mut hot_skip);
+            }
+            if self.seal_moved(generation) {
+                return Ok(None);
+            }
 
             // --- Per-volume accumulation closure -----------------------------------
             // Extracted so both sequential and parallel paths share one implementation.
@@ -8976,28 +9025,6 @@ impl Table for SegmentedTable {
                     }
                     if skip_volume {
                         return Ok(None);
-                    }
-
-                    // Zone-map pruning
-                    for pp in &phys_preds {
-                        if pp.phys_col < vol.meta.zone_maps.len() {
-                            let zm = &vol.meta.zone_maps[pp.phys_col];
-                            let val_for_zm = zm_probe_value(&pp.target, pp.is_timestamp);
-                            let nans = vol.meta.nan_count(pp.phys_col) != Some(0);
-                            let can_match = match pp.op {
-                                crate::core::Operator::Eq => zm.may_contain_eq(&val_for_zm, nans),
-                                crate::core::Operator::Gt | crate::core::Operator::Gte => {
-                                    zm.may_contain_gte(&val_for_zm, nans)
-                                }
-                                crate::core::Operator::Lt | crate::core::Operator::Lte => {
-                                    zm.may_contain_lte(&val_for_zm, nans)
-                                }
-                                _ => true,
-                            };
-                            if !can_match {
-                                return Ok(None);
-                            }
-                        }
                     }
 
                     // Row-group skip decisions

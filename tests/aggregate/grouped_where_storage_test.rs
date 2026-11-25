@@ -120,6 +120,25 @@ fn a_grouped_where_sees_the_rows_of_its_own_transaction() {
 }
 
 #[test]
+fn the_hot_rows_a_where_passes_are_read_through_its_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = mixed(dir.path());
+    let cases = [
+        (
+            "SELECT g, COUNT(*) FROM t WHERE a > 1 GROUP BY g",
+            "scan.index, aggregate.storage_grouped",
+        ),
+        (
+            "SELECT COUNT(*), SUM(a) FROM t WHERE a > 1",
+            "scan.index, aggregate.storage_filtered",
+        ),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(path(&db, sql), want, "{sql}");
+    }
+}
+
+#[test]
 fn a_float_sum_passing_the_range_across_volumes_is_an_overflow() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(&format!(
