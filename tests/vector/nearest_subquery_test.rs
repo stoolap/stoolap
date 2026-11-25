@@ -18,7 +18,9 @@
 
 use stoolap::Database;
 
-/// 500 rows on a curve, each at its own distance from any other
+/// Ten rows on a line: row k at x = 0, 2, 5, 9, 14, 20, 27, 35, 44, 55. Row
+/// 7 (x = 27) is at L2 distance 0, 7, 8, 13, 17 from rows 7, 6, 8, 5, 9, and
+/// at 18 or more from every other row: no two rows tie
 fn docs(name: &str) -> Database {
     let db = Database::open(&format!("memory://{name}")).unwrap();
     db.execute(
@@ -26,17 +28,20 @@ fn docs(name: &str) -> Database {
         (),
     )
     .unwrap();
-    db.execute(
-        "INSERT INTO docs SELECT value, '[' || CAST(SIN(value) AS TEXT) || ',' || \
-         CAST(COS(value) AS TEXT) || ',' || CAST(value / 500.0 AS TEXT) || ']' \
-         FROM GENERATE_SERIES(1, 500)",
-        (),
-    )
-    .unwrap();
+    for (id, x) in [0, 2, 5, 9, 14, 20, 27, 35, 44, 55].into_iter().enumerate() {
+        db.execute(
+            &format!("INSERT INTO docs VALUES ({}, '[{x}.0, 0.0, 0.0]')", id + 1),
+            (),
+        )
+        .unwrap();
+    }
     db.execute("CREATE INDEX idx_emb ON docs(emb) USING HNSW", ())
         .unwrap();
     db
 }
+
+/// The five rows nearest row 7, nearest first, and their distances
+const NEAREST: [(i64, f64); 5] = [(7, 0.0), (6, 7.0), (8, 8.0), (5, 13.0), (9, 17.0)];
 
 fn plan(db: &Database, sql: &str) -> String {
     db.query(&format!("EXPLAIN {sql}"), ())
@@ -51,12 +56,6 @@ fn ids(db: &Database, sql: &str) -> Vec<i64> {
         .unwrap_or_else(|e| panic!("{sql}: {e}"))
         .map(|row| row.unwrap().get::<i64>(0).unwrap())
         .collect()
-}
-
-/// Row 7's vector, as a literal
-fn literal(db: &Database) -> String {
-    db.query_one("SELECT VEC_TO_TEXT(emb) FROM docs WHERE id = 7", ())
-        .unwrap()
 }
 
 const BY_ALIAS: &str = "SELECT id, VEC_DISTANCE_L2(emb, (SELECT emb FROM docs WHERE id = 7)) AS d \
@@ -77,16 +76,19 @@ fn a_scalar_subquery_query_vector_is_planned_through_the_index() {
 }
 
 #[test]
-fn a_scalar_subquery_query_vector_finds_what_the_literal_finds() {
+fn a_scalar_subquery_query_vector_finds_the_nearest_rows() {
     let db = docs("nearest_subquery_rows");
-    let vector = literal(&db);
-    let expected = ids(
-        &db,
-        &format!("SELECT id FROM docs ORDER BY VEC_DISTANCE_L2(emb, '{vector}') LIMIT 5"),
-    );
-    assert_eq!(expected[0], 7, "the row itself is nearest");
-    assert_eq!(ids(&db, BY_ALIAS), expected);
-    assert_eq!(ids(&db, BY_KEY), expected);
+    let found: Vec<(i64, f64)> = db
+        .query(BY_ALIAS, ())
+        .unwrap()
+        .map(|row| {
+            let row = row.unwrap();
+            (row.get::<i64>(0).unwrap(), row.get::<f64>(1).unwrap())
+        })
+        .collect();
+    assert_eq!(found, NEAREST, "{BY_ALIAS}");
+    let expected: Vec<i64> = NEAREST.iter().map(|&(id, _)| id).collect();
+    assert_eq!(ids(&db, BY_KEY), expected, "{BY_KEY}");
 }
 
 #[cfg(feature = "test-failpoints")]
@@ -107,29 +109,31 @@ fn the_index_answers_a_scalar_subquery_query_vector_when_it_runs() {
 #[test]
 fn a_positional_parameter_query_vector_still_finds_its_rows() {
     let db = docs("nearest_subquery_param");
-    let vector = literal(&db);
     let found: Vec<i64> = db
         .query(
             "SELECT id FROM docs ORDER BY VEC_DISTANCE_L2(emb, $1) LIMIT 3",
-            (vector.as_str(),),
+            ("[27.0, 0.0, 0.0]",),
         )
         .unwrap()
         .map(|row| row.unwrap().get::<i64>(0).unwrap())
         .collect();
-    assert_eq!(found[0], 7);
-    assert_eq!(found.len(), 3);
+    assert_eq!(found, vec![7, 6, 8]);
 }
 
 #[test]
 fn a_correlated_query_vector_is_answered_row_by_row() {
     let db = docs("nearest_subquery_correlated");
-    // Each row's distance from itself: every one is 0, the order is the key's
-    let rows = ids(
-        &db,
-        "SELECT id FROM docs d ORDER BY \
-         VEC_DISTANCE_L2(emb, (SELECT emb FROM docs x WHERE x.id = d.id)) LIMIT 3",
-    );
-    assert_eq!(rows.len(), 3);
+    // Each row at distance 0 from itself
+    let found: Vec<f64> = db
+        .query(
+            "SELECT VEC_DISTANCE_L2(emb, (SELECT emb FROM docs x WHERE x.id = d.id)) AS dist \
+             FROM docs d ORDER BY dist LIMIT 3",
+            (),
+        )
+        .unwrap()
+        .map(|row| row.unwrap().get::<f64>(0).unwrap())
+        .collect();
+    assert_eq!(found, vec![0.0, 0.0, 0.0]);
 }
 
 #[test]
