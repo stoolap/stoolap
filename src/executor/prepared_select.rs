@@ -9269,6 +9269,9 @@ impl PreparedSelect {
             })
             .map(|id| u16::try_from(id).map_err(|_| Error::internal("too many subqueries")))
             .collect::<Result<Vec<_>>>()?;
+        // The SELECT items holding subqueries as rewritten, their
+        // uncorrelated values run slots
+        let written_items = &select;
         // Over one table `t.*` is `*`, the projection's expansion; the
         // names' prefix rule for a joined `t.*` would drop columns
         let select: std::borrow::Cow<[Expression]> = if stmt
@@ -9433,7 +9436,31 @@ impl PreparedSelect {
                 });
                 let nearest = bound
                     .filter(|_| ordered.is_none() && stmt.limit.is_some() && !stmt.distinct)
-                    .and_then(|item| Executor::vector_distance_order(stmt, item))
+                    .and_then(|item| {
+                        let call = Executor::vector_distance_order(stmt, item)?;
+                        // A query vector an uncorrelated block gives is a run
+                        // slot by now, a parameter the run binds: the key as
+                        // rewritten names it. The column stays as written
+                        let written = match item {
+                            Some(item) => written_items.get(item),
+                            None => order_by.first(),
+                        };
+                        let slot = written
+                            .and_then(Option::as_ref)
+                            .and_then(Executor::vector_distance_call)
+                            .and_then(|written| match written.arguments.get(1) {
+                                Some(slot @ Expression::Parameter(_)) => Some(slot.clone()),
+                                _ => None,
+                            });
+                        Some(match slot {
+                            Some(slot) => {
+                                let mut call = call.into_owned();
+                                call.arguments[1] = slot;
+                                std::borrow::Cow::Owned(call)
+                            }
+                            None => call,
+                        })
+                    })
                     .and_then(|call| nearest_read(&store, schema, &call));
                 if ordered.is_none() && !stmt.order_by.is_empty() {
                     steps.push(sort);
@@ -16375,7 +16402,15 @@ impl<'a> PreparedRunner<'a> {
         ctx: &ExecutionContext,
         k: usize,
     ) -> Result<Option<RowVec>> {
-        let query = match super::expression::evaluate_once(&read.query, Some(ctx)).ok() {
+        // A parameter is read from the run's buffer, which also holds the run
+        // slots: an uncorrelated block's value is one, filled before the rows
+        let given = match &read.query {
+            Expression::Parameter(param) => parameter_slot(param)
+                .ok()
+                .and_then(|at| self.base.get(at as usize).cloned()),
+            query => super::expression::evaluate_once(query, Some(ctx)).ok(),
+        };
+        let query = match given {
             Some(Value::Text(text)) => match crate::core::value::parse_vector_str(&text) {
                 Some(floats) => Value::vector(floats),
                 None => return Ok(None),
@@ -16456,6 +16491,8 @@ impl<'a> PreparedRunner<'a> {
                 if nearest.len() < k {
                     return Ok(None);
                 }
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::nearest_index_answered();
                 nearest
             }
             false => {
