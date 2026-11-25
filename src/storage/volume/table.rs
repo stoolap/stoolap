@@ -8928,8 +8928,10 @@ impl Table for SegmentedTable {
             // A side file over a key the comparisons bound names the only rows
             // the calls must look at, each read from its row group
             let walk_asks = self.side_asks(&comparisons);
+            // Each volume's run starts from this empty one
+            let empty = groups.empty_like();
 
-            let process_volume = |(_, cs): &(u64, super::manifest::ColdSegment)| -> Result<
+            let process_volume =|(_, cs): &(u64, super::manifest::ColdSegment)| -> Result<
                 Option<GroupedAggregates>,
             > {
                     if bail.load(std::sync::atomic::Ordering::Relaxed) {
@@ -9329,7 +9331,7 @@ impl Table for SegmentedTable {
                         }
                         Ok(true)
                     }
-                    let mut part = groups.empty_like();
+                    let mut part = empty.empty_like();
                     if let Some(mut walk) = walk {
                         // A walk reads row groups, so it answers the one group only
                         if !matches!(group_column, GroupColumn::None) {
@@ -9357,6 +9359,15 @@ impl Table for SegmentedTable {
                         &cut,
                         deadline,
                     )?);
+                    // A volume that shows no row is left with its columns
+                    // unread, its rows still charged a row group at a time
+                    let rows_shown = |bits: &[u64]| shown_count(bits, vol.meta.row_count);
+                    if shown.0.as_deref().is_some_and(|bits| rows_shown(bits) == 0) {
+                        for rows in row_groups(0..vol.meta.row_count) {
+                            deadline.charge(DeadlineSite::StorageAggregate, rows.len())?;
+                        }
+                        return Ok(None);
+                    }
                     let calls = (&**vol, mapping, aggregates);
                     let rows =(&phys_preds[..], &row_group_skips[..], &shown, deadline);
                     // Each row's group: the one group, a value the volume holds
@@ -9412,37 +9423,47 @@ impl Table for SegmentedTable {
             // Only use rayon when total cold rows justify the scheduling overhead.
             let _total_cold_rows: usize =
                 volumes.iter().map(|(_, cs)| cs.volume.meta.row_count).sum();
-            #[cfg(feature = "parallel")]
-            let volume_accums: Vec<Option<GroupedAggregates>> =
-                if volumes.len() >= 4 && _total_cold_rows >= 100_000 {
-                    use rayon::prelude::*;
-                    volumes
-                        .par_iter()
-                        .map(|v| process_volume(v))
-                        .collect::<Result<_>>()?
-                } else {
-                    volumes
-                        .iter()
-                        .map(|v| process_volume(v))
-                        .collect::<Result<_>>()?
-                };
-            #[cfg(not(feature = "parallel"))]
-            let volume_accums: Vec<Option<GroupedAggregates>> = volumes
-                .iter()
-                .map(|v| process_volume(v))
-                .collect::<Result<_>>()?;
-
-            if bail.load(std::sync::atomic::Ordering::Relaxed) {
-                return Ok(Some(None));
-            }
-
             // The volumes' runs merge in volume order into the hot rows' run;
             // a FLOAT sum that could pass the range on the way reads the rows
-            for part in volume_accums.into_iter().flatten() {
-                if !groups.merges_in_order(&part) {
-                    return Ok(Some(None));
+            let merge_in = |groups: &mut GroupedAggregates, part| match part {
+                Some(part) if !groups.merges_in_order(&part) => false,
+                Some(part) => {
+                    groups.merge(part);
+                    true
                 }
-                groups.merge(part);
+                None => true,
+            };
+            #[cfg(feature = "parallel")]
+            let parallel = volumes.len() >= 4 && _total_cold_rows >= 100_000;
+            #[cfg(not(feature = "parallel"))]
+            let parallel = false;
+            if parallel {
+                #[cfg(feature = "parallel")]
+                {
+                    use rayon::prelude::*;
+                    let parts: Vec<Option<GroupedAggregates>> = volumes
+                        .par_iter()
+                        .map(|v| process_volume(v))
+                        .collect::<Result<_>>()?;
+                    if bail.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Ok(Some(None));
+                    }
+                    for part in parts {
+                        if !merge_in(&mut groups, part) {
+                            return Ok(Some(None));
+                        }
+                    }
+                }
+            } else {
+                // A serial read merges each volume's run as it is read
+                for volume in volumes.iter() {
+                    let part = process_volume(volume)?;
+                    if bail.load(std::sync::atomic::Ordering::Relaxed)
+                        || !merge_in(&mut groups, part)
+                    {
+                        return Ok(Some(None));
+                    }
+                }
             }
 
             self.check_cold()?;

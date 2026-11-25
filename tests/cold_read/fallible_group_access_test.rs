@@ -1264,6 +1264,16 @@ fn fully_hidden_warm_columns_are_not_decoded() {
         .unwrap()
         .unwrap()
         .is_empty());
+    assert!(table
+        .compute_grouped_aggregates(
+            &[1],
+            &[(AggregateOp::Sum, 0)],
+            None,
+            stoolap::executor::Deadline::NONE,
+        )
+        .unwrap()
+        .unwrap()
+        .is_empty());
     table.drop_index("idx_b").unwrap();
     table
         .create_btree_index("b", true, Some("unique_b"))
