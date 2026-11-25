@@ -13997,13 +13997,8 @@ impl Executor {
         }
         let source = prepared.read.and_then(Read::aggregated).filter(|_| !widen);
         let source = source.unwrap_or(GlobalSource::Scan);
-        let pushed = match (source, stmt.where_clause.as_deref()) {
-            (GlobalSource::StorageFiltered, Some(where_clause)) => {
-                match pushdown::try_pushdown(where_clause, table.schema(), Some(ctx)) {
-                    (Some(pushed), false) => Some(pushed),
-                    _ => None,
-                }
-            }
+        let pushed = match source {
+            GlobalSource::StorageFiltered => Self::pushed_where(stmt, table.schema(), ctx),
             _ => None,
         };
         let scan = || {

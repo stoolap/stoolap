@@ -1576,42 +1576,15 @@ pub trait Table: Send + Sync {
         Ok(None) // Default implementation - override in concrete tables
     }
 
-    /// Compute aggregates with a WHERE filter at the storage level.
-    ///
-    /// This pushes filtered aggregation (e.g. `SELECT SUM(col) FROM t WHERE x > 5`)
-    /// directly into the storage layer, scanning only rows that match the predicate
-    /// and computing aggregates without materializing full Row objects in the executor.
-    ///
-    /// # Arguments
-    /// * `aggregates` - List of (operation, column_index) pairs
-    /// * `where_expr` - Storage expression representing the WHERE clause filter
-    ///
-    /// # Returns
-    /// Some(values) with one Value per aggregate if optimization is available, None otherwise
-    fn compute_filtered_aggregates(
-        &self,
-        _aggregates: &[(AggregateOp, usize)],
-        _where_expr: &dyn Expression,
-        _deadline: Deadline,
-    ) -> Result<Option<Vec<crate::core::Value>>> {
-        Ok(None) // Default: not supported
-    }
-
-    /// Compute grouped aggregates at the storage level.
-    ///
-    /// This performs GROUP BY aggregation directly on arena storage without
-    /// materializing Row objects, significantly reducing memory allocations.
-    ///
-    /// # Arguments
-    /// * `group_by_indices` - Column indices to group by
-    /// * `aggregates` - List of (operation, column_index) pairs
-    ///
-    /// # Returns
-    /// Some(groups) if optimization is available, None otherwise
+    /// The groups of `aggregates`, each an (operation, column) pair, over the
+    /// rows `filter` passes, keyed by the columns `group_by_indices` names:
+    /// none for the one group of an aggregation without GROUP BY. None when
+    /// the table cannot answer and the rows are read instead
     fn compute_grouped_aggregates(
         &self,
         _group_by_indices: &[usize],
         _aggregates: &[(AggregateOp, usize)],
+        _filter: Option<&dyn Expression>,
         _deadline: Deadline,
     ) -> Result<Option<GroupedAggregates>> {
         Ok(None) // Default: not supported

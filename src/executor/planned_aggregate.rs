@@ -142,21 +142,26 @@ impl Executor {
             true => self.parse_aggregations(stmt, Some(ctx))?,
             false => self.parse_aggregation_shape(stmt)?,
         };
-        let pushed = match stmt.where_clause.as_deref() {
-            Some(where_clause) => {
-                match super::pushdown::try_pushdown(where_clause, schema, Some(ctx)) {
-                    (Some(pushed), false) => Some(pushed),
-                    _ => None,
-                }
-            }
-            None => None,
-        };
+        let pushed = Self::pushed_where(stmt, schema, ctx);
         let plain = non_aggregated.is_empty();
         let source = Self::global_source(stmt, &aggregations, plain, pushed.is_some(), indexed);
         Ok(Some(AggregatePlan {
             aggregations,
             read: AggregateRead::Global { source },
         }))
+    }
+
+    /// `stmt`'s WHERE as the table of `schema` runs it, when it runs the
+    /// whole of it; None without a WHERE
+    pub(crate) fn pushed_where(
+        stmt: &SelectStatement,
+        schema: &Schema,
+        ctx: &ExecutionContext,
+    ) -> Option<Box<dyn StorageExpr>> {
+        match super::pushdown::try_pushdown(stmt.where_clause.as_deref()?, schema, Some(ctx)) {
+            (Some(pushed), false) => Some(pushed),
+            _ => None,
+        }
     }
 
     /// Where `stmt`, which aggregates one table into one row, reads its row
@@ -357,9 +362,16 @@ impl Executor {
             };
             ops.push(op);
         }
-        Ok(table
-            .compute_filtered_aggregates(&ops, pushed, deadline)?
-            .map(|values| values.into_iter().collect()))
+        let Some(groups) = table.compute_grouped_aggregates(&[], &ops, Some(pushed), deadline)?
+        else {
+            return Ok(None);
+        };
+        // The one group of an aggregation without GROUP BY, there with no rows
+        Ok(groups
+            .into_rows()?
+            .into_iter()
+            .next()
+            .map(|(_, row)| row.into_values().into_iter().collect()))
     }
 
     /// Each call's column in `columns`, the one table's, whatever qualifier

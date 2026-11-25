@@ -1457,6 +1457,13 @@ impl SegmentedTable {
     /// `lazy` leaves cold volumes unloaded. The caller checks the seal
     /// generation after it
     fn cold_view(&self, hot_skip: &mut KeySet<i64>, lazy: bool) -> Result<ColdView> {
+        let view = self.cold_volumes(lazy)?;
+        self.hide_hot_copies(hot_skip);
+        Ok(view)
+    }
+
+    /// The tombstones, then the volumes, of `cold_view`, with no hot ids
+    fn cold_volumes(&self, lazy: bool) -> Result<ColdView> {
         let tombstones = self.segment_mgr.tombstone_set_arc();
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::cold_view_begun();
@@ -1467,10 +1474,15 @@ impl SegmentedTable {
         };
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::cold_view_taken();
+        Ok((tombstones, volumes))
+    }
+
+    /// Adds to `hot_skip` the hot ids and pending tombstones that hide
+    /// sealed copies, read after the volumes they hide rows of
+    fn hide_hot_copies(&self, hot_skip: &mut KeySet<i64>) {
         self.hot.collect_hot_row_ids_into(hot_skip);
         self.segment_mgr
             .insert_pending_tombstones_into(self.pending(), hot_skip);
-        Ok((tombstones, volumes))
     }
 
     /// Cold rows read through this handle's mappings are in its schema
@@ -8673,27 +8685,30 @@ impl Table for SegmentedTable {
     // Deferred aggregation
     // =========================================================================
 
-    fn compute_filtered_aggregates(
+    fn compute_grouped_aggregates(
         &self,
+        group_by_indices: &[usize],
         aggregates: &[(AggregateOp, usize)],
-        where_expr: &dyn Expression,
+        filter: Option<&dyn Expression>,
         deadline: Deadline,
-    ) -> Result<Option<Vec<Value>>> {
+    ) -> Result<Option<GroupedAggregates>> {
         #[cfg(feature = "test-failpoints")]
-        crate::test_failpoints::note_read("seg.compute_filtered_aggregates");
-        // Bail out: only conjunctive-simple filters can be evaluated on raw arrays
-        if !where_expr.is_conjunctive_simple() {
+        crate::test_failpoints::note_read("seg.compute_grouped_aggregates");
+        // Multi-column GROUP BY: fall back to the full executor path.
+        if group_by_indices.len() > 1 {
             return Ok(None);
         }
-        let comparisons = where_expr.collect_comparisons();
-        if comparisons.is_empty() {
-            return Ok(None);
-        }
+        // Only a conjunction of simple comparisons runs on the raw arrays
+        let comparisons = match filter {
+            Some(filter) if !filter.is_conjunctive_simple() => return Ok(None),
+            Some(filter) => match filter.collect_comparisons() {
+                comparisons if comparisons.is_empty() => return Ok(None),
+                comparisons => comparisons,
+            },
+            None => Vec::new(),
+        };
 
         let schema = self.hot.schema().clone();
-        if !typed_aggregates_answer(&schema, aggregates) {
-            return Ok(None);
-        }
 
         // --- Type-resolve predicates -----------------------------------------
         // For each comparison, resolve to (schema_col_idx, operator, typed_target).
@@ -8755,35 +8770,60 @@ impl Table for SegmentedTable {
         // The volume stats count rows a snapshot or a view may not see
         self.newest_across_seals(|generation| {
             let cut = self.read_cut();
+            if !self.segment_mgr.has_segments() {
+                // The rows a WHERE passes in the hot store alone are the scan's to read
+                if filter.is_some() {
+                    return Ok(Some(None));
+                }
+                let hot = self.hot.compute_grouped_aggregates(
+                    group_by_indices,
+                    aggregates,
+                    None,
+                    deadline,
+                )?;
+                return Ok((!self.seal_moved(generation)).then_some(hot));
+            }
             // Bail out: during seal, hot+cold overlap makes aggregation unreliable
             if self.segment_mgr.seal_overlap() > 0 {
                 return Ok(Some(None));
             }
-            // Bail out: no cold volumes — let the regular path handle hot-only data
-            if !self.segment_mgr.has_segments() {
+            if !typed_aggregates_answer(&schema, aggregates) {
                 return Ok(Some(None));
             }
+            // A text group column is read by its dictionary ids, an INTEGER
+            // or TIMESTAMP one by its integers; any other is the scan's
+            let group_column = match group_by_indices.first() {
+                None => GroupColumn::None,
+                Some(&at) => match schema.columns.get(at).map(|c| c.data_type) {
+                    Some(DataType::Text) => GroupColumn::Text(at),
+                    Some(DataType::Integer | DataType::Timestamp) => GroupColumn::Integer(at),
+                    _ => return Ok(Some(None)),
+                },
+            };
 
             // --- Hot buffer rows -------------------------------------------------
-            let mut groups = GroupedAggregates::global(
-                aggregates.iter().map(|&(op, _)| op.template()).collect(),
-            );
-            let hot_rows =
-                self.hot
-                    .collect_access_rows(ScanAccess::Seq, Some(where_expr), deadline)?;
+            let mut groups = match group_column {
+                GroupColumn::None => GroupedAggregates::global(
+                    aggregates.iter().map(|&(op, _)| op.template()).collect(),
+                ),
+                _ => grouped_aggregates(group_by_indices, aggregates),
+            };
+            // The hot rows a WHERE passes are read through the indexes the
+            // access rule picks for it, as the statement's scan would
+            let plan = filter.and_then(|filter| self.hot.index_plan(filter));
+            let access = plan.as_ref().map_or(ScanAccess::Seq, ScanAccess::Index);
+            let hot_rows = self.hot.collect_access_rows(access, filter, deadline)?;
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::hot_and_cold_reads_split();
             let mut hot_skip: KeySet<i64> =
                 KeySet::with_capacity_and_hasher(hot_rows.len().max(1024), Default::default());
             for (row_id, row) in &hot_rows {
                 hot_skip.insert(*row_id);
-                aggregate_row(&mut groups, &[], aggregates, row.as_slice());
+                aggregate_row(&mut groups, group_by_indices, aggregates, row.as_slice());
             }
 
             // --- Cold volumes (THE FAST PATH) ------------------------------------
-            // The remaining hot ids join the skip set
-            let (tombstones_arc, volumes) = self.cold_view(&mut hot_skip, false)?;
-            if self.seal_moved(generation) {
-                return Ok(None);
-            }
+            let (tombstones_arc, volumes) = self.cold_volumes(false)?;
 
             // Physical-predicate and physical-aggregate structs used per volume.
             struct PhysPred {
@@ -8832,9 +8872,9 @@ impl Table for SegmentedTable {
             // evolution), and (2) no timestamp predicates (i64 nanos vs Value::Timestamp
             // mismatch in zone maps). Schema-evolved volumes and timestamp predicates
             // are pruned correctly inside the per-volume closure after normalization.
-            let comparisons_for_prune: Vec<_> = where_expr
-                .collect_comparisons()
-                .into_iter()
+            let comparisons_for_prune: Vec<_> = comparisons
+                .iter()
+                .copied()
                 .filter(|(col_name, _, _)| {
                     schema
                         .column_index_map()
@@ -8843,9 +8883,41 @@ impl Table for SegmentedTable {
                         .is_none_or(|col| col.data_type != DataType::Timestamp)
                 })
                 .collect();
+            // Whether the volume's zone maps let a row pass every predicate
+            fn zones_may_pass(
+                vol: &FrozenVolume,
+                mapping: &super::writer::ColumnMapping,
+                preds: &[ResolvedPred],
+            ) -> bool {
+                preds.iter().all(|pred| {
+                    let Some(super::writer::ColSource::Volume(phys)) =
+                        mapping.sources.get(pred.schema_col_idx)
+                    else {
+                        return true;
+                    };
+                    let Some(zm) = vol.meta.zone_maps.get(*phys) else {
+                        return true;
+                    };
+                    let probe = zm_probe_value(&pred.target, pred.is_timestamp);
+                    let nans = vol.meta.nan_count(*phys) != Some(0);
+                    match pred.op {
+                        crate::core::Operator::Eq => zm.may_contain_eq(&probe, nans),
+                        crate::core::Operator::Gt | crate::core::Operator::Gte => {
+                            zm.may_contain_gte(&probe, nans)
+                        }
+                        crate::core::Operator::Lt | crate::core::Operator::Lte => {
+                            zm.may_contain_lte(&probe, nans)
+                        }
+                        _ => true,
+                    }
+                })
+            }
             let bloom_hashes = Self::precompute_bloom_hashes(&comparisons_for_prune);
             let mut pruned_volumes = Vec::with_capacity(volumes.len());
             for volume in volumes.iter() {
+                if !zones_may_pass(&volume.1.volume, &volume.1.mapping, &preds) {
+                    continue;
+                }
                 if comparisons_for_prune.is_empty()
                     || !volume.1.mapping.is_identity
                     || !Self::prune_volume(
@@ -8860,6 +8932,13 @@ impl Table for SegmentedTable {
                 }
             }
             let volumes = pruned_volumes;
+            // The hot ids hide sealed copies only in a volume left to read
+            if !volumes.is_empty() {
+                self.hide_hot_copies(&mut hot_skip);
+            }
+            if self.seal_moved(generation) {
+                return Ok(None);
+            }
 
             // --- Per-volume accumulation closure -----------------------------------
             // Extracted so both sequential and parallel paths share one implementation.
@@ -8871,8 +8950,10 @@ impl Table for SegmentedTable {
             // A side file over a key the comparisons bound names the only rows
             // the calls must look at, each read from its row group
             let walk_asks = self.side_asks(&comparisons);
+            // Each volume's run starts from this empty one
+            let empty = groups.empty_like();
 
-            let process_volume = |(_, cs): &(u64, super::manifest::ColdSegment)| -> Result<
+            let process_volume =|(_, cs): &(u64, super::manifest::ColdSegment)| -> Result<
                 Option<GroupedAggregates>,
             > {
                     if bail.load(std::sync::atomic::Ordering::Relaxed) {
@@ -8880,10 +8961,13 @@ impl Table for SegmentedTable {
                     }
                     let vol = &cs.volume;
                     let mapping = &cs.mapping;
-                    let walk = match self.side_decision(cs, &walk_asks)? {
-                        SideDecision::Empty => return Ok(None),
-                        SideDecision::Scan => None,
-                        SideDecision::Walk(plan) => start_walk(&plan)?,
+                    let walk = match preds.is_empty() {
+                        true => None,
+                        false => match self.side_decision(cs, &walk_asks)? {
+                            SideDecision::Empty => return Ok(None),
+                            SideDecision::Scan => None,
+                            SideDecision::Walk(plan) => start_walk(&plan)?,
+                        },
                     };
 
                     // Resolve predicates to physical column indices via mapping.
@@ -8967,28 +9051,6 @@ impl Table for SegmentedTable {
                         return Ok(None);
                     }
 
-                    // Zone-map pruning
-                    for pp in &phys_preds {
-                        if pp.phys_col < vol.meta.zone_maps.len() {
-                            let zm = &vol.meta.zone_maps[pp.phys_col];
-                            let val_for_zm = zm_probe_value(&pp.target, pp.is_timestamp);
-                            let nans = vol.meta.nan_count(pp.phys_col) != Some(0);
-                            let can_match = match pp.op {
-                                crate::core::Operator::Eq => zm.may_contain_eq(&val_for_zm, nans),
-                                crate::core::Operator::Gt | crate::core::Operator::Gte => {
-                                    zm.may_contain_gte(&val_for_zm, nans)
-                                }
-                                crate::core::Operator::Lt | crate::core::Operator::Lte => {
-                                    zm.may_contain_lte(&val_for_zm, nans)
-                                }
-                                _ => true,
-                            };
-                            if !can_match {
-                                return Ok(None);
-                            }
-                        }
-                    }
-
                     // Row-group skip decisions
                     let row_group_skips: Vec<bool> = if !vol.meta.row_groups.is_empty() {
                         vol.meta
@@ -9025,41 +9087,148 @@ impl Table for SegmentedTable {
                         Vec::new()
                     };
 
-                    // Inner loop: the volume's own run of every call, its
-                    // inputs resolved at the first row that passes
-                    let mut part = groups.empty_like();
-                    let mut inputs: Option<(usize, Vec<ColdInput>)> = None;
-                    let mut group_candidates: Vec<usize> = Vec::new();
-                    let row_count = vol.meta.row_count;
-                    let rg_size = vol.meta.group_rows;
-                    let num_groups = row_count.div_ceil(rg_size);
-                    // Feeds a passing row to the calls; false when the volume
-                    // cannot answer and the statement reads the rows instead
-                    #[inline(always)]
-                    fn take<'v>(
-                        vol: &'v FrozenVolume,
-                        mapping: &super::writer::ColumnMapping,
-                        aggregates: &[(AggregateOp, usize)],
-                        bail: &std::sync::atomic::AtomicBool,
+                    // Feeds each shown row that passes to the calls of its
+                    // group, built once per kind of key; false when the
+                    // volume lacks a call's column and the statement reads the rows
+                    fn scan<'v, K: GroupOf>(
+                        (vol, mapping, aggregates): (
+                            &'v FrozenVolume,
+                            &super::writer::ColumnMapping,
+                            &[(AggregateOp, usize)],
+                        ),
+                        (preds, skips, shown, deadline): (&[PhysPred], &[bool], &ShownRows, Deadline),
+                        key: K,
                         part: &mut GroupedAggregates,
-                        inputs: &mut Option<(usize, Vec<ColdInput<'v>>)>,
-                        i: usize,
                     ) -> Result<bool> {
-                        if inputs.is_none() {
-                            let Some(resolved) = ColdInput::resolve(vol, mapping, aggregates)?
-                            else {
-                                bail.store(true, std::sync::atomic::Ordering::Relaxed);
+                        let row_count = vol.meta.row_count;
+                        let rg_size = vol.meta.group_rows;
+                        // The calls' inputs are resolved at the first row that passes
+                        let mut state: (K, Option<Vec<ColdInput<'v>>>) = (key, None);
+                        let mut candidates: Vec<usize> = Vec::new();
+                        for gi in 0..row_count.div_ceil(rg_size) {
+                            if skips.get(gi) == Some(&true) {
+                                continue;
+                            }
+                            let g_start = gi * rg_size;
+                            let g_end = ((gi + 1) * rg_size).min(row_count);
+                            deadline.charge(DeadlineSite::StorageAggregate, g_end - g_start)?;
+
+                            // Dictionary equalities are answered for the whole group in
+                            // one pass over the raw ids; the other predicates run per
+                            // surviving row
+                            let dict_preds: smallvec::SmallVec<[super::column::DictFilter<'_>; 4]> =
+                                preds
+                                    .iter()
+                                    .filter(|pp| matches!(pp.target, TypedTarget::DictEq(_)))
+                                    .map(|pp| {
+                                        Ok((
+                                            vol.columns.get(pp.phys_col)?,
+                                            g_start,
+                                            pp.dict_id.unwrap_or(u32::MAX),
+                                        ))
+                                    })
+                                    .collect::<std::io::Result<_>>()?;
+                            candidates.clear();
+                            let prefiltered = !dict_preds.is_empty()
+                                && super::column::ColumnData::dict_matching_offsets(
+                                    &dict_preds,
+                                    g_end - g_start,
+                                    &mut candidates,
+                                )
+                                .is_some();
+                            let calls = (vol, mapping, aggregates);
+                            let rows = (preds, prefiltered, shown);
+                            let fed = match prefiltered {
+                                true => feed(
+                                    candidates.iter().map(|&at| g_start + at),
+                                    calls,
+                                    rows,
+                                    state,
+                                    part,
+                                )?,
+                                false => feed(g_start..g_end, calls, rows, state, part)?,
+                            };
+                            let Some(fed) = fed else {
                                 return Ok(false);
                             };
-                            let Some(group) = part.group(&[] as &[Value]) else {
-                                return Ok(false);
-                            };
-                            *inputs = Some((group, resolved));
-                        }
-                        if let Some((group, inputs)) = inputs {
-                            accumulate_columnar(part.aggregates(*group), inputs, i);
+                            state = fed;
                         }
                         Ok(true)
+                    }
+                    // The rows of one row group, out of line and with the key
+                    // and the inputs its own, so the loop keeps them in
+                    // registers; they come back for the next row group
+                    #[inline(never)]
+                    #[allow(clippy::type_complexity)]
+                    fn feed<'v, K: GroupOf>(
+                        positions: impl Iterator<Item = usize>,
+                        (vol, mapping, aggregates): (
+                            &'v FrozenVolume,
+                            &super::writer::ColumnMapping,
+                            &[(AggregateOp, usize)],
+                        ),
+                        (preds, prefiltered, shown): (&[PhysPred], bool, &ShownRows),
+                        (mut key, inputs): (K, Option<Vec<ColdInput<'v>>>),
+                        part: &mut GroupedAggregates,
+                    ) -> Result<Option<(K, Option<Vec<ColdInput<'v>>>)>> {
+                        // Whether row `i` is shown and passes every predicate
+                        #[inline(always)]
+                        fn passes(
+                            vol: &FrozenVolume,
+                            (preds, prefiltered, shown): (&[PhysPred], bool, &ShownRows),
+                            i: usize,
+                        ) -> std::io::Result<bool> {
+                            if !shown.has(i) {
+                                return Ok(false);
+                            }
+                            for pp in preds {
+                                if prefiltered && matches!(pp.target, TypedTarget::DictEq(_)) {
+                                    continue;
+                                }
+                                if !pred_passes(pp, vol.columns.get(pp.phys_col)?, i) {
+                                    return Ok(false);
+                                }
+                            }
+                            Ok(true)
+                        }
+                        let rows = (preds, prefiltered, shown);
+                        let mut positions = positions;
+                        let inputs = match inputs {
+                            Some(inputs) => inputs,
+                            None => loop {
+                                let Some(i) = positions.next() else {
+                                    return Ok(Some((key, None)));
+                                };
+                                if !passes(vol, rows, i)? {
+                                    continue;
+                                }
+                                let Some(inputs) = ColdInput::resolve(vol, mapping, aggregates)?
+                                else {
+                                    return Ok(None);
+                                };
+                                if let Some(group) = key.group(part, i) {
+                                    accumulate_columnar(part.aggregates(group), &inputs, i);
+                                }
+                                break inputs;
+                            },
+                        };
+                        // A new key past the group cap drops its row
+                        if preds.is_empty() {
+                            for i in positions.filter(|&i| shown.has(i)) {
+                                if let Some(group) = key.group(part, i) {
+                                    accumulate_columnar(part.aggregates(group), &inputs, i);
+                                }
+                            }
+                        } else {
+                            for i in positions {
+                                if passes(vol, rows, i)?
+                                    && let Some(group) = key.group(part, i)
+                                {
+                                    accumulate_columnar(part.aggregates(group), &inputs, i);
+                                }
+                            }
+                        }
+                        Ok(Some((key, Some(inputs))))
                     }
                     // The side file names the candidates; each passes every
                     // predicate, read from its row group, before the calls
@@ -9184,7 +9353,13 @@ impl Table for SegmentedTable {
                         }
                         Ok(true)
                     }
+                    let mut part = empty.empty_like();
                     if let Some(mut walk) = walk {
+                        // A walk reads row groups, so it answers the one group only
+                        if !matches!(group_column, GroupColumn::None) {
+                            bail.store(true, std::sync::atomic::Ordering::Relaxed);
+                            return Ok(None);
+                        }
                         let view = (&**tombstones_ref, hot_skip_ref, &cut, deadline);
                         let calls = (mapping, aggregates, &bail);
                         let walked = walk_candidates(
@@ -9206,74 +9381,63 @@ impl Table for SegmentedTable {
                         &cut,
                         deadline,
                     )?);
-                    for gi in 0..num_groups {
-                        if gi < row_group_skips.len() && row_group_skips[gi] {
-                            continue;
+                    // A volume that shows no row is left with its columns
+                    // unread, its rows still charged a row group at a time
+                    let rows_shown = |bits: &[u64]| shown_count(bits, vol.meta.row_count);
+                    if shown.0.as_deref().is_some_and(|bits| rows_shown(bits) == 0) {
+                        for rows in row_groups(0..vol.meta.row_count) {
+                            deadline.charge(DeadlineSite::StorageAggregate, rows.len())?;
                         }
-                        let g_start = gi * rg_size;
-                        let g_end = ((gi + 1) * rg_size).min(row_count);
-                        deadline.charge(DeadlineSite::StorageAggregate, g_end - g_start)?;
-
-                        // Dictionary equalities are answered for the whole group in
-                        // one pass over the raw ids; the other predicates run per
-                        // surviving row
-                        let dict_preds: smallvec::SmallVec<[super::column::DictFilter<'_>; 4]> =
-                            phys_preds
-                                .iter()
-                                .filter(|pp| matches!(pp.target, TypedTarget::DictEq(_)))
-                                .map(|pp| {
-                                    Ok((
-                                        vol.columns.get(pp.phys_col)?,
-                                        g_start,
-                                        pp.dict_id.unwrap_or(u32::MAX),
-                                    ))
-                                })
-                                .collect::<std::io::Result<_>>()?;
-                        group_candidates.clear();
-                        let prefiltered = !dict_preds.is_empty()
-                            && super::column::ColumnData::dict_matching_offsets(
-                                &dict_preds,
-                                g_end - g_start,
-                                &mut group_candidates,
-                            )
-                            .is_some();
-                        let mut pos = 0usize;
-                        let mut plain = g_start;
-                        let mut next_row = || -> Option<usize> {
-                            if prefiltered {
-                                let i = g_start + *group_candidates.get(pos)?;
-                                pos += 1;
-                                Some(i)
-                            } else if plain < g_end {
-                                plain += 1;
-                                Some(plain - 1)
-                            } else {
-                                None
-                            }
-                        };
-
-                        while let Some(i) = next_row() {
-                            if !shown.has(i) {
-                                continue;
-                            }
-                            let mut all_pass = true;
-                            for pp in &phys_preds {
-                                if prefiltered && matches!(pp.target, TypedTarget::DictEq(_)) {
-                                    continue;
-                                }
-                                if !pred_passes(pp, vol.columns.get(pp.phys_col)?, i) {
-                                    all_pass = false;
-                                    break;
-                                }
-                            }
-                            if all_pass
-                                && !take(vol, mapping, aggregates, &bail, &mut part, &mut inputs, i)?
-                            {
-                                return Ok(None);
-                            }
-                        }
+                        return Ok(None);
                     }
-
+                    let calls = (&**vol, mapping, aggregates);
+                    let rows =(&phys_preds[..], &row_group_skips[..], &shown, deadline);
+                    // Each row's group: the one group, a value the volume holds
+                    // for every row, or the volume's group column read whole
+                    let answered = match group_column {
+                        GroupColumn::None => scan(calls, rows, FixedGroup(None, None), &mut part)?,
+                        GroupColumn::Text(at) | GroupColumn::Integer(at) => {
+                            match mapping.sources.get(at) {
+                                Some(super::writer::ColSource::Volume(phys)) => {
+                                    match (group_column, vol.columns.get(*phys)?) {
+                                        (
+                                            GroupColumn::Text(_),
+                                            super::column::ColumnData::Dictionary {
+                                                ids,
+                                                dictionary,
+                                                nulls,
+                                            },
+                                        ) => {
+                                            let key = TextGroups {
+                                                ids,
+                                                dictionary,
+                                                nulls,
+                                                known: vec![u32::MAX; dictionary.len() + 1],
+                                            };
+                                            scan(calls, rows, key, &mut part)?
+                                        }
+                                        (GroupColumn::Integer(_), column) => {
+                                            let key = IntegerGroups {
+                                                column,
+                                                known: KeyMap::default(),
+                                                null: None,
+                                            };
+                                            scan(calls, rows, key, &mut part)?
+                                        }
+                                        _ => false,
+                                    }
+                                }
+                                Some(super::writer::ColSource::Default(value)) => {
+                                    scan(calls, rows, FixedGroup(Some(value), None), &mut part)?
+                                }
+                                None => false,
+                            }
+                        }
+                    };
+                    if !answered {
+                        bail.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return Ok(None);
+                    }
                     Ok(Some(part))
                 };
 
@@ -9281,284 +9445,44 @@ impl Table for SegmentedTable {
             // Only use rayon when total cold rows justify the scheduling overhead.
             let _total_cold_rows: usize =
                 volumes.iter().map(|(_, cs)| cs.volume.meta.row_count).sum();
+            // The volumes' runs merge in volume order into the hot rows' run;
+            // a FLOAT sum that could pass the range on the way reads the rows
+            let merge_in = |groups: &mut GroupedAggregates, part| match part {
+                Some(part) if !groups.merges_in_order(&part) => false,
+                Some(part) => {
+                    groups.merge(part);
+                    true
+                }
+                None => true,
+            };
             #[cfg(feature = "parallel")]
-            let volume_accums: Vec<Option<GroupedAggregates>> =
-                if volumes.len() >= 4 && _total_cold_rows >= 100_000 {
-                    use rayon::prelude::*;
-                    volumes
-                        .par_iter()
-                        .map(|v| process_volume(v))
-                        .collect::<Result<_>>()?
-                } else {
-                    volumes
-                        .iter()
-                        .map(|v| process_volume(v))
-                        .collect::<Result<_>>()?
-                };
+            let parallel = volumes.len() >= 4 && _total_cold_rows >= 100_000;
             #[cfg(not(feature = "parallel"))]
-            let volume_accums: Vec<Option<GroupedAggregates>> = volumes
-                .iter()
-                .map(|v| process_volume(v))
-                .collect::<Result<_>>()?;
-
-            if bail.load(std::sync::atomic::Ordering::Relaxed) {
-                return Ok(Some(None));
-            }
-
-            // The volumes' runs merge in volume order into the hot rows' run
-            for part in volume_accums.into_iter().flatten() {
-                groups.merge(part);
-            }
-            let results = match groups.into_rows()?.into_iter().next() {
-                Some((_, row)) => row.into_values(),
-                None => return Ok(Some(None)),
-            };
-
-            self.check_cold()?;
-            // A run whose last charge read no clock is checked once more
-            deadline.check()?;
-            Ok(Some(Some(results)))
-        })
-    }
-
-    fn compute_grouped_aggregates(
-        &self,
-        group_by_indices: &[usize],
-        aggregates: &[(AggregateOp, usize)],
-        deadline: Deadline,
-    ) -> Result<Option<GroupedAggregates>> {
-        #[cfg(feature = "test-failpoints")]
-        crate::test_failpoints::note_read("seg.compute_grouped_aggregates");
-        // Multi-column GROUP BY: fall back to the full executor path.
-        if group_by_indices.len() != 1 {
-            return Ok(None);
-        }
-        self.newest_across_seals(|generation| {
-            let cut = self.read_cut();
-            if !self.segment_mgr.has_segments() {
-                let hot =
-                    self.hot
-                        .compute_grouped_aggregates(group_by_indices, aggregates, deadline)?;
-                return Ok((!self.seal_moved(generation)).then_some(hot));
-            }
-
-            // During seal, hot+cold overlap — can't reliably aggregate
-            if self.segment_mgr.seal_overlap() > 0 {
-                return Ok(Some(None));
-            }
-
-            let gb_idx = group_by_indices[0];
-
-            let current_schema = self.hot.schema();
-            if !typed_aggregates_answer(current_schema, aggregates) {
-                return Ok(Some(None));
-            }
-
-            // Determine GROUP BY column type from schema.
-            let gb_data_type = if gb_idx < current_schema.columns.len() {
-                current_schema.columns[gb_idx].data_type
-            } else {
-                return Ok(Some(None));
-            };
-
-            // Only support Dictionary (Text), Int64 (Integer), and TimestampNanos (Timestamp).
-            // Float, Boolean, Bytes: bail to regular executor path.
-            let gb_is_dict = gb_data_type == DataType::Text;
-            let gb_is_i64 =
-                gb_data_type == DataType::Integer || gb_data_type == DataType::Timestamp;
-            if !gb_is_dict && !gb_is_i64 {
-                return Ok(Some(None));
-            }
-
-            let mut groups = grouped_aggregates(group_by_indices, aggregates);
-
-            // ---- Process hot rows (small, use Value-based path) ----
-            let hot_rows = self
-                .hot
-                .collect_access_rows(ScanAccess::Seq, None, deadline)?;
-            #[cfg(feature = "test-failpoints")]
-            crate::test_failpoints::hot_and_cold_reads_split();
-            for (_, row) in &hot_rows {
-                aggregate_row(&mut groups, group_by_indices, aggregates, row.as_slice());
-            }
-
-            // ---- Process cold volumes (columnar fast path) ----
-            let mut hot_skip: KeySet<i64> =
-                KeySet::with_capacity_and_hasher(10_000, Default::default());
-            let (tombstones_arc, volumes) = self.cold_view(&mut hot_skip, false)?;
-            if self.seal_moved(generation) {
-                return Ok(None);
-            }
-
-            let hot_skip_ref = &hot_skip;
-            let tombstones_ref = &tombstones_arc;
-
-            // Runs the visible rows of one volume into `groups`, the deadline
-            // charged a row group at a time; false when the volume's layout
-            // cannot answer. A key's group is looked up once per volume
-            let process_volume = |(_, cs): &(u64, super::manifest::ColdSegment),
-                                  groups: &mut GroupedAggregates|
-             -> Result<bool> {
-                let vol = &cs.volume;
-                let mapping = &cs.mapping;
-                if gb_idx >= mapping.sources.len() {
-                    return Ok(false);
-                }
-
-                let shown =
-                    ShownRows(self.shown_rows(cs, tombstones_ref, hot_skip_ref, &cut, deadline)?);
-                let end = vol.meta.row_count;
-                let mut first = None;
-                for rows in row_groups(0..end) {
-                    deadline.charge(DeadlineSite::StorageAggregate, rows.len())?;
-                    first = rows.into_iter().find(|&i| shown.has(i));
-                    if first.is_some() {
-                        break;
-                    }
-                }
-                let Some(start) = first else {
-                    return Ok(true);
-                };
-
-                let Some(inputs) = ColdInput::resolve(vol, mapping, aggregates)? else {
-                    return Ok(false);
-                };
-
-                match &mapping.sources[gb_idx] {
-                    super::writer::ColSource::Volume(gb_phys_idx) => {
-                        let gb_col = vol.columns.get(*gb_phys_idx)?;
-                        if gb_is_dict {
-                            let super::column::ColumnData::Dictionary {
-                                ids,
-                                dictionary,
-                                nulls,
-                            } = gb_col
-                            else {
-                                return Ok(false);
-                            };
-                            // Each entry's group, NULL's last
-                            let mut known = vec![u32::MAX; dictionary.len() + 1];
-                            for rows in row_groups(start..end) {
-                                deadline.charge(DeadlineSite::StorageAggregate, rows.len())?;
-                                for i in rows {
-                                    if !shown.has(i) {
-                                        continue;
-                                    }
-                                    let slot = if nulls[i] {
-                                        dictionary.len()
-                                    } else {
-                                        ids[i] as usize
-                                    };
-                                    if known[slot] == u32::MAX {
-                                        let key = match dictionary.get(slot) {
-                                            Some(text) => Value::Text(text.clone()),
-                                            None => Value::Null(DataType::Text),
-                                        };
-                                        match groups.group(std::slice::from_ref(&key)) {
-                                            Some(group) => known[slot] = group as u32,
-                                            None => continue,
-                                        }
-                                    }
-                                    accumulate_columnar(
-                                        groups.aggregates(known[slot] as usize),
-                                        &inputs,
-                                        i,
-                                    );
-                                }
-                            }
-                        } else {
-                            let mut known: KeyMap<i64, u32> = KeyMap::default();
-                            let mut null_group: Option<u32> = None;
-                            for rows in row_groups(start..end) {
-                                deadline.charge(DeadlineSite::StorageAggregate, rows.len())?;
-                                for i in rows {
-                                    if !shown.has(i) {
-                                        continue;
-                                    }
-                                    let is_null = gb_col.is_null(i);
-                                    let found = match is_null {
-                                        true => null_group,
-                                        false => known.get(&gb_col.get_i64(i)).copied(),
-                                    };
-                                    let group = match found {
-                                        Some(group) => group,
-                                        None => {
-                                            let key = gb_col.get_value(i);
-                                            let Some(group) =
-                                                groups.group(std::slice::from_ref(&key))
-                                            else {
-                                                continue;
-                                            };
-                                            let group = group as u32;
-                                            match is_null {
-                                                true => null_group = Some(group),
-                                                false => {
-                                                    known.insert(gb_col.get_i64(i), group);
-                                                }
-                                            }
-                                            group
-                                        }
-                                    };
-                                    let aggregates = groups.aggregates(group as usize);
-                                    accumulate_columnar(aggregates, &inputs, i);
-                                }
-                            }
-                        }
-                    }
-                    super::writer::ColSource::Default(default_val) => {
-                        let mut group = None;
-                        for rows in row_groups(start..end) {
-                            deadline.charge(DeadlineSite::StorageAggregate, rows.len())?;
-                            for i in rows {
-                                if !shown.has(i) {
-                                    continue;
-                                }
-                                if group.is_none() {
-                                    group = groups.group(std::slice::from_ref(default_val));
-                                }
-                                if let Some(group) = group {
-                                    accumulate_columnar(groups.aggregates(group), &inputs, i);
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(true)
-            };
-
-            // Large volume sets run each volume apart and merge the parts in
-            // volume order
-            #[cfg(feature = "parallel")]
-            let use_parallel = volumes.len() >= 4
-                && volumes
-                    .iter()
-                    .map(|(_, cs)| cs.volume.meta.row_count)
-                    .sum::<usize>()
-                    >= 100_000;
-            #[cfg(not(feature = "parallel"))]
-            let use_parallel = false;
-
-            if use_parallel {
+            let parallel = false;
+            if parallel {
                 #[cfg(feature = "parallel")]
                 {
                     use rayon::prelude::*;
                     let parts: Vec<Option<GroupedAggregates>> = volumes
                         .par_iter()
-                        .map(|volume| {
-                            let mut part = groups.empty_like();
-                            Ok(process_volume(volume, &mut part)?.then_some(part))
-                        })
+                        .map(|v| process_volume(v))
                         .collect::<Result<_>>()?;
+                    if bail.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Ok(Some(None));
+                    }
                     for part in parts {
-                        match part {
-                            Some(part) => groups.merge(part),
-                            None => return Ok(Some(None)),
+                        if !merge_in(&mut groups, part) {
+                            return Ok(Some(None));
                         }
                     }
                 }
             } else {
+                // A serial read merges each volume's run as it is read
                 for volume in volumes.iter() {
-                    if !process_volume(volume, &mut groups)? {
+                    let part = process_volume(volume)?;
+                    if bail.load(std::sync::atomic::Ordering::Relaxed)
+                        || !merge_in(&mut groups, part)
+                    {
                         return Ok(Some(None));
                     }
                 }
@@ -9569,6 +9493,92 @@ impl Table for SegmentedTable {
             deadline.check()?;
             Ok(Some(Some(groups)))
         })
+    }
+}
+
+/// The group column of an aggregation the volumes answer, by its place in
+/// the table: text read by its dictionary ids, INTEGER or TIMESTAMP by its
+/// integers; none for the one group of an aggregation without GROUP BY
+#[derive(Clone, Copy)]
+enum GroupColumn {
+    None,
+    Text(usize),
+    Integer(usize),
+}
+
+/// How one volume's rows find their group, each key's group cached once found
+trait GroupOf {
+    /// The group of row `i` in `part`; None for a new key past its group cap
+    fn group(&mut self, part: &mut GroupedAggregates, i: usize) -> Option<usize>;
+}
+
+/// The one group, of no key or of a value the volume holds for every row
+struct FixedGroup<'v>(Option<&'v Value>, Option<usize>);
+
+impl GroupOf for FixedGroup<'_> {
+    #[inline(always)]
+    fn group(&mut self, part: &mut GroupedAggregates, _: usize) -> Option<usize> {
+        if self.1.is_none() {
+            self.1 = part.group(self.0.map_or(&[] as &[Value], std::slice::from_ref));
+        }
+        self.1
+    }
+}
+
+/// A text group column, read by its dictionary ids
+struct TextGroups<'v> {
+    ids: &'v [u32],
+    dictionary: &'v [crate::common::SmartString],
+    nulls: &'v [bool],
+    /// Each entry's group, NULL's last, `u32::MAX` while it has none
+    known: Vec<u32>,
+}
+
+impl GroupOf for TextGroups<'_> {
+    #[inline(always)]
+    fn group(&mut self, part: &mut GroupedAggregates, i: usize) -> Option<usize> {
+        let slot = match self.nulls[i] {
+            true => self.dictionary.len(),
+            false => self.ids[i] as usize,
+        };
+        if self.known[slot] == u32::MAX {
+            let key = match self.dictionary.get(slot) {
+                Some(text) => Value::Text(text.clone()),
+                None => Value::Null(DataType::Text),
+            };
+            self.known[slot] = part.group(std::slice::from_ref(&key))? as u32;
+        }
+        Some(self.known[slot] as usize)
+    }
+}
+
+/// An INTEGER or TIMESTAMP group column, read by its integers
+struct IntegerGroups<'v> {
+    column: &'v super::column::ColumnData,
+    known: KeyMap<i64, u32>,
+    null: Option<u32>,
+}
+
+impl GroupOf for IntegerGroups<'_> {
+    #[inline(always)]
+    fn group(&mut self, part: &mut GroupedAggregates, i: usize) -> Option<usize> {
+        let is_null = self.column.is_null(i);
+        let found = match is_null {
+            true => self.null,
+            false => self.known.get(&self.column.get_i64(i)).copied(),
+        };
+        if let Some(group) = found {
+            return Some(group as usize);
+        }
+        let key = self.column.get_value(i);
+        let group = part.group(std::slice::from_ref(&key))? as u32;
+        match is_null {
+            true => self.null = Some(group),
+            false => {
+                self.known.insert(self.column.get_i64(i), group);
+            }
+        }
+        Some(group as usize)
     }
 }
 

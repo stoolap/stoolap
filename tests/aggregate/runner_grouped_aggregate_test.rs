@@ -241,7 +241,8 @@ fn explain_shows_the_groups_over_the_rows_the_read_passes() {
             "  TopN k ASC",
             "    Having (COUNT(*) > 1)",
             "      Aggregate k, COUNT(*) by k",
-            "        IndexScan t (b > 3)",
+            "        StorageGrouped t (k) (b > 3)",
+            "        else IndexScan t (b > 3)",
             "          Index t_b (b range)",
         ]
     );

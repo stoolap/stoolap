@@ -5874,8 +5874,13 @@ impl Table for MVCCTable {
         &self,
         group_by_indices: &[usize],
         aggregates: &[(crate::storage::mvcc::version_store::AggregateOp, usize)],
+        filter: Option<&dyn Expression>,
         deadline: Deadline,
     ) -> Result<Option<crate::functions::aggregate::GroupedAggregates>> {
+        // The rows a WHERE passes are the scan's to read
+        if filter.is_some() {
+            return Ok(None);
+        }
         // Only use storage-level aggregation if no uncommitted local changes
         let txn_versions = self.local();
         if txn_versions.has_local_changes() {

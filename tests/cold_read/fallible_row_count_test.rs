@@ -334,14 +334,21 @@ fn ordered_rows_propagate_cold_reload_failure() {
 fn filtered_aggregates_propagate_cold_reload_failure() {
     assert_optional_reload_failure(
         |table| {
-            format!(
-                "{:?}",
-                table.compute_filtered_aggregates(
-                    &[(AggregateOp::Sum, 1)],
-                    &ComparisonExpr::gte("v", Value::Integer(0)),
-                    stoolap::executor::Deadline::NONE,
-                )
-            )
+            let filter = ComparisonExpr::gte("v", Value::Integer(0));
+            let none = stoolap::executor::Deadline::NONE;
+            let groups = table.compute_grouped_aggregates(
+                &[],
+                &[(AggregateOp::Sum, 1)],
+                Some(&filter),
+                none,
+            );
+            let row = groups.map(|groups| {
+                groups.map(|groups| {
+                    let rows = groups.into_rows().unwrap();
+                    rows[0].1.as_slice().to_vec()
+                })
+            });
+            format!("{row:?}")
         },
         vec![Value::Integer(20)],
     );
@@ -352,7 +359,8 @@ fn grouped_aggregates_propagate_cold_reload_failure() {
     assert_optional_reload_failure(
         |table| {
             let none = stoolap::executor::Deadline::NONE;
-            let groups = table.compute_grouped_aggregates(&[1], &[(AggregateOp::Sum, 1)], none);
+            let groups =
+                table.compute_grouped_aggregates(&[1], &[(AggregateOp::Sum, 1)], None, none);
             let rows = groups.map(|groups| {
                 groups.map(|groups| {
                     let rows = groups.into_rows().unwrap();

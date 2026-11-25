@@ -1193,9 +1193,10 @@ fn warm_filtered_aggregation_propagates_column_failure() {
     use stoolap::storage::traits::Table;
     assert_warm_read_failure(|table| {
         table
-            .compute_filtered_aggregates(
+            .compute_grouped_aggregates(
+                &[],
                 &[(AggregateOp::Sum, 1)],
-                &ComparisonExpr::gte("a", Value::Integer(0)),
+                Some(&ComparisonExpr::gte("a", Value::Integer(0))),
                 stoolap::executor::Deadline::NONE,
             )
             .map(drop)
@@ -1211,6 +1212,7 @@ fn warm_grouped_aggregation_propagates_column_failure() {
             .compute_grouped_aggregates(
                 &[0],
                 &[(AggregateOp::Sum, 1)],
+                None,
                 stoolap::executor::Deadline::NONE,
             )
             .map(drop)
@@ -1256,6 +1258,17 @@ fn fully_hidden_warm_columns_are_not_decoded() {
         .compute_grouped_aggregates(
             &[0],
             &[(AggregateOp::Sum, 1)],
+            None,
+            stoolap::executor::Deadline::NONE,
+        )
+        .unwrap()
+        .unwrap()
+        .is_empty());
+    assert!(table
+        .compute_grouped_aggregates(
+            &[1],
+            &[(AggregateOp::Sum, 0)],
+            None,
             stoolap::executor::Deadline::NONE,
         )
         .unwrap()

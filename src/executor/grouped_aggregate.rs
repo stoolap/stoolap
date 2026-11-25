@@ -19,6 +19,7 @@ use crate::common::deadline::{Deadline, DeadlineSite};
 use crate::common::names::eq_names;
 use crate::core::{Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::{Expression, GroupByModifier, SelectStatement};
+use crate::storage::expression::Expression as StorageExpr;
 use crate::storage::index::id_list::GroupIds;
 use crate::storage::traits::{QueryResult, Table};
 
@@ -114,9 +115,9 @@ impl Executor {
             && (counts || stmt.limit.is_some())
     }
 
-    /// The plan of `stmt` when it groups one table of `schema` by one column
-    /// without WHERE and the rule picks a source other than the hash
-    /// grouping, which the scan does
+    /// The plan of `stmt` when it groups one table of `schema` by one column,
+    /// under a WHERE the table runs whole, and the rule picks a source other
+    /// than the hash grouping, which the scan does
     pub(super) fn grouped_read_plan(
         &self,
         stmt: &SelectStatement,
@@ -124,10 +125,14 @@ impl Executor {
         (ctx, runs): (&ExecutionContext, bool),
         schema: &Schema,
     ) -> Result<Option<AggregatePlan>> {
-        if classification.has_where
+        if classification.where_has_subqueries
             || stmt.group_by.columns.len() != 1
             || !matches!(stmt.group_by.modifier, GroupByModifier::None)
         {
+            return Ok(None);
+        }
+        let filtered = stmt.where_clause.is_some();
+        if filtered && Self::pushed_where(stmt, schema, ctx).is_none() {
             return Ok(None);
         }
         let Some((group, false)) = self.single_group_column(stmt)? else {
@@ -164,12 +169,15 @@ impl Executor {
         let grouped_names = non_aggregated.iter().all(|column| eq_names(column, &group));
         let source =
             Self::grouped_source(stmt, classification, &aggregations, plain, grouped_names);
-        if source == GroupedSource::Hash {
+        // The index walk reads every row of a group: a WHERE is the table's
+        // to run, or the scan's
+        if source == GroupedSource::Hash || filtered && source != GroupedSource::Storage {
             return Ok(None);
         }
         // A table that declines its own grouping is walked by its index when
         // the walk may read the groups
-        let walks = !aggregations.is_empty()
+        let walks = !filtered
+            && !aggregations.is_empty()
             && (source == GroupedSource::SortedStream
                 || Self::sorts_groups(stmt, classification, &aggregations, grouped_names));
         Ok(Some(AggregatePlan {
@@ -202,13 +210,23 @@ impl Executor {
         ),
         all_columns: &[String],
     ) -> Result<Option<Box<dyn QueryResult>>> {
+        // The rows a WHERE passes in the hot store alone are the scan's
+        if stmt.where_clause.is_some() && !table.has_sealed_rows() {
+            return Ok(None);
+        }
         let columns = Self::call_columns(aggregations, all_columns);
-        let stored = match source {
-            GroupedSource::Storage => {
+        let stored = match (source, stmt.where_clause.is_some()) {
+            (GroupedSource::Storage, filtered) => {
+                let pushed = Self::pushed_where(stmt, table.schema(), ctx);
+                // A WHERE the table cannot run whole is the scan's
+                if filtered && pushed.is_none() {
+                    return Ok(None);
+                }
                 let deadline = ctx.deadline_of_call();
-                Self::stored_groups(table, group_index, aggregations, &columns, deadline)?
+                let read = (group_index, pushed.as_deref());
+                Self::stored_groups(table, read, aggregations, &columns, deadline)?
             }
-            GroupedSource::SortedStream | GroupedSource::Hash => None,
+            (GroupedSource::SortedStream | GroupedSource::Hash, _) => None,
         };
         let rows = match stored {
             Some(rows) => (AggregatePath::StorageGrouped, rows),
@@ -260,13 +278,14 @@ impl Executor {
     /// column of `columns`; None when the table declines
     fn stored_groups(
         table: &dyn Table,
-        group_index: usize,
+        (group_index, filter): (usize, Option<&dyn StorageExpr>),
         aggregations: &[SqlAggregateFunction],
         columns: &[Option<usize>],
         deadline: Deadline,
     ) -> Result<Option<RowVec>> {
         use crate::storage::mvcc::version_store::AggregateOp;
-        if aggregations.is_empty() {
+        // A column's values are its groups when no WHERE leaves some out
+        if aggregations.is_empty() && filter.is_none() {
             let column = &table.schema().columns[group_index].name_lower;
             let values = table.get_partition_values(column, deadline)?;
             // A read whose last charge read no clock is checked once more
@@ -291,7 +310,7 @@ impl Executor {
             };
             ops.push(op);
         }
-        match table.compute_grouped_aggregates(&[group_index], &ops, deadline)? {
+        match table.compute_grouped_aggregates(&[group_index], &ops, filter, deadline)? {
             Some(groups) => groups.into_rows().map(Some),
             None => Ok(None),
         }
