@@ -141,6 +141,33 @@ fn integer_group_columns_over_a_large_volume_keep_their_groups_apart() {
 }
 
 #[test]
+fn a_limit_that_bounds_the_groups_of_several_columns_keeps_the_hash_grouping() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = mixed(dir.path());
+    for sql in [
+        "SELECT g, s, COUNT(*) FROM t GROUP BY g, s LIMIT 1",
+        "SELECT g, s, COUNT(*) FROM t GROUP BY g, s LIMIT 2 OFFSET 1",
+    ] {
+        assert!(path(&db, sql).ends_with("aggregate.hash_groups"), "{sql}");
+    }
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT g, s, COUNT(*) FROM t GROUP BY g, s LIMIT 2 OFFSET 1"
+        )
+        .len(),
+        2
+    );
+    let sql = "SELECT g, s, COUNT(*) FROM t GROUP BY g, s ORDER BY g LIMIT 1";
+    assert_eq!(rows(&db, sql), ["1|x|2"]);
+    assert!(
+        path(&db, sql).contains("aggregate.storage_grouped"),
+        "{sql}: {}",
+        path(&db, sql)
+    );
+}
+
+#[test]
 fn a_group_column_a_volume_holds_as_its_default_is_one_value() {
     let dir = tempfile::tempdir().unwrap();
     let db = mixed(dir.path());

@@ -9674,9 +9674,32 @@ impl<'v> ManyGroups<'v> {
         schema: &crate::core::Schema,
         group_by_indices: &[usize],
     ) -> std::io::Result<Option<Self>> {
-        let mut columns = smallvec::SmallVec::new();
+        use super::writer::ColSource;
+        // Each column's radix from the volume's metadata, before a column
+        // is read: a key space past `u64` declines with nothing decoded
+        let mut radices = smallvec::SmallVec::<[u64; 4]>::new();
         let mut keys: u64 = 1;
         for &at in group_by_indices {
+            let radix = match (mapping.sources.get(at), schema.columns[at].data_type) {
+                (Some(ColSource::Default(_)), _) => 1,
+                (Some(ColSource::Volume(phys)), DataType::Text) => {
+                    match vol.columns.get_column_dictionary(*phys)? {
+                        Some(dictionary) => dictionary.len() as u64 + 1,
+                        None => return Ok(None),
+                    }
+                }
+                (Some(ColSource::Volume(_)), _) => vol.meta.row_count as u64 + 1,
+                (None, _) => return Ok(None),
+            };
+            let Some(more) = keys.checked_mul(radix) else {
+                return Ok(None);
+            };
+            radices.push(radix);
+            keys = more;
+        }
+        let mut columns = smallvec::SmallVec::new();
+        let mut stride: u64 = 1;
+        for (&at, radix) in group_by_indices.iter().zip(radices) {
             let slots = match mapping.sources.get(at) {
                 Some(super::writer::ColSource::Default(value)) => KeySlots::Fixed(value),
                 Some(super::writer::ColSource::Volume(phys)) => {
@@ -9702,16 +9725,8 @@ impl<'v> ManyGroups<'v> {
                 }
                 None => return Ok(None),
             };
-            let radix = match &slots {
-                KeySlots::Text { dictionary, .. } => dictionary.len() as u64 + 1,
-                KeySlots::Integer { .. } => vol.meta.row_count as u64 + 1,
-                KeySlots::Fixed(_) => 1,
-            };
-            let Some(more) = keys.checked_mul(radix) else {
-                return Ok(None);
-            };
-            columns.push((slots, keys));
-            keys = more;
+            columns.push((slots, stride));
+            stride *= radix;
         }
         let dense = match keys <= DENSE_KEYS {
             true => vec![u32::MAX; keys as usize],
@@ -10620,6 +10635,43 @@ mod tests {
             answer,
             Ok(false),
             "a seal queued behind a held read leaves the estimate no view"
+        );
+    }
+
+    #[test]
+    fn group_columns_past_the_key_space_decline_before_a_column_is_read() {
+        use super::super::writer::{ColSource, ColumnMapping};
+        let schema = (0..6)
+            .fold(SchemaBuilder::new("t"), |schema, at| {
+                schema.column(format!("c{at}"), DataType::Integer, true, at == 0)
+            })
+            .build();
+        let mut builder = VolumeBuilder::with_capacity(&schema, 2000);
+        for id in 0..2000 {
+            builder.add_row(id, &Row::from_values(vec![Value::Integer(id); 6]));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let written =
+            super::super::io::write_volume_to_disk(dir.path(), "t", 1, &builder.finish().unwrap())
+                .unwrap();
+        let vol = super::super::io::read_volume_from_disk(&written).unwrap();
+        let mapping = ColumnMapping {
+            sources: (0..6).map(ColSource::Volume).collect(),
+            names: Vec::new(),
+            is_identity: true,
+        };
+        let declined = ManyGroups::of(&vol, &mapping, &schema, &[0, 1, 2, 3, 4, 5]).unwrap();
+        assert!(declined.is_none(), "2001^6 keys pass u64");
+        assert!(
+            (0..6).all(|at| vol.columns.resident(at).is_none()),
+            "no column is decoded for a declined key"
+        );
+        assert!(ManyGroups::of(&vol, &mapping, &schema, &[1, 2])
+            .unwrap()
+            .is_some());
+        assert!(
+            vol.columns.resident(1).is_some(),
+            "a key that fits reads its columns"
         );
     }
 }

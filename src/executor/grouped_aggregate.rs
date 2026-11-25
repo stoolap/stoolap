@@ -147,6 +147,11 @@ impl Executor {
             };
             groups.push((name, at));
         }
+        // The hash grouping makes no group past the LIMIT; the table makes
+        // every pair of several columns
+        if groups.len() > 1 && Self::limit_caps_groups(stmt) {
+            return Ok(None);
+        }
         let (aggregations, non_aggregated) = match runs {
             true => self.parse_aggregations(stmt, Some(ctx))?,
             false => self.parse_aggregation_shape(stmt)?,
