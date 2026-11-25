@@ -6267,6 +6267,18 @@ impl Table for SegmentedTable {
         offset: usize,
         deadline: Deadline,
     ) -> Result<RowVec> {
+        // A bare `pk = k` names one row: fetched by its id, as a point read
+        // is, instead of walking the cold rows until one matches (a foreign
+        // key's check of its parent reads this way)
+        if let Some((expr, pk)) = where_expr
+            .filter(|_| matches!(access, ScanAccess::Index(IndexPlan::Key)))
+            .and_then(|e| {
+                crate::storage::mvcc::table::pk_equality_id(e, self.hot.schema()).map(|pk| (e, pk))
+            })
+        {
+            let rows = self.fetch_rows_by_ids(&[pk], expr, deadline)?;
+            return Ok(rows.into_iter().skip(offset).take(limit).collect());
+        }
         self.limited_cold_and_hot_unordered(where_expr, limit, offset, access, deadline)
     }
 
