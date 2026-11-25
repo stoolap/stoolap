@@ -1222,6 +1222,7 @@ thread_local! {
     static SCAN_PATHS_TAKEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     static ONE_SHOT_COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static ONE_SHOT_LITERAL_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static NEAREST_INDEX_ANSWERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PROGRAM_COMPILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -1276,6 +1277,15 @@ pub fn one_shot_literal_reads() -> usize {
 
 pub(crate) fn one_shot_literal_read() {
     ONE_SHOT_LITERAL_READS.with(|n| n.set(n.get() + 1));
+}
+
+/// Nearest-vector reads an HNSW index answered on this thread, so far
+pub fn nearest_index_answers() -> usize {
+    NEAREST_INDEX_ANSWERS.with(std::cell::Cell::get)
+}
+
+pub(crate) fn nearest_index_answered() {
+    NEAREST_INDEX_ANSWERS.with(|n| n.set(n.get() + 1));
 }
 
 /// The name of every path that builds an aggregate result

@@ -568,7 +568,6 @@ impl Executor {
         stmt: &SelectStatement,
         item: Option<usize>,
     ) -> Option<std::borrow::Cow<'_, FunctionCall>> {
-        use std::borrow::Cow;
         // Must have exactly 1 ORDER BY + LIMIT, ascending order
         let [order_by] = stmt.order_by.as_slice() else {
             return None;
@@ -577,6 +576,22 @@ impl Executor {
         if !order_by.ascending || crate::core::value::nulls_first(true, order_by.nulls_first) {
             return None; // Vector search returns closest first, NULLs last
         }
+        let key = match item {
+            Some(item) => match stmt.columns.get(item)? {
+                Expression::Aliased(aliased) => aliased.expression.as_ref(),
+                expr => expr,
+            },
+            None => &order_by.expression,
+        };
+        Self::vector_distance_call(key)
+    }
+
+    /// `key` as the VEC_DISTANCE call of two arguments it is, with `<=>`
+    /// read as VEC_DISTANCE_L2
+    pub(crate) fn vector_distance_call(
+        key: &Expression,
+    ) -> Option<std::borrow::Cow<'_, FunctionCall>> {
+        use std::borrow::Cow;
         // <=> is VEC_DISTANCE_L2
         let l2 = |infix: &InfixExpression| FunctionCall {
             token: infix.token.clone(),
@@ -585,13 +600,6 @@ impl Executor {
             is_distinct: false,
             order_by: Vec::new(),
             filter: None,
-        };
-        let key = match item {
-            Some(item) => match stmt.columns.get(item)? {
-                Expression::Aliased(aliased) => aliased.expression.as_ref(),
-                expr => expr,
-            },
-            None => &order_by.expression,
         };
         let func_call = match key {
             Expression::FunctionCall(fc) => Cow::Borrowed(fc.as_ref()),
