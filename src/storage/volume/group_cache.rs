@@ -44,6 +44,8 @@ struct Entry {
     slot: Arc<Slot>,
     bytes: usize,
     last_used: u64,
+    /// The scan that read it last, 0 for none
+    scan: u64,
 }
 
 #[derive(Default)]
@@ -58,6 +60,7 @@ pub struct DecodedGroupCache {
     budget: AtomicUsize,
     hits: AtomicU64,
     misses: AtomicU64,
+    scans: AtomicU64,
 }
 
 /// Snapshot of the cache for PRAGMA reporting
@@ -79,14 +82,23 @@ impl DecodedGroupCache {
             budget: AtomicUsize::new(budget_bytes),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
+            scans: AtomicU64::new(0),
         }
     }
 
+    /// A new scan id, never 0
+    pub fn new_scan(&self) -> u64 {
+        self.scans.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
     /// The decoded column for `key`, decoding it with `decode` when absent.
-    /// A budget of zero bypasses the cache.
+    /// A budget of zero bypasses the cache. A scan other than 0 never evicts
+    /// an entry it read itself: a scan larger than the budget keeps the part
+    /// that fits for the next one instead of cycling every entry out.
     pub fn get_or_decode(
         &self,
         key: GroupKey,
+        scan: u64,
         decode: impl FnOnce() -> std::io::Result<ColumnData>,
     ) -> std::io::Result<Arc<ColumnData>> {
         let budget = self.budget.load(Ordering::Relaxed);
@@ -100,6 +112,9 @@ impl DecodedGroupCache {
             match inner.entries.get_mut(&key) {
                 Some(entry) => {
                     entry.last_used = tick;
+                    if scan != 0 {
+                        entry.scan = scan;
+                    }
                     self.hits.fetch_add(1, Ordering::Relaxed);
                     Arc::clone(&entry.slot)
                 }
@@ -115,6 +130,7 @@ impl DecodedGroupCache {
                             slot: Arc::clone(&slot),
                             bytes: 0,
                             last_used: tick,
+                            scan,
                         },
                     );
                     slot
@@ -165,8 +181,10 @@ impl DecodedGroupCache {
             inner.entries.remove(&key);
             return;
         }
+        let mut scan = 0;
         if let Some(entry) = inner.entries.get_mut(&key) {
             entry.bytes = bytes;
+            scan = entry.scan;
         }
         inner.bytes += bytes;
         while inner.bytes > budget {
@@ -175,9 +193,14 @@ impl DecodedGroupCache {
                 .iter()
                 .filter(|(k, _)| **k != key)
                 .min_by_key(|(_, e)| e.last_used)
-                .map(|(k, _)| *k);
+                .map(|(k, e)| (*k, e.scan));
             match victim {
-                Some(victim) => {
+                Some((_, victim_scan)) if scan != 0 && victim_scan == scan => {
+                    inner.entries.remove(&key);
+                    inner.bytes -= bytes;
+                    break;
+                }
+                Some((victim, _)) => {
                     if let Some(entry) = inner.entries.remove(&victim) {
                         inner.bytes -= entry.bytes;
                     }
@@ -297,7 +320,7 @@ mod tests {
                     scope.spawn(|| {
                         starts.wait();
                         cache
-                            .get_or_decode((600, 0, 0), || {
+                            .get_or_decode((600, 0, 0), 0, || {
                                 decodes.fetch_add(1, Ordering::SeqCst);
                                 Ok(ints(1))
                             })
@@ -317,7 +340,7 @@ mod tests {
     fn failed_decode_preserves_error_kind_and_can_retry() {
         let cache = DecodedGroupCache::new(1024);
         let error = cache
-            .get_or_decode((700, 0, 0), || {
+            .get_or_decode((700, 0, 0), 0, || {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "invalid group payload",
@@ -329,7 +352,7 @@ mod tests {
         assert_eq!(error.to_string(), "invalid group payload");
         let stats = cache.stats();
         assert_eq!((stats.bytes, stats.entries), (0, 0));
-        let column = cache.get_or_decode((700, 0, 0), || Ok(ints(2))).unwrap();
+        let column = cache.get_or_decode((700, 0, 0), 0, || Ok(ints(2))).unwrap();
         assert_eq!(column.len(), 2);
     }
 
@@ -337,9 +360,9 @@ mod tests {
     fn failed_decode_does_not_remove_a_replacement_entry() {
         let cache = DecodedGroupCache::new(1024);
         let mut replacement = None;
-        let result = cache.get_or_decode((800, 0, 0), || {
+        let result = cache.get_or_decode((800, 0, 0), 0, || {
             cache.remove_store(800);
-            replacement = Some(cache.get_or_decode((800, 0, 0), || Ok(ints(2))).unwrap());
+            replacement = Some(cache.get_or_decode((800, 0, 0), 0, || Ok(ints(2))).unwrap());
             Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "obsolete decode failed",
@@ -350,7 +373,7 @@ mod tests {
         let stats = cache.stats();
         assert_eq!((stats.bytes, stats.entries), (replacement.cache_size(), 1));
         let cached = cache
-            .get_or_decode((800, 0, 0), || panic!("replacement was evicted"))
+            .get_or_decode((800, 0, 0), 0, || panic!("replacement was evicted"))
             .unwrap();
         assert!(Arc::ptr_eq(&cached, &replacement));
         cache.remove_store(800);
@@ -367,7 +390,7 @@ mod tests {
             let cache = &cache;
             let worker = scope.spawn(move || {
                 cache
-                    .get_or_decode((100, 0, 0), || {
+                    .get_or_decode((100, 0, 0), 0, || {
                         entered_tx.send(()).unwrap();
                         resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
                         Ok(ints(1))
@@ -375,8 +398,8 @@ mod tests {
                     .unwrap();
             });
             entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-            cache.get_or_decode((200, 0, 0), || Ok(ints(2))).unwrap();
-            cache.get_or_decode((300, 0, 0), || Ok(ints(2))).unwrap();
+            cache.get_or_decode((200, 0, 0), 0, || Ok(ints(2))).unwrap();
+            cache.get_or_decode((300, 0, 0), 0, || Ok(ints(2))).unwrap();
             resume_tx.send(()).unwrap();
             worker.join().unwrap();
         });
@@ -396,7 +419,7 @@ mod tests {
             let cache = &cache;
             let worker = scope.spawn(move || {
                 cache
-                    .get_or_decode((400, 0, 0), || {
+                    .get_or_decode((400, 0, 0), 0, || {
                         entered_tx.send(()).unwrap();
                         resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
                         Ok(ints(1))
@@ -416,7 +439,7 @@ mod tests {
     fn a_column_larger_than_the_budget_is_not_kept() {
         let cache = DecodedGroupCache::new(1024 * 1024);
         cache
-            .get_or_decode((500, 0, 0), || {
+            .get_or_decode((500, 0, 0), 0, || {
                 Ok(ColumnData::Bytes {
                     data: vec![b'x'; 8 * 1024 * 1024],
                     offsets: vec![(0, 8 * 1024 * 1024)],
@@ -448,7 +471,7 @@ mod tests {
                     for _ in 0..ROUNDS {
                         barrier.wait();
                         cache
-                            .get_or_decode((10_000 + worker, 0, 0), || Ok(ints(1)))
+                            .get_or_decode((10_000 + worker, 0, 0), 0, || Ok(ints(1)))
                             .unwrap();
                         barrier.wait();
                     }
@@ -469,5 +492,53 @@ mod tests {
             failure, None,
             "a zero budget left data behind (round, bytes, entries)"
         );
+    }
+
+    #[test]
+    fn a_scan_larger_than_the_budget_keeps_what_fits_for_the_next_scan() {
+        let cache = DecodedGroupCache::new(3 * ints(1).cache_size());
+        let decodes = AtomicUsize::new(0);
+        let run = || {
+            let scan = cache.new_scan();
+            decodes.store(0, Ordering::SeqCst);
+            for group in 0..6 {
+                cache
+                    .get_or_decode((900, 0, group), scan, || {
+                        decodes.fetch_add(1, Ordering::SeqCst);
+                        Ok(ints(1))
+                    })
+                    .unwrap();
+            }
+            decodes.load(Ordering::SeqCst)
+        };
+        assert_eq!(run(), 6);
+        assert_eq!(
+            run(),
+            3,
+            "the second scan decodes again only what did not fit"
+        );
+        assert_eq!(run(), 3);
+        let stats = cache.stats();
+        assert_eq!((stats.entries, stats.bytes), (3, 3 * ints(1).cache_size()));
+    }
+
+    #[test]
+    fn a_new_scan_evicts_what_an_earlier_scan_read() {
+        let cache = DecodedGroupCache::new(2 * ints(1).cache_size());
+        for store in [910, 920] {
+            let scan = cache.new_scan();
+            for group in 0..2 {
+                cache
+                    .get_or_decode((store, 0, group), scan, || Ok(ints(1)))
+                    .unwrap();
+            }
+        }
+        cache
+            .get_or_decode((920, 0, 0), 0, || {
+                panic!("the later scan's entry was evicted")
+            })
+            .unwrap();
+        cache.remove_store(920);
+        assert_eq!(cache.stats().entries, 0, "the earlier scan's entries left");
     }
 }

@@ -383,9 +383,20 @@ const READ_AHEAD_BYTES: usize = 16 << 20;
 #[derive(Default)]
 pub struct ScanReads {
     columns: smallvec::SmallVec<[(usize, ReadAhead); 4]>,
+    /// The decoded group cache's scan these reads belong to, 0 for none
+    scan: u64,
 }
 
 impl ScanReads {
+    /// Reads of one scan of the decoded group cache, which the scan's
+    /// readers of several volumes share
+    pub fn of_scan(scan: u64) -> Self {
+        ScanReads {
+            columns: smallvec::SmallVec::new(),
+            scan,
+        }
+    }
+
     fn column(&mut self, col_idx: usize) -> &mut ReadAhead {
         let at = match self.columns.iter().position(|(col, _)| *col == col_idx) {
             Some(at) => at,
@@ -676,7 +687,7 @@ impl CompressedBlockStore {
         col_idx: usize,
         group_idx: usize,
     ) -> std::io::Result<Arc<ColumnData>> {
-        self.cached_group_column(col_idx, group_idx, None)
+        self.cached_group_column(col_idx, group_idx, 0, None)
     }
 
     /// `group_column` for a reader that goes through the groups in order:
@@ -688,7 +699,8 @@ impl CompressedBlockStore {
         group_idx: usize,
         reads: &mut ScanReads,
     ) -> std::io::Result<Arc<ColumnData>> {
-        self.cached_group_column(col_idx, group_idx, Some(reads.column(col_idx)))
+        let scan = reads.scan;
+        self.cached_group_column(col_idx, group_idx, scan, Some(reads.column(col_idx)))
     }
 
     /// Builds the groups of `column` from `row_ids` instead of decoding its
@@ -724,6 +736,7 @@ impl CompressedBlockStore {
         &self,
         col_idx: usize,
         group_idx: usize,
+        scan: u64,
         ahead: Option<&mut ReadAhead>,
     ) -> std::io::Result<Arc<ColumnData>> {
         let key_col = u32::try_from(col_idx).map_err(|_| {
@@ -735,17 +748,21 @@ impl CompressedBlockStore {
         let key_group = u32::try_from(group_idx).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "group index out of range")
         })?;
-        super::group_cache::DECODED_GROUPS.get_or_decode((self.id, key_col, key_group), || {
-            if let Some(column) = self.row_id_group(col_idx, group_idx) {
-                return column;
-            }
-            #[cfg(test)]
-            self.decoded_groups
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            #[cfg(feature = "test-failpoints")]
-            crate::test_failpoints::group_column_decoded(col_idx, group_idx);
-            self.decompress_group_in(col_idx, group_idx, ahead)
-        })
+        super::group_cache::DECODED_GROUPS.get_or_decode(
+            (self.id, key_col, key_group),
+            scan,
+            || {
+                if let Some(column) = self.row_id_group(col_idx, group_idx) {
+                    return column;
+                }
+                #[cfg(test)]
+                self.decoded_groups
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::group_column_decoded(col_idx, group_idx);
+                self.decompress_group_in(col_idx, group_idx, ahead)
+            },
+        )
     }
 
     /// How many groups were decoded from this store's blocks so far

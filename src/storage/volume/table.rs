@@ -8952,6 +8952,7 @@ impl Table for SegmentedTable {
             let walk_asks = self.side_asks(&comparisons);
             // Each volume's run starts from this empty one
             let empty = groups.empty_like();
+            let cache_scan = super::group_cache::DECODED_GROUPS.new_scan();
 
             let process_volume =|(_, cs): &(u64, super::manifest::ColdSegment)| -> Result<
                 Option<GroupedAggregates>,
@@ -9097,7 +9098,13 @@ impl Table for SegmentedTable {
                             &'v super::writer::ColumnMapping,
                             &[(AggregateOp, usize)],
                         ),
-                        (preds, skips, shown, deadline): (&[PhysPred], &[bool], &ShownRows, Deadline),
+                        (preds, skips, shown, deadline, cache_scan): (
+                            &[PhysPred],
+                            &[bool],
+                            &ShownRows,
+                            Deadline,
+                            u64,
+                        ),
                         mut key: K,
                         part: &mut GroupedAggregates,
                     ) -> Result<bool> {
@@ -9114,7 +9121,7 @@ impl Table for SegmentedTable {
                             .chain(key.columns().iter().copied())
                             .chain(called);
                         let reads = ColumnReads::of(vol, read);
-                        let mut scan_reads = super::writer::ScanReads::default();
+                        let mut scan_reads = super::writer::ScanReads::of_scan(cache_scan);
                         let mut candidates: Vec<usize> = Vec::new();
                         for gi in 0..row_count.div_ceil(rg_size) {
                             if skips.get(gi) == Some(&true) {
@@ -9442,7 +9449,7 @@ impl Table for SegmentedTable {
                         return Ok(None);
                     }
                     let calls = (&**vol, mapping, aggregates);
-                    let rows =(&phys_preds[..], &row_group_skips[..], &shown, deadline);
+                    let rows =(&phys_preds[..], &row_group_skips[..], &shown, deadline, cache_scan);
                     // Each row's group: the one group, a value the volume holds
                     // for every row, or the volume's group column
                     let answered = match group_column {
