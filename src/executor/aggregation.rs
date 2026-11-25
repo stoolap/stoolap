@@ -3508,28 +3508,30 @@ impl Executor {
         Ok(group_items)
     }
 
-    /// The source column a single named GROUP BY item groups by, bound by
-    /// `parse_group_by` as the shared projection binds it, and whether the
-    /// item carried a qualifier
-    pub(crate) fn single_group_column(
-        &self,
-        stmt: &SelectStatement,
-    ) -> Result<Option<(String, bool)>> {
-        match stmt.group_by.columns.as_slice() {
-            [Expression::Identifier(_)] => {}
-            [Expression::QualifiedIdentifier(qid)] => {
-                return Ok(Some((qid.name.value_lower.to_string(), true)));
-            }
-            _ => return Ok(None),
+    /// The source columns GROUP BY items that each name one column without
+    /// a qualifier group by, bound by `parse_group_by` as the shared
+    /// projection binds them; None for any other item
+    pub(crate) fn group_columns(&self, stmt: &SelectStatement) -> Result<Option<Vec<String>>> {
+        if !stmt
+            .group_by
+            .columns
+            .iter()
+            .all(|item| matches!(item, Expression::Identifier(_)))
+        {
+            return Ok(None);
         }
-        Ok(match self.parse_group_by(stmt, &[])?.as_slice() {
-            [GroupByItem::Column(name)] => Some((name.to_lowercase(), false)),
-            [GroupByItem::Expression {
-                expr: Expression::Identifier(id),
-                ..
-            }] => Some((id.value_lower.to_string(), false)),
-            _ => None,
-        })
+        let items = self.parse_group_by(stmt, &[])?;
+        Ok(items
+            .iter()
+            .map(|item| match item {
+                GroupByItem::Column(name) => Some(name.to_lowercase()),
+                GroupByItem::Expression {
+                    expr: Expression::Identifier(id),
+                    ..
+                } => Some(id.value_lower.to_string()),
+                _ => None,
+            })
+            .collect())
     }
 
     /// Find the alias for an expression in the SELECT list

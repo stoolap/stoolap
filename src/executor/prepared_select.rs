@@ -4795,13 +4795,16 @@ impl PreparedSelect {
                 read:
                     AggregateRead::Grouped {
                         source,
-                        group: (name, at),
+                        groups,
                         walks,
                     },
                 ..
             }) => Read::Grouped {
                 source,
-                group: (SmartString::from(name), at),
+                groups: groups
+                    .into_iter()
+                    .map(|(name, at)| (SmartString::from(name), at))
+                    .collect(),
                 walks,
                 otherwise: Box::new(read),
             },

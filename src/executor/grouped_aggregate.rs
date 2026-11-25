@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A statement that groups one table by one column without WHERE: the one
-//! rule that says where its groups come from, and the run of that source
+//! A statement that groups one table by its columns: the one rule that
+//! says where its groups come from, and the run of that source
 
 use crate::common::deadline::{Deadline, DeadlineSite};
 use crate::common::names::eq_names;
+use crate::common::SmartString;
 use crate::core::{Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::{Expression, GroupByModifier, SelectStatement};
 use crate::storage::expression::Expression as StorageExpr;
@@ -32,8 +33,8 @@ use super::query_classification::QueryClassification;
 use super::row_count::rows_needed;
 use super::Executor;
 
-/// Where a statement that groups one table by one column, without WHERE,
-/// reads its groups from
+/// Where a statement that groups one table by its columns reads its
+/// groups from
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupedSource {
     /// Every group computed by the table over its rows; a run the table
@@ -48,16 +49,16 @@ pub enum GroupedSource {
 }
 
 impl Executor {
-    /// Where `stmt`'s groups come from, a statement grouping one table by one
-    /// column without WHERE: the rule every run decides it by. `plain` when
-    /// its SELECT list reads the group column and `aggregations` only,
-    /// `grouped_names` when every name outside a call is the group column
+    /// Where `stmt`'s groups come from, a statement grouping one table by
+    /// its columns: the rule every run decides it by. `plain` when its
+    /// SELECT list reads the group columns and `aggregations` only,
+    /// `grouped_names` when every name outside a call is a group column,
+    /// `one_column` when it groups by one, whose index the walk may read
     pub(crate) fn grouped_source(
         stmt: &SelectStatement,
         classification: &QueryClassification,
         aggregations: &[SqlAggregateFunction],
-        plain: bool,
-        grouped_names: bool,
+        (plain, grouped_names, one_column): (bool, bool, bool),
     ) -> GroupedSource {
         // With no call, the groups are the column's distinct values
         if plain && aggregations.is_empty() {
@@ -75,7 +76,8 @@ impl Executor {
         // The table computes counts, sums, averages and bounds of columns; a
         // HAVING the index walk does not judge, naming no column but the
         // group's, judges the groups the table gives
-        let sorts = Self::sorts_groups(stmt, classification, aggregations, grouped_names);
+        let sorts =
+            one_column && Self::sorts_groups(stmt, classification, aggregations, grouped_names);
         let stored = (stmt.having.is_none() || (grouped_names && !sorts))
             && aggregations
                 .iter()
@@ -115,9 +117,9 @@ impl Executor {
             && (counts || stmt.limit.is_some())
     }
 
-    /// The plan of `stmt` when it groups one table of `schema` by one column,
-    /// under a WHERE the table runs whole, and the rule picks a source other
-    /// than the hash grouping, which the scan does
+    /// The plan of `stmt` when it groups one table of `schema` by its
+    /// columns, under a WHERE the table runs whole, and the rule picks a
+    /// source other than the hash grouping, which the scan does
     pub(super) fn grouped_read_plan(
         &self,
         stmt: &SelectStatement,
@@ -126,7 +128,7 @@ impl Executor {
         schema: &Schema,
     ) -> Result<Option<AggregatePlan>> {
         if classification.where_has_subqueries
-            || stmt.group_by.columns.len() != 1
+            || stmt.group_by.columns.is_empty()
             || !matches!(stmt.group_by.modifier, GroupByModifier::None)
         {
             return Ok(None);
@@ -135,28 +137,41 @@ impl Executor {
         if filtered && Self::pushed_where(stmt, schema, ctx).is_none() {
             return Ok(None);
         }
-        let Some((group, false)) = self.single_group_column(stmt)? else {
+        let Some(names) = self.group_columns(stmt)? else {
             return Ok(None);
         };
-        let Some(group_index) = schema
-            .columns
-            .iter()
-            .position(|c| eq_names(&c.name, &group))
-        else {
-            return Ok(None);
-        };
+        let mut groups = Vec::with_capacity(names.len());
+        for name in names {
+            let Some(at) = schema.columns.iter().position(|c| eq_names(&c.name, &name)) else {
+                return Ok(None);
+            };
+            groups.push((name, at));
+        }
         let (aggregations, non_aggregated) = match runs {
             true => self.parse_aggregations(stmt, Some(ctx))?,
             false => self.parse_aggregation_shape(stmt)?,
         };
-        // The SELECT list reads the group column and aggregate calls only
+        let column = |name: &str| groups.iter().any(|(group, _)| eq_names(name, group));
+        // A name is a group column's, or the alias the SELECT list gives one
+        let grouped = |name: &str| {
+            column(name)
+                || stmt.columns.iter().any(|item| match item {
+                    Expression::Aliased(aliased) => {
+                        eq_names(&aliased.alias.value, name)
+                            && matches!(aliased.expression.as_ref(),
+                                Expression::Identifier(id) if column(&id.value))
+                    }
+                    _ => false,
+                })
+        };
+        // The SELECT list reads the group columns and aggregate calls only
         let group_item = |expr: &Expression| {
             let inner = match expr {
                 Expression::Aliased(aliased) => aliased.expression.as_ref(),
                 other => other,
             };
             match inner {
-                Expression::Identifier(id) => eq_names(&id.value, &group),
+                Expression::Identifier(id) => grouped(&id.value),
                 Expression::FunctionCall(call) => {
                     super::utils::is_aggregate_function(&call.function)
                 }
@@ -165,10 +180,11 @@ impl Executor {
         };
         let plain = stmt.columns.iter().all(group_item);
         // A name outside a call, from HAVING or an ORDER BY alias, which only
-        // the walk reads, and only as the group column
-        let grouped_names = non_aggregated.iter().all(|column| eq_names(column, &group));
-        let source =
-            Self::grouped_source(stmt, classification, &aggregations, plain, grouped_names);
+        // the walk reads, and only as a group column
+        let grouped_names = non_aggregated.iter().all(|column| grouped(column));
+        let one_column = groups.len() == 1;
+        let shape = (plain, grouped_names, one_column);
+        let source = Self::grouped_source(stmt, classification, &aggregations, shape);
         // The index walk reads every row of a group: a WHERE is the table's
         // to run, or the scan's
         if source == GroupedSource::Hash || filtered && source != GroupedSource::Storage {
@@ -177,6 +193,7 @@ impl Executor {
         // A table that declines its own grouping is walked by its index when
         // the walk may read the groups
         let walks = !filtered
+            && one_column
             && !aggregations.is_empty()
             && (source == GroupedSource::SortedStream
                 || Self::sorts_groups(stmt, classification, &aggregations, grouped_names));
@@ -184,14 +201,15 @@ impl Executor {
             aggregations,
             read: AggregateRead::Grouped {
                 source,
-                group: (group, group_index),
+                groups,
                 walks,
             },
         }))
     }
 
-    /// `stmt`'s groups of `aggregations` over `table` by the column `group`,
-    /// named and placed, from `source`, else by the index walk when `walks`;
+    /// `stmt`'s groups of `aggregations` over `table` by the columns of
+    /// `groups`, named and placed, from `source`, else by the index walk of
+    /// the one column when `walks`;
     /// None for the hash grouping, which the scan does. Its `blocks` answer
     /// the subqueries of its HAVING and SELECT list, its `held` calls hold
     /// its projection. Inlined into the table scan, it costs that scan's
@@ -202,7 +220,7 @@ impl Executor {
         table: &dyn Table,
         stmt: &SelectStatement,
         aggregations: &[SqlAggregateFunction],
-        (source, (group, group_index), walks): (GroupedSource, (&str, usize), bool),
+        (source, groups, walks): (GroupedSource, &[(SmartString, usize)], bool),
         (ctx, blocks, held): (
             &ExecutionContext,
             Option<&dyn SubqueryExecutor>,
@@ -223,19 +241,18 @@ impl Executor {
                     return Ok(None);
                 }
                 let deadline = ctx.deadline_of_call();
-                let read = (group_index, pushed.as_deref());
+                let read = (groups, pushed.as_deref());
                 Self::stored_groups(table, read, aggregations, &columns, deadline)?
             }
             (GroupedSource::SortedStream | GroupedSource::Hash, _) => None,
         };
-        let rows = match stored {
-            Some(rows) => (AggregatePath::StorageGrouped, rows),
-            None if walks => {
-                let group = (group, group_index);
+        let rows = match (stored, groups) {
+            (Some(rows), _) => (AggregatePath::StorageGrouped, rows),
+            (None, [(group, group_index)]) if walks => {
                 match self.sorted_groups(
                     table,
                     stmt,
-                    group,
+                    (group, *group_index),
                     aggregations,
                     &columns,
                     all_columns,
@@ -245,11 +262,11 @@ impl Executor {
                     None => return Ok(None),
                 }
             }
-            None => return Ok(None),
+            (None, _) => return Ok(None),
         };
         let (path, rows) = rows;
-        let mut slot_columns = Vec::with_capacity(1 + aggregations.len());
-        slot_columns.push(all_columns[group_index].clone());
+        let mut slot_columns = Vec::with_capacity(groups.len() + aggregations.len());
+        slot_columns.extend(groups.iter().map(|&(_, at)| all_columns[at].clone()));
         slot_columns.extend(aggregations.iter().map(|agg| agg.get_column_name()));
         // The walk judged its groups by the HAVING as it read them
         let rows = match path {
@@ -264,7 +281,7 @@ impl Executor {
             stmt,
             written_stmt: stmt,
             aggregations,
-            group_by_count: 1,
+            group_by_count: groups.len(),
             source_columns: all_columns,
             blocks,
             alone: None,
@@ -278,15 +295,15 @@ impl Executor {
     /// column of `columns`; None when the table declines
     fn stored_groups(
         table: &dyn Table,
-        (group_index, filter): (usize, Option<&dyn StorageExpr>),
+        (groups, filter): (&[(SmartString, usize)], Option<&dyn StorageExpr>),
         aggregations: &[SqlAggregateFunction],
         columns: &[Option<usize>],
         deadline: Deadline,
     ) -> Result<Option<RowVec>> {
         use crate::storage::mvcc::version_store::AggregateOp;
-        // A column's values are its groups when no WHERE leaves some out
-        if aggregations.is_empty() && filter.is_none() {
-            let column = &table.schema().columns[group_index].name_lower;
+        // One column's values are its groups when no WHERE leaves some out
+        if let ([(_, group_index)], true, None) = (groups, aggregations.is_empty(), filter) {
+            let column = &table.schema().columns[*group_index].name_lower;
             let values = table.get_partition_values(column, deadline)?;
             // A read whose last charge read no clock is checked once more
             deadline.check()?;
@@ -310,7 +327,8 @@ impl Executor {
             };
             ops.push(op);
         }
-        match table.compute_grouped_aggregates(&[group_index], &ops, filter, deadline)? {
+        let indices: smallvec::SmallVec<[usize; 4]> = groups.iter().map(|&(_, at)| at).collect();
+        match table.compute_grouped_aggregates(&indices, &ops, filter, deadline)? {
             Some(groups) => groups.into_rows().map(Some),
             None => Ok(None),
         }
