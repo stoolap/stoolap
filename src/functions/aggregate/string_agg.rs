@@ -34,6 +34,8 @@ fn separator_text(separator: &Value) -> Option<Cow<'_, str>> {
 #[derive(Clone)]
 struct OrderedEntry {
     value: String,
+    /// The value as the row gave it, which orders entries with equal keys
+    original: Value,
     sort_keys: Vec<Value>,
 }
 
@@ -69,6 +71,8 @@ pub struct StringAggFunction {
     order_keys: Vec<crate::functions::AggregateOrder>,
     /// Whether ORDER BY is active
     has_order_by: bool,
+    /// Whether DISTINCT keeps each value at its first place in the order
+    distinct: bool,
     /// The call's separator (default: ","), None for a NULL one
     separator: Option<String>,
 }
@@ -79,7 +83,7 @@ impl StringAggFunction {
     #[inline(always)]
     fn push(&mut self, value: &Value, row: Option<&Value>, sort_keys: Option<Vec<Value>>) {
         // STRING_AGG ignores NULLs; a value is joined as its text form
-        let Some(value) = value.text_form() else {
+        let Some(text) = value.text_form() else {
             return;
         };
         match (sort_keys, row) {
@@ -88,12 +92,13 @@ impl StringAggFunction {
                     self.row_separators.push(row.clone());
                 }
                 self.ordered_entries.push(OrderedEntry {
-                    value: value.into_owned(),
+                    value: text.into_owned(),
+                    original: value.clone(),
                     sort_keys,
                 });
             }
-            (None, None) => join(&mut self.joined, &value, self.separator.as_deref()),
-            (None, Some(row)) => join(&mut self.joined, &value, separator_text(row).as_deref()),
+            (None, None) => join(&mut self.joined, &text, self.separator.as_deref()),
+            (None, Some(row)) => join(&mut self.joined, &text, separator_text(row).as_deref()),
         }
     }
 
@@ -114,6 +119,7 @@ impl Default for StringAggFunction {
             row_separators: Vec::new(),
             order_keys: Vec::new(),
             has_order_by: false,
+            distinct: false,
             separator: Some(",".to_string()),
         }
     }
@@ -153,6 +159,11 @@ impl AggregateFunction for StringAggFunction {
         true
     }
 
+    fn distinct_in_order(&mut self) -> bool {
+        self.distinct = true;
+        true
+    }
+
     fn accumulate(&mut self, value: &Value) {
         self.push(value, None, None);
     }
@@ -176,19 +187,47 @@ impl AggregateFunction for StringAggFunction {
         {
             return Ok(Value::text(joined));
         }
-        // Sorted by their keys under ORDER BY, else in arrival order
-        let mut entries: Vec<&OrderedEntry> = self.ordered_entries.iter().collect();
-        if self.has_order_by {
-            let keys = &self.order_keys;
-            entries.sort_by(|a, b| super::compare_sort_keys(&a.sort_keys, &b.sort_keys, keys));
-        }
-        let Some((first, rest)) = entries.split_first() else {
-            return Ok(Value::null_unknown());
-        };
         // An entry's position in arrival order, which its own separator has
         let base = self.ordered_entries.as_ptr() as usize;
         let at = |entry: &OrderedEntry| {
             (entry as *const OrderedEntry as usize - base) / std::mem::size_of::<OrderedEntry>()
+        };
+        // Each row's own separator as text, made once for the sort and the join
+        let own: Vec<Option<Cow<'_, str>>> = match self.row_separators.is_empty() {
+            true => Vec::new(),
+            false => (0..self.ordered_entries.len())
+                .map(|at| self.separator_of(at))
+                .collect(),
+        };
+        let separator = |at: usize| match own.get(at) {
+            Some(text) => text.as_deref(),
+            None => self.separator.as_deref(),
+        };
+        // Under ORDER BY sorted by their keys, their values and then their
+        // separators, else in arrival order
+        let mut entries: Vec<&OrderedEntry> = self.ordered_entries.iter().collect();
+        if self.has_order_by {
+            let keys = &self.order_keys;
+            entries.sort_by(|a, b| {
+                super::compare_ordered_values(
+                    (&a.sort_keys, &a.original),
+                    (&b.sort_keys, &b.original),
+                    keys,
+                )
+                .then_with(|| separator(at(a)).cmp(&separator(at(b))))
+            });
+            if self.distinct {
+                let mut seen = super::DistinctTracker::default();
+                entries.retain(|e| match self.row_separators.get(at(e)) {
+                    Some(separator) => {
+                        seen.check_and_add_row(&e.original, std::slice::from_ref(separator))
+                    }
+                    None => seen.check_and_add(&e.original),
+                });
+            }
+        }
+        let Some((first, rest)) = entries.split_first() else {
+            return Ok(Value::null_unknown());
         };
         // Room for the values and the call's separators; a row's own may grow it
         let values = entries.iter().map(|e| e.value.len()).sum::<usize>();
@@ -196,7 +235,7 @@ impl AggregateFunction for StringAggFunction {
         let mut joined = String::with_capacity(values + separators);
         joined.push_str(&first.value);
         for entry in rest {
-            joined.push_str(self.separator_of(at(entry)).as_deref().unwrap_or_default());
+            joined.push_str(separator(at(entry)).unwrap_or_default());
             joined.push_str(&entry.value);
         }
         Ok(Value::text(joined))
@@ -249,6 +288,10 @@ impl AggregateFunction for GroupConcatFunction {
 
     fn supports_order_by(&self) -> bool {
         true
+    }
+
+    fn distinct_in_order(&mut self) -> bool {
+        self.inner.distinct_in_order()
     }
 
     fn accumulate(&mut self, value: &Value) {

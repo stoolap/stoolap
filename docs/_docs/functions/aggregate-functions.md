@@ -186,6 +186,17 @@ FROM employees
 GROUP BY department;
 ```
 
+### Equal keys and DISTINCT under ORDER BY
+
+STRING_AGG, GROUP_CONCAT and ARRAY_AGG with an ORDER BY give one answer whatever order the rows are read in. Rows are ordered by the ORDER BY keys, then by the value itself, ascending, then by the row's separator. Among values that compare equal, an INTEGER comes before a FLOAT and `-0.0` before `0.0`:
+
+```sql
+-- Rows (k, name): (1, 'b'), (1, 'a'), (2, 'c')
+SELECT STRING_AGG(name, ',' ORDER BY k) FROM t;  -- a,b,c
+```
+
+Under DISTINCT, each distinct value stays at its first place in that order: over the rows `(k 3, x 5)`, `(k 1, x 5)`, `(k 2, x 7)`, `ARRAY_AGG(DISTINCT x ORDER BY k)` gives `[5,7]`. Without ORDER BY, the values come in the order the rows are read.
+
 ## Position Functions
 
 ### FIRST

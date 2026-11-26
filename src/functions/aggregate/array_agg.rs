@@ -45,6 +45,8 @@ pub struct ArrayAggFunction {
     order_keys: Vec<crate::functions::AggregateOrder>,
     /// Whether ORDER BY is active
     has_order_by: bool,
+    /// Whether DISTINCT keeps each value at its first place in the order
+    distinct: bool,
 }
 
 impl AggregateFunction for ArrayAggFunction {
@@ -74,6 +76,11 @@ impl AggregateFunction for ArrayAggFunction {
         true
     }
 
+    fn distinct_in_order(&mut self) -> bool {
+        self.distinct = true;
+        true
+    }
+
     fn accumulate(&mut self, value: &Value) {
         // Handle NULL values - ARRAY_AGG includes NULLs by default (standard SQL behavior)
         // but we'll skip them like other aggregates for consistency
@@ -100,12 +107,19 @@ impl AggregateFunction for ArrayAggFunction {
         // Get the values to output, potentially sorted
         let values_to_output: Vec<&Value> = if self.has_order_by && !self.ordered_entries.is_empty()
         {
-            // Sort the entries by their sort keys
             let mut entries: Vec<&OrderedEntry> = self.ordered_entries.iter().collect();
             let keys = &self.order_keys;
-
-            entries.sort_by(|a, b| super::compare_sort_keys(&a.sort_keys, &b.sort_keys, keys));
-
+            entries.sort_by(|a, b| {
+                super::compare_ordered_values(
+                    (&a.sort_keys, &a.value),
+                    (&b.sort_keys, &b.value),
+                    keys,
+                )
+            });
+            if self.distinct {
+                let mut seen = super::DistinctTracker::default();
+                entries.retain(|e| seen.check_and_add(&e.value));
+            }
             entries.iter().map(|e| &e.value).collect()
         } else if !self.values.is_empty() {
             self.values.iter().collect()
