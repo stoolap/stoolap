@@ -9951,10 +9951,13 @@ enum ColdInput<'a> {
     Present(&'a super::column::ColumnData),
     Integer(&'a [i64], &'a [bool]),
     Float(&'a [f64], &'a [bool]),
-    Value(&'a super::column::ColumnData),
+    /// A column read as values, with the ORDER BY key's column of a FIRST
+    /// or LAST
+    Value(
+        &'a super::column::ColumnData,
+        Option<&'a super::column::ColumnData>,
+    ),
     Default(Value),
-    /// FIRST or LAST: the value's column and its ORDER BY key's
-    Ordered(&'a super::column::ColumnData, &'a super::column::ColumnData),
 }
 
 /// What COUNT is fed for a row it counts
@@ -9969,7 +9972,7 @@ impl<'a> ColdInput<'a> {
             (AggregateOp::Count, _) => ColdInput::Present(col),
             (_, ColumnData::Int64 { values, nulls }) => ColdInput::Integer(values, nulls),
             (_, ColumnData::Float64 { values, nulls }) => ColdInput::Float(values, nulls),
-            _ => ColdInput::Value(col),
+            _ => ColdInput::Value(col, None),
         }
     }
 
@@ -9993,9 +9996,9 @@ impl<'a> ColdInput<'a> {
                 use super::writer::ColSource::Volume;
                 match (source, mapping.sources.get(key)) {
                     (Volume(value), Some(Volume(key))) => {
-                        inputs.push(ColdInput::Ordered(
+                        inputs.push(ColdInput::Value(
                             vol.columns.get(*value)?,
-                            vol.columns.get(*key)?,
+                            Some(vol.columns.get(*key)?),
                         ));
                         continue;
                     }
@@ -10033,6 +10036,21 @@ impl ShownRows {
     }
 }
 
+/// Feeds row `i` of `value` and `key` to a FIRST or LAST run, out of line
+/// so the other calls' loop keeps its shape
+#[cold]
+#[inline(never)]
+fn accumulate_ordered(
+    run: &mut CompiledAggregate,
+    value: &super::column::ColumnData,
+    key: &super::column::ColumnData,
+    i: usize,
+) {
+    if !value.is_null(i) {
+        run.accumulate_ordered(&value.get_value(i), &key.get_value(i));
+    }
+}
+
 /// Feeds row `i` of a volume to the runs of every call
 #[inline(always)]
 fn accumulate_columnar(runs: &mut [CompiledAggregate], inputs: &[ColdInput<'_>], i: usize) {
@@ -10054,13 +10072,9 @@ fn accumulate_columnar(runs: &mut [CompiledAggregate], inputs: &[ColdInput<'_>],
                     run.accumulate(&Value::Float(values[i]));
                 }
             }
-            ColdInput::Value(col) => run.accumulate(&col.get_value(i)),
+            ColdInput::Value(col, None) => run.accumulate(&col.get_value(i)),
+            ColdInput::Value(col, Some(key)) => accumulate_ordered(run, col, key, i),
             ColdInput::Default(value) => run.accumulate(value),
-            ColdInput::Ordered(value, key) => {
-                if !value.is_null(i) {
-                    run.accumulate_ordered(&value.get_value(i), &key.get_value(i));
-                }
-            }
         }
     }
 }
