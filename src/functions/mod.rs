@@ -279,6 +279,12 @@ pub trait AggregateFunction: Send + Sync {
         false
     }
 
+    /// Whether DISTINCT leaves the result as it is, so every value is
+    /// accumulated: true for a function that picks one of its values
+    fn ignores_distinct(&self) -> bool {
+        false
+    }
+
     /// Get the final result, or the error the arithmetic raises, as SUM
     /// does when its INTEGER sum leaves the INTEGER range
     fn result(&self) -> Result<Value>;

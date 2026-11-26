@@ -105,6 +105,16 @@ fn first_and_last_order_equal_keys_by_the_value() {
                 ],
             ),
             (
+                "SELECT g, FIRST(DISTINCT v ORDER BY k), LAST(DISTINCT v ORDER BY k DESC), \
+                 FIRST(DISTINCT f ORDER BY k), LAST(DISTINCT f ORDER BY k NULLS FIRST) \
+                 FROM t GROUP BY g ORDER BY g",
+                vec![
+                    "a 10 30 -0.0 0.0",
+                    "b 50 60 2.0 2.0",
+                    "c NULL NULL NULL NULL",
+                ],
+            ),
+            (
                 "SELECT FIRST(v ORDER BY k), LAST(v ORDER BY k DESC) FROM t WHERE g = 'a'",
                 vec!["10 30"],
             ),
@@ -162,6 +172,51 @@ fn first_and_last_order_equal_keys_by_the_value() {
             let got = rows(prepared.query((1,)));
             if got != ["a -0.0", "c NULL"] {
                 wrong.push(format!("{context} prepared: {got:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn distinct_leaves_first_and_last_as_they_are_in_either_read_order() {
+    let db = Database::open("memory://first_last_ties_rule_distinct").unwrap();
+    let mut wrong = Vec::new();
+    for (calls, rows_in, want) in [
+        (
+            "FIRST(DISTINCT x ORDER BY k), LAST(DISTINCT x ORDER BY k DESC)",
+            [
+                "SELECT 3 AS k, 5 AS x",
+                "SELECT 1 AS k, 5 AS x",
+                "SELECT 2 AS k, 7 AS x",
+            ],
+            "5 5",
+        ),
+        (
+            "FIRST(DISTINCT x ORDER BY k), LAST(DISTINCT x ORDER BY k)",
+            [
+                "SELECT 1 AS k, 1.0 AS x",
+                "SELECT 1 AS k, 1 AS x",
+                "SELECT 2 AS k, NULL AS x",
+            ],
+            "1 1.0",
+        ),
+        (
+            "FIRST(DISTINCT x ORDER BY k), LAST(DISTINCT x ORDER BY k)",
+            [
+                "SELECT 1 AS k, 0.0 AS x",
+                "SELECT 1 AS k, -0.0 AS x",
+                "SELECT 2 AS k, NULL AS x",
+            ],
+            "-0.0 0.0",
+        ),
+    ] {
+        for order in [[0, 1, 2], [1, 0, 2]] {
+            let source = order.map(|i| rows_in[i]).join(" UNION ALL ");
+            let sql = format!("SELECT {calls} FROM ({source}) d");
+            let got = rows(db.query(&sql, ()));
+            if got != [want] {
+                wrong.push(format!("{sql}: {got:?}"));
             }
         }
     }

@@ -63,6 +63,10 @@ impl AggregateFunction for LastFunction {
         true
     }
 
+    fn ignores_distinct(&self) -> bool {
+        true
+    }
+
     fn accumulate(&mut self, value: &Value) {
         if value.is_null() {
             return;

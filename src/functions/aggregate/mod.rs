@@ -185,6 +185,7 @@ impl AggregateState {
         if !order_by.is_empty() && function.supports_order_by() {
             function.set_order_by(order_by);
         }
+        let distinct = distinct && !function.ignores_distinct();
         Self {
             function,
             distinct: distinct.then(Box::default),

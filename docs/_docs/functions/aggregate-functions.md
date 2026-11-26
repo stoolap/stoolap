@@ -232,6 +232,8 @@ SELECT FIRST(price ORDER BY ts), LAST(price ORDER BY ts) FROM readings;  -- 10, 
 
 Each call orders its own rows, so on equal keys `FIRST(a ORDER BY ts)` and `FIRST(b ORDER BY ts)` may read their values from different rows.
 
+DISTINCT has no effect on FIRST and LAST: the first of the distinct values is the first value. `FIRST(DISTINCT x ORDER BY k)` answers as `FIRST(x ORDER BY k)` does.
+
 ## Using GROUP BY
 
 The GROUP BY clause groups rows with the same values and applies aggregate functions to each group:
