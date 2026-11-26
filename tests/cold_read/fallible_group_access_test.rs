@@ -1205,12 +1205,12 @@ fn warm_filtered_aggregation_propagates_column_failure() {
 
 #[test]
 fn warm_grouped_aggregation_propagates_column_failure() {
-    use stoolap::storage::mvcc::version_store::AggregateOp;
+    use stoolap::storage::mvcc::version_store::{AggregateOp, GroupBy};
     use stoolap::storage::traits::Table;
     assert_warm_read_failure(|table| {
         table
             .compute_grouped_aggregates(
-                &[0],
+                &[GroupBy::column(0)],
                 &[(AggregateOp::Sum, 1)],
                 None,
                 stoolap::executor::Deadline::NONE,
@@ -1222,7 +1222,7 @@ fn warm_grouped_aggregation_propagates_column_failure() {
 #[test]
 fn fully_hidden_warm_columns_are_not_decoded() {
     use stoolap::core::Value;
-    use stoolap::storage::mvcc::version_store::AggregateOp;
+    use stoolap::storage::mvcc::version_store::{AggregateOp, GroupBy};
     use stoolap::storage::traits::Table;
     let table = malformed_warm_table();
     table.segment_manager().add_tombstones(&[1, 2], 1);
@@ -1256,7 +1256,7 @@ fn fully_hidden_warm_columns_are_not_decoded() {
         .is_empty());
     assert!(table
         .compute_grouped_aggregates(
-            &[0],
+            &[GroupBy::column(0)],
             &[(AggregateOp::Sum, 1)],
             None,
             stoolap::executor::Deadline::NONE,
@@ -1266,7 +1266,7 @@ fn fully_hidden_warm_columns_are_not_decoded() {
         .is_empty());
     assert!(table
         .compute_grouped_aggregates(
-            &[1],
+            &[GroupBy::column(1)],
             &[(AggregateOp::Sum, 0)],
             None,
             stoolap::executor::Deadline::NONE,

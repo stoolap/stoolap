@@ -56,7 +56,7 @@ pub use conversion::{CastFunction, CollateFunction};
 pub use datetime::{
     CurrentDateFunction, CurrentTimeFunction, CurrentTimestampFunction, DateAddFunction,
     DateDiffAliasFunction, DateDiffFunction, DateSubFunction, DateTruncFunction, DayFunction,
-    ExtractFunction, HourFunction, MinuteFunction, MonthFunction, SecondFunction,
+    ExtractFunction, HourFunction, MinuteFunction, MonthFunction, SecondFunction, TimeBucket,
     TimeTruncFunction, ToCharFunction, VersionFunction, YearFunction,
 };
 pub use hash::{

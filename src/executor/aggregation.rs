@@ -31,6 +31,7 @@ use crate::core::{condition_truth, Result, Row, RowVec, Value};
 use crate::functions::aggregate::{
     AggregateState, CallTemplate, ColumnsKey, CompiledAggregate, GroupKey, GroupedAggregates,
 };
+use crate::functions::scalar::TimeBucket;
 use crate::parser::ast::*;
 use crate::storage::traits::QueryResult;
 
@@ -319,6 +320,34 @@ struct GroupingSet {
     /// For each GROUP BY column, whether it's included in this grouping level
     /// If false, the column value will be NULL in the output (rolled up)
     active_columns: Vec<bool>,
+}
+
+/// A GROUP BY key a table can read: a column by its lowercase name, its
+/// bucket when the key is a DATE_TRUNC or TIME_TRUNC of it, with the name
+/// and the expression of the bucket's slot
+pub(crate) struct GroupName {
+    pub(crate) column: String,
+    pub(crate) bucket: Option<(TimeBucket, String, ExprKey)>,
+}
+
+/// The bucket and the lowercase column of a DATE_TRUNC or TIME_TRUNC of an
+/// unqualified column by a text literal the call accepts
+pub(crate) fn bucket_of(expr: &Expression) -> Option<(TimeBucket, String)> {
+    let Expression::FunctionCall(call) = expr else {
+        return None;
+    };
+    if call.is_distinct || !call.order_by.is_empty() || call.filter.is_some() {
+        return None;
+    }
+    match call.arguments.as_slice() {
+        [Expression::StringLiteral(unit), Expression::Identifier(column)]
+            if unit.type_hint.is_none() =>
+        {
+            TimeBucket::of_call(&call.function, &unit.value)
+                .map(|bucket| (bucket, column.value_lower.to_string()))
+        }
+        _ => None,
+    }
 }
 
 /// The expressions `stmt` groups by, in the order its groups hold them:
@@ -3506,27 +3535,49 @@ impl Executor {
         Ok(group_items)
     }
 
-    /// The source columns GROUP BY items that each name one column without
-    /// a qualifier group by, bound by `parse_group_by` as the shared
-    /// projection binds them; None for any other item
-    pub(crate) fn group_columns(&self, stmt: &SelectStatement) -> Result<Option<Vec<String>>> {
-        if !stmt
-            .group_by
-            .columns
-            .iter()
-            .all(|item| matches!(item, Expression::Identifier(_)))
-        {
+    /// The keys of a GROUP BY without a modifier whose items each name one
+    /// column without a qualifier, or a DATE_TRUNC or TIME_TRUNC of one by a
+    /// literal, bound by `parse_group_by` as the shared projection binds
+    /// them; None for any other item
+    pub(crate) fn group_columns(&self, stmt: &SelectStatement) -> Result<Option<Vec<GroupName>>> {
+        let written = |item: &Expression| {
+            matches!(
+                item,
+                Expression::Identifier(_)
+                    | Expression::FunctionCall(_)
+                    | Expression::IntegerLiteral(_)
+            )
+        };
+        if !stmt.group_by.columns.iter().all(written) {
             return Ok(None);
         }
         let items = self.parse_group_by(stmt, &[])?;
-        Ok(items
+        let plain = |column: String| GroupName {
+            column,
+            bucket: None,
+        };
+        Ok(stmt
+            .group_by
+            .columns
             .iter()
-            .map(|item| match item {
-                GroupByItem::Column(name) => Some(name.to_lowercase()),
-                GroupByItem::Expression {
-                    expr: Expression::Identifier(id),
-                    ..
-                } => Some(id.value_lower.to_string()),
+            .zip(&items)
+            .map(|(written, item)| match (written, item) {
+                (Expression::Identifier(_), GroupByItem::Column(name)) => {
+                    Some(plain(name.to_lowercase()))
+                }
+                (
+                    Expression::Identifier(_),
+                    GroupByItem::Expression {
+                        expr: Expression::Identifier(id),
+                        ..
+                    },
+                ) => Some(plain(id.value_lower.to_string())),
+                (_, GroupByItem::Expression { expr, display_name }) => {
+                    bucket_of(expr).map(|(bucket, column)| GroupName {
+                        column,
+                        bucket: Some((bucket, display_name.clone(), ExprKey::of(expr))),
+                    })
+                }
                 _ => None,
             })
             .collect())

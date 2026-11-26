@@ -5872,7 +5872,7 @@ impl Table for MVCCTable {
 
     fn compute_grouped_aggregates(
         &self,
-        group_by_indices: &[usize],
+        keys: &[crate::storage::mvcc::version_store::GroupBy],
         aggregates: &[(crate::storage::mvcc::version_store::AggregateOp, usize)],
         filter: Option<&dyn Expression>,
         deadline: Deadline,
@@ -5890,7 +5890,7 @@ impl Table for MVCCTable {
 
         let groups = self.version_store.compute_grouped_aggregates(
             self.reader(),
-            group_by_indices,
+            keys,
             aggregates,
             deadline,
         )?;

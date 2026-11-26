@@ -71,8 +71,8 @@ pub enum Step {
     Filter,
 }
 
-/// The columns an aggregate groups by, each named and placed in its table
-pub type GroupColumns = [(SmartString, usize)];
+/// The keys an aggregate groups by, each named
+pub type GroupColumns = [(SmartString, crate::storage::mvcc::version_store::GroupBy)];
 
 /// How a plan reads its table; a scan without a choice is the table's to
 /// choose, as for a statement whose WHERE asks a block
@@ -118,13 +118,13 @@ pub enum Read {
         column: Option<SmartString>,
         otherwise: Box<Read>,
     },
-    /// The groups of an aggregate by the columns of `groups`, each named and
-    /// placed, from `source`, else by the index walk of the one column when
-    /// `walks`; the rows of `otherwise` grouped when the table cannot answer
-    /// so in this run
+    /// The groups of an aggregate by the keys of `groups`, each named, from
+    /// `source`, else by the index walk of the one column when `walks`; the
+    /// rows of `otherwise` grouped when the table cannot answer so in this
+    /// run
     Grouped {
         source: GroupedSource,
-        groups: Vec<(SmartString, usize)>,
+        groups: Vec<(SmartString, crate::storage::mvcc::version_store::GroupBy)>,
         walks: bool,
         otherwise: Box<Read>,
     },

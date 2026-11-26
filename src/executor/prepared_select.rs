@@ -4803,7 +4803,7 @@ impl PreparedSelect {
                 source,
                 groups: groups
                     .into_iter()
-                    .map(|(name, at)| (SmartString::from(name), at))
+                    .map(|(name, key)| (SmartString::from(name), key))
                     .collect(),
                 walks,
                 otherwise: Box::new(read),
