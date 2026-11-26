@@ -8832,7 +8832,8 @@ impl Table for SegmentedTable {
             let mut hot_skip: KeySet<i64> =
                 KeySet::with_capacity_and_hasher(hot_rows.len().max(1024), Default::default());
             let plain = plain_columns(keys);
-            let mut bucketed = Vec::with_capacity(keys.len());
+            // Allocated by the first bucketed row only
+            let mut bucketed = Vec::new();
             for (row_id, row) in &hot_rows {
                 hot_skip.insert(*row_id);
                 let row = row.as_slice();
