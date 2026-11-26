@@ -192,6 +192,17 @@ impl AggregateFunction for StringAggFunction {
         let at = |entry: &OrderedEntry| {
             (entry as *const OrderedEntry as usize - base) / std::mem::size_of::<OrderedEntry>()
         };
+        // Each row's own separator as text, made once for the sort and the join
+        let own: Vec<Option<Cow<'_, str>>> = match self.row_separators.is_empty() {
+            true => Vec::new(),
+            false => (0..self.ordered_entries.len())
+                .map(|at| self.separator_of(at))
+                .collect(),
+        };
+        let separator = |at: usize| match own.get(at) {
+            Some(text) => text.as_deref(),
+            None => self.separator.as_deref(),
+        };
         // Under ORDER BY sorted by their keys, their values and then their
         // separators, else in arrival order
         let mut entries: Vec<&OrderedEntry> = self.ordered_entries.iter().collect();
@@ -203,7 +214,7 @@ impl AggregateFunction for StringAggFunction {
                     (&b.sort_keys, &b.original),
                     keys,
                 )
-                .then_with(|| self.separator_of(at(a)).cmp(&self.separator_of(at(b))))
+                .then_with(|| separator(at(a)).cmp(&separator(at(b))))
             });
             if self.distinct {
                 let mut seen = super::DistinctTracker::default();
@@ -224,7 +235,7 @@ impl AggregateFunction for StringAggFunction {
         let mut joined = String::with_capacity(values + separators);
         joined.push_str(&first.value);
         for entry in rest {
-            joined.push_str(self.separator_of(at(entry)).as_deref().unwrap_or_default());
+            joined.push_str(separator(at(entry)).unwrap_or_default());
             joined.push_str(&entry.value);
         }
         Ok(Value::text(joined))
