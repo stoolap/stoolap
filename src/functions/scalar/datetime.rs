@@ -186,7 +186,14 @@ impl TimeBucket {
     pub fn truncate_nanos(self, at: i64) -> DateTime<Utc> {
         match self {
             Self::Calendar(unit) => unit.truncate(DateTime::from_timestamp_nanos(at)),
-            Self::Every(nanos) => DateTime::from_timestamp_nanos(at - at % nanos),
+            // Rounds down before 1970 too; a start before i64::MIN is subtracted as a time
+            Self::Every(nanos) => {
+                let past = at.rem_euclid(nanos);
+                match at.checked_sub(past) {
+                    Some(start) => DateTime::from_timestamp_nanos(start),
+                    None => DateTime::from_timestamp_nanos(at) - Duration::nanoseconds(past),
+                }
+            }
         }
     }
 

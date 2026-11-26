@@ -25,8 +25,8 @@ use stoolap::Database;
 use crate::oracle;
 
 /// Rows out of time order: week, month, quarter and year edges, a leap
-/// day, equal timestamps, NULLs, and timestamps before 1970, where
-/// DATE_TRUNC rounds down and TIME_TRUNC toward 1970
+/// day, equal timestamps, NULLs, and timestamps before 1970, which both
+/// functions round down
 const ROWS: &str = "INSERT INTO r VALUES \
     (1, 'a', '2024-01-01 00:00:00', 1), (2, 'a', '2024-01-07 23:59:59', 2), \
     (3, 'b', '2024-01-08 00:00:00', 3), (4, 'b', '2024-03-31 23:59:59.999', 4), \

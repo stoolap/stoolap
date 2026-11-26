@@ -406,7 +406,10 @@ Truncates a timestamp to a duration interval.
 ```sql
 SELECT TIME_TRUNC('15m', '2024-03-15 10:37:45');     -- '2024-03-15T10:30:00Z'
 SELECT TIME_TRUNC('1h', '2024-03-15 10:37:45');      -- '2024-03-15T10:00:00Z'
+SELECT TIME_TRUNC('1h', '1969-12-31 22:30:00');      -- '1969-12-31T22:00:00Z'
 ```
+
+The result is the start of the interval holding the timestamp, intervals counted from 1970-01-01 UTC, so a timestamp before 1970 rounds down too.
 
 Supported intervals: `ns`, `us`, `ms`, `s`, `m`, `h` (with numeric prefix, e.g., `15m`, `4h`)
 
