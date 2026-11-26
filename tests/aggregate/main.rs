@@ -35,6 +35,7 @@ mod boolean_aggregate_test;
 mod bug_alias_shadow_group_by_test;
 mod bug_count_column_nulls_test;
 mod bug_max_no_where_test;
+mod column_pair_filter_test;
 mod count_aggregate_test;
 mod count_star_fallback_test;
 mod extension_min_max_test;

@@ -176,16 +176,7 @@ impl ComparisonExpr {
     /// Apply the configured operator to a column-vs-value ordering
     #[inline]
     fn check_ordering(&self, ord: std::cmp::Ordering) -> bool {
-        use std::cmp::Ordering;
-        match self.operator {
-            Operator::Eq => ord == Ordering::Equal,
-            Operator::Ne => ord != Ordering::Equal,
-            Operator::Gt => ord == Ordering::Greater,
-            Operator::Gte => ord != Ordering::Less,
-            Operator::Lt => ord == Ordering::Less,
-            Operator::Lte => ord != Ordering::Greater,
-            _ => false,
-        }
+        self.operator.holds(ord)
     }
 
     /// Compare two floats with the configured operator, in the total order

@@ -8695,17 +8695,36 @@ impl Table for SegmentedTable {
     ) -> Result<Option<GroupedAggregates>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.compute_grouped_aggregates");
-        // Only a conjunction of simple comparisons runs on the raw arrays
-        let comparisons = match filter {
-            Some(filter) if !filter.is_conjunctive_simple() => return Ok(None),
-            Some(filter) => match filter.collect_comparisons() {
-                comparisons if comparisons.is_empty() => return Ok(None),
-                comparisons => comparisons,
+        // Only a conjunction of comparisons, with a value or of two columns,
+        // runs on the raw arrays
+        let (comparisons, column_pairs) = match filter {
+            Some(filter) => match crate::storage::expression::conjunctive_parts(filter) {
+                Some((comparisons, pairs)) if !(comparisons.is_empty() && pairs.is_empty()) => {
+                    (comparisons, pairs)
+                }
+                _ => return Ok(None),
             },
-            None => Vec::new(),
+            None => (Vec::new(), Vec::new()),
         };
 
         let schema = self.hot.schema().clone();
+        // Two columns compared are each a number or a timestamp
+        let mut pairs: Vec<(usize, crate::core::Operator, usize)> =
+            Vec::with_capacity(column_pairs.len());
+        for (left, op, right) in column_pairs {
+            let index = |name: &str| {
+                let at = *schema.column_index_map().get(&name.to_lowercase())?;
+                let typed = matches!(
+                    schema.columns.get(at)?.data_type,
+                    DataType::Integer | DataType::Float | DataType::Timestamp
+                );
+                typed.then_some(at)
+            };
+            match (index(left), index(right)) {
+                (Some(left), Some(right)) => pairs.push((left, op, right)),
+                _ => return Ok(None),
+            }
+        }
 
         // --- Type-resolve predicates -----------------------------------------
         // For each comparison, resolve to (schema_col_idx, operator, typed_target).
@@ -8859,6 +8878,25 @@ impl Table for SegmentedTable {
                 dict_id: Option<u32>, // resolved dict_id for DictEq (per-volume)
                 is_timestamp: bool,
             }
+            // Two columns of a volume compared, by their physical places
+            struct PhysPair {
+                left: usize,
+                op: crate::core::Operator,
+                right: usize,
+            }
+            // Whether row `i` passes every comparison of two columns, as
+            // `sql_compare_op` answers their values
+            #[inline(never)]
+            fn pairs_pass(vol: &FrozenVolume, pairs: &[PhysPair], i: usize) -> std::io::Result<bool> {
+                for pair in pairs {
+                    let left = vol.columns.get(pair.left)?.get_value(i);
+                    let right = vol.columns.get(pair.right)?.get_value(i);
+                    if crate::core::predicate::sql_compare_op(&left, pair.op, &right) != Some(true) {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
             // Whether row `i` of `col` passes the predicate
             #[inline(always)]
             fn pred_passes(pp: &PhysPred, col: &super::column::ColumnData, i: usize) -> bool {
@@ -8987,7 +9025,8 @@ impl Table for SegmentedTable {
                     }
                     let vol = &cs.volume;
                     let mapping = &cs.mapping;
-                    let walk = match preds.is_empty() {
+                    // Two columns compared are asked of every row; a side file names none
+                    let walk = match preds.is_empty() || !pairs.is_empty() {
                         true => None,
                         false => match self.side_decision(cs, &walk_asks)? {
                             SideDecision::Empty => return Ok(None),
@@ -9076,6 +9115,24 @@ impl Table for SegmentedTable {
                     if skip_volume {
                         return Ok(None);
                     }
+                    let mut phys_pairs: Vec<PhysPair> = Vec::with_capacity(pairs.len());
+                    for &(left, op, right) in &pairs {
+                        use super::writer::ColSource::Volume;
+                        match (mapping.sources.get(left), mapping.sources.get(right)) {
+                            (Some(Volume(left)), Some(Volume(right))) => {
+                                phys_pairs.push(PhysPair {
+                                    left: *left,
+                                    op,
+                                    right: *right,
+                                })
+                            }
+                            // A column the volume does not hold is the scan's to read
+                            _ => {
+                                bail.store(true, std::sync::atomic::Ordering::Relaxed);
+                                return Ok(None);
+                            }
+                        }
+                    }
 
                     // Row-group skip decisions
                     let row_group_skips: Vec<bool> = if !vol.meta.row_groups.is_empty() {
@@ -9122,7 +9179,13 @@ impl Table for SegmentedTable {
                             &super::writer::ColumnMapping,
                             &[(AggregateOp, usize)],
                         ),
-                        (preds, skips, shown, deadline): (&[PhysPred], &[bool], &ShownRows, Deadline),
+                        (preds, pairs, skips, shown, deadline): (
+                            &[PhysPred],
+                            &[PhysPair],
+                            &[bool],
+                            &ShownRows,
+                            Deadline,
+                        ),
                         key: K,
                         part: &mut GroupedAggregates,
                     ) -> Result<bool> {
@@ -9163,7 +9226,7 @@ impl Table for SegmentedTable {
                                 )
                                 .is_some();
                             let calls = (vol, mapping, aggregates);
-                            let rows = (preds, prefiltered, shown);
+                            let rows = (preds, pairs, prefiltered, shown);
                             let fed = match prefiltered {
                                 true => feed(
                                     candidates.iter().map(|&at| g_start + at),
@@ -9193,7 +9256,7 @@ impl Table for SegmentedTable {
                             &super::writer::ColumnMapping,
                             &[(AggregateOp, usize)],
                         ),
-                        (preds, prefiltered, shown): (&[PhysPred], bool, &ShownRows),
+                        (preds, pairs, prefiltered, shown): (&[PhysPred], &[PhysPair], bool, &ShownRows),
                         (mut key, inputs): (K, Option<Vec<ColdInput<'v>>>),
                         part: &mut GroupedAggregates,
                     ) -> Result<Option<(K, Option<Vec<ColdInput<'v>>>)>> {
@@ -9201,7 +9264,7 @@ impl Table for SegmentedTable {
                         #[inline(always)]
                         fn passes(
                             vol: &FrozenVolume,
-                            (preds, prefiltered, shown): (&[PhysPred], bool, &ShownRows),
+                            (preds, pairs, prefiltered, shown): (&[PhysPred], &[PhysPair], bool, &ShownRows),
                             i: usize,
                         ) -> std::io::Result<bool> {
                             if !shown.has(i) {
@@ -9215,9 +9278,9 @@ impl Table for SegmentedTable {
                                     return Ok(false);
                                 }
                             }
-                            Ok(true)
+                            Ok(pairs.is_empty() || pairs_pass(vol, pairs, i)?)
                         }
-                        let rows = (preds, prefiltered, shown);
+                        let rows = (preds, pairs, prefiltered, shown);
                         let mut positions = positions;
                         let inputs = match inputs {
                             Some(inputs) => inputs,
@@ -9239,7 +9302,7 @@ impl Table for SegmentedTable {
                             },
                         };
                         // A new key past the group cap drops its row
-                        if preds.is_empty() {
+                        if preds.is_empty() && pairs.is_empty() {
                             for i in positions.filter(|&i| shown.has(i)) {
                                 if let Some(group) = key.group(part, i) {
                                     accumulate_columnar(part.aggregates(group), &inputs, i);
@@ -9422,7 +9485,13 @@ impl Table for SegmentedTable {
                         return Ok(None);
                     }
                     let calls = (&**vol, mapping, aggregates);
-                    let rows =(&phys_preds[..], &row_group_skips[..], &shown, deadline);
+                    let rows = (
+                        &phys_preds[..],
+                        &phys_pairs[..],
+                        &row_group_skips[..],
+                        &shown,
+                        deadline,
+                    );
                     // Each row's group: the one group, a value the volume holds
                     // for every row, or the volume's group column read whole
                     let answered = match group_column {

@@ -64,6 +64,7 @@ Not all expressions can be pushed down. Stoolap categorizes expressions by pushd
 These expressions can be pushed all the way to the storage layer:
 
 - **Simple Comparisons** - Equality (=), inequality (!=, <>), greater/less than (>, <, >=, <=)
+- **Comparisons of Two Columns** - `b > a`, of two unqualified columns of the table, compared as the WHERE in memory compares them. The table's aggregates read them from the column data when both columns are numbers or timestamps
 - **Range Conditions** - BETWEEN, IN
 - **Null Checks** - IS NULL, IS NOT NULL
 - **String Patterns** - LIKE (with limitations)

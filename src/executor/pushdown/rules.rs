@@ -23,8 +23,8 @@ use crate::functions::global_registry;
 use crate::functions::scalar::vector::read_as_vector;
 use crate::parser::ast::{self as ast, InfixOperator, PrefixOperator};
 use crate::storage::expression::{
-    AndExpr, BetweenExpr, ComparisonExpr, ConstBoolExpr, Expression as StorageExpr, FunctionArg,
-    FunctionExpr, InListExpr, LikeExpr, NotExpr, NullCheckExpr, OrExpr,
+    AndExpr, BetweenExpr, ColumnPairExpr, ComparisonExpr, ConstBoolExpr, Expression as StorageExpr,
+    FunctionArg, FunctionExpr, InListExpr, LikeExpr, NotExpr, NullCheckExpr, OrExpr,
 };
 use std::sync::Arc;
 
@@ -161,6 +161,43 @@ impl PushdownRule for ComparisonRule {
         let mut expr = ComparisonExpr::new(column, operator, value);
         expr.prepare_for_schema(ctx.schema);
         PushdownResult::Converted(Box::new(expr))
+    }
+}
+
+// =============================================================================
+// Column Pair Rule: col op col, two unqualified columns of the table
+// =============================================================================
+
+pub struct ColumnPairRule;
+
+impl PushdownRule for ColumnPairRule {
+    fn try_convert(&self, expr: &ast::Expression, ctx: &PushdownContext<'_>) -> PushdownResult {
+        let ast::Expression::Infix(infix) = expr else {
+            return PushdownResult::NotApplicable;
+        };
+        let Some(operator) = infix_to_operator(infix.op_type) else {
+            return PushdownResult::NotApplicable;
+        };
+        // A qualified name may be another table's in a join
+        fn column<'e>(side: &'e ast::Expression, ctx: &PushdownContext<'_>) -> Option<&'e str> {
+            match side {
+                ast::Expression::Identifier(id) => Some(id.value.as_str()),
+                ast::Expression::Column(column) => Some(column.name.value.as_str()),
+                _ => None,
+            }
+            .filter(|name| ctx.has_column(name))
+        }
+        let (Some(left), Some(right)) = (column(&infix.left, ctx), column(&infix.right, ctx))
+        else {
+            return PushdownResult::NotApplicable;
+        };
+        match ColumnPairExpr::new(left, operator, right) {
+            Some(mut pair) => {
+                pair.prepare_for_schema(ctx.schema);
+                PushdownResult::Converted(Box::new(pair))
+            }
+            None => PushdownResult::NotApplicable,
+        }
     }
 }
 

@@ -29,6 +29,7 @@
 
 pub mod between;
 pub mod cast;
+pub mod column_pair;
 pub mod comparison;
 pub mod compiled;
 pub mod function;
@@ -47,6 +48,7 @@ use crate::core::{Operator, Result, Row, Schema, Value};
 // Re-export expression types
 pub use between::BetweenExpr;
 pub use cast::{CastExpr, CompoundExpr};
+pub use column_pair::ColumnPairExpr;
 pub use comparison::ComparisonExpr;
 pub use compiled::CompiledFilter;
 pub use function::{FunctionArg, FunctionExpr};
@@ -188,6 +190,11 @@ pub trait Expression: Send + Sync + Debug {
         false
     }
 
+    /// The two columns and the operator of a comparison of two columns
+    fn column_pair(&self) -> Option<(&str, Operator, &str)> {
+        None
+    }
+
     /// Clone the expression into a boxed trait object
     fn clone_box(&self) -> Box<dyn Expression>;
 
@@ -237,6 +244,33 @@ pub fn passes(expr: &dyn Expression, fallible: bool, row: &Row) -> Result<bool> 
     } else {
         Ok(expr.evaluate_fast(row))
     }
+}
+
+/// A column compared with a value, and two columns compared
+pub type ConjunctiveParts<'e> = (
+    Vec<(&'e str, Operator, &'e Value)>,
+    Vec<(&'e str, Operator, &'e str)>,
+);
+
+/// The comparisons with a value and the comparisons of two columns that
+/// `expr` is a conjunction of; None when it holds any other predicate
+pub fn conjunctive_parts(expr: &dyn Expression) -> Option<ConjunctiveParts<'_>> {
+    fn walk<'e>(expr: &'e dyn Expression, parts: &mut ConjunctiveParts<'e>) -> bool {
+        if let Some(pair) = expr.column_pair() {
+            parts.1.push(pair);
+            return true;
+        }
+        if let Some(operands) = expr.get_and_operands() {
+            return operands.iter().all(|operand| walk(operand.as_ref(), parts));
+        }
+        if !expr.is_conjunctive_simple() {
+            return false;
+        }
+        parts.0.extend(expr.collect_comparisons());
+        true
+    }
+    let mut parts = (Vec::new(), Vec::new());
+    walk(expr, &mut parts).then_some(parts)
 }
 
 /// Helper to find column index in schema

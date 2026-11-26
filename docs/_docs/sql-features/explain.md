@@ -243,7 +243,7 @@ Aggregate MAX(id)
   else SeqScan products
 ```
 
-With a WHERE, the table computes the calls over the rows the WHERE passes (`StorageFiltered`) when its volumes can; otherwise the rows are read by the scan after `else`, through the indexes the WHERE can use:
+With a WHERE, the table computes the calls over the rows the WHERE passes (`StorageFiltered`) when its volumes can: the WHERE is an AND of comparisons of a column with a value, or of two columns that are numbers or timestamps, such as `b > a`. Otherwise the rows are read by the scan after `else`, through the indexes the WHERE can use:
 
 ```sql
 EXPLAIN SELECT SUM(value) FROM products WHERE value > 15;

@@ -185,6 +185,18 @@ pub fn sql_eq(a: &Value, b: &Value) -> Option<bool> {
     eq_across(a, b)
 }
 
+/// `a op b` in a predicate for a comparison operator, as the expression VM
+/// answers it: `=` and `<>` by `sql_eq`, an ordering by `sql_compare`;
+/// None is UNKNOWN
+#[inline]
+pub fn sql_compare_op(a: &Value, op: super::Operator, b: &Value) -> Option<bool> {
+    match op {
+        super::Operator::Eq => sql_eq(a, b),
+        super::Operator::Ne => sql_eq(a, b).map(|eq| !eq),
+        op => sql_compare(a, b).map(|ordering| op.holds(ordering)),
+    }
+}
+
 /// `sql_eq` for a pair that is not of one plain type, kept out of line
 #[inline(never)]
 fn eq_across(a: &Value, b: &Value) -> Option<bool> {
