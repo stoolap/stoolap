@@ -144,7 +144,9 @@ SELECT TIME_TRUNC('15m', event_time) FROM events;
 SELECT TIME_TRUNC('1h', event_time) FROM events;
 ```
 
-The interval parameter accepts duration strings like `15m`, `30m`, `1h`, `4h`, `1d`.
+The interval parameter accepts duration strings like `15m`, `30m`, `1h`, `4h`, with the units `ns`, `us`, `ms`, `s`, `m` and `h`.
+
+The result is the start of the interval that holds the timestamp, intervals counted from 1970-01-01 UTC. A timestamp before 1970 rounds down as well: `TIME_TRUNC('1h', '1969-12-31 22:30:00')` is `1969-12-31 22:00:00`.
 
 ### DATE_ADD / DATE_SUB
 

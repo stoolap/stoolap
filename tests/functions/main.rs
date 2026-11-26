@@ -43,6 +43,7 @@ mod scalar_functions_extended_test;
 mod string_boundary_test;
 mod text_form_rule_test;
 mod time_functions_test;
+mod time_trunc_rounding_rule_test;
 mod time_trunc_test;
 mod timestamp_arithmetic_test;
 mod timestamp_range_rule_test;
