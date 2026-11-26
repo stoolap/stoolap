@@ -220,5 +220,11 @@ fn distinct_leaves_first_and_last_as_they_are_in_either_read_order() {
             }
         }
     }
+    let sql = "SELECT FIRST(DISTINCT x), FIRST(x), LAST(DISTINCT x), LAST(x) \
+               FROM (SELECT 1 AS x UNION ALL SELECT 2 AS x UNION ALL SELECT 1 AS x) d";
+    let got = rows(db.query(sql, ()));
+    if got != ["1 1 1 1"] {
+        wrong.push(format!("{sql}: {got:?}"));
+    }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
