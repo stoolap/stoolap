@@ -9342,6 +9342,11 @@ impl Table for SegmentedTable {
                                 for &(op, col_idx) in aggregates {
                                     resolved.push(match (op, mapping.sources.get(col_idx)) {
                                         (AggregateOp::CountStar, _) => Call::Fixed(ColdInput::Star),
+                                        // A row group holds one column, an ordered call reads two
+                                        (op, _) if op.order_key().is_some() => {
+                                            bail.store(true, std::sync::atomic::Ordering::Relaxed);
+                                            return Ok(false);
+                                        }
                                         (_, Some(super::writer::ColSource::Volume(phys))) => {
                                             Call::Column(*phys, None)
                                         }
@@ -9948,6 +9953,8 @@ enum ColdInput<'a> {
     Float(&'a [f64], &'a [bool]),
     Value(&'a super::column::ColumnData),
     Default(Value),
+    /// FIRST or LAST: the value's column and its ORDER BY key's
+    Ordered(&'a super::column::ColumnData, &'a super::column::ColumnData),
 }
 
 /// What COUNT is fed for a row it counts
@@ -9981,6 +9988,20 @@ impl<'a> ColdInput<'a> {
             let Some(source) = mapping.sources.get(col_idx) else {
                 return Ok(None);
             };
+            // A key or value the volume does not hold is the scan's to read
+            if let Some(key) = op.order_key() {
+                use super::writer::ColSource::Volume;
+                match (source, mapping.sources.get(key)) {
+                    (Volume(value), Some(Volume(key))) => {
+                        inputs.push(ColdInput::Ordered(
+                            vol.columns.get(*value)?,
+                            vol.columns.get(*key)?,
+                        ));
+                        continue;
+                    }
+                    _ => return Ok(None),
+                }
+            }
             inputs.push(match source {
                 super::writer::ColSource::Volume(phys_idx) => {
                     ColdInput::of(op, vol.columns.get(*phys_idx)?)
@@ -10035,14 +10056,20 @@ fn accumulate_columnar(runs: &mut [CompiledAggregate], inputs: &[ColdInput<'_>],
             }
             ColdInput::Value(col) => run.accumulate(&col.get_value(i)),
             ColdInput::Default(value) => run.accumulate(value),
+            ColdInput::Ordered(value, key) => {
+                if !value.is_null(i) {
+                    run.accumulate_ordered(&value.get_value(i), &key.get_value(i));
+                }
+            }
         }
     }
 }
 
 /// Whether the filtered and grouped storage aggregates take every call:
-/// SUM and AVG over numbers, MIN and MAX over numbers and timestamps, read
-/// from a volume's column without a text value per row; any other call
-/// leaves the query to the general path
+/// SUM and AVG over numbers, MIN and MAX over numbers and timestamps, FIRST
+/// and LAST of a number, timestamp or boolean by one of those, read from a
+/// volume's column without a text value per row; any other call leaves the
+/// query to the general path
 fn typed_aggregates_answer(schema: &Schema, aggregates: &[(AggregateOp, usize)]) -> bool {
     aggregates.iter().all(|&(op, col_idx)| {
         let data_type = schema.columns.get(col_idx).map(|c| c.data_type);
@@ -10056,6 +10083,20 @@ fn typed_aggregates_answer(schema: &Schema, aggregates: &[(AggregateOp, usize)])
                 data_type,
                 Some(DataType::Integer | DataType::Float | DataType::Timestamp)
             ),
+            AggregateOp::First { key, .. } | AggregateOp::Last { key, .. } => {
+                matches!(
+                    data_type,
+                    Some(
+                        DataType::Integer
+                            | DataType::Float
+                            | DataType::Timestamp
+                            | DataType::Boolean
+                    )
+                ) && matches!(
+                    schema.columns.get(key).map(|c| c.data_type),
+                    Some(DataType::Integer | DataType::Float | DataType::Timestamp)
+                )
+            }
         }
     })
 }

@@ -892,6 +892,30 @@ impl SqlAggregateFunction {
         self.modifiers().within(supported)
     }
 
+    /// The column FIRST or LAST of a column orders by and its order, when
+    /// the call has one ORDER BY key, an unqualified column, and no modifier
+    /// but DISTINCT, which leaves its answer as it is
+    pub(crate) fn order_column(&self) -> Option<(&str, crate::functions::AggregateOrder)> {
+        if !matches!(self.name.as_str(), "FIRST" | "LAST")
+            || !self.answered_with(Modifiers::ORDER_BY.and(Modifiers::DISTINCT))
+        {
+            return None;
+        }
+        match self.order_by.as_slice() {
+            [order] => match &order.expression {
+                Expression::Identifier(column) => Some((
+                    column.value.as_str(),
+                    crate::functions::AggregateOrder {
+                        ascending: order.ascending,
+                        nulls_first: order.nulls_first,
+                    },
+                )),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Whether this is a COUNT of every row: COUNT(*), or a COUNT of a
     /// constant that is never NULL
     pub(crate) fn counts_rows(&self) -> bool {
