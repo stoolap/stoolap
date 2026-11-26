@@ -9025,8 +9025,7 @@ impl Table for SegmentedTable {
                     }
                     let vol = &cs.volume;
                     let mapping = &cs.mapping;
-                    // Two columns compared are asked of every row; a side file names none
-                    let walk = match preds.is_empty() || !pairs.is_empty() {
+                    let walk = match preds.is_empty() {
                         true => None,
                         false => match self.side_decision(cs, &walk_asks)? {
                             SideDecision::Empty => return Ok(None),
@@ -9327,7 +9326,7 @@ impl Table for SegmentedTable {
                     fn walk_candidates<'v>(
                         table: &SegmentedTable,
                         cs: &'v super::manifest::ColdSegment,
-                        preds: &[PhysPred],
+                        (preds, pairs): (&[PhysPred], &[PhysPair]),
                         walk: &mut super::secondary::SideWalk,
                         (tombstones, hot_skip, cut, deadline): (
                             &KeyMap<i64, u64>,
@@ -9375,6 +9374,7 @@ impl Table for SegmentedTable {
                             Column(usize, Held),
                         }
                         let mut held: Vec<Held> = vec![None; preds.len()];
+                        let mut pair_held: Vec<(Held, Held)> = vec![(None, None); pairs.len()];
                         let mut calls: Option<(usize, Vec<Call<'v>>)> = None;
                         while let Some(i) = walk.next_position().map_err(side_error)? {
                             deadline.charge(DeadlineSite::StorageAggregate, 1)?;
@@ -9396,6 +9396,18 @@ impl Table for SegmentedTable {
                                     all_pass = false;
                                     break;
                                 }
+                            }
+                            // Two columns compared, each read from its row group
+                            for (pair, (left_held, right_held)) in pairs.iter().zip(pair_held.iter_mut()) {
+                                if !all_pass {
+                                    break;
+                                }
+                                let (left, local) = at(vol, left_held, pair.left, i, shift)?;
+                                let left = left.get_value(local);
+                                let (right, local) = at(vol, right_held, pair.right, i, shift)?;
+                                let right = right.get_value(local);
+                                all_pass = crate::core::predicate::sql_compare_op(&left, pair.op, &right)
+                                    == Some(true);
                             }
                             if !all_pass {
                                 continue;
@@ -9459,7 +9471,7 @@ impl Table for SegmentedTable {
                         let walked = walk_candidates(
                             self,
                             cs,
-                            &phys_preds,
+                            (&phys_preds, &phys_pairs),
                             &mut walk,
                             view,
                             calls,

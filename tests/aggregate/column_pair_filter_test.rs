@@ -267,3 +267,57 @@ fn rows_written_by_a_comparison_of_two_columns_are_the_rows_it_holds_for() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+#[test]
+fn a_selective_key_beside_two_columns_compared_walks_its_side_file() {
+    use stoolap::executor::DeadlineSite;
+    use stoolap::test_failpoints::{count_deadline_charges, deadline_charges, keep_deadlines};
+    let _guard = stoolap::test_failpoints::FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}/walk?checkpoint_interval=0",
+        dir.path().display()
+    ))
+    .unwrap();
+    for sql in [
+        "CREATE TABLE w (id INTEGER PRIMARY KEY, k INTEGER, a INTEGER, b INTEGER)",
+        "CREATE INDEX w_k ON w (k)",
+        // k spread over every row group, so no zone map narrows a key
+        "INSERT INTO w SELECT g.value, (g.value * 7919) % 600000, g.value % 10, g.value % 7 \
+         FROM generate_series(1, 600000) g",
+        "PRAGMA CHECKPOINT",
+        "PRAGMA query_timeout = 3600000",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    // Row 123450 holds k = 200550, a = 0 and b = 5; a scan charges each of ten row groups
+    count_deadline_charges(DeadlineSite::StorageAggregate);
+    let (got, taken) = run(
+        &db,
+        "SELECT COUNT(*), SUM(id) FROM w WHERE k = 200550 AND a < b",
+    );
+    let charges = deadline_charges();
+    keep_deadlines();
+    assert_eq!(
+        got,
+        Ok(vec![
+            "columns: COUNT(*)|SUM(id)".to_string(),
+            "i:1|i:123450".to_string()
+        ])
+    );
+    assert_eq!(taken, ["storage_filtered"]);
+    assert_eq!(charges, 1, "the side file names one row");
+    // Row 123456 holds k = 248064, a = 6 and b = 4: named, then dropped by a < b
+    let (got, taken) = run(
+        &db,
+        "SELECT COUNT(*), SUM(id) FROM w WHERE k = 248064 AND a < b",
+    );
+    assert_eq!(
+        got,
+        Ok(vec![
+            "columns: COUNT(*)|SUM(id)".to_string(),
+            "i:0|NULL".to_string()
+        ])
+    );
+    assert_eq!(taken, ["storage_filtered"]);
+}
