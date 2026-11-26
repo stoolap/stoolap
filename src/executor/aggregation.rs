@@ -2022,6 +2022,16 @@ impl Executor {
         )
     }
 
+    /// Whether `stmt`'s LIMIT bounds the groups the hash grouping makes: no
+    /// ORDER BY, HAVING, DISTINCT or window function reads past the first
+    pub(super) fn limit_caps_groups(stmt: &SelectStatement) -> bool {
+        stmt.limit.is_some()
+            && stmt.order_by.is_empty()
+            && stmt.having.is_none()
+            && !stmt.distinct
+            && !super::query_classification::get_classification(stmt).has_window_functions
+    }
+
     /// `stmt`'s groups of `aggregations` over the rows of `input`, whose
     /// columns are `base_columns`: one group, its GROUP BY's or its grouping
     /// sets', those its HAVING keeps, with their columns and the group items
@@ -2038,21 +2048,9 @@ impl Executor {
         let blocks = run.0;
         let group_by_columns = self.parse_group_by(stmt, base_columns)?;
 
-        // Determine if we can push LIMIT to aggregation for early termination
-        // This is safe when:
-        // 1. There's a LIMIT but no ORDER BY (order doesn't matter)
-        // 2. No HAVING clause (filtering might reduce groups below limit)
-        // 3. No DISTINCT (deduplication might reduce results)
-        // 4. No window function, which reads every group
-        let can_push_limit = stmt.limit.is_some()
-            && stmt.order_by.is_empty()
-            && stmt.having.is_none()
-            && !stmt.distinct
-            && !super::query_classification::get_classification(stmt).has_window_functions;
-
         // OFFSET is applied after aggregation, so the groups it skips must be
         // built too: the pushed limit is LIMIT + OFFSET
-        let aggregation_limit = if can_push_limit {
+        let aggregation_limit = if Self::limit_caps_groups(stmt) {
             super::row_count::rows_needed(stmt, ctx)
         } else {
             None
@@ -3508,28 +3506,30 @@ impl Executor {
         Ok(group_items)
     }
 
-    /// The source column a single named GROUP BY item groups by, bound by
-    /// `parse_group_by` as the shared projection binds it, and whether the
-    /// item carried a qualifier
-    pub(crate) fn single_group_column(
-        &self,
-        stmt: &SelectStatement,
-    ) -> Result<Option<(String, bool)>> {
-        match stmt.group_by.columns.as_slice() {
-            [Expression::Identifier(_)] => {}
-            [Expression::QualifiedIdentifier(qid)] => {
-                return Ok(Some((qid.name.value_lower.to_string(), true)));
-            }
-            _ => return Ok(None),
+    /// The source columns GROUP BY items that each name one column without
+    /// a qualifier group by, bound by `parse_group_by` as the shared
+    /// projection binds them; None for any other item
+    pub(crate) fn group_columns(&self, stmt: &SelectStatement) -> Result<Option<Vec<String>>> {
+        if !stmt
+            .group_by
+            .columns
+            .iter()
+            .all(|item| matches!(item, Expression::Identifier(_)))
+        {
+            return Ok(None);
         }
-        Ok(match self.parse_group_by(stmt, &[])?.as_slice() {
-            [GroupByItem::Column(name)] => Some((name.to_lowercase(), false)),
-            [GroupByItem::Expression {
-                expr: Expression::Identifier(id),
-                ..
-            }] => Some((id.value_lower.to_string(), false)),
-            _ => None,
-        })
+        let items = self.parse_group_by(stmt, &[])?;
+        Ok(items
+            .iter()
+            .map(|item| match item {
+                GroupByItem::Column(name) => Some(name.to_lowercase()),
+                GroupByItem::Expression {
+                    expr: Expression::Identifier(id),
+                    ..
+                } => Some(id.value_lower.to_string()),
+                _ => None,
+            })
+            .collect())
     }
 
     /// Find the alias for an expression in the SELECT list

@@ -109,11 +109,15 @@
 2	18ef53658f4551fc	sealed: SELECT g, SUM(a) FROM t WHERE a >= 1 GROUP BY g HAVING COUNT(*) > 1 ORDER BY g DESC LIMIT 1
 2	706eb16e2be23f26	sealed: SELECT g, SUM(a), (SELECT a FROM t WHERE id = 3) AS n FROM t GROUP BY g
 2	e1c45919aff4b7cd	sealed: SELECT g, SUM(a), SUM(SUM(a)) OVER () FROM (SELECT g, a, s FROM t) d WHERE a > 0 GROUP BY g HAVING COUNT(*) > 0 ORDER BY g LIMIT 1
+3	5e5babf6d8473210	sealed: SELECT g, s FROM t GROUP BY g, s
 3	17760ce9ddaa7db0	sealed: SELECT g, s, COUNT(*), SUM(a) FROM t WHERE a > 0 GROUP BY g, s
+2	614d7ff7cdea1b7a	sealed: SELECT g, s, SUM(a) FROM t GROUP BY g, s HAVING g > 1 ORDER BY s DESC LIMIT 2
 6	ee41f89b5d70a6ac	sealed: SELECT g, s, SUM(a), ROW_NUMBER() OVER (ORDER BY g, s) FROM t GROUP BY ROLLUP (g, s)
+5	e5e600313cfbdac5	sealed: SELECT g, s, a, COUNT(*) FROM t GROUP BY g, s, a
 3	b8aebb8e67822604	sealed: SELECT id FROM t WHERE 1 < (SELECT COUNT(a) FROM t AS u WHERE u.g = t.g AND u.id + 0 = u.id)
 3	a00a7cff8c8aadb7	sealed: SELECT s, COUNT(DISTINCT a), STRING_AGG(s, ',' ORDER BY id) FROM t GROUP BY s
 2	cdfdac8b3bf60c6d	sealed: SELECT s, COUNT(a), AVG(a) FROM t WHERE g = 2 GROUP BY s
 3	3f5e5273046de7b9	sealed: SELECT s, MIN(a), MIN(a) AS lo FROM (SELECT s, a FROM t) d GROUP BY s
+3	6a66370814d77fca	sealed: SELECT s, g, COUNT(*), MIN(a), MAX(a), AVG(a) FROM t GROUP BY s, g
 2	6612ab654af37bea	sealed: SELECT t.g, COUNT(*), RANK() OVER (ORDER BY COUNT(*) * (SELECT 2)) FROM t JOIN t t2 ON t2.id = t.id GROUP BY t.g
 6	b506da2a09ea6d57	sealed: WITH c AS (SELECT g, s, a FROM t) SELECT g, s, SUM(a) FROM c GROUP BY ROLLUP (g, s)

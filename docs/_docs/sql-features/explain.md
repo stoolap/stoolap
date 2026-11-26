@@ -261,7 +261,7 @@ Aggregate SUM(value)
 
 ### Aggregation
 
-A GROUP BY of one column shows its groups after `by`. The table computes the groups itself when it can (`StorageGrouped`), with a WHERE over the rows the WHERE passes; groups read in the order of the column's index, each by its rows, stop once a LIMIT's groups pass the HAVING (`SortedStream`); otherwise every row is read and grouped. A HAVING naming no column but the group's judges the groups the table computes when the index walk does not take it:
+A GROUP BY of one column or of several plain columns shows its groups after `by`. The table computes the groups itself when it can (`StorageGrouped`), with a WHERE over the rows the WHERE passes; the groups of one column read in the order of its index, each by its rows, stop once a LIMIT's groups pass the HAVING (`SortedStream`); otherwise every row is read and grouped. A HAVING naming no column but the group columns judges the groups the table computes when the index walk does not take it:
 
 ```sql
 EXPLAIN SELECT category, SUM(value) FROM products GROUP BY category;
@@ -292,7 +292,22 @@ Having (SUM(value) > 100)
     else SeqScan products
 ```
 
-With a WHERE, the WHERE follows the group column; the rows are read by the scan after `else` when the volumes cannot compute the groups:
+Several group columns are named in their order:
+
+```sql
+EXPLAIN SELECT category, name, SUM(value) FROM products GROUP BY category, name;
+```
+
+Output:
+```
+plan
+----
+Aggregate category, name, SUM(value) by category, name
+  StorageGrouped products (category, name)
+  else SeqScan products
+```
+
+With a WHERE, the WHERE follows the group columns; the rows are read by the scan after `else` when the volumes cannot compute the groups:
 
 ```sql
 EXPLAIN SELECT category, SUM(value) FROM products WHERE value > 0 GROUP BY category;
@@ -308,17 +323,17 @@ Aggregate category, SUM(value) by category
     Index idx_value (value range)
 ```
 
-Any other grouping over one table, with several keys, expressions, ROLLUP, CUBE or GROUPING SETS, groups the rows its read passes, and a HAVING without GROUP BY judges the one row:
+Any other grouping over one table, with an expression among its keys, ROLLUP, CUBE or GROUPING SETS, groups the rows its read passes, and a HAVING without GROUP BY judges the one row:
 
 ```sql
-EXPLAIN SELECT category, SUM(value) FROM products WHERE value > 0 GROUP BY category, name;
+EXPLAIN SELECT category, SUM(value) FROM products WHERE value > 0 GROUP BY category, LOWER(name);
 ```
 
 Output:
 ```
 plan
 ----
-Aggregate category, SUM(value) by category, name
+Aggregate category, SUM(value) by category, LOWER(name)
   IndexScan products (value > 0)
     Index idx_value (value range)
 ```
@@ -352,7 +367,8 @@ plan
 DistinctOn category
   Sort category ASC, SUM(value) DESC
     Aggregate category, name, SUM(value) by category, name
-      SeqScan products
+      StorageGrouped products (category, name)
+      else SeqScan products
 ```
 
 A window that names a `WINDOW` definition shows as the `Window` step any window does, `Window RANK() OVER w`. A grouped statement with a subquery prints the format of the path that runs it.

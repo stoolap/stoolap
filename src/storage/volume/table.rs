@@ -8694,10 +8694,6 @@ impl Table for SegmentedTable {
     ) -> Result<Option<GroupedAggregates>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("seg.compute_grouped_aggregates");
-        // Multi-column GROUP BY: fall back to the full executor path.
-        if group_by_indices.len() > 1 {
-            return Ok(None);
-        }
         // Only a conjunction of simple comparisons runs on the raw arrays
         let comparisons = match filter {
             Some(filter) if !filter.is_conjunctive_simple() => return Ok(None),
@@ -8792,12 +8788,22 @@ impl Table for SegmentedTable {
             }
             // A text group column is read by its dictionary ids, an INTEGER
             // or TIMESTAMP one by its integers; any other is the scan's
-            let group_column = match group_by_indices.first() {
-                None => GroupColumn::None,
-                Some(&at) => match schema.columns.get(at).map(|c| c.data_type) {
+            let group_type = |at: usize| schema.columns.get(at).map(|c| c.data_type);
+            let group_column = match group_by_indices {
+                [] => GroupColumn::None,
+                &[at] => match group_type(at) {
                     Some(DataType::Text) => GroupColumn::Text(at),
                     Some(DataType::Integer | DataType::Timestamp) => GroupColumn::Integer(at),
                     _ => return Ok(Some(None)),
+                },
+                many => match many.iter().all(|&at| {
+                    matches!(
+                        group_type(at),
+                        Some(DataType::Text | DataType::Integer | DataType::Timestamp)
+                    )
+                }) {
+                    true => GroupColumn::Many,
+                    false => return Ok(Some(None)),
                 },
             };
 
@@ -9433,6 +9439,12 @@ impl Table for SegmentedTable {
                                 None => false,
                             }
                         }
+                        GroupColumn::Many => {
+                            match ManyGroups::of(vol, mapping, &schema, group_by_indices)? {
+                                Some(key) => scan(calls, rows, key, &mut part)?,
+                                None => false,
+                            }
+                        }
                     };
                     if !answered {
                         bail.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -9498,12 +9510,14 @@ impl Table for SegmentedTable {
 
 /// The group column of an aggregation the volumes answer, by its place in
 /// the table: text read by its dictionary ids, INTEGER or TIMESTAMP by its
-/// integers; none for the one group of an aggregation without GROUP BY
+/// integers; none for the one group of an aggregation without GROUP BY,
+/// `Many` for several columns, read together as one key
 #[derive(Clone, Copy)]
 enum GroupColumn {
     None,
     Text(usize),
     Integer(usize),
+    Many,
 }
 
 /// How one volume's rows find their group, each key's group cached once found
@@ -9579,6 +9593,187 @@ impl GroupOf for IntegerGroups<'_> {
             }
         }
         Some(group as usize)
+    }
+}
+
+/// Mixed-radix keys up to this many are held in an array, larger ones in a map
+const DENSE_KEYS: u64 = 1 << 16;
+
+/// One of several group columns, each row read as a slot below its radix
+enum KeySlots<'v> {
+    /// Dictionary ids, NULL's slot last
+    Text {
+        ids: &'v [u32],
+        dictionary: &'v [crate::common::SmartString],
+        nulls: &'v [bool],
+    },
+    /// Integers, slots handed out as values first come, NULL's slot 0
+    Integer {
+        column: &'v super::column::ColumnData,
+        slots: KeyMap<i64, u32>,
+    },
+    /// A value the volume holds for every row
+    Fixed(&'v Value),
+}
+
+impl KeySlots<'_> {
+    #[inline(always)]
+    fn slot(&mut self, i: usize) -> u64 {
+        match self {
+            Self::Text {
+                ids,
+                dictionary,
+                nulls,
+            } => match nulls[i] {
+                true => dictionary.len() as u64,
+                false => ids[i] as u64,
+            },
+            Self::Integer { column, slots } => match column.is_null(i) {
+                true => 0,
+                false => {
+                    let next = slots.len() as u32 + 1;
+                    *slots.entry(column.get_i64(i)).or_insert(next) as u64
+                }
+            },
+            Self::Fixed(_) => 0,
+        }
+    }
+
+    /// The value of row `i`, for its group's key
+    fn value(&self, i: usize) -> Value {
+        match self {
+            Self::Text {
+                ids,
+                dictionary,
+                nulls,
+            } => match nulls[i] {
+                true => Value::Null(DataType::Text),
+                false => Value::Text(dictionary[ids[i] as usize].clone()),
+            },
+            Self::Integer { column, .. } => column.get_value(i),
+            Self::Fixed(value) => (*value).clone(),
+        }
+    }
+}
+
+/// Several group columns, each row's slots read as one mixed-radix key;
+/// a key's group is held in an array for a small key space, else a map
+struct ManyGroups<'v> {
+    columns: smallvec::SmallVec<[(KeySlots<'v>, u64); 4]>,
+    /// Each key's group, `u32::MAX` while it has none; empty when sparse
+    dense: Vec<u32>,
+    sparse: KeyMap<u64, u32>,
+}
+
+impl<'v> ManyGroups<'v> {
+    /// The key of `group_by_indices` in `vol`; None when a column is missing,
+    /// a text one is not a dictionary, or the key space passes `u64`
+    fn of(
+        vol: &'v FrozenVolume,
+        mapping: &'v super::writer::ColumnMapping,
+        schema: &crate::core::Schema,
+        group_by_indices: &[usize],
+    ) -> std::io::Result<Option<Self>> {
+        use super::writer::ColSource;
+        // Each column's radix from the volume's metadata, before a column
+        // is read: a key space past `u64` declines with nothing decoded
+        let mut radices = smallvec::SmallVec::<[u64; 4]>::new();
+        let mut keys: u64 = 1;
+        for &at in group_by_indices {
+            let radix = match (mapping.sources.get(at), schema.columns[at].data_type) {
+                (Some(ColSource::Default(_)), _) => 1,
+                (Some(ColSource::Volume(phys)), DataType::Text) => {
+                    match vol.columns.get_column_dictionary(*phys)? {
+                        Some(dictionary) => dictionary.len() as u64 + 1,
+                        None => return Ok(None),
+                    }
+                }
+                (Some(ColSource::Volume(_)), _) => vol.meta.row_count as u64 + 1,
+                (None, _) => return Ok(None),
+            };
+            let Some(more) = keys.checked_mul(radix) else {
+                return Ok(None);
+            };
+            radices.push(radix);
+            keys = more;
+        }
+        let mut columns = smallvec::SmallVec::new();
+        let mut stride: u64 = 1;
+        for (&at, radix) in group_by_indices.iter().zip(radices) {
+            let slots = match mapping.sources.get(at) {
+                Some(super::writer::ColSource::Default(value)) => KeySlots::Fixed(value),
+                Some(super::writer::ColSource::Volume(phys)) => {
+                    match (schema.columns[at].data_type, vol.columns.get(*phys)?) {
+                        (
+                            DataType::Text,
+                            super::column::ColumnData::Dictionary {
+                                ids,
+                                dictionary,
+                                nulls,
+                            },
+                        ) => KeySlots::Text {
+                            ids,
+                            dictionary,
+                            nulls,
+                        },
+                        (DataType::Text, _) => return Ok(None),
+                        (_, column) => KeySlots::Integer {
+                            column,
+                            slots: KeyMap::default(),
+                        },
+                    }
+                }
+                None => return Ok(None),
+            };
+            columns.push((slots, stride));
+            stride *= radix;
+        }
+        let dense = match keys <= DENSE_KEYS {
+            true => vec![u32::MAX; keys as usize],
+            false => Vec::new(),
+        };
+        Ok(Some(Self {
+            columns,
+            dense,
+            sparse: KeyMap::default(),
+        }))
+    }
+
+    /// `group` for a key not seen yet in this volume
+    #[cold]
+    #[inline(never)]
+    fn first(&mut self, part: &mut GroupedAggregates, i: usize, key: u64) -> Option<usize> {
+        let values: smallvec::SmallVec<[Value; 4]> = self
+            .columns
+            .iter()
+            .map(|(slots, _)| slots.value(i))
+            .collect();
+        let group = part.group(values.as_slice())? as u32;
+        match self.dense.get_mut(key as usize) {
+            Some(held) => *held = group,
+            None => {
+                self.sparse.insert(key, group);
+            }
+        }
+        Some(group as usize)
+    }
+}
+
+impl GroupOf for ManyGroups<'_> {
+    #[inline(always)]
+    fn group(&mut self, part: &mut GroupedAggregates, i: usize) -> Option<usize> {
+        let mut key = 0;
+        for (slots, stride) in self.columns.iter_mut() {
+            key += slots.slot(i) * *stride;
+        }
+        let held = match self.dense.is_empty() {
+            false => Some(self.dense[key as usize]).filter(|&g| g != u32::MAX),
+            true => self.sparse.get(&key).copied(),
+        };
+        match held {
+            Some(group) => Some(group as usize),
+            None => self.first(part, i, key),
+        }
     }
 }
 
@@ -10440,6 +10635,43 @@ mod tests {
             answer,
             Ok(false),
             "a seal queued behind a held read leaves the estimate no view"
+        );
+    }
+
+    #[test]
+    fn group_columns_past_the_key_space_decline_before_a_column_is_read() {
+        use super::super::writer::{ColSource, ColumnMapping};
+        let schema = (0..6)
+            .fold(SchemaBuilder::new("t"), |schema, at| {
+                schema.column(format!("c{at}"), DataType::Integer, true, at == 0)
+            })
+            .build();
+        let mut builder = VolumeBuilder::with_capacity(&schema, 2000);
+        for id in 0..2000 {
+            builder.add_row(id, &Row::from_values(vec![Value::Integer(id); 6]));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let written =
+            super::super::io::write_volume_to_disk(dir.path(), "t", 1, &builder.finish().unwrap())
+                .unwrap();
+        let vol = super::super::io::read_volume_from_disk(&written).unwrap();
+        let mapping = ColumnMapping {
+            sources: (0..6).map(ColSource::Volume).collect(),
+            names: Vec::new(),
+            is_identity: true,
+        };
+        let declined = ManyGroups::of(&vol, &mapping, &schema, &[0, 1, 2, 3, 4, 5]).unwrap();
+        assert!(declined.is_none(), "2001^6 keys pass u64");
+        assert!(
+            (0..6).all(|at| vol.columns.resident(at).is_none()),
+            "no column is decoded for a declined key"
+        );
+        assert!(ManyGroups::of(&vol, &mapping, &schema, &[1, 2])
+            .unwrap()
+            .is_some());
+        assert!(
+            vol.columns.resident(1).is_some(),
+            "a key that fits reads its columns"
         );
     }
 }

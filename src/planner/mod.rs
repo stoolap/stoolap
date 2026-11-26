@@ -71,6 +71,9 @@ pub enum Step {
     Filter,
 }
 
+/// The columns an aggregate groups by, each named and placed in its table
+pub type GroupColumns = [(SmartString, usize)];
+
 /// How a plan reads its table; a scan without a choice is the table's to
 /// choose, as for a statement whose WHERE asks a block
 #[derive(Debug)]
@@ -115,12 +118,13 @@ pub enum Read {
         column: Option<SmartString>,
         otherwise: Box<Read>,
     },
-    /// The groups of an aggregate by the one column `group`, named and
-    /// placed, from `source`, else by the index walk when `walks`; the rows
-    /// of `otherwise` grouped when the table cannot answer so in this run
+    /// The groups of an aggregate by the columns of `groups`, each named and
+    /// placed, from `source`, else by the index walk of the one column when
+    /// `walks`; the rows of `otherwise` grouped when the table cannot answer
+    /// so in this run
     Grouped {
         source: GroupedSource,
-        group: (SmartString, usize),
+        groups: Vec<(SmartString, usize)>,
         walks: bool,
         otherwise: Box<Read>,
     },
@@ -229,16 +233,16 @@ impl Read {
         }
     }
 
-    /// Where an aggregate's groups come from, the group column, and whether
-    /// the index walk reads them, for a plan that groups by one column
-    pub fn grouped(&self) -> Option<(GroupedSource, (&str, usize), bool)> {
+    /// Where an aggregate's groups come from, the group columns, and whether
+    /// the index walk reads them, for a plan that groups by columns
+    pub fn grouped(&self) -> Option<(GroupedSource, &GroupColumns, bool)> {
         match self {
             Self::Grouped {
                 source,
-                group: (name, at),
+                groups,
                 walks,
                 ..
-            } => Some((*source, (name.as_str(), *at), *walks)),
+            } => Some((*source, groups.as_slice(), *walks)),
             _ => None,
         }
     }
@@ -438,13 +442,18 @@ fn read_lines(read: &Read, text: &PlanText<'_>, lines: &mut Vec<String>) {
         (
             Read::Grouped {
                 source,
-                group: (group, _),
+                groups,
                 walks,
                 otherwise,
             },
             _,
         ) => {
             let table = text.table;
+            let group = groups
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
             match source {
                 GroupedSource::Storage => {
                     let line = match text.pushed {

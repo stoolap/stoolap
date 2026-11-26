@@ -52,6 +52,7 @@ mod grouped_computed_order_keys_test;
 mod grouped_index_join_having_test;
 mod grouped_join_limit_parameter_test;
 mod grouped_join_stream_test;
+mod grouped_keys_storage_test;
 mod grouped_output_blocks_test;
 mod grouped_sources_blocks_test;
 mod grouped_where_storage_test;

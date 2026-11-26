@@ -441,9 +441,35 @@ const CASES: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "sealed",
-        "hash_groups",
+        "storage_grouped",
         "SELECT g, s, COUNT(*), SUM(a) FROM t WHERE a > 0 GROUP BY g, s",
         "SELECT g, s, COUNT(*), SUM(a) FROM t WHERE a > 0 AND id + 0 = id GROUP BY g, s",
+    ),
+    // Several group columns read together as one key in each volume
+    (
+        "sealed",
+        "storage_grouped",
+        "SELECT s, g, COUNT(*), MIN(a), MAX(a), AVG(a) FROM t GROUP BY s, g",
+        "SELECT s, g, COUNT(*), MIN(a), MAX(a), AVG(a) FROM t WHERE id + 0 = id GROUP BY s, g",
+    ),
+    (
+        "sealed",
+        "storage_grouped",
+        "SELECT g, s FROM t GROUP BY g, s",
+        "SELECT g, s FROM t WHERE id + 0 = id GROUP BY g, s",
+    ),
+    (
+        "sealed",
+        "storage_grouped",
+        "SELECT g, s, a, COUNT(*) FROM t GROUP BY g, s, a",
+        "SELECT g, s, a, COUNT(*) FROM t WHERE id + 0 = id GROUP BY g, s, a",
+    ),
+    (
+        "sealed",
+        "storage_grouped",
+        "SELECT g, s, SUM(a) FROM t GROUP BY g, s HAVING g > 1 ORDER BY s DESC LIMIT 2",
+        "SELECT g, s, SUM(a) FROM t WHERE id + 0 = id GROUP BY g, s HAVING g > 1 \
+         ORDER BY s DESC LIMIT 2",
     ),
     (
         "memory",
@@ -773,7 +799,7 @@ const CASES: &[(&str, &str, &str, &str)] = &[
     // A DISTINCT ON over the groups, its keys computed over them
     (
         "memory",
-        "hash_groups",
+        "storage_grouped",
         "SELECT DISTINCT ON (s) s, g, SUM(a) FROM t GROUP BY s, g ORDER BY s, g DESC",
         "SELECT DISTINCT ON (s) s, g, SUM(a) FROM t WHERE id + 0 = id GROUP BY s, g \
          ORDER BY s, g DESC",

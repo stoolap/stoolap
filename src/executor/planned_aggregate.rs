@@ -84,11 +84,12 @@ pub(crate) struct AggregatePlan {
 pub(crate) enum AggregateRead {
     /// Its one row from `source`
     Global { source: GlobalSource },
-    /// Its groups by one column, named and placed as `group`, from `source`;
-    /// `walks` whether the index walk reads them when the table declines
+    /// Its groups by the columns of `groups`, each named and placed, from
+    /// `source`; `walks` whether the index walk reads them when the table
+    /// declines, which only one column's groups may
     Grouped {
         source: GroupedSource,
-        group: (String, usize),
+        groups: Vec<(String, usize)>,
         walks: bool,
     },
 }
