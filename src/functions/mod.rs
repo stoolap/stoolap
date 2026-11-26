@@ -285,6 +285,13 @@ pub trait AggregateFunction: Send + Sync {
         false
     }
 
+    /// Asks a function that orders its input to apply DISTINCT itself,
+    /// after its order, so a value stays at its first place in it; true
+    /// when it does, and every value is then accumulated
+    fn distinct_in_order(&mut self) -> bool {
+        false
+    }
+
     /// Get the final result, or the error the arithmetic raises, as SUM
     /// does when its INTEGER sum leaves the INTEGER range
     fn result(&self) -> Result<Value>;

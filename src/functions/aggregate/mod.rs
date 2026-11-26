@@ -200,10 +200,12 @@ impl AggregateState {
         if !extra_args.is_empty() {
             function.configure(extra_args);
         }
-        if !order_by.is_empty() && function.supports_order_by() {
+        let ordered = !order_by.is_empty() && function.supports_order_by();
+        if ordered {
             function.set_order_by(order_by);
         }
-        let distinct = distinct && !function.ignores_distinct();
+        let distinct =
+            distinct && !function.ignores_distinct() && !(ordered && function.distinct_in_order());
         Self {
             function,
             distinct: distinct.then(Box::default),
