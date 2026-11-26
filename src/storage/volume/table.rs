@@ -8832,14 +8832,18 @@ impl Table for SegmentedTable {
             let mut hot_skip: KeySet<i64> =
                 KeySet::with_capacity_and_hasher(hot_rows.len().max(1024), Default::default());
             let plain = plain_columns(keys);
+            let mut bucketed = Vec::with_capacity(keys.len());
             for (row_id, row) in &hot_rows {
                 hot_skip.insert(*row_id);
+                let row = row.as_slice();
                 match &plain {
-                    Some(columns) => aggregate_row(&mut groups, columns, aggregates, row.as_slice()),
-                    None if !aggregate_bucketed_row(&mut groups, keys, aggregates, row.as_slice()) => {
-                        return Ok(Some(None));
+                    Some(columns) => aggregate_row(&mut groups, columns, aggregates, row),
+                    None => {
+                        if !aggregate_bucketed_row(&mut groups, keys, aggregates, row, &mut bucketed)
+                        {
+                            return Ok(Some(None));
+                        }
                     }
-                    None => {}
                 }
             }
 

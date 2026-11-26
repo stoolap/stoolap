@@ -547,7 +547,8 @@ pub fn aggregate_row(
     }
 }
 
-/// `aggregate_row` for keys of which some are bucketed; false for a row
+/// `aggregate_row` for keys of which some are bucketed, their values held
+/// in `bucketed`, which the rows of one aggregation share; false for a row
 /// whose bucket rejects its value
 #[inline(always)]
 pub fn aggregate_bucketed_row(
@@ -555,8 +556,9 @@ pub fn aggregate_bucketed_row(
     keys: &[GroupBy],
     aggregates: &[(AggregateOp, usize)],
     row: &[Value],
+    bucketed: &mut Vec<Value>,
 ) -> bool {
-    let mut bucketed = smallvec::SmallVec::<[Value; 4]>::new();
+    bucketed.clear();
     for key in keys {
         bucketed.push(match key.bucket {
             Some(bucket) => {
@@ -572,7 +574,7 @@ pub fn aggregate_bucketed_row(
     let key = RowKey {
         row,
         keys,
-        bucketed: &bucketed,
+        bucketed,
     };
     if let Some(group) = groups.group(&key) {
         accumulate_row(groups, group, aggregates, row);
@@ -7656,8 +7658,10 @@ impl VersionStore {
                 self.visit_live_heads(&checker, reader, visit, deadline)
             }
             None => {
+                let mut bucketed = Vec::with_capacity(keys.len());
                 let visit = |row: &[Value]| {
-                    rejected |= !aggregate_bucketed_row(&mut groups, keys, aggregates, row);
+                    rejected |=
+                        !aggregate_bucketed_row(&mut groups, keys, aggregates, row, &mut bucketed);
                 };
                 self.visit_live_heads(&checker, reader, visit, deadline)
             }
