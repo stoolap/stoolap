@@ -40,7 +40,8 @@ use std::cmp::Ordering;
 use crate::core::value::compare_floats;
 use crate::core::{Result, SumAccumulator, Value};
 
-use super::{AggregateState, DistinctTracker};
+use super::{takes_over, AggregateState, DistinctTracker};
+use crate::functions::AggregateOrder;
 
 /// Compiled aggregate function - enum-based specialization for zero virtual dispatch
 ///
@@ -82,6 +83,14 @@ pub enum CompiledAggregate {
 
     /// MAX(column) - maximum value (type-generic using Value comparison)
     Max { max_value: Option<Value> },
+
+    /// FIRST (`last` false) or LAST of a column by one ORDER BY key: the
+    /// key and the value of the row it holds so far
+    Ordered {
+        last: bool,
+        order: AggregateOrder,
+        best: Option<(Value, Value)>,
+    },
 
     /// Fallback to dynamic dispatch for complex aggregates, with the call's
     /// modifiers in its state
@@ -129,6 +138,12 @@ impl std::fmt::Debug for CompiledAggregate {
             CompiledAggregate::Max { max_value } => {
                 f.debug_struct("Max").field("max_value", max_value).finish()
             }
+            CompiledAggregate::Ordered { last, order, best } => f
+                .debug_struct("Ordered")
+                .field("last", last)
+                .field("order", order)
+                .field("best", best)
+                .finish(),
             CompiledAggregate::Dynamic(state) => f.debug_tuple("Dynamic").field(state).finish(),
         }
     }
@@ -211,6 +226,28 @@ impl CompiledAggregate {
     /// Create a compiled MAX aggregate (generic)
     pub fn max() -> Self {
         CompiledAggregate::Max { max_value: None }
+    }
+
+    /// Create a compiled FIRST, or LAST when `last`, ordered by one key
+    pub fn ordered(last: bool, order: AggregateOrder) -> Self {
+        CompiledAggregate::Ordered {
+            last,
+            order,
+            best: None,
+        }
+    }
+
+    /// Feeds an ordered run a row's value and its ORDER BY key, kept when
+    /// the row takes over the one it holds
+    #[inline(always)]
+    pub fn accumulate_ordered(&mut self, value: &Value, key: &Value) {
+        if let CompiledAggregate::Ordered { last, order, best } = self {
+            let held = best.as_ref().map(|(k, v)| (std::slice::from_ref(k), v));
+            let candidate = (std::slice::from_ref(key), value);
+            if takes_over(*last, candidate, held, std::slice::from_ref(order)) {
+                *best = Some((key.clone(), value.clone()));
+            }
+        }
     }
 
     /// Compile from a function name and configuration
@@ -366,6 +403,10 @@ impl CompiledAggregate {
                 }
             }
 
+            CompiledAggregate::Ordered { .. } => {
+                debug_assert!(false, "an ordered run is fed with accumulate_ordered")
+            }
+
             // Dynamic fallback
             CompiledAggregate::Dynamic(state) => {
                 state.accumulate(value);
@@ -384,6 +425,7 @@ impl CompiledAggregate {
                 | CompiledAggregate::Avg { .. }
                 | CompiledAggregate::Min { .. }
                 | CompiledAggregate::Max { .. }
+                | CompiledAggregate::Ordered { .. }
         )
     }
 
@@ -437,6 +479,12 @@ impl CompiledAggregate {
             self.accumulate(&value);
             return;
         }
+        if let CompiledAggregate::Ordered { best, .. } = other {
+            if let Some((key, value)) = best {
+                self.accumulate_ordered(value, key);
+            }
+            return;
+        }
         match (self, other) {
             (
                 CompiledAggregate::CountStar { count },
@@ -477,6 +525,9 @@ impl CompiledAggregate {
             CompiledAggregate::Max { max_value } => {
                 max_value.clone().unwrap_or_else(Value::null_unknown)
             }
+            CompiledAggregate::Ordered { best, .. } => best
+                .as_ref()
+                .map_or_else(Value::null_unknown, |(_, value)| value.clone()),
 
             CompiledAggregate::Dynamic(state) => return state.result(),
         })
@@ -506,6 +557,7 @@ impl CompiledAggregate {
 
             CompiledAggregate::Min { min_value } => *min_value = None,
             CompiledAggregate::Max { max_value } => *max_value = None,
+            CompiledAggregate::Ordered { best, .. } => *best = None,
 
             CompiledAggregate::Dynamic(state) => state.reset(),
         }
@@ -519,6 +571,54 @@ mod tests {
     #[test]
     fn a_run_takes_one_cache_line() {
         assert_eq!(std::mem::size_of::<CompiledAggregate>(), 64);
+    }
+
+    #[test]
+    fn an_ordered_run_merged_from_parts_answers_as_one_run() {
+        let rows = [
+            (Value::Integer(2), Value::Integer(20)),
+            (Value::Integer(1), Value::Integer(10)),
+            (Value::Integer(1), Value::Integer(5)),
+            (Value::null_unknown(), Value::Integer(99)),
+            (Value::Integer(3), Value::null_unknown()),
+            (Value::Integer(3), Value::Float(-0.0)),
+            (Value::Integer(3), Value::Float(0.0)),
+        ];
+        let orders = [
+            AggregateOrder {
+                ascending: true,
+                nulls_first: None,
+            },
+            AggregateOrder {
+                ascending: false,
+                nulls_first: Some(false),
+            },
+        ];
+        let run = |last, order, rows: &[(Value, Value)]| {
+            let mut run = CompiledAggregate::ordered(last, order);
+            for (key, value) in rows {
+                run.accumulate_ordered(value, key);
+            }
+            run
+        };
+        for last in [false, true] {
+            for order in orders {
+                let whole = run(last, order, &rows).result().unwrap();
+                for cut in 0..=rows.len() {
+                    let (head, tail) = rows.split_at(cut);
+                    for (a, b) in [(head, tail), (tail, head)] {
+                        let mut merged = run(last, order, a);
+                        merged.merge(&run(last, order, b));
+                        let got = merged.result().unwrap();
+                        assert_eq!(
+                            format!("{got:?}"),
+                            format!("{whole:?}"),
+                            "last {last}, {order:?}, cut {cut}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

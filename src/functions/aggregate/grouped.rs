@@ -47,6 +47,8 @@ pub enum CallTemplate {
         /// there is a group to read
         failed: Option<crate::core::Error>,
     },
+    /// FIRST, or LAST when `last`, of a column read with its one ORDER BY key
+    Ordered { last: bool, order: AggregateOrder },
 }
 
 impl CallTemplate {
@@ -94,6 +96,7 @@ impl CallTemplate {
                 extra_args,
                 order_by.clone(),
             )),
+            &CallTemplate::Ordered { last, order } => CompiledAggregate::ordered(last, order),
         }
     }
 
@@ -101,7 +104,7 @@ impl CallTemplate {
     fn failure(&self) -> Option<&crate::core::Error> {
         match self {
             CallTemplate::Dynamic { failed, .. } => failed.as_ref(),
-            CallTemplate::Compiled(_) => None,
+            CallTemplate::Compiled(_) | CallTemplate::Ordered { .. } => None,
         }
     }
 
@@ -121,6 +124,7 @@ impl CallTemplate {
                 order_by: order_by.clone(),
                 failed: failed.clone(),
             },
+            &CallTemplate::Ordered { last, order } => CallTemplate::Ordered { last, order },
         }
     }
 }
@@ -236,6 +240,7 @@ impl GroupedAggregates {
         self.cap == usize::MAX
             && self.calls.iter().all(|call| match call {
                 CallTemplate::Compiled(make) => make().can_merge(),
+                CallTemplate::Ordered { .. } => true,
                 CallTemplate::Dynamic { .. } => false,
             })
     }

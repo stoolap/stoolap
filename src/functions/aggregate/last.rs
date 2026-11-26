@@ -19,7 +19,7 @@ use crate::functions::{
     AggregateFunction, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType,
 };
 
-use super::compare_ordered_values;
+use super::takes_over;
 
 struct BestEntry {
     value: Value,
@@ -77,18 +77,11 @@ impl AggregateFunction for LastFunction {
     }
 
     fn accumulate_with_sort_key(&mut self, value: &Value, sort_keys: Vec<Value>) {
-        if value.is_null() {
-            return;
-        }
-
-        let should_replace = self.best_entry.as_ref().is_none_or(|best| {
-            compare_ordered_values(
-                (&sort_keys, value),
-                (&best.sort_keys, &best.value),
-                &self.order_keys,
-            ) == std::cmp::Ordering::Greater
-        });
-        if should_replace {
+        let best = self
+            .best_entry
+            .as_ref()
+            .map(|best| (best.sort_keys.as_slice(), &best.value));
+        if takes_over(true, (&sort_keys, value), best, &self.order_keys) {
             self.best_entry = Some(BestEntry {
                 value: value.clone(),
                 sort_keys,

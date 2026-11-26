@@ -47,6 +47,7 @@ use crate::functions::aggregate::{
     CallTemplate, ColumnsKey, CompiledAggregate, GroupKey, GroupedAggregates,
 };
 use crate::functions::scalar::TimeBucket;
+use crate::functions::AggregateOrder;
 use crate::storage::expression::CompiledFilter;
 use crate::storage::mvcc::arena::{Relayout, RowArena};
 use crate::storage::mvcc::commit_log::ReadPoint;
@@ -439,12 +440,35 @@ pub enum AggregateOp {
     Min,
     Max,
     Avg,
+    /// FIRST of the call's column by the column at `key`
+    First {
+        key: usize,
+        order: AggregateOrder,
+    },
+    /// LAST of the call's column by the column at `key`
+    Last {
+        key: usize,
+        order: AggregateOrder,
+    },
 }
 
 impl AggregateOp {
+    /// The column of the call's one ORDER BY key, for FIRST and LAST
+    #[inline(always)]
+    pub fn order_key(self) -> Option<usize> {
+        match self {
+            AggregateOp::First { key, .. } | AggregateOp::Last { key, .. } => Some(key),
+            _ => None,
+        }
+    }
+
     /// How every group runs the call, by its compiled implementation
     pub fn template(self) -> CallTemplate {
         let make: fn() -> CompiledAggregate = match self {
+            AggregateOp::First { order, .. } => {
+                return CallTemplate::Ordered { last: false, order }
+            }
+            AggregateOp::Last { order, .. } => return CallTemplate::Ordered { last: true, order },
             AggregateOp::Count => || CompiledAggregate::count(false),
             AggregateOp::CountStar => CompiledAggregate::count_star,
             AggregateOp::Sum => || CompiledAggregate::sum(false),
@@ -590,8 +614,12 @@ fn accumulate_row(
     aggregates: &[(AggregateOp, usize)],
     row: &[Value],
 ) {
-    for (run, &(_, col_idx)) in groups.aggregates(group).iter_mut().zip(aggregates) {
-        run.accumulate(row.get(col_idx).unwrap_or(&ABSENT));
+    for (run, &(op, col_idx)) in groups.aggregates(group).iter_mut().zip(aggregates) {
+        let value = row.get(col_idx).unwrap_or(&ABSENT);
+        match op.order_key() {
+            None => run.accumulate(value),
+            Some(key) => run.accumulate_ordered(value, row.get(key).unwrap_or(&ABSENT)),
+        }
     }
 }
 

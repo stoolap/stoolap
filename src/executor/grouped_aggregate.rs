@@ -93,19 +93,21 @@ impl Executor {
             || Self::aggregates_hold_subquery(stmt)
             || !aggregations
                 .iter()
-                .all(|agg| agg.answered_with(Modifiers::NONE))
+                .all(|agg| agg.answered_with(Modifiers::NONE) || agg.order_column().is_some())
         {
             return GroupedSource::Hash;
         }
-        // The table computes counts, sums, averages and bounds of columns; a
-        // HAVING the index walk does not judge, naming no column but the
-        // group's, judges the groups the table gives
+        // The table computes counts, sums, averages and bounds of columns,
+        // and the first and last of a column by another; a HAVING the index
+        // walk does not judge, naming no column but the group's, judges the
+        // groups the table gives
         let sorts =
             one_column && Self::sorts_groups(stmt, classification, aggregations, grouped_names);
         let stored = (stmt.having.is_none() || (grouped_names && !sorts))
-            && aggregations
-                .iter()
-                .all(|agg| matches!(agg.name.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"));
+            && aggregations.iter().all(|agg| {
+                matches!(agg.name.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
+                    || agg.order_column().is_some()
+            });
         match (stored, sorts) {
             (true, _) => GroupedSource::Storage,
             (false, true) => GroupedSource::SortedStream,
@@ -396,8 +398,23 @@ impl Executor {
             }));
         }
         let mut ops = Vec::with_capacity(aggregations.len());
+        // The column a FIRST or LAST orders by, and its order
+        let order_column = |agg: &SqlAggregateFunction| {
+            let (name, order) = agg.order_column()?;
+            let schema = table.schema();
+            let key = schema
+                .columns
+                .iter()
+                .position(|c| eq_names(&c.name, name))?;
+            Some((key, order))
+        };
         for (agg, &column) in aggregations.iter().zip(columns) {
             let op = match (agg.name.as_str(), agg.column.as_str(), column) {
+                ("FIRST" | "LAST", _, Some(idx)) => match (order_column(agg), agg.name == "LAST") {
+                    (Some((key, order)), false) => (AggregateOp::First { key, order }, idx),
+                    (Some((key, order)), true) => (AggregateOp::Last { key, order }, idx),
+                    (None, _) => return Ok(None),
+                },
                 ("COUNT", "*", _) => (AggregateOp::CountStar, 0),
                 ("COUNT", _, Some(idx)) => (AggregateOp::Count, idx),
                 ("SUM", _, Some(idx)) => (AggregateOp::Sum, idx),

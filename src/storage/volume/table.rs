@@ -9342,6 +9342,11 @@ impl Table for SegmentedTable {
                                 for &(op, col_idx) in aggregates {
                                     resolved.push(match (op, mapping.sources.get(col_idx)) {
                                         (AggregateOp::CountStar, _) => Call::Fixed(ColdInput::Star),
+                                        // A row group holds one column, an ordered call reads two
+                                        (op, _) if op.order_key().is_some() => {
+                                            bail.store(true, std::sync::atomic::Ordering::Relaxed);
+                                            return Ok(false);
+                                        }
                                         (_, Some(super::writer::ColSource::Volume(phys))) => {
                                             Call::Column(*phys, None)
                                         }
@@ -9946,7 +9951,12 @@ enum ColdInput<'a> {
     Present(&'a super::column::ColumnData),
     Integer(&'a [i64], &'a [bool]),
     Float(&'a [f64], &'a [bool]),
-    Value(&'a super::column::ColumnData),
+    /// A column read as values, with the ORDER BY key's column of a FIRST
+    /// or LAST
+    Value(
+        &'a super::column::ColumnData,
+        Option<&'a super::column::ColumnData>,
+    ),
     Default(Value),
 }
 
@@ -9962,7 +9972,7 @@ impl<'a> ColdInput<'a> {
             (AggregateOp::Count, _) => ColdInput::Present(col),
             (_, ColumnData::Int64 { values, nulls }) => ColdInput::Integer(values, nulls),
             (_, ColumnData::Float64 { values, nulls }) => ColdInput::Float(values, nulls),
-            _ => ColdInput::Value(col),
+            _ => ColdInput::Value(col, None),
         }
     }
 
@@ -9981,6 +9991,20 @@ impl<'a> ColdInput<'a> {
             let Some(source) = mapping.sources.get(col_idx) else {
                 return Ok(None);
             };
+            // A key or value the volume does not hold is the scan's to read
+            if let Some(key) = op.order_key() {
+                use super::writer::ColSource::Volume;
+                match (source, mapping.sources.get(key)) {
+                    (Volume(value), Some(Volume(key))) => {
+                        inputs.push(ColdInput::Value(
+                            vol.columns.get(*value)?,
+                            Some(vol.columns.get(*key)?),
+                        ));
+                        continue;
+                    }
+                    _ => return Ok(None),
+                }
+            }
             inputs.push(match source {
                 super::writer::ColSource::Volume(phys_idx) => {
                     ColdInput::of(op, vol.columns.get(*phys_idx)?)
@@ -10012,6 +10036,21 @@ impl ShownRows {
     }
 }
 
+/// Feeds row `i` of `value` and `key` to a FIRST or LAST run, out of line
+/// so the other calls' loop keeps its shape
+#[cold]
+#[inline(never)]
+fn accumulate_ordered(
+    run: &mut CompiledAggregate,
+    value: &super::column::ColumnData,
+    key: &super::column::ColumnData,
+    i: usize,
+) {
+    if !value.is_null(i) {
+        run.accumulate_ordered(&value.get_value(i), &key.get_value(i));
+    }
+}
+
 /// Feeds row `i` of a volume to the runs of every call
 #[inline(always)]
 fn accumulate_columnar(runs: &mut [CompiledAggregate], inputs: &[ColdInput<'_>], i: usize) {
@@ -10033,16 +10072,18 @@ fn accumulate_columnar(runs: &mut [CompiledAggregate], inputs: &[ColdInput<'_>],
                     run.accumulate(&Value::Float(values[i]));
                 }
             }
-            ColdInput::Value(col) => run.accumulate(&col.get_value(i)),
+            ColdInput::Value(col, None) => run.accumulate(&col.get_value(i)),
+            ColdInput::Value(col, Some(key)) => accumulate_ordered(run, col, key, i),
             ColdInput::Default(value) => run.accumulate(value),
         }
     }
 }
 
 /// Whether the filtered and grouped storage aggregates take every call:
-/// SUM and AVG over numbers, MIN and MAX over numbers and timestamps, read
-/// from a volume's column without a text value per row; any other call
-/// leaves the query to the general path
+/// SUM and AVG over numbers, MIN and MAX over numbers and timestamps, FIRST
+/// and LAST of a number, timestamp or boolean by one of those, read from a
+/// volume's column without a text value per row; any other call leaves the
+/// query to the general path
 fn typed_aggregates_answer(schema: &Schema, aggregates: &[(AggregateOp, usize)]) -> bool {
     aggregates.iter().all(|&(op, col_idx)| {
         let data_type = schema.columns.get(col_idx).map(|c| c.data_type);
@@ -10056,6 +10097,20 @@ fn typed_aggregates_answer(schema: &Schema, aggregates: &[(AggregateOp, usize)])
                 data_type,
                 Some(DataType::Integer | DataType::Float | DataType::Timestamp)
             ),
+            AggregateOp::First { key, .. } | AggregateOp::Last { key, .. } => {
+                matches!(
+                    data_type,
+                    Some(
+                        DataType::Integer
+                            | DataType::Float
+                            | DataType::Timestamp
+                            | DataType::Boolean
+                    )
+                ) && matches!(
+                    schema.columns.get(key).map(|c| c.data_type),
+                    Some(DataType::Integer | DataType::Float | DataType::Timestamp)
+                )
+            }
         }
     })
 }

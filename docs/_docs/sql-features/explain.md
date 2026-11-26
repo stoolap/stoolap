@@ -261,7 +261,7 @@ Aggregate SUM(value)
 
 ### Aggregation
 
-A GROUP BY of one column or of several plain columns shows its groups after `by`. The table computes the groups itself when it can (`StorageGrouped`), with a WHERE over the rows the WHERE passes; the groups of one column read in the order of its index, each by its rows, stop once a LIMIT's groups pass the HAVING (`SortedStream`); otherwise every row is read and grouped. A HAVING naming no column but the group columns judges the groups the table computes when the index walk does not take it:
+A GROUP BY of one column or of several plain columns shows its groups after `by`. The table computes the groups itself when it can (`StorageGrouped`), with a WHERE over the rows the WHERE passes; the groups of one column read in the order of its index, each by its rows, stop once a LIMIT's groups pass the HAVING (`SortedStream`); otherwise every row is read and grouped. The table computes COUNT, SUM, AVG, MIN and MAX of a column, and FIRST and LAST of a number, timestamp or boolean column by one ORDER BY column that is a number or a timestamp, such as `FIRST(price ORDER BY ts)`. A HAVING naming no column but the group columns judges the groups the table computes when the index walk does not take it:
 
 ```sql
 EXPLAIN SELECT category, SUM(value) FROM products GROUP BY category;

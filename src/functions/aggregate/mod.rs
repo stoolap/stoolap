@@ -112,6 +112,24 @@ pub(crate) fn compare_ordered_values(
         })
 }
 
+/// Whether LAST (`last`) or FIRST takes `candidate` over `best`, the row it
+/// holds so far, in the order of `compare_ordered_values`; a NULL value is
+/// never taken
+#[inline]
+pub(crate) fn takes_over(
+    last: bool,
+    candidate: (&[Value], &Value),
+    best: Option<(&[Value], &Value)>,
+    keys: &[crate::functions::AggregateOrder],
+) -> bool {
+    let wins = match last {
+        true => Ordering::Greater,
+        false => Ordering::Less,
+    };
+    !candidate.1.is_null()
+        && best.is_none_or(|best| compare_ordered_values(candidate, best, keys) == wins)
+}
+
 /// Helper struct for tracking distinct values
 ///
 /// Uses a hashbrown set under the engine's hasher so membership and insert
