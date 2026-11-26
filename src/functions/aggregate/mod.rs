@@ -94,6 +94,24 @@ pub(crate) fn compare_sort_keys(
     Ordering::Equal
 }
 
+/// The order FIRST and LAST read their rows in: by the call's ORDER BY
+/// keys, then by the value ascending, values `cmp` holds equal by type
+/// (INTEGER first) and sign (-0.0 first), so no two distinct rows tie
+pub(crate) fn compare_ordered_values(
+    (a_keys, a): (&[Value], &Value),
+    (b_keys, b): (&[Value], &Value),
+    keys: &[crate::functions::AggregateOrder],
+) -> Ordering {
+    compare_sort_keys(a_keys, b_keys, keys)
+        .then_with(|| a.cmp(b))
+        .then_with(|| match (a, b) {
+            (Value::Integer(_), Value::Float(_)) => Ordering::Less,
+            (Value::Float(_), Value::Integer(_)) => Ordering::Greater,
+            (Value::Float(x), Value::Float(y)) => x.total_cmp(y),
+            _ => Ordering::Equal,
+        })
+}
+
 /// Helper struct for tracking distinct values
 ///
 /// Uses a hashbrown set under the engine's hasher so membership and insert
