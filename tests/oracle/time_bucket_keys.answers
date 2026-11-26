@@ -1,0 +1,64 @@
+11	b7379e388cb43ba5	memory: SELECT DATE_TRUNC('Month', ts), COUNT(*) FROM r GROUP BY DATE_TRUNC('Month', ts)
+13	b827ae759d599d28	memory: SELECT DATE_TRUNC('day', ts) AS dd, COUNT(*) FROM r GROUP BY dd ORDER BY DATE_TRUNC('day', ts)
+4	7636336c0653e29d	memory: SELECT DATE_TRUNC('day', ts), COUNT(*) FROM r GROUP BY DATE_TRUNC('day', ts) HAVING DATE_TRUNC('day', ts) > '2024-06-01'
+13	7fe68f031205126c	memory: SELECT DATE_TRUNC('day', ts), COUNT(*), SUM(v) FROM r GROUP BY DATE_TRUNC('day', ts)
+13	016be5785ca5355b	memory: SELECT DATE_TRUNC('hour', ts), COUNT(*) FROM r GROUP BY DATE_TRUNC('hour', ts)
+15	e1d2d7897c6de8a4	memory: SELECT DATE_TRUNC('minute', ts), COUNT(*) FROM r GROUP BY DATE_TRUNC('minute', ts)
+11	78a39263df80fb7e	memory: SELECT DATE_TRUNC('month', ts) AS m, MIN(v), MAX(v), AVG(v) FROM r GROUP BY m ORDER BY m
+8	d5f417f31ab3092a	memory: SELECT DATE_TRUNC('quarter', ts) FROM r GROUP BY 1
+8	22119abf418cea89	memory: SELECT DATE_TRUNC('quarter', ts), COUNT(*) FROM r GROUP BY DATE_TRUNC('quarter', ts)
+15	fe93e3b2c39c7d21	memory: SELECT DATE_TRUNC('second', ts), COUNT(*) FROM r GROUP BY DATE_TRUNC('second', ts)
+11	d4cc91f71eaf2afd	memory: SELECT DATE_TRUNC('week', ts), SUM(v) FROM r GROUP BY DATE_TRUNC('week', ts)
+4	6a428747bb19ad11	memory: SELECT DATE_TRUNC('year', ts), COUNT(*) FROM r GROUP BY DATE_TRUNC('year', ts) HAVING COUNT(*) > 1
+5	bf046ea21ecf6175	memory: SELECT DATE_TRUNC('year', ts), COUNT(*), SUM(v) FROM r GROUP BY DATE_TRUNC('year', ts)
+14	bbe265dded1290d3	memory: SELECT TIME_TRUNC('15m', ts), COUNT(*), MIN(v) FROM r GROUP BY TIME_TRUNC('15m', ts)
+13	6958a491a2c6fce8	memory: SELECT TIME_TRUNC('1h', ts), COUNT(*) FROM r GROUP BY 1 ORDER BY 1 DESC
+13	d19f592a895345bb	memory: SELECT TIME_TRUNC('1h', ts), DATE_TRUNC('day', ts), COUNT(*) FROM r GROUP BY TIME_TRUNC('1h', ts), DATE_TRUNC('day', ts)
+13	56b10f81ee65be22	memory: SELECT TIME_TRUNC('1h30m', ts), MAX(v) FROM r GROUP BY TIME_TRUNC('1h30m', ts)
+15	f12f01d4d8db5912	memory: SELECT TIME_TRUNC('1s', ts), COUNT(*), SUM(v) FROM r GROUP BY TIME_TRUNC('1s', ts)
+15	509b3ca5b98b4a51	memory: SELECT TIME_TRUNC('500ms', ts), COUNT(*) FROM r GROUP BY TIME_TRUNC('500ms', ts)
+14	e69c59303e91a23f	memory: SELECT d, DATE_TRUNC('week', ts), COUNT(*), SUM(v) FROM r GROUP BY d, DATE_TRUNC('week', ts)
+10	0198d69256e3f9a5	mixed: SELECT DATE_TRUNC('Month', ts), COUNT(*) FROM r GROUP BY DATE_TRUNC('Month', ts)
+12	80f3c9842ffb5e11	mixed: SELECT DATE_TRUNC('day', ts) AS dd, COUNT(*) FROM r GROUP BY dd ORDER BY DATE_TRUNC('day', ts)
+3	daf77e3ce06af355	mixed: SELECT DATE_TRUNC('day', ts), COUNT(*) FROM r GROUP BY DATE_TRUNC('day', ts) HAVING DATE_TRUNC('day', ts) > '2024-06-01'
+12	c7d4acdabee35961	mixed: SELECT DATE_TRUNC('day', ts), COUNT(*), SUM(v) FROM r GROUP BY DATE_TRUNC('day', ts)
+13	ed5bb22742ce7809	mixed: SELECT DATE_TRUNC('hour', ts), COUNT(*) FROM r GROUP BY DATE_TRUNC('hour', ts)
+15	441d692141eca68c	mixed: SELECT DATE_TRUNC('minute', ts), COUNT(*) FROM r GROUP BY DATE_TRUNC('minute', ts)
+10	3987c2b6fccf552e	mixed: SELECT DATE_TRUNC('month', ts) AS m, MIN(v), MAX(v), AVG(v) FROM r GROUP BY m ORDER BY m
+10	e7c57af6d1c3b666	mixed: SELECT DATE_TRUNC('month', ts), SUM(v) FROM r WHERE v > 2 GROUP BY DATE_TRUNC('month', ts)
+7	555faffaf5e5bdc7	mixed: SELECT DATE_TRUNC('quarter', ts) FROM r GROUP BY 1
+7	d8582c727c882ab3	mixed: SELECT DATE_TRUNC('quarter', ts), COUNT(*) FROM r GROUP BY DATE_TRUNC('quarter', ts)
+16	756a4dcbd139dbd9	mixed: SELECT DATE_TRUNC('second', ts), COUNT(*) FROM r GROUP BY DATE_TRUNC('second', ts)
+11	f77b044f6d078932	mixed: SELECT DATE_TRUNC('week', ts), SUM(v) FROM r GROUP BY DATE_TRUNC('week', ts)
+4	6a428747bb19ad11	mixed: SELECT DATE_TRUNC('year', ts), COUNT(*) FROM r GROUP BY DATE_TRUNC('year', ts) HAVING COUNT(*) > 1
+5	5a287274d541d47c	mixed: SELECT DATE_TRUNC('year', ts), COUNT(*), SUM(v) FROM r GROUP BY DATE_TRUNC('year', ts)
+14	6fc24668f693591e	mixed: SELECT TIME_TRUNC('15m', ts), COUNT(*), MIN(v) FROM r GROUP BY TIME_TRUNC('15m', ts)
+13	9f4a6a9ea1d17106	mixed: SELECT TIME_TRUNC('1h', ts), COUNT(*) FROM r GROUP BY 1 ORDER BY 1 DESC
+13	fbfcc9fe5ca941f4	mixed: SELECT TIME_TRUNC('1h', ts), DATE_TRUNC('day', ts), COUNT(*) FROM r GROUP BY TIME_TRUNC('1h', ts), DATE_TRUNC('day', ts)
+12	8ba2e5b08dd80376	mixed: SELECT TIME_TRUNC('1h30m', ts), MAX(v) FROM r GROUP BY TIME_TRUNC('1h30m', ts)
+16	174ba077293dab75	mixed: SELECT TIME_TRUNC('1s', ts), COUNT(*), SUM(v) FROM r GROUP BY TIME_TRUNC('1s', ts)
+16	4794dd5159eac225	mixed: SELECT TIME_TRUNC('500ms', ts), COUNT(*) FROM r GROUP BY TIME_TRUNC('500ms', ts)
+13	c5e2a1997f63b8bb	mixed: SELECT d, DATE_TRUNC('week', ts), COUNT(*), SUM(v) FROM r GROUP BY d, DATE_TRUNC('week', ts)
+5	24ba5b7d2bc8fe5b	mixed: SELECT d, TIME_TRUNC('1h', ts), COUNT(*) FROM r WHERE ts >= '2024-06-01' GROUP BY d, TIME_TRUNC('1h', ts)
+11	b7379e388cb43ba5	sealed: SELECT DATE_TRUNC('Month', ts), COUNT(*) FROM r GROUP BY DATE_TRUNC('Month', ts)
+13	b827ae759d599d28	sealed: SELECT DATE_TRUNC('day', ts) AS dd, COUNT(*) FROM r GROUP BY dd ORDER BY DATE_TRUNC('day', ts)
+4	7636336c0653e29d	sealed: SELECT DATE_TRUNC('day', ts), COUNT(*) FROM r GROUP BY DATE_TRUNC('day', ts) HAVING DATE_TRUNC('day', ts) > '2024-06-01'
+13	7fe68f031205126c	sealed: SELECT DATE_TRUNC('day', ts), COUNT(*), SUM(v) FROM r GROUP BY DATE_TRUNC('day', ts)
+13	016be5785ca5355b	sealed: SELECT DATE_TRUNC('hour', ts), COUNT(*) FROM r GROUP BY DATE_TRUNC('hour', ts)
+15	e1d2d7897c6de8a4	sealed: SELECT DATE_TRUNC('minute', ts), COUNT(*) FROM r GROUP BY DATE_TRUNC('minute', ts)
+11	78a39263df80fb7e	sealed: SELECT DATE_TRUNC('month', ts) AS m, MIN(v), MAX(v), AVG(v) FROM r GROUP BY m ORDER BY m
+11	98c6cf20a1654745	sealed: SELECT DATE_TRUNC('month', ts), SUM(v) FROM r WHERE v > 2 GROUP BY DATE_TRUNC('month', ts)
+8	d5f417f31ab3092a	sealed: SELECT DATE_TRUNC('quarter', ts) FROM r GROUP BY 1
+8	22119abf418cea89	sealed: SELECT DATE_TRUNC('quarter', ts), COUNT(*) FROM r GROUP BY DATE_TRUNC('quarter', ts)
+15	fe93e3b2c39c7d21	sealed: SELECT DATE_TRUNC('second', ts), COUNT(*) FROM r GROUP BY DATE_TRUNC('second', ts)
+11	d4cc91f71eaf2afd	sealed: SELECT DATE_TRUNC('week', ts), SUM(v) FROM r GROUP BY DATE_TRUNC('week', ts)
+4	6a428747bb19ad11	sealed: SELECT DATE_TRUNC('year', ts), COUNT(*) FROM r GROUP BY DATE_TRUNC('year', ts) HAVING COUNT(*) > 1
+5	bf046ea21ecf6175	sealed: SELECT DATE_TRUNC('year', ts), COUNT(*), SUM(v) FROM r GROUP BY DATE_TRUNC('year', ts)
+14	bbe265dded1290d3	sealed: SELECT TIME_TRUNC('15m', ts), COUNT(*), MIN(v) FROM r GROUP BY TIME_TRUNC('15m', ts)
+13	6958a491a2c6fce8	sealed: SELECT TIME_TRUNC('1h', ts), COUNT(*) FROM r GROUP BY 1 ORDER BY 1 DESC
+13	d19f592a895345bb	sealed: SELECT TIME_TRUNC('1h', ts), DATE_TRUNC('day', ts), COUNT(*) FROM r GROUP BY TIME_TRUNC('1h', ts), DATE_TRUNC('day', ts)
+13	56b10f81ee65be22	sealed: SELECT TIME_TRUNC('1h30m', ts), MAX(v) FROM r GROUP BY TIME_TRUNC('1h30m', ts)
+15	f12f01d4d8db5912	sealed: SELECT TIME_TRUNC('1s', ts), COUNT(*), SUM(v) FROM r GROUP BY TIME_TRUNC('1s', ts)
+15	509b3ca5b98b4a51	sealed: SELECT TIME_TRUNC('500ms', ts), COUNT(*) FROM r GROUP BY TIME_TRUNC('500ms', ts)
+14	e69c59303e91a23f	sealed: SELECT d, DATE_TRUNC('week', ts), COUNT(*), SUM(v) FROM r GROUP BY d, DATE_TRUNC('week', ts)
+5	e220bc2cdab16e26	sealed: SELECT d, TIME_TRUNC('1h', ts), COUNT(*) FROM r WHERE ts >= '2024-06-01' GROUP BY d, TIME_TRUNC('1h', ts)

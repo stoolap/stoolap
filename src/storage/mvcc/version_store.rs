@@ -43,7 +43,10 @@ use crate::common::{
 use crate::common::{KeyMap, KeySet};
 use crate::core::types::DataType;
 use crate::core::{Error, Row, RowVec, Schema, SumAccumulator, Value, NULL_VALUE};
-use crate::functions::aggregate::{CallTemplate, ColumnsKey, CompiledAggregate, GroupedAggregates};
+use crate::functions::aggregate::{
+    CallTemplate, ColumnsKey, CompiledAggregate, GroupKey, GroupedAggregates,
+};
+use crate::functions::scalar::TimeBucket;
 use crate::storage::expression::CompiledFilter;
 use crate::storage::mvcc::arena::{Relayout, RowArena};
 use crate::storage::mvcc::commit_log::ReadPoint;
@@ -453,19 +456,78 @@ impl AggregateOp {
     }
 }
 
-/// No groups yet of `aggregates` keyed by `group_by_indices`
+/// One key of a grouped aggregation: the column at `column`, truncated to
+/// `bucket` when it has one
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupBy {
+    pub column: usize,
+    pub bucket: Option<TimeBucket>,
+}
+
+impl GroupBy {
+    /// The key of the plain column at `column`
+    pub fn column(column: usize) -> Self {
+        Self {
+            column,
+            bucket: None,
+        }
+    }
+
+    /// The key a row whose column holds `value` falls in: a bucket reads a
+    /// timestamp, NULL keeps NULL; None for a timestamp the bucket rejects
+    /// or any other value
+    pub fn bucketed(bucket: TimeBucket, value: &Value) -> Option<Value> {
+        match value {
+            Value::Timestamp(ts) => bucket.truncate(*ts).ok().map(Value::Timestamp),
+            value if value.is_null() => Some(Value::null_unknown()),
+            _ => None,
+        }
+    }
+}
+
+/// The key `keys` give a row read in place: a bucketed key reads its value
+/// from `bucketed`, a plain one from the row
+struct RowKey<'a> {
+    row: &'a [Value],
+    keys: &'a [GroupBy],
+    bucketed: &'a [Value],
+}
+
+impl GroupKey for RowKey<'_> {
+    #[inline(always)]
+    fn width(&self) -> usize {
+        self.keys.len()
+    }
+    #[inline(always)]
+    fn at(&self, i: usize) -> &Value {
+        match self.keys[i].bucket {
+            Some(_) => &self.bucketed[i],
+            None => self.row.get(self.keys[i].column).unwrap_or(&ABSENT),
+        }
+    }
+}
+
+/// No groups yet of `aggregates` keyed by `keys`
 pub fn grouped_aggregates(
-    group_by_indices: &[usize],
+    keys: &[GroupBy],
     aggregates: &[(AggregateOp, usize)],
 ) -> GroupedAggregates {
     GroupedAggregates::new(
         aggregates.iter().map(|&(op, _)| op.template()).collect(),
-        group_by_indices.len(),
+        keys.len(),
     )
 }
 
 /// What a column past a row's end reads
 static ABSENT: Value = NULL_VALUE;
+
+/// The columns of `keys` when none is bucketed, which `aggregate_row` reads
+/// in place; None when one is, for `aggregate_bucketed_row`
+pub fn plain_columns(keys: &[GroupBy]) -> Option<smallvec::SmallVec<[usize; 4]>> {
+    keys.iter()
+        .map(|key| key.bucket.is_none().then_some(key.column))
+        .collect()
+}
 
 /// Runs one row, read in place, into its group; a column past the row's
 /// end reads NULL
@@ -481,9 +543,55 @@ pub fn aggregate_row(
         columns: group_by_indices,
     };
     if let Some(group) = groups.group(&key) {
-        for (run, &(_, col_idx)) in groups.aggregates(group).iter_mut().zip(aggregates) {
-            run.accumulate(row.get(col_idx).unwrap_or(&ABSENT));
-        }
+        accumulate_row(groups, group, aggregates, row);
+    }
+}
+
+/// `aggregate_row` for keys of which some are bucketed, their values held
+/// in `bucketed`, which the rows of one aggregation share; false for a row
+/// whose bucket rejects its value
+#[inline(always)]
+pub fn aggregate_bucketed_row(
+    groups: &mut GroupedAggregates,
+    keys: &[GroupBy],
+    aggregates: &[(AggregateOp, usize)],
+    row: &[Value],
+    bucketed: &mut Vec<Value>,
+) -> bool {
+    bucketed.clear();
+    for key in keys {
+        bucketed.push(match key.bucket {
+            Some(bucket) => {
+                let value = row.get(key.column).unwrap_or(&ABSENT);
+                match GroupBy::bucketed(bucket, value) {
+                    Some(value) => value,
+                    None => return false,
+                }
+            }
+            None => Value::null_unknown(),
+        });
+    }
+    let key = RowKey {
+        row,
+        keys,
+        bucketed,
+    };
+    if let Some(group) = groups.group(&key) {
+        accumulate_row(groups, group, aggregates, row);
+    }
+    true
+}
+
+/// Runs `row` into the calls of `group`
+#[inline(always)]
+fn accumulate_row(
+    groups: &mut GroupedAggregates,
+    group: usize,
+    aggregates: &[(AggregateOp, usize)],
+    row: &[Value],
+) {
+    for (run, &(_, col_idx)) in groups.aggregates(group).iter_mut().zip(aggregates) {
+        run.accumulate(row.get(col_idx).unwrap_or(&ABSENT));
     }
 }
 
@@ -7520,21 +7628,22 @@ impl VersionStore {
     ///
     /// # Arguments
     /// * `reader` - The reader whose snapshot decides visibility
-    /// * `group_by_indices` - Column indices to group by
+    /// * `keys` - The keys to group by
     /// * `aggregates` - List of (operation, column_index) pairs
     ///
     /// # Returns
-    /// The groups, or None when the arena's heads cannot answer for the reader
+    /// The groups, or None when the arena's heads cannot answer for the
+    /// reader or a bucket rejects a row's value
     pub fn compute_grouped_aggregates(
         &self,
         reader: Reader<'_>,
-        group_by_indices: &[usize],
+        keys: &[GroupBy],
         aggregates: &[(AggregateOp, usize)],
         deadline: Deadline,
     ) -> crate::core::Result<Option<GroupedAggregates>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.compute_grouped_aggregates");
-        let mut groups = grouped_aggregates(group_by_indices, aggregates);
+        let mut groups = grouped_aggregates(keys, aggregates);
         if self.closed.load(Ordering::Acquire) {
             return Ok(Some(groups));
         }
@@ -7542,8 +7651,23 @@ impl VersionStore {
             return Ok(Some(groups));
         };
         // None lets the caller fall back to regular GROUP BY aggregation
-        let visit = |row: &[Value]| aggregate_row(&mut groups, group_by_indices, aggregates, row);
-        match self.visit_live_heads(&checker, reader, visit, deadline) {
+        let mut rejected = false;
+        let pass = match plain_columns(keys) {
+            Some(columns) => {
+                let visit = |row: &[Value]| aggregate_row(&mut groups, &columns, aggregates, row);
+                self.visit_live_heads(&checker, reader, visit, deadline)
+            }
+            None => {
+                let mut bucketed = Vec::with_capacity(keys.len());
+                let visit = |row: &[Value]| {
+                    rejected |=
+                        !aggregate_bucketed_row(&mut groups, keys, aggregates, row, &mut bucketed);
+                };
+                self.visit_live_heads(&checker, reader, visit, deadline)
+            }
+        };
+        match pass {
+            _ if rejected => Ok(None),
             HeadsPass::Answered | HeadsPass::Empty => Ok(Some(groups)),
             HeadsPass::Unheld => Ok(None),
             HeadsPass::Stopped => Err(crate::core::Error::QueryCancelled),
@@ -10518,7 +10642,7 @@ mod tests {
         txn.commit().unwrap();
 
         let results = store
-            .compute_grouped_aggregates(2.into(), &[1], &[], Deadline::NONE)
+            .compute_grouped_aggregates(2.into(), &[GroupBy::column(1)], &[], Deadline::NONE)
             .unwrap()
             .expect("arena path should handle an empty aggregate list")
             .into_rows()
@@ -10571,7 +10695,7 @@ mod tests {
         let results = store
             .compute_grouped_aggregates(
                 2.into(),
-                &[1, 2],
+                &[GroupBy::column(1), GroupBy::column(2)],
                 &[(AggregateOp::CountStar, 0)],
                 Deadline::NONE,
             )

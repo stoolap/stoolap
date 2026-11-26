@@ -97,70 +97,174 @@ impl ScalarFunction for DateTruncFunction {
             }
         };
 
-        // Truncate based on unit (case-insensitive without allocation)
-        let result = if unit.eq_ignore_ascii_case("year") {
-            Utc.with_ymd_and_hms(ts.year(), 1, 1, 0, 0, 0)
-                .single()
-                .unwrap_or(ts)
-        } else if unit.eq_ignore_ascii_case("month") {
-            Utc.with_ymd_and_hms(ts.year(), ts.month(), 1, 0, 0, 0)
-                .single()
-                .unwrap_or(ts)
-        } else if unit.eq_ignore_ascii_case("day") {
-            Utc.with_ymd_and_hms(ts.year(), ts.month(), ts.day(), 0, 0, 0)
-                .single()
-                .unwrap_or(ts)
-        } else if unit.eq_ignore_ascii_case("hour") {
-            Utc.with_ymd_and_hms(ts.year(), ts.month(), ts.day(), ts.hour(), 0, 0)
-                .single()
-                .unwrap_or(ts)
-        } else if unit.eq_ignore_ascii_case("minute") {
-            Utc.with_ymd_and_hms(ts.year(), ts.month(), ts.day(), ts.hour(), ts.minute(), 0)
-                .single()
-                .unwrap_or(ts)
-        } else if unit.eq_ignore_ascii_case("second") {
-            Utc.with_ymd_and_hms(
-                ts.year(),
-                ts.month(),
-                ts.day(),
-                ts.hour(),
-                ts.minute(),
-                ts.second(),
-            )
-            .single()
-            .unwrap_or(ts)
-        } else if unit.eq_ignore_ascii_case("week") {
-            // Truncate to start of week (Monday)
-            let weekday = ts.weekday().num_days_from_monday();
-            let start_of_week = ts - Duration::days(weekday as i64);
-            Utc.with_ymd_and_hms(
-                start_of_week.year(),
-                start_of_week.month(),
-                start_of_week.day(),
-                0,
-                0,
-                0,
-            )
-            .single()
-            .unwrap_or(ts)
-        } else if unit.eq_ignore_ascii_case("quarter") {
-            // Truncate to start of quarter
-            let quarter_month = ((ts.month() - 1) / 3) * 3 + 1;
-            Utc.with_ymd_and_hms(ts.year(), quarter_month, 1, 0, 0, 0)
-                .single()
-                .unwrap_or(ts)
-        } else {
-            return Err(Error::invalid_argument(format!(
-                "DATE_TRUNC invalid unit: {}. Valid units are: year, quarter, month, week, day, hour, minute, second",
-                unit
-            )));
-        };
-
-        Ok(Value::Timestamp(result))
+        TimeBucket::date_unit(unit)?
+            .truncate(ts)
+            .map(Value::Timestamp)
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
         Box::new(DateTruncFunction)
+    }
+}
+
+/// What DATE_TRUNC and TIME_TRUNC truncate a timestamp to: a calendar unit,
+/// or an interval in nanoseconds. Every reader of either call truncates by it
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeBucket {
+    Calendar(CalendarUnit),
+    Every(i64),
+}
+
+/// DATE_TRUNC's units
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CalendarUnit {
+    Year,
+    Quarter,
+    Month,
+    Week,
+    Day,
+    Hour,
+    Minute,
+    Second,
+}
+
+impl TimeBucket {
+    /// DATE_TRUNC's `unit`, of any case
+    pub fn date_unit(unit: &str) -> Result<Self> {
+        const UNITS: [(&str, CalendarUnit); 8] = [
+            ("year", CalendarUnit::Year),
+            ("month", CalendarUnit::Month),
+            ("day", CalendarUnit::Day),
+            ("hour", CalendarUnit::Hour),
+            ("minute", CalendarUnit::Minute),
+            ("second", CalendarUnit::Second),
+            ("week", CalendarUnit::Week),
+            ("quarter", CalendarUnit::Quarter),
+        ];
+        UNITS
+            .iter()
+            .find(|(name, _)| unit.eq_ignore_ascii_case(name))
+            .map(|&(_, unit)| Self::Calendar(unit))
+            .ok_or_else(|| {
+                Error::invalid_argument(format!(
+                    "DATE_TRUNC invalid unit: {}. Valid units are: year, quarter, month, week, day, hour, minute, second",
+                    unit
+                ))
+            })
+    }
+
+    /// TIME_TRUNC's `duration`
+    pub fn interval(duration: &str) -> Result<Self> {
+        TimeTruncFunction::cached_parse_duration(duration).map(Self::Every)
+    }
+
+    /// The bucket of a call named `function` with `argument` as its first
+    /// argument; None for another function or an argument it rejects
+    pub fn of_call(function: &str, argument: &str) -> Option<Self> {
+        if function.eq_ignore_ascii_case("DATE_TRUNC") {
+            Self::date_unit(argument).ok()
+        } else if function.eq_ignore_ascii_case("TIME_TRUNC") {
+            Self::interval(argument).ok()
+        } else {
+            None
+        }
+    }
+
+    /// `ts` truncated to the bucket; an interval reads it in nanoseconds,
+    /// which a timestamp outside their range has none of
+    pub fn truncate(self, ts: DateTime<Utc>) -> Result<DateTime<Utc>> {
+        match self {
+            Self::Calendar(unit) => Ok(unit.truncate(ts)),
+            Self::Every(_) => {
+                crate::core::value::timestamp_nanos(&ts).map(|at| self.truncate_nanos(at))
+            }
+        }
+    }
+
+    /// `truncate` for a timestamp of `at` nanoseconds. A later timestamp
+    /// never truncates to an earlier one
+    pub fn truncate_nanos(self, at: i64) -> DateTime<Utc> {
+        match self {
+            Self::Calendar(unit) => unit.truncate(DateTime::from_timestamp_nanos(at)),
+            Self::Every(nanos) => DateTime::from_timestamp_nanos(at - at % nanos),
+        }
+    }
+
+    /// The first and last nanosecond that truncate as `at` does, found by
+    /// truncating alone: as truncation never decreases, they bound one run
+    pub fn span_nanos(self, at: i64) -> (i64, i64) {
+        let start = self.truncate_nanos(at);
+        let same = |t: i128| self.truncate_nanos(t as i64) == start;
+        let edge = |toward: i128| {
+            let limit = match toward > 0 {
+                true => i64::MAX as i128,
+                false => i64::MIN as i128,
+            };
+            // Gallop out of the bucket, then halve back to its edge
+            let (mut inside, mut step) = (at as i128, 1i128);
+            let mut outside = loop {
+                let probe = inside + toward * step;
+                if (probe - limit) * toward >= 0 {
+                    if same(limit) {
+                        return limit as i64;
+                    }
+                    break limit;
+                }
+                if !same(probe) {
+                    break probe;
+                }
+                inside = probe;
+                step *= 2;
+            };
+            while (outside - inside).abs() > 1 {
+                let mid = (inside + outside) / 2;
+                match same(mid) {
+                    true => inside = mid,
+                    false => outside = mid,
+                }
+            }
+            inside as i64
+        };
+        (edge(-1), edge(1))
+    }
+}
+
+impl CalendarUnit {
+    fn truncate(self, ts: DateTime<Utc>) -> DateTime<Utc> {
+        let day = |year, month, day| {
+            Utc.with_ymd_and_hms(year, month, day, 0, 0, 0)
+                .single()
+                .unwrap_or(ts)
+        };
+        match self {
+            Self::Year => day(ts.year(), 1, 1),
+            Self::Quarter => day(ts.year(), ((ts.month() - 1) / 3) * 3 + 1, 1),
+            Self::Month => day(ts.year(), ts.month(), 1),
+            Self::Week => {
+                let start = ts - Duration::days(ts.weekday().num_days_from_monday() as i64);
+                day(start.year(), start.month(), start.day())
+            }
+            Self::Day => day(ts.year(), ts.month(), ts.day()),
+            Self::Hour => Utc
+                .with_ymd_and_hms(ts.year(), ts.month(), ts.day(), ts.hour(), 0, 0)
+                .single()
+                .unwrap_or(ts),
+            Self::Minute => Utc
+                .with_ymd_and_hms(ts.year(), ts.month(), ts.day(), ts.hour(), ts.minute(), 0)
+                .single()
+                .unwrap_or(ts),
+            Self::Second => Utc
+                .with_ymd_and_hms(
+                    ts.year(),
+                    ts.month(),
+                    ts.day(),
+                    ts.hour(),
+                    ts.minute(),
+                    ts.second(),
+                )
+                .single()
+                .unwrap_or(ts),
+        }
     }
 }
 
@@ -336,16 +440,9 @@ impl ScalarFunction for TimeTruncFunction {
             }
         };
 
-        // Parse the duration (cached for repeated calls with the same string)
-        let duration_nanos = Self::cached_parse_duration(&duration_str)?;
-
-        // Truncate the timestamp
-        let ts_nanos = crate::core::value::timestamp_nanos(&ts)?;
-        let truncated_nanos = ts_nanos - (ts_nanos % duration_nanos);
-
-        let result = DateTime::from_timestamp_nanos(truncated_nanos);
-
-        Ok(Value::Timestamp(result))
+        TimeBucket::interval(&duration_str)?
+            .truncate(ts)
+            .map(Value::Timestamp)
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
@@ -1649,5 +1746,68 @@ mod tests {
     fn test_version_no_args() {
         let f = VersionFunction;
         assert!(f.evaluate(&[Value::Integer(1)]).is_err());
+    }
+
+    #[test]
+    fn a_later_timestamp_never_truncates_to_an_earlier_bucket() {
+        let buckets = [
+            "year", "quarter", "month", "week", "day", "hour", "minute", "second",
+        ]
+        .map(|unit| TimeBucket::date_unit(unit).unwrap())
+        .into_iter()
+        .chain(["1s", "15m", "1h30m", "7ms"].map(|d| TimeBucket::interval(d).unwrap()));
+        // Nanoseconds across 1970 and across a leap day, in steps that are
+        // no unit's multiple
+        let step = 7_919_000_003_i64;
+        let times: Vec<i64> = (-400..400).map(|k| k * step).collect();
+        for bucket in buckets {
+            let truncated: Vec<_> = times.iter().map(|&at| bucket.truncate_nanos(at)).collect();
+            assert!(
+                truncated.windows(2).all(|pair| pair[0] <= pair[1]),
+                "{bucket:?} decreases"
+            );
+            for (&at, &start) in times.iter().zip(&truncated) {
+                let ts = DateTime::from_timestamp_nanos(at);
+                assert_eq!(bucket.truncate(ts).unwrap(), start, "{bucket:?} at {at}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_span_holds_every_nanosecond_of_its_bucket_and_no_other() {
+        let buckets = [
+            "year", "quarter", "month", "week", "day", "hour", "minute", "second",
+        ]
+        .map(|unit| TimeBucket::date_unit(unit).unwrap())
+        .into_iter()
+        .chain(["1s", "15m", "1h30m", "7ms"].map(|d| TimeBucket::interval(d).unwrap()));
+        let times = [
+            -1_000_000_001,
+            -1,
+            0,
+            1,
+            1_709_208_000_000_000_000,
+            i64::MAX,
+            i64::MIN,
+        ];
+        for bucket in buckets {
+            for at in times {
+                let start = bucket.truncate_nanos(at);
+                let (lo, hi) = bucket.span_nanos(at);
+                assert!(lo <= at && at <= hi, "{bucket:?} at {at}: {lo}..{hi}");
+                assert_eq!(
+                    bucket.truncate_nanos(lo),
+                    start,
+                    "{bucket:?} at {at}: first"
+                );
+                assert_eq!(bucket.truncate_nanos(hi), start, "{bucket:?} at {at}: last");
+                if let Some(before) = lo.checked_sub(1) {
+                    assert_ne!(bucket.truncate_nanos(before), start, "{bucket:?} at {at}");
+                }
+                if let Some(after) = hi.checked_add(1) {
+                    assert_ne!(bucket.truncate_nanos(after), start, "{bucket:?} at {at}");
+                }
+            }
+        }
     }
 }

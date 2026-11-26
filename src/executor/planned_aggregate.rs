@@ -23,6 +23,7 @@ use crate::common::{CompactArc, CompactVec, SmartString};
 use crate::core::{IndexType, Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::{Expression, GroupByModifier, SelectStatement};
 use crate::storage::expression::Expression as StorageExpr;
+use crate::storage::mvcc::version_store::GroupBy;
 use crate::storage::traits::transaction::{StatementTable, TableUse};
 use crate::storage::traits::{Index, QueryResult, Table};
 
@@ -84,12 +85,12 @@ pub(crate) struct AggregatePlan {
 pub(crate) enum AggregateRead {
     /// Its one row from `source`
     Global { source: GlobalSource },
-    /// Its groups by the columns of `groups`, each named and placed, from
-    /// `source`; `walks` whether the index walk reads them when the table
-    /// declines, which only one column's groups may
+    /// Its groups by the keys of `groups`, each named, from `source`;
+    /// `walks` whether the index walk reads them when the table declines,
+    /// which only one column's groups may
     Grouped {
         source: GroupedSource,
-        groups: Vec<(String, usize)>,
+        groups: Vec<(String, GroupBy)>,
         walks: bool,
     },
 }

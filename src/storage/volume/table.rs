@@ -45,7 +45,8 @@ use crate::storage::mvcc::index_plan::{self, IndexPlan};
 use crate::storage::mvcc::registry::{CommitCut, StatementView};
 use crate::storage::mvcc::txn_gate::{GateRef, TxnGate};
 use crate::storage::mvcc::version_store::{
-    aggregate_row, grouped_aggregates, AggregateOp, LayoutToken, EVERY_WRITE,
+    aggregate_bucketed_row, aggregate_row, grouped_aggregates, plain_columns, AggregateOp, GroupBy,
+    LayoutToken, EVERY_WRITE,
 };
 use crate::storage::traits::table::ScanAccess;
 use crate::storage::traits::{
@@ -8687,7 +8688,7 @@ impl Table for SegmentedTable {
 
     fn compute_grouped_aggregates(
         &self,
-        group_by_indices: &[usize],
+        keys: &[GroupBy],
         aggregates: &[(AggregateOp, usize)],
         filter: Option<&dyn Expression>,
         deadline: Deadline,
@@ -8772,7 +8773,7 @@ impl Table for SegmentedTable {
                     return Ok(Some(None));
                 }
                 let hot = self.hot.compute_grouped_aggregates(
-                    group_by_indices,
+                    keys,
                     aggregates,
                     None,
                     deadline,
@@ -8787,21 +8788,28 @@ impl Table for SegmentedTable {
                 return Ok(Some(None));
             }
             // A text group column is read by its dictionary ids, an INTEGER
-            // or TIMESTAMP one by its integers; any other is the scan's
+            // or TIMESTAMP one by its integers, a bucket of a TIMESTAMP one
+            // by its integers' buckets; any other is the scan's
             let group_type = |at: usize| schema.columns.get(at).map(|c| c.data_type);
-            let group_column = match group_by_indices {
+            let keyed = |key: &GroupBy| match key.bucket {
+                Some(_) => group_type(key.column) == Some(DataType::Timestamp),
+                None => matches!(
+                    group_type(key.column),
+                    Some(DataType::Text | DataType::Integer | DataType::Timestamp)
+                ),
+            };
+            let group_column = match keys {
                 [] => GroupColumn::None,
-                &[at] => match group_type(at) {
-                    Some(DataType::Text) => GroupColumn::Text(at),
-                    Some(DataType::Integer | DataType::Timestamp) => GroupColumn::Integer(at),
-                    _ => return Ok(Some(None)),
+                [key] if !keyed(key) => return Ok(Some(None)),
+                &[GroupBy {
+                    column,
+                    bucket: Some(bucket),
+                }] => GroupColumn::Bucket(column, bucket),
+                &[GroupBy { column, .. }] => match group_type(column) {
+                    Some(DataType::Text) => GroupColumn::Text(column),
+                    _ => GroupColumn::Integer(column),
                 },
-                many => match many.iter().all(|&at| {
-                    matches!(
-                        group_type(at),
-                        Some(DataType::Text | DataType::Integer | DataType::Timestamp)
-                    )
-                }) {
+                many => match many.iter().all(keyed) {
                     true => GroupColumn::Many,
                     false => return Ok(Some(None)),
                 },
@@ -8812,7 +8820,7 @@ impl Table for SegmentedTable {
                 GroupColumn::None => GroupedAggregates::global(
                     aggregates.iter().map(|&(op, _)| op.template()).collect(),
                 ),
-                _ => grouped_aggregates(group_by_indices, aggregates),
+                _ => grouped_aggregates(keys, aggregates),
             };
             // The hot rows a WHERE passes are read through the indexes the
             // access rule picks for it, as the statement's scan would
@@ -8823,9 +8831,21 @@ impl Table for SegmentedTable {
             crate::test_failpoints::hot_and_cold_reads_split();
             let mut hot_skip: KeySet<i64> =
                 KeySet::with_capacity_and_hasher(hot_rows.len().max(1024), Default::default());
+            let plain = plain_columns(keys);
+            // Allocated by the first bucketed row only
+            let mut bucketed = Vec::new();
             for (row_id, row) in &hot_rows {
                 hot_skip.insert(*row_id);
-                aggregate_row(&mut groups, group_by_indices, aggregates, row.as_slice());
+                let row = row.as_slice();
+                match &plain {
+                    Some(columns) => aggregate_row(&mut groups, columns, aggregates, row),
+                    None => {
+                        if !aggregate_bucketed_row(&mut groups, keys, aggregates, row, &mut bucketed)
+                        {
+                            return Ok(Some(None));
+                        }
+                    }
+                }
             }
 
             // --- Cold volumes (THE FAST PATH) ------------------------------------
@@ -9439,8 +9459,24 @@ impl Table for SegmentedTable {
                                 None => false,
                             }
                         }
+                        GroupColumn::Bucket(at, bucket) => match mapping.sources.get(at) {
+                            Some(super::writer::ColSource::Volume(phys)) => {
+                                let key = BucketGroups::new(vol.columns.get(*phys)?, bucket);
+                                scan(calls, rows, key, &mut part)?
+                            }
+                            Some(super::writer::ColSource::Default(value)) => {
+                                match GroupBy::bucketed(bucket, value) {
+                                    Some(value) => {
+                                        let key = FixedGroup(Some(&value), None);
+                                        scan(calls, rows, key, &mut part)?
+                                    }
+                                    None => false,
+                                }
+                            }
+                            None => false,
+                        },
                         GroupColumn::Many => {
-                            match ManyGroups::of(vol, mapping, &schema, group_by_indices)? {
+                            match ManyGroups::of(vol, mapping, &schema, keys)? {
                                 Some(key) => scan(calls, rows, key, &mut part)?,
                                 None => false,
                             }
@@ -9510,13 +9546,15 @@ impl Table for SegmentedTable {
 
 /// The group column of an aggregation the volumes answer, by its place in
 /// the table: text read by its dictionary ids, INTEGER or TIMESTAMP by its
-/// integers; none for the one group of an aggregation without GROUP BY,
-/// `Many` for several columns, read together as one key
+/// integers, a TIMESTAMP's bucket by its integers' buckets; none for the one
+/// group of an aggregation without GROUP BY, `Many` for several keys, read
+/// together as one
 #[derive(Clone, Copy)]
 enum GroupColumn {
     None,
     Text(usize),
     Integer(usize),
+    Bucket(usize, crate::functions::scalar::TimeBucket),
     Many,
 }
 
@@ -9596,6 +9634,102 @@ impl GroupOf for IntegerGroups<'_> {
     }
 }
 
+/// A TIMESTAMP column's buckets as runs of nanoseconds, each found once and
+/// held with its id; the last run is checked first, and a row inside it
+/// finds its id with no truncation
+struct BucketSpans {
+    bucket: crate::functions::scalar::TimeBucket,
+    /// The last run's first and last nanosecond and its id; empty at first
+    last: (i64, i64, u32),
+    spans: KeyMap<chrono::DateTime<chrono::Utc>, (i64, i64, u32)>,
+}
+
+impl BucketSpans {
+    fn new(bucket: crate::functions::scalar::TimeBucket) -> Self {
+        Self {
+            bucket,
+            last: (1, 0, 0),
+            spans: KeyMap::default(),
+        }
+    }
+
+    /// The id of the bucket of `at`; a new bucket takes the id `new_id`
+    /// gives its start and the count of buckets held, None for none
+    #[inline(always)]
+    fn id(
+        &mut self,
+        at: i64,
+        new_id: impl FnOnce(chrono::DateTime<chrono::Utc>, usize) -> Option<u32>,
+    ) -> Option<u32> {
+        let (lo, hi, id) = self.last;
+        match lo <= at && at <= hi {
+            true => Some(id),
+            false => self.find(at, new_id),
+        }
+    }
+
+    /// `id` for a timestamp outside the last run
+    #[cold]
+    #[inline(never)]
+    fn find(
+        &mut self,
+        at: i64,
+        new_id: impl FnOnce(chrono::DateTime<chrono::Utc>, usize) -> Option<u32>,
+    ) -> Option<u32> {
+        let start = self.bucket.truncate_nanos(at);
+        let span = match self.spans.get(&start) {
+            Some(&span) => span,
+            None => {
+                let (lo, hi) = self.bucket.span_nanos(at);
+                let span = (lo, hi, new_id(start, self.spans.len())?);
+                self.spans.insert(start, span);
+                span
+            }
+        };
+        self.last = span;
+        Some(span.2)
+    }
+}
+
+/// A TIMESTAMP group column's buckets, each bucket's group held by its run
+struct BucketGroups<'v> {
+    column: &'v super::column::ColumnData,
+    spans: BucketSpans,
+    null: Option<u32>,
+}
+
+impl<'v> BucketGroups<'v> {
+    fn new(
+        column: &'v super::column::ColumnData,
+        bucket: crate::functions::scalar::TimeBucket,
+    ) -> Self {
+        Self {
+            column,
+            spans: BucketSpans::new(bucket),
+            null: None,
+        }
+    }
+}
+
+impl GroupOf for BucketGroups<'_> {
+    #[inline(always)]
+    fn group(&mut self, part: &mut GroupedAggregates, i: usize) -> Option<usize> {
+        if self.column.is_null(i) {
+            if self.null.is_none() {
+                let key = Value::null_unknown();
+                self.null = Some(part.group(std::slice::from_ref(&key))? as u32);
+            }
+            return self.null.map(|group| group as usize);
+        }
+        let group = self.spans.id(self.column.get_i64(i), |start, _| {
+            let key = Value::Timestamp(start);
+            part.group(std::slice::from_ref(&key))
+                .map(|group| group as u32)
+        })?;
+        Some(group as usize)
+    }
+}
+
 /// Mixed-radix keys up to this many are held in an array, larger ones in a map
 const DENSE_KEYS: u64 = 1 << 16;
 
@@ -9612,8 +9746,14 @@ enum KeySlots<'v> {
         column: &'v super::column::ColumnData,
         slots: KeyMap<i64, u32>,
     },
-    /// A value the volume holds for every row
-    Fixed(&'v Value),
+    /// A TIMESTAMP column's buckets, slots handed out as buckets first come,
+    /// NULL's slot 0
+    Bucket {
+        column: &'v super::column::ColumnData,
+        spans: BucketSpans,
+    },
+    /// A value the volume holds for every row, bucketed when its key is
+    Fixed(Value),
 }
 
 impl KeySlots<'_> {
@@ -9635,6 +9775,13 @@ impl KeySlots<'_> {
                     *slots.entry(column.get_i64(i)).or_insert(next) as u64
                 }
             },
+            Self::Bucket { column, spans } => match column.is_null(i) {
+                true => 0,
+                // A slot is always handed out, so the id is never None
+                false => spans
+                    .id(column.get_i64(i), |_, held| Some(held as u32 + 1))
+                    .map_or(0, u64::from),
+            },
             Self::Fixed(_) => 0,
         }
     }
@@ -9651,7 +9798,11 @@ impl KeySlots<'_> {
                 false => Value::Text(dictionary[ids[i] as usize].clone()),
             },
             Self::Integer { column, .. } => column.get_value(i),
-            Self::Fixed(value) => (*value).clone(),
+            Self::Bucket { column, spans } => match column.is_null(i) {
+                true => Value::null_unknown(),
+                false => Value::Timestamp(spans.bucket.truncate_nanos(column.get_i64(i))),
+            },
+            Self::Fixed(value) => value.clone(),
         }
     }
 }
@@ -9666,20 +9817,21 @@ struct ManyGroups<'v> {
 }
 
 impl<'v> ManyGroups<'v> {
-    /// The key of `group_by_indices` in `vol`; None when a column is missing,
-    /// a text one is not a dictionary, or the key space passes `u64`
+    /// The key of `group_by` in `vol`; None when a column is missing, a text
+    /// one is not a dictionary, a bucket rejects a value the volume holds
+    /// for every row, or the key space passes `u64`
     fn of(
         vol: &'v FrozenVolume,
         mapping: &'v super::writer::ColumnMapping,
         schema: &crate::core::Schema,
-        group_by_indices: &[usize],
+        group_by: &[GroupBy],
     ) -> std::io::Result<Option<Self>> {
         use super::writer::ColSource;
         // Each column's radix from the volume's metadata, before a column
         // is read: a key space past `u64` declines with nothing decoded
         let mut radices = smallvec::SmallVec::<[u64; 4]>::new();
         let mut keys: u64 = 1;
-        for &at in group_by_indices {
+        for &GroupBy { column: at, .. } in group_by {
             let radix = match (mapping.sources.get(at), schema.columns[at].data_type) {
                 (Some(ColSource::Default(_)), _) => 1,
                 (Some(ColSource::Volume(phys)), DataType::Text) => {
@@ -9699,10 +9851,20 @@ impl<'v> ManyGroups<'v> {
         }
         let mut columns = smallvec::SmallVec::new();
         let mut stride: u64 = 1;
-        for (&at, radix) in group_by_indices.iter().zip(radices) {
-            let slots = match mapping.sources.get(at) {
-                Some(super::writer::ColSource::Default(value)) => KeySlots::Fixed(value),
-                Some(super::writer::ColSource::Volume(phys)) => {
+        for (&GroupBy { column: at, bucket }, radix) in group_by.iter().zip(radices) {
+            let slots = match (mapping.sources.get(at), bucket) {
+                (Some(ColSource::Default(value)), None) => KeySlots::Fixed(value.clone()),
+                (Some(ColSource::Default(value)), Some(bucket)) => {
+                    match GroupBy::bucketed(bucket, value) {
+                        Some(value) => KeySlots::Fixed(value),
+                        None => return Ok(None),
+                    }
+                }
+                (Some(ColSource::Volume(phys)), Some(bucket)) => KeySlots::Bucket {
+                    column: vol.columns.get(*phys)?,
+                    spans: BucketSpans::new(bucket),
+                },
+                (Some(ColSource::Volume(phys)), None) => {
                     match (schema.columns[at].data_type, vol.columns.get(*phys)?) {
                         (
                             DataType::Text,
@@ -9723,7 +9885,7 @@ impl<'v> ManyGroups<'v> {
                         },
                     }
                 }
-                None => return Ok(None),
+                (None, _) => return Ok(None),
             };
             columns.push((slots, stride));
             stride *= radix;
@@ -10660,13 +10822,14 @@ mod tests {
             names: Vec::new(),
             is_identity: true,
         };
-        let declined = ManyGroups::of(&vol, &mapping, &schema, &[0, 1, 2, 3, 4, 5]).unwrap();
+        let keys = (0..6).map(GroupBy::column).collect::<Vec<_>>();
+        let declined = ManyGroups::of(&vol, &mapping, &schema, &keys).unwrap();
         assert!(declined.is_none(), "2001^6 keys pass u64");
         assert!(
             (0..6).all(|at| vol.columns.resident(at).is_none()),
             "no column is decoded for a declined key"
         );
-        assert!(ManyGroups::of(&vol, &mapping, &schema, &[1, 2])
+        assert!(ManyGroups::of(&vol, &mapping, &schema, &keys[1..3])
             .unwrap()
             .is_some());
         assert!(

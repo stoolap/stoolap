@@ -18,14 +18,18 @@
 use crate::common::deadline::{Deadline, DeadlineSite};
 use crate::common::names::eq_names;
 use crate::common::SmartString;
-use crate::core::{Result, Row, RowVec, Schema, Value};
+use crate::core::{DataType, Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::{Expression, GroupByModifier, SelectStatement};
 use crate::storage::expression::Expression as StorageExpr;
 use crate::storage::index::id_list::GroupIds;
+use crate::storage::mvcc::version_store::GroupBy;
 use crate::storage::traits::{QueryResult, Table};
 
-use super::aggregation::{AggregatePath, AggregateSlots, Modifiers, SqlAggregateFunction};
+use super::aggregation::{
+    AggregatePath, AggregateSlots, GroupName, Modifiers, SqlAggregateFunction,
+};
 use super::context::ExecutionContext;
+use super::expr_key::ExprKey;
 use super::expression::{ExprVM, SubqueryExecutor};
 use super::planned_aggregate::{AggregatePlan, AggregateRead};
 use super::prepared_select::PreparedCalls;
@@ -46,6 +50,26 @@ pub enum GroupedSource {
     SortedStream,
     /// The rows read and grouped by their key
     Hash,
+}
+
+/// The names `expr` reads outside aggregate calls and outside the bucket
+/// keys `bucket` knows, into `names`
+fn names_outside<'e>(
+    expr: &'e Expression,
+    bucket: &impl Fn(&Expression) -> bool,
+    names: &mut Vec<&'e str>,
+) {
+    match expr {
+        expr if bucket(expr) => {}
+        Expression::FunctionCall(call) if super::utils::is_aggregate_function(&call.function) => {}
+        Expression::Identifier(id) => names.push(&id.value),
+        expr => {
+            let _ = expr.try_for_each_child(&mut |child| {
+                names_outside(child, bucket, names);
+                Ok::<(), ()>(())
+            });
+        }
+    }
 }
 
 impl Executor {
@@ -140,12 +164,31 @@ impl Executor {
         let Some(names) = self.group_columns(stmt)? else {
             return Ok(None);
         };
+        // A plain key is named by its column, a bucket by its slot
         let mut groups = Vec::with_capacity(names.len());
-        for name in names {
-            let Some(at) = schema.columns.iter().position(|c| eq_names(&c.name, &name)) else {
+        let mut buckets = Vec::new();
+        for GroupName { column, bucket } in names {
+            let Some(at) = schema
+                .columns
+                .iter()
+                .position(|c| eq_names(&c.name, &column))
+            else {
                 return Ok(None);
             };
-            groups.push((name, at));
+            match bucket {
+                None => groups.push((column, GroupBy::column(at))),
+                Some(_) if schema.columns[at].data_type != DataType::Timestamp => {
+                    return Ok(None);
+                }
+                Some((bucket, slot, key)) => {
+                    buckets.push(key);
+                    let key = GroupBy {
+                        column: at,
+                        bucket: Some(bucket),
+                    };
+                    groups.push((slot, key));
+                }
+            }
         }
         // The hash grouping makes no group past the LIMIT; the table makes
         // every pair of several columns
@@ -156,7 +199,9 @@ impl Executor {
             true => self.parse_aggregations(stmt, Some(ctx))?,
             false => self.parse_aggregation_shape(stmt)?,
         };
+        // A bucket's slot name is its alias when the SELECT list gives one
         let column = |name: &str| groups.iter().any(|(group, _)| eq_names(name, group));
+        let bucket = |expr: &Expression| buckets.contains(&ExprKey::of(expr));
         // A name is a group column's, or the alias the SELECT list gives one
         let grouped = |name: &str| {
             column(name)
@@ -169,7 +214,8 @@ impl Executor {
                     _ => false,
                 })
         };
-        // The SELECT list reads the group columns and aggregate calls only
+        // The SELECT list reads the group columns, the buckets and aggregate
+        // calls only
         let group_item = |expr: &Expression| {
             let inner = match expr {
                 Expression::Aliased(aliased) => aliased.expression.as_ref(),
@@ -177,6 +223,7 @@ impl Executor {
             };
             match inner {
                 Expression::Identifier(id) => grouped(&id.value),
+                inner if bucket(inner) => true,
                 Expression::FunctionCall(call) => {
                     super::utils::is_aggregate_function(&call.function)
                 }
@@ -185,9 +232,22 @@ impl Executor {
         };
         let plain = stmt.columns.iter().all(group_item);
         // A name outside a call, from HAVING or an ORDER BY alias, which only
-        // the walk reads, and only as a group column
-        let grouped_names = non_aggregated.iter().all(|column| grouped(column));
-        let one_column = groups.len() == 1;
+        // the walk reads, and only as a group column; a bucket's column is
+        // read only inside the bucket
+        let grouped_names = match buckets.is_empty() {
+            true => non_aggregated.iter().all(|column| grouped(column)),
+            false => {
+                let mut names = Vec::new();
+                let clauses = stmt.columns.iter().chain(stmt.having.as_deref());
+                for expr in clauses.chain(stmt.order_by.iter().map(|o| &o.expression)) {
+                    names_outside(expr, &bucket, &mut names);
+                }
+                let having = stmt.having.as_deref();
+                names.iter().all(|name| grouped(name))
+                    && having.is_none_or(|having| !Self::has_subqueries(having))
+            }
+        };
+        let one_column = groups.len() == 1 && buckets.is_empty();
         let shape = (plain, grouped_names, one_column);
         let source = Self::grouped_source(stmt, classification, &aggregations, shape);
         // The index walk reads every row of a group: a WHERE is the table's
@@ -212,9 +272,9 @@ impl Executor {
         }))
     }
 
-    /// `stmt`'s groups of `aggregations` over `table` by the columns of
-    /// `groups`, named and placed, from `source`, else by the index walk of
-    /// the one column when `walks`;
+    /// `stmt`'s groups of `aggregations` over `table` by the keys of
+    /// `groups`, each named, from `source`, else by the index walk of the
+    /// one column when `walks`;
     /// None for the hash grouping, which the scan does. Its `blocks` answer
     /// the subqueries of its HAVING and SELECT list, its `held` calls hold
     /// its projection. Inlined into the table scan, it costs that scan's
@@ -225,7 +285,7 @@ impl Executor {
         table: &dyn Table,
         stmt: &SelectStatement,
         aggregations: &[SqlAggregateFunction],
-        (source, groups, walks): (GroupedSource, &[(SmartString, usize)], bool),
+        (source, groups, walks): (GroupedSource, &[(SmartString, GroupBy)], bool),
         (ctx, blocks, held): (
             &ExecutionContext,
             Option<&dyn SubqueryExecutor>,
@@ -253,11 +313,11 @@ impl Executor {
         };
         let rows = match (stored, groups) {
             (Some(rows), _) => (AggregatePath::StorageGrouped, rows),
-            (None, [(group, group_index)]) if walks => {
+            (None, [(group, key)]) if walks => {
                 match self.sorted_groups(
                     table,
                     stmt,
-                    (group, *group_index),
+                    (group, key.column),
                     aggregations,
                     &columns,
                     all_columns,
@@ -271,7 +331,12 @@ impl Executor {
         };
         let (path, rows) = rows;
         let mut slot_columns = Vec::with_capacity(groups.len() + aggregations.len());
-        slot_columns.extend(groups.iter().map(|&(_, at)| all_columns[at].clone()));
+        // A column's slot is named as the table names it, a bucket's as
+        // the projection names its key
+        slot_columns.extend(groups.iter().map(|(name, key)| match key.bucket {
+            None => all_columns[key.column].clone(),
+            Some(_) => name.to_string(),
+        }));
         slot_columns.extend(aggregations.iter().map(|agg| agg.get_column_name()));
         // The walk judged its groups by the HAVING as it read them
         let rows = match path {
@@ -300,15 +365,26 @@ impl Executor {
     /// column of `columns`; None when the table declines
     fn stored_groups(
         table: &dyn Table,
-        (groups, filter): (&[(SmartString, usize)], Option<&dyn StorageExpr>),
+        (groups, filter): (&[(SmartString, GroupBy)], Option<&dyn StorageExpr>),
         aggregations: &[SqlAggregateFunction],
         columns: &[Option<usize>],
         deadline: Deadline,
     ) -> Result<Option<RowVec>> {
         use crate::storage::mvcc::version_store::AggregateOp;
         // One column's values are its groups when no WHERE leaves some out
-        if let ([(_, group_index)], true, None) = (groups, aggregations.is_empty(), filter) {
-            let column = &table.schema().columns[*group_index].name_lower;
+        if let (
+            [(
+                _,
+                GroupBy {
+                    column,
+                    bucket: None,
+                },
+            )],
+            true,
+            None,
+        ) = (groups, aggregations.is_empty(), filter)
+        {
+            let column = &table.schema().columns[*column].name_lower;
             let values = table.get_partition_values(column, deadline)?;
             // A read whose last charge read no clock is checked once more
             deadline.check()?;
@@ -332,8 +408,8 @@ impl Executor {
             };
             ops.push(op);
         }
-        let indices: smallvec::SmallVec<[usize; 4]> = groups.iter().map(|&(_, at)| at).collect();
-        match table.compute_grouped_aggregates(&indices, &ops, filter, deadline)? {
+        let keys: smallvec::SmallVec<[GroupBy; 4]> = groups.iter().map(|&(_, key)| key).collect();
+        match table.compute_grouped_aggregates(&keys, &ops, filter, deadline)? {
             Some(groups) => groups.into_rows().map(Some),
             None => Ok(None),
         }
