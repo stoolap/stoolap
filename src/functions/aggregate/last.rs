@@ -19,7 +19,7 @@ use crate::functions::{
     AggregateFunction, FunctionDataType, FunctionInfo, FunctionSignature, FunctionType,
 };
 
-use super::compare_sort_keys;
+use super::compare_ordered_values;
 
 struct BestEntry {
     value: Value,
@@ -29,7 +29,8 @@ struct BestEntry {
 /// LAST aggregate function
 ///
 /// Returns the last non-NULL value in the specified column.
-/// When used with ORDER BY, returns the last value according to the specified ordering.
+/// When used with ORDER BY, returns the last value according to the specified ordering,
+/// equal keys ordered by the value (`compare_ordered_values`).
 /// Tracks only the current best candidate during accumulation (O(1) memory).
 #[derive(Default)]
 pub struct LastFunction {
@@ -62,6 +63,10 @@ impl AggregateFunction for LastFunction {
         true
     }
 
+    fn ignores_distinct(&self) -> bool {
+        true
+    }
+
     fn accumulate(&mut self, value: &Value) {
         if value.is_null() {
             return;
@@ -76,11 +81,12 @@ impl AggregateFunction for LastFunction {
             return;
         }
 
-        // LAST: keep the entry that would sort last (maximum in sort order).
-        // For equal keys, replace (last-seen-wins, matching stable sort behavior).
         let should_replace = self.best_entry.as_ref().is_none_or(|best| {
-            compare_sort_keys(&sort_keys, &best.sort_keys, &self.order_keys)
-                != std::cmp::Ordering::Less
+            compare_ordered_values(
+                (&sort_keys, value),
+                (&best.sort_keys, &best.value),
+                &self.order_keys,
+            ) == std::cmp::Ordering::Greater
         });
         if should_replace {
             self.best_entry = Some(BestEntry {

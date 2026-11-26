@@ -39,6 +39,7 @@ mod count_aggregate_test;
 mod count_star_fallback_test;
 mod extension_min_max_test;
 mod first_last_aggregate_test;
+mod first_last_ties_rule_test;
 mod global_aggregate_projection_test;
 mod global_aggregate_rule_test;
 mod group_by_aliased_key_reuse_test;

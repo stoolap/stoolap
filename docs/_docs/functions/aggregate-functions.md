@@ -214,6 +214,26 @@ SELECT department, LAST(name) FROM employees GROUP BY department;
 
 Note: LAST depends on the order of rows. Use ORDER BY in a subquery for deterministic results.
 
+### FIRST and LAST with ORDER BY
+
+An ORDER BY inside the call makes the answer independent of the order rows are read in:
+
+```sql
+SELECT device, FIRST(price ORDER BY ts), LAST(price ORDER BY ts)
+FROM readings GROUP BY device;
+```
+
+Rows with a NULL value are skipped. The rest are ordered by the ORDER BY keys and then by the value itself, ascending, so rows with equal keys still have one answer: FIRST takes the smallest value among them and LAST the largest. Among values that compare equal, an INTEGER comes before a FLOAT and `-0.0` before `0.0`.
+
+```sql
+-- Three rows at the same ts with prices 20, 10 and 30
+SELECT FIRST(price ORDER BY ts), LAST(price ORDER BY ts) FROM readings;  -- 10, 30
+```
+
+Each call orders its own rows, so on equal keys `FIRST(a ORDER BY ts)` and `FIRST(b ORDER BY ts)` may read their values from different rows.
+
+DISTINCT has no effect on FIRST and LAST: the first of the distinct values is the first value. `FIRST(DISTINCT x ORDER BY k)` answers as `FIRST(x ORDER BY k)` does.
+
 ## Using GROUP BY
 
 The GROUP BY clause groups rows with the same values and applies aggregate functions to each group:
