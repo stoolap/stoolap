@@ -19,6 +19,7 @@
 mod oracle;
 
 mod aggregate_alias_group_column_test;
+mod aggregate_arithmetic_test;
 mod aggregate_distinct_on_test;
 mod aggregate_expression_names_test;
 mod aggregate_functions_test;

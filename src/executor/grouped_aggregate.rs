@@ -91,16 +91,21 @@ impl Executor {
         if !plain
             || aggregations.is_empty()
             || Self::aggregates_hold_subquery(stmt)
-            || !aggregations
-                .iter()
-                .all(|agg| agg.answered_with(Modifiers::NONE) || agg.order_column().is_some())
+            || !aggregations.iter().all(|agg| {
+                agg.answered_with(Modifiers::NONE)
+                    || agg.order_column().is_some()
+                    // A LIMIT's groups leave the other rows' arithmetic,
+                    // and its errors, unrun
+                    || (super::planned_aggregate::arithmetic_call(agg)
+                        && !Self::limit_caps_groups(stmt))
+            })
         {
             return GroupedSource::Hash;
         }
-        // The table computes counts, sums, averages and bounds of columns,
-        // and the first and last of a column by another; a HAVING the index
-        // walk does not judge, naming no column but the group's, judges the
-        // groups the table gives
+        // The table computes counts, sums, averages and bounds of columns or
+        // arithmetic over them, and the first and last of a column by
+        // another; a HAVING the index walk does not judge, naming no column
+        // but the group's, judges the groups the table gives
         let sorts =
             one_column && Self::sorts_groups(stmt, classification, aggregations, grouped_names);
         let stored = (stmt.having.is_none() || (grouped_names && !sorts))
@@ -309,7 +314,7 @@ impl Executor {
                 }
                 let deadline = ctx.deadline_of_call();
                 let read = (groups, pushed.as_deref());
-                Self::stored_groups(table, read, aggregations, &columns, deadline)?
+                Self::stored_groups(table, read, aggregations, (&columns, ctx), deadline)?
             }
             (GroupedSource::SortedStream | GroupedSource::Hash, _) => None,
         };
@@ -369,10 +374,12 @@ impl Executor {
         table: &dyn Table,
         (groups, filter): (&[(SmartString, GroupBy)], Option<&dyn StorageExpr>),
         aggregations: &[SqlAggregateFunction],
-        columns: &[Option<usize>],
+        (columns, ctx): (&[Option<usize>], &ExecutionContext),
         deadline: Deadline,
     ) -> Result<Option<RowVec>> {
-        use crate::storage::mvcc::version_store::AggregateOp;
+        use super::planned_aggregate::call_input;
+        use crate::storage::mvcc::version_store::{AggregateInput, AggregateOp};
+        let ctx = Some(ctx);
         // One column's values are its groups when no WHERE leaves some out
         if let (
             [(
@@ -410,18 +417,29 @@ impl Executor {
         };
         for (agg, &column) in aggregations.iter().zip(columns) {
             let op = match (agg.name.as_str(), agg.column.as_str(), column) {
-                ("FIRST" | "LAST", _, Some(idx)) => match (order_column(agg), agg.name == "LAST") {
-                    (Some((key, order)), false) => (AggregateOp::First { key, order }, idx),
-                    (Some((key, order)), true) => (AggregateOp::Last { key, order }, idx),
-                    (None, _) => return Ok(None),
-                },
-                ("COUNT", "*", _) => (AggregateOp::CountStar, 0),
-                ("COUNT", _, Some(idx)) => (AggregateOp::Count, idx),
-                ("SUM", _, Some(idx)) => (AggregateOp::Sum, idx),
-                ("AVG", _, Some(idx)) => (AggregateOp::Avg, idx),
-                ("MIN", _, Some(idx)) => (AggregateOp::Min, idx),
-                ("MAX", _, Some(idx)) => (AggregateOp::Max, idx),
-                _ => return Ok(None),
+                ("FIRST" | "LAST", _, Some(idx)) => {
+                    let op = match (order_column(agg), agg.name == "LAST") {
+                        (Some((key, order)), false) => AggregateOp::First { key, order },
+                        (Some((key, order)), true) => AggregateOp::Last { key, order },
+                        (None, _) => return Ok(None),
+                    };
+                    (op, AggregateInput::Column(idx))
+                }
+                ("COUNT", "*", _) => (AggregateOp::CountStar, AggregateInput::Column(0)),
+                (name, _, column) => {
+                    let op = match name {
+                        "COUNT" => AggregateOp::Count,
+                        "SUM" => AggregateOp::Sum,
+                        "AVG" => AggregateOp::Avg,
+                        "MIN" => AggregateOp::Min,
+                        "MAX" => AggregateOp::Max,
+                        _ => return Ok(None),
+                    };
+                    match call_input(agg, column, table.schema(), ctx) {
+                        Some(input) => (op, input),
+                        None => return Ok(None),
+                    }
+                }
             };
             ops.push(op);
         }

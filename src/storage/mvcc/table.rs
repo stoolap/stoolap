@@ -5873,7 +5873,7 @@ impl Table for MVCCTable {
     fn compute_grouped_aggregates(
         &self,
         keys: &[crate::storage::mvcc::version_store::GroupBy],
-        aggregates: &[(crate::storage::mvcc::version_store::AggregateOp, usize)],
+        aggregates: &[crate::storage::mvcc::version_store::AggregateCall],
         filter: Option<&dyn Expression>,
         deadline: Deadline,
     ) -> Result<Option<crate::functions::aggregate::GroupedAggregates>> {

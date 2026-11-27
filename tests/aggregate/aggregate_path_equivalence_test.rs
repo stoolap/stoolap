@@ -697,9 +697,9 @@ const CASES: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "sealed",
-        "hash_groups",
+        "storage_grouped",
         "SELECT g, SUM(a + (SELECT 1)) FROM t WHERE a > 0 GROUP BY g",
-        "SELECT g, SUM(a + (SELECT 1)) FROM t WHERE a > 0 GROUP BY g",
+        "SELECT g, SUM(a + (SELECT 1)) FROM t WHERE id + 0 = id AND a > 0 GROUP BY g",
     ),
     (
         "memory",

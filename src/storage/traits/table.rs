@@ -27,7 +27,7 @@ use crate::storage::index::id_list::GroupIds;
 use crate::storage::mvcc::commit_log::ReadPoint;
 use crate::storage::mvcc::index_plan::IndexPlan;
 use crate::storage::mvcc::registry::CommitCut;
-use crate::storage::mvcc::version_store::{AggregateOp, GroupBy, LayoutToken};
+use crate::storage::mvcc::version_store::{AggregateCall, GroupBy, LayoutToken};
 use crate::storage::mvcc::VersionStore;
 use crate::storage::traits::{CappedEqual, Index, QueryResult, Scanner};
 
@@ -1576,14 +1576,14 @@ pub trait Table: Send + Sync {
         Ok(None) // Default implementation - override in concrete tables
     }
 
-    /// The groups of `aggregates`, each an (operation, column) pair, over the
+    /// The groups of `aggregates`, each an operation and what it reads, over the
     /// rows `filter` passes, by `keys`: none for the one group of an
     /// aggregation without GROUP BY. None when the table cannot answer and
     /// the rows are read instead
     fn compute_grouped_aggregates(
         &self,
         _keys: &[GroupBy],
-        _aggregates: &[(AggregateOp, usize)],
+        _aggregates: &[AggregateCall],
         _filter: Option<&dyn Expression>,
         _deadline: Deadline,
     ) -> Result<Option<GroupedAggregates>> {

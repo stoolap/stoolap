@@ -516,6 +516,12 @@ impl Error {
         }
     }
 
+    /// The error an aggregate call's argument raised for a row, naming the
+    /// call as `name(argument)`
+    pub fn aggregate_argument(name: &str, argument: &str, error: Error) -> Self {
+        Self::expression_evaluation(format!("{name}({argument}): {error}"))
+    }
+
     /// Create a new InvalidArgument error
     pub fn invalid_argument(message: impl Into<String>) -> Self {
         Error::InvalidArgument(message.into())
