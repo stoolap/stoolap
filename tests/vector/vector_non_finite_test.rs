@@ -74,6 +74,8 @@ fn a_vector_column_refuses_a_non_finite_component() {
         "CREATE TABLE w (id INTEGER PRIMARY KEY, e TEXT)",
         "INSERT INTO w VALUES (1, '[1,NaN,1]')",
         "CREATE TABLE d (id INTEGER PRIMARY KEY, e VECTOR(2) DEFAULT '[NaN,1]')",
+        "CREATE TABLE x (id INTEGER PRIMARY KEY)",
+        "INSERT INTO x VALUES (1), (2)",
     ] {
         db.execute(sql, ()).unwrap();
     }
@@ -90,9 +92,16 @@ fn a_vector_column_refuses_a_non_finite_component() {
         // A default and a table made from a query write the value too
         "INSERT INTO d (id) VALUES (1)",
         "CREATE TABLE c AS SELECT 1 AS id, CAST('[1,NaN]' AS VECTOR) AS e",
+        // The rows a table has take a column's default when it is added
+        "ALTER TABLE x ADD COLUMN e VECTOR(2) DEFAULT '[NaN,1]'",
     ] {
         refused(sql, db.execute(sql, ()));
     }
+    // A JSON value is no vector, whatever its components
+    let sql = "CREATE TABLE j AS SELECT id, CASE WHEN id = 1 THEN CAST('[1,2]' AS VECTOR) \
+               ELSE CAST('{\"a\":1}' AS JSON) END AS e FROM x";
+    let error = db.execute(sql, ()).expect_err(sql).to_string();
+    assert!(error.contains("type mismatch in column 'e'"), "{error}");
     let defaulted = tempfile::NamedTempFile::new().unwrap();
     writeln!(defaulted.as_file(), "5").unwrap();
     let sql = format!(

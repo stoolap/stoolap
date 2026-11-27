@@ -1241,6 +1241,11 @@ impl Executor {
                     if let Some(crate::core::Value::Timestamp(t)) = &default_value {
                         crate::core::value::timestamp_in_range(*t)?;
                     }
+                    if let (Some(value), DataType::Vector) = (&default_value, data_type) {
+                        let dimensions =
+                            crate::executor::utils::parse_vector_dimension(&col_def.data_type);
+                        value.check_vector_column(&col_def.name.value, dimensions, true)?;
+                    }
                     let check_expr = col_def.constraints.iter().find_map(|c| match c {
                         ColumnConstraint::Check(expr) => Some(expr),
                         _ => None,

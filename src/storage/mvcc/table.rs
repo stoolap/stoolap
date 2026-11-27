@@ -1909,9 +1909,12 @@ impl MVCCTable {
                         col.data_type == DataType::Timestamp
                             && crate::core::value::timestamp_fits(t)
                     }
-                    Value::Extension(_) if col.data_type == DataType::Vector => value
-                        .check_vector_column(&col.name, col.vector_dimensions, true)
-                        .is_ok(),
+                    Value::Extension(_) if col.data_type == DataType::Vector => {
+                        value.data_type() == DataType::Vector
+                            && value
+                                .check_vector_column(&col.name, col.vector_dimensions, true)
+                                .is_ok()
+                    }
                     _ => value.data_type() == col.data_type,
                 })
         {

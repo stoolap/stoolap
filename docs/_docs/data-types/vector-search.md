@@ -56,7 +56,7 @@ Stoolap provides three distance metrics for comparing vectors:
 | `VEC_DISTANCE_COSINE(a, b)` | Cosine distance (1 - cosine similarity) | 0 to 2 | Text embeddings, normalized vectors |
 | `VEC_DISTANCE_IP(a, b)` | Negative inner product distance (-dot product) | varies | Maximum inner product search |
 
-The cosine distance of a zero vector to any vector is 1, and a cosine distance with a `NaN` or `Infinity` component is `NaN`, which ranks after every other in a nearest neighbor search, with or without an HNSW index. The L2 and inner product distances give what their arithmetic gives: `NaN` for a `NaN` component, and an infinite distance for an infinite one, such as `VEC_DISTANCE_L2('[inf]', '[1]')` = `Infinity` and `VEC_DISTANCE_IP('[inf]', '[1]')` = `-Infinity`.
+The cosine distance of a zero vector to any vector is 1, and a cosine distance with a `NaN` or `Infinity` component is `NaN`, which ranks after every other in a nearest neighbor search, with or without an HNSW index. The L2 and inner product distances give what their arithmetic gives, `NaN` or an infinity by the components: `VEC_DISTANCE_L2('[inf]', '[1]')` = `Infinity` and `VEC_DISTANCE_IP('[inf]', '[1]')` = `-Infinity`, while `VEC_DISTANCE_L2('[inf]', '[inf]')` and `VEC_DISTANCE_IP('[inf]', '[0]')` are `NaN`.
 
 ### Examples
 
