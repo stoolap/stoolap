@@ -59,6 +59,7 @@ mod grouped_join_stream_test;
 mod grouped_keys_storage_test;
 mod grouped_output_blocks_test;
 mod grouped_sources_blocks_test;
+mod grouped_walk_decline_test;
 mod grouped_where_storage_test;
 mod grouping_float_keys_test;
 mod grouping_identity_rule_test;
