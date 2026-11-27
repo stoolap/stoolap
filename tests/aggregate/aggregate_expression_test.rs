@@ -20,10 +20,39 @@
 #![cfg(feature = "test-failpoints")]
 
 use stoolap::core::Value;
+use stoolap::functions::registry::global_registry;
+use stoolap::functions::{
+    FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
+};
 use stoolap::test_failpoints::{aggregate_paths_taken, reset_aggregate_paths};
 use stoolap::Database;
 
 use crate::oracle;
+
+/// A function an application registers, which may call back into the
+/// database: here it gives its argument
+#[derive(Default)]
+struct RegisteredEcho;
+
+impl ScalarFunction for RegisteredEcho {
+    fn name(&self) -> &str {
+        "AGGREGATE_EXPRESSION_ECHO"
+    }
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "AGGREGATE_EXPRESSION_ECHO",
+            FunctionType::Scalar,
+            "gives its argument",
+            FunctionSignature::new(FunctionDataType::Any, vec![FunctionDataType::Any], 1, 1),
+        )
+    }
+    fn evaluate(&self, args: &[Value]) -> stoolap::core::Result<Value> {
+        Ok(args[0].clone())
+    }
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(RegisteredEcho)
+    }
+}
 
 /// NULLs, a zero divisor, negatives, and INTEGER beside FLOAT
 const ROWS: &str = "INSERT INTO r VALUES \
@@ -300,6 +329,42 @@ fn a_limit_bounding_the_groups_leaves_the_arithmetic_of_rows_past_them_unrun() {
 }
 
 #[test]
+fn a_cancelled_hot_read_leaves_the_rows_it_holds_uncomputed() {
+    use stoolap::executor::DeadlineSite;
+    use stoolap::test_failpoints::{keep_deadlines, pass_deadline_after, programs_ran};
+    let _guard = stoolap::test_failpoints::FailpointGuard::new();
+    let db = Database::open("memory://aggregate_expression_cancelled").unwrap();
+    for sql in [
+        "CREATE TABLE h (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)",
+        // Two strides of the heads pass: 1,024 slots, then the rest
+        "INSERT INTO h SELECT s.value, s.value % 3, s.value FROM generate_series(1, 1500) s",
+        "PRAGMA query_timeout = 3600000",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    pass_deadline_after(DeadlineSite::StorageAggregate, 1);
+    let mut got = None;
+    let ran = programs_ran(|| {
+        got = Some(
+            db.query("SELECT g, SUM(ABS(v)) FROM h GROUP BY g", ())
+                .and_then(|rows| rows.collect::<std::result::Result<Vec<_>, _>>())
+                .map(|rows| rows.len()),
+        );
+    });
+    keep_deadlines();
+    assert!(
+        matches!(got, Some(Err(stoolap::core::Error::QueryCancelled))),
+        "{got:?}"
+    );
+    let argument: usize = ran
+        .iter()
+        .filter(|(listing, _)| listing.contains("CallScalar"))
+        .map(|(_, times)| times)
+        .sum();
+    assert_eq!(argument, 0, "the held rows were computed: {ran:?}");
+}
+
+#[test]
 fn the_error_is_the_first_failing_rows_first_failing_call() {
     let dir = tempfile::tempdir().unwrap();
     for sealed in [false, true] {
@@ -359,7 +424,11 @@ fn an_argument_the_table_cannot_compute_is_left_to_the_general_path() {
         "SELECT d, SUM(a * (SELECT COUNT(*) FROM o WHERE o.g = r.b)) FROM r GROUP BY d",
         // An expression as FIRST's value
         "SELECT d, FIRST(a * 2 ORDER BY v) FROM r GROUP BY d",
+        // A registered function, which may call back into the database
+        "SELECT d, SUM(AGGREGATE_EXPRESSION_ECHO(a) * 2) FROM r GROUP BY d",
     ];
+    // A second registration of the same function replaces the first
+    let _ = global_registry().register_scalar::<RegisteredEcho>();
     for sql in declined {
         let (_, taken) = run(&db, sql);
         assert!(

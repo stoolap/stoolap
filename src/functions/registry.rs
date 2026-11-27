@@ -314,8 +314,14 @@ impl FunctionRegistry {
     }
 
     /// An error when `name` is a built-in function's, of any kind
+    /// Whether `name` is a built-in function's, not one an application
+    /// registered
+    pub fn is_built_in(&self, name: &str) -> bool {
+        self.built_in_names.contains(&name.to_uppercase())
+    }
+
     fn refuse_built_in(&self, name: &str) -> Result<()> {
-        match self.built_in_names.contains(&name.to_uppercase()) {
+        match self.is_built_in(name) {
             true => Err(Error::invalid_argument(format!(
                 "{} is a built-in function name and cannot be registered",
                 name.to_uppercase()

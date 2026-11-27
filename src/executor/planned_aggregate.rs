@@ -57,14 +57,20 @@ fn bare_column(agg: &SqlAggregateFunction) -> &str {
 }
 
 /// The places in `names`, a table's columns, of the columns `expr` names,
-/// in the order it first names them; None for a name the table lacks or
-/// one a table qualifies
+/// in the order it first names them; None for a name the table lacks, one
+/// a table qualifies, or a call of a function an application registered,
+/// which may call back into the database while the table reads its rows
 fn named_columns(expr: &Expression, names: &[String]) -> Option<Vec<usize>> {
     fn walk(expr: &Expression, names: &[String], columns: &mut Vec<usize>) -> Option<()> {
         let name = match expr {
             Expression::Identifier(id) => Some(&id.value),
             Expression::Column(bound) => Some(&bound.name.value),
             Expression::QualifiedIdentifier(_) => return None,
+            Expression::FunctionCall(call)
+                if !crate::functions::registry::global_registry().is_built_in(&call.function) =>
+            {
+                return None
+            }
             _ => None,
         };
         if let Some(name) = name {

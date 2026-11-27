@@ -7870,7 +7870,10 @@ impl VersionStore {
                 self.visit_live_heads(checker, reader, visit, deadline)
             }
         };
-        aggregates.finish(groups);
+        // Only a pass whose groups answer feeds the rows it still holds
+        if matches!(pass, HeadsPass::Answered | HeadsPass::Empty) && !*rejected {
+            aggregates.finish(groups);
+        }
         pass
     }
 
