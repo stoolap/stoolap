@@ -166,7 +166,7 @@ pub(crate) fn validate_coercion(
         )));
     }
     if target_type == DataType::Vector {
-        coerced.check_vector_column(column_name, vector_dimensions)?;
+        coerced.check_vector_column(column_name, vector_dimensions, true)?;
     }
     Ok(())
 }
@@ -3851,7 +3851,7 @@ impl Executor {
                         .try_into_coerce_to_type(*col_type)?;
                     if *col_type == DataType::Vector {
                         let name = schema.columns.get(*idx).map_or("?", |c| c.name.as_str());
-                        coerced.check_vector_column(name, *vec_dims)?;
+                        coerced.check_vector_column(name, *vec_dims, true)?;
                     }
                     updates.push((*idx, coerced));
                 }

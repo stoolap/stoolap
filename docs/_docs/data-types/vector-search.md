@@ -36,7 +36,7 @@ VALUES (1, 'Hello world', '[0.1, 0.2, 0.3, ...]');
 
 Dimension count is validated on insert. Providing a vector with the wrong number of dimensions will return an error.
 
-A VECTOR column holds only finite components. Writing a vector with a `NaN` or `Infinity` component, by INSERT, UPDATE, `ON CONFLICT DO UPDATE`, COPY or `ALTER TABLE ... MODIFY COLUMN`, returns an error naming the column, such as `VECTOR column 'embedding' cannot hold NaN or Infinity (component 3)`. A vector literal used only in a query, such as the query vector of a distance function, is not checked.
+A VECTOR column holds only finite components. Writing a vector with a `NaN` or `Infinity` component, by INSERT, UPDATE, `ON CONFLICT DO UPDATE`, COPY, a column's DEFAULT, `CREATE TABLE ... AS SELECT` or `ALTER TABLE ... MODIFY COLUMN`, returns an error naming the column, such as `VECTOR column 'embedding' cannot hold NaN or Infinity (component 3)`. A vector literal used only in a query, such as the query vector of a distance function, is not checked.
 
 ### NULL Handling
 
@@ -56,7 +56,7 @@ Stoolap provides three distance metrics for comparing vectors:
 | `VEC_DISTANCE_COSINE(a, b)` | Cosine distance (1 - cosine similarity) | 0 to 2 | Text embeddings, normalized vectors |
 | `VEC_DISTANCE_IP(a, b)` | Negative inner product distance (-dot product) | varies | Maximum inner product search |
 
-The cosine distance of a zero vector to any vector is 1. A distance with a `NaN` or `Infinity` component is `NaN` for every metric. A `NaN` cosine distance ranks after every other in a nearest neighbor search, with or without an HNSW index.
+The cosine distance of a zero vector to any vector is 1, and a cosine distance with a `NaN` or `Infinity` component is `NaN`, which ranks after every other in a nearest neighbor search, with or without an HNSW index. The L2 and inner product distances give what their arithmetic gives: `NaN` for a `NaN` component, and an infinite distance for an infinite one, such as `VEC_DISTANCE_L2('[inf]', '[1]')` = `Infinity` and `VEC_DISTANCE_IP('[inf]', '[1]')` = `-Infinity`.
 
 ### Examples
 

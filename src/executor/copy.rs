@@ -563,7 +563,7 @@ fn validate_vector_dims(
     column: &str,
 ) -> Result<()> {
     match target_type {
-        DataType::Vector => value.check_vector_column(column, expected_dims),
+        DataType::Vector => value.check_vector_column(column, expected_dims, true),
         _ => Ok(()),
     }
 }

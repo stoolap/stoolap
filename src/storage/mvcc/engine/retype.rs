@@ -900,7 +900,8 @@ impl UniqueKeys {
 }
 
 /// A value of the column in the new type, checked against its definition
-/// and, when `storable`, the range a TIMESTAMP is stored in
+/// and, when `storable`, the range a TIMESTAMP is stored in and a vector's
+/// finite components: the log's replay keeps a value committed before
 fn validate_value(
     value: Option<&Value>,
     change: &ColumnTypeChange<'_>,
@@ -916,7 +917,34 @@ fn validate_value(
         crate::core::value::timestamp_in_range(*t)?;
     }
     if change.data_type == DataType::Vector {
-        value.check_vector_column(change.column, change.vector_dimensions)?;
+        value.check_vector_column(change.column, change.vector_dimensions, storable)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_replayed_change_keeps_a_committed_non_finite_vector() {
+        let change = ColumnTypeChange {
+            table: "t",
+            column: "e",
+            data_type: DataType::Vector,
+            nullable: true,
+            vector_dimensions: 2,
+            default: None,
+            check: None,
+            judge: None,
+        };
+        let nan = Value::vector(vec![f32::NAN, 1.0]);
+        assert!(validate_value(Some(&nan), &change, true).is_err());
+        assert!(validate_value(Some(&nan), &change, false).is_ok());
+        let short = Value::vector(vec![1.0]);
+        assert!(
+            validate_value(Some(&short), &change, false).is_err(),
+            "the dimension count holds on replay too"
+        );
+    }
 }

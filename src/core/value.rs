@@ -407,8 +407,10 @@ impl Value {
 
     /// Whether VECTOR column `column` of `dimensions` components, 0 for
     /// any, may hold this value: a vector of that many components, each
-    /// finite. A value that is no vector is not this rule's
-    pub fn check_vector_column(&self, column: &str, dimensions: u16) -> Result<()> {
+    /// finite when `finite`, which a write asks and the log's replay of a
+    /// value committed before does not. A value that is no vector is not
+    /// this rule's
+    pub fn check_vector_column(&self, column: &str, dimensions: u16, finite: bool) -> Result<()> {
         let Some(mut components) = self.vector_f32_iter() else {
             return Ok(());
         };
@@ -418,6 +420,9 @@ impl Value {
                 expected: dimensions,
                 got: u16::try_from(got).unwrap_or(u16::MAX),
             });
+        }
+        if !finite {
+            return Ok(());
         }
         match components.position(|component| !component.is_finite()) {
             Some(at) => Err(Error::Type(format!(

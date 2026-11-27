@@ -73,6 +73,7 @@ fn a_vector_column_refuses_a_non_finite_component() {
         "INSERT INTO v VALUES (1, '[0,1,0]')",
         "CREATE TABLE w (id INTEGER PRIMARY KEY, e TEXT)",
         "INSERT INTO w VALUES (1, '[1,NaN,1]')",
+        "CREATE TABLE d (id INTEGER PRIMARY KEY, e VECTOR(2) DEFAULT '[NaN,1]')",
     ] {
         db.execute(sql, ()).unwrap();
     }
@@ -86,9 +87,19 @@ fn a_vector_column_refuses_a_non_finite_component() {
         "UPDATE v SET e = '[0,0,-inf]' WHERE id = 1",
         "INSERT INTO v VALUES (1, '[1,1,1]') ON CONFLICT (id) DO UPDATE SET e = '[NaN,1,1]'",
         "ALTER TABLE w MODIFY COLUMN e VECTOR(3)",
+        // A default and a table made from a query write the value too
+        "INSERT INTO d (id) VALUES (1)",
+        "CREATE TABLE c AS SELECT 1 AS id, CAST('[1,NaN]' AS VECTOR) AS e",
     ] {
         refused(sql, db.execute(sql, ()));
     }
+    let defaulted = tempfile::NamedTempFile::new().unwrap();
+    writeln!(defaulted.as_file(), "5").unwrap();
+    let sql = format!(
+        "COPY d (id) FROM '{}' WITH (FORMAT CSV, HEADER false)",
+        defaulted.path().display()
+    );
+    refused(&sql, db.execute(&sql, ()));
     let sql = "INSERT INTO v VALUES ($1, $2)";
     refused(sql, db.execute(sql, (3, "[1,2,NaN]")));
     let csv = tempfile::NamedTempFile::new().unwrap();
