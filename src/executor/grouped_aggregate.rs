@@ -94,16 +94,16 @@ impl Executor {
             || !aggregations.iter().all(|agg| {
                 agg.answered_with(Modifiers::NONE)
                     || agg.order_column().is_some()
-                    // A LIMIT's groups leave the other rows' arithmetic,
-                    // and its errors, unrun
-                    || (super::planned_aggregate::arithmetic_call(agg)
+                    // A LIMIT's groups leave the other rows' expressions,
+                    // and their errors, unrun
+                    || (super::planned_aggregate::expression_call(agg)
                         && !Self::limit_caps_groups(stmt))
             })
         {
             return GroupedSource::Hash;
         }
         // The table computes counts, sums, averages and bounds of columns or
-        // arithmetic over them, and the first and last of a column by
+        // expressions over them, and the first and last of a column by
         // another; a HAVING the index walk does not judge, naming no column
         // but the group's, judges the groups the table gives
         let sorts =
@@ -304,7 +304,15 @@ impl Executor {
         if stmt.where_clause.is_some() && !table.has_sealed_rows() {
             return Ok(None);
         }
-        let columns = Self::call_columns(aggregations, all_columns);
+        let places = held.map(|calls| calls.places(all_columns));
+        let found;
+        let reads: super::planned_aggregate::CallReads<'_> = match places.as_deref() {
+            Some(places) => (&places.calls, Some(&places.arguments)),
+            None => {
+                found = Self::call_columns(aggregations, all_columns);
+                (&found, None)
+            }
+        };
         let stored = match (source, stmt.where_clause.is_some()) {
             (GroupedSource::Storage, filtered) => {
                 let pushed = Self::pushed_where(stmt, table.schema(), ctx);
@@ -314,7 +322,7 @@ impl Executor {
                 }
                 let deadline = ctx.deadline_of_call();
                 let read = (groups, pushed.as_deref());
-                Self::stored_groups(table, read, aggregations, (&columns, ctx), deadline)?
+                Self::stored_groups(table, read, aggregations, (reads, ctx), deadline)?
             }
             (GroupedSource::SortedStream | GroupedSource::Hash, _) => None,
         };
@@ -326,7 +334,7 @@ impl Executor {
                     stmt,
                     (group, key.column),
                     aggregations,
-                    &columns,
+                    reads.0,
                     all_columns,
                     ctx,
                 )? {
@@ -374,7 +382,7 @@ impl Executor {
         table: &dyn Table,
         (groups, filter): (&[(SmartString, GroupBy)], Option<&dyn StorageExpr>),
         aggregations: &[SqlAggregateFunction],
-        (columns, ctx): (&[Option<usize>], &ExecutionContext),
+        ((columns, held), ctx): (super::planned_aggregate::CallReads<'_>, &ExecutionContext),
         deadline: Deadline,
     ) -> Result<Option<RowVec>> {
         use super::planned_aggregate::call_input;
@@ -415,7 +423,7 @@ impl Executor {
                 .position(|c| eq_names(&c.name, name))?;
             Some((key, order))
         };
-        for (agg, &column) in aggregations.iter().zip(columns) {
+        for (at, (agg, &column)) in aggregations.iter().zip(columns).enumerate() {
             let op = match (agg.name.as_str(), agg.column.as_str(), column) {
                 ("FIRST" | "LAST", _, Some(idx)) => {
                     let op = match (order_column(agg), agg.name == "LAST") {
@@ -435,7 +443,8 @@ impl Executor {
                         "MAX" => AggregateOp::Max,
                         _ => return Ok(None),
                     };
-                    match call_input(agg, column, table.schema(), ctx) {
+                    let argument = held.and_then(|held| held[at].as_ref());
+                    match call_input(agg, (column, argument), table.schema(), ctx) {
                         Some(input) => (op, input),
                         None => return Ok(None),
                     }

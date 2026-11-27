@@ -338,9 +338,12 @@ fn a_statement_with_expressions_decodes_only_the_columns_it_names() {
         assert_eq!(misses, blocks, "{sql}: groups decoded {misses} times");
         rows
     };
-    // COUNT(*) and SUM(ABS(id * k)), which the scan reads: the filter's k,
+    // COUNT(*) and a sum under FILTER, which the scan reads: the filter's k,
     // the sum's id and k
-    let rows = expect("SELECT COUNT(*), SUM(ABS(id * k)) FROM t WHERE k >= 1", 2);
+    let rows = expect(
+        "SELECT COUNT(*), SUM(ABS(id * k)) FILTER (WHERE id > 0) FROM t WHERE k >= 1",
+        2,
+    );
     assert_eq!(rows[0][0], "43");
     let sum: i64 = (1..=64i64)
         .filter(|i| i % 3 >= 1)

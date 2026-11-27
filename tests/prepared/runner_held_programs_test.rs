@@ -110,6 +110,15 @@ const CASES: &[(&str, &[i64], &[&str])] = &[
     ),
     ("SELECT SUM(a * $1) FROM t", &[2], &["Integer(120)"]),
     (
+        "SELECT id, SUM(ABS(a - $1)) FROM t GROUP BY id ORDER BY id",
+        &[15],
+        &[
+            "Integer(1)|Integer(5)",
+            "Integer(2)|Integer(5)",
+            "Integer(3)|Integer(15)",
+        ],
+    ),
+    (
         "SELECT id % 2, SUM(a + $1) FROM t GROUP BY id % 2 ORDER BY 1",
         &[1],
         &["Integer(0)|Integer(21)", "Integer(1)|Integer(42)"],

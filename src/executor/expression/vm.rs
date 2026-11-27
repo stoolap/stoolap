@@ -386,6 +386,12 @@ fn read_failed<'a>(failed: &[(usize, Error)], index: usize, value: &'a Value) ->
     }
 }
 
+/// A batch step found fewer operands than its op takes
+#[cold]
+fn empty_batch_stack() -> Error {
+    Error::internal("a batch step lacks an operand")
+}
+
 #[cold]
 fn missing_parameter(index: usize, provided: usize) -> Error {
     Error::invalid_argument(format!(
@@ -613,6 +619,136 @@ impl ExprVM {
         let matched = re.is_match(&text);
         self.cached_regexp = Some((SmartString::new(&pat), re));
         Ok(Value::Boolean(matched))
+    }
+
+    /// Whether [`Self::execute_batch`] runs every op of `program`
+    pub fn runs_batched(program: &Program) -> bool {
+        program.ops().iter().all(|op| {
+            matches!(
+                op,
+                Op::LoadColumn(_)
+                    | Op::LoadConst(_)
+                    | Op::LoadParam(_)
+                    | Op::LoadNull(_)
+                    | Op::Add
+                    | Op::Sub
+                    | Op::Mul
+                    | Op::Div
+                    | Op::Mod
+                    | Op::Neg
+                    | Op::Return
+            )
+        })
+    }
+
+    /// `program` over `n` rows whose column `k` holds `leaves[k]`, into
+    /// `out`: each op one loop over the rows calling the rule its row form
+    /// calls, `pool` lending the vectors the steps fill. For a program
+    /// [`Self::runs_batched`] accepts; an error is the first a step raised,
+    /// which need not be the first row's
+    pub fn execute_batch(
+        &mut self,
+        program: &Program,
+        (leaves, n): (&[Vec<Value>], usize),
+        params: &[Value],
+        out: &mut Vec<Value>,
+        pool: &mut Vec<Vec<Value>>,
+    ) -> Result<()> {
+        enum Operand<'a> {
+            Leaf(&'a [Value]),
+            Fixed(std::borrow::Cow<'a, Value>),
+            Rows(Vec<Value>),
+        }
+        fn at<'b>(operand: &'b Operand<'_>, row: usize) -> &'b Value {
+            match operand {
+                Operand::Leaf(values) => &values[row],
+                Operand::Fixed(value) => value,
+                Operand::Rows(values) => &values[row],
+            }
+        }
+        /// `left op right` over the rows into a vector `pool` lends, each
+        /// row by `rule`, monomorphised so the rule inlines into the loop
+        #[inline(always)]
+        fn step<'a>(
+            (left, right): (Operand<'a>, Operand<'a>),
+            n: usize,
+            pool: &mut Vec<Vec<Value>>,
+            rule: impl Fn(&Value, &Value) -> Result<Value>,
+        ) -> Result<Operand<'a>> {
+            let mut rows = pool.pop().unwrap_or_else(|| Vec::with_capacity(n));
+            rows.clear();
+            for row in 0..n {
+                rows.push(rule(at(&left, row), at(&right, row))?);
+            }
+            recycle(left, pool);
+            recycle(right, pool);
+            Ok(Operand::Rows(rows))
+        }
+        let mut stack: SmallVec<[Operand<'_>; 8]> = SmallVec::new();
+        for op in program.ops() {
+            let binary = match op {
+                Op::LoadColumn(idx) => {
+                    let leaf = leaves
+                        .get(*idx as usize)
+                        .ok_or_else(|| Error::internal("a batch reads a column it lacks"))?;
+                    stack.push(Operand::Leaf(&leaf[..n]));
+                    continue;
+                }
+                Op::LoadConst(value) => {
+                    stack.push(Operand::Fixed(std::borrow::Cow::Borrowed(value)));
+                    continue;
+                }
+                Op::LoadParam(idx) => {
+                    let value = params
+                        .get(*idx as usize)
+                        .ok_or_else(|| missing_parameter(*idx as usize, params.len()))?;
+                    stack.push(Operand::Fixed(std::borrow::Cow::Borrowed(value)));
+                    continue;
+                }
+                Op::LoadNull(dt) => {
+                    stack.push(Operand::Fixed(std::borrow::Cow::Owned(Value::Null(*dt))));
+                    continue;
+                }
+                Op::Neg => {
+                    let operand = stack.pop().ok_or_else(empty_batch_stack)?;
+                    let mut rows = pool.pop().unwrap_or_else(|| Vec::with_capacity(n));
+                    rows.clear();
+                    for row in 0..n {
+                        rows.push(numeric_neg(at(&operand, row))?);
+                    }
+                    recycle(operand, pool);
+                    stack.push(Operand::Rows(rows));
+                    continue;
+                }
+                Op::Return => break,
+                Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod => op,
+                _ => return Err(Error::internal("a batch holds an op it does not run")),
+            };
+            let right = stack.pop().ok_or_else(empty_batch_stack)?;
+            let left = stack.pop().ok_or_else(empty_batch_stack)?;
+            let operands = (left, right);
+            let rows = match binary {
+                Op::Add => step(operands, n, pool, Self::add_op)?,
+                Op::Sub => step(operands, n, pool, |a, b| self.sub_op(a, b))?,
+                Op::Mul => step(operands, n, pool, Self::mul_op)?,
+                Op::Div => step(operands, n, pool, Self::div_op)?,
+                _ => step(operands, n, pool, Self::mod_op)?,
+            };
+            stack.push(rows);
+        }
+        fn recycle(operand: Operand<'_>, pool: &mut Vec<Vec<Value>>) {
+            if let Operand::Rows(rows) = operand {
+                pool.push(rows);
+            }
+        }
+        out.clear();
+        out.reserve(n);
+        match stack.pop() {
+            Some(Operand::Rows(rows)) => pool.push(std::mem::replace(out, rows)),
+            Some(operand) => out.extend((0..n).map(|row| at(&operand, row).clone())),
+            None => out.extend((0..n).map(|_| Value::null_unknown())),
+        }
+        Ok(())
     }
 
     /// The value `program` computes over `ctx`'s row

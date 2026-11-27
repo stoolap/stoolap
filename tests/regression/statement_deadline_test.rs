@@ -121,7 +121,9 @@ fn statement(site: DeadlineSite, csv: &str) -> String {
              SELECT n FROM r"
         }
         DeadlineSite::Tvf => "SELECT value FROM generate_series(1, 5000)",
-        DeadlineSite::Aggregate => "SELECT k, SUM(ABS(v) * 2) FROM big GROUP BY k",
+        DeadlineSite::Aggregate => {
+            "SELECT k, SUM(ABS(v) * 2) FILTER (WHERE k = k) FROM big GROUP BY k"
+        }
         DeadlineSite::StorageDelete => "DELETE FROM w WHERE k >= 0",
         DeadlineSite::StorageUpdate => "UPDATE u SET k = k + 0 WHERE k >= 0",
         DeadlineSite::StorageRead => "SELECT id, ROW_NUMBER() OVER (ORDER BY v) AS n FROM big",
