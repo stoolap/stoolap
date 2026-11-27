@@ -43,6 +43,7 @@ use crate::common::{
 use crate::common::{KeyMap, KeySet};
 use crate::core::types::DataType;
 use crate::core::{Error, Row, RowVec, Schema, SumAccumulator, Value, NULL_VALUE};
+use crate::executor::expression::{ArgumentProgram, ExpressionBatch};
 use crate::functions::aggregate::{
     CallTemplate, ColumnsKey, CompiledAggregate, GroupKey, GroupedAggregates,
 };
@@ -432,15 +433,15 @@ pub fn clear_version_map_pools() {
 const TX_VERSION_MAP_INITIAL_CAPACITY: usize = 16;
 
 /// What one call of the storage aggregate pushdowns reads of a row: a
-/// column, or arithmetic over number columns
+/// column, or an expression over columns
 #[derive(Clone, Debug)]
 pub enum AggregateInput {
     Column(usize),
-    Program(std::sync::Arc<crate::core::numeric::NumericProgram>),
+    Program(std::sync::Arc<ArgumentProgram>),
 }
 
 impl AggregateInput {
-    /// The column a call reads, None for arithmetic
+    /// The column a call reads, None for an expression
     #[inline(always)]
     pub fn column(&self) -> Option<usize> {
         match self {
@@ -573,7 +574,7 @@ pub fn plain_columns(keys: &[GroupBy]) -> Option<smallvec::SmallVec<[usize; 4]>>
 }
 
 /// The calls of a statement, each with the column it reads, when none reads
-/// arithmetic; their rows take the loop without it
+/// an expression; their rows take the loop without it
 pub fn column_calls(
     aggregates: &[AggregateCall],
 ) -> Option<smallvec::SmallVec<[(AggregateOp, usize); 4]>> {
@@ -584,18 +585,21 @@ pub fn column_calls(
 }
 
 /// The calls a row runs into: `[(AggregateOp, usize)]` when every call reads
-/// a column, `[AggregateCall]` when one reads arithmetic
+/// a column, [`ExpressionCalls`] when one reads an expression
 pub trait RowCalls {
     /// Runs `row` into the calls of `group`
-    fn accumulate_row(&self, groups: &mut GroupedAggregates, group: usize, row: &[Value]);
+    fn accumulate_row(&mut self, groups: &mut GroupedAggregates, group: usize, row: &[Value]);
 
-    /// Whether a row's arithmetic failed, which ends the rows
+    /// Whether a row's expression failed, which ends the rows
     fn failed(&self, groups: &GroupedAggregates) -> bool;
+
+    /// Feeds the rows still held to their calls, once the rows end
+    fn finish(&mut self, groups: &mut GroupedAggregates);
 }
 
 impl RowCalls for [(AggregateOp, usize)] {
     #[inline(always)]
-    fn accumulate_row(&self, groups: &mut GroupedAggregates, group: usize, row: &[Value]) {
+    fn accumulate_row(&mut self, groups: &mut GroupedAggregates, group: usize, row: &[Value]) {
         accumulate_row(groups, group, self, row);
     }
 
@@ -603,17 +607,50 @@ impl RowCalls for [(AggregateOp, usize)] {
     fn failed(&self, _: &GroupedAggregates) -> bool {
         false
     }
+
+    #[inline(always)]
+    fn finish(&mut self, _: &mut GroupedAggregates) {}
 }
 
-impl RowCalls for [AggregateCall] {
+/// The calls of a statement of which some read an expression: a column
+/// call is fed as its row is read, an expression's rows are held and fed a
+/// chunk at a time
+pub struct ExpressionCalls<'a> {
+    calls: &'a [AggregateCall],
+    batch: ExpressionBatch,
+}
+
+impl<'a> ExpressionCalls<'a> {
+    pub fn new(calls: &'a [AggregateCall]) -> Self {
+        let arguments = calls
+            .iter()
+            .enumerate()
+            .filter_map(|(at, (_, input))| match input {
+                AggregateInput::Program(program) => Some((at, Arc::clone(program))),
+                AggregateInput::Column(_) => None,
+            });
+        Self {
+            calls,
+            batch: ExpressionBatch::new(arguments),
+        }
+    }
+}
+
+impl RowCalls for ExpressionCalls<'_> {
     #[inline(always)]
-    fn accumulate_row(&self, groups: &mut GroupedAggregates, group: usize, row: &[Value]) {
-        accumulate_row_with_arithmetic(groups, group, self, row);
+    fn accumulate_row(&mut self, groups: &mut GroupedAggregates, group: usize, row: &[Value]) {
+        accumulate_row_with_expressions(groups, group, self, row);
     }
 
     #[inline(always)]
     fn failed(&self, groups: &GroupedAggregates) -> bool {
         groups.has_failed()
+    }
+
+    fn finish(&mut self, groups: &mut GroupedAggregates) {
+        if let Err(error) = self.batch.flush(groups, |_, _, _, _| {}) {
+            groups.fail(error);
+        }
     }
 }
 
@@ -623,7 +660,7 @@ impl RowCalls for [AggregateCall] {
 pub fn aggregate_row<C: RowCalls + ?Sized>(
     groups: &mut GroupedAggregates,
     group_by_indices: &[usize],
-    aggregates: &C,
+    aggregates: &mut C,
     row: &[Value],
 ) {
     let key = ColumnsKey {
@@ -642,7 +679,7 @@ pub fn aggregate_row<C: RowCalls + ?Sized>(
 pub fn aggregate_bucketed_row<C: RowCalls + ?Sized>(
     groups: &mut GroupedAggregates,
     keys: &[GroupBy],
-    aggregates: &C,
+    aggregates: &mut C,
     row: &[Value],
     bucketed: &mut Vec<Value>,
 ) -> bool {
@@ -687,50 +724,38 @@ fn accumulate_row(
     }
 }
 
-/// `accumulate_row` for calls of which some read arithmetic; the first
-/// error a row's arithmetic raises is the groups'
+/// `accumulate_row` for calls of which some read an expression: the column
+/// calls are fed, the row's cells held for the expressions, and a chunk
+/// held is fed; the first error a row's expression raises is the groups'
 #[inline(never)]
-fn accumulate_row_with_arithmetic(
+fn accumulate_row_with_expressions(
     groups: &mut GroupedAggregates,
     group: usize,
-    aggregates: &[AggregateCall],
+    calls: &mut ExpressionCalls<'_>,
     row: &[Value],
 ) {
-    let mut failed = None;
-    for (run, (op, input)) in groups.aggregates(group).iter_mut().zip(aggregates) {
-        let col_idx = match input {
-            AggregateInput::Column(column) => *column,
-            AggregateInput::Program(program) => {
-                if let Err(error) = accumulate_program(run, program, row) {
-                    failed = Some(error);
-                    break;
-                }
-                continue;
-            }
+    for (run, (op, input)) in groups.aggregates(group).iter_mut().zip(calls.calls) {
+        let AggregateInput::Column(col_idx) = input else {
+            continue;
         };
-        let value = row.get(col_idx).unwrap_or(&ABSENT);
+        let value = row.get(*col_idx).unwrap_or(&ABSENT);
         match op.order_key() {
             None => run.accumulate(value),
             Some(key) => run.accumulate_ordered(value, row.get(key).unwrap_or(&ABSENT)),
         }
     }
-    if let Some(error) = failed {
+    // A number is copied in place, the other values cloned
+    let cell = |_, _, column: usize| match row.get(column) {
+        Some(Value::Integer(value)) => Value::Integer(*value),
+        Some(Value::Float(value)) => Value::Float(*value),
+        Some(value) => value.clone(),
+        None => NULL_VALUE,
+    };
+    if calls.batch.hold(group, cell)
+        && let Err(error) = calls.batch.flush(groups, |_, _, _, _| {})
+    {
         groups.fail(error);
     }
-}
-
-/// Feeds a call the arithmetic `program` computes over `row`, out of line
-/// so the column calls' loop keeps its shape
-#[cold]
-#[inline(never)]
-fn accumulate_program(
-    run: &mut CompiledAggregate,
-    program: &crate::core::numeric::NumericProgram,
-    row: &[Value],
-) -> crate::core::Result<()> {
-    let cell = |at: usize| row.get(program.columns[at]).cloned().unwrap_or(NULL_VALUE);
-    run.accumulate(&program.evaluate(&cell)?);
-    Ok(())
 }
 
 /// The stamp of a version published before its transaction took a commit
@@ -7791,9 +7816,9 @@ impl VersionStore {
         // None lets the caller fall back to regular GROUP BY aggregation
         let mut rejected = false;
         let pass = match column_calls(aggregates) {
-            Some(calls) => self.visit_grouped(
+            Some(mut calls) => self.visit_grouped(
                 keys,
-                &calls[..],
+                &mut calls[..],
                 &mut groups,
                 &mut rejected,
                 (&checker, reader),
@@ -7801,7 +7826,7 @@ impl VersionStore {
             ),
             None => self.visit_grouped(
                 keys,
-                aggregates,
+                &mut ExpressionCalls::new(aggregates),
                 &mut groups,
                 &mut rejected,
                 (&checker, reader),
@@ -7821,13 +7846,13 @@ impl VersionStore {
     fn visit_grouped<C: VisibilityChecker + ?Sized, A: RowCalls + ?Sized>(
         &self,
         keys: &[GroupBy],
-        aggregates: &A,
+        aggregates: &mut A,
         groups: &mut GroupedAggregates,
         rejected: &mut bool,
         (checker, reader): (&ReaderChecker<'_, '_, C>, Reader<'_>),
         deadline: Deadline,
     ) -> HeadsPass {
-        match plain_columns(keys) {
+        let pass = match plain_columns(keys) {
             Some(columns) => {
                 let visit = |row: &[Value]| {
                     aggregate_row(groups, &columns, aggregates, row);
@@ -7844,7 +7869,12 @@ impl VersionStore {
                 };
                 self.visit_live_heads(checker, reader, visit, deadline)
             }
+        };
+        // Only a pass whose groups answer feeds the rows it still holds
+        if matches!(pass, HeadsPass::Answered | HeadsPass::Empty) && !*rejected {
+            aggregates.finish(groups);
         }
+        pass
     }
 
     /// Runs `visit` over every arena head `reader` sees, until it returns

@@ -125,13 +125,13 @@ fn failing_allocations(
 }
 
 #[test]
-fn arithmetic_that_fails_stops_at_its_first_row() {
+fn arithmetic_that_fails_stops_within_its_first_chunk() {
     let dir = tempfile::tempdir().unwrap();
-    // Many failing rows hot or in one volume, then one failing volume
-    // before a healthy one
+    // Failing rows past one chunk of 2,048 hot or in one volume, then one
+    // failing volume before a healthy one
     let shapes = [
-        (None, [(100, 0), (800, 0)]),
-        (Some(dir.path()), [(100, 0), (800, 0)]),
+        (None, [(3000, 0), (24000, 0)]),
+        (Some(dir.path()), [(3000, 0), (24000, 0)]),
         (Some(dir.path()), [(1, 100), (1, 800)]),
     ];
     for (sealed, [few_rows, many_rows]) in shapes {

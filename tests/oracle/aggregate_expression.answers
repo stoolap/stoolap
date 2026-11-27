@@ -1,12 +1,18 @@
 2	178da4ac8f2fced4	memory: SELECT AVG((b - a) / a), SUM(a % b), SUM(v * 2 + 1), AVG(f * f) FROM r
 2	bfefbd9fcadf736a	memory: SELECT AVG(f * a) FROM r WHERE b > a
 2	43bbd985ac259b40	memory: SELECT COUNT(*), SUM(a * b) FROM r WHERE v > 15
+5	436ff09e140f5eb2	memory: SELECT DATE_TRUNC('day', ts), SUM(2 * 3), AVG(NULLIF(b, 0) * 2) FROM r GROUP BY DATE_TRUNC('day', ts)
 5	e121044f14bf6057	memory: SELECT DATE_TRUNC('day', ts), SUM(v / 3), SUM(v % 3) FROM r GROUP BY DATE_TRUNC('day', ts)
+2	d16c69765be47a66	memory: SELECT SUM(CAST(a AS FLOAT) / 4), MAX(LENGTH(d) + v), MIN(UPPER(d)), MAX(d || '-') FROM r
 1	583903d474834fdc	memory: SELECT SUM(a * 2) FROM o
 2	d3f3b094011106de	memory: SELECT SUM(a * b), SUM(a + f), COUNT(a / b), MIN(a - b), MAX(-a) FROM r
 4	3ebf6d4a9d8047af	memory: SELECT d, FIRST(a ORDER BY v), SUM(a * b), LAST(f ORDER BY v) FROM r GROUP BY d
+4	7fdf42c6e94aa481	memory: SELECT d, MAX(ts + 1), MIN(ts - 1), COUNT(NULLIF(a, 0)) FROM r GROUP BY d
 3	79ec806f9ab5d2cc	memory: SELECT d, MIN(a * f), MAX(v - a) FROM r GROUP BY d HAVING SUM(a * b) > 0
 4	f8f6ea48deea8f81	memory: SELECT d, SUM((a - 1) * (b + 1)), SUM(a) FROM r GROUP BY d
+4	c62b7b8e8aa488d7	memory: SELECT d, SUM(ABS(a)), MAX(ROUND(f * 3, 1)), MIN(COALESCE(f, -9)) FROM r GROUP BY d
+4	678b995c5a2cc789	memory: SELECT d, SUM(CASE WHEN a > 0 THEN a ELSE 0 END), COUNT(CASE WHEN b > 2 THEN 1 END) FROM r GROUP BY d
+4	84126ea796fda743	memory: SELECT d, SUM(a * b + ABS(b)) FROM r WHERE v > 15 GROUP BY d
 3	e212d3d6d9755349	memory: SELECT d, SUM(a * b) FROM r WHERE a > 0 GROUP BY d
 4	84dc62c8b0f59bcb	memory: SELECT d, SUM(a * b), AVG(a + 0.5), COUNT(b / a) FROM r GROUP BY d
 8	bfcd13e75104c3b6	memory: SELECT d, a, SUM(v * b), COUNT(*) FROM r GROUP BY d, a
@@ -14,12 +20,18 @@
 2	579bc4a4bc1b61f6	mixed: SELECT AVG((b - a) / a), SUM(a % b), SUM(v * 2 + 1), AVG(f * f) FROM r
 2	5b816b6e9c3abb20	mixed: SELECT AVG(f * a) FROM r WHERE b > a
 2	5585d585b65ac92d	mixed: SELECT COUNT(*), SUM(a * b) FROM r WHERE v > 15
+4	a9b9770f2358331f	mixed: SELECT DATE_TRUNC('day', ts), SUM(2 * 3), AVG(NULLIF(b, 0) * 2) FROM r GROUP BY DATE_TRUNC('day', ts)
 4	3f688a12f4261552	mixed: SELECT DATE_TRUNC('day', ts), SUM(v / 3), SUM(v % 3) FROM r GROUP BY DATE_TRUNC('day', ts)
+2	72d77873e6ebf533	mixed: SELECT SUM(CAST(a AS FLOAT) / 4), MAX(LENGTH(d) + v), MIN(UPPER(d)), MAX(d || '-') FROM r
 1	583903d474834fdc	mixed: SELECT SUM(a * 2) FROM o
 2	1353d2595da18d53	mixed: SELECT SUM(a * b), SUM(a + f), COUNT(a / b), MIN(a - b), MAX(-a) FROM r
 4	a8339597df48ee52	mixed: SELECT d, FIRST(a ORDER BY v), SUM(a * b), LAST(f ORDER BY v) FROM r GROUP BY d
+4	2f2395b6346d4b6a	mixed: SELECT d, MAX(ts + 1), MIN(ts - 1), COUNT(NULLIF(a, 0)) FROM r GROUP BY d
 2	f393396079f49495	mixed: SELECT d, MIN(a * f), MAX(v - a) FROM r GROUP BY d HAVING SUM(a * b) > 0
 4	80893731c322bdee	mixed: SELECT d, SUM((a - 1) * (b + 1)), SUM(a) FROM r GROUP BY d
+4	42b984c46622f902	mixed: SELECT d, SUM(ABS(a)), MAX(ROUND(f * 3, 1)), MIN(COALESCE(f, -9)) FROM r GROUP BY d
+4	25b764704d27f0d3	mixed: SELECT d, SUM(CASE WHEN a > 0 THEN a ELSE 0 END), COUNT(CASE WHEN b > 2 THEN 1 END) FROM r GROUP BY d
+3	9521c85834195f4a	mixed: SELECT d, SUM(a * b + ABS(b)) FROM r WHERE v > 15 GROUP BY d
 4	95ebe6f7a28b8bda	mixed: SELECT d, SUM(a * b) FROM r WHERE a > 0 GROUP BY d
 4	974873c659985d8c	mixed: SELECT d, SUM(a * b), AVG(a + 0.5), COUNT(b / a) FROM r GROUP BY d
 8	71a69a844c7b70ca	mixed: SELECT d, a, SUM(v * b), COUNT(*) FROM r GROUP BY d, a
@@ -27,12 +39,18 @@
 2	178da4ac8f2fced4	sealed: SELECT AVG((b - a) / a), SUM(a % b), SUM(v * 2 + 1), AVG(f * f) FROM r
 2	bfefbd9fcadf736a	sealed: SELECT AVG(f * a) FROM r WHERE b > a
 2	43bbd985ac259b40	sealed: SELECT COUNT(*), SUM(a * b) FROM r WHERE v > 15
+5	436ff09e140f5eb2	sealed: SELECT DATE_TRUNC('day', ts), SUM(2 * 3), AVG(NULLIF(b, 0) * 2) FROM r GROUP BY DATE_TRUNC('day', ts)
 5	e121044f14bf6057	sealed: SELECT DATE_TRUNC('day', ts), SUM(v / 3), SUM(v % 3) FROM r GROUP BY DATE_TRUNC('day', ts)
+2	d16c69765be47a66	sealed: SELECT SUM(CAST(a AS FLOAT) / 4), MAX(LENGTH(d) + v), MIN(UPPER(d)), MAX(d || '-') FROM r
 1	583903d474834fdc	sealed: SELECT SUM(a * 2) FROM o
 2	d3f3b094011106de	sealed: SELECT SUM(a * b), SUM(a + f), COUNT(a / b), MIN(a - b), MAX(-a) FROM r
 4	3ebf6d4a9d8047af	sealed: SELECT d, FIRST(a ORDER BY v), SUM(a * b), LAST(f ORDER BY v) FROM r GROUP BY d
+4	7fdf42c6e94aa481	sealed: SELECT d, MAX(ts + 1), MIN(ts - 1), COUNT(NULLIF(a, 0)) FROM r GROUP BY d
 3	79ec806f9ab5d2cc	sealed: SELECT d, MIN(a * f), MAX(v - a) FROM r GROUP BY d HAVING SUM(a * b) > 0
 4	f8f6ea48deea8f81	sealed: SELECT d, SUM((a - 1) * (b + 1)), SUM(a) FROM r GROUP BY d
+4	c62b7b8e8aa488d7	sealed: SELECT d, SUM(ABS(a)), MAX(ROUND(f * 3, 1)), MIN(COALESCE(f, -9)) FROM r GROUP BY d
+4	678b995c5a2cc789	sealed: SELECT d, SUM(CASE WHEN a > 0 THEN a ELSE 0 END), COUNT(CASE WHEN b > 2 THEN 1 END) FROM r GROUP BY d
+4	84126ea796fda743	sealed: SELECT d, SUM(a * b + ABS(b)) FROM r WHERE v > 15 GROUP BY d
 3	e212d3d6d9755349	sealed: SELECT d, SUM(a * b) FROM r WHERE a > 0 GROUP BY d
 4	84dc62c8b0f59bcb	sealed: SELECT d, SUM(a * b), AVG(a + 0.5), COUNT(b / a) FROM r GROUP BY d
 8	bfcd13e75104c3b6	sealed: SELECT d, a, SUM(v * b), COUNT(*) FROM r GROUP BY d, a

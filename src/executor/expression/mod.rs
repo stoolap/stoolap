@@ -36,6 +36,7 @@
 //   │   (Value)   │     │              │     │             │
 //   └─────────────┘     └──────────────┘     └─────────────┘
 
+mod argument;
 mod bound_program;
 mod compiler;
 mod join_filter;
@@ -45,6 +46,7 @@ mod program;
 mod row_filter;
 mod vm;
 
+pub use argument::{ArgumentProgram, ExpressionBatch};
 pub(crate) use compiler::literal_value;
 pub(crate) use compiler::parameter_slot;
 pub(crate) use compiler::Reference;

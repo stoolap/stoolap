@@ -12,18 +12,47 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! COUNT, SUM, AVG, MIN and MAX of arithmetic over number columns, such as
-//! `SUM(c * a)`, are computed by the table, in the hot rows and the
-//! volumes, and answer as recorded, each answer confirmed by the general
-//! path when it was recorded
+//! COUNT, SUM, AVG, MIN and MAX of an expression over columns, such as
+//! `SUM(c * a)` or `SUM(CASE ...)`, are computed by the table, in the hot
+//! rows and the volumes, and answer as recorded, each answer confirmed by
+//! the general path when it was recorded
 
 #![cfg(feature = "test-failpoints")]
 
 use stoolap::core::Value;
+use stoolap::functions::registry::global_registry;
+use stoolap::functions::{
+    FunctionDataType, FunctionInfo, FunctionSignature, FunctionType, ScalarFunction,
+};
 use stoolap::test_failpoints::{aggregate_paths_taken, reset_aggregate_paths};
 use stoolap::Database;
 
 use crate::oracle;
+
+/// A function an application registers, which may call back into the
+/// database: here it gives its argument
+#[derive(Default)]
+struct RegisteredEcho;
+
+impl ScalarFunction for RegisteredEcho {
+    fn name(&self) -> &str {
+        "AGGREGATE_EXPRESSION_ECHO"
+    }
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "AGGREGATE_EXPRESSION_ECHO",
+            FunctionType::Scalar,
+            "gives its argument",
+            FunctionSignature::new(FunctionDataType::Any, vec![FunctionDataType::Any], 1, 1),
+        )
+    }
+    fn evaluate(&self, args: &[Value]) -> stoolap::core::Result<Value> {
+        Ok(args[0].clone())
+    }
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(RegisteredEcho)
+    }
+}
 
 /// NULLs, a zero divisor, negatives, and INTEGER beside FLOAT
 const ROWS: &str = "INSERT INTO r VALUES \
@@ -49,6 +78,15 @@ const CASES: &[&str] = &[
     "SELECT d, a, SUM(v * b), COUNT(*) FROM r GROUP BY d, a",
     "SELECT d, SUM((a - 1) * (b + 1)), SUM(a) FROM r GROUP BY d",
     "SELECT d, FIRST(a ORDER BY v), SUM(a * b), LAST(f ORDER BY v) FROM r GROUP BY d",
+    // Functions, CASE, CAST, text and timestamps, run a row at a time
+    "SELECT d, SUM(ABS(a)), MAX(ROUND(f * 3, 1)), MIN(COALESCE(f, -9)) FROM r GROUP BY d",
+    "SELECT d, SUM(CASE WHEN a > 0 THEN a ELSE 0 END), COUNT(CASE WHEN b > 2 THEN 1 END) \
+     FROM r GROUP BY d",
+    "SELECT SUM(CAST(a AS FLOAT) / 4), MAX(LENGTH(d) + v), MIN(UPPER(d)), MAX(d || '-') FROM r",
+    "SELECT d, MAX(ts + 1), MIN(ts - 1), COUNT(NULLIF(a, 0)) FROM r GROUP BY d",
+    "SELECT DATE_TRUNC('day', ts), SUM(2 * 3), AVG(NULLIF(b, 0) * 2) FROM r \
+     GROUP BY DATE_TRUNC('day', ts)",
+    "SELECT d, SUM(a * b + ABS(b)) FROM r WHERE v > 15 GROUP BY d",
 ];
 
 /// `sql` with `id + 0 = id` in its WHERE, which the table cannot run
@@ -128,7 +166,7 @@ fn run(db: &Database, sql: &str) -> (Result<Vec<String>, String>, Vec<&'static s
     (answer, aggregate_paths_taken())
 }
 
-const RECORDED: oracle::Answers = answers!("aggregate_arithmetic");
+const RECORDED: oracle::Answers = answers!("aggregate_expression");
 
 /// Whether the table computes `sql` in `context`: a memory table leaves the
 /// rows a WHERE passes to the scan
@@ -137,7 +175,7 @@ fn computed(context: &str, sql: &str) -> bool {
 }
 
 #[test]
-fn arithmetic_over_columns_aggregates_in_the_table_as_recorded() {
+fn expressions_over_columns_aggregate_in_the_table_as_recorded() {
     let dir = tempfile::tempdir().unwrap();
     let file = |name: &str| {
         Database::open(&format!(
@@ -150,7 +188,7 @@ fn arithmetic_over_columns_aggregates_in_the_table_as_recorded() {
         (
             "memory",
             open(
-                Database::open("memory://aggregate_arithmetic").unwrap(),
+                Database::open("memory://aggregate_expression").unwrap(),
                 "memory",
             ),
         ),
@@ -207,7 +245,7 @@ fn a_parameter_in_the_arithmetic_is_read_at_each_run() {
     for sealed in [false, true] {
         let db = match sealed {
             false => open(
-                Database::open("memory://aggregate_arithmetic_parameter").unwrap(),
+                Database::open("memory://aggregate_expression_parameter").unwrap(),
                 "memory",
             ),
             true => open(
@@ -254,7 +292,7 @@ fn a_limit_bounding_the_groups_leaves_the_arithmetic_of_rows_past_them_unrun() {
     let dir = tempfile::tempdir().unwrap();
     for sealed in [false, true] {
         let db = match sealed {
-            false => Database::open("memory://aggregate_arithmetic_group_limit").unwrap(),
+            false => Database::open("memory://aggregate_expression_group_limit").unwrap(),
             true => Database::open(&format!(
                 "file://{}/group_limit?checkpoint_interval=0",
                 dir.path().display()
@@ -291,6 +329,80 @@ fn a_limit_bounding_the_groups_leaves_the_arithmetic_of_rows_past_them_unrun() {
 }
 
 #[test]
+fn a_cancelled_hot_read_leaves_the_rows_it_holds_uncomputed() {
+    use stoolap::executor::DeadlineSite;
+    use stoolap::test_failpoints::{keep_deadlines, pass_deadline_after, programs_ran};
+    let _guard = stoolap::test_failpoints::FailpointGuard::new();
+    let db = Database::open("memory://aggregate_expression_cancelled").unwrap();
+    for sql in [
+        "CREATE TABLE h (id INTEGER PRIMARY KEY, g INTEGER, v INTEGER)",
+        // Two strides of the heads pass: 1,024 slots, then the rest
+        "INSERT INTO h SELECT s.value, s.value % 3, s.value FROM generate_series(1, 1500) s",
+        "PRAGMA query_timeout = 3600000",
+    ] {
+        db.execute(sql, ()).unwrap();
+    }
+    pass_deadline_after(DeadlineSite::StorageAggregate, 1);
+    let mut got = None;
+    let ran = programs_ran(|| {
+        got = Some(
+            db.query("SELECT g, SUM(ABS(v)) FROM h GROUP BY g", ())
+                .and_then(|rows| rows.collect::<std::result::Result<Vec<_>, _>>())
+                .map(|rows| rows.len()),
+        );
+    });
+    keep_deadlines();
+    assert!(
+        matches!(got, Some(Err(stoolap::core::Error::QueryCancelled))),
+        "{got:?}"
+    );
+    let argument: usize = ran
+        .iter()
+        .filter(|(listing, _)| listing.contains("CallScalar"))
+        .map(|(_, times)| times)
+        .sum();
+    assert_eq!(argument, 0, "the held rows were computed: {ran:?}");
+}
+
+#[test]
+fn the_error_is_the_first_failing_rows_first_failing_call() {
+    let dir = tempfile::tempdir().unwrap();
+    for sealed in [false, true] {
+        let db = match sealed {
+            false => Database::open("memory://aggregate_expression_error_order").unwrap(),
+            true => Database::open(&format!(
+                "file://{}/error_order?checkpoint_interval=0",
+                dir.path().display()
+            ))
+            .unwrap(),
+        };
+        for sql in [
+            "CREATE TABLE e (id INTEGER PRIMARY KEY, g INTEGER, a INTEGER, b INTEGER)",
+            // Row 1 overflows b * 2, row 2 a * 2
+            "INSERT INTO e VALUES (1, 1, 1, 9223372036854775807), \
+             (2, 1, 9223372036854775807, 1)",
+        ] {
+            db.execute(sql, ()).unwrap();
+        }
+        if sealed {
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        for sql in [
+            "SELECT SUM(a * 2), SUM(b * 2) FROM e",
+            "SELECT g, SUM(a * 2), SUM(b * 2) FROM e GROUP BY g",
+            "SELECT SUM(a * 2), SUM(b * 2) FROM e WHERE id + 0 = id",
+        ] {
+            let (got, _) = run(&db, sql);
+            let error = got.expect_err(sql);
+            assert!(
+                error.contains("SUM(b * 2)"),
+                "sealed {sealed}: {sql}: {error}"
+            );
+        }
+    }
+}
+
+#[test]
 fn an_argument_the_table_cannot_compute_is_left_to_the_general_path() {
     let dir = tempfile::tempdir().unwrap();
     let db = open(
@@ -302,18 +414,21 @@ fn an_argument_the_table_cannot_compute_is_left_to_the_general_path() {
         "sealed",
     );
     let declined = [
-        // A function, CASE, CAST, a timestamp, no column at all
-        "SELECT d, SUM(ABS(a)) FROM r GROUP BY d",
-        "SELECT d, SUM(CASE WHEN a > 0 THEN a ELSE 0 END) FROM r GROUP BY d",
-        "SELECT d, SUM(CAST(a AS FLOAT) * 2) FROM r GROUP BY d",
-        "SELECT d, MAX(ts + 1) FROM r GROUP BY d",
-        "SELECT d, SUM(2 * 3) FROM r GROUP BY d",
-        // DISTINCT, FILTER, a qualified column, a TEXT column
+        // DISTINCT, FILTER, a qualified column
         "SELECT d, SUM(DISTINCT a * b) FROM r GROUP BY d",
         "SELECT d, SUM(a * b) FILTER (WHERE v > 0) FROM r GROUP BY d",
         "SELECT d, SUM(r.a * b) FROM r GROUP BY d",
-        "SELECT SUM(a * d) FROM r",
+        // A new value per call or per statement, a subquery
+        "SELECT d, SUM(a * RANDOM()) FROM r GROUP BY d",
+        "SELECT d, MAX(NOW()) FROM r GROUP BY d",
+        "SELECT d, SUM(a * (SELECT COUNT(*) FROM o WHERE o.g = r.b)) FROM r GROUP BY d",
+        // An expression as FIRST's value
+        "SELECT d, FIRST(a * 2 ORDER BY v) FROM r GROUP BY d",
+        // A registered function, which may call back into the database
+        "SELECT d, SUM(AGGREGATE_EXPRESSION_ECHO(a) * 2) FROM r GROUP BY d",
     ];
+    // A second registration of the same function replaces the first
+    let _ = global_registry().register_scalar::<RegisteredEcho>();
     for sql in declined {
         let (_, taken) = run(&db, sql);
         assert!(

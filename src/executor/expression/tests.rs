@@ -172,6 +172,70 @@ fn test_arithmetic() {
 }
 
 #[test]
+fn a_batch_computes_each_row_by_its_ops_rules() {
+    use crate::core::DataType;
+    let mut vm = ExprVM::new();
+    // -(col[0] * col[1]) + 1
+    let program = Program::new(vec![
+        Op::LoadColumn(0),
+        Op::LoadColumn(1),
+        Op::Mul,
+        Op::Neg,
+        Op::LoadConst(Value::Integer(1)),
+        Op::Add,
+        Op::Return,
+    ]);
+    assert!(ExprVM::runs_batched(&program));
+    let leaves = vec![
+        vec![
+            Value::Integer(2),
+            Value::Integer(3),
+            Value::Null(DataType::Integer),
+            Value::Float(1.5),
+            Value::Integer(7),
+        ],
+        vec![
+            Value::Integer(4),
+            Value::Null(DataType::Integer),
+            Value::Integer(5),
+            Value::Integer(2),
+            Value::Integer(0),
+        ],
+    ];
+    let (mut out, mut pool) = (Vec::new(), Vec::new());
+    vm.execute_batch(&program, (&leaves, 5), &[], &mut out, &mut pool)
+        .unwrap();
+    assert_eq!(
+        out,
+        [
+            Value::Integer(-7),
+            Value::Null(DataType::Float),
+            Value::Null(DataType::Float),
+            Value::Float(-2.0),
+            Value::Integer(1),
+        ]
+    );
+
+    // An overflowing row fails the batch
+    let leaves = vec![
+        vec![Value::Integer(1), Value::Integer(i64::MAX)],
+        vec![Value::Integer(2), Value::Integer(2)],
+    ];
+    assert!(vm
+        .execute_batch(&program, (&leaves, 2), &[], &mut out, &mut pool)
+        .is_err());
+
+    // A jump is run a row at a time
+    let program = Program::new(vec![
+        Op::LoadColumn(0),
+        Op::JumpIfNotNull(3),
+        Op::Return,
+        Op::Return,
+    ]);
+    assert!(!ExprVM::runs_batched(&program));
+}
+
+#[test]
 fn test_in_set() {
     let mut vm = ExprVM::new();
 

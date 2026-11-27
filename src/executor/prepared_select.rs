@@ -4371,11 +4371,13 @@ pub(crate) struct PreparedCalls {
 }
 
 /// Where a run finds names in the columns it reads: each column by name,
-/// and the column each call reads alone
+/// the column each call reads alone, and each call's expression compiled
+/// for the table to compute
 #[derive(Debug)]
 pub(crate) struct ColumnPlaces {
     pub(crate) map: StringMap<usize>,
     pub(crate) calls: Vec<Option<usize>>,
+    pub(crate) arguments: Vec<Option<super::planned_aggregate::CompiledArgument>>,
 }
 
 impl PreparedCalls {
@@ -4388,6 +4390,7 @@ impl PreparedCalls {
         let places = Arc::new(ColumnPlaces {
             map: build_column_index_map(columns),
             calls: Executor::call_columns(&self.calls, columns),
+            arguments: Executor::call_arguments(&self.calls, columns),
         });
         self.places
             .hold(wanted, || columns.to_vec(), || Arc::clone(&places));
