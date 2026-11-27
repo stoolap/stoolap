@@ -8850,8 +8850,8 @@ impl Table for SegmentedTable {
             crate::test_failpoints::hot_and_cold_reads_split();
             let mut hot_skip: KeySet<i64> =
                 KeySet::with_capacity_and_hasher(hot_rows.len().max(1024), Default::default());
-            // Runs the hot rows into `groups`; false when a bucket rejects
-            // a row's value
+            // Runs the hot rows into `groups`, up to the first whose
+            // arithmetic fails; false when a bucket rejects a row's value
             fn feed_hot<C: RowCalls + ?Sized>(
                 groups: &mut GroupedAggregates,
                 keys: &[GroupBy],
@@ -8874,6 +8874,9 @@ impl Table for SegmentedTable {
                             }
                         }
                     }
+                    if aggregates.failed(groups) {
+                        break;
+                    }
                 }
                 true
             }
@@ -8883,6 +8886,10 @@ impl Table for SegmentedTable {
             };
             if !fed {
                 return Ok(Some(None));
+            }
+            // A hot row's arithmetic failed: the volumes are not read
+            if groups.has_failed() {
+                return Ok(Some(Some(groups)));
             }
 
             // --- Cold volumes (THE FAST PATH) ------------------------------------
@@ -10240,6 +10247,10 @@ impl<'v> VolumeInputs<'v> for RichInputs<'v> {
 
     #[inline(always)]
     fn feed_row(&mut self, runs: &mut [CompiledAggregate], i: usize) {
+        // After a failed row the rest of its row group feeds nothing
+        if self.failed.is_some() {
+            return;
+        }
         for (run, input) in runs.iter_mut().zip(&self.inputs) {
             match input {
                 RichInput::Plain(input) => {
@@ -10247,7 +10258,8 @@ impl<'v> VolumeInputs<'v> for RichInputs<'v> {
                 }
                 RichInput::Program(cells) => {
                     if let Err(error) = accumulate_program(run, cells, i) {
-                        self.failed.get_or_insert(error);
+                        self.failed = Some(error);
+                        return;
                     }
                 }
             }

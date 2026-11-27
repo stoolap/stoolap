@@ -588,6 +588,9 @@ pub fn column_calls(
 pub trait RowCalls {
     /// Runs `row` into the calls of `group`
     fn accumulate_row(&self, groups: &mut GroupedAggregates, group: usize, row: &[Value]);
+
+    /// Whether a row's arithmetic failed, which ends the rows
+    fn failed(&self, groups: &GroupedAggregates) -> bool;
 }
 
 impl RowCalls for [(AggregateOp, usize)] {
@@ -595,12 +598,22 @@ impl RowCalls for [(AggregateOp, usize)] {
     fn accumulate_row(&self, groups: &mut GroupedAggregates, group: usize, row: &[Value]) {
         accumulate_row(groups, group, self, row);
     }
+
+    #[inline(always)]
+    fn failed(&self, _: &GroupedAggregates) -> bool {
+        false
+    }
 }
 
 impl RowCalls for [AggregateCall] {
     #[inline(always)]
     fn accumulate_row(&self, groups: &mut GroupedAggregates, group: usize, row: &[Value]) {
         accumulate_row_with_arithmetic(groups, group, self, row);
+    }
+
+    #[inline(always)]
+    fn failed(&self, groups: &GroupedAggregates) -> bool {
+        groups.has_failed()
     }
 }
 
@@ -689,7 +702,8 @@ fn accumulate_row_with_arithmetic(
             AggregateInput::Column(column) => *column,
             AggregateInput::Program(program) => {
                 if let Err(error) = accumulate_program(run, program, row) {
-                    failed.get_or_insert(error);
+                    failed = Some(error);
+                    break;
                 }
                 continue;
             }
@@ -7815,7 +7829,10 @@ impl VersionStore {
     ) -> HeadsPass {
         match plain_columns(keys) {
             Some(columns) => {
-                let visit = |row: &[Value]| aggregate_row(groups, &columns, aggregates, row);
+                let visit = |row: &[Value]| {
+                    aggregate_row(groups, &columns, aggregates, row);
+                    !aggregates.failed(groups)
+                };
                 self.visit_live_heads(checker, reader, visit, deadline)
             }
             None => {
@@ -7823,20 +7840,22 @@ impl VersionStore {
                 let visit = |row: &[Value]| {
                     *rejected |=
                         !aggregate_bucketed_row(groups, keys, aggregates, row, &mut bucketed);
+                    !aggregates.failed(groups)
                 };
                 self.visit_live_heads(checker, reader, visit, deadline)
             }
         }
     }
 
-    /// Runs `visit` over every arena head `reader` sees. A head may hide an
-    /// older version the reader sees, so the pass runs only inside the arena
-    /// window, and answers only if no commit published across it
+    /// Runs `visit` over every arena head `reader` sees, until it returns
+    /// false. A head may hide an older version the reader sees, so the pass
+    /// runs only inside the arena window, and answers only if no commit
+    /// published across it
     fn visit_live_heads<C: VisibilityChecker + ?Sized>(
         &self,
         checker: &ReaderChecker<'_, '_, C>,
         reader: Reader<'_>,
-        mut visit: impl FnMut(&[Value]),
+        mut visit: impl FnMut(&[Value]) -> bool,
         deadline: Deadline,
     ) -> HeadsPass {
         // Slots between checks that no commit began publishing: its answer
@@ -7855,7 +7874,7 @@ impl VersionStore {
         // Asked once per run of heads from one transaction
         let (mut last_txn_id, mut last_visible) = (0i64, false);
 
-        for (stride, metas) in arena_meta.chunks(EPOCH_STRIDE).enumerate() {
+        'heads: for (stride, metas) in arena_meta.chunks(EPOCH_STRIDE).enumerate() {
             if self.publish_epoch_if_quiet() != Some(epoch) {
                 return HeadsPass::Unheld;
             }
@@ -7883,8 +7902,10 @@ impl VersionStore {
                 {
                     continue;
                 }
-                if let Some(row) = arena_data.get(idx) {
-                    visit(row.as_ref());
+                if let Some(row) = arena_data.get(idx)
+                    && !visit(row.as_ref())
+                {
+                    break 'heads;
                 }
             }
         }
@@ -7959,6 +7980,7 @@ impl VersionStore {
                 if let Some(value) = row.get(col_idx) {
                     run.accumulate(value);
                 }
+                true
             },
             deadline,
         );

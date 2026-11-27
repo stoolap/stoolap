@@ -218,6 +218,11 @@ impl GroupedAggregates {
         self.failed.get_or_insert(error);
     }
 
+    /// Whether a row's argument raised an error
+    pub fn has_failed(&self) -> bool {
+        self.failed.is_some()
+    }
+
     /// The one group of an aggregation without GROUP BY, there with no rows
     pub fn global(calls: Vec<CallTemplate>) -> Self {
         let mut groups = Self::new(calls, 0);

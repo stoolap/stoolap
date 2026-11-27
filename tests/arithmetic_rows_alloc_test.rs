@@ -74,6 +74,71 @@ fn allocations(rows: i64, sql: &str) -> usize {
     ALLOCATIONS.with(Cell::get) - before
 }
 
+/// The allocations of one failing run of `sql`, prepared, over `rows` rows
+/// whose `k` doubled overflows, hot or sealed in `dir`, in database `n`
+fn failing_allocations(n: usize, rows: i64, sql: &str, dir: Option<&std::path::Path>) -> usize {
+    let dsn = match dir {
+        None => format!("memory://arithmetic_rows_alloc_failing_{n}_{rows}"),
+        Some(dir) => format!(
+            "file://{}/failing_{n}_{rows}?checkpoint_interval=0",
+            dir.display()
+        ),
+    };
+    let db = Database::open(&dsn).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, k INTEGER, v FLOAT)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        &format!(
+            "INSERT INTO t SELECT g.value, 1, 9223372036854775807, 0.5 \
+             FROM generate_series(1, {rows}) g"
+        ),
+        (),
+    )
+    .unwrap();
+    if dir.is_some() {
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    }
+    let query = db.prepare(sql).unwrap();
+    let run = || {
+        query
+            .query(())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+            .is_err()
+    };
+    assert!(run(), "{sql}: must fail");
+    let before = ALLOCATIONS.with(Cell::get);
+    run();
+    ALLOCATIONS.with(Cell::get) - before
+}
+
+#[test]
+fn arithmetic_that_fails_stops_at_its_first_row() {
+    let dir = tempfile::tempdir().unwrap();
+    for sealed in [None, Some(dir.path())] {
+        for (n, sql) in [
+            "SELECT g, SUM(k * 2), SUM(v * 2) FROM t GROUP BY g",
+            "SELECT SUM(k * 2), SUM(v * 2) FROM t",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (few, many) = (
+                failing_allocations(n, 100, sql, sealed),
+                failing_allocations(n, 800, sql, sealed),
+            );
+            assert_eq!(
+                few,
+                many,
+                "{sql}, sealed {}: {few} allocations over 100 rows, {many} over 800",
+                sealed.is_some()
+            );
+        }
+    }
+}
+
 #[test]
 fn arithmetic_arguments_allocate_alike_for_few_and_many_rows() {
     for sql in [
