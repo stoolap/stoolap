@@ -9034,6 +9034,8 @@ impl Table for SegmentedTable {
             // Returns Some(volume's run) on success, None to skip (pruned / dict miss).
             // Sets `bail` to true on schema mismatch (caller must check after collect).
             let bail = std::sync::atomic::AtomicBool::new(false);
+            // A volume's arithmetic failed: the volumes not begun are not read
+            let failed = std::sync::atomic::AtomicBool::new(false);
             let hot_skip_ref = &hot_skip;
             let tombstones_ref = &tombstones_arc;
             // A side file over a key the comparisons bound names the only rows
@@ -9047,7 +9049,9 @@ impl Table for SegmentedTable {
             let process_volume =|(_, cs): &(u64, super::manifest::ColdSegment)| -> Result<
                 Option<GroupedAggregates>,
             > {
-                    if bail.load(std::sync::atomic::Ordering::Relaxed) {
+                    if bail.load(std::sync::atomic::Ordering::Relaxed)
+                        || failed.load(std::sync::atomic::Ordering::Relaxed)
+                    {
                         return Ok(None);
                     }
                     let vol = &cs.volume;
@@ -9347,15 +9351,22 @@ impl Table for SegmentedTable {
                                 break inputs;
                             },
                         };
-                        // A new key past the group cap drops its row
+                        // A new key past the group cap drops its row; a
+                        // failed row ends the rows before another group is made
                         if preds.is_empty() && pairs.is_empty() {
                             for i in positions.filter(|&i| shown.has(i)) {
+                                if inputs.stopped() {
+                                    break;
+                                }
                                 if let Some(group) = key.group(part, i) {
                                     inputs.feed_row(part.aggregates(group), i);
                                 }
                             }
                         } else {
                             for i in positions {
+                                if inputs.stopped() {
+                                    break;
+                                }
                                 if passes(vol, rows, i)?
                                     && let Some(group) = key.group(part, i)
                                 {
@@ -9624,6 +9635,9 @@ impl Table for SegmentedTable {
                     if !answered {
                         bail.store(true, std::sync::atomic::Ordering::Relaxed);
                         return Ok(None);
+                    }
+                    if part.has_failed() {
+                        failed.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     Ok(Some(part))
                 };
@@ -10160,6 +10174,9 @@ trait VolumeInputs<'v>: Sized {
 
     /// The first error a row raised, taken
     fn take_error(&mut self) -> Option<crate::core::Error>;
+
+    /// Whether a row raised an error, which ends the rows
+    fn stopped(&self) -> bool;
 }
 
 impl<'v> VolumeInputs<'v> for Vec<ColdInput<'v>> {
@@ -10189,6 +10206,11 @@ impl<'v> VolumeInputs<'v> for Vec<ColdInput<'v>> {
     #[inline(always)]
     fn take_error(&mut self) -> Option<crate::core::Error> {
         None
+    }
+
+    #[inline(always)]
+    fn stopped(&self) -> bool {
+        false
     }
 }
 
@@ -10247,10 +10269,6 @@ impl<'v> VolumeInputs<'v> for RichInputs<'v> {
 
     #[inline(always)]
     fn feed_row(&mut self, runs: &mut [CompiledAggregate], i: usize) {
-        // After a failed row the rest of its row group feeds nothing
-        if self.failed.is_some() {
-            return;
-        }
         for (run, input) in runs.iter_mut().zip(&self.inputs) {
             match input {
                 RichInput::Plain(input) => {
@@ -10268,6 +10286,11 @@ impl<'v> VolumeInputs<'v> for RichInputs<'v> {
 
     fn take_error(&mut self) -> Option<crate::core::Error> {
         self.failed.take()
+    }
+
+    #[inline(always)]
+    fn stopped(&self) -> bool {
+        self.failed.is_some()
     }
 }
 

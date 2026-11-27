@@ -74,15 +74,20 @@ fn allocations(rows: i64, sql: &str) -> usize {
     ALLOCATIONS.with(Cell::get) - before
 }
 
-/// The allocations of one failing run of `sql`, prepared, over `rows` rows
-/// whose `k` doubled overflows, hot or sealed in `dir`, in database `n`
-fn failing_allocations(n: usize, rows: i64, sql: &str, dir: Option<&std::path::Path>) -> usize {
+/// The allocations of one failing run of `sql`, prepared, in database `n`:
+/// `healthy` rows, then `failing` rows whose `k` doubled overflows, each row
+/// its own group; hot, or sealed in `dir` as one volume of each, the
+/// failing one newest and so read first
+fn failing_allocations(
+    n: usize,
+    (failing, healthy): (i64, i64),
+    sql: &str,
+    dir: Option<&std::path::Path>,
+) -> usize {
+    let name = format!("failing_{n}_{failing}_{healthy}");
     let dsn = match dir {
-        None => format!("memory://arithmetic_rows_alloc_failing_{n}_{rows}"),
-        Some(dir) => format!(
-            "file://{}/failing_{n}_{rows}?checkpoint_interval=0",
-            dir.display()
-        ),
+        None => format!("memory://arithmetic_rows_alloc_{name}"),
+        Some(dir) => format!("file://{}/{name}?checkpoint_interval=0", dir.display()),
     };
     let db = Database::open(&dsn).unwrap();
     db.execute(
@@ -90,16 +95,21 @@ fn failing_allocations(n: usize, rows: i64, sql: &str, dir: Option<&std::path::P
         (),
     )
     .unwrap();
-    db.execute(
-        &format!(
-            "INSERT INTO t SELECT g.value, 1, 9223372036854775807, 0.5 \
-             FROM generate_series(1, {rows}) g"
-        ),
-        (),
-    )
-    .unwrap();
-    if dir.is_some() {
-        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    for (first, rows, k) in [(1, healthy, 1), (healthy + 1, failing, i64::MAX)] {
+        if rows > 0 {
+            db.execute(
+                &format!(
+                    "INSERT INTO t SELECT g.value, g.value, {k}, 0.5 \
+                     FROM generate_series({first}, {}) g",
+                    first + rows - 1
+                ),
+                (),
+            )
+            .unwrap();
+        }
+        if dir.is_some() {
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
     }
     let query = db.prepare(sql).unwrap();
     let run = || {
@@ -117,7 +127,14 @@ fn failing_allocations(n: usize, rows: i64, sql: &str, dir: Option<&std::path::P
 #[test]
 fn arithmetic_that_fails_stops_at_its_first_row() {
     let dir = tempfile::tempdir().unwrap();
-    for sealed in [None, Some(dir.path())] {
+    // Many failing rows hot or in one volume, then one failing volume
+    // before a healthy one
+    let shapes = [
+        (None, [(100, 0), (800, 0)]),
+        (Some(dir.path()), [(100, 0), (800, 0)]),
+        (Some(dir.path()), [(1, 100), (1, 800)]),
+    ];
+    for (sealed, [few_rows, many_rows]) in shapes {
         for (n, sql) in [
             "SELECT g, SUM(k * 2), SUM(v * 2) FROM t GROUP BY g",
             "SELECT SUM(k * 2), SUM(v * 2) FROM t",
@@ -126,13 +143,14 @@ fn arithmetic_that_fails_stops_at_its_first_row() {
         .enumerate()
         {
             let (few, many) = (
-                failing_allocations(n, 100, sql, sealed),
-                failing_allocations(n, 800, sql, sealed),
+                failing_allocations(n, few_rows, sql, sealed),
+                failing_allocations(n, many_rows, sql, sealed),
             );
             assert_eq!(
                 few,
                 many,
-                "{sql}, sealed {}: {few} allocations over 100 rows, {many} over 800",
+                "{sql}, sealed {}: {few} allocations over {few_rows:?} rows, \
+                 {many} over {many_rows:?}",
                 sealed.is_some()
             );
         }
