@@ -9069,8 +9069,9 @@ impl Table for SegmentedTable {
             #[cfg(not(feature = "parallel"))]
             let parallel = false;
             // Each volume's side-file decision other than a scan, made before
-            // any volume is read
+            // any volume is read; a decision may read the side file's pages
             let decide = |(id, cs): &(u64, super::manifest::ColdSegment)| {
+                deadline.check()?;
                 Ok(match self.side_decision(cs, &walk_asks)? {
                     SideDecision::Scan => None,
                     decision => Some((*id, decision)),

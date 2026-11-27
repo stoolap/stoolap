@@ -14,14 +14,15 @@
 
 //! A volume whose side file would walk a WHERE for groups, which the walk
 //! cannot answer, sends the statement to the scan before any volume's rows
-//! are read
+//! are read; the side files are decided under the statement's deadline
 
 #![cfg(feature = "test-failpoints")]
 
+use stoolap::core::Error;
 use stoolap::executor::DeadlineSite;
 use stoolap::test_failpoints::{
-    aggregate_paths_taken, count_deadline_charges, deadline_charges, keep_deadlines,
-    reset_aggregate_paths, FailpointGuard,
+    after_cold_view_taken, aggregate_paths_taken, count_deadline_charges, deadline_charges,
+    keep_deadlines, pass_deadlines, reset_aggregate_paths, side_decisions, FailpointGuard,
 };
 use stoolap::Database;
 
@@ -47,30 +48,35 @@ fn run(db: &Database, sql: &str) -> (Vec<String>, Vec<&'static str>, usize) {
     (rows, aggregate_paths_taken(), charges)
 }
 
-#[test]
-fn a_volume_that_would_walk_for_groups_declines_before_any_volume_is_read() {
-    let _guard = FailpointGuard::new();
-    let dir = tempfile::tempdir().unwrap();
+/// `w` indexed on `k` in two volumes: the newer, read first, holds k = 7
+/// on all of its rows and scans; the older holds it on row 323753 alone
+/// among keys spread over it, and walks
+fn open(dir: &std::path::Path) -> Database {
     let db = Database::open(&format!(
         "file://{}/decline?checkpoint_interval=0",
-        dir.path().display()
+        dir.display()
     ))
     .unwrap();
     for sql in [
         "CREATE TABLE w (id INTEGER PRIMARY KEY, k INTEGER, g INTEGER)",
         "CREATE INDEX w_k ON w (k)",
-        // The older volume holds k = 7 once among keys spread over it: it walks
         "INSERT INTO w SELECT s.value, (s.value * 7919) % 600000, 1 \
          FROM generate_series(1, 600000) s",
         "PRAGMA CHECKPOINT",
-        // The newer volume, read first, holds k = 7 on every row: it scans
         "INSERT INTO w SELECT s.value, 7, 2 FROM generate_series(600001, 700000) s",
         "PRAGMA CHECKPOINT",
         "PRAGMA query_timeout = 3600000",
     ] {
         db.execute(sql, ()).unwrap();
     }
-    // Row 323753 holds k = 7 in the older volume
+    db
+}
+
+#[test]
+fn a_volume_that_would_walk_for_groups_declines_before_any_volume_is_read() {
+    let _guard = FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
     let (got, taken, charges) = run(&db, "SELECT g, COUNT(*) FROM w WHERE k = 7 GROUP BY g");
     assert_eq!(got, ["1|1", "2|100000"]);
     assert_eq!(taken, ["hash_groups"]);
@@ -79,4 +85,24 @@ fn a_volume_that_would_walk_for_groups_declines_before_any_volume_is_read() {
     let (got, taken, _) = run(&db, "SELECT COUNT(*) FROM w WHERE k = 7");
     assert_eq!(got, ["100001"]);
     assert_eq!(taken, ["storage_filtered"]);
+}
+
+#[test]
+fn a_deadline_passed_before_the_side_file_decisions_stops_them() {
+    let _guard = FailpointGuard::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    let before = side_decisions();
+    after_cold_view_taken(pass_deadlines);
+    let got = db
+        .query("SELECT g, COUNT(*) FROM w WHERE k = 7 GROUP BY g", ())
+        .and_then(|rows| rows.collect::<Result<Vec<_>, _>>());
+    let decided = side_decisions();
+    keep_deadlines();
+    assert!(
+        matches!(got, Err(Error::QueryCancelled)),
+        "{:?}",
+        got.map(|rows| rows.len())
+    );
+    assert_eq!(decided, before, "side files decided after the deadline");
 }
