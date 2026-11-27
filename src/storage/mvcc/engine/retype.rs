@@ -915,14 +915,8 @@ fn validate_value(
     if let (true, Value::Timestamp(t)) = (storable, value) {
         crate::core::value::timestamp_in_range(*t)?;
     }
-    if change.data_type == DataType::Vector && change.vector_dimensions > 0 {
-        let got = value.vector_f32_iter().map_or(0, |values| values.len());
-        if got != change.vector_dimensions as usize {
-            return Err(Error::VectorDimensionMismatch {
-                expected: change.vector_dimensions,
-                got: u16::try_from(got).unwrap_or(u16::MAX),
-            });
-        }
+    if change.data_type == DataType::Vector {
+        value.check_vector_column(change.column, change.vector_dimensions)?;
     }
     Ok(())
 }

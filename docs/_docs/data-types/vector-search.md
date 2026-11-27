@@ -36,6 +36,8 @@ VALUES (1, 'Hello world', '[0.1, 0.2, 0.3, ...]');
 
 Dimension count is validated on insert. Providing a vector with the wrong number of dimensions will return an error.
 
+A VECTOR column holds only finite components. Writing a vector with a `NaN` or `Infinity` component, by INSERT, UPDATE, `ON CONFLICT DO UPDATE`, COPY or `ALTER TABLE ... MODIFY COLUMN`, returns an error naming the column, such as `VECTOR column 'embedding' cannot hold NaN or Infinity (component 3)`. A vector literal used only in a query, such as the query vector of a distance function, is not checked.
+
 ### NULL Handling
 
 VECTOR columns accept NULL values like any other column:
@@ -53,6 +55,8 @@ Stoolap provides three distance metrics for comparing vectors:
 | `VEC_DISTANCE_L2(a, b)` | Euclidean distance | 0 to infinity | General-purpose similarity |
 | `VEC_DISTANCE_COSINE(a, b)` | Cosine distance (1 - cosine similarity) | 0 to 2 | Text embeddings, normalized vectors |
 | `VEC_DISTANCE_IP(a, b)` | Negative inner product distance (-dot product) | varies | Maximum inner product search |
+
+The cosine distance of a zero vector to any vector is 1. A distance with a `NaN` or `Infinity` component is `NaN` for every metric. A `NaN` cosine distance ranks after every other in a nearest neighbor search, with or without an HNSW index.
 
 ### Examples
 
@@ -201,8 +205,8 @@ SELECT VEC_TO_TEXT(embedding) FROM embeddings WHERE id = 1;
 
 - **Vector data** is fully persisted through WAL and snapshots, like any other data type
 - **HNSW index definitions** are persisted in WAL (index metadata includes m, ef_construction, ef_search, and metric)
-- **HNSW graph structure** is serialized to binary files during snapshots for fast recovery, avoiding expensive graph rebuilds on restart
-- On recovery, if a graph file is found, it is loaded directly; otherwise the graph is rebuilt from table data
+- **HNSW graph structure** is not written to disk: each open rebuilds the graph from the table's data, so opening a database takes longer as the number of indexed vectors grows
+- A database that still carries a graph file written by an older version loads it instead of rebuilding
 
 ## Performance
 

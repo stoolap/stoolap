@@ -405,6 +405,29 @@ impl Value {
         self.vector_f32_iter().map(Iterator::collect)
     }
 
+    /// Whether VECTOR column `column` of `dimensions` components, 0 for
+    /// any, may hold this value: a vector of that many components, each
+    /// finite. A value that is no vector is not this rule's
+    pub fn check_vector_column(&self, column: &str, dimensions: u16) -> Result<()> {
+        let Some(mut components) = self.vector_f32_iter() else {
+            return Ok(());
+        };
+        let got = components.len();
+        if dimensions > 0 && got != dimensions as usize {
+            return Err(Error::VectorDimensionMismatch {
+                expected: dimensions,
+                got: u16::try_from(got).unwrap_or(u16::MAX),
+            });
+        }
+        match components.position(|component| !component.is_finite()) {
+            Some(at) => Err(Error::Type(format!(
+                "VECTOR column '{column}' cannot hold NaN or Infinity (component {})",
+                at + 1
+            ))),
+            None => Ok(()),
+        }
+    }
+
     // =========================================================================
     // Comparison
     // =========================================================================

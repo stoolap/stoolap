@@ -21,4 +21,5 @@ mod keyless_sealed_hnsw_test;
 mod nearest_subquery_test;
 mod serde_rows_test;
 mod vector_distance_operator_test;
+mod vector_non_finite_test;
 mod vector_test;
