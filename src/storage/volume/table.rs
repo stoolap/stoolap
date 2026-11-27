@@ -45,8 +45,8 @@ use crate::storage::mvcc::index_plan::{self, IndexPlan};
 use crate::storage::mvcc::registry::{CommitCut, StatementView};
 use crate::storage::mvcc::txn_gate::{GateRef, TxnGate};
 use crate::storage::mvcc::version_store::{
-    aggregate_bucketed_row, aggregate_row, grouped_aggregates, plain_columns, AggregateOp, GroupBy,
-    LayoutToken, EVERY_WRITE,
+    aggregate_bucketed_row, aggregate_row, column_calls, grouped_aggregates, plain_columns,
+    AggregateCall, AggregateInput, AggregateOp, GroupBy, LayoutToken, RowCalls, EVERY_WRITE,
 };
 use crate::storage::traits::table::ScanAccess;
 use crate::storage::traits::{
@@ -8689,7 +8689,7 @@ impl Table for SegmentedTable {
     fn compute_grouped_aggregates(
         &self,
         keys: &[GroupBy],
-        aggregates: &[(AggregateOp, usize)],
+        aggregates: &[AggregateCall],
         filter: Option<&dyn Expression>,
         deadline: Deadline,
     ) -> Result<Option<GroupedAggregates>> {
@@ -8837,7 +8837,7 @@ impl Table for SegmentedTable {
             // --- Hot buffer rows -------------------------------------------------
             let mut groups = match group_column {
                 GroupColumn::None => GroupedAggregates::global(
-                    aggregates.iter().map(|&(op, _)| op.template()).collect(),
+                    aggregates.iter().map(|(op, _)| op.template()).collect(),
                 ),
                 _ => grouped_aggregates(keys, aggregates),
             };
@@ -8850,21 +8850,46 @@ impl Table for SegmentedTable {
             crate::test_failpoints::hot_and_cold_reads_split();
             let mut hot_skip: KeySet<i64> =
                 KeySet::with_capacity_and_hasher(hot_rows.len().max(1024), Default::default());
-            let plain = plain_columns(keys);
-            // Allocated by the first bucketed row only
-            let mut bucketed = Vec::new();
-            for (row_id, row) in &hot_rows {
-                hot_skip.insert(*row_id);
-                let row = row.as_slice();
-                match &plain {
-                    Some(columns) => aggregate_row(&mut groups, columns, aggregates, row),
-                    None => {
-                        if !aggregate_bucketed_row(&mut groups, keys, aggregates, row, &mut bucketed)
-                        {
-                            return Ok(Some(None));
+            // Runs the hot rows into `groups`, up to the first whose
+            // arithmetic fails; false when a bucket rejects a row's value
+            fn feed_hot<C: RowCalls + ?Sized>(
+                groups: &mut GroupedAggregates,
+                keys: &[GroupBy],
+                aggregates: &C,
+                hot_rows: &[(i64, Row)],
+                hot_skip: &mut KeySet<i64>,
+            ) -> bool {
+                let plain = plain_columns(keys);
+                // Allocated by the first bucketed row only
+                let mut bucketed = Vec::new();
+                for (row_id, row) in hot_rows {
+                    hot_skip.insert(*row_id);
+                    let row = row.as_slice();
+                    match &plain {
+                        Some(columns) => aggregate_row(groups, columns, aggregates, row),
+                        None => {
+                            if !aggregate_bucketed_row(groups, keys, aggregates, row, &mut bucketed)
+                            {
+                                return false;
+                            }
                         }
                     }
+                    if aggregates.failed(groups) {
+                        break;
+                    }
                 }
+                true
+            }
+            let fed = match column_calls(aggregates) {
+                Some(calls) => feed_hot(&mut groups, keys, &calls[..], &hot_rows, &mut hot_skip),
+                None => feed_hot(&mut groups, keys, aggregates, &hot_rows, &mut hot_skip),
+            };
+            if !fed {
+                return Ok(Some(None));
+            }
+            // A hot row's arithmetic failed: the volumes are not read
+            if groups.has_failed() {
+                return Ok(Some(Some(groups)));
             }
 
             // --- Cold volumes (THE FAST PATH) ------------------------------------
@@ -9009,18 +9034,24 @@ impl Table for SegmentedTable {
             // Returns Some(volume's run) on success, None to skip (pruned / dict miss).
             // Sets `bail` to true on schema mismatch (caller must check after collect).
             let bail = std::sync::atomic::AtomicBool::new(false);
+            // A volume's arithmetic failed: the volumes not begun are not read
+            let failed = std::sync::atomic::AtomicBool::new(false);
             let hot_skip_ref = &hot_skip;
             let tombstones_ref = &tombstones_arc;
             // A side file over a key the comparisons bound names the only rows
             // the calls must look at, each read from its row group
             let walk_asks = self.side_asks(&comparisons);
+            // Arithmetic in a call: its volumes take the inputs that compute it
+            let arithmetic = aggregates.iter().any(|(_, input)| input.column().is_none());
             // Each volume's run starts from this empty one
             let empty = groups.empty_like();
 
             let process_volume =|(_, cs): &(u64, super::manifest::ColdSegment)| -> Result<
                 Option<GroupedAggregates>,
             > {
-                    if bail.load(std::sync::atomic::Ordering::Relaxed) {
+                    if bail.load(std::sync::atomic::Ordering::Relaxed)
+                        || failed.load(std::sync::atomic::Ordering::Relaxed)
+                    {
                         return Ok(None);
                     }
                     let vol = &cs.volume;
@@ -9169,14 +9200,30 @@ impl Table for SegmentedTable {
                         Vec::new()
                     };
 
+                    // `scan` with the inputs the calls need: arithmetic takes
+                    // inputs of its own, so the column calls' loop keeps the
+                    // plain ones
+                    #[allow(clippy::type_complexity)]
+                    fn scan_as<'v, K: GroupOf>(
+                        arithmetic: bool,
+                        calls: (&'v FrozenVolume, &super::writer::ColumnMapping, &[AggregateCall]),
+                        rows: (&[PhysPred], &[PhysPair], &[bool], &ShownRows, Deadline),
+                        key: K,
+                        part: &mut GroupedAggregates,
+                    ) -> Result<bool> {
+                        match arithmetic {
+                            true => scan::<K, RichInputs<'v>>(calls, rows, key, part),
+                            false => scan::<K, Vec<ColdInput<'v>>>(calls, rows, key, part),
+                        }
+                    }
                     // Feeds each shown row that passes to the calls of its
                     // group, built once per kind of key; false when the
                     // volume lacks a call's column and the statement reads the rows
-                    fn scan<'v, K: GroupOf>(
+                    fn scan<'v, K: GroupOf, In: VolumeInputs<'v>>(
                         (vol, mapping, aggregates): (
                             &'v FrozenVolume,
                             &super::writer::ColumnMapping,
-                            &[(AggregateOp, usize)],
+                            &[AggregateCall],
                         ),
                         (preds, pairs, skips, shown, deadline): (
                             &[PhysPred],
@@ -9191,7 +9238,7 @@ impl Table for SegmentedTable {
                         let row_count = vol.meta.row_count;
                         let rg_size = vol.meta.group_rows;
                         // The calls' inputs are resolved at the first row that passes
-                        let mut state: (K, Option<Vec<ColdInput<'v>>>) = (key, None);
+                        let mut state: (K, Option<In>) = (key, None);
                         let mut candidates: Vec<usize> = Vec::new();
                         for gi in 0..row_count.div_ceil(rg_size) {
                             if skips.get(gi) == Some(&true) {
@@ -9236,9 +9283,14 @@ impl Table for SegmentedTable {
                                 )?,
                                 false => feed(g_start..g_end, calls, rows, state, part)?,
                             };
-                            let Some(fed) = fed else {
+                            let Some(mut fed) = fed else {
                                 return Ok(false);
                             };
+                            // A row's arithmetic failed: the statement fails with it
+                            if let Some(error) = fed.1.as_mut().and_then(In::take_error) {
+                                part.fail(error);
+                                return Ok(true);
+                            }
                             state = fed;
                         }
                         Ok(true)
@@ -9248,17 +9300,17 @@ impl Table for SegmentedTable {
                     // registers; they come back for the next row group
                     #[inline(never)]
                     #[allow(clippy::type_complexity)]
-                    fn feed<'v, K: GroupOf>(
+                    fn feed<'v, K: GroupOf, In: VolumeInputs<'v>>(
                         positions: impl Iterator<Item = usize>,
                         (vol, mapping, aggregates): (
                             &'v FrozenVolume,
                             &super::writer::ColumnMapping,
-                            &[(AggregateOp, usize)],
+                            &[AggregateCall],
                         ),
                         (preds, pairs, prefiltered, shown): (&[PhysPred], &[PhysPair], bool, &ShownRows),
-                        (mut key, inputs): (K, Option<Vec<ColdInput<'v>>>),
+                        (mut key, inputs): (K, Option<In>),
                         part: &mut GroupedAggregates,
-                    ) -> Result<Option<(K, Option<Vec<ColdInput<'v>>>)>> {
+                    ) -> Result<Option<(K, Option<In>)>> {
                         // Whether row `i` is shown and passes every predicate
                         #[inline(always)]
                         fn passes(
@@ -9281,7 +9333,7 @@ impl Table for SegmentedTable {
                         }
                         let rows = (preds, pairs, prefiltered, shown);
                         let mut positions = positions;
-                        let inputs = match inputs {
+                        let mut inputs = match inputs {
                             Some(inputs) => inputs,
                             None => loop {
                                 let Some(i) = positions.next() else {
@@ -9290,29 +9342,35 @@ impl Table for SegmentedTable {
                                 if !passes(vol, rows, i)? {
                                     continue;
                                 }
-                                let Some(inputs) = ColdInput::resolve(vol, mapping, aggregates)?
-                                else {
+                                let Some(mut inputs) = In::resolve(vol, mapping, aggregates)? else {
                                     return Ok(None);
                                 };
                                 if let Some(group) = key.group(part, i) {
-                                    accumulate_columnar(part.aggregates(group), &inputs, i);
+                                    inputs.feed_row(part.aggregates(group), i);
                                 }
                                 break inputs;
                             },
                         };
-                        // A new key past the group cap drops its row
+                        // A new key past the group cap drops its row; a
+                        // failed row ends the rows before another group is made
                         if preds.is_empty() && pairs.is_empty() {
                             for i in positions.filter(|&i| shown.has(i)) {
+                                if inputs.stopped() {
+                                    break;
+                                }
                                 if let Some(group) = key.group(part, i) {
-                                    accumulate_columnar(part.aggregates(group), &inputs, i);
+                                    inputs.feed_row(part.aggregates(group), i);
                                 }
                             }
                         } else {
                             for i in positions {
+                                if inputs.stopped() {
+                                    break;
+                                }
                                 if passes(vol, rows, i)?
                                     && let Some(group) = key.group(part, i)
                                 {
-                                    accumulate_columnar(part.aggregates(group), &inputs, i);
+                                    inputs.feed_row(part.aggregates(group), i);
                                 }
                             }
                         }
@@ -9336,7 +9394,7 @@ impl Table for SegmentedTable {
                         ),
                         (mapping, aggregates, bail): (
                             &super::writer::ColumnMapping,
-                            &[(AggregateOp, usize)],
+                            &[AggregateCall],
                             &std::sync::atomic::AtomicBool,
                         ),
                         part: &mut GroupedAggregates,
@@ -9414,7 +9472,13 @@ impl Table for SegmentedTable {
                             }
                             if calls.is_none() {
                                 let mut resolved = Vec::with_capacity(aggregates.len());
-                                for &(op, col_idx) in aggregates {
+                                for (op, input) in aggregates {
+                                    let op = *op;
+                                    // A row group holds one column; arithmetic reads more
+                                    let Some(col_idx) = input.column() else {
+                                        bail.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        return Ok(false);
+                                    };
                                     resolved.push(match (op, mapping.sources.get(col_idx)) {
                                         (AggregateOp::CountStar, _) => Call::Fixed(ColdInput::Star),
                                         // A row group holds one column, an ordered call reads two
@@ -9507,7 +9571,7 @@ impl Table for SegmentedTable {
                     // Each row's group: the one group, a value the volume holds
                     // for every row, or the volume's group column read whole
                     let answered = match group_column {
-                        GroupColumn::None => scan(calls, rows, FixedGroup(None, None), &mut part)?,
+                        GroupColumn::None => scan_as(arithmetic, calls, rows, FixedGroup(None, None), &mut part)?,
                         GroupColumn::Text(at) | GroupColumn::Integer(at) => {
                             match mapping.sources.get(at) {
                                 Some(super::writer::ColSource::Volume(phys)) => {
@@ -9526,7 +9590,7 @@ impl Table for SegmentedTable {
                                                 nulls,
                                                 known: vec![u32::MAX; dictionary.len() + 1],
                                             };
-                                            scan(calls, rows, key, &mut part)?
+                                            scan_as(arithmetic, calls, rows, key, &mut part)?
                                         }
                                         (GroupColumn::Integer(_), column) => {
                                             let key = IntegerGroups {
@@ -9534,13 +9598,13 @@ impl Table for SegmentedTable {
                                                 known: KeyMap::default(),
                                                 null: None,
                                             };
-                                            scan(calls, rows, key, &mut part)?
+                                            scan_as(arithmetic, calls, rows, key, &mut part)?
                                         }
                                         _ => false,
                                     }
                                 }
                                 Some(super::writer::ColSource::Default(value)) => {
-                                    scan(calls, rows, FixedGroup(Some(value), None), &mut part)?
+                                    scan_as(arithmetic, calls, rows, FixedGroup(Some(value), None), &mut part)?
                                 }
                                 None => false,
                             }
@@ -9548,13 +9612,13 @@ impl Table for SegmentedTable {
                         GroupColumn::Bucket(at, bucket) => match mapping.sources.get(at) {
                             Some(super::writer::ColSource::Volume(phys)) => {
                                 let key = BucketGroups::new(vol.columns.get(*phys)?, bucket);
-                                scan(calls, rows, key, &mut part)?
+                                scan_as(arithmetic, calls, rows, key, &mut part)?
                             }
                             Some(super::writer::ColSource::Default(value)) => {
                                 match GroupBy::bucketed(bucket, value) {
                                     Some(value) => {
                                         let key = FixedGroup(Some(&value), None);
-                                        scan(calls, rows, key, &mut part)?
+                                        scan_as(arithmetic, calls, rows, key, &mut part)?
                                     }
                                     None => false,
                                 }
@@ -9563,7 +9627,7 @@ impl Table for SegmentedTable {
                         },
                         GroupColumn::Many => {
                             match ManyGroups::of(vol, mapping, &schema, keys)? {
-                                Some(key) => scan(calls, rows, key, &mut part)?,
+                                Some(key) => scan_as(arithmetic, calls, rows, key, &mut part)?,
                                 None => false,
                             }
                         }
@@ -9571,6 +9635,9 @@ impl Table for SegmentedTable {
                     if !answered {
                         bail.store(true, std::sync::atomic::Ordering::Relaxed);
                         return Ok(None);
+                    }
+                    if part.has_failed() {
+                        failed.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     Ok(Some(part))
                 };
@@ -10057,44 +10124,214 @@ impl<'a> ColdInput<'a> {
         }
     }
 
-    /// The inputs of `aggregates` in `vol`; None when its layout lacks one
+    /// How call `op` of the column at `col_idx` reads `vol`; None when its
+    /// layout lacks the column
     fn resolve(
         vol: &'a FrozenVolume,
         mapping: &super::writer::ColumnMapping,
-        aggregates: &[(AggregateOp, usize)],
-    ) -> Result<Option<Vec<ColdInput<'a>>>> {
-        let mut inputs = Vec::with_capacity(aggregates.len());
-        for &(op, col_idx) in aggregates {
-            if op == AggregateOp::CountStar {
-                inputs.push(ColdInput::Star);
-                continue;
+        op: AggregateOp,
+        col_idx: usize,
+    ) -> Result<Option<ColdInput<'a>>> {
+        if op == AggregateOp::CountStar {
+            return Ok(Some(ColdInput::Star));
+        }
+        let Some(source) = mapping.sources.get(col_idx) else {
+            return Ok(None);
+        };
+        // A key or value the volume does not hold is the scan's to read
+        if let Some(key) = op.order_key() {
+            use super::writer::ColSource::Volume;
+            return match (source, mapping.sources.get(key)) {
+                (Volume(value), Some(Volume(key))) => Ok(Some(ColdInput::Value(
+                    vol.columns.get(*value)?,
+                    Some(vol.columns.get(*key)?),
+                ))),
+                _ => Ok(None),
+            };
+        }
+        Ok(Some(match source {
+            super::writer::ColSource::Volume(phys_idx) => {
+                ColdInput::of(op, vol.columns.get(*phys_idx)?)
             }
-            let Some(source) = mapping.sources.get(col_idx) else {
+            super::writer::ColSource::Default(val) => ColdInput::Default(val.clone()),
+        }))
+    }
+}
+
+/// The inputs of one volume's calls, and how a row of it feeds them: plain
+/// columns, or with arithmetic beside them, which only a statement holding
+/// arithmetic builds, so the column calls' loop keeps its shape
+trait VolumeInputs<'v>: Sized {
+    /// The inputs of `aggregates` in `vol`; None when its layout lacks one
+    fn resolve(
+        vol: &'v FrozenVolume,
+        mapping: &super::writer::ColumnMapping,
+        aggregates: &[AggregateCall],
+    ) -> Result<Option<Self>>;
+
+    /// Feeds row `i` to `runs`, keeping the first error a row raises
+    fn feed_row(&mut self, runs: &mut [CompiledAggregate], i: usize);
+
+    /// The first error a row raised, taken
+    fn take_error(&mut self) -> Option<crate::core::Error>;
+
+    /// Whether a row raised an error, which ends the rows
+    fn stopped(&self) -> bool;
+}
+
+impl<'v> VolumeInputs<'v> for Vec<ColdInput<'v>> {
+    fn resolve(
+        vol: &'v FrozenVolume,
+        mapping: &super::writer::ColumnMapping,
+        aggregates: &[AggregateCall],
+    ) -> Result<Option<Self>> {
+        let mut inputs = Vec::with_capacity(aggregates.len());
+        for (op, input) in aggregates {
+            let Some(col_idx) = input.column() else {
                 return Ok(None);
             };
-            // A key or value the volume does not hold is the scan's to read
-            if let Some(key) = op.order_key() {
-                use super::writer::ColSource::Volume;
-                match (source, mapping.sources.get(key)) {
-                    (Volume(value), Some(Volume(key))) => {
-                        inputs.push(ColdInput::Value(
-                            vol.columns.get(*value)?,
-                            Some(vol.columns.get(*key)?),
-                        ));
-                        continue;
-                    }
-                    _ => return Ok(None),
-                }
+            match ColdInput::resolve(vol, mapping, *op, col_idx)? {
+                Some(input) => inputs.push(input),
+                None => return Ok(None),
             }
-            inputs.push(match source {
-                super::writer::ColSource::Volume(phys_idx) => {
-                    ColdInput::of(op, vol.columns.get(*phys_idx)?)
-                }
-                super::writer::ColSource::Default(val) => ColdInput::Default(val.clone()),
-            });
         }
         Ok(Some(inputs))
     }
+
+    #[inline(always)]
+    fn feed_row(&mut self, runs: &mut [CompiledAggregate], i: usize) {
+        accumulate_columnar(runs, self, i);
+    }
+
+    #[inline(always)]
+    fn take_error(&mut self) -> Option<crate::core::Error> {
+        None
+    }
+
+    #[inline(always)]
+    fn stopped(&self) -> bool {
+        false
+    }
+}
+
+/// The inputs of a volume's calls when one of them reads arithmetic, and
+/// the first error a row's arithmetic raised
+struct RichInputs<'a> {
+    inputs: Vec<RichInput<'a>>,
+    failed: Option<crate::core::Error>,
+}
+
+/// A call's input over a volume when a call of the statement reads
+/// arithmetic
+enum RichInput<'a> {
+    Plain(ColdInput<'a>),
+    Program(ProgramCells<'a>),
+}
+
+/// Arithmetic over a volume: its program, and each column it reads in the
+/// volume or as the value the volume holds for every row
+struct ProgramCells<'a> {
+    program: Arc<crate::core::numeric::NumericProgram>,
+    cells: Vec<ProgramCell<'a>>,
+}
+
+enum ProgramCell<'a> {
+    Column(&'a super::column::ColumnData),
+    Fixed(Value),
+}
+
+impl<'v> VolumeInputs<'v> for RichInputs<'v> {
+    fn resolve(
+        vol: &'v FrozenVolume,
+        mapping: &super::writer::ColumnMapping,
+        aggregates: &[AggregateCall],
+    ) -> Result<Option<Self>> {
+        let mut inputs = Vec::with_capacity(aggregates.len());
+        for (op, input) in aggregates {
+            let input = match input {
+                AggregateInput::Column(col_idx) => {
+                    ColdInput::resolve(vol, mapping, *op, *col_idx)?.map(RichInput::Plain)
+                }
+                AggregateInput::Program(program) => {
+                    program_cells(vol, mapping, program)?.map(RichInput::Program)
+                }
+            };
+            match input {
+                Some(input) => inputs.push(input),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(RichInputs {
+            inputs,
+            failed: None,
+        }))
+    }
+
+    #[inline(always)]
+    fn feed_row(&mut self, runs: &mut [CompiledAggregate], i: usize) {
+        for (run, input) in runs.iter_mut().zip(&self.inputs) {
+            match input {
+                RichInput::Plain(input) => {
+                    accumulate_columnar(std::slice::from_mut(run), std::slice::from_ref(input), i)
+                }
+                RichInput::Program(cells) => {
+                    if let Err(error) = accumulate_program(run, cells, i) {
+                        self.failed = Some(error);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    fn take_error(&mut self) -> Option<crate::core::Error> {
+        self.failed.take()
+    }
+
+    #[inline(always)]
+    fn stopped(&self) -> bool {
+        self.failed.is_some()
+    }
+}
+
+/// The cells of `program`'s columns in `vol`; None when its layout lacks
+/// one of them
+fn program_cells<'v>(
+    vol: &'v FrozenVolume,
+    mapping: &super::writer::ColumnMapping,
+    program: &Arc<crate::core::numeric::NumericProgram>,
+) -> Result<Option<ProgramCells<'v>>> {
+    let mut cells = Vec::with_capacity(program.columns.len());
+    for &column in &program.columns {
+        cells.push(match mapping.sources.get(column) {
+            Some(super::writer::ColSource::Volume(phys)) => {
+                ProgramCell::Column(vol.columns.get(*phys)?)
+            }
+            Some(super::writer::ColSource::Default(value)) => ProgramCell::Fixed(value.clone()),
+            None => return Ok(None),
+        });
+    }
+    Ok(Some(ProgramCells {
+        program: Arc::clone(program),
+        cells,
+    }))
+}
+
+/// Feeds row `i` to a call reading arithmetic over a volume's columns, out
+/// of line so the other calls of its statement keep their loop's shape
+#[cold]
+#[inline(never)]
+fn accumulate_program(
+    run: &mut CompiledAggregate,
+    cells: &ProgramCells<'_>,
+    i: usize,
+) -> Result<()> {
+    let cell = |at: usize| match &cells.cells[at] {
+        ProgramCell::Column(data) => data.get_value(i),
+        ProgramCell::Fixed(value) => value.clone(),
+    };
+    run.accumulate(&cells.program.evaluate(&cell)?);
+    Ok(())
 }
 
 /// `rows` cut into runs of at most a row group each
@@ -10165,8 +10402,22 @@ fn accumulate_columnar(runs: &mut [CompiledAggregate], inputs: &[ColdInput<'_>],
 /// and LAST of a number, timestamp or boolean by one of those, read from a
 /// volume's column without a text value per row; any other call leaves the
 /// query to the general path
-fn typed_aggregates_answer(schema: &Schema, aggregates: &[(AggregateOp, usize)]) -> bool {
-    aggregates.iter().all(|&(op, col_idx)| {
+fn typed_aggregates_answer(schema: &Schema, aggregates: &[AggregateCall]) -> bool {
+    let number = |column: &usize| {
+        matches!(
+            schema.columns.get(*column).map(|c| c.data_type),
+            Some(DataType::Integer | DataType::Float)
+        )
+    };
+    aggregates.iter().all(|(op, input)| {
+        let col_idx = match input {
+            AggregateInput::Column(column) => *column,
+            // Arithmetic reads numbers and gives one, which every call takes
+            AggregateInput::Program(program) => {
+                return op.order_key().is_none() && program.columns.iter().all(number)
+            }
+        };
+        let op = *op;
         let data_type = schema.columns.get(col_idx).map(|c| c.data_type);
         match op {
             AggregateOp::CountStar | AggregateOp::Count => true,

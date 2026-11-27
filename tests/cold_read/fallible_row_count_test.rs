@@ -20,7 +20,7 @@ use stoolap::core::{DataType, Result, Row, RowVec, SchemaBuilder, Value};
 use stoolap::functions::scalar::SleepFunction;
 use stoolap::functions::{global_registry, FunctionInfo, ScalarFunction};
 use stoolap::storage::expression::ComparisonExpr;
-use stoolap::storage::mvcc::version_store::{AggregateOp, GroupBy};
+use stoolap::storage::mvcc::version_store::{AggregateInput, AggregateOp, GroupBy};
 use stoolap::storage::mvcc::{MVCCTable, TransactionVersionStore, VersionStore};
 use stoolap::storage::traits::Table;
 use stoolap::storage::volume::io::{read_volume_from_disk, write_volume_to_disk};
@@ -338,7 +338,7 @@ fn filtered_aggregates_propagate_cold_reload_failure() {
             let none = stoolap::executor::Deadline::NONE;
             let groups = table.compute_grouped_aggregates(
                 &[],
-                &[(AggregateOp::Sum, 1)],
+                &[(AggregateOp::Sum, AggregateInput::Column(1))],
                 Some(&filter),
                 none,
             );
@@ -361,7 +361,7 @@ fn grouped_aggregates_propagate_cold_reload_failure() {
             let none = stoolap::executor::Deadline::NONE;
             let groups = table.compute_grouped_aggregates(
                 &[GroupBy::column(1)],
-                &[(AggregateOp::Sum, 1)],
+                &[(AggregateOp::Sum, AggregateInput::Column(1))],
                 None,
                 none,
             );

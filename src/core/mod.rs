@@ -29,6 +29,7 @@ pub mod error;
 pub mod float;
 pub mod integer;
 pub mod interval;
+pub mod numeric;
 pub mod pattern;
 pub mod predicate;
 pub mod row;

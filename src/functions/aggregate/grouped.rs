@@ -192,6 +192,8 @@ pub struct GroupedAggregates {
     integers: I64Map<u32>,
     groups: usize,
     cap: usize,
+    /// The first error a row's argument raised, the statement's
+    failed: Option<crate::core::Error>,
 }
 
 impl GroupedAggregates {
@@ -206,7 +208,19 @@ impl GroupedAggregates {
             integers: I64Map::new(),
             groups: 0,
             cap: usize::MAX,
+            failed: None,
         }
+    }
+
+    /// Keeps the first error a row's argument raised, which `into_rows`
+    /// and `into_group_results` return in place of the groups
+    pub fn fail(&mut self, error: crate::core::Error) {
+        self.failed.get_or_insert(error);
+    }
+
+    /// Whether a row's argument raised an error
+    pub fn has_failed(&self) -> bool {
+        self.failed.is_some()
     }
 
     /// The one group of an aggregation without GROUP BY, there with no rows
@@ -346,6 +360,9 @@ impl GroupedAggregates {
     /// Folds the groups of a run over other rows into these, see `can_merge`
     pub fn merge(&mut self, other: GroupedAggregates) {
         debug_assert!(self.can_merge(), "merge needs runs that merge");
+        if let Some(error) = other.failed {
+            self.fail(error);
+        }
         let calls = self.calls.len();
         for group in 0..other.groups {
             let key = &other.keys[group * other.width..][..other.width];
@@ -389,6 +406,9 @@ impl GroupedAggregates {
             std::result::Result<CompactVec<Value>, (CompactVec<Value>, crate::core::Error)>,
         ) -> Result<()>,
     ) -> Result<()> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
         if self.groups > 0
             && let Some(error) = self.calls.iter().find_map(CallTemplate::failure)
         {

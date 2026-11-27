@@ -259,9 +259,24 @@ Aggregate SUM(value)
     Index idx_value (value range)
 ```
 
+The table also computes COUNT, SUM, AVG, MIN and MAX of arithmetic over INTEGER and FLOAT columns: `+`, `-`, `*`, `/`, `%` and a minus sign, over unqualified columns, numbers and parameters, such as `SUM(value * stock)`. Without a WHERE such a call shows `StorageFiltered` with no condition, since the statistics cannot answer it:
+
+```sql
+EXPLAIN SELECT SUM(value * stock) FROM products;
+```
+
+Output:
+```
+plan
+----
+Aggregate SUM(value * stock)
+  StorageFiltered products
+  else SeqScan products
+```
+
 ### Aggregation
 
-A GROUP BY of one column or of several plain columns shows its groups after `by`. The table computes the groups itself when it can (`StorageGrouped`), with a WHERE over the rows the WHERE passes; the groups of one column read in the order of its index, each by its rows, stop once a LIMIT's groups pass the HAVING (`SortedStream`); otherwise every row is read and grouped. The table computes COUNT, SUM, AVG, MIN and MAX of a column, and FIRST and LAST of a number, timestamp or boolean column by one ORDER BY column that is a number or a timestamp, such as `FIRST(price ORDER BY ts)`. A HAVING naming no column but the group columns judges the groups the table computes when the index walk does not take it:
+A GROUP BY of one column or of several plain columns shows its groups after `by`. The table computes the groups itself when it can (`StorageGrouped`), with a WHERE over the rows the WHERE passes; the groups of one column read in the order of its index, each by its rows, stop once a LIMIT's groups pass the HAVING (`SortedStream`); otherwise every row is read and grouped. The table computes COUNT, SUM, AVG, MIN and MAX of a column or of arithmetic over number columns, and FIRST and LAST of a number, timestamp or boolean column by one ORDER BY column that is a number or a timestamp, such as `FIRST(price ORDER BY ts)`. A HAVING naming no column but the group columns judges the groups the table computes when the index walk does not take it:
 
 ```sql
 EXPLAIN SELECT category, SUM(value) FROM products GROUP BY category;

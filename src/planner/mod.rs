@@ -435,6 +435,9 @@ fn read_lines(read: &Read, text: &PlanText<'_>, lines: &mut Vec<String>) {
                 (GlobalSource::StorageFiltered, _, Some(pushed)) => {
                     alternative(lines, format!("StorageFiltered {table} {pushed}"))
                 }
+                (GlobalSource::StorageFiltered, _, None) => {
+                    alternative(lines, format!("StorageFiltered {table}"))
+                }
                 _ => {}
             }
             read_lines(otherwise, text, lines);

@@ -20,10 +20,11 @@ use std::sync::Arc;
 use crate::common::deadline::Deadline;
 use crate::common::names::eq_names;
 use crate::common::{CompactArc, CompactVec, SmartString};
+use crate::core::numeric::{NumericExpr, NumericProgram};
 use crate::core::{IndexType, Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::{Expression, GroupByModifier, SelectStatement};
 use crate::storage::expression::Expression as StorageExpr;
-use crate::storage::mvcc::version_store::GroupBy;
+use crate::storage::mvcc::version_store::{AggregateInput, GroupBy};
 use crate::storage::traits::transaction::{StatementTable, TableUse};
 use crate::storage::traits::{Index, QueryResult, Table};
 
@@ -54,6 +55,113 @@ pub enum GlobalSource {
 /// The column a call reads, without the table naming it
 fn bare_column(agg: &SqlAggregateFunction) -> &str {
     super::utils::bare_name(&agg.column_lower)
+}
+
+/// `expr` as arithmetic over columns: `+`, `-`, `*`, `/` and `%` of column
+/// names, number literals and parameters, and `-` of one, each column's
+/// place found by `column` and each parameter's value by `param`, with the
+/// columns its leaves read; None for any other expression or one that reads
+/// no column
+fn arithmetic(
+    expr: &Expression,
+    column: &impl Fn(&str) -> Option<usize>,
+    param: &impl Fn(usize) -> Option<Value>,
+) -> Option<(NumericExpr, Vec<usize>)> {
+    use crate::core::float::FloatOp;
+    use crate::core::integer::IntegerOp;
+    use crate::parser::ast::{InfixOperator, PrefixOperator};
+    fn walk(
+        expr: &Expression,
+        column: &impl Fn(&str) -> Option<usize>,
+        param: &impl Fn(usize) -> Option<Value>,
+        columns: &mut Vec<usize>,
+    ) -> Option<NumericExpr> {
+        let number = |value: Value| match value {
+            Value::Integer(_) | Value::Float(_) => Some(NumericExpr::Literal(value)),
+            _ => None,
+        };
+        Some(match expr {
+            Expression::Identifier(id) => {
+                columns.push(column(&id.value)?);
+                NumericExpr::Column(columns.len() - 1)
+            }
+            Expression::Column(bound) => {
+                columns.push(column(&bound.name.value)?);
+                NumericExpr::Column(columns.len() - 1)
+            }
+            Expression::IntegerLiteral(literal) => {
+                NumericExpr::Literal(Value::Integer(literal.value))
+            }
+            Expression::FloatLiteral(literal) => NumericExpr::Literal(Value::Float(literal.value)),
+            // Slots are 1-indexed
+            Expression::Parameter(slot) => number(param(slot.index.checked_sub(1)?)?)?,
+            Expression::Prefix(prefix) if prefix.op_type == PrefixOperator::Negate => {
+                NumericExpr::Neg(Box::new(walk(&prefix.right, column, param, columns)?))
+            }
+            Expression::Infix(infix) => {
+                let (int_op, float) = match infix.op_type {
+                    InfixOperator::Add => (IntegerOp::Add, FloatOp::Add),
+                    InfixOperator::Subtract => (IntegerOp::Sub, FloatOp::Sub),
+                    InfixOperator::Multiply => (IntegerOp::Mul, FloatOp::Mul),
+                    InfixOperator::Divide => (IntegerOp::Div, FloatOp::Div),
+                    InfixOperator::Modulo => (IntegerOp::Mod, FloatOp::Mod),
+                    _ => return None,
+                };
+                let left = walk(&infix.left, column, param, columns)?;
+                let right = walk(&infix.right, column, param, columns)?;
+                NumericExpr::Binary(int_op, float, Box::new(left), Box::new(right))
+            }
+            _ => return None,
+        })
+    }
+    let mut columns = Vec::new();
+    let expr = walk(expr, column, param, &mut columns)?;
+    (!columns.is_empty()).then_some((expr, columns))
+}
+
+/// Whether a COUNT, SUM, AVG, MIN or MAX reads arithmetic over columns the
+/// table may compute, as `arithmetic` reads it, with no other modifier
+pub(crate) fn arithmetic_call(agg: &SqlAggregateFunction) -> bool {
+    matches!(agg.name.as_str(), "COUNT" | "SUM" | "AVG" | "MIN" | "MAX")
+        && agg.answered_with(Modifiers::EXPRESSION)
+        && agg.expression.as_ref().is_some_and(|expr| {
+            arithmetic(expr, &|_| Some(0), &|_| Some(Value::Integer(0))).is_some()
+        })
+}
+
+/// What a call reads for the table to compute it: its column of `columns`,
+/// or its arithmetic over number columns of `schema`, a parameter's value
+/// from `ctx`; None for anything else
+pub(crate) fn call_input(
+    agg: &SqlAggregateFunction,
+    column: Option<usize>,
+    schema: &Schema,
+    ctx: Option<&ExecutionContext>,
+) -> Option<AggregateInput> {
+    if let Some(column) = column {
+        return Some(AggregateInput::Column(column));
+    }
+    if !arithmetic_call(agg) {
+        return None;
+    }
+    let number_column = |name: &str| {
+        let at = schema
+            .columns
+            .iter()
+            .position(|c| eq_names(&c.name, name))?;
+        matches!(
+            schema.columns[at].data_type,
+            crate::core::DataType::Integer | crate::core::DataType::Float
+        )
+        .then_some(at)
+    };
+    let param = |slot: usize| ctx?.params().get(slot).cloned();
+    let (expr, columns) = arithmetic(agg.expression.as_ref()?, &number_column, &param)?;
+    Some(AggregateInput::Program(Arc::new(NumericProgram {
+        expr,
+        columns,
+        call: (agg.name.clone(), agg.column.clone()),
+    })))
 }
 
 /// Whether `index` keeps its values in order, which gives their bounds
@@ -184,6 +292,14 @@ impl Executor {
             matches!(agg.name.as_str(), "SUM" | "MIN" | "MAX" | "AVG")
                 && agg.answered_with(Modifiers::NONE)
         };
+        // The table computes the calls over the rows its WHERE passes: a
+        // column's count among them, and arithmetic over columns
+        let computed = aggregations.iter().all(|agg| {
+            plain_call(agg)
+                || agg.counts_rows()
+                || agg.name == "COUNT" && agg.answered_with(Modifiers::NONE)
+                || arithmetic_call(agg)
+        });
         if stmt.where_clause.is_none() {
             // The stats count rows and an index's distinct values, not a column's
             let stats = aggregations.iter().all(|agg| {
@@ -192,7 +308,11 @@ impl Executor {
                     || agg.name == "COUNT" && agg.distinct && agg.answered_with(Modifiers::DISTINCT)
             });
             if !stats {
-                return GlobalSource::Scan;
+                // Arithmetic the stats do not keep is computed over every row
+                return match computed && aggregations.iter().any(arithmetic_call) {
+                    true => GlobalSource::StorageFiltered,
+                    false => GlobalSource::Scan,
+                };
             }
             return match aggregations {
                 [agg]
@@ -205,13 +325,6 @@ impl Executor {
                 _ => GlobalSource::Stats,
             };
         }
-        // The table computes the calls over the rows its WHERE passes: a
-        // column's count among them
-        let computed = aggregations.iter().all(|agg| {
-            plain_call(agg)
-                || agg.counts_rows()
-                || agg.name == "COUNT" && agg.answered_with(Modifiers::NONE)
-        });
         match pushed && computed {
             true => GlobalSource::StorageFiltered,
             false => GlobalSource::Scan,
@@ -222,14 +335,15 @@ impl Executor {
     /// reading its column of `columns`; None when the table cannot answer
     /// from there and the rows are read instead. A `quiet` read, through no
     /// view, takes only a count that vouches for itself; `pushed` is the
-    /// WHERE the table runs
+    /// WHERE the table runs, `filtered` whether the statement has a WHERE,
+    /// and `ctx` holds the parameters a call's arithmetic reads
     fn global_values(
         source: GlobalSource,
         table: &dyn Table,
         aggregations: &[SqlAggregateFunction],
         columns: &[Option<usize>],
         quiet: bool,
-        pushed: Option<&dyn StorageExpr>,
+        (pushed, filtered, ctx): (Option<&dyn StorageExpr>, bool, Option<&ExecutionContext>),
         deadline: Deadline,
     ) -> Result<Option<(GlobalSource, CompactVec<Value>)>> {
         match source {
@@ -254,15 +368,13 @@ impl Executor {
                         .map(|values| (source, values)),
                 )
             }
-            GlobalSource::StorageFiltered => match pushed {
-                Some(pushed) => {
-                    Ok(
-                        Self::filtered_values(table, pushed, aggregations, columns, deadline)?
-                            .map(|values| (source, values)),
-                    )
-                }
-                None => Ok(None),
-            },
+            // A WHERE the table does not run leaves the rows to the scan
+            GlobalSource::StorageFiltered if quiet || (filtered && pushed.is_none()) => Ok(None),
+            GlobalSource::StorageFiltered => {
+                let read = (aggregations, columns, ctx);
+                Ok(Self::filtered_values(table, pushed, read, deadline)?
+                    .map(|values| (source, values)))
+            }
             GlobalSource::Scan => Ok(None),
         }
     }
@@ -345,27 +457,35 @@ impl Executor {
     /// None when the table cannot run the WHERE or the calls
     fn filtered_values(
         table: &dyn Table,
-        pushed: &dyn StorageExpr,
-        aggregations: &[SqlAggregateFunction],
-        columns: &[Option<usize>],
+        pushed: Option<&dyn StorageExpr>,
+        (aggregations, columns, ctx): (
+            &[SqlAggregateFunction],
+            &[Option<usize>],
+            Option<&ExecutionContext>,
+        ),
         deadline: Deadline,
     ) -> Result<Option<CompactVec<Value>>> {
         use crate::storage::mvcc::version_store::AggregateOp;
         let mut ops = Vec::with_capacity(aggregations.len());
         for (agg, &column) in aggregations.iter().zip(columns) {
-            let op = match (agg.name.as_str(), column) {
-                ("COUNT", _) if agg.counts_rows() => (AggregateOp::CountStar, 0),
-                ("COUNT", Some(idx)) => (AggregateOp::Count, idx),
-                ("SUM", Some(idx)) => (AggregateOp::Sum, idx),
-                ("AVG", Some(idx)) => (AggregateOp::Avg, idx),
-                ("MIN", Some(idx)) => (AggregateOp::Min, idx),
-                ("MAX", Some(idx)) => (AggregateOp::Max, idx),
+            if agg.name == "COUNT" && agg.counts_rows() {
+                ops.push((AggregateOp::CountStar, AggregateInput::Column(0)));
+                continue;
+            }
+            let op = match agg.name.as_str() {
+                "COUNT" => AggregateOp::Count,
+                "SUM" => AggregateOp::Sum,
+                "AVG" => AggregateOp::Avg,
+                "MIN" => AggregateOp::Min,
+                "MAX" => AggregateOp::Max,
                 _ => return Ok(None),
             };
-            ops.push(op);
+            let Some(input) = call_input(agg, column, table.schema(), ctx) else {
+                return Ok(None);
+            };
+            ops.push((op, input));
         }
-        let Some(groups) = table.compute_grouped_aggregates(&[], &ops, Some(pushed), deadline)?
-        else {
+        let Some(groups) = table.compute_grouped_aggregates(&[], &ops, pushed, deadline)? else {
             return Ok(None);
         };
         // The one group of an aggregation without GROUP BY, there with no rows
@@ -462,7 +582,7 @@ impl Executor {
             aggregations,
             columns,
             false,
-            pushed,
+            (pushed, stmt.where_clause.is_some(), Some(ctx)),
             deadline,
         )?;
         let (path, rows) = match row {
@@ -516,7 +636,7 @@ impl Executor {
                 // the table's layout may move
                 &[None],
                 quiet,
-                None,
+                (None, true, None),
                 ctx.deadline_of_call(),
             )?;
             let Some((answered, values)) = row else {

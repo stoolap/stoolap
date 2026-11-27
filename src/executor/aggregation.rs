@@ -1262,10 +1262,7 @@ impl CallInputs {
             Some(program) => {
                 let vm = vm.get_or_insert_with(ExprVM::new);
                 argument = vm.execute(program, row).map_err(|e| {
-                    crate::core::Error::expression_evaluation(format!(
-                        "{}({}): {}",
-                        agg.name, agg.column, e
-                    ))
+                    crate::core::Error::aggregate_argument(&agg.name, &agg.column, e)
                 })?;
                 &argument
             }
