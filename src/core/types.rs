@@ -164,6 +164,24 @@ pub enum Operator {
     IsNotNull = 10,
 }
 
+impl Operator {
+    /// Whether this operator, one of `=`, `<>`, `<`, `<=`, `>`, `>=`, holds
+    /// for two values that order as `ordering`; false for any other
+    #[inline]
+    pub fn holds(self, ordering: std::cmp::Ordering) -> bool {
+        use std::cmp::Ordering;
+        match self {
+            Operator::Eq => ordering == Ordering::Equal,
+            Operator::Ne => ordering != Ordering::Equal,
+            Operator::Lt => ordering == Ordering::Less,
+            Operator::Lte => ordering != Ordering::Greater,
+            Operator::Gt => ordering == Ordering::Greater,
+            Operator::Gte => ordering != Ordering::Less,
+            _ => false,
+        }
+    }
+}
+
 impl fmt::Display for Operator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

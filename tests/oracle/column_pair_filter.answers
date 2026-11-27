@@ -1,0 +1,54 @@
+2	478a9fd4ead349d9	memory: SELECT COUNT(*) FROM r WHERE ts > a
+2	11e718e79eee5860	memory: SELECT COUNT(*), MIN(v), MAX(v) FROM r WHERE a = f
+2	e15e78b261fb1dcc	memory: SELECT COUNT(*), SUM(v) FROM r WHERE a <> b AND v > 15
+2	975a9dc62639dbf4	memory: SELECT COUNT(*), SUM(v) FROM r WHERE b > a
+5	e5a812ceb4cd4fe7	memory: SELECT DATE_TRUNC('day', ts), COUNT(*) FROM r WHERE ts >= u GROUP BY DATE_TRUNC('day', ts)
+4	c864adf70df7db1e	memory: SELECT d, COUNT(*) FROM r WHERE a >= f GROUP BY d
+2	ffd19d8e2ce42a3f	memory: SELECT d, COUNT(*) FROM r WHERE b > a GROUP BY d HAVING COUNT(*) > 1 ORDER BY d
+4	18bb229372c06f79	memory: SELECT d, COUNT(*) FROM r WHERE ts <> a GROUP BY d
+2	4e8532951bab1ba0	memory: SELECT d, COUNT(*), SUM(v) FROM r WHERE b > a GROUP BY d
+3	675116d061025242	memory: SELECT d, MIN(v), MAX(v) FROM r WHERE f <= g GROUP BY d
+2	5bd84225070e977f	memory: SELECT d, SUM(v) FROM r WHERE ts < u AND d = 'x' GROUP BY d
+5	f72f85e824793c5b	memory: SELECT d, a, COUNT(*) FROM r WHERE a <= b GROUP BY d, a
+5	f85543b1c53ea4c2	memory: SELECT id FROM r WHERE NOT (a = b) ORDER BY id
+5	1e8727b505e5e480	memory: SELECT id FROM r WHERE NOT (b > a) ORDER BY id
+4	cb2e791efd336875	memory: SELECT id FROM r WHERE b > a OR v = 50 ORDER BY id
+3	b8bfbd8e67909c9d	memory: SELECT id FROM r WHERE b > a ORDER BY id
+2	a385859198d0e141	memory: SELECT id FROM r WHERE f < g AND v > 15 ORDER BY id
+3	55c8a745423dc844	memory: SELECT id, CASE WHEN v > 30 THEN 'big' ELSE 'small' END FROM r WHERE ts < u ORDER BY id
+2	478a9fd4ead349d9	mixed: SELECT COUNT(*) FROM r WHERE ts > a
+2	92b9a5fd55505e84	mixed: SELECT COUNT(*), MIN(v), MAX(v) FROM r WHERE a = f
+2	0c30710de6b10511	mixed: SELECT COUNT(*), SUM(v) FROM r WHERE a <> b AND v > 15
+2	e8c1c3b265ce0847	mixed: SELECT COUNT(*), SUM(v) FROM r WHERE b > a
+5	e5a812ceb4cd4fe7	mixed: SELECT DATE_TRUNC('day', ts), COUNT(*) FROM r WHERE ts >= u GROUP BY DATE_TRUNC('day', ts)
+4	c864adf70df7db1e	mixed: SELECT d, COUNT(*) FROM r WHERE a >= f GROUP BY d
+2	ffd19d8e2ce42a3f	mixed: SELECT d, COUNT(*) FROM r WHERE b > a GROUP BY d HAVING COUNT(*) > 1 ORDER BY d
+4	18bb229372c06f79	mixed: SELECT d, COUNT(*) FROM r WHERE ts <> a GROUP BY d
+3	e884dade6d475dba	mixed: SELECT d, COUNT(*), SUM(v) FROM r WHERE b > a GROUP BY d
+3	f67bc905402e293f	mixed: SELECT d, MIN(v), MAX(v) FROM r WHERE f <= g GROUP BY d
+2	66372424295eef52	mixed: SELECT d, SUM(v) FROM r WHERE ts < u AND d = 'x' GROUP BY d
+6	470bd2d80944ab82	mixed: SELECT d, a, COUNT(*) FROM r WHERE a <= b GROUP BY d, a
+5	bd21e5b2b2de817a	mixed: SELECT id FROM r WHERE NOT (a = b) ORDER BY id
+4	faec664bf925810e	mixed: SELECT id FROM r WHERE NOT (b > a) ORDER BY id
+5	d0fccee88baf5493	mixed: SELECT id FROM r WHERE b > a OR v = 50 ORDER BY id
+4	fe5a226e4ed1ad43	mixed: SELECT id FROM r WHERE b > a ORDER BY id
+3	403889d1f7ecef45	mixed: SELECT id FROM r WHERE f < g AND v > 15 ORDER BY id
+3	1df983e1fe925bab	mixed: SELECT id, CASE WHEN v > 30 THEN 'big' ELSE 'small' END FROM r WHERE ts < u ORDER BY id
+2	478a9fd4ead349d9	sealed: SELECT COUNT(*) FROM r WHERE ts > a
+2	11e718e79eee5860	sealed: SELECT COUNT(*), MIN(v), MAX(v) FROM r WHERE a = f
+2	e15e78b261fb1dcc	sealed: SELECT COUNT(*), SUM(v) FROM r WHERE a <> b AND v > 15
+2	975a9dc62639dbf4	sealed: SELECT COUNT(*), SUM(v) FROM r WHERE b > a
+5	e5a812ceb4cd4fe7	sealed: SELECT DATE_TRUNC('day', ts), COUNT(*) FROM r WHERE ts >= u GROUP BY DATE_TRUNC('day', ts)
+4	c864adf70df7db1e	sealed: SELECT d, COUNT(*) FROM r WHERE a >= f GROUP BY d
+2	ffd19d8e2ce42a3f	sealed: SELECT d, COUNT(*) FROM r WHERE b > a GROUP BY d HAVING COUNT(*) > 1 ORDER BY d
+4	18bb229372c06f79	sealed: SELECT d, COUNT(*) FROM r WHERE ts <> a GROUP BY d
+2	4e8532951bab1ba0	sealed: SELECT d, COUNT(*), SUM(v) FROM r WHERE b > a GROUP BY d
+3	675116d061025242	sealed: SELECT d, MIN(v), MAX(v) FROM r WHERE f <= g GROUP BY d
+2	5bd84225070e977f	sealed: SELECT d, SUM(v) FROM r WHERE ts < u AND d = 'x' GROUP BY d
+5	f72f85e824793c5b	sealed: SELECT d, a, COUNT(*) FROM r WHERE a <= b GROUP BY d, a
+5	f85543b1c53ea4c2	sealed: SELECT id FROM r WHERE NOT (a = b) ORDER BY id
+5	1e8727b505e5e480	sealed: SELECT id FROM r WHERE NOT (b > a) ORDER BY id
+4	cb2e791efd336875	sealed: SELECT id FROM r WHERE b > a OR v = 50 ORDER BY id
+3	b8bfbd8e67909c9d	sealed: SELECT id FROM r WHERE b > a ORDER BY id
+2	a385859198d0e141	sealed: SELECT id FROM r WHERE f < g AND v > 15 ORDER BY id
+3	55c8a745423dc844	sealed: SELECT id, CASE WHEN v > 30 THEN 'big' ELSE 'small' END FROM r WHERE ts < u ORDER BY id

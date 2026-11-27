@@ -241,6 +241,7 @@ impl PushdownRegistry {
 
         // Comparison operators (most common, should be fast)
         registry.register(Box::new(ComparisonRule));
+        registry.register(Box::new(ColumnPairRule));
         registry.register(Box::new(QuantifiedSetRule));
 
         // Function expressions (LENGTH(col) > 5, etc.)
