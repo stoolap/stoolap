@@ -389,6 +389,16 @@ fn start_walk(plan: &super::secondary::SidePlan) -> Result<Option<super::seconda
     }
 }
 
+/// The column an aggregate's walk over side-file candidates reads for call
+/// `op`: a walk reads one column of a row group, so neither an ordered call
+/// nor arithmetic
+fn walk_column(op: AggregateOp, input: &AggregateInput) -> Option<usize> {
+    match op.order_key() {
+        Some(_) => None,
+        None => input.column(),
+    }
+}
+
 /// One row held by [`TopK`]: ordered so that the worst row of the k is the
 /// greatest, which puts it on top of a max-heap.
 struct Ranked {
@@ -9043,10 +9053,58 @@ impl Table for SegmentedTable {
             let walk_asks = self.side_asks(&comparisons);
             // Arithmetic in a call: its volumes take the inputs that compute it
             let arithmetic = aggregates.iter().any(|(_, input)| input.column().is_none());
+            // A walk answers the one group of calls that each read one column
+            let walk_answers = matches!(group_column, GroupColumn::None)
+                && aggregates
+                    .iter()
+                    .all(|(op, input)| walk_column(*op, input).is_some());
             // Each volume's run starts from this empty one
             let empty = groups.empty_like();
+            // Parallel or sequential volume processing.
+            // Only use rayon when total cold rows justify the scheduling overhead.
+            let _total_cold_rows: usize =
+                volumes.iter().map(|(_, cs)| cs.volume.meta.row_count).sum();
+            #[cfg(feature = "parallel")]
+            let parallel = volumes.len() >= 4 && _total_cold_rows >= 100_000;
+            #[cfg(not(feature = "parallel"))]
+            let parallel = false;
+            // Each volume's side-file decision other than a scan, made before
+            // any volume is read; a decision may read the side file's pages
+            let decide = |(id, cs): &(u64, super::manifest::ColdSegment)| {
+                deadline.check()?;
+                Ok(match self.side_decision(cs, &walk_asks)? {
+                    SideDecision::Scan => None,
+                    decision => Some((*id, decision)),
+                })
+            };
+            let decided: KeyMap<u64, SideDecision> = match (preds.is_empty(), parallel) {
+                (true, _) => KeyMap::default(),
+                #[cfg(feature = "parallel")]
+                (false, true) => {
+                    use rayon::prelude::*;
+                    let decided: Vec<_> =
+                        volumes.par_iter().map(|v| decide(v)).collect::<Result<_>>()?;
+                    decided.into_iter().flatten().collect()
+                }
+                (false, _) => volumes
+                    .iter()
+                    .map(|v| decide(v))
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+            };
+            // A volume that would walk where the walk cannot answer sends the
+            // statement to the scan before any volume's rows are read
+            if !walk_answers
+                && decided
+                    .values()
+                    .any(|decision| matches!(decision, SideDecision::Walk(_)))
+            {
+                return Ok(Some(None));
+            }
 
-            let process_volume =|(_, cs): &(u64, super::manifest::ColdSegment)| -> Result<
+            let process_volume =|(id, cs): &(u64, super::manifest::ColdSegment)| -> Result<
                 Option<GroupedAggregates>,
             > {
                     if bail.load(std::sync::atomic::Ordering::Relaxed)
@@ -9056,13 +9114,10 @@ impl Table for SegmentedTable {
                     }
                     let vol = &cs.volume;
                     let mapping = &cs.mapping;
-                    let walk = match preds.is_empty() {
-                        true => None,
-                        false => match self.side_decision(cs, &walk_asks)? {
-                            SideDecision::Empty => return Ok(None),
-                            SideDecision::Scan => None,
-                            SideDecision::Walk(plan) => start_walk(&plan)?,
-                        },
+                    let walk = match decided.get(id) {
+                        None | Some(SideDecision::Scan) => None,
+                        Some(SideDecision::Empty) => return Ok(None),
+                        Some(SideDecision::Walk(plan)) => start_walk(plan)?,
                     };
 
                     // Resolve predicates to physical column indices via mapping.
@@ -9474,18 +9529,12 @@ impl Table for SegmentedTable {
                                 let mut resolved = Vec::with_capacity(aggregates.len());
                                 for (op, input) in aggregates {
                                     let op = *op;
-                                    // A row group holds one column; arithmetic reads more
-                                    let Some(col_idx) = input.column() else {
+                                    let Some(col_idx) = walk_column(op, input) else {
                                         bail.store(true, std::sync::atomic::Ordering::Relaxed);
                                         return Ok(false);
                                     };
                                     resolved.push(match (op, mapping.sources.get(col_idx)) {
                                         (AggregateOp::CountStar, _) => Call::Fixed(ColdInput::Star),
-                                        // A row group holds one column, an ordered call reads two
-                                        (op, _) if op.order_key().is_some() => {
-                                            bail.store(true, std::sync::atomic::Ordering::Relaxed);
-                                            return Ok(false);
-                                        }
                                         (_, Some(super::writer::ColSource::Volume(phys))) => {
                                             Call::Column(*phys, None)
                                         }
@@ -9525,11 +9574,6 @@ impl Table for SegmentedTable {
                     }
                     let mut part = empty.empty_like();
                     if let Some(mut walk) = walk {
-                        // A walk reads row groups, so it answers the one group only
-                        if !matches!(group_column, GroupColumn::None) {
-                            bail.store(true, std::sync::atomic::Ordering::Relaxed);
-                            return Ok(None);
-                        }
                         let view = (&**tombstones_ref, hot_skip_ref, &cut, deadline);
                         let calls = (mapping, aggregates, &bail);
                         let walked = walk_candidates(
@@ -9642,10 +9686,6 @@ impl Table for SegmentedTable {
                     Ok(Some(part))
                 };
 
-            // Parallel or sequential volume processing.
-            // Only use rayon when total cold rows justify the scheduling overhead.
-            let _total_cold_rows: usize =
-                volumes.iter().map(|(_, cs)| cs.volume.meta.row_count).sum();
             // The volumes' runs merge in volume order into the hot rows' run;
             // a FLOAT sum that could pass the range on the way reads the rows
             let merge_in = |groups: &mut GroupedAggregates, part| match part {
@@ -9656,10 +9696,6 @@ impl Table for SegmentedTable {
                 }
                 None => true,
             };
-            #[cfg(feature = "parallel")]
-            let parallel = volumes.len() >= 4 && _total_cold_rows >= 100_000;
-            #[cfg(not(feature = "parallel"))]
-            let parallel = false;
             if parallel {
                 #[cfg(feature = "parallel")]
                 {
