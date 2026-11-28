@@ -91,14 +91,18 @@ fn a_where_value_fails_only_for_a_row_that_reaches_it() {
                 let sql = site.replace("{w}", where_);
                 // The second run reads the plan the first one kept
                 for run in 0..2 {
+                    let params = || match sql.contains("$1") {
+                        true => vec![stoolap::Value::text("a")],
+                        false => Vec::new(),
+                    };
                     let answered = match writes {
                         true => {
-                            let answered = db.execute(&sql, ("a",)).is_ok();
+                            let answered = db.execute(&sql, params()).is_ok();
                             refill(&db, sealed);
                             answered
                         }
                         false => db
-                            .query(&sql, ("a",))
+                            .query(&sql, params())
                             .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
                             .is_ok(),
                     };

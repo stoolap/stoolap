@@ -90,7 +90,12 @@ const PLAIN_SHAPES: &[&str] = &[
 ];
 
 fn answer(db: &Database, sql: &str) -> Result<Vec<i64>, String> {
-    let rows = db.query(sql, (1,)).map_err(|e| e.to_string())?;
+    // A statement with `$1` reads 1 there, the others no value
+    let params = match sql.contains("$1") {
+        true => vec![stoolap::Value::Integer(1)],
+        false => Vec::new(),
+    };
+    let rows = db.query(sql, params).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for row in rows {
         let row = row.map_err(|e| e.to_string())?;
