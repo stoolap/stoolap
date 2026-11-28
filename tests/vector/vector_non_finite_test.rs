@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A cosine distance with a NaN or Infinity component is NaN, as the L2
-//! and inner product distances are, and a VECTOR column holds only finite
-//! components, whichever statement writes it
+//! A cosine distance with a NaN or Infinity component is NaN, and a VECTOR
+//! column holds only finite components, whichever statement writes it
 
 use std::io::Write;
 
@@ -97,6 +96,20 @@ fn a_vector_column_refuses_a_non_finite_component() {
     ] {
         refused(sql, db.execute(sql, ()));
     }
+    // The refused ADD COLUMN left the table as it was
+    let columns = db.query("SELECT * FROM x", ()).unwrap().columns().len();
+    assert_eq!(columns, 1);
+    // The engine's own call adds a column as the statement does
+    let added = db.engine().create_column_with_default(
+        "x",
+        "e",
+        stoolap::core::DataType::Vector,
+        true,
+        (None, Some(Value::vector(vec![f32::NAN, 1.0])), None),
+        2,
+    );
+    let error = added.expect_err("create_column_with_default").to_string();
+    assert!(error.contains(REFUSED), "{error}");
     // A JSON value is no vector, whatever its components
     let sql = "CREATE TABLE j AS SELECT id, CASE WHEN id = 1 THEN CAST('[1,2]' AS VECTOR) \
                ELSE CAST('{\"a\":1}' AS JSON) END AS e FROM x";
