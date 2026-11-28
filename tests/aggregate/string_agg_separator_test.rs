@@ -62,14 +62,22 @@ fn create(db: &Database) {
 }
 
 fn check(db: &Database, storage: &str, wrong: &mut Vec<String>) {
+    // A separator spelled `$1` reads "+", the others no value
+    let values = |sql: &str| match sql.contains("$1") {
+        true => vec![Value::text("+")],
+        false => Vec::new(),
+    };
     for sep in SEPARATORS {
         let want = match sep {
             "NULL" => Ok(Value::text("xy")),
-            _ => last_of_first_row(db.query(&format!("SELECT CONCAT_WS({sep}, 'x', 'y')"), ("+",))),
+            _ => {
+                let sql = format!("SELECT CONCAT_WS({sep}, 'x', 'y')");
+                last_of_first_row(db.query(&sql, values(&sql)))
+            }
         };
         for shape in SHAPES {
             let sql = shape.replace("{sep}", sep);
-            let got = last_of_first_row(db.query(&sql, ("+",)));
+            let got = last_of_first_row(db.query(&sql, values(&sql)));
             if got != want {
                 wrong.push(format!("{storage}: {sql} gave {got:?}, want {want:?}"));
             }
@@ -135,7 +143,11 @@ fn test_a_separator_names_its_column_as_written() {
         "$1",
     ] {
         let sql = format!("SELECT STRING_AGG(b, {sep}) FROM t");
-        let rows = db.query(&sql, ("+",)).unwrap();
+        let values = match sep == "$1" {
+            true => vec![Value::text("+")],
+            false => Vec::new(),
+        };
+        let rows = db.query(&sql, values).unwrap();
         let want = format!("STRING_AGG(b, {sep})");
         if rows.columns() != [want.as_str()] {
             wrong.push(format!("{sql} named {:?}, want {want}", rows.columns()));
