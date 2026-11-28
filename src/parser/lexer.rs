@@ -195,6 +195,10 @@ impl<'a> Lexer<'a> {
 
             // Number literal
             b'0'..=b'9' => match self.read_number() {
+                _ if self.last_error.is_some() => {
+                    let err = self.last_error.take().unwrap_or_default();
+                    Token::error(err, "", pos)
+                }
                 (literal, true) => Token::new(TokenType::Float, literal, pos),
                 (literal, false) => Token::new(TokenType::Integer, literal, pos),
             },
@@ -324,15 +328,28 @@ impl<'a> Lexer<'a> {
         let start = self.at;
         loop {
             self.skip_class(WORD);
-            if self.byte(self.at) < 0x80 {
-                break;
-            }
-            match self.char_at(self.at) {
-                (c, len) if c.is_alphanumeric() => self.step(len),
-                _ => break,
+            match self.non_ascii_name_char(self.at) {
+                Some(len) => self.step(len),
+                None => break,
             }
         }
         self.text(start, self.at)
+    }
+
+    /// Whether the character at `at` continues a name, as `read_identifier` reads one
+    fn continues_name(&self, at: usize) -> bool {
+        BYTE_CLASS[usize::from(self.byte(at))] & WORD != 0 || self.non_ascii_name_char(at).is_some()
+    }
+
+    /// The length of the character at `at` when it is a letter or digit beyond ASCII
+    fn non_ascii_name_char(&self, at: usize) -> Option<usize> {
+        if self.byte(at) < 0x80 {
+            return None;
+        }
+        match self.char_at(at) {
+            (c, len) if c.is_alphanumeric() => Some(len),
+            _ => None,
+        }
     }
 
     /// Read a number, and whether it has a decimal point or an exponent
@@ -360,13 +377,26 @@ impl<'a> Lexer<'a> {
 
             // Must have at least one digit after exponent
             if !self.byte(self.at).is_ascii_digit() {
-                self.last_error = Some("invalid number format: exponent has no digits".to_string());
-                return (self.token_since(start), float);
+                return self.invalid_number(start);
             }
             self.skip_class(DIGIT);
         }
 
+        // A character a name continues with, right after it, would make it a name
+        if self.continues_name(self.at) {
+            return self.invalid_number(start);
+        }
         (self.token_since(start), float)
+    }
+
+    /// The number from byte `start` that is not one, read to the end of the
+    /// name it runs into, so the error shows the whole text as written
+    #[cold]
+    fn invalid_number(&mut self, start: usize) -> (SmartString, bool) {
+        self.read_identifier();
+        let text = self.token_since(start);
+        self.last_error = Some(format!("invalid number: {text}"));
+        (text, false)
     }
 
     /// Read a string literal (single-quoted)
@@ -975,17 +1005,17 @@ mod tests {
         assert_eq!(lexer.next_token().literal, ":long_named_parameter_x");
     }
 
-    /// A malformed number or comment keeps its token type and leaves the
-    /// message in `get_error`; a bad parameter or quoted identifier becomes an
-    /// Error token. Slicing must preserve the partial literal and the report.
+    /// A malformed comment keeps its token type and leaves the message in
+    /// `last_error`; a malformed number, a bad parameter or quoted identifier
+    /// becomes an Error token. Slicing must preserve the report.
     #[test]
     fn test_reader_error_paths_still_report() {
-        // exponent without digits: the partial literal is kept
+        // exponent without digits: an error naming the whole text
         let mut lexer = Lexer::new("1e+");
         let token = lexer.next_token();
-        assert_eq!(token.token_type, TokenType::Float);
-        assert_eq!(token.literal, "1e+");
-        assert!(lexer.last_error.is_some());
+        assert_eq!(token.token_type, TokenType::Error);
+        assert_eq!(token.literal, "invalid number: 1e+");
+        assert!(lexer.last_error.is_none());
 
         // a bare $ is a parameter without a number: an error token
         let mut lexer = Lexer::new("$ ");

@@ -461,3 +461,59 @@ fn test_negative_numbers() {
         assert_eq!(c, -100);
     }
 }
+
+#[test]
+fn a_number_written_into_a_name_is_an_error_naming_it_in_every_clause() {
+    let db = Database::open("memory://number_suffix").expect("open");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 16), (2, 31)", ())
+        .unwrap();
+    let refused = |sql: &str, text: &str| {
+        let error = match db.query(sql, ()) {
+            Ok(rows) => match rows.collect::<Result<Vec<_>, _>>() {
+                Ok(rows) => panic!("{sql}: answered {} rows", rows.len()),
+                Err(e) => e.to_string(),
+            },
+            Err(e) => e.to_string(),
+        };
+        let says = format!("invalid number: {text}");
+        assert!(error.contains(&says), "{sql}: {error}");
+        let prepared = db.prepare(sql).err().map(|e| e.to_string());
+        assert!(
+            prepared.as_deref().is_some_and(|e| e.contains(&says)),
+            "prepared {sql}: {prepared:?}"
+        );
+    };
+    for text in [
+        "0x1F", "0xZZ", "0b101", "0o17", "1_000", "1abc", "12e3x", "1.5x", "1$", "1é", "1.5é",
+        "1e3é", "1xé", "2日本",
+    ] {
+        refused(&format!("SELECT {text}"), text);
+        refused(&format!("SELECT {text}, 1"), text);
+        refused(&format!("SELECT * FROM (SELECT {text}) s"), text);
+        refused(&format!("SELECT id FROM t WHERE a = {text}"), text);
+        refused(&format!("SELECT id FROM t LIMIT {text}"), text);
+        refused(&format!("INSERT INTO t VALUES (3, {text})"), text);
+    }
+    refused("SELECT id FROM t LIMIT 10OFFSET 1", "10OFFSET");
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
+    assert_eq!(count, 2, "nothing inserted");
+    // A space keeps the name an alias, and a number's own forms stay numbers
+    use stoolap::Value;
+    for (sql, column, want) in [
+        ("SELECT 1 x", "x", Value::Integer(1)),
+        ("SELECT 1 é", "é", Value::Integer(1)),
+        ("SELECT 1e3", "1000", Value::Float(1000.0)),
+        ("SELECT 1e-3", "0.001", Value::Float(0.001)),
+        ("SELECT 1.5", "1.5", Value::Float(1.5)),
+        ("SELECT 2E+2", "200", Value::Float(200.0)),
+    ] {
+        let rows = db.query(sql, ()).unwrap();
+        assert_eq!(rows.columns(), [column], "{sql}");
+        let values: Vec<Value> = rows
+            .map(|row| row.unwrap().get_value(0).unwrap().clone())
+            .collect();
+        assert_eq!(values, [want], "{sql}");
+    }
+}

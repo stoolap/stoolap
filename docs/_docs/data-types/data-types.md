@@ -56,6 +56,10 @@ Features:
 - Full range of 64-bit floating-point values
 - Support for scientific notation
 
+### Writing numbers
+
+A number is written as decimal digits, with an optional fraction (`1.5`) and an optional exponent (`1e3`, `2E+7`, `1.5e-3`); a sign is an operator before it. A number with a fraction or an exponent is FLOAT, one without is INTEGER. A character a name may continue with (a letter or digit of any script, `_` or `$`) written right after a number is an error that names the whole text, such as `invalid number: 0x1F` or `invalid number: 1_000`, so hexadecimal, binary and digit separators are not read as numbers. Put a space between a number and a name: `SELECT 1 x` names the column `x`.
+
 ### TEXT
 
 UTF-8 encoded string values:
