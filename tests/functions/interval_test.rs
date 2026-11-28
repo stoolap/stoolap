@@ -415,13 +415,18 @@ fn test_interval_compound_not_truncated() {
         assert!(result.is_err(), "{} returned {:?}", sql, result);
     }
 
-    let ts: Option<String> = db
-        .query_one(
+    // As text, a compound interval is no interval either
+    let error = db
+        .query_one::<String, _>(
             "SELECT TIMESTAMP '2024-01-15 00:00:00' + '1 day 2 hours'",
             (),
         )
-        .expect("Failed to execute query");
-    assert_eq!(ts, None);
+        .expect_err("compound interval text")
+        .to_string();
+    assert!(
+        error.contains("a timestamp moves by an interval, got '1 day 2 hours'"),
+        "{error}"
+    );
 }
 
 /// The interval a timestamp difference is formatted as can be added back

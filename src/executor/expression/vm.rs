@@ -2699,15 +2699,17 @@ impl ExprVM {
     }
 
     /// A timestamp moved by interval text, backwards when `subtract`; NULL
-    /// for anything else and for text that is not an interval
+    /// for anything else, an error for text that is not an interval
     fn timestamp_add_interval(ts: &Value, interval: &Value, subtract: bool) -> Result<Value> {
         let (Value::Timestamp(t), Value::Text(text)) = (ts, interval) else {
             return Ok(Value::Null(DataType::Timestamp));
         };
-        Ok(match interval::parse_interval(text)? {
-            Some(interval) => Value::Timestamp(interval::shift(*t, interval, subtract)?),
-            None => Value::Null(DataType::Timestamp),
-        })
+        match interval::parse_interval(text)? {
+            Some(interval) => Ok(Value::Timestamp(interval::shift(*t, interval, subtract)?)),
+            None => Err(Error::Type(format!(
+                "a timestamp moves by an interval, got '{text}'"
+            ))),
+        }
     }
 
     /// A timestamp moved by a number of days, backwards when `subtract`

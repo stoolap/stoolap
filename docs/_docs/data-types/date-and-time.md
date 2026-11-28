@@ -210,7 +210,7 @@ SELECT NOW() - INTERVAL '30 minutes';
 - `month` or `months` - Calendar months; the day is clamped to the last day of the target month
 - `year` or `years` - Calendar years (12 months)
 
-Units are read in any case, in an INTERVAL literal, in interval text added to a timestamp, in `DATE_ADD` and in `generate_series`. An INTERVAL literal with any other unit is an error. Interval text from a column or a parameter that is not an interval reads as NULL; its number outside the range is an error.
+Units are read in any case, in an INTERVAL literal, in interval text added to a timestamp, in `DATE_ADD` and in `generate_series`. An INTERVAL literal with any other unit is an error. Text added to or subtracted from a timestamp that is not an interval, from a literal, a column or a parameter, is an error naming it, such as `a timestamp moves by an interval, got 'banana'`; so is its number outside the range.
 
 ### INTERVAL Examples
 

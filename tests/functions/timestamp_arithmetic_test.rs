@@ -159,18 +159,33 @@ fn test_an_interval_reads_one_way() {
     for literal in ["INTERVAL '1 banana'", "INTERVAL 1 BANANA"] {
         fails(&db, &format!("SELECT {base} + {literal}"));
     }
-    // Text that is not an interval reads as NULL
-    assert!(answer(&db, "SELECT ts + s FROM t WHERE id = 3").is_null());
-    assert!(answer(&db, "SELECT ts + '1.5 days' FROM t WHERE id = 3").is_null());
+    // Text that is not an interval is an error naming it, from a column, a
+    // literal or a parameter
+    let refused = |sql: &str, params: Vec<Value>, text: &str| {
+        let error = db
+            .query(sql, params)
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        let says = format!("a timestamp moves by an interval, got '{text}'");
+        assert!(error.contains(&says), "{sql}: {error}");
+    };
+    refused("SELECT ts + s FROM t WHERE id = 3", Vec::new(), "banana");
+    refused(
+        "SELECT ts + '1.5 days' FROM t WHERE id = 3",
+        Vec::new(),
+        "1.5 days",
+    );
     for text in [
         "banana days 99999999999999999999:00:00",
         "99999999999999999999 days banana:00:00",
     ] {
-        let rows = db
-            .query("SELECT ts + $1 FROM t WHERE id = 3", (Value::text(text),))
-            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
-            .unwrap_or_else(|e| panic!("{text}: {e}"));
-        assert!(rows[0].get_value(0).unwrap().is_null(), "{text}");
+        refused(
+            "SELECT ts + $1 FROM t WHERE id = 3",
+            vec![Value::text(text)],
+            text,
+        );
     }
 }
 

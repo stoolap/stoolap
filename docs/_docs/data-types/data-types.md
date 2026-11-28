@@ -326,8 +326,9 @@ SELECT CAST(42 AS TEXT);
 SELECT CAST('42' AS INTEGER);
 SELECT CAST('2023-01-01' AS TIMESTAMP);
 
--- Implicit conversion
-SELECT '42' + 1;  -- Converts '42' to INTEGER
+-- No implicit conversion: arithmetic takes numbers
+SELECT '42' + 1;                   -- error: arithmetic needs INTEGER or FLOAT, got TEXT
+SELECT CAST('42' AS INTEGER) + 1;  -- 43
 ```
 
 More details on type conversions can be found in the dedicated [CAST Operations]({% link _docs/sql-features/cast-operations.md %}) documentation.
