@@ -365,10 +365,8 @@ impl Value {
             Value::Null(_) => None,
             Value::Timestamp(t) => Some(*t),
             Value::Text(s) => parse_timestamp(s).ok(),
-            Value::Integer(nanos) => {
-                // Interpret as nanoseconds since Unix epoch
-                DateTime::from_timestamp(*nanos / 1_000_000_000, (*nanos % 1_000_000_000) as u32)
-            }
+            // Nanoseconds since the Unix epoch, before it too
+            Value::Integer(nanos) => Some(DateTime::from_timestamp_nanos(*nanos)),
             _ => None,
         }
     }
@@ -745,14 +743,9 @@ impl Value {
                     Value::Text(s) => parse_timestamp(s)
                         .map(Value::Timestamp)
                         .unwrap_or(Value::Null(target_type)),
+                    // Nanoseconds since the Unix epoch, before it too
                     Value::Integer(nanos) => {
-                        // Interpret as nanoseconds since Unix epoch
-                        DateTime::from_timestamp(
-                            *nanos / 1_000_000_000,
-                            (*nanos % 1_000_000_000) as u32,
-                        )
-                        .map(Value::Timestamp)
-                        .unwrap_or(Value::Null(target_type))
+                        Value::Timestamp(DateTime::from_timestamp_nanos(*nanos))
                     }
                     _ => Value::Null(target_type),
                 }
@@ -875,11 +868,7 @@ impl Value {
                 Value::Text(s) => parse_timestamp(&s)
                     .map(Value::Timestamp)
                     .unwrap_or(Value::Null(target_type)),
-                Value::Integer(nanos) => {
-                    DateTime::from_timestamp(nanos / 1_000_000_000, (nanos % 1_000_000_000) as u32)
-                        .map(Value::Timestamp)
-                        .unwrap_or(Value::Null(target_type))
-                }
+                Value::Integer(nanos) => Value::Timestamp(DateTime::from_timestamp_nanos(nanos)),
                 _ => Value::Null(target_type),
             },
             DataType::Json => match self {
