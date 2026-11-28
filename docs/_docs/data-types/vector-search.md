@@ -155,6 +155,8 @@ LIMIT 10;
 
 A column holds one index. Its metric decides which distance function the index serves; a query with another distance function scans.
 
+The index measures distances in single precision. A cosine index ranks as `VEC_DISTANCE_COSINE` does for any finite components. An L2 index cannot tell apart vectors whose distance from the query passes about 1.8e19, and an inner product index those whose inner product with it passes about 3.4e38: the index ranks them as equal, where the distance functions, computed in double precision, order them.
+
 ### How HNSW Works
 
 HNSW builds a multi-layer graph where:

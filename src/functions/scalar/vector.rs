@@ -111,16 +111,19 @@ pub fn l2_distance_bytes(a: &[u8], b: &[u8]) -> f64 {
 #[inline]
 pub fn cosine_distance_bytes(a: &[u8], b: &[u8]) -> f64 {
     debug_assert_eq!(a.len(), b.len());
-    let len = a.len() / 4;
-    let mut dot = 0.0f64;
-    let mut norm_a = 0.0f64;
-    let mut norm_b = 0.0f64;
-    for i in 0..len {
-        let ai = read_f32(a, i) as f64;
-        let bi = read_f32(b, i) as f64;
-        dot += ai * bi;
-        norm_a += ai * ai;
-        norm_b += bi * bi;
+    cosine_distance_wide((0..a.len() / 4).map(|i| (read_f32(a, i), read_f32(b, i))))
+}
+
+/// The cosine distance of component pairs summed in f64, where no square
+/// of an f32 component overflows or underflows
+#[inline]
+pub fn cosine_distance_wide(pairs: impl Iterator<Item = (f32, f32)>) -> f64 {
+    let (mut dot, mut norm_a, mut norm_b) = (0.0f64, 0.0f64, 0.0f64);
+    for (a, b) in pairs {
+        let (a, b) = (a as f64, b as f64);
+        dot += a * b;
+        norm_a += a * a;
+        norm_b += b * b;
     }
     cosine_distance_of(dot, norm_a, norm_b)
 }
