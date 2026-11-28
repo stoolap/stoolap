@@ -339,6 +339,17 @@ impl<'a> Parser<'a> {
             self.named_slots.push(SmartString::new(name));
             return Some(self.named_slots.len());
         }
+        // A `?` after a `$n` would read a slot already numbered, a `$n` after a `?` one taken in turn
+        let mixed = match name == "?" {
+            true => self.max_positional >= self.parameter_counter,
+            false => self.parameter_counter > 1,
+        };
+        if mixed {
+            self.add_error(
+                "a statement numbers its positional parameters with $n or ?, not both".to_string(),
+            );
+            return None;
+        }
         let index = if name == "?" {
             self.next_parameter_index()
         } else {

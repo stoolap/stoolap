@@ -393,6 +393,36 @@ fn a_statement_takes_positional_or_named_parameters_not_both() {
 }
 
 #[test]
+fn a_statement_numbers_its_positions_with_dollar_or_question_mark_not_both() {
+    let db = open("param_slots_dollar_and_question");
+    for sql in [
+        "SELECT $1, ?",
+        "SELECT ?, $1",
+        "SELECT id FROM t WHERE id = ? AND v = $2",
+        "SELECT id FROM t WHERE id IN (SELECT id FROM t WHERE v = $1) AND id = ?",
+    ] {
+        for values in [vec![int(1)], vec![int(1), int(2)]] {
+            let error = rows(db.query(sql, values)).expect_err(sql).to_string();
+            assert!(error.contains("not both"), "{sql}: {error}");
+        }
+        assert!(db.prepare(sql).is_err(), "prepare {sql}");
+    }
+    let sql = "SELECT ?, ?, $1 + 0";
+    let error = rows(db.query(sql, (1, 2))).expect_err(sql).to_string();
+    assert!(error.contains("not both"), "{sql}: {error}");
+    for (sql, values, want) in [
+        ("SELECT ?, ?", vec![int(1), int(2)], vec![int(1), int(2)]),
+        (
+            "SELECT $2, $1, $2",
+            vec![int(1), int(2)],
+            vec![int(2), int(1), int(2)],
+        ),
+    ] {
+        assert_eq!(rows(db.query(sql, values)).unwrap(), [want], "{sql}");
+    }
+}
+
+#[test]
 fn named_writes_take_the_compiled_point_paths_as_positional_ones_do() {
     let db = open("param_slots_named_writes");
     let update = db.prepare("UPDATE t SET v = :v WHERE id = :id").unwrap();
