@@ -208,9 +208,16 @@ fn refuse_unkept_constraints(column: &ColumnDefinition, operation: &str) -> Resu
         ColumnConstraint::References { .. } => Some("REFERENCES"),
     });
     match unkept {
-        Some(constraint) => Err(Error::InvalidArgument(format!(
-            "ALTER TABLE {operation} does not take a {constraint} constraint"
-        ))),
+        Some(constraint) => {
+            let article = if constraint.starts_with('A') {
+                "an"
+            } else {
+                "a"
+            };
+            Err(Error::InvalidArgument(format!(
+                "ALTER TABLE {operation} does not take {article} {constraint} constraint"
+            )))
+        }
         None => Ok(()),
     }
 }
@@ -452,6 +459,11 @@ impl Executor {
                 .constraints
                 .iter()
                 .any(|c| matches!(c, ColumnConstraint::AutoIncrement));
+            if is_auto_increment && !is_primary_key {
+                return Err(Error::InvalidArgument(format!(
+                    "AUTO_INCREMENT is allowed only on the INTEGER PRIMARY KEY, not on '{col_name}'"
+                )));
+            }
 
             // Extract DEFAULT expression
             refuse_repeated_constraints(col_def)?;
