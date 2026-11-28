@@ -95,8 +95,8 @@ The operands of `+`, `-`, `*`, `/`, `%` and unary `-` are INTEGER, FLOAT or NULL
 
 | Operator | Description | Example |
 |----------|-------------|---------|
-| `&` | Bitwise AND | `SELECT flags & 0x0F` |
-| `\|` | Bitwise OR | `SELECT flags \| 0x10` |
+| `&` | Bitwise AND | `SELECT flags & 15` |
+| `\|` | Bitwise OR | `SELECT flags \| 16` |
 | `^` | Bitwise XOR | `SELECT a ^ b` |
 | `~` | Bitwise NOT | `SELECT ~flags` |
 | `<<` | Left shift | `SELECT 1 << 4` (returns 16) |
@@ -382,11 +382,11 @@ FROM order_items;
 
 ```sql
 -- Check if specific bit is set
-SELECT * FROM permissions WHERE (flags & 0x04) = 0x04;  -- Check bit 2
+SELECT * FROM permissions WHERE (flags & 4) = 4;  -- Check bit 2
 
 -- Set a bit
-UPDATE permissions SET flags = flags | 0x04 WHERE user_id = 1;
+UPDATE permissions SET flags = flags | 4 WHERE user_id = 1;
 
 -- Clear a bit
-UPDATE permissions SET flags = flags & ~0x04 WHERE user_id = 1;
+UPDATE permissions SET flags = flags & ~4 WHERE user_id = 1;
 ```

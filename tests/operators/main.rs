@@ -21,6 +21,7 @@ mod cast_column_alias_test;
 mod cast_padded_text_test;
 mod cast_simple_test;
 mod cast_test;
+mod cast_unconvertible_test;
 mod cast_where_clause_test;
 mod column_range_rule_test;
 mod comparison_contract_test;

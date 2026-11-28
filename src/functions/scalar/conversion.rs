@@ -58,160 +58,19 @@ impl ScalarFunction for CastFunction {
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
         validate_arg_count!(args, "CAST", 2);
-
-        let value = &args[0];
-        let target_type = match &args[1] {
-            Value::Text(s) => s.to_uppercase(),
-            _ => {
-                return Err(Error::invalid_argument(
-                    "Second argument to CAST must be a string type name",
-                ))
-            }
+        let Value::Text(name) = &args[1] else {
+            return Err(Error::invalid_argument(
+                "Second argument to CAST must be a string type name",
+            ));
         };
-
-        // Handle NULL values - SQL standard: CAST(NULL AS type) returns NULL
-        if value.is_null() {
-            return Ok(match target_type.as_str() {
-                "INT" | "INTEGER" => Value::Null(DataType::Integer),
-                "FLOAT" | "REAL" | "DOUBLE" => Value::Null(DataType::Float),
-                "STRING" | "TEXT" | "VARCHAR" | "CHAR" => Value::Null(DataType::Text),
-                "BOOLEAN" | "BOOL" => Value::Null(DataType::Boolean),
-                "TIMESTAMP" | "DATETIME" | "DATE" | "TIME" => Value::Null(DataType::Timestamp),
-                "JSON" => Value::Null(DataType::Json),
-                _ => Value::null_unknown(),
-            });
-        }
-
-        // Convert based on target type
-        match target_type.as_str() {
-            "INT" | "INTEGER" => cast_to_integer(value),
-            "FLOAT" | "REAL" | "DOUBLE" => cast_to_float(value),
-            "STRING" | "TEXT" | "VARCHAR" | "CHAR" => cast_to_string(value),
-            "BOOLEAN" | "BOOL" => cast_to_boolean(value),
-            "TIMESTAMP" | "DATETIME" | "DATE" | "TIME" => cast_to_timestamp(value),
-            "JSON" => cast_to_json(value),
-            _ => Err(Error::invalid_argument(format!(
-                "Unsupported cast target type: {}",
-                target_type
-            ))),
-        }
+        let target_type: DataType = name.parse().map_err(|_| {
+            Error::invalid_argument(format!("Unsupported cast target type: {name}"))
+        })?;
+        args[0].cast_to(target_type)
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
         Box::new(CastFunction)
-    }
-}
-
-/// Cast a value to INTEGER
-fn cast_to_integer(value: &Value) -> Result<Value> {
-    value.try_coerce_to_type(DataType::Integer)
-}
-
-/// Cast a value to FLOAT
-fn cast_to_float(value: &Value) -> Result<Value> {
-    match value {
-        Value::Integer(i) => Ok(Value::Float(*i as f64)),
-        Value::Float(f) => Ok(Value::Float(*f)),
-        Value::Boolean(b) => Ok(Value::Float(if *b { 1.0 } else { 0.0 })),
-        Value::Text(s) => {
-            if s.is_empty() {
-                return Ok(Value::Float(0.0));
-            }
-            match s.parse::<f64>() {
-                Ok(f) => Ok(Value::Float(f)),
-                Err(_) => Err(Error::invalid_argument(format!(
-                    "Cannot convert '{}' to FLOAT",
-                    s
-                ))),
-            }
-        }
-        Value::Timestamp(t) => Ok(Value::Float(t.timestamp() as f64)),
-        Value::Extension(_) => Err(Error::invalid_argument("Cannot convert JSON to FLOAT")),
-        Value::Null(dt) => Ok(Value::Null(*dt)),
-    }
-}
-
-/// Cast a value to STRING/TEXT
-fn cast_to_string(value: &Value) -> Result<Value> {
-    match value {
-        Value::Text(s) => Ok(Value::Text(s.clone())),
-        Value::Integer(i) => Ok(Value::Text(SmartString::from_string(i.to_string()))),
-        Value::Float(f) => {
-            // Format with up to 6 decimal places
-            Ok(Value::Text(SmartString::from_string(format!("{:.6}", f))))
-        }
-        Value::Boolean(b) => Ok(Value::Text(SmartString::from_string(b.to_string()))),
-        Value::Timestamp(t) => Ok(Value::Text(SmartString::from_string(t.to_rfc3339()))),
-        Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
-            let s = std::str::from_utf8(&data[1..]).unwrap_or("");
-            Ok(Value::Text(SmartString::from(s)))
-        }
-        Value::Extension(_) => Ok(Value::Text(SmartString::from(""))),
-        Value::Null(dt) => Ok(Value::Null(*dt)),
-    }
-}
-
-/// Cast a value to BOOLEAN
-fn cast_to_boolean(value: &Value) -> Result<Value> {
-    match value {
-        Value::Boolean(b) => Ok(Value::Boolean(*b)),
-        Value::Integer(i) => Ok(Value::Boolean(*i != 0)),
-        Value::Float(f) => Ok(Value::Boolean(*f != 0.0)),
-        Value::Text(s) => Ok(crate::core::value::text_as_boolean(s)
-            .map_or(Value::Null(DataType::Boolean), Value::Boolean)),
-        Value::Timestamp(_) => Err(Error::invalid_argument(
-            "Cannot convert TIMESTAMP to BOOLEAN",
-        )),
-        Value::Extension(_) => Err(Error::invalid_argument("Cannot convert JSON to BOOLEAN")),
-        Value::Null(dt) => Ok(Value::Null(*dt)),
-    }
-}
-
-/// Cast a value to TIMESTAMP
-fn cast_to_timestamp(value: &Value) -> Result<Value> {
-    match value {
-        Value::Timestamp(t) => Ok(Value::Timestamp(*t)),
-        Value::Text(s) => {
-            // Try to parse the timestamp using the core parse_timestamp function
-            match crate::core::parse_timestamp(s) {
-                Ok(t) => Ok(Value::Timestamp(t)),
-                Err(_) => Err(Error::invalid_argument(format!(
-                    "Cannot parse '{}' as TIMESTAMP",
-                    s
-                ))),
-            }
-        }
-        Value::Integer(i) => {
-            // Interpret as Unix timestamp
-            use chrono::{TimeZone, Utc};
-            match Utc.timestamp_opt(*i, 0) {
-                chrono::LocalResult::Single(t) => Ok(Value::Timestamp(t)),
-                _ => Err(Error::invalid_argument(format!(
-                    "Invalid Unix timestamp: {}",
-                    i
-                ))),
-            }
-        }
-        _ => Err(Error::invalid_argument(format!(
-            "Cannot convert {:?} to TIMESTAMP",
-            value.data_type()
-        ))),
-    }
-}
-
-/// Cast a value to JSON
-fn cast_to_json(value: &Value) -> Result<Value> {
-    match value {
-        Value::Extension(data) if data.first() == Some(&(DataType::Json as u8)) => {
-            Ok(value.clone())
-        }
-        Value::Text(s) => Ok(Value::json(s.as_ref())),
-        Value::Integer(i) => Ok(Value::json(i.to_string())),
-        Value::Float(f) => Ok(Value::json(f.to_string())),
-        Value::Boolean(b) => Ok(Value::json(b.to_string())),
-        Value::Null(_) => Ok(Value::json("null")),
-        Value::Timestamp(t) => Ok(Value::json(format!("\"{}\"", t.to_rfc3339()))),
-        Value::Extension(_) => Ok(Value::json("null")),
     }
 }
 
@@ -332,197 +191,40 @@ fn is_combining_mark(c: char) -> bool {
 mod tests {
     use super::*;
 
-    // CAST tests
     #[test]
-    fn test_cast_to_integer() {
-        let cast = CastFunction;
-
-        // Integer passthrough
-        assert_eq!(
-            cast.evaluate(&[Value::Integer(42), Value::text("INTEGER")])
-                .unwrap(),
-            Value::Integer(42)
-        );
-
-        // Float to integer
-        assert_eq!(
-            cast.evaluate(&[Value::Float(3.7), Value::text("INT")])
-                .unwrap(),
-            Value::Integer(3)
-        );
-
-        // String to integer
-        assert_eq!(
-            cast.evaluate(&[Value::text("123"), Value::text("INTEGER")])
-                .unwrap(),
-            Value::Integer(123)
-        );
-
-        // Boolean to integer
-        assert_eq!(
-            cast.evaluate(&[Value::Boolean(true), Value::text("INT")])
-                .unwrap(),
-            Value::Integer(1)
-        );
-        assert_eq!(
-            cast.evaluate(&[Value::Boolean(false), Value::text("INT")])
-                .unwrap(),
-            Value::Integer(0)
-        );
-
-        // Empty string to integer
-        assert_eq!(
-            cast.evaluate(&[Value::text(""), Value::text("INTEGER")])
-                .unwrap(),
-            Value::Null(DataType::Integer)
-        );
-    }
-
-    #[test]
-    fn test_cast_text_to_integer_edge_cases() {
-        let cast = CastFunction;
-
-        for text in ["inf", "-inf", "NaN", "1e30", "3.14"] {
-            assert_eq!(
-                cast.evaluate(&[Value::text(text), Value::text("INTEGER")])
-                    .unwrap(),
-                Value::Null(DataType::Integer),
-                "{text}"
-            );
+    fn the_cast_function_answers_as_a_cast() {
+        let values = [
+            Value::Integer(42),
+            Value::Float(3.7),
+            Value::Float(1.5),
+            Value::text("123"),
+            Value::text("abc"),
+            Value::text("3.14"),
+            Value::text(""),
+            Value::text("yes"),
+            Value::text("junk"),
+            Value::text("9223372036854775808"),
+            Value::Float(1e30),
+            Value::Boolean(true),
+            Value::null_unknown(),
+        ];
+        for value in values {
+            for name in [
+                "INTEGER", "INT", "FLOAT", "REAL", "TEXT", "VARCHAR", "BOOLEAN", "JSON",
+            ] {
+                let target: DataType = name.parse().unwrap();
+                let got = CastFunction.evaluate(&[value.clone(), Value::text(name)]);
+                let want = value.cast_to(target);
+                assert_eq!(
+                    got.as_ref().map_err(|e| e.to_string()),
+                    want.as_ref().map_err(|e| e.to_string()),
+                    "CAST({value:?} AS {name})"
+                );
+            }
         }
-        assert!(cast
-            .evaluate(&[Value::text("9223372036854775808"), Value::text("INTEGER")])
+        assert!(CastFunction
+            .evaluate(&[Value::Integer(1), Value::text("NOPE")])
             .is_err());
-        assert!(cast
-            .evaluate(&[Value::Float(1e30), Value::text("INTEGER")])
-            .is_err());
-    }
-
-    #[test]
-    fn test_cast_to_float() {
-        let cast = CastFunction;
-
-        // Integer to float
-        assert_eq!(
-            cast.evaluate(&[Value::Integer(42), Value::text("FLOAT")])
-                .unwrap(),
-            Value::Float(42.0)
-        );
-
-        // Float passthrough
-        assert_eq!(
-            cast.evaluate(&[Value::Float(3.5), Value::text("REAL")])
-                .unwrap(),
-            Value::Float(3.5)
-        );
-
-        // String to float
-        assert_eq!(
-            cast.evaluate(&[Value::text("2.5"), Value::text("DOUBLE")])
-                .unwrap(),
-            Value::Float(2.5)
-        );
-    }
-
-    #[test]
-    fn test_cast_to_string() {
-        let cast = CastFunction;
-
-        // Integer to string
-        assert_eq!(
-            cast.evaluate(&[Value::Integer(42), Value::text("TEXT")])
-                .unwrap(),
-            Value::text("42")
-        );
-
-        // Boolean to string
-        assert_eq!(
-            cast.evaluate(&[Value::Boolean(true), Value::text("STRING")])
-                .unwrap(),
-            Value::text("true")
-        );
-
-        // String passthrough
-        assert_eq!(
-            cast.evaluate(&[Value::text("hello"), Value::text("VARCHAR")])
-                .unwrap(),
-            Value::text("hello")
-        );
-    }
-
-    #[test]
-    fn test_cast_to_boolean() {
-        let cast = CastFunction;
-
-        // Integer to boolean
-        assert_eq!(
-            cast.evaluate(&[Value::Integer(1), Value::text("BOOL")])
-                .unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            cast.evaluate(&[Value::Integer(0), Value::text("BOOLEAN")])
-                .unwrap(),
-            Value::Boolean(false)
-        );
-
-        // String to boolean
-        assert_eq!(
-            cast.evaluate(&[Value::text("true"), Value::text("BOOL")])
-                .unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            cast.evaluate(&[Value::text("false"), Value::text("BOOL")])
-                .unwrap(),
-            Value::Boolean(false)
-        );
-        assert_eq!(
-            cast.evaluate(&[Value::text("yes"), Value::text("BOOL")])
-                .unwrap(),
-            Value::Boolean(true)
-        );
-    }
-
-    #[test]
-    fn test_cast_null_handling() {
-        let cast = CastFunction;
-
-        // SQL standard: CAST(NULL AS type) returns NULL with the target type
-        let result = cast
-            .evaluate(&[Value::null_unknown(), Value::text("INTEGER")])
-            .unwrap();
-        assert!(result.is_null(), "CAST(NULL AS INTEGER) should return NULL");
-
-        let result = cast
-            .evaluate(&[Value::null_unknown(), Value::text("TEXT")])
-            .unwrap();
-        assert!(result.is_null(), "CAST(NULL AS TEXT) should return NULL");
-
-        let result = cast
-            .evaluate(&[Value::null_unknown(), Value::text("FLOAT")])
-            .unwrap();
-        assert!(result.is_null(), "CAST(NULL AS FLOAT) should return NULL");
-
-        let result = cast
-            .evaluate(&[Value::null_unknown(), Value::text("BOOLEAN")])
-            .unwrap();
-        assert!(result.is_null(), "CAST(NULL AS BOOLEAN) should return NULL");
-    }
-
-    #[test]
-    fn test_cast_to_boolean_reads_text_as_sql_cast() {
-        let cast = CastFunction;
-        for text in [
-            "true", "T", "yes", "Y", "1", "false", "f", "NO", "n", "0", "junk", "", "2",
-        ] {
-            let want = crate::core::value::text_as_boolean(text)
-                .map_or(Value::Null(DataType::Boolean), Value::Boolean);
-            let got = cast
-                .evaluate(&[Value::text(text), Value::text("BOOLEAN")])
-                .unwrap();
-            assert_eq!(got, want, "CAST('{text}' AS BOOLEAN)");
-        }
     }
 
     // COLLATE tests

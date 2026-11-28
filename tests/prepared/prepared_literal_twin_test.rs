@@ -210,7 +210,11 @@ fn other_values(params: &[Value]) -> Vec<Value> {
         .iter()
         .map(|value| match value {
             Value::Integer(n) => Value::Integer(n + 100),
-            Value::Text(s) => Value::text(format!("{s}z")),
+            // A text a CAST reads as a number stays one, or the CAST refuses it
+            Value::Text(s) => match s.parse::<i64>() {
+                Ok(n) => Value::text((n + 100).to_string()),
+                Err(_) => Value::text(format!("{s}z")),
+            },
             value => value.clone(),
         })
         .collect()

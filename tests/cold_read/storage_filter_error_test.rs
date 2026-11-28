@@ -69,10 +69,7 @@ const CASES: [(&str, &str); 17] = [
         "[Integer(2)]",
     ),
     ("SELECT id FROM t WHERE UPPER(s) = 'A'", "[Integer(1)]"),
-    (
-        "SELECT id FROM t WHERE CAST(s AS INTEGER) > 0",
-        "[Integer(2)]",
-    ),
+    ("SELECT id FROM t WHERE CAST(s AS INTEGER) > 0", ERR),
     ("UPDATE t SET k = 0 WHERE ABS(x) >= 0", ERR),
     ("DELETE FROM t WHERE ABS(x) >= 0", ERR),
     ("SELECT COUNT(*) FROM t WHERE k > 0", "[Integer(2)]"),

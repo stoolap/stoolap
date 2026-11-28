@@ -166,14 +166,13 @@ fn a_zone_out_of_range_or_not_written_whole_reads_as_no_timestamp() {
         "2024-01-10 03:00:00+03:",
         "2024-01-10 03:00:00+03:0",
     ] {
-        assert_eq!(
-            truth(
-                &db,
-                &format!("SELECT CAST('{text}' AS TIMESTAMP) IS NULL"),
-                vec![]
-            ),
-            Some(true),
-            "{text}"
+        let error = db
+            .query_one::<Option<String>, _>(&format!("SELECT CAST('{text}' AS TIMESTAMP)"), ())
+            .expect_err(text)
+            .to_string();
+        assert!(
+            error.contains(&format!("cannot cast TEXT '{text}' to TIMESTAMP")),
+            "{text}: {error}"
         );
         assert_eq!(
             truth(&db, &format!("SELECT ts = '{text}' FROM t"), vec![]),

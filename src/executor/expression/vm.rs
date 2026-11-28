@@ -1306,7 +1306,7 @@ impl ExprVM {
                 // =============================================================
                 Op::Cast(target_type) => {
                     let v = stack.pop();
-                    let result = v.try_coerce_to_type(*target_type)?;
+                    let result = v.cast_to(*target_type)?;
                     stack.push(result);
                     pc += 1;
                 }

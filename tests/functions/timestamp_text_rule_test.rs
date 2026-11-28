@@ -145,12 +145,22 @@ fn a_date_alone_reads_in_every_documented_form_with_a_four_digit_year() {
         ("15/05/2023", "2023-05-15T00:00:00Z"),
         ("2024/03/04 05:06:07", "2024-03-04T05:06:07Z"),
         ("0024-03-04", "0024-03-04T00:00:00Z"),
-        ("24-03-04", "NULL"),
-        ("3/4/24", "NULL"),
     ] {
         let got = texts(&db, "SELECT CAST($1 AS TIMESTAMP)", vec![Value::text(text)]);
         if got != [want] {
             wrong.push(format!("{text:?} read as {got:?}, want {want}"));
+        }
+    }
+    // A two-digit year reads as no timestamp, which a CAST refuses
+    for text in ["24-03-04", "3/4/24"] {
+        let got = db
+            .query("SELECT CAST($1 AS TIMESTAMP)", vec![Value::text(text)])
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        if !got.contains(&format!("cannot cast TEXT '{text}' to TIMESTAMP")) {
+            wrong.push(format!("{text:?}: {got:?}"));
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
