@@ -91,10 +91,15 @@ CREATE TABLE cast_test (
 INSERT INTO cast_test VALUES 
     (1, '100', 100, 100.5, TRUE),
     (2, '200', 200, 200.5, FALSE),
-    (3, 'abc', 300, 300.5, TRUE);
+    (3, '300', 300, 300.5, TRUE);
 
 -- Cast text column to integer in WHERE clause
-SELECT id FROM cast_test WHERE CAST(text_val AS INTEGER) > 150;  -- Returns 2
+SELECT id FROM cast_test WHERE CAST(text_val AS INTEGER) > 150;  -- Returns 2 and 3
+
+-- A row holding text no INTEGER reads makes the statement fail
+INSERT INTO cast_test VALUES (4, 'abc', 400, 400.5, FALSE);
+SELECT id FROM cast_test WHERE CAST(text_val AS INTEGER) > 150;
+-- error: cannot cast TEXT 'abc' to INTEGER
 ```
 
 ### Complex CAST Operations
@@ -114,12 +119,14 @@ SELECT CAST(NULL AS BOOLEAN);                  -- Returns NULL (typed as BOOLEAN
 
 ## Type Conversion Rules
 
+A CAST of NULL is NULL of the target type. A CAST of any other value that its target type cannot read is an error naming the value and the type, such as `cannot cast TEXT 'abc' to INTEGER` or `cannot cast TIMESTAMP ... to INTEGER`; it is never NULL. The rules below say what each type reads.
+
 ### To INTEGER
 
 - **From FLOAT**: Truncates toward zero (123.45 → 123, -3.7 → -3). A value outside the INTEGER range, NaN or infinity is an error
-- **From TEXT**: Parses an integer, ignoring the spaces around it (" 123 " → 123). A number outside the INTEGER range is an error; any other text, including "3.7" and "", becomes NULL
+- **From TEXT**: Parses an integer, ignoring the spaces around it (" 123 " → 123). A number outside the INTEGER range is an error, and so is any other text, including "3.7", "1e3" and ""
 - **From BOOLEAN**: TRUE → 1, FALSE → 0
-- **From TIMESTAMP**: NULL
+- **From TIMESTAMP**: an error
 - **From NULL**: Returns NULL (typed as INTEGER)
 
 The same conversion applies wherever a value becomes an INTEGER: a CAST, a value written into an INTEGER column by INSERT, UPDATE, upsert, a DEFAULT or COPY, and an INTEGER argument of a function such as LEFT or SUBSTRING. A FLOAT outside the range is never clamped to the largest INTEGER. `ALTER TABLE ... MODIFY COLUMN ... INTEGER` is the exception: a value it cannot convert becomes NULL, as described for that statement.
@@ -127,7 +134,7 @@ The same conversion applies wherever a value becomes an INTEGER: a CAST, a value
 ### To FLOAT
 
 - **From INTEGER**: Direct conversion (123 → 123.0)
-- **From TEXT**: Parses numeric string ("123.45" → 123.45), non-numeric strings become 0.0
+- **From TEXT**: Parses numeric string ("123.45" → 123.45); any other text is an error
 - **From BOOLEAN**: TRUE → 1.0, FALSE → 0.0
 - **From TIMESTAMP**: Converts to Unix timestamp with fractional seconds
 - **From NULL**: Returns NULL (typed as FLOAT)
@@ -148,19 +155,21 @@ The same conversion applies wherever a value becomes a TEXT: a CAST, a value wri
 - **From FLOAT**: 0.0 → FALSE, non-zero → TRUE
 - **From TEXT**: "true", "t", "yes", "y", "1" → TRUE (case-insensitive)
                 "false", "f", "no", "n", "0" → FALSE (case-insensitive)
-                any other text, including "", becomes NULL
+                any other text, including "", is an error
 - **From NULL**: Returns NULL (typed as BOOLEAN)
 
 ### To TIMESTAMP
 
-- **From INTEGER**: Interpreted as Unix timestamp
-- **From FLOAT**: Interpreted as Unix timestamp with fractional seconds
-- **From TEXT**: Parses date/time string in various formats
+- **From INTEGER**: Read as nanoseconds since 1970-01-01 00:00:00 UTC, the unit a TIMESTAMP is held in (`CAST(1700000000 AS TIMESTAMP)` is 1.7 seconds after the epoch)
+- **From FLOAT**: an error
+- **From TEXT**: Parses date/time string in various formats; text that is not one, or a date that does not exist such as "2024-13-45", is an error
 - **From NULL**: Returns NULL (typed as TIMESTAMP)
+
+`CAST(x AS DATE)` reads `x` as `CAST(x AS TIMESTAMP)` does, and gives that TIMESTAMP at midnight. So it refuses what the TIMESTAMP cast refuses, with that cast's error, and `CAST(NULL AS DATE)` is NULL.
 
 ### To JSON
 
-- **From TEXT**: Validated as JSON string
+- **From TEXT**: Validated as JSON string; text that is not JSON is an error
 - **From other types**: Converted to JSON representation
 
 ## Implicit Type Conversion

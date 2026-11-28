@@ -1306,7 +1306,7 @@ impl ExprVM {
                 // =============================================================
                 Op::Cast(target_type) => {
                     let v = stack.pop();
-                    let result = v.try_coerce_to_type(*target_type)?;
+                    let result = v.cast_to(*target_type)?;
                     stack.push(result);
                     pc += 1;
                 }
@@ -1687,42 +1687,17 @@ impl ExprVM {
             }
 
             Op::TruncateToDate => {
-                let v = stack.pop();
-                let result = match &*v {
+                // A DATE is the TIMESTAMP the CAST reads, at midnight
+                let result = match stack.pop().cast_to(DataType::Timestamp)? {
                     Value::Timestamp(t) => {
                         use chrono::{Datelike, TimeZone, Utc};
                         let truncated = Utc
                             .with_ymd_and_hms(t.year(), t.month(), t.day(), 0, 0, 0)
                             .single()
-                            .unwrap_or(*t);
+                            .unwrap_or(t);
                         Value::Timestamp(truncated)
                     }
-                    Value::Text(s) => match crate::core::parse_timestamp(s) {
-                        Ok(t) => {
-                            use chrono::{Datelike, TimeZone, Utc};
-                            let truncated = Utc
-                                .with_ymd_and_hms(t.year(), t.month(), t.day(), 0, 0, 0)
-                                .single()
-                                .unwrap_or(t);
-                            Value::Timestamp(truncated)
-                        }
-                        Err(_) => Value::Null(DataType::Timestamp),
-                    },
-                    Value::Integer(i) => {
-                        use chrono::{Datelike, TimeZone, Utc};
-                        match Utc.timestamp_opt(*i, 0) {
-                            chrono::LocalResult::Single(t) => {
-                                let truncated = Utc
-                                    .with_ymd_and_hms(t.year(), t.month(), t.day(), 0, 0, 0)
-                                    .single()
-                                    .unwrap_or(t);
-                                Value::Timestamp(truncated)
-                            }
-                            _ => Value::Null(DataType::Timestamp),
-                        }
-                    }
-                    Value::Null(_) => Value::Null(DataType::Timestamp),
-                    _ => Value::Null(DataType::Timestamp),
+                    other => other,
                 };
                 stack.push(result);
             }

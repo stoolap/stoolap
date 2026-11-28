@@ -55,15 +55,18 @@ fn test_cast_outside_the_range_is_an_error() {
         Some(i64::MIN)
     );
     assert_eq!(int(&db, "SELECT CAST(' 42 ' AS INTEGER)"), Some(42));
-    assert_eq!(int(&db, "SELECT CAST('3.7' AS INTEGER)"), None);
-    assert_eq!(
-        int(&db, "SELECT CAST('999999999999999999999x' AS INTEGER)"),
-        None
-    );
-    assert_eq!(
-        int(&db, "SELECT CAST('-999999999999999999999x' AS INTEGER)"),
-        None
-    );
+    // Text that is no integer is refused as text, not as a number out of range
+    for text in ["3.7", "999999999999999999999x", "-999999999999999999999x"] {
+        let sql = format!("SELECT CAST('{text}' AS INTEGER)");
+        let error = db
+            .query_one::<Option<i64>, _>(&sql, ())
+            .expect_err(&sql)
+            .to_string();
+        assert!(
+            error.contains(&format!("cannot cast TEXT '{text}' to INTEGER")),
+            "{sql}: {error}"
+        );
+    }
     for sql in [
         "SELECT CAST(9223372036854775807.0 AS INTEGER)",
         "SELECT CAST(1e30 AS INTEGER)",

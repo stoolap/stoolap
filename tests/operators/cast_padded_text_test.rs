@@ -21,7 +21,7 @@ fn test_cast_of_padded_text_to_a_number() {
     let db = Database::open("memory://cast_padded_text").unwrap();
     let row = db
         .query(
-            "SELECT CAST(' 7' AS INTEGER), CAST('7 ' AS INTEGER), CAST(' -3' AS INTEGER), CAST(' 7.5 ' AS FLOAT), CAST('x' AS INTEGER)",
+            "SELECT CAST(' 7' AS INTEGER), CAST('7 ' AS INTEGER), CAST(' -3' AS INTEGER), CAST(' 7.5 ' AS FLOAT)",
             (),
         )
         .unwrap()
@@ -32,5 +32,9 @@ fn test_cast_of_padded_text_to_a_number() {
     assert_eq!(row.get::<Option<i64>>(1).unwrap(), Some(7));
     assert_eq!(row.get::<Option<i64>>(2).unwrap(), Some(-3));
     assert_eq!(row.get::<Option<f64>>(3).unwrap(), Some(7.5));
-    assert_eq!(row.get::<Option<i64>>(4).unwrap(), None);
+    let error = db
+        .query_one::<Option<i64>, _>("SELECT CAST('x' AS INTEGER)", ())
+        .expect_err("'x' is no number")
+        .to_string();
+    assert!(error.contains("cannot cast TEXT 'x' to INTEGER"), "{error}");
 }

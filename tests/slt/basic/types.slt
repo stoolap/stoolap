@@ -173,11 +173,9 @@ SELECT CAST(42 AS FLOAT)
 ----
 42.000
 
-# CAST invalid text to int returns NULL
-query I
+# CAST of text that is no integer fails
+statement error
 SELECT CAST('not_a_number' AS INTEGER)
-----
-NULL
 
 # Comparison with NULL always returns NULL/no match
 query I

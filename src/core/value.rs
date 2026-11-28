@@ -365,10 +365,8 @@ impl Value {
             Value::Null(_) => None,
             Value::Timestamp(t) => Some(*t),
             Value::Text(s) => parse_timestamp(s).ok(),
-            Value::Integer(nanos) => {
-                // Interpret as nanoseconds since Unix epoch
-                DateTime::from_timestamp(*nanos / 1_000_000_000, (*nanos % 1_000_000_000) as u32)
-            }
+            // Nanoseconds since the Unix epoch, before it too
+            Value::Integer(nanos) => Some(DateTime::from_timestamp_nanos(*nanos)),
             _ => None,
         }
     }
@@ -745,14 +743,9 @@ impl Value {
                     Value::Text(s) => parse_timestamp(s)
                         .map(Value::Timestamp)
                         .unwrap_or(Value::Null(target_type)),
+                    // Nanoseconds since the Unix epoch, before it too
                     Value::Integer(nanos) => {
-                        // Interpret as nanoseconds since Unix epoch
-                        DateTime::from_timestamp(
-                            *nanos / 1_000_000_000,
-                            (*nanos % 1_000_000_000) as u32,
-                        )
-                        .map(Value::Timestamp)
-                        .unwrap_or(Value::Null(target_type))
+                        Value::Timestamp(DateTime::from_timestamp_nanos(*nanos))
                     }
                     _ => Value::Null(target_type),
                 }
@@ -793,6 +786,16 @@ impl Value {
             },
             DataType::Null => Value::Null(DataType::Null),
         }
+    }
+
+    /// `CAST(self AS target_type)`: `try_coerce_to_type`, and an error for a
+    /// value that is not NULL and that `target_type` cannot read
+    pub fn cast_to(&self, target_type: DataType) -> Result<Value> {
+        let cast = self.try_coerce_to_type(target_type)?;
+        if cast.is_null() && !self.is_null() {
+            return Err(cannot_cast(self, target_type));
+        }
+        Ok(cast)
     }
 
     /// `coerce_to_type`, but an error for a number outside the INTEGER range,
@@ -865,11 +868,7 @@ impl Value {
                 Value::Text(s) => parse_timestamp(&s)
                     .map(Value::Timestamp)
                     .unwrap_or(Value::Null(target_type)),
-                Value::Integer(nanos) => {
-                    DateTime::from_timestamp(nanos / 1_000_000_000, (nanos % 1_000_000_000) as u32)
-                        .map(Value::Timestamp)
-                        .unwrap_or(Value::Null(target_type))
-                }
+                Value::Integer(nanos) => Value::Timestamp(DateTime::from_timestamp_nanos(nanos)),
                 _ => Value::Null(target_type),
             },
             DataType::Json => match self {
@@ -962,6 +961,20 @@ impl PartialEq for Value {
 }
 
 impl Eq for Value {}
+
+/// The error for a CAST of `value` that `target_type` cannot read
+#[cold]
+#[inline(never)]
+fn cannot_cast(value: &Value, target_type: DataType) -> Error {
+    let shown = match value {
+        Value::Text(text) => format!("'{text}'"),
+        _ => value.to_string(),
+    };
+    Error::Type(format!(
+        "cannot cast {} {shown} to {target_type}",
+        value.data_type()
+    ))
+}
 
 /// Compare an i64 with an f64 exactly. `i as f64` rounds above 2^53, so
 /// e.g. i64::MAX as f64 == 2^63 and a naive float comparison calls

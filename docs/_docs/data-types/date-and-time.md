@@ -63,7 +63,7 @@ A typed literal, `TIMESTAMP '...'` or `DATE '...'`, whose text does not read as 
 15/05/2023                    -- European format (day/month/year)
 ```
 
-A date in either of the last two forms that both can read, such as `03/04/2024`, is read as the US form, month before day: March 4. A year is always written with four digits (`0024-03-04` for the year 24), so `24-03-04` or `3/4/24` reads as no TIMESTAMP and `CAST` gives NULL.
+A date in either of the last two forms that both can read, such as `03/04/2024`, is read as the US form, month before day: March 4. A year is always written with four digits (`0024-03-04` for the year 24), so `24-03-04` or `3/4/24` reads as no TIMESTAMP and `CAST` refuses it with `cannot cast TEXT '24-03-04' to TIMESTAMP`.
 
 ### Time Only
 ```

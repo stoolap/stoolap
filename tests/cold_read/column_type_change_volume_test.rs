@@ -30,6 +30,21 @@ fn value(db: &Database, sql: &str) -> Value {
         .unwrap_or(Value::Null(DataType::Null))
 }
 
+/// What MODIFY COLUMN keeps of the value `sql` casts: the CAST's answer, or
+/// NULL where the CAST refuses it, as the change does
+fn kept(db: &Database, sql: &str) -> Value {
+    match db
+        .query(sql, ())
+        .and_then(|mut rows| rows.next().transpose())
+    {
+        Ok(Some(row)) => row
+            .get_value(0)
+            .cloned()
+            .unwrap_or(Value::Null(DataType::Null)),
+        _ => Value::Null(DataType::Null),
+    }
+}
+
 fn x_of(db: &Database, id: i64) -> Value {
     value(db, &format!("SELECT x FROM t WHERE id = {id}"))
 }
@@ -74,11 +89,11 @@ fn a_sealed_or_compacted_value_reads_as_its_cast_to_the_new_type() {
         db.execute(&format!("ALTER TABLE t MODIFY COLUMN x {to}"), ())
             .unwrap();
         let want = [
-            value(
+            kept(
                 &db,
                 &format!("SELECT CAST(CAST({sealed} AS {from}) AS {to})"),
             ),
-            value(&db, &format!("SELECT CAST(CAST({hot} AS {from}) AS {to})")),
+            kept(&db, &format!("SELECT CAST(CAST({hot} AS {from}) AS {to})")),
         ];
         // Row 2 is sealed under the new type
         db.execute("PRAGMA CHECKPOINT", ()).unwrap();
