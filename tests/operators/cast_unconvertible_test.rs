@@ -69,6 +69,10 @@ fn a_cast_its_target_cannot_read_is_an_error_in_every_clause() {
             ("SELECT CAST('abc' AS BOOLEAN)", "BOOLEAN"),
             ("SELECT CAST('abc' AS JSON)", "JSON"),
             ("SELECT CAST('abc' AS VECTOR)", "VECTOR"),
+            // A DATE reads as a TIMESTAMP does
+            ("SELECT CAST('abc' AS DATE)", "TIMESTAMP"),
+            ("SELECT CAST(TRUE AS DATE)", "TIMESTAMP"),
+            ("SELECT CAST(s AS DATE) FROM t", "TIMESTAMP"),
             (
                 "SELECT CAST(TIMESTAMP '2024-01-01 00:00:00' AS INTEGER)",
                 "INTEGER",
@@ -122,6 +126,15 @@ fn a_cast_its_target_cannot_read_is_an_error_in_every_clause() {
             ("SELECT CAST('1.5' AS FLOAT)", "1.5"),
             ("SELECT CAST('yes' AS BOOLEAN)", "true"),
             ("SELECT CAST(s AS INTEGER) FROM t WHERE id = 2", "42"),
+            (
+                "SELECT CAST('2024-01-15 14:30:00' AS DATE) = TIMESTAMP '2024-01-15 00:00:00'",
+                "true",
+            ),
+            (
+                "SELECT CAST(ts AS DATE) IS NULL FROM t WHERE id = 2",
+                "true",
+            ),
+            ("SELECT CAST(NULL AS DATE) IS NULL", "true"),
         ] {
             assert_eq!(
                 answer(&db, sql, Vec::new()),

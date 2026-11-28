@@ -91,10 +91,15 @@ CREATE TABLE cast_test (
 INSERT INTO cast_test VALUES 
     (1, '100', 100, 100.5, TRUE),
     (2, '200', 200, 200.5, FALSE),
-    (3, 'abc', 300, 300.5, TRUE);
+    (3, '300', 300, 300.5, TRUE);
 
 -- Cast text column to integer in WHERE clause
-SELECT id FROM cast_test WHERE CAST(text_val AS INTEGER) > 150;  -- Returns 2
+SELECT id FROM cast_test WHERE CAST(text_val AS INTEGER) > 150;  -- Returns 2 and 3
+
+-- A row holding text no INTEGER reads makes the statement fail
+INSERT INTO cast_test VALUES (4, 'abc', 400, 400.5, FALSE);
+SELECT id FROM cast_test WHERE CAST(text_val AS INTEGER) > 150;
+-- error: cannot cast TEXT 'abc' to INTEGER
 ```
 
 ### Complex CAST Operations
@@ -155,10 +160,12 @@ The same conversion applies wherever a value becomes a TEXT: a CAST, a value wri
 
 ### To TIMESTAMP
 
-- **From INTEGER**: Interpreted as Unix timestamp
-- **From FLOAT**: Interpreted as Unix timestamp with fractional seconds
+- **From INTEGER**: Read as nanoseconds since 1970-01-01 00:00:00 UTC, the unit a TIMESTAMP is held in (`CAST(1700000000 AS TIMESTAMP)` is 1.7 seconds after the epoch)
+- **From FLOAT**: an error
 - **From TEXT**: Parses date/time string in various formats; text that is not one, or a date that does not exist such as "2024-13-45", is an error
 - **From NULL**: Returns NULL (typed as TIMESTAMP)
+
+`CAST(x AS DATE)` reads `x` as `CAST(x AS TIMESTAMP)` does, and gives that TIMESTAMP at midnight. So it refuses what the TIMESTAMP cast refuses, with that cast's error, and `CAST(NULL AS DATE)` is NULL.
 
 ### To JSON
 
