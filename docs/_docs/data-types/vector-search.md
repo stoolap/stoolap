@@ -155,7 +155,7 @@ LIMIT 10;
 
 A column holds one index. Its metric decides which distance function the index serves; a query with another distance function scans.
 
-The index measures distances in single precision. A cosine index ranks as `VEC_DISTANCE_COSINE` does for any finite components. An L2 index cannot tell apart vectors whose distance from the query passes about 1.8e19, and an inner product index those whose inner product with it passes about 3.4e38: the index ranks them as equal, where the distance functions, computed in double precision, order them.
+The index measures distances in single precision, where the distance functions use double precision, so the index can rank as equal two distances that differ only past single precision: against `[1,0]`, a cosine index finds `[1,0.0001]` and `[1,0.0002]` both at 0, where `VEC_DISTANCE_COSINE` gives about 5e-9 and 2e-8. A cosine index takes its sums again in double precision when a squared norm would be 0, subnormal or infinite in single precision, so components past about 1.8e19 or below about 1e-19 keep their real distance. An L2 index cannot tell apart vectors whose distance from the query passes about 1.8e19, and an inner product index those whose inner product with it passes about 3.4e38: the index ranks them as equal, where the distance functions, computed in double precision, order them.
 
 ### How HNSW Works
 
