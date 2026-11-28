@@ -570,20 +570,18 @@ fn deserialize_snapshot_schema(data: &[u8]) -> Result<Schema> {
             None
         };
 
-        let name_lower = col_name.to_lowercase();
-        columns.push(SchemaColumn {
-            id: i,
-            name: col_name,
-            name_lower,
+        let mut column = SchemaColumn::with_constraints(
+            i,
+            col_name,
             data_type,
             nullable,
             primary_key,
             auto_increment,
             default_expr,
-            default_value: None,
             check_expr,
-            vector_dimensions,
-        });
+        );
+        column.vector_dimensions = vector_dimensions;
+        columns.push(column);
     }
 
     // Timestamps (optional for backward compatibility)

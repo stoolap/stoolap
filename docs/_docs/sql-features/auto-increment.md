@@ -21,6 +21,8 @@ CREATE TABLE products (
 
 Both `AUTO_INCREMENT` and `AUTOINCREMENT` are accepted.
 
+AUTO_INCREMENT belongs to the INTEGER PRIMARY KEY. On any other column CREATE TABLE refuses it with `AUTO_INCREMENT is allowed only on the INTEGER PRIMARY KEY, not on 'n'`, and ALTER TABLE ADD COLUMN and MODIFY COLUMN refuse it too. A table a build before 0.5.2 created with AUTO_INCREMENT on another column opens without it there: DESCRIBE and SHOW CREATE TABLE no longer show it, and the column takes what it took before, NULL or its DEFAULT.
+
 ## Usage
 
 Omit the auto-increment column to generate the next value:

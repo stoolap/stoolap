@@ -30,7 +30,7 @@ const REFUSED: &[(&str, &str)] = &[
     ),
     (
         "ADD COLUMN z INTEGER AUTO_INCREMENT",
-        "ADD COLUMN does not take a AUTO_INCREMENT",
+        "ADD COLUMN does not take an AUTO_INCREMENT",
     ),
     (
         "ADD COLUMN z INTEGER REFERENCES p(id)",
@@ -50,7 +50,7 @@ const REFUSED: &[(&str, &str)] = &[
     ),
     (
         "MODIFY COLUMN v INTEGER AUTO_INCREMENT",
-        "MODIFY COLUMN does not take a AUTO_INCREMENT",
+        "MODIFY COLUMN does not take an AUTO_INCREMENT",
     ),
     (
         "MODIFY COLUMN v INTEGER REFERENCES p(id)",

@@ -89,7 +89,9 @@ impl SchemaColumn {
         }
     }
 
-    /// Create a new column definition with all options
+    /// Create a new column definition with all options; AUTO_INCREMENT is
+    /// kept only on the primary key, so a table an older build wrote with it
+    /// on another column reads back without it
     #[allow(clippy::too_many_arguments)]
     pub fn with_constraints(
         id: usize,
@@ -110,7 +112,7 @@ impl SchemaColumn {
             data_type,
             nullable,
             primary_key,
-            auto_increment,
+            auto_increment: auto_increment && primary_key,
             default_expr,
             default_value: None,
             check_expr,
