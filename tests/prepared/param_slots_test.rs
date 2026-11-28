@@ -216,6 +216,75 @@ fn a_position_the_call_does_not_give_is_an_error_on_every_path() {
 }
 
 #[test]
+fn a_value_the_statement_does_not_take_is_an_error_on_every_path() {
+    let db = open("param_slots_positional_extra");
+    for (sql, given) in [
+        ("SELECT 1", 1),
+        ("SELECT $1", 2),
+        ("SELECT ?", 2),
+        ("SELECT id FROM t WHERE id = $1", 2),
+        ("SELECT id FROM t WHERE id = $1 AND v = $2", 3),
+        ("SELECT id FROM t WHERE id = $1 ORDER BY id LIMIT $2", 3),
+        ("SELECT id FROM t WHERE v = 20", 1),
+    ] {
+        assert_all_err(
+            sql,
+            positional_paths(&db, sql, &[int(1), int(2), int(3)][..given]),
+            "parameters but",
+        );
+    }
+}
+
+#[test]
+fn a_write_given_a_value_too_many_writes_nothing() {
+    let db = open("param_slots_write_extra");
+    for (sql, given) in [
+        (
+            "INSERT INTO t VALUES ($1, $2, 'x')",
+            vec![int(7), int(70), int(700)],
+        ),
+        (
+            "UPDATE t SET v = $1 WHERE id = $2",
+            vec![int(99), int(1), int(2)],
+        ),
+        ("DELETE FROM t WHERE id = $1", vec![int(1), int(2)]),
+        ("CREATE TABLE c AS SELECT $1 AS a", vec![int(1), int(2)]),
+        (
+            "INSERT INTO t VALUES ($1, 1, 'x'); SELECT $1",
+            vec![int(8), int(9)],
+        ),
+    ] {
+        let error = db.execute(sql, given).expect_err(sql).to_string();
+        assert!(error.contains("parameters but"), "{sql}: {error}");
+    }
+    let rows = rows(db.query("SELECT id, v FROM t ORDER BY id", ())).unwrap();
+    assert_eq!(
+        rows,
+        [
+            vec![int(1), int(10)],
+            vec![int(2), int(20)],
+            vec![int(3), int(30)]
+        ]
+    );
+    // The statements of one program share the values, the one taking most
+    // decides; an EXPLAIN shows its statement with the values given or none
+    for (sql, given) in [
+        (
+            "BEGIN; INSERT INTO t VALUES ($1, 1, 'x'); COMMIT",
+            vec![int(4)],
+        ),
+        ("CREATE TABLE d AS SELECT $1 AS a", vec![int(5)]),
+        (
+            "EXPLAIN SELECT id FROM t WHERE id = $1",
+            vec![int(1), int(2)],
+        ),
+    ] {
+        db.execute(sql, given)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+#[test]
 fn a_write_missing_a_value_writes_nothing() {
     let db = open("param_slots_writes");
     let before = rows(db.query("SELECT id, v, s FROM t ORDER BY id", ())).unwrap();
@@ -320,6 +389,36 @@ fn a_statement_takes_positional_or_named_parameters_not_both() {
             db.query_named(sql, named_params! { v: 1 }).is_err(),
             "named {sql}"
         );
+    }
+}
+
+#[test]
+fn a_statement_numbers_its_positions_with_dollar_or_question_mark_not_both() {
+    let db = open("param_slots_dollar_and_question");
+    for sql in [
+        "SELECT $1, ?",
+        "SELECT ?, $1",
+        "SELECT id FROM t WHERE id = ? AND v = $2",
+        "SELECT id FROM t WHERE id IN (SELECT id FROM t WHERE v = $1) AND id = ?",
+    ] {
+        for values in [vec![int(1)], vec![int(1), int(2)]] {
+            let error = rows(db.query(sql, values)).expect_err(sql).to_string();
+            assert!(error.contains("not both"), "{sql}: {error}");
+        }
+        assert!(db.prepare(sql).is_err(), "prepare {sql}");
+    }
+    let sql = "SELECT ?, ?, $1 + 0";
+    let error = rows(db.query(sql, (1, 2))).expect_err(sql).to_string();
+    assert!(error.contains("not both"), "{sql}: {error}");
+    for (sql, values, want) in [
+        ("SELECT ?, ?", vec![int(1), int(2)], vec![int(1), int(2)]),
+        (
+            "SELECT $2, $1, $2",
+            vec![int(1), int(2)],
+            vec![int(2), int(1), int(2)],
+        ),
+    ] {
+        assert_eq!(rows(db.query(sql, values)).unwrap(), [want], "{sql}");
     }
 }
 
@@ -542,4 +641,26 @@ fn explain_analyze_of_a_view_with_a_parameter_creates_nothing() {
     }
     let error = rows(db.query("SELECT * FROM v", ())).expect_err("no view v");
     assert!(!error.to_string().contains("parameters"), "{error}");
+}
+
+#[test]
+fn a_parsed_statement_keeping_no_count_runs_with_its_values() {
+    let db = open("param_slots_parsed_expression");
+    let sum = stoolap::parser::Parser::new("$1 + 1")
+        .parse_statement()
+        .unwrap();
+    let executor = stoolap::Executor::new(db.engine().clone());
+    let ctx = stoolap::ExecutionContext::with_params(stoolap::ParamVec::from(vec![int(1)]));
+    let mut result = executor.execute_statement(&sum, &ctx).unwrap();
+    assert!(result.next(), "one row");
+    assert_eq!(result.row().get(0), Some(&int(2)));
+}
+
+#[test]
+fn a_statement_parsed_alone_with_an_error_is_none() {
+    for sql in ["SELECT $1, ?", "SELECT ?, $1", "SELECT $1, :v"] {
+        let mut parser = stoolap::parser::Parser::new(sql);
+        let parsed = parser.parse_statement();
+        assert!(parsed.is_none(), "{sql}: {parsed:?}");
+    }
 }

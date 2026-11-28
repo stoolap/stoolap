@@ -2190,13 +2190,21 @@ pub enum Statement {
 impl Statement {
     /// The parameter slots the statement takes, as the parser counted them
     pub fn param_count(&self) -> usize {
+        self.carried_param_count().unwrap_or(0)
+    }
+
+    /// [`Self::param_count`] for a statement that keeps its count, None for
+    /// one that does not, such as a bare expression, SET or a column DEFAULT
+    pub(crate) fn carried_param_count(&self) -> Option<usize> {
         match self {
-            Statement::Select(s) => s.param_count,
-            Statement::Insert(s) => s.param_count,
-            Statement::Update(s) => s.param_count,
-            Statement::Delete(s) => s.param_count,
-            Statement::Explain(s) if s.analyze => s.statement.param_count(),
-            _ => 0,
+            Statement::Select(s) => Some(s.param_count),
+            Statement::Insert(s) => Some(s.param_count),
+            Statement::Update(s) => Some(s.param_count),
+            Statement::Delete(s) => Some(s.param_count),
+            Statement::Explain(s) if s.analyze => s.statement.carried_param_count(),
+            Statement::Explain(_) => Some(0),
+            Statement::CreateTable(s) => s.as_select.as_ref().map(|s| s.param_count),
+            _ => None,
         }
     }
 
@@ -2207,6 +2215,11 @@ impl Statement {
             Statement::Update(s) => s.param_count = count,
             Statement::Delete(s) => s.param_count = count,
             Statement::Explain(s) => s.statement.set_param_count(count),
+            Statement::CreateTable(s) => {
+                if let Some(select) = s.as_select.as_mut() {
+                    select.param_count = count;
+                }
+            }
             _ => {}
         }
     }

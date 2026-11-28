@@ -46,8 +46,13 @@ fn sealed(dir: &tempfile::TempDir) -> Database {
     db
 }
 
+/// The ids `sql` answers, `param` read as its `$1` when it has one
 fn ids(db: &Database, sql: &str, param: i64) -> Result<Vec<i64>, String> {
-    let rows = db.query(sql, (param,)).map_err(|e| e.to_string())?;
+    let params = match sql.contains("$1") {
+        true => vec![stoolap::Value::Integer(param)],
+        false => Vec::new(),
+    };
+    let rows = db.query(sql, params).map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row.map_err(|e| e.to_string())?.get::<i64>(0).unwrap());

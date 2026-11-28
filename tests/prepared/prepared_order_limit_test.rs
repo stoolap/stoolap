@@ -52,9 +52,14 @@ fn prepared_line(db: &Database, sql: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Each row's values, and the values of the ORDER BY keys in row order
+/// Each row's values, and the values of the ORDER BY keys in row order; a
+/// statement with `$1` reads 3 there, its literal twin no value
 fn answer(db: &Database, sql: &str) -> Result<Vec<String>, String> {
-    let rows = db.query(sql, (3,)).map_err(|e| e.to_string())?;
+    let params = match sql.contains("$1") {
+        true => vec![stoolap::Value::Integer(3)],
+        false => Vec::new(),
+    };
+    let rows = db.query(sql, params).map_err(|e| e.to_string())?;
     rows.map(|row| {
         let row = row.map_err(|e| e.to_string())?;
         Ok(format!(

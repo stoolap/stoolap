@@ -63,6 +63,14 @@ fn setup(name: &str) -> Database {
     db
 }
 
+/// 1 for a statement with `$1`, no value for its literal twin
+fn one_if_it_takes_it(sql: &str) -> Vec<stoolap::Value> {
+    match sql.contains("$1") {
+        true => vec![stoolap::Value::Integer(1)],
+        false => Vec::new(),
+    }
+}
+
 /// The first column of each row, and the prepared subquery runs it took
 fn ids<P: Params>(db: &Database, sql: &str, params: P) -> (Vec<i64>, usize) {
     let before = prepared_scalar_runs();
@@ -989,7 +997,7 @@ fn test_classifier_rules() {
     ];
     let rows = |sql: &str| -> Vec<String> {
         let mut found: Vec<String> = db
-            .query(sql, (1,))
+            .query(sql, one_if_it_takes_it(sql))
             .unwrap()
             .map(|row| {
                 let row = row.unwrap();
@@ -1079,9 +1087,11 @@ fn test_in_family_statements_reach_no_general_path_mechanism() {
     let runs = prepared_scalar_runs();
     let before = general_hits();
     for sql in corpus {
-        db.query(sql, (1,)).unwrap().for_each(|row| {
-            row.unwrap();
-        });
+        db.query(sql, one_if_it_takes_it(sql))
+            .unwrap()
+            .for_each(|row| {
+                row.unwrap();
+            });
     }
     db.query_named(
         "SELECT id FROM t WHERE a > (SELECT v FROM u WHERE u.id = t.id AND u.v < :cap)",

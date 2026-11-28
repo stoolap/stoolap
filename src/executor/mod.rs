@@ -556,7 +556,9 @@ impl Executor {
         match self.query_cache.lookup(sql)? {
             CachedText::Own(plan) => self.param_fast_paths(&plan, params),
             CachedText::Shared(shared, values) if sharing_on() => {
-                if let Err(e) = check_param_count(&shared.user, params.len()) {
+                if let Err(e) =
+                    check_param_count(&shared.plan.statement, &shared.user, params.len())
+                {
                     return Some(Err(e));
                 }
                 // The caller's values fill the statement's own slots, the
@@ -592,7 +594,7 @@ impl Executor {
         if self.query_timeout_ms() > 0 {
             return None;
         }
-        if let Err(e) = check_param_count(&plan.params, params.len()) {
+        if let Err(e) = check_param_count(&plan.statement, &plan.params, params.len()) {
             return Some(Err(e));
         }
 
@@ -741,7 +743,7 @@ impl Executor {
         values: query_cache::SharedValues,
         mut ctx: std::borrow::Cow<'_, ExecutionContext>,
     ) -> Result<Box<dyn QueryResult>> {
-        check_param_count(&shared.user, ctx.params().len())?;
+        check_param_count(&shared.plan.statement, &shared.user, ctx.params().len())?;
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::shared_plan_ran();
         let user = shared.user.count;
@@ -992,9 +994,7 @@ impl Executor {
         program: &Program,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        for slots in &program.params {
-            check_param_count(slots, ctx.params().len())?;
-        }
+        check_program_params(program, ctx.params().len())?;
         self.run_statements(program, |_| ctx)
     }
 
@@ -1015,17 +1015,26 @@ impl Executor {
     }
 
     /// Execute a single statement; its parameters are checked against the
-    /// count the parser wrote on it
+    /// count the parser wrote on it, for a statement that keeps one
     pub fn execute_statement(
         &self,
         statement: &Statement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        let slots = ParamSlots {
-            count: statement.param_count(),
-            names: None,
-        };
-        check_param_count(&slots, ctx.params().len())?;
+        if let Some(count) = statement.carried_param_count() {
+            let slots = ParamSlots { count, names: None };
+            check_param_count(statement, &slots, ctx.params().len())?;
+        }
+        self.execute_checked_statement(statement, ctx)
+    }
+
+    /// [`Self::execute_statement`] for a statement of a program whose
+    /// parameters the caller checked whole
+    pub(crate) fn execute_checked_statement(
+        &self,
+        statement: &Statement,
+        ctx: &ExecutionContext,
+    ) -> Result<Box<dyn QueryResult>> {
         let _gate = self.enter(changes_session(statement));
         self.run_statement(statement, ctx)
     }
@@ -1389,7 +1398,7 @@ impl Executor {
         plan: &CachedPlanRef,
         ctx: std::borrow::Cow<'_, ExecutionContext>,
     ) -> Result<Box<dyn QueryResult>> {
-        check_param_count(&plan.params, ctx.params().len())?;
+        check_param_count(&plan.statement, &plan.params, ctx.params().len())?;
         // The compiled fast paths run only a plan a run here has filled
         if plan.compiled.checked().get().is_none() {
             utils::statement_form_error(&plan.statement, crate::functions::global_registry())?;
@@ -1459,14 +1468,51 @@ fn parse_single(
     Ok(Ok((stmt, params)))
 }
 
-/// Refuses a statement taking `slots` that is given `provided` values: a
-/// parameter without a value is an error, never NULL
+/// Refuses `statement`, taking `slots`, given `provided` values: a parameter
+/// without a value is an error, never NULL, and so is a value without a
+/// parameter, but for an EXPLAIN, which shows its statement with any values
 #[inline]
-pub(crate) fn check_param_count(slots: &ParamSlots, provided: usize) -> Result<()> {
+pub(crate) fn check_param_count(
+    statement: &Statement,
+    slots: &ParamSlots,
+    provided: usize,
+) -> Result<()> {
+    if provided == slots.count {
+        return Ok(());
+    }
     if provided < slots.count {
         return Err(too_few_params(slots, provided));
     }
-    Ok(())
+    match shows_plan_only(statement) {
+        true => Ok(()),
+        false => Err(too_many_params(slots, provided)),
+    }
+}
+
+/// [`check_param_count`] for `program`, whose statements share one list of
+/// values: the statement taking most decides
+pub(crate) fn check_program_params(program: &Program, provided: usize) -> Result<()> {
+    let mut pairs = program.statements.iter().zip(&program.params);
+    let Some((statement, slots)) = pairs.clone().max_by_key(|(_, slots)| slots.count) else {
+        return Ok(());
+    };
+    if provided > slots.count && pairs.any(|(statement, _)| shows_plan_only(statement)) {
+        return Ok(());
+    }
+    check_param_count(statement, slots, provided)
+}
+
+/// Whether `statement` is an EXPLAIN without ANALYZE, which runs nothing
+fn shows_plan_only(statement: &Statement) -> bool {
+    matches!(statement, Statement::Explain(explain) if !explain.analyze)
+}
+
+#[cold]
+fn too_many_params(slots: &ParamSlots, provided: usize) -> Error {
+    Error::invalid_argument(format!(
+        "statement takes {} parameters but {} were given",
+        slots.count, provided
+    ))
 }
 
 /// The error for the first slot of `slots` past the `provided` values
@@ -1494,7 +1540,9 @@ pub(crate) fn bind_named(
     value_of: &mut impl FnMut(&str) -> Result<Option<Value>>,
 ) -> Result<ParamVec> {
     let Some(names) = &slots.names else {
-        check_param_count(slots, 0)?;
+        if slots.count > 0 {
+            return Err(too_few_params(slots, 0));
+        }
         return Ok(ParamVec::new());
     };
     let mut values = ParamVec::with_capacity(names.len());

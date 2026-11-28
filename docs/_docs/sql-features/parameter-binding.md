@@ -44,7 +44,7 @@ Both styles work identically. Use whichever is more natural for your application
 
 ### How values are bound
 
-Every parameter is a slot. `$n` is slot n, each `?` takes the next slot, and each distinct `:name` takes the next slot the first time it appears, so a name written twice reads one value. An expression holding a parameter is the same expression elsewhere in the statement only when it reads the same slot: `SELECT g + $1, COUNT(*) FROM t GROUP BY g + $1` groups by its select item, while the same statement written with two `?` holds two expressions, even when both are given one value, and fails because its select item is not grouped. Write `$n` or `:name` to repeat a value. A statement uses positional (`$n`, `?`) or named (`:name`) parameters, not both: mixing them is a parse error, and so is `$0`. A view cannot take parameters, nor can `EXPLAIN ANALYZE` of a `CREATE VIEW`.
+Every parameter is a slot. `$n` is slot n, each `?` takes the next slot, and each distinct `:name` takes the next slot the first time it appears, so a name written twice reads one value. An expression holding a parameter is the same expression elsewhere in the statement only when it reads the same slot: `SELECT g + $1, COUNT(*) FROM t GROUP BY g + $1` groups by its select item, while the same statement written with two `?` holds two expressions, even when both are given one value, and fails because its select item is not grouped. Write `$n` or `:name` to repeat a value. A statement uses positional (`$n`, `?`) or named (`:name`) parameters, not both: mixing them is a parse error, and so is `$0`. Its positional parameters are all `$n` or all `?`: in `SELECT $1, ?` the `?` would read slot 1 again, so that is a parse error too. A view cannot take parameters, nor can `EXPLAIN ANALYZE` of a `CREATE VIEW`.
 
 A parameter the call gives no value for is an error, on every path (ad hoc, prepared, inside a transaction, cached plans) and in every clause, before the statement reads or writes a row:
 
@@ -56,9 +56,18 @@ db.query_named("SELECT * FROM users WHERE id = :id", named_params!{})?;
 // Error: named parameter :id has no value
 ```
 
+A positional value the statement has no slot for is an error as well, on the same paths:
+
+```rust
+db.query("SELECT * FROM users WHERE id = $1", (1, 2))?;
+// Error: statement takes 1 parameters but 2 were given
+```
+
+The count is the highest slot, so `SELECT $1, $3` takes three values and reads the first and the third. The statements of one SQL text share its values, and the statement taking most decides how many the text takes: `BEGIN; INSERT INTO t VALUES ($1); COMMIT` takes one.
+
 Names are matched as written (`:ID` is not `:id`). A name the statement does not read is ignored.
 
-`EXPLAIN` reads no value: it shows each parameter as written, so it runs without them. `EXPLAIN ANALYZE` runs the statement and needs every value.
+`EXPLAIN` reads no value: it shows each parameter as written, so it runs without them, and with values given it shows the plan they lead to. It takes any number of values. `EXPLAIN ANALYZE` runs the statement and needs exactly its values.
 
 ## Using Parameters in Rust
 

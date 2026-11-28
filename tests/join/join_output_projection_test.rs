@@ -131,7 +131,12 @@ const LIMITS: &[&str] = &["", " LIMIT 3", " LIMIT 2 OFFSET 1"];
 /// The column names and the rows of `sql` as text, sorted unless the
 /// statement orders them, or the error
 fn answer(db: &Database, sql: &str) -> Result<(Vec<String>, Vec<String>), String> {
-    let rows = db.query(sql, (2,)).map_err(|e| e.to_string())?;
+    // A statement with `$1` reads 2 there, its literal twin no value
+    let params = match sql.contains("$1") {
+        true => vec![stoolap::Value::Integer(2)],
+        false => Vec::new(),
+    };
+    let rows = db.query(sql, params).map_err(|e| e.to_string())?;
     let columns = rows.columns().to_vec();
     let mut out = Vec::new();
     for row in rows {

@@ -58,7 +58,12 @@ fn setup(db: &Database) {
 /// The rows, sorted unless the statement orders them: an ORDER BY past the
 /// last parenthesis, which the subquery's own is not
 fn answer(db: &Database, sql: &str) -> Result<Vec<String>, String> {
-    let rows = db.query(sql, (2,)).map_err(|e| e.to_string())?;
+    // A statement with `$1` reads 2 there, its literal twin no value
+    let params = match sql.contains("$1") {
+        true => vec![stoolap::Value::Integer(2)],
+        false => Vec::new(),
+    };
+    let rows = db.query(sql, params).map_err(|e| e.to_string())?;
     let mut found = rows
         .map(|row| {
             let row = row.map_err(|e| e.to_string())?;

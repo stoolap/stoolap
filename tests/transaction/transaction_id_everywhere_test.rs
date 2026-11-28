@@ -74,6 +74,14 @@ fn answer(rows: stoolap::Result<stoolap::Rows>) -> Result<Vec<Value>, String> {
     Ok(out)
 }
 
+/// The values `sql` takes: 7 for its one shape with a parameter
+fn values(sql: &str) -> Vec<Value> {
+    match sql.contains("$1") {
+        true => vec![Value::Integer(7)],
+        false => Vec::new(),
+    }
+}
+
 #[test]
 fn a_statement_reads_its_transaction_in_every_program() {
     let dir = tempfile::tempdir().unwrap();
@@ -92,7 +100,7 @@ fn a_statement_reads_its_transaction_in_every_program() {
                     .replace("{s}", source)
                     .replace("{x}", "CURRENT_TRANSACTION_ID()");
                 count += 1;
-                let got = answer(tx.query(&sql, vec![Value::Integer(7)]));
+                let got = answer(tx.query(&sql, values(&sql)));
                 if got != want {
                     wrong.push(format!("{context}: {sql}: {got:?}, want {want:?}"));
                 }
@@ -116,7 +124,7 @@ fn a_statement_outside_a_transaction_reads_null_in_every_program() {
         let sql = shape
             .replace("{s}", "t")
             .replace("{x}", "CURRENT_TRANSACTION_ID()");
-        let got = answer(db.query(&sql, vec![Value::Integer(7)]));
+        let got = answer(db.query(&sql, values(&sql)));
         let null = got
             .as_ref()
             .is_ok_and(|values| values.iter().all(Value::is_null));

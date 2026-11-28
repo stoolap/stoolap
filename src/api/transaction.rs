@@ -38,7 +38,7 @@ use crate::api::params::{NamedParams, ParamVec};
 use crate::core::{Error, Result, Value};
 use crate::executor::context::ExecutionContext;
 use crate::executor::{
-    bind_named, bind_program, check_param_count, value_in, CachedPlanRef, Executor,
+    bind_named, bind_program, check_program_params, value_in, CachedPlanRef, Executor,
 };
 use crate::parser::ast::{Program, RollbackStatement, Statement};
 use crate::storage::traits::QueryResult;
@@ -294,9 +294,7 @@ impl Transaction {
             Ok(plan) => return self.execute_plan(&plan, ctx),
             Err(program) => program,
         };
-        for slots in &program.params {
-            check_param_count(slots, ctx.params().len())?;
-        }
+        check_program_params(&program, ctx.params().len())?;
         self.execute_statements(&program, |_| &ctx)
     }
 
@@ -325,7 +323,11 @@ impl Transaction {
     ) -> Result<Box<dyn QueryResult>> {
         let mut last_result: Option<Box<dyn QueryResult>> = None;
         for (i, statement) in program.statements.iter().enumerate() {
-            last_result = Some(self.execute_statement(statement, ctx_of(i))?);
+            runs_in_transaction(statement)?;
+            let result = self
+                .executor
+                .execute_checked_statement(statement, ctx_of(i))?;
+            last_result = Some(result);
         }
         last_result.ok_or(Error::NoStatementsToExecute)
     }
