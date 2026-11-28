@@ -1140,7 +1140,7 @@ pub fn parallel_topn_vector_search(
                                 idx,
                             });
                         } else if let Some(worst) = heap.peek()
-                            && dist < worst.distance
+                            && dist.total_cmp(&worst.distance).is_lt()
                         {
                             let evict_idx = worst.idx;
                             heap.pop();
@@ -1198,7 +1198,7 @@ pub fn parallel_topn_vector_search(
                 idx,
             });
         } else if let Some(worst) = heap.peek()
-            && dist < worst.distance
+            && dist.total_cmp(&worst.distance).is_lt()
         {
             let evict_idx = worst.idx;
             heap.pop();

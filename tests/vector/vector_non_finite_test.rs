@@ -156,3 +156,45 @@ fn a_vector_column_refuses_a_non_finite_component() {
         .collect();
     assert_eq!(rows, ["1|[0.0, 1.0, 0.0]"]);
 }
+
+/// The ids `ORDER BY VEC_DISTANCE_IP(e, '[inf,0]') LIMIT 3` gives over `rows`
+/// rows, all at distance NaN (`inf * 0`) but the last three, at minus infinity
+fn nearest_past_nan(name: &str, rows: i64) -> Vec<i64> {
+    let db = Database::open(&format!("memory://{name}")).unwrap();
+    db.execute("CREATE TABLE v (id INTEGER PRIMARY KEY, e VECTOR(2))", ())
+        .unwrap();
+    let ids: Vec<i64> = (1..=rows).collect();
+    for batch in ids.chunks(1000) {
+        let values: Vec<String> = batch
+            .iter()
+            .map(|&id| match id > rows - 3 {
+                true => format!("({id}, '[1,0]')"),
+                false => format!("({id}, '[0,1]')"),
+            })
+            .collect();
+        let sql = format!("INSERT INTO v VALUES {}", values.join(", "));
+        db.execute(&sql, ()).unwrap();
+    }
+    let sql = "SELECT id FROM v ORDER BY VEC_DISTANCE_IP(e, '[inf,0]') LIMIT 3";
+    let mut ids: Vec<i64> = db
+        .query(sql, ())
+        .unwrap()
+        .map(|row| row.unwrap().get::<i64>(0).unwrap())
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+#[test]
+fn a_nan_distance_gives_its_place_in_a_nearest_neighbor_limit() {
+    assert_eq!(
+        nearest_past_nan("vector_non_finite_limit", 6),
+        [4, 5, 6],
+        "one scan"
+    );
+    assert_eq!(
+        nearest_past_nan("vector_non_finite_limit_parallel", 20_000),
+        [19_998, 19_999, 20_000],
+        "scan in parallel chunks"
+    );
+}
