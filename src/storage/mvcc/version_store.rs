@@ -612,6 +612,37 @@ impl RowCalls for [(AggregateOp, usize)] {
     fn finish(&mut self, _: &mut GroupedAggregates) {}
 }
 
+/// Column calls none of which is FIRST or LAST: each row's value is fed with
+/// no test for an ORDER BY key
+pub(crate) struct PlainCalls<'a>(&'a [(AggregateOp, usize)]);
+
+impl<'a> PlainCalls<'a> {
+    /// `calls` as plain calls, None when one orders by a key
+    pub(crate) fn of(calls: &'a [(AggregateOp, usize)]) -> Option<Self> {
+        match calls.iter().any(|(op, _)| op.order_key().is_some()) {
+            true => None,
+            false => Some(Self(calls)),
+        }
+    }
+}
+
+impl RowCalls for PlainCalls<'_> {
+    #[inline(always)]
+    fn accumulate_row(&mut self, groups: &mut GroupedAggregates, group: usize, row: &[Value]) {
+        for (run, &(_, col_idx)) in groups.aggregates(group).iter_mut().zip(self.0) {
+            run.accumulate(row.get(col_idx).unwrap_or(&ABSENT));
+        }
+    }
+
+    #[inline(always)]
+    fn failed(&self, _: &GroupedAggregates) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    fn finish(&mut self, _: &mut GroupedAggregates) {}
+}
+
 /// The calls of a statement of which some read an expression: a column
 /// call is fed as its row is read, an expression's rows are held and fed a
 /// chunk at a time
@@ -7806,7 +7837,7 @@ impl VersionStore {
     ) -> crate::core::Result<Option<GroupedAggregates>> {
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::note_read("vs.compute_grouped_aggregates");
-        let mut groups = grouped_aggregates(keys, aggregates);
+        let groups = grouped_aggregates(keys, aggregates);
         if self.closed.load(Ordering::Acquire) {
             return Ok(Some(groups));
         }
@@ -7815,19 +7846,29 @@ impl VersionStore {
         };
         // None lets the caller fall back to regular GROUP BY aggregation
         let mut rejected = false;
-        let pass = match column_calls(aggregates) {
-            Some(mut calls) => self.visit_grouped(
-                keys,
-                &mut calls[..],
-                &mut groups,
-                &mut rejected,
-                (&checker, reader),
-                deadline,
-            ),
+        let (pass, groups) = match column_calls(aggregates) {
+            Some(mut calls) => match PlainCalls::of(&calls) {
+                Some(mut plain) => self.visit_grouped(
+                    keys,
+                    &mut plain,
+                    groups,
+                    &mut rejected,
+                    (&checker, reader),
+                    deadline,
+                ),
+                None => self.visit_grouped(
+                    keys,
+                    &mut calls[..],
+                    groups,
+                    &mut rejected,
+                    (&checker, reader),
+                    deadline,
+                ),
+            },
             None => self.visit_grouped(
                 keys,
                 &mut ExpressionCalls::new(aggregates),
-                &mut groups,
+                groups,
                 &mut rejected,
                 (&checker, reader),
                 deadline,
@@ -7841,22 +7882,23 @@ impl VersionStore {
         }
     }
 
-    /// Runs every arena head `reader` sees into `groups`; `rejected` when a
-    /// bucket rejects a row's value
+    /// Runs every arena head `reader` sees into `groups`, and gives them back;
+    /// `rejected` when a bucket rejects a row's value. The groups are taken
+    /// by value so the row loop keeps them as its own local
     fn visit_grouped<C: VisibilityChecker + ?Sized, A: RowCalls + ?Sized>(
         &self,
         keys: &[GroupBy],
         aggregates: &mut A,
-        groups: &mut GroupedAggregates,
+        mut groups: GroupedAggregates,
         rejected: &mut bool,
         (checker, reader): (&ReaderChecker<'_, '_, C>, Reader<'_>),
         deadline: Deadline,
-    ) -> HeadsPass {
+    ) -> (HeadsPass, GroupedAggregates) {
         let pass = match plain_columns(keys) {
             Some(columns) => {
                 let visit = |row: &[Value]| {
-                    aggregate_row(groups, &columns, aggregates, row);
-                    !aggregates.failed(groups)
+                    aggregate_row(&mut groups, &columns, aggregates, row);
+                    !aggregates.failed(&groups)
                 };
                 self.visit_live_heads(checker, reader, visit, deadline)
             }
@@ -7864,17 +7906,17 @@ impl VersionStore {
                 let mut bucketed = Vec::with_capacity(keys.len());
                 let visit = |row: &[Value]| {
                     *rejected |=
-                        !aggregate_bucketed_row(groups, keys, aggregates, row, &mut bucketed);
-                    !aggregates.failed(groups)
+                        !aggregate_bucketed_row(&mut groups, keys, aggregates, row, &mut bucketed);
+                    !aggregates.failed(&groups)
                 };
                 self.visit_live_heads(checker, reader, visit, deadline)
             }
         };
         // Only a pass whose groups answer feeds the rows it still holds
         if matches!(pass, HeadsPass::Answered | HeadsPass::Empty) && !*rejected {
-            aggregates.finish(groups);
+            aggregates.finish(&mut groups);
         }
-        pass
+        (pass, groups)
     }
 
     /// Runs `visit` over every arena head `reader` sees, until it returns
