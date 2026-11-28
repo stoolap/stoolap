@@ -198,3 +198,33 @@ fn a_nan_distance_gives_its_place_in_a_nearest_neighbor_limit() {
         "scan in parallel chunks"
     );
 }
+
+/// The id an HNSW cosine index finds nearest to `[1,1,1]`, among `nearest`
+/// as row 1 and 399 rows pointing elsewhere
+fn indexed_nearest(name: &str, nearest: &str) -> i64 {
+    let db = Database::open(&format!("memory://{name}")).unwrap();
+    db.execute("CREATE TABLE h (id INTEGER PRIMARY KEY, e VECTOR(3))", ())
+        .unwrap();
+    let mut values = vec![format!("(1, '{nearest}')")];
+    values.extend((2..=400).map(|id| format!("({id}, '[1,0,{}.{id}]')", id % 7)));
+    let sql = format!("INSERT INTO h VALUES {}", values.join(", "));
+    db.execute(&sql, ()).unwrap();
+    db.execute(
+        "CREATE INDEX hc ON h(e) USING HNSW WITH (metric = 'cosine')",
+        (),
+    )
+    .unwrap();
+    let sql = "SELECT id FROM h ORDER BY VEC_DISTANCE_COSINE(e, '[1,1,1]') LIMIT 1";
+    let row = db.query(sql, ()).unwrap().next().unwrap().unwrap();
+    row.get::<i64>(0).unwrap()
+}
+
+#[test]
+fn an_hnsw_cosine_index_ranks_components_past_the_f32_square_range() {
+    for (name, nearest) in [
+        ("vector_cosine_index_overflow", "[1e30,1e30,1e30]"),
+        ("vector_cosine_index_underflow", "[1e-25,1e-25,1e-25]"),
+    ] {
+        assert_eq!(indexed_nearest(name, nearest), 1, "{nearest}");
+    }
+}

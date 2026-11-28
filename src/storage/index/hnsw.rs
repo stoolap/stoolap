@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use crate::common::{I64Map, I64Set};
 use crate::core::{DataType, IndexEntry, IndexType, Operator, Result, Value};
-use crate::functions::scalar::vector::cosine_distance_of;
+use crate::functions::scalar::vector::{cosine_distance_of, cosine_distance_wide};
 use crate::storage::traits::index_trait::Index;
 
 // ─────────────────────────────────────────────────────────────
@@ -1869,12 +1869,12 @@ unsafe fn l2_distance_sq_avx2(ap: *const f32, bp: *const f32, n: usize) -> f32 {
     }
 }
 
-/// AVX2+FMA cosine distance.
+/// AVX2+FMA cosine distance, None when its sums need f64.
 /// 3 quantity chains (dot, norm_a, norm_b) × 4 accumulators × 8 lanes = 32-wide.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 #[inline]
-unsafe fn cosine_distance_avx2(ap: *const f32, bp: *const f32, n: usize) -> f32 {
+unsafe fn cosine_distance_avx2(ap: *const f32, bp: *const f32, n: usize) -> Option<f32> {
     // SAFETY: `ap` and `bp` point at `n` readable f32 values, which the dispatcher derives from two equal-length slices, and the dispatcher calls it only after `is_x86_feature_detected!` confirmed AVX2 and FMA.
     unsafe {
         use std::arch::x86_64::*;
@@ -1940,7 +1940,7 @@ unsafe fn cosine_distance_avx2(ap: *const f32, bp: *const f32, n: usize) -> f32 
             norm_b += bv * bv;
             i += 1;
         }
-        cosine_distance_of(dot as f64, norm_a as f64, norm_b as f64) as f32
+        cosine_of_f32_sums(dot, norm_a, norm_b)
     }
 }
 
@@ -2055,11 +2055,11 @@ fn l2_distance_sq_f32(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-/// NEON-accelerated cosine distance helper.
+/// NEON-accelerated cosine distance, None when its sums need f64.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline]
-unsafe fn cosine_distance_neon(ap: *const f32, bp: *const f32, n: usize) -> f32 {
+unsafe fn cosine_distance_neon(ap: *const f32, bp: *const f32, n: usize) -> Option<f32> {
     // SAFETY: `ap` and `bp` point at `n` readable f32 values, which the dispatcher derives from two equal-length slices; NEON is always available on aarch64.
     unsafe {
         use std::arch::aarch64::*;
@@ -2122,8 +2122,23 @@ unsafe fn cosine_distance_neon(ap: *const f32, bp: *const f32, n: usize) -> f32 
             norm_b += bv * bv;
             i += 1;
         }
-        cosine_distance_of(dot as f64, norm_a as f64, norm_b as f64) as f32
+        cosine_of_f32_sums(dot, norm_a, norm_b)
     }
+}
+
+/// The cosine distance from f32 sums, or None when a squared norm left
+/// f32's normal range and the sums must be taken again in f64; within it
+/// the dot is bounded by the norms and cannot overflow
+#[inline(always)]
+fn cosine_of_f32_sums(dot: f32, norm_a: f32, norm_b: f32) -> Option<f32> {
+    (norm_a.is_normal() && norm_b.is_normal())
+        .then(|| cosine_distance_of(dot as f64, norm_a as f64, norm_b as f64) as f32)
+}
+
+#[cold]
+#[inline(never)]
+fn cosine_distance_wide_f32(a: &[f32], b: &[f32]) -> f32 {
+    cosine_distance_wide(a.iter().copied().zip(b.iter().copied())) as f32
 }
 
 /// Cosine distance on f32 slices: 1 - dot(a,b)/(norm_a * norm_b)
@@ -2140,7 +2155,8 @@ fn cosine_distance_f32(a: &[f32], b: &[f32]) -> f32 {
     {
         // SAFETY: a and b are valid f32 slices of equal length (asserted above); pointers and
         // length are derived from slice references. NEON is always available on aarch64.
-        unsafe { cosine_distance_neon(a.as_ptr(), b.as_ptr(), a.len()) }
+        let distance = unsafe { cosine_distance_neon(a.as_ptr(), b.as_ptr(), a.len()) };
+        distance.unwrap_or_else(|| cosine_distance_wide_f32(a, b))
     }
 
     #[cfg(not(target_arch = "aarch64"))]
@@ -2150,7 +2166,8 @@ fn cosine_distance_f32(a: &[f32], b: &[f32]) -> f32 {
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
                 // SAFETY: a and b are valid f32 slices of equal length; AVX2+FMA availability
                 // is verified by is_x86_feature_detected at runtime.
-                return unsafe { cosine_distance_avx2(a.as_ptr(), b.as_ptr(), a.len()) };
+                let distance = unsafe { cosine_distance_avx2(a.as_ptr(), b.as_ptr(), a.len()) };
+                return distance.unwrap_or_else(|| cosine_distance_wide_f32(a, b));
             }
         }
         let n = a.len();
@@ -2199,7 +2216,7 @@ fn cosine_distance_f32(a: &[f32], b: &[f32]) -> f32 {
         let dot = (d0 + d1) + (d2 + d3);
         let norm_a = (a0 + a1) + (a2 + a3);
         let norm_b = (b0 + b1) + (b2 + b3);
-        cosine_distance_of(dot as f64, norm_a as f64, norm_b as f64) as f32
+        cosine_of_f32_sums(dot, norm_a, norm_b).unwrap_or_else(|| cosine_distance_wide_f32(a, b))
     }
 }
 
