@@ -47,8 +47,8 @@ use crate::storage::mvcc::registry::{CommitCut, StatementView};
 use crate::storage::mvcc::txn_gate::{GateRef, TxnGate};
 use crate::storage::mvcc::version_store::{
     aggregate_bucketed_row, aggregate_row, column_calls, grouped_aggregates, plain_columns,
-    AggregateCall, AggregateInput, AggregateOp, ExpressionCalls, GroupBy, LayoutToken,
-    OrderedCalls, RowCalls, EVERY_WRITE,
+    AggregateCall, AggregateInput, AggregateOp, ExpressionCalls, GroupBy, LayoutToken, PlainCalls,
+    RowCalls, EVERY_WRITE,
 };
 use crate::storage::traits::table::ScanAccess;
 use crate::storage::traits::{
@@ -8894,13 +8894,12 @@ impl Table for SegmentedTable {
                 true
             }
             let fed = match column_calls(aggregates) {
-                Some(calls) if OrderedCalls::needed(&calls) => {
-                    let mut calls = OrderedCalls(&calls);
-                    feed_hot(&mut groups, keys, &mut calls, &hot_rows, &mut hot_skip)
-                }
-                Some(mut calls) => {
-                    feed_hot(&mut groups, keys, &mut calls[..], &hot_rows, &mut hot_skip)
-                }
+                Some(mut calls) => match PlainCalls::of(&calls) {
+                    Some(mut plain) => {
+                        feed_hot(&mut groups, keys, &mut plain, &hot_rows, &mut hot_skip)
+                    }
+                    None => feed_hot(&mut groups, keys, &mut calls[..], &hot_rows, &mut hot_skip),
+                },
                 None => {
                     let mut calls = ExpressionCalls::new(aggregates);
                     feed_hot(&mut groups, keys, &mut calls, &hot_rows, &mut hot_skip)

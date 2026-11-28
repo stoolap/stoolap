@@ -585,8 +585,7 @@ pub fn column_calls(
 }
 
 /// The calls a row runs into: `[(AggregateOp, usize)]` when every call reads
-/// a column and none is FIRST or LAST, [`OrderedCalls`] when one is, and
-/// [`ExpressionCalls`] when one reads an expression
+/// a column, [`ExpressionCalls`] when one reads an expression
 pub trait RowCalls {
     /// Runs `row` into the calls of `group`
     fn accumulate_row(&mut self, groups: &mut GroupedAggregates, group: usize, row: &[Value]);
@@ -613,25 +612,25 @@ impl RowCalls for [(AggregateOp, usize)] {
     fn finish(&mut self, _: &mut GroupedAggregates) {}
 }
 
-/// Column calls of which one is FIRST or LAST, fed with its ORDER BY key
-pub struct OrderedCalls<'a>(pub &'a [(AggregateOp, usize)]);
+/// Column calls none of which is FIRST or LAST: each row's value is fed with
+/// no test for an ORDER BY key
+pub(crate) struct PlainCalls<'a>(&'a [(AggregateOp, usize)]);
 
-impl OrderedCalls<'_> {
-    /// Whether `calls` needs this type: one of them orders by a key
-    pub fn needed(calls: &[(AggregateOp, usize)]) -> bool {
-        calls.iter().any(|(op, _)| op.order_key().is_some())
+impl<'a> PlainCalls<'a> {
+    /// `calls` as plain calls, None when one orders by a key
+    pub(crate) fn of(calls: &'a [(AggregateOp, usize)]) -> Option<Self> {
+        match calls.iter().any(|(op, _)| op.order_key().is_some()) {
+            true => None,
+            false => Some(Self(calls)),
+        }
     }
 }
 
-impl RowCalls for OrderedCalls<'_> {
+impl RowCalls for PlainCalls<'_> {
     #[inline(always)]
     fn accumulate_row(&mut self, groups: &mut GroupedAggregates, group: usize, row: &[Value]) {
-        for (run, &(op, col_idx)) in groups.aggregates(group).iter_mut().zip(self.0) {
-            let value = row.get(col_idx).unwrap_or(&ABSENT);
-            match op.order_key() {
-                None => run.accumulate(value),
-                Some(key) => run.accumulate_ordered(value, row.get(key).unwrap_or(&ABSENT)),
-            }
+        for (run, &(_, col_idx)) in groups.aggregates(group).iter_mut().zip(self.0) {
+            run.accumulate(row.get(col_idx).unwrap_or(&ABSENT));
         }
     }
 
@@ -739,7 +738,7 @@ pub fn aggregate_bucketed_row<C: RowCalls + ?Sized>(
     true
 }
 
-/// Runs `row` into the calls of `group`, none of them FIRST or LAST
+/// Runs `row` into the calls of `group`
 #[inline(always)]
 fn accumulate_row(
     groups: &mut GroupedAggregates,
@@ -748,11 +747,11 @@ fn accumulate_row(
     row: &[Value],
 ) {
     for (run, &(op, col_idx)) in groups.aggregates(group).iter_mut().zip(aggregates) {
-        debug_assert!(
-            op.order_key().is_none(),
-            "an ordered call takes OrderedCalls"
-        );
-        run.accumulate(row.get(col_idx).unwrap_or(&ABSENT));
+        let value = row.get(col_idx).unwrap_or(&ABSENT);
+        match op.order_key() {
+            None => run.accumulate(value),
+            Some(key) => run.accumulate_ordered(value, row.get(key).unwrap_or(&ABSENT)),
+        }
     }
 }
 
@@ -7848,22 +7847,24 @@ impl VersionStore {
         // None lets the caller fall back to regular GROUP BY aggregation
         let mut rejected = false;
         let (pass, groups) = match column_calls(aggregates) {
-            Some(calls) if OrderedCalls::needed(&calls) => self.visit_grouped(
-                keys,
-                &mut OrderedCalls(&calls),
-                groups,
-                &mut rejected,
-                (&checker, reader),
-                deadline,
-            ),
-            Some(mut calls) => self.visit_grouped(
-                keys,
-                &mut calls[..],
-                groups,
-                &mut rejected,
-                (&checker, reader),
-                deadline,
-            ),
+            Some(mut calls) => match PlainCalls::of(&calls) {
+                Some(mut plain) => self.visit_grouped(
+                    keys,
+                    &mut plain,
+                    groups,
+                    &mut rejected,
+                    (&checker, reader),
+                    deadline,
+                ),
+                None => self.visit_grouped(
+                    keys,
+                    &mut calls[..],
+                    groups,
+                    &mut rejected,
+                    (&checker, reader),
+                    deadline,
+                ),
+            },
             None => self.visit_grouped(
                 keys,
                 &mut ExpressionCalls::new(aggregates),

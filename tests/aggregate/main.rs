@@ -70,6 +70,7 @@ mod having_constant_fold_test;
 mod having_without_group_by_test;
 mod ordered_aggregate_ties_rule_test;
 mod rollup_cube_test;
+mod row_calls_api_test;
 mod runner_global_aggregate_test;
 mod runner_grouped_aggregate_test;
 mod runner_source_aggregate_test;
