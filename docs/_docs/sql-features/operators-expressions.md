@@ -89,6 +89,8 @@ INTEGER arithmetic is exact. A result outside the INTEGER range is an `Integer o
 
 An operation with a FLOAT operand is FLOAT arithmetic. When both operands are finite and the result of `+`, `-`, `*` or `/` is not, the statement fails with `Float overflow in arithmetic operation: 1e308 and 10`, wherever the expression stands: the SELECT list, WHERE, HAVING, ORDER BY, an aggregate's or a window's argument, an UPDATE or an INSERT. An operand that is already infinite, read from a stored value or written as `CAST('inf' AS FLOAT)`, gives an infinite result as before. Dividing by zero returns NULL.
 
+The operands of `+`, `-`, `*`, `/`, `%` and unary `-` are INTEGER, FLOAT or NULL; a NULL operand gives NULL. Any other operand is an error naming its type, wherever the expression stands: `'42' + 1`, `s * 2` over a TEXT column and `TRUE + 1` fail with `arithmetic needs INTEGER or FLOAT, got TEXT` (or `BOOLEAN`). A text holding a number is not converted; write `CAST(s AS INTEGER)`. A timestamp is the exception: it adds or subtracts an INTEGER number of days, an INTERVAL or text that reads as one, and subtracting two timestamps gives their difference, as [Date and Time]({% link _docs/data-types/date-and-time.md %}) describes. An operand from a column is checked on the rows the expression is computed for, so a table with no rows raises nothing.
+
 ## Bitwise Operators
 
 | Operator | Description | Example |

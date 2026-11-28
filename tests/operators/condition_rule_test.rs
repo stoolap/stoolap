@@ -302,9 +302,12 @@ fn a_cached_answer_keeps_the_type_of_an_arithmetic_it_reads() {
     let warm = Database::open("memory://condition_rule_arith_warm").unwrap();
     fill(&warm);
     assert_eq!(all_rows(&warm, "SELECT * FROM t WHERE t.s IS NULL"), Ok(0));
-    // 'x' * 1 is NULL, so the one row passes on either cache
-    assert_eq!(all_rows(&cold, sql), Ok(1), "cold");
-    assert_eq!(all_rows(&warm, sql), Ok(1), "warm");
+    // 'x' * 1 is an error, which the cached answer of `t.s IS NULL` must not hide
+    let refused = |result: Result<usize, String>| {
+        result.is_err_and(|e| e.contains("arithmetic needs INTEGER or FLOAT, got TEXT"))
+    };
+    assert!(refused(all_rows(&cold, sql)), "cold");
+    assert!(refused(all_rows(&warm, sql)), "warm");
 }
 
 #[test]

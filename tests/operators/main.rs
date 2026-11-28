@@ -14,6 +14,7 @@
 
 //! Operators and types: casts, comparisons, NULL, IN lists and arithmetic
 
+mod arithmetic_operand_rule_test;
 mod bitwise_operators_test;
 mod boolean_predicate_test;
 mod cast_column_alias_test;
