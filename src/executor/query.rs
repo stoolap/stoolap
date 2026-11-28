@@ -9230,6 +9230,48 @@ impl Executor {
         Ok(())
     }
 
+    /// The names `execute_set` takes, as its match arms spell them
+    const SET_NAMES: &[&str] = &["ISOLATION_LEVEL", "TRANSACTION_ISOLATION"];
+
+    /// The names `execute_pragma` takes, as its match arms spell them
+    const PRAGMA_NAMES: &[&str] = &[
+        "SNAPSHOT",
+        "CHECKPOINT",
+        "RESTORE",
+        "DEDUP_SEGMENTS",
+        "SNAPSHOT_INTERVAL",
+        "CHECKPOINT_INTERVAL",
+        "COMPACT_THRESHOLD",
+        "TARGET_VOLUME_ROWS",
+        "HOT_MAX_ROWS",
+        "HOT_MAX_BYTES",
+        "MEMORY_STATS",
+        "SYNC_MODE",
+        "WAL_FLUSH_TRIGGER",
+        "KEEP_SNAPSHOTS",
+        "HEAP_PROFILE",
+        "QUERY_TIMEOUT",
+        "GROUP_CACHE_MB",
+        "INDEX_CACHE_MB",
+        "INDEX_BUILD_MB",
+        "INDEX_BACKFILL",
+        "INDEX_READ_STATS",
+        "INDEX_STATS",
+        "GROUP_CACHE_STATS",
+        "VOLUME_STATS",
+        "VERIFY",
+        "VACUUM",
+    ];
+
+    /// The error for a `kind` statement naming `name`, which is none of `names`
+    fn unknown_setting(kind: &str, name: &str, names: &[&str]) -> Error {
+        let known: Vec<String> = names.iter().map(|name| name.to_lowercase()).collect();
+        Error::InvalidArgument(format!(
+            "unknown {kind}: {name}. Known: {}",
+            known.join(", ")
+        ))
+    }
+
     /// Execute SET statement
     pub(crate) fn execute_set(
         &self,
@@ -9263,10 +9305,11 @@ impl Executor {
 
                 Ok(Box::new(ExecResult::empty()))
             }
-            _ => {
-                // Silently accept unknown SET variables for compatibility
-                Ok(Box::new(ExecResult::empty()))
-            }
+            _ => Err(Self::unknown_setting(
+                "SET",
+                &stmt.name.value,
+                Self::SET_NAMES,
+            )),
         }
     }
 
@@ -9965,10 +10008,11 @@ impl Executor {
                 };
                 self.execute_vacuum(&vacuum_stmt, ctx)
             }
-            _ => {
-                // Unknown pragma - return empty result for compatibility
-                Ok(Box::new(ExecResult::empty()))
-            }
+            _ => Err(Self::unknown_setting(
+                "PRAGMA",
+                &stmt.name.value,
+                Self::PRAGMA_NAMES,
+            )),
         }
     }
 
@@ -10740,6 +10784,24 @@ mod tests {
         let engine = MVCCEngine::in_memory();
         engine.open_engine().unwrap();
         Executor::new(Arc::new(engine))
+    }
+
+    #[test]
+    fn every_listed_pragma_and_set_name_is_one_the_statement_takes() {
+        let executor = create_test_executor();
+        let statements = (Executor::PRAGMA_NAMES
+            .iter()
+            .map(|name| format!("PRAGMA {name}")))
+        .chain(
+            Executor::SET_NAMES
+                .iter()
+                .map(|name| format!("SET {name} = 'SNAPSHOT'")),
+        );
+        for sql in statements {
+            if let Err(error) = executor.execute(&sql) {
+                assert!(!error.to_string().contains("unknown"), "{sql}: {error}");
+            }
+        }
     }
 
     #[test]
