@@ -159,6 +159,10 @@ const STATEMENTS: &[(&str, &str)] = &[
     ),
     (
         "SELECT STRING_AGG(x, \"zz\" ORDER BY id) FROM t",
+        "error: olumn 'zz' not found",
+    ),
+    (
+        "SELECT STRING_AGG(x, 'zz' ORDER BY id) FROM t",
         "azzbzzczzdzzezzf",
     ),
     ("SELECT STRING_AGG(x, NULL ORDER BY id) FROM t", "abcdef"),
@@ -189,6 +193,10 @@ const STATEMENTS: &[(&str, &str)] = &[
     ),
     (
         "SELECT id, STRING_AGG(x, \"zz\") OVER (PARTITION BY g ORDER BY id) FROM t ORDER BY id",
+        "error: olumn 'zz' not found",
+    ),
+    (
+        "SELECT id, STRING_AGG(x, 'zz') OVER (PARTITION BY g ORDER BY id) FROM t ORDER BY id",
         "1|a 2|azzb 3|azzbzzc 4|d 5|dzze 6|dzzezzf",
     ),
     (

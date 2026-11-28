@@ -130,8 +130,6 @@ pub enum ColumnSource {
 #[derive(Debug)]
 pub(crate) enum Reference {
     Column(ColumnSource),
-    /// A double-quoted name no column has: its own text
-    Text,
     /// No column has it: the name as the error spells it
     Missing(String),
     /// Two columns carry it: the name as the error spells it
@@ -399,10 +397,7 @@ impl<'a> CompileContext<'a> {
                 Some((table, column)) => found(self.resolve_qualified(table, column)),
                 None => found(self.resolve_column(&id.value_lower)),
             }
-            .unwrap_or_else(|| match id.quoted {
-                true => Reference::Text,
-                false => Reference::Missing(id.value.to_string()),
-            }),
+            .unwrap_or_else(|| Reference::Missing(id.value.to_string())),
             Expression::QualifiedIdentifier(qid) => {
                 let (table, column) = (&qid.qualifier.value_lower, &qid.name.value_lower);
                 found(self.resolve_qualified(table, column))
@@ -855,12 +850,6 @@ impl<'a> ExprCompiler<'a> {
             }
             Some(Reference::Column(ColumnSource::Row1(idx))) => builder.emit(Op::LoadColumn(idx)),
             Some(Reference::Column(ColumnSource::Row2(idx))) => builder.emit(Op::LoadColumn2(idx)),
-            Some(Reference::Text) => {
-                let Expression::Identifier(id) = expr else {
-                    return Err(CompileError::InvalidExpression(expr.to_string()));
-                };
-                builder.emit(Op::LoadConst(Value::text(id.value.as_str())));
-            }
             Some(Reference::Missing(name)) => return Err(CompileError::ColumnNotFound(name)),
             Some(Reference::Ambiguous(name)) => return Err(CompileError::Ambiguous(name)),
             None => return Err(CompileError::InvalidExpression(expr.to_string())),
@@ -1736,9 +1725,9 @@ impl<'a> ExprCompiler<'a> {
         Ok(())
     }
 
-    /// The text of a pattern known when compiled: a literal, a double-quoted
-    /// identifier, or an expression that folds, a parameter the program's
-    /// execution holds among them. None for NULL, read as the runtime op reads it
+    /// The text of a pattern known when compiled: a literal or an expression
+    /// that folds, a parameter the program's execution holds among them. None
+    /// for NULL, read as the runtime op reads it
     fn constant_pattern(&self, expr: &Expression) -> Option<SmartString> {
         if let Some(text) = Self::extract_pattern_string(expr) {
             return Some(text);
@@ -1751,16 +1740,13 @@ impl<'a> ExprCompiler<'a> {
             .map(SmartString::from_string)
     }
 
-    /// A pattern known when compiled: a literal read as its text form, a
-    /// typed literal by its value, or a double-quoted identifier's text. None
-    /// for a NULL and for an expression read per row
+    /// A pattern known when compiled: a literal read as its text form, or a
+    /// typed literal by its value. None for a NULL and for an expression read
+    /// per row
     fn extract_pattern_string(expr: &Expression) -> Option<SmartString> {
-        match expr {
-            Expression::Identifier(id) if id.quoted => Some(id.value.clone()),
-            expr => extract_literal_value(expr)?
-                .as_string()
-                .map(SmartString::from_string),
-        }
+        extract_literal_value(expr)?
+            .as_string()
+            .map(SmartString::from_string)
     }
 
     /// Compile a CASE expression
@@ -2377,7 +2363,6 @@ fn try_eval_constant(expr: &Expression) -> Option<Value> {
         Expression::StringLiteral(lit) => Some(string_literal_value(lit)),
         Expression::BooleanLiteral(lit) => Some(Value::Boolean(lit.value)),
         Expression::NullLiteral(_) => Some(Value::null_unknown()),
-        Expression::Identifier(id) if id.quoted => Some(Value::Text(id.value.clone())),
         _ => None,
     }
 }

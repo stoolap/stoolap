@@ -143,7 +143,7 @@ const ANSWERED: &[(&str, &[&str])] = &[
     ),
     ("SELECT 7, COUNT(*) FROM u", &["7|5"]),
     (
-        "SELECT \"w\", COUNT(*) FROM u WHERE k = 1 GROUP BY k",
+        "SELECT 'w', COUNT(*) FROM u WHERE k = 1 GROUP BY k",
         &["w|2"],
     ),
     (

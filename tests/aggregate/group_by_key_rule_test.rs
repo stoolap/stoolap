@@ -225,29 +225,24 @@ fn an_aggregate_alias_leaves_a_column_of_its_name_to_group_by() {
 }
 
 #[test]
-fn a_quoted_group_by_name_binds_as_the_compiler_binds_it() {
+fn a_quoted_group_by_name_binds_the_column_it_names() {
     let db = open("quoted_group_by_name");
+    for sql in [
+        "SELECT COUNT(*) FROM one GROUP BY \"constant\"",
+        "SELECT \"constant\", COUNT(*) FROM one GROUP BY \"constant\"",
+        "SELECT COUNT(*) FROM one GROUP BY \"constant\" || ''",
+        "SELECT COUNT(*), (SELECT MAX(x) FROM u) FROM one GROUP BY \"constant\"",
+        "SELECT id, (SELECT COUNT(*) FROM u GROUP BY \"constant\") FROM one WHERE id = 1",
+        "SELECT \"constant\", COUNT(*) FROM one GROUP BY 1",
+    ] {
+        let got = error(&db, sql);
+        assert!(
+            got.as_deref()
+                .is_some_and(|e| e.contains("olumn 'constant' not found")),
+            "{sql}: {got:?}"
+        );
+    }
     for (sql, want) in [
-        (
-            "SELECT COUNT(*) FROM one GROUP BY \"constant\"",
-            vec!["Some(Integer(3))"],
-        ),
-        (
-            "SELECT \"constant\", COUNT(*) FROM one GROUP BY \"constant\"",
-            vec!["Some(Text(\"constant\"))|Some(Integer(3))"],
-        ),
-        (
-            "SELECT COUNT(*) FROM one GROUP BY \"constant\" || ''",
-            vec!["Some(Integer(3))"],
-        ),
-        (
-            "SELECT COUNT(*), (SELECT MAX(x) FROM u) FROM one GROUP BY \"constant\"",
-            vec!["Some(Integer(3))|Some(Integer(6))"],
-        ),
-        (
-            "SELECT id, (SELECT COUNT(*) FROM u GROUP BY \"constant\") FROM one WHERE id = 1",
-            vec!["Some(Integer(1))|Some(Integer(2))"],
-        ),
         (
             "SELECT \"a\", COUNT(*) FROM one GROUP BY \"a\" ORDER BY 1",
             vec![
@@ -270,27 +265,27 @@ fn a_quoted_group_by_name_binds_as_the_compiler_binds_it() {
             ],
         ),
         (
-            "SELECT \"constant\", COUNT(*) FROM one GROUP BY 1",
+            "SELECT 'constant', COUNT(*) FROM one GROUP BY 1",
             vec!["Some(Text(\"constant\"))|Some(Integer(3))"],
         ),
         (
-            "SELECT \"constant\" AS k, COUNT(*) FROM one GROUP BY 1",
+            "SELECT 'constant' AS k, COUNT(*) FROM one GROUP BY 1",
             vec!["Some(Text(\"constant\"))|Some(Integer(3))"],
         ),
         (
-            "SELECT \"constant\", COUNT(*), (SELECT MAX(x) FROM u) FROM one GROUP BY 1",
+            "SELECT 'constant', COUNT(*), (SELECT MAX(x) FROM u) FROM one GROUP BY 1",
             vec!["Some(Text(\"constant\"))|Some(Integer(3))|Some(Integer(6))"],
         ),
         (
-            "SELECT \"c\" AS k, COUNT(*) AS c FROM one GROUP BY 1",
+            "SELECT 'c' AS k, COUNT(*) AS c FROM one GROUP BY 1",
             vec!["Some(Text(\"c\"))|Some(Integer(3))"],
         ),
         (
-            "SELECT \"c\" AS k, COUNT(*) AS c FROM one GROUP BY k",
+            "SELECT 'c' AS k, COUNT(*) AS c FROM one GROUP BY k",
             vec!["Some(Text(\"c\"))|Some(Integer(3))"],
         ),
         (
-            "SELECT EXISTS (SELECT \"c\" AS k, COUNT(*) AS c FROM u GROUP BY k) FROM one \
+            "SELECT EXISTS (SELECT 'c' AS k, COUNT(*) AS c FROM u GROUP BY k) FROM one \
              WHERE id = 1",
             vec!["Some(Boolean(true))"],
         ),

@@ -55,7 +55,7 @@ const CASES: &[(&str, &[i64], &[&str])] = &[
         &["Integer(1)", "Integer(2)"],
     ),
     (
-        "SELECT x FROM (VALUES (\"A\"), (\"a\")) AS v(x)",
+        "SELECT x FROM (VALUES ('A'), ('a')) AS v(x)",
         &[],
         &["Text(\"A\")", "Text(\"a\")"],
     ),

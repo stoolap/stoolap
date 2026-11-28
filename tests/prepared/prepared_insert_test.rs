@@ -233,7 +233,8 @@ fn a_values_subquery_reads_no_column_of_the_target() {
     db.execute("CREATE TABLE s (id INTEGER PRIMARY KEY, b TEXT)", ())
         .unwrap();
     for (id, value, want) in [
-        (1, "(SELECT \"b\" FROM u WHERE u.id = 1)", Some("b")),
+        (1, "(SELECT \"b\" FROM u WHERE u.id = 1)", None),
+        (5, "(SELECT 'b' FROM u WHERE u.id = 1)", Some("b")),
         (2, "(SELECT s.id FROM u WHERE u.id = 1)", None),
         (3, "(SELECT b FROM u WHERE u.id = 1)", None),
         (4, "b || (SELECT 'x')", None),
@@ -253,10 +254,10 @@ fn a_values_subquery_reads_no_column_of_the_target() {
 
 /// Each value with its parameter and the `b` it inserts
 const ENTRY_SHAPES: &[(&str, i64, &str)] = &[
-    ("LENGTH(\"b\") + (SELECT x FROM u WHERE id = 1)", 0, "2"),
+    ("LENGTH('b') + (SELECT x FROM u WHERE id = 1)", 0, "2"),
     ("(SELECT x FROM u WHERE u.id = $1 + 1)", 0, "1"),
     ("(SELECT x FROM u WHERE u.id = $1)", 2, "2"),
-    ("LENGTH(\"b\") + (SELECT x FROM u WHERE id = 1)", 0, "2"),
+    ("LENGTH('b') + (SELECT x FROM u WHERE id = 1)", 0, "2"),
     ("$1 + (SELECT COUNT(*) FROM t)", 5, "9"),
 ];
 

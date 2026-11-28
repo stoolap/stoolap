@@ -1254,15 +1254,9 @@ pub(crate) fn split_join_where(
 
 /// The input column a SELECT item names, its alias set aside: a bare name,
 /// or a qualified one by its full name and then its bare one; the error for
-/// a name no column has; None for any other expression, a quoted name no
-/// column has among them
+/// a name no column has; None for any other expression
 fn select_column(expr: &Expression, col_index_map: &StringMap<usize>) -> Option<Result<usize>> {
     match unaliased_item(expr) {
-        Expression::Identifier(id)
-            if id.quoted && !col_index_map.contains_key(id.value_lower.as_str()) =>
-        {
-            None
-        }
         Expression::Identifier(id) => Some(
             col_index_map
                 .get(id.value_lower.as_str())

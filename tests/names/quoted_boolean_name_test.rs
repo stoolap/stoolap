@@ -48,12 +48,19 @@ fn test_quoted_true_and_false_are_columns() {
 }
 
 #[test]
-fn test_quoted_name_text_is_not_shared_through_the_program_cache() {
-    // A quoted name that is no column reads as its own text, so programs for
-    // "ABC" and "abc" must not be reused for each other
+fn test_a_quoted_name_in_any_case_is_one_column_or_its_own_error() {
     let db = Database::open("memory://quoted_name_cache").unwrap();
-    assert_eq!(strings(&db, "SELECT \"ABC\""), ["Text(\"ABC\")"]);
-    assert_eq!(strings(&db, "SELECT \"abc\""), ["Text(\"abc\")"]);
-    assert_eq!(strings(&db, "SELECT \"TRUE\""), ["Text(\"TRUE\")"]);
-    assert_eq!(strings(&db, "SELECT \"true\""), ["Text(\"true\")"]);
+    for (sql, want) in [
+        ("SELECT \"ABC\"", "column 'ABC' not found"),
+        ("SELECT \"abc\"", "column 'abc' not found"),
+        ("SELECT \"TRUE\"", "column 'TRUE' not found"),
+        ("SELECT \"true\"", "column 'true' not found"),
+    ] {
+        let got = db.query(sql, ()).map(|_| ()).map_err(|e| e.to_string());
+        assert_eq!(got, Err(want.to_string()), "{sql}");
+    }
+    db.execute("CREATE TABLE c (abc INTEGER)", ()).unwrap();
+    db.execute("INSERT INTO c VALUES (4)", ()).unwrap();
+    assert_eq!(strings(&db, "SELECT \"ABC\" FROM c"), ["Integer(4)"]);
+    assert_eq!(strings(&db, "SELECT \"abc\" FROM c"), ["Integer(4)"]);
 }

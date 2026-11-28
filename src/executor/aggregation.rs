@@ -424,22 +424,6 @@ pub(crate) fn aggregate_alias_key(
         })
 }
 
-/// The quoted name `stmt` writes as its GROUP BY key at `at`, itself or as
-/// the SELECT item a position names
-fn written_quoted(stmt: &SelectStatement, at: usize) -> Option<&Expression> {
-    let key = match grouping_items(stmt).get(at) {
-        Some(Expression::IntegerLiteral(position)) => usize::try_from(position.value)
-            .ok()
-            .and_then(|position| stmt.columns.get(position.checked_sub(1)?))
-            .map(|item| match item {
-                Expression::Aliased(aliased) => &*aliased.expression,
-                item => item,
-            }),
-        key => key.copied(),
-    };
-    key.filter(|key| matches!(key, Expression::Identifier(id) if id.quoted))
-}
-
 /// The error the grouped `stmt` raises when it runs over `source` and reads
 /// a column outside its groups, raised without running it
 pub(crate) fn check_grouped_reads(
@@ -830,9 +814,6 @@ pub struct SqlAggregateFunction {
     pub column: String,
     /// Pre-computed lowercase column name for index lookups
     pub column_lower: String,
-    /// Whether the column is a name written double-quoted, which reads as
-    /// its text when no column carries it
-    pub(crate) quoted: bool,
     /// Alias for the result column
     pub alias: Option<String>,
     /// Whether DISTINCT is specified
@@ -1144,11 +1125,6 @@ fn literal_extra_arg(arg: &Expression) -> Option<Value> {
         true => super::utils::extract_literal_value(arg),
         false => None,
     }
-}
-
-/// Whether a call's first argument is a name written double-quoted
-fn quoted_argument(args: &[Expression]) -> bool {
-    matches!(args.first(), Some(Expression::Identifier(id)) if id.quoted)
 }
 
 /// Whether every argument of a call to `args` after the first is a literal,
@@ -1559,17 +1535,12 @@ impl CompiledFeed {
                             {
                                 return Err(aggregate_group_key())
                             }
-                            None => match stmt.and_then(|s| written_quoted(s, at)) {
-                                // A quoted name no column carries is its text,
-                                // as the compiler reads it
-                                Some(quoted) => KeyItem::Program(compile(quoted)?),
-                                None => {
-                                    return Err(ungrouped_column(&match split_qualified(name) {
-                                        Some((table, column)) => format!("{table}.{column}"),
-                                        None => name.clone(),
-                                    }))
-                                }
-                            },
+                            None => {
+                                return Err(ungrouped_column(&match split_qualified(name) {
+                                    Some((table, column)) => format!("{table}.{column}"),
+                                    None => name.clone(),
+                                }))
+                            }
                         }
                     }
                     GroupByItem::Expression { expr, .. } => KeyItem::Program(compile(expr)?),
@@ -1583,15 +1554,14 @@ impl CompiledFeed {
                 _ => None,
             })
             .collect::<Option<Vec<_>>>();
-        let mut programs = key_columns.is_none()
+        let programs = key_columns.is_none()
             || !aggregations
                 .iter()
                 .all(|a| a.answered_with(Modifiers::DISTINCT.and(Modifiers::EXTRA_ARGS)));
-        let mut inputs = CallInputs::compile_with(aggregations, &compile)?;
+        let inputs = CallInputs::compile_with(aggregations, &compile)?;
         let columns = aggregations
             .iter()
-            .zip(&mut inputs)
-            .map(|(agg, input)| {
+            .map(|agg| {
                 if agg.column == "*" || agg.expression.is_some() {
                     return Ok(None);
                 }
@@ -1600,14 +1570,6 @@ impl CompiledFeed {
                     // A qualified name its source lacks
                     None if split_qualified(&agg.column).is_some() => {
                         Err(ungrouped_column(&shown_name(&agg.column)))
-                    }
-                    // A quoted name no column carries is its text, as the
-                    // compiler reads it
-                    None if agg.quoted => {
-                        let text = super::utils::value_to_expression(&Value::text(&agg.column));
-                        input.argument = Some(compile(&text)?);
-                        programs = true;
-                        Ok(None)
                     }
                     None => Err(crate::core::Error::ColumnNotFound(agg.column.clone())),
                 }
@@ -3209,7 +3171,6 @@ impl Executor {
                         name: func.function.to_string(),
                         column,
                         column_lower,
-                        quoted: quoted_argument(&func.arguments),
                         alias: None,
                         distinct: distinct || func.is_distinct,
                         extra_args,
@@ -3369,7 +3330,6 @@ impl Executor {
                         name: func.function.to_string(),
                         column,
                         column_lower,
-                        quoted: quoted_argument(&func.arguments),
                         alias: Some(aliased.alias.value.to_string()),
                         distinct: distinct || func.is_distinct,
                         extra_args,

@@ -269,7 +269,7 @@ fn a_join_opens_the_where_s_select_aliases_once() {
     ] {
         db.execute(sql, ()).unwrap();
     }
-    let sql = "SELECT 1 AS x, \"x\" AS y FROM l JOIN r ON l.id < r.id WHERE y = 'x'";
+    let sql = "SELECT 1 AS x, 'x' AS y FROM l JOIN r ON l.id < r.id WHERE y = 'x'";
     for _ in 0..2 {
         let got: Vec<String> = db
             .query(sql, ())
@@ -286,7 +286,7 @@ fn a_join_opens_the_where_s_select_aliases_once() {
         assert_eq!(
             got.len(),
             1,
-            "y opens to the text \"x\", not to the alias x: {got:?}"
+            "y opens to the text 'x', not to the alias x: {got:?}"
         );
     }
 }
