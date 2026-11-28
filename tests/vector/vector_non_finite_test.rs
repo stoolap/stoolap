@@ -228,3 +228,31 @@ fn an_hnsw_cosine_index_ranks_components_past_the_f32_square_range() {
         assert_eq!(indexed_nearest(name, nearest), 1, "{nearest}");
     }
 }
+
+#[test]
+fn a_non_finite_query_vector_is_answered_past_the_hnsw_index() {
+    let db = Database::open("memory://vector_non_finite_query_index").unwrap();
+    db.execute("CREATE TABLE v (id INTEGER PRIMARY KEY, e VECTOR(2))", ())
+        .unwrap();
+    let mut values: Vec<String> = (1..=300)
+        .map(|id| format!("({id}, '[0,1.{id}]')"))
+        .collect();
+    values.push("(301, '[1,0]')".to_string());
+    let sql = format!("INSERT INTO v VALUES {}", values.join(", "));
+    db.execute(&sql, ()).unwrap();
+    db.execute(
+        "CREATE INDEX hi ON v(e) USING HNSW WITH (metric = 'ip')",
+        (),
+    )
+    .unwrap();
+    let nearest = |sql: &str, rows: stoolap::Rows| {
+        let ids: Vec<i64> = rows
+            .map(|row| row.unwrap().get::<i64>(0).unwrap())
+            .collect();
+        assert_eq!(ids.first(), Some(&301), "{sql}: {ids:?}");
+    };
+    let sql = "SELECT id FROM v ORDER BY VEC_DISTANCE_IP(e, '[inf,0]') LIMIT 2";
+    nearest(sql, db.query(sql, ()).unwrap());
+    let sql = "SELECT id FROM v ORDER BY VEC_DISTANCE_IP(e, $1) LIMIT 2";
+    nearest(sql, db.query(sql, ("[inf,0]",)).unwrap());
+}

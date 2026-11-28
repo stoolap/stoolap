@@ -3088,6 +3088,10 @@ impl Index for HnswIndex {
         if query_bytes.len() != self.dims * 4 {
             return None;
         }
+        // Distances from a non-finite query carry no order to walk: the scan answers
+        if !query.vector_f32_iter()?.all(f32::is_finite) {
+            return None;
+        }
         Some(self.search_nearest(query_bytes, k, ef_search))
     }
 
@@ -3570,5 +3574,36 @@ mod tests {
         let bytes: Vec<u8> = floats.iter().flat_map(|f| f.to_le_bytes()).collect();
         let slice = as_f32_slice(&bytes);
         assert_eq!(slice, &floats);
+    }
+
+    #[test]
+    fn a_non_finite_query_vector_is_not_searched_in_the_graph() {
+        let index = HnswIndex::new(
+            "test_idx".to_string(),
+            "test_table".to_string(),
+            "embedding".to_string(),
+            1,
+            2,
+            16,
+            200,
+            64,
+            HnswDistanceMetric::InnerProduct,
+        );
+        index.add(&[make_vector_value(&[1.0, 0.0])], 1, 1).unwrap();
+        index.add(&[make_vector_value(&[0.0, 1.0])], 2, 2).unwrap();
+        for query in [
+            [f32::INFINITY, 0.0],
+            [f32::NAN, 0.0],
+            [0.0, f32::NEG_INFINITY],
+        ] {
+            let found = Index::search_nearest(&index, &make_vector_value(&query), 1, 64);
+            assert!(found.is_none(), "{query:?} gave {found:?}");
+        }
+        let found = Index::search_nearest(&index, &make_vector_value(&[1.0, 0.0]), 1, 64);
+        assert_eq!(
+            found.map(|found| found[0].0),
+            Some(1),
+            "a finite query searches"
+        );
     }
 }
