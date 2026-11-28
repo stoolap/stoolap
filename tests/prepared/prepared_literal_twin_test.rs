@@ -543,7 +543,9 @@ fn a_runner_output_known_before_the_rows_runs_no_program_per_row() {
         "SELECT id, (SELECT MAX(x) FROM u), 'k' FROM t",
         "SELECT id, (SELECT MAX(x) FROM u), 'k', $1, s FROM t",
     ] {
-        let programs = row_programs(&db, sql, &[Value::text("p")]);
+        let value = [Value::text("p")];
+        let params = if sql.contains("$1") { &value[..] } else { &[] };
+        let programs = row_programs(&db, sql, params);
         assert_eq!(programs, Ok(Vec::new()), "{sql}");
     }
 }

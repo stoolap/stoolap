@@ -2196,6 +2196,7 @@ impl Statement {
             Statement::Update(s) => s.param_count,
             Statement::Delete(s) => s.param_count,
             Statement::Explain(s) if s.analyze => s.statement.param_count(),
+            Statement::CreateTable(s) => s.as_select.as_ref().map_or(0, |s| s.param_count),
             _ => 0,
         }
     }
@@ -2207,6 +2208,11 @@ impl Statement {
             Statement::Update(s) => s.param_count = count,
             Statement::Delete(s) => s.param_count = count,
             Statement::Explain(s) => s.statement.set_param_count(count),
+            Statement::CreateTable(s) => {
+                if let Some(select) = s.as_select.as_mut() {
+                    select.param_count = count;
+                }
+            }
             _ => {}
         }
     }

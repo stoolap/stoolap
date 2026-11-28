@@ -267,12 +267,16 @@ fn a_values_subquery_answers_alike_on_every_entry() {
         setup(&db);
         for (value, param, want) in ENTRY_SHAPES {
             let sql = format!("INSERT INTO t VALUES (10, {value})");
+            let params = || match value.contains("$1") {
+                true => vec![stoolap::Value::Integer(*param)],
+                false => Vec::new(),
+            };
             let inserted = match run {
-                0 => db.execute(&sql, (*param,)),
-                1 => db.prepare(&sql).and_then(|s| s.execute((*param,))),
+                0 => db.execute(&sql, params()),
+                1 => db.prepare(&sql).and_then(|s| s.execute(params())),
                 _ => {
                     let mut tx = db.begin().unwrap();
-                    let n = tx.execute(&sql, (*param,));
+                    let n = tx.execute(&sql, params());
                     tx.commit().unwrap();
                     n
                 }

@@ -216,6 +216,75 @@ fn a_position_the_call_does_not_give_is_an_error_on_every_path() {
 }
 
 #[test]
+fn a_value_the_statement_does_not_take_is_an_error_on_every_path() {
+    let db = open("param_slots_positional_extra");
+    for (sql, given) in [
+        ("SELECT 1", 1),
+        ("SELECT $1", 2),
+        ("SELECT ?", 2),
+        ("SELECT id FROM t WHERE id = $1", 2),
+        ("SELECT id FROM t WHERE id = $1 AND v = $2", 3),
+        ("SELECT id FROM t WHERE id = $1 ORDER BY id LIMIT $2", 3),
+        ("SELECT id FROM t WHERE v = 20", 1),
+    ] {
+        assert_all_err(
+            sql,
+            positional_paths(&db, sql, &[int(1), int(2), int(3)][..given]),
+            "parameters but",
+        );
+    }
+}
+
+#[test]
+fn a_write_given_a_value_too_many_writes_nothing() {
+    let db = open("param_slots_write_extra");
+    for (sql, given) in [
+        (
+            "INSERT INTO t VALUES ($1, $2, 'x')",
+            vec![int(7), int(70), int(700)],
+        ),
+        (
+            "UPDATE t SET v = $1 WHERE id = $2",
+            vec![int(99), int(1), int(2)],
+        ),
+        ("DELETE FROM t WHERE id = $1", vec![int(1), int(2)]),
+        ("CREATE TABLE c AS SELECT $1 AS a", vec![int(1), int(2)]),
+        (
+            "INSERT INTO t VALUES ($1, 1, 'x'); SELECT $1",
+            vec![int(8), int(9)],
+        ),
+    ] {
+        let error = db.execute(sql, given).expect_err(sql).to_string();
+        assert!(error.contains("parameters but"), "{sql}: {error}");
+    }
+    let rows = rows(db.query("SELECT id, v FROM t ORDER BY id", ())).unwrap();
+    assert_eq!(
+        rows,
+        [
+            vec![int(1), int(10)],
+            vec![int(2), int(20)],
+            vec![int(3), int(30)]
+        ]
+    );
+    // The statements of one program share the values, the one taking most
+    // decides; an EXPLAIN shows its statement with the values given or none
+    for (sql, given) in [
+        (
+            "BEGIN; INSERT INTO t VALUES ($1, 1, 'x'); COMMIT",
+            vec![int(4)],
+        ),
+        ("CREATE TABLE d AS SELECT $1 AS a", vec![int(5)]),
+        (
+            "EXPLAIN SELECT id FROM t WHERE id = $1",
+            vec![int(1), int(2)],
+        ),
+    ] {
+        db.execute(sql, given)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+}
+
+#[test]
 fn a_write_missing_a_value_writes_nothing() {
     let db = open("param_slots_writes");
     let before = rows(db.query("SELECT id, v, s FROM t ORDER BY id", ())).unwrap();

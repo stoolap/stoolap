@@ -297,7 +297,11 @@ fn a_failing_parameter_or_subquery_fails_only_where_a_row_reaches_it() {
     let db = table("planned_failing_parameter");
     db.execute("CREATE INDEX t_v ON t(v)", ()).unwrap();
     let answer = |sql: &str| {
-        db.query(sql, ("a",))
+        let params = match sql.contains("$1") {
+            true => vec![stoolap::Value::text("a")],
+            false => Vec::new(),
+        };
+        db.query(sql, params)
             .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
             .map(|rows| rows.len())
     };

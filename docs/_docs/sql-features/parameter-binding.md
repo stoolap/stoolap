@@ -56,9 +56,18 @@ db.query_named("SELECT * FROM users WHERE id = :id", named_params!{})?;
 // Error: named parameter :id has no value
 ```
 
+A positional value the statement has no slot for is an error as well, on the same paths:
+
+```rust
+db.query("SELECT * FROM users WHERE id = $1", (1, 2))?;
+// Error: statement takes 1 parameters but 2 were given
+```
+
+The count is the highest slot, so `SELECT $1, $3` takes three values and reads the first and the third. The statements of one SQL text share its values, and the statement taking most decides how many the text takes: `BEGIN; INSERT INTO t VALUES ($1); COMMIT` takes one.
+
 Names are matched as written (`:ID` is not `:id`). A name the statement does not read is ignored.
 
-`EXPLAIN` reads no value: it shows each parameter as written, so it runs without them. `EXPLAIN ANALYZE` runs the statement and needs every value.
+`EXPLAIN` reads no value: it shows each parameter as written, so it runs without them, and with values given it shows the plan they lead to. It takes any number of values. `EXPLAIN ANALYZE` runs the statement and needs exactly its values.
 
 ## Using Parameters in Rust
 
