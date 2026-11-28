@@ -43,7 +43,7 @@ SET isolation_level = 'READ COMMITTED';
 SET isolation_level = 'SNAPSHOT';
 ```
 
-Both `isolation_level` and `transaction_isolation` are accepted as variable names.
+Both `isolation_level` and `transaction_isolation` are accepted as variable names. `SET` with any other name is an error that names it, such as `unknown SET: isolationlevel. Known: isolation_level, transaction_isolation`.
 
 This setting affects:
 - **Auto-commit transactions** - Queries executed without an explicit transaction

@@ -251,3 +251,35 @@ fn test_pragma_volume_stats_with_table() {
         "In-memory tables have no volumes before checkpoint"
     );
 }
+
+#[test]
+fn an_unknown_pragma_or_set_name_is_an_error_naming_it() {
+    let db = Database::open("memory://pragma_unknown_name").expect("open");
+    for (sql, name) in [
+        ("PRAGMA foo", "unknown PRAGMA: foo"),
+        ("PRAGMA foo = 1", "unknown PRAGMA: foo"),
+        ("PRAGMA query_timout = 100", "unknown PRAGMA: query_timout"),
+        ("PRAGMA sync_mod = 2", "unknown PRAGMA: sync_mod"),
+        ("SET foo = 1", "unknown SET: foo"),
+        (
+            "SET isolationlevel = 'SNAPSHOT'",
+            "unknown SET: isolationlevel",
+        ),
+    ] {
+        let error = db.execute(sql, ()).expect_err(sql).to_string();
+        assert!(error.contains(name), "{sql}: {error}");
+        let prepared = db.prepare(sql).and_then(|stmt| stmt.execute(()));
+        let error = prepared.expect_err(sql).to_string();
+        assert!(error.contains(name), "prepared {sql}: {error}");
+    }
+    let error = db.execute("PRAGMA foo", ()).expect_err("foo").to_string();
+    assert!(
+        error.contains("query_timeout"),
+        "the names it takes: {error}"
+    );
+    let error = db.execute("SET foo = 1", ()).expect_err("foo").to_string();
+    assert!(
+        error.contains("isolation_level"),
+        "the names it takes: {error}"
+    );
+}

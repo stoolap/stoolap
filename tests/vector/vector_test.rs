@@ -849,7 +849,7 @@ fn test_vector_snapshot_persistence() {
         )
         .expect("insert");
 
-        db.execute("PRAGMA create_snapshot", ()).ok();
+        db.execute("PRAGMA snapshot", ()).expect("snapshot");
     }
 
     {

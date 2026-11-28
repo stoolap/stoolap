@@ -18,7 +18,7 @@
 
 use stoolap::Database;
 
-/// Test session-wide isolation level setting with SET ISOLATIONLEVEL
+/// Test session-wide isolation level setting with SET ISOLATION_LEVEL
 #[test]
 fn test_isolation_level_session() {
     let db = Database::open("memory://iso_session").expect("Failed to create database");
@@ -31,7 +31,7 @@ fn test_isolation_level_session() {
     .expect("Failed to create table");
 
     // Test session-wide isolation level setting
-    db.execute("SET ISOLATIONLEVEL = 'SNAPSHOT'", ())
+    db.execute("SET ISOLATION_LEVEL = 'SNAPSHOT'", ())
         .expect("Failed to set session isolation level");
 
     // Start a transaction
@@ -55,8 +55,42 @@ fn test_isolation_level_session() {
     assert_eq!(count, 1, "Expected 1 row after commit");
 
     // Change back to READ COMMITTED
-    db.execute("SET ISOLATIONLEVEL = 'READ COMMITTED'", ())
+    db.execute("SET ISOLATION_LEVEL = 'READ COMMITTED'", ())
         .expect("Failed to reset session isolation level");
+}
+
+/// The rows a transaction under `level` counts in `t` after another
+/// session commits one more row during it
+fn count_after_another_commit(name: &str, level: &str) -> i64 {
+    let db = Database::open(&format!("memory://{name}")).expect("open");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+        .expect("create");
+    db.execute("INSERT INTO t VALUES (1)", ()).expect("insert");
+    let other = db.clone();
+    db.execute(&format!("SET ISOLATION_LEVEL = '{level}'"), ())
+        .expect("set");
+    db.execute("BEGIN", ()).expect("begin");
+    let _: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).expect("count");
+    other
+        .execute("INSERT INTO t VALUES (2)", ())
+        .expect("other insert");
+    let count = db.query_one("SELECT COUNT(*) FROM t", ()).expect("count");
+    db.execute("COMMIT", ()).expect("commit");
+    count
+}
+
+#[test]
+fn a_session_isolation_level_decides_what_its_transactions_see() {
+    assert_eq!(
+        count_after_another_commit("iso_level_snapshot", "SNAPSHOT"),
+        1,
+        "a snapshot keeps the rows it began with"
+    );
+    assert_eq!(
+        count_after_another_commit("iso_level_read_committed", "READ COMMITTED"),
+        2,
+        "read committed sees the other session's commit"
+    );
 }
 
 /// Test transaction-specific isolation level setting
@@ -72,7 +106,7 @@ fn test_isolation_level_transaction() {
     .expect("Failed to create table");
 
     // Set session to READ COMMITTED
-    db.execute("SET ISOLATIONLEVEL = 'READ COMMITTED'", ())
+    db.execute("SET ISOLATION_LEVEL = 'READ COMMITTED'", ())
         .expect("Failed to set session isolation level");
 
     // Start a transaction with specific isolation level
@@ -117,7 +151,7 @@ fn test_isolation_level_reset() {
     .expect("Failed to create table");
 
     // Set session isolation level to READ COMMITTED
-    db.execute("SET ISOLATIONLEVEL = 'READ COMMITTED'", ())
+    db.execute("SET ISOLATION_LEVEL = 'READ COMMITTED'", ())
         .expect("Failed to set session isolation level");
 
     // Start transaction with specific isolation level
@@ -150,19 +184,15 @@ fn test_isolation_level_variants() {
     let db = Database::open("memory://iso_variants").expect("Failed to create database");
 
     // Test setting SNAPSHOT isolation
-    db.execute("SET ISOLATIONLEVEL = 'SNAPSHOT'", ())
+    db.execute("SET ISOLATION_LEVEL = 'SNAPSHOT'", ())
         .expect("Failed to set SNAPSHOT isolation");
 
     // Test setting READ COMMITTED isolation
-    db.execute("SET ISOLATIONLEVEL = 'READ COMMITTED'", ())
+    db.execute("SET ISOLATION_LEVEL = 'READ COMMITTED'", ())
         .expect("Failed to set READ COMMITTED isolation");
 
-    // Test setting SERIALIZABLE isolation (if supported)
-    let result = db.execute("SET ISOLATIONLEVEL = 'SERIALIZABLE'", ());
-    // May or may not be supported - just log the result
-    if result.is_err() {
-        println!("SERIALIZABLE isolation level not supported");
-    }
+    db.execute("SET ISOLATION_LEVEL = 'SERIALIZABLE'", ())
+        .expect("SERIALIZABLE reads as SNAPSHOT");
 }
 
 /// Test isolation in concurrent-like scenario
@@ -185,7 +215,7 @@ fn test_isolation_visibility() {
     .expect("Failed to insert initial data");
 
     // Set SNAPSHOT isolation
-    db.execute("SET ISOLATIONLEVEL = 'SNAPSHOT'", ())
+    db.execute("SET ISOLATION_LEVEL = 'SNAPSHOT'", ())
         .expect("Failed to set isolation level");
 
     // Begin first transaction
@@ -237,7 +267,7 @@ fn test_isolation_rollback() {
         .expect("Failed to insert");
 
     // Set isolation level
-    db.execute("SET ISOLATIONLEVEL = 'SNAPSHOT'", ())
+    db.execute("SET ISOLATION_LEVEL = 'SNAPSHOT'", ())
         .expect("Failed to set isolation level");
 
     // Begin transaction

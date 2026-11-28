@@ -27,6 +27,8 @@ or to retrieve the current value:
 PRAGMA [pragma_name];
 ```
 
+A name the engine does not take is an error that names it and lists the names it takes, such as `unknown PRAGMA: query_timout. Known: snapshot, checkpoint, ...`. The names are matched without regard to case.
+
 ## Available PRAGMA Commands
 
 Stoolap currently supports the following PRAGMA commands:
