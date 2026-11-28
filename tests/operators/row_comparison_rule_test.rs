@@ -223,8 +223,11 @@ fn check_every_context(db: &Database) {
             }
         }
         let prepared = db.prepare(&format!("SELECT {with_parameters}")).unwrap();
+        // A right side written as literals leaves `$3` and `$4` out
+        let takes = if with_parameters.contains("$3") { 4 } else { 2 };
         for (_, a, b) in &rows {
-            let params = vec![value(a[0]), value(a[1]), value(b[0]), value(b[1])];
+            let mut params = vec![value(a[0]), value(a[1]), value(b[0]), value(b[1])];
+            params.truncate(takes);
             for _ in 0..2 {
                 let mut result = prepared.query(params.clone()).unwrap();
                 let row = result.next().unwrap().unwrap();
