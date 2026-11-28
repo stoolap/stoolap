@@ -486,7 +486,8 @@ fn a_number_written_into_a_name_is_an_error_naming_it_in_every_clause() {
         );
     };
     for text in [
-        "0x1F", "0xZZ", "0b101", "0o17", "1_000", "1abc", "12e3x", "1.5x", "1$",
+        "0x1F", "0xZZ", "0b101", "0o17", "1_000", "1abc", "12e3x", "1.5x", "1$", "1é", "1.5é",
+        "1e3é", "1xé", "2日本",
     ] {
         refused(&format!("SELECT {text}"), text);
         refused(&format!("SELECT {text}, 1"), text);
@@ -502,6 +503,7 @@ fn a_number_written_into_a_name_is_an_error_naming_it_in_every_clause() {
     use stoolap::Value;
     for (sql, column, want) in [
         ("SELECT 1 x", "x", Value::Integer(1)),
+        ("SELECT 1 é", "é", Value::Integer(1)),
         ("SELECT 1e3", "1000", Value::Float(1000.0)),
         ("SELECT 1e-3", "0.001", Value::Float(0.001)),
         ("SELECT 1.5", "1.5", Value::Float(1.5)),

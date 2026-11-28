@@ -328,15 +328,28 @@ impl<'a> Lexer<'a> {
         let start = self.at;
         loop {
             self.skip_class(WORD);
-            if self.byte(self.at) < 0x80 {
-                break;
-            }
-            match self.char_at(self.at) {
-                (c, len) if c.is_alphanumeric() => self.step(len),
-                _ => break,
+            match self.non_ascii_name_char(self.at) {
+                Some(len) => self.step(len),
+                None => break,
             }
         }
         self.text(start, self.at)
+    }
+
+    /// Whether the character at `at` continues a name, as `read_identifier` reads one
+    fn continues_name(&self, at: usize) -> bool {
+        BYTE_CLASS[usize::from(self.byte(at))] & WORD != 0 || self.non_ascii_name_char(at).is_some()
+    }
+
+    /// The length of the character at `at` when it is a letter or digit beyond ASCII
+    fn non_ascii_name_char(&self, at: usize) -> Option<usize> {
+        if self.byte(at) < 0x80 {
+            return None;
+        }
+        match self.char_at(at) {
+            (c, len) if c.is_alphanumeric() => Some(len),
+            _ => None,
+        }
     }
 
     /// Read a number, and whether it has a decimal point or an exponent
@@ -369,8 +382,8 @@ impl<'a> Lexer<'a> {
             self.skip_class(DIGIT);
         }
 
-        // A letter, digit, `_` or `$` right after it would make it a name
-        if BYTE_CLASS[usize::from(self.byte(self.at))] & WORD != 0 {
+        // A character a name continues with, right after it, would make it a name
+        if self.continues_name(self.at) {
             return self.invalid_number(start);
         }
         (self.token_since(start), float)
@@ -380,7 +393,7 @@ impl<'a> Lexer<'a> {
     /// name it runs into, so the error shows the whole text as written
     #[cold]
     fn invalid_number(&mut self, start: usize) -> (SmartString, bool) {
-        self.skip_class(WORD);
+        self.read_identifier();
         let text = self.token_since(start);
         self.last_error = Some(format!("invalid number: {text}"));
         (text, false)
