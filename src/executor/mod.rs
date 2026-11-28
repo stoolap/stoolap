@@ -1015,17 +1015,16 @@ impl Executor {
     }
 
     /// Execute a single statement; its parameters are checked against the
-    /// count the parser wrote on it
+    /// count the parser wrote on it, for a statement that keeps one
     pub fn execute_statement(
         &self,
         statement: &Statement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        let slots = ParamSlots {
-            count: statement.param_count(),
-            names: None,
-        };
-        check_param_count(statement, &slots, ctx.params().len())?;
+        if let Some(count) = statement.carried_param_count() {
+            let slots = ParamSlots { count, names: None };
+            check_param_count(statement, &slots, ctx.params().len())?;
+        }
         self.execute_checked_statement(statement, ctx)
     }
 

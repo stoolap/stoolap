@@ -642,3 +642,25 @@ fn explain_analyze_of_a_view_with_a_parameter_creates_nothing() {
     let error = rows(db.query("SELECT * FROM v", ())).expect_err("no view v");
     assert!(!error.to_string().contains("parameters"), "{error}");
 }
+
+#[test]
+fn a_parsed_statement_keeping_no_count_runs_with_its_values() {
+    let db = open("param_slots_parsed_expression");
+    let sum = stoolap::parser::Parser::new("$1 + 1")
+        .parse_statement()
+        .unwrap();
+    let executor = stoolap::Executor::new(db.engine().clone());
+    let ctx = stoolap::ExecutionContext::with_params(stoolap::ParamVec::from(vec![int(1)]));
+    let mut result = executor.execute_statement(&sum, &ctx).unwrap();
+    assert!(result.next(), "one row");
+    assert_eq!(result.row().get(0), Some(&int(2)));
+}
+
+#[test]
+fn a_statement_parsed_alone_with_an_error_is_none() {
+    for sql in ["SELECT $1, ?", "SELECT ?, $1", "SELECT $1, :v"] {
+        let mut parser = stoolap::parser::Parser::new(sql);
+        let parsed = parser.parse_statement();
+        assert!(parsed.is_none(), "{sql}: {parsed:?}");
+    }
+}

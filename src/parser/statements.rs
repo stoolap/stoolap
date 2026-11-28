@@ -71,9 +71,12 @@ fn is_reserved_alias_keyword(upper: &str) -> bool {
 
 impl Parser<'_> {
     /// Parse a whole statement, with the parameter slot count it takes
-    /// written on it
+    /// written on it; None when parsing it raised an error, as the statement
+    /// may lack what the error skipped
     pub fn parse_statement(&mut self) -> Option<Statement> {
-        self.parse_statement_with_slots().map(|(stmt, _)| stmt)
+        let errors = self.error_count();
+        let (stmt, _) = self.parse_statement_with_slots()?;
+        (self.error_count() == errors).then_some(stmt)
     }
 
     /// [`Self::parse_statement`] and the slots the statement takes

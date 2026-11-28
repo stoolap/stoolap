@@ -295,6 +295,11 @@ impl<'a> Parser<'a> {
         Ok(Program { statements, params })
     }
 
+    /// How many errors the parser has raised so far
+    pub(crate) fn error_count(&self) -> usize {
+        self.errors.len()
+    }
+
     /// The slots `stmt`, just parsed whole, takes, leaving the counters for
     /// the next statement; an EXPLAIN without ANALYZE reads no value, it
     /// shows each parameter as written
