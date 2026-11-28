@@ -4267,6 +4267,7 @@ impl MVCCEngine {
                 col.default_expr = default_expr;
                 col.check_expr = check_expr;
                 col.vector_dimensions = vector_dimensions;
+                self.check_added_default(&col)?;
                 store.add_column(col)?;
                 store.lay_out_rows();
             }
@@ -5204,7 +5205,24 @@ impl MVCCEngine {
         table_name: &str,
         column: crate::core::SchemaColumn,
     ) -> Result<()> {
+        self.check_added_default(&column)?;
         self.get_version_store(table_name)?.add_column(column)
+    }
+
+    /// Whether an added column's default, which the table's rows take past
+    /// its write checks, is a value the column holds: a VECTOR default's
+    /// dimension count and finite components. A change the log replays was
+    /// taken when it was made
+    fn check_added_default(&self, column: &crate::core::SchemaColumn) -> Result<()> {
+        if self.loading_from_disk.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        match (&column.default_value, column.data_type) {
+            (Some(value), DataType::Vector) => {
+                value.check_vector_column(&column.name, column.vector_dimensions, true)
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Runs `judge` over each committed row of `table_name`, closed by an
@@ -12279,6 +12297,40 @@ mod tests {
             .sum();
         assert_eq!(entered, 0, "rows entered under a key");
         db.execute("ROLLBACK", ()).unwrap();
+    }
+
+    #[test]
+    fn an_added_vector_default_holds_finite_components_unless_replayed() {
+        let engine = MVCCEngine::in_memory();
+        engine.open_engine().unwrap();
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .build();
+        engine.create_table(schema).unwrap();
+        let nan = || (None, Some(Value::vector(vec![f32::NAN, 1.0])), None);
+        let live = engine.create_column_with_default("t", "e", DataType::Vector, true, nan(), 2);
+        assert!(
+            live.unwrap_err().to_string().contains("cannot hold NaN"),
+            "a live change refuses it"
+        );
+        let short = || (None, Some(Value::vector(vec![1.0])), None);
+        let live = engine.create_column_with_default("t", "e", DataType::Vector, true, short(), 2);
+        assert!(
+            live.unwrap_err().to_string().contains("dimension mismatch"),
+            "a live change refuses a short default"
+        );
+        engine.loading_from_disk.store(true, Ordering::Release);
+        let replayed =
+            engine.create_column_with_default("t", "e", DataType::Vector, true, nan(), 2);
+        let replayed_short =
+            engine.create_column_with_default("t", "f", DataType::Vector, true, short(), 2);
+        engine.loading_from_disk.store(false, Ordering::Release);
+        assert!(replayed.is_ok(), "a replayed change keeps it: {replayed:?}");
+        assert!(
+            replayed_short.is_ok(),
+            "a replayed short default keeps its column: {replayed_short:?}"
+        );
+        engine.close_engine().unwrap();
     }
 
     #[test]

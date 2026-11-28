@@ -1250,7 +1250,12 @@ impl Executor {
                     let previous_schema = self.engine.get_table_schema(table_name)?;
                     // The schema takes the column now; the rows follow once
                     // the change is recorded
-                    let column = crate::core::SchemaColumn::with_default_value(
+                    let vector_dimensions = if data_type == DataType::Vector {
+                        crate::executor::utils::parse_vector_dimension(&col_def.data_type)
+                    } else {
+                        0
+                    };
+                    let mut column = crate::core::SchemaColumn::with_default_value(
                         previous_schema.columns.len(),
                         col_def.name.value.as_str(),
                         data_type,
@@ -1261,6 +1266,7 @@ impl Executor {
                         default_value,
                         check_expr.map(|expr| expr.to_string()),
                     );
+                    column.vector_dimensions = vector_dimensions;
                     // Refused before anything changes when a volume would not map
                     let mut added = crate::core::Schema::clone(&previous_schema);
                     added.add_column(column.clone())?;
@@ -1339,11 +1345,6 @@ impl Executor {
                     }
 
                     // Record ALTER TABLE ADD COLUMN to WAL for persistence
-                    let vector_dimensions = if data_type == DataType::Vector {
-                        crate::executor::utils::parse_vector_dimension(&col_def.data_type)
-                    } else {
-                        0
-                    };
                     if let Err(error) = self.engine.record_alter_table_add_column(
                         table_name,
                         &column,

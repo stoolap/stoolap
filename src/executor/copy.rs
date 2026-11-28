@@ -301,7 +301,7 @@ impl Executor {
                 let target_type = all_column_types[col_idx];
                 let col_name = column_names.get(i).map(|s| s.as_str()).unwrap_or("?");
                 let value = parse_field(field, target_type, col_name)?;
-                validate_vector_dims(&value, target_type, all_vector_dims[col_idx])?;
+                validate_vector_dims(&value, target_type, all_vector_dims[col_idx], col_name)?;
                 row_values[col_idx] = value;
             }
 
@@ -447,7 +447,12 @@ impl Executor {
 
                 if let Some(v) = json_val {
                     let value = json_value_to_stoolap(v, target_type, lower_name, null_str)?;
-                    validate_vector_dims(&value, target_type, all_vector_dims[*col_idx])?;
+                    validate_vector_dims(
+                        &value,
+                        target_type,
+                        all_vector_dims[*col_idx],
+                        lower_name,
+                    )?;
                     row_values[*col_idx] = value;
                     given[*col_idx] = true;
                 }
@@ -464,7 +469,7 @@ impl Executor {
                 {
                     let target_type = all_column_types[col_idx];
                     let value = json_value_to_stoolap(json_val, target_type, &lower_key, null_str)?;
-                    validate_vector_dims(&value, target_type, all_vector_dims[col_idx])?;
+                    validate_vector_dims(&value, target_type, all_vector_dims[col_idx], key)?;
                     row_values[col_idx] = value;
                     given[col_idx] = true;
                 }
@@ -548,23 +553,19 @@ impl CopyDefaults {
     }
 }
 
-/// Validate vector dimensions if the column is a VECTOR type.
+/// Whether VECTOR column `column` may hold `value`, by the column rule
+/// `Value::check_vector_column`
 #[inline]
-fn validate_vector_dims(value: &Value, target_type: DataType, expected_dims: u16) -> Result<()> {
-    if target_type == DataType::Vector
-        && expected_dims > 0
-        && let Value::Extension(data) = value
-        && data.first() == Some(&(DataType::Vector as u8))
-    {
-        let got_dim = u16::try_from((data.len() - 1) / 4).unwrap_or(u16::MAX);
-        if got_dim != expected_dims {
-            return Err(Error::VectorDimensionMismatch {
-                expected: expected_dims,
-                got: got_dim,
-            });
-        }
+fn validate_vector_dims(
+    value: &Value,
+    target_type: DataType,
+    expected_dims: u16,
+    column: &str,
+) -> Result<()> {
+    match target_type {
+        DataType::Vector => value.check_vector_column(column, expected_dims, true),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 /// Case-insensitive JSON key lookup using Unicode-aware lowercasing.

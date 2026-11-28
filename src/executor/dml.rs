@@ -165,20 +165,8 @@ pub(crate) fn validate_coercion(
             original, target_type, column_name
         )));
     }
-    // Validate vector dimension matches column definition
-    if target_type == DataType::Vector
-        && let Value::Extension(data) = coerced
-        && data.first() == Some(&(DataType::Vector as u8))
-    {
-        // Payload is packed LE f32 bytes after the tag byte
-        let got_dim = u16::try_from((data.len() - 1) / 4).unwrap_or(u16::MAX);
-        // vector_dimensions == 0 means unspecified, skip check
-        if vector_dimensions > 0 && got_dim != vector_dimensions {
-            return Err(Error::VectorDimensionMismatch {
-                expected: vector_dimensions,
-                got: got_dim,
-            });
-        }
+    if target_type == DataType::Vector {
+        coerced.check_vector_column(column_name, vector_dimensions, true)?;
     }
     Ok(())
 }
@@ -3861,19 +3849,9 @@ impl Executor {
                     let coerced = vm
                         .execute(program, &exec_ctx)?
                         .try_into_coerce_to_type(*col_type)?;
-                    // Validate vector dimensions
-                    if *col_type == DataType::Vector
-                        && *vec_dims > 0
-                        && let Value::Extension(data) = &coerced
-                        && data.first() == Some(&(DataType::Vector as u8))
-                    {
-                        let got_dim = u16::try_from((data.len() - 1) / 4).unwrap_or(u16::MAX);
-                        if got_dim != *vec_dims {
-                            return Err(Error::VectorDimensionMismatch {
-                                expected: *vec_dims,
-                                got: got_dim,
-                            });
-                        }
+                    if *col_type == DataType::Vector {
+                        let name = schema.columns.get(*idx).map_or("?", |c| c.name.as_str());
+                        coerced.check_vector_column(name, *vec_dims, true)?;
                     }
                     updates.push((*idx, coerced));
                 }

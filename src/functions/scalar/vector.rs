@@ -122,13 +122,26 @@ pub fn cosine_distance_bytes(a: &[u8], b: &[u8]) -> f64 {
         norm_a += ai * ai;
         norm_b += bi * bi;
     }
+    cosine_distance_of(dot, norm_a, norm_b)
+}
+
+/// The cosine distance of two vectors from their dot product and squared
+/// norms: 1 when either is a zero vector, a positive NaN when a component
+/// is not finite, which `total_cmp` ranks after every distance, and a
+/// rounding below 0 read as 0. Every cosine distance, the function's and
+/// the HNSW index's, is this one
+#[inline]
+pub fn cosine_distance_of(dot: f64, norm_a: f64, norm_b: f64) -> f64 {
     let denom = norm_a.sqrt() * norm_b.sqrt();
     if denom == 0.0 {
-        1.0 // Zero vector: maximum dissimilarity (consistent with HNSW)
-    } else {
-        // Clamp to 0.0: floating-point rounding can produce tiny negatives (~1e-15)
-        // for near-identical vectors, which would break WHERE distance >= 0 filters.
-        (1.0 - (dot / denom)).max(0.0)
+        return 1.0;
+    }
+    let distance = 1.0 - dot / denom;
+    match distance {
+        // The NaN arithmetic gives carries the sign the target chooses
+        _ if distance.is_nan() => f64::NAN,
+        _ if distance < 0.0 => 0.0,
+        _ => distance,
     }
 }
 

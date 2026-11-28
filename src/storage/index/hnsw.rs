@@ -28,6 +28,7 @@ use std::sync::Arc;
 
 use crate::common::{I64Map, I64Set};
 use crate::core::{DataType, IndexEntry, IndexType, Operator, Result, Value};
+use crate::functions::scalar::vector::cosine_distance_of;
 use crate::storage::traits::index_trait::Index;
 
 // ─────────────────────────────────────────────────────────────
@@ -1939,12 +1940,7 @@ unsafe fn cosine_distance_avx2(ap: *const f32, bp: *const f32, n: usize) -> f32 
             norm_b += bv * bv;
             i += 1;
         }
-        let denom = (norm_a * norm_b).sqrt();
-        if denom < f32::EPSILON {
-            1.0
-        } else {
-            (1.0 - dot / denom).max(0.0)
-        }
+        cosine_distance_of(dot as f64, norm_a as f64, norm_b as f64) as f32
     }
 }
 
@@ -2126,13 +2122,7 @@ unsafe fn cosine_distance_neon(ap: *const f32, bp: *const f32, n: usize) -> f32 
             norm_b += bv * bv;
             i += 1;
         }
-        let denom = (norm_a * norm_b).sqrt();
-        if denom < f32::EPSILON {
-            1.0
-        } else {
-            // Clamp: f32 rounding can produce tiny negatives for near-identical vectors
-            (1.0 - dot / denom).max(0.0)
-        }
+        cosine_distance_of(dot as f64, norm_a as f64, norm_b as f64) as f32
     }
 }
 
@@ -2209,12 +2199,7 @@ fn cosine_distance_f32(a: &[f32], b: &[f32]) -> f32 {
         let dot = (d0 + d1) + (d2 + d3);
         let norm_a = (a0 + a1) + (a2 + a3);
         let norm_b = (b0 + b1) + (b2 + b3);
-        let denom = (norm_a * norm_b).sqrt();
-        if denom < f32::EPSILON {
-            1.0
-        } else {
-            (1.0 - dot / denom).max(0.0)
-        }
+        cosine_distance_of(dot as f64, norm_a as f64, norm_b as f64) as f32
     }
 }
 
@@ -3203,6 +3188,26 @@ impl Index for HnswIndex {
 mod tests {
     use super::*;
     use crate::functions::scalar::vector::l2_distance_bytes;
+
+    #[test]
+    fn a_cosine_distance_with_a_non_finite_component_is_nan() {
+        // 19 components: the wide loop and the remainder both read them
+        let finite: Vec<f32> = (1..=19).map(|i| i as f32).collect();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for at in [0, 18] {
+                let mut vector = finite.clone();
+                vector[at] = bad;
+                let distance = cosine_distance_f32(&vector, &finite);
+                // A positive NaN, which `total_cmp` ranks last on any target
+                assert!(
+                    distance.is_nan() && distance.is_sign_positive(),
+                    "{bad} at {at}: {distance}"
+                );
+            }
+        }
+        assert_eq!(cosine_distance_f32(&[0.0; 19], &finite), 1.0);
+        assert!(cosine_distance_f32(&finite, &finite) < 1e-6);
+    }
 
     fn make_vector_value(data: &[f32]) -> Value {
         Value::vector(data.to_vec())
