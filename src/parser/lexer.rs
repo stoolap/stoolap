@@ -195,6 +195,10 @@ impl<'a> Lexer<'a> {
 
             // Number literal
             b'0'..=b'9' => match self.read_number() {
+                _ if self.last_error.is_some() => {
+                    let err = self.last_error.take().unwrap_or_default();
+                    Token::error(err, "", pos)
+                }
                 (literal, true) => Token::new(TokenType::Float, literal, pos),
                 (literal, false) => Token::new(TokenType::Integer, literal, pos),
             },
@@ -360,13 +364,26 @@ impl<'a> Lexer<'a> {
 
             // Must have at least one digit after exponent
             if !self.byte(self.at).is_ascii_digit() {
-                self.last_error = Some("invalid number format: exponent has no digits".to_string());
-                return (self.token_since(start), float);
+                return self.invalid_number(start);
             }
             self.skip_class(DIGIT);
         }
 
+        // A letter, digit, `_` or `$` right after it would make it a name
+        if BYTE_CLASS[usize::from(self.byte(self.at))] & WORD != 0 {
+            return self.invalid_number(start);
+        }
         (self.token_since(start), float)
+    }
+
+    /// The number from byte `start` that is not one, read to the end of the
+    /// name it runs into, so the error shows the whole text as written
+    #[cold]
+    fn invalid_number(&mut self, start: usize) -> (SmartString, bool) {
+        self.skip_class(WORD);
+        let text = self.token_since(start);
+        self.last_error = Some(format!("invalid number: {text}"));
+        (text, false)
     }
 
     /// Read a string literal (single-quoted)
@@ -975,17 +992,17 @@ mod tests {
         assert_eq!(lexer.next_token().literal, ":long_named_parameter_x");
     }
 
-    /// A malformed number or comment keeps its token type and leaves the
-    /// message in `get_error`; a bad parameter or quoted identifier becomes an
-    /// Error token. Slicing must preserve the partial literal and the report.
+    /// A malformed comment keeps its token type and leaves the message in
+    /// `last_error`; a malformed number, a bad parameter or quoted identifier
+    /// becomes an Error token. Slicing must preserve the report.
     #[test]
     fn test_reader_error_paths_still_report() {
-        // exponent without digits: the partial literal is kept
+        // exponent without digits: an error naming the whole text
         let mut lexer = Lexer::new("1e+");
         let token = lexer.next_token();
-        assert_eq!(token.token_type, TokenType::Float);
-        assert_eq!(token.literal, "1e+");
-        assert!(lexer.last_error.is_some());
+        assert_eq!(token.token_type, TokenType::Error);
+        assert_eq!(token.literal, "invalid number: 1e+");
+        assert!(lexer.last_error.is_none());
 
         // a bare $ is a parameter without a number: an error token
         let mut lexer = Lexer::new("$ ");
