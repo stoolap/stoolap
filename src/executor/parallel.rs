@@ -43,7 +43,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::common::deadline::{Deadline, DeadlineSite};
 use crate::common::{CompactArc, CompactVec};
-use crate::core::value::NULL_VALUE;
+use crate::core::value::{compare_floats, NULL_VALUE};
 use crate::core::{Result, Row, RowVec, Value};
 
 #[cfg(feature = "parallel")]
@@ -1085,7 +1085,7 @@ pub fn parallel_topn_vector_search(
 
     impl PartialEq for HeapEntry {
         fn eq(&self, other: &Self) -> bool {
-            self.distance == other.distance
+            compare_floats(self.distance, other.distance).is_eq()
         }
     }
     impl Eq for HeapEntry {}
@@ -1096,7 +1096,7 @@ pub fn parallel_topn_vector_search(
     }
     impl Ord for HeapEntry {
         fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-            self.distance.total_cmp(&other.distance)
+            compare_floats(self.distance, other.distance)
         }
     }
 
@@ -1140,7 +1140,7 @@ pub fn parallel_topn_vector_search(
                                 idx,
                             });
                         } else if let Some(worst) = heap.peek()
-                            && dist < worst.distance
+                            && compare_floats(dist, worst.distance).is_lt()
                         {
                             let evict_idx = worst.idx;
                             heap.pop();
@@ -1170,7 +1170,7 @@ pub fn parallel_topn_vector_search(
 
             // Merge: collect all chunk results, take global top-K
             let mut merged: Vec<(i64, Row, f64)> = chunk_results.into_iter().flatten().collect();
-            merged.sort_unstable_by(|a, b| a.2.total_cmp(&b.2));
+            merged.sort_unstable_by(|a, b| compare_floats(a.2, b.2));
             merged.truncate(k);
             return merged;
         }
@@ -1198,7 +1198,7 @@ pub fn parallel_topn_vector_search(
                 idx,
             });
         } else if let Some(worst) = heap.peek()
-            && dist < worst.distance
+            && compare_floats(dist, worst.distance).is_lt()
         {
             let evict_idx = worst.idx;
             heap.pop();
@@ -1222,7 +1222,7 @@ pub fn parallel_topn_vector_search(
             }
         })
         .collect();
-    result.sort_unstable_by(|a, b| a.2.total_cmp(&b.2));
+    result.sort_unstable_by(|a, b| compare_floats(a.2, b.2));
     result
 }
 
@@ -1706,5 +1706,40 @@ mod tests {
             !rows_equal(&row_with_null1, &row_no_null),
             "NULL should not equal non-NULL"
         );
+    }
+
+    #[test]
+    fn a_nan_distance_of_either_sign_ranks_last_in_the_vector_top_n() {
+        let query = Value::vector(vec![0.0, 0.0]);
+        let Value::Extension(query) = &query else {
+            panic!("a vector is an extension value");
+        };
+        let parallel = ParallelConfig {
+            min_rows_for_parallel_filter: 1,
+            ..Default::default()
+        };
+        for bits in [0x7FC0_0000u32, 0xFFC0_0000] {
+            let rows = || {
+                RowVec::from_vec(vec![
+                    (1, Row::from_values(vec![Value::vector(vec![1.0, 0.0])])),
+                    (
+                        2,
+                        Row::from_values(vec![Value::vector(vec![f32::from_bits(bits), 0.0])]),
+                    ),
+                ])
+            };
+            for config in [ParallelConfig::disabled(), parallel.clone()] {
+                let nearest = parallel_topn_vector_search(
+                    rows(),
+                    0,
+                    &query[1..],
+                    1,
+                    DistanceMetric::L2,
+                    &config,
+                );
+                let ids: Vec<i64> = nearest.iter().map(|(id, _, _)| *id).collect();
+                assert_eq!(ids, [1], "NaN bits {bits:#x}, parallel {}", config.enabled);
+            }
+        }
     }
 }
