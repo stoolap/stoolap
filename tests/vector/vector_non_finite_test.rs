@@ -99,6 +99,16 @@ fn a_vector_column_refuses_a_non_finite_component() {
     // The refused ADD COLUMN left the table as it was
     let columns = db.query("SELECT * FROM x", ()).unwrap().columns().len();
     assert_eq!(columns, 1);
+    // An added column holds its dimension count from the statement on
+    let sql = "ALTER TABLE x ADD COLUMN e VECTOR(2) DEFAULT '[1]'";
+    let error = db.execute(sql, ()).expect_err(sql).to_string();
+    assert!(error.contains("dimension mismatch"), "{sql}: {error}");
+    db.execute("ALTER TABLE x ADD COLUMN f VECTOR(2)", ())
+        .unwrap();
+    let sql = "INSERT INTO x VALUES (3, '[1]')";
+    let error = db.execute(sql, ()).expect_err(sql).to_string();
+    assert!(error.contains("dimension mismatch"), "{sql}: {error}");
+    db.execute("ALTER TABLE x DROP COLUMN f", ()).unwrap();
     // The engine's own call adds a column as the statement does
     let added = db.engine().create_column_with_default(
         "x",

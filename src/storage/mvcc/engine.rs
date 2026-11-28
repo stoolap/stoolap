@@ -5211,15 +5211,16 @@ impl MVCCEngine {
 
     /// Whether an added column's default, which the table's rows take past
     /// its write checks, is a value the column holds: a VECTOR default's
-    /// dimension count, and its finite components unless the log replays a
-    /// change made before
+    /// dimension count and finite components. A change the log replays was
+    /// taken when it was made
     fn check_added_default(&self, column: &crate::core::SchemaColumn) -> Result<()> {
+        if self.loading_from_disk.load(Ordering::Acquire) {
+            return Ok(());
+        }
         match (&column.default_value, column.data_type) {
-            (Some(value), DataType::Vector) => value.check_vector_column(
-                &column.name,
-                column.vector_dimensions,
-                !self.loading_from_disk.load(Ordering::Acquire),
-            ),
+            (Some(value), DataType::Vector) => {
+                value.check_vector_column(&column.name, column.vector_dimensions, true)
+            }
             _ => Ok(()),
         }
     }
@@ -12312,11 +12313,23 @@ mod tests {
             live.unwrap_err().to_string().contains("cannot hold NaN"),
             "a live change refuses it"
         );
+        let short = || (None, Some(Value::vector(vec![1.0])), None);
+        let live = engine.create_column_with_default("t", "e", DataType::Vector, true, short(), 2);
+        assert!(
+            live.unwrap_err().to_string().contains("dimension mismatch"),
+            "a live change refuses a short default"
+        );
         engine.loading_from_disk.store(true, Ordering::Release);
         let replayed =
             engine.create_column_with_default("t", "e", DataType::Vector, true, nan(), 2);
+        let replayed_short =
+            engine.create_column_with_default("t", "f", DataType::Vector, true, short(), 2);
         engine.loading_from_disk.store(false, Ordering::Release);
         assert!(replayed.is_ok(), "a replayed change keeps it: {replayed:?}");
+        assert!(
+            replayed_short.is_ok(),
+            "a replayed short default keeps its column: {replayed_short:?}"
+        );
         engine.close_engine().unwrap();
     }
 
