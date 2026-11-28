@@ -20,6 +20,8 @@ use stoolap::{Database, Rows, Value};
 
 const COLUMN: &str = "column 'missing' not found";
 const TABLE: &str = "table or view 'nope' not found";
+/// A GROUP BY key or an aggregate's separator no column has, quoted or not
+const COMPILED: &str = "Compile error: Column 'missing' not found";
 
 /// Each statement, the parameters it takes and its error
 const CASES: &[(&str, &[i64], &str)] = &[
@@ -66,21 +68,61 @@ const CASES: &[(&str, &[i64], &str)] = &[
         COLUMN,
     ),
     ("SELECT DISTINCT missing FROM t", &[], COLUMN),
-    ("SELECT * FROM nope", &[], TABLE),
-    ("SELECT COUNT(*) FROM nope", &[], TABLE),
-    ("SELECT id FROM nope WHERE id = $1", &[1], TABLE),
-];
-
-/// Aggregates of a quoted name no column carries, each with its parameters
-const QUOTED: &[(&str, &[i64])] = &[
-    ("SELECT COUNT(\"missing\") FROM t", &[]),
-    ("SELECT MAX(\"missing\") FROM t WHERE id > $1", &[1]),
+    // A double-quoted name is a name too
+    ("SELECT \"missing\" FROM t", &[], COLUMN),
+    ("SELECT \"missing\"", &[], COLUMN),
+    ("SELECT id, \"missing\" || 'x' FROM t", &[], COLUMN),
+    (
+        "SELECT CASE WHEN a > 1 THEN \"missing\" END FROM t",
+        &[],
+        COLUMN,
+    ),
+    ("SELECT id FROM t WHERE a = \"missing\"", &[], COLUMN),
+    ("SELECT id FROM t WHERE a IN (\"missing\", 1)", &[], COLUMN),
+    ("SELECT id FROM t WHERE a LIKE \"missing\"", &[], COLUMN),
+    (
+        "SELECT id FROM t WHERE id > $1 ORDER BY \"missing\"",
+        &[0],
+        COLUMN,
+    ),
+    ("SELECT COUNT(*) FROM t GROUP BY missing", &[], COMPILED),
+    ("SELECT COUNT(*) FROM t GROUP BY \"missing\"", &[], COMPILED),
+    (
+        "SELECT g FROM t GROUP BY g HAVING MAX(\"missing\") > $1",
+        &[0],
+        COLUMN,
+    ),
+    ("SELECT COUNT(\"missing\") FROM t", &[], COLUMN),
+    ("SELECT MAX(\"missing\") FROM t WHERE id > $1", &[1], COLUMN),
     (
         "SELECT g, MIN(\"missing\") FROM t GROUP BY g ORDER BY g",
         &[],
+        COLUMN,
     ),
-    ("SELECT STRING_AGG(\"missing\", ',') FROM t", &[]),
-    ("SELECT COUNT(DISTINCT \"missing\"), SUM(a) FROM t", &[]),
+    ("SELECT STRING_AGG(\"missing\", ',') FROM t", &[], COLUMN),
+    (
+        "SELECT g, STRING_AGG(CAST(a AS TEXT), missing) FROM t GROUP BY g",
+        &[],
+        COMPILED,
+    ),
+    (
+        "SELECT g, STRING_AGG(CAST(a AS TEXT), \"missing\") FROM t GROUP BY g",
+        &[],
+        COMPILED,
+    ),
+    (
+        "SELECT COUNT(DISTINCT \"missing\"), SUM(a) FROM t",
+        &[],
+        COLUMN,
+    ),
+    (
+        "SELECT id FROM t WHERE a IN (SELECT \"missing\" FROM t)",
+        &[],
+        COLUMN,
+    ),
+    ("SELECT * FROM nope", &[], TABLE),
+    ("SELECT COUNT(*) FROM nope", &[], TABLE),
+    ("SELECT id FROM nope WHERE id = $1", &[1], TABLE),
 ];
 
 fn open(dir: &tempfile::TempDir, sealed: bool) -> Database {
@@ -151,16 +193,41 @@ fn answer(rows: stoolap::Result<Rows>) -> Result<Vec<String>, String> {
 }
 
 #[test]
-fn an_aggregate_of_a_quoted_name_no_column_has_reads_its_text() {
+fn a_quoted_name_reads_the_column_it_names_and_writes_nothing_else() {
     for sealed in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let db = open(&dir, sealed);
-        for (sql, params) in QUOTED {
-            let twin = sql.replace("\"missing\"", "'missing'");
-            let want = answer(db.query(&twin, values(params)));
-            assert!(want.is_ok(), "{twin}: {want:?}");
-            let got = answer(db.query(sql, values(params)));
-            assert_eq!(got, want, "sealed {sealed}: {sql}");
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "SELECT \"a\" FROM t WHERE \"g\" = 1 ORDER BY id",
+                &["10", "20"],
+            ),
+            (
+                "SELECT id FROM t WHERE a IN (\"a\") ORDER BY id",
+                &["1", "2", "3"],
+            ),
+            ("SELECT MAX(\"a\") FROM t", &["30"]),
+            (
+                "SELECT g, COUNT(*) FROM t GROUP BY \"g\" ORDER BY g",
+                &["1|2", "2|1"],
+            ),
+        ];
+        for (sql, want) in cases {
+            let got = answer(db.query(sql, ()));
+            let want = want.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            assert_eq!(got, Ok(want), "sealed {sealed}: {sql}");
         }
+        let got = db.execute("UPDATE t SET a = \"missing\"", ());
+        assert_eq!(
+            got.map_err(|e| e.to_string()),
+            Err(COLUMN.to_string()),
+            "sealed {sealed}: UPDATE"
+        );
+        let got = answer(db.query("SELECT a FROM t ORDER BY id", ()));
+        assert_eq!(
+            got,
+            Ok(vec!["10".into(), "20".into(), "30".into()]),
+            "sealed {sealed}"
+        );
     }
 }

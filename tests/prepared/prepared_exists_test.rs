@@ -993,21 +993,21 @@ fn test_a_kept_answer_is_of_the_scopes_its_names_bound_in() {
     let db = Database::open("memory://prepared_exists_binding").unwrap();
     for sql in [
         "CREATE TABLE t1 (id INTEGER PRIMARY KEY, k INTEGER, p TEXT)",
-        "CREATE TABLE t2 (id INTEGER PRIMARY KEY, k INTEGER)",
+        "CREATE TABLE t2 (id INTEGER PRIMARY KEY, k INTEGER, p TEXT)",
         "CREATE TABLE u (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)",
         "INSERT INTO t1 VALUES (1, 1, 'p')",
-        "INSERT INTO t2 VALUES (1, 1)",
+        "INSERT INTO t2 VALUES (1, 1, 'x')",
         "INSERT INTO u VALUES (1, 1, 'p')",
     ] {
         db.execute(sql, ()).unwrap();
     }
     force_exists_strategy(Some(true));
-    // "p" is t1's column, and a TEXT literal over t2
-    for table in ["t1", "t2", "t1"] {
+    // "p" is t1's column over t1 and t2's over t2
+    for (table, want) in [("t1", vec![1]), ("t2", vec![]), ("t1", vec![1])] {
         let sql = format!(
             "SELECT id FROM {table} t WHERE id = 0 OR EXISTS (SELECT 1 FROM u WHERE u.a = t.k AND u.b = \"p\")"
         );
-        assert_eq!(ids(&db, &sql), vec![1], "{sql}");
+        assert_eq!(ids(&db, &sql), want, "{sql}");
     }
 }
 

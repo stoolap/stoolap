@@ -327,7 +327,7 @@ fn a_quoted_name_cannot_hold_the_qualifier_separator() {
 }
 
 #[test]
-fn a_quoted_name_no_column_has_is_its_text_over_every_source() {
+fn a_quoted_name_no_column_has_is_an_error_over_every_source() {
     let db = Database::open("memory://column_sources_fallback").unwrap();
     for sql in [
         "CREATE TABLE q (id INTEGER PRIMARY KEY, \"a.b\" INTEGER)",
@@ -347,13 +347,13 @@ fn a_quoted_name_no_column_has_is_its_text_over_every_source() {
         ("", "(VALUES (5)) AS v(\"a.b\")", "v"),
     ] {
         for (item, want) in [
-            ("\"b\"".to_string(), Some("[Some(Text(\"b\"))]")),
-            ("\"b\" AS x".to_string(), Some("[Some(Text(\"b\"))]")),
+            // A name is a column or nothing, quoted or qualified
+            ("\"b\"".to_string(), None),
+            ("\"b\" AS x".to_string(), None),
             ("\"a.b\"".to_string(), Some("[Some(Integer(5))]")),
             ("\"a.b\" AS x".to_string(), Some("[Some(Integer(5))]")),
             (format!("{entry}.\"a.b\""), Some("[Some(Integer(5))]")),
             (format!("{entry}.\"a.b\" AS x"), Some("[Some(Integer(5))]")),
-            // A qualified name is a column or nothing: it never reads as text
             (format!("{entry}.b"), None),
             (format!("{entry}.b AS x"), None),
         ] {

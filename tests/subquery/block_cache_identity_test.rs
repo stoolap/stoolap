@@ -48,18 +48,8 @@ fn the_same_block_written_twice_is_kept_once_for_both() {
             ["10", "20"],
         ),
         (
-            "SELECT (SELECT \"UPPER\" FROM q), (SELECT \"upper\" FROM q) FROM q",
-            ["UPPER", "upper"],
-        ),
-        (
             "SELECT (SELECT b FROM \"q AS a\"), (SELECT b FROM q AS a) FROM q",
             ["30", "10"],
-        ),
-        // A final sigma lowers to its own letter, as the resolver lowers the alias
-        (
-            "SELECT (SELECT 'x' AS \"ΟΣ\" FROM q WHERE \"οσ\" = 'οσ'), \
-             (SELECT 'x' AS \"οσ\" FROM q WHERE \"οσ\" = 'οσ') FROM q",
-            ["x", "NULL"],
         ),
         (
             "SELECT (SELECT b FROM q AS a), (SELECT b FROM \"q AS a\") FROM q",

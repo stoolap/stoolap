@@ -2934,14 +2934,9 @@ impl Chain<'_> {
             }
         }
         if let Some((qualifier, name)) = split_qualified(&id.value_lower) {
-            let resolved = self.qualified(qualifier, name, id.quoted, &id.value);
-            return match resolved {
-                Err(_) if id.quoted => Ok(None),
-                other => other.map(Some),
-            };
-        }
-        if id.quoted {
-            return Ok(None);
+            return self
+                .qualified(qualifier, name, id.quoted, &id.value)
+                .map(Some);
         }
         Err(Error::ColumnNotFound(id.value.to_string()))
     }

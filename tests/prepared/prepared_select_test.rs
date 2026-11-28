@@ -823,12 +823,12 @@ fn test_quoting_is_unchanged() {
         (vec![1], 2),
         "a quoted name resolves by its lowercase form"
     );
-    let literal =
+    let missing =
         "SELECT id FROM t WHERE s = (SELECT \"abc\" FROM u WHERE u.id = t.id) ORDER BY id";
     assert_eq!(
-        ids(&db, literal, ()),
-        (vec![1], 2),
-        "a quoted name naming no column reads as TEXT"
+        db.query(missing, ()).map(|_| ()).map_err(|e| e.to_string()),
+        Err("column 'abc' not found".to_string()),
+        "a quoted name naming no column is an error"
     );
 }
 
@@ -3324,7 +3324,7 @@ fn test_a_computed_limit_and_offset_are_read_once_before_the_rows() {
             ),
             (
                 "SELECT id FROM t WHERE a < (SELECT MAX(v) FROM u) * 10 ORDER BY id \
-                 LIMIT LENGTH(\"xx\") + (SELECT 0)",
+                 LIMIT LENGTH('xx') + (SELECT 0)",
                 vec![1, 2],
             ),
         ] {

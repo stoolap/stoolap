@@ -344,7 +344,7 @@ fn a_derived_table_knows_every_source_s_names_without_running_it() {
     let mut wrong = Vec::new();
     for (sql, expected) in [
         (
-            "SELECT id, (SELECT COUNT(*) FROM (SELECT \"hello\") AS q) FROM t WHERE id = 1".to_string(),
+            "SELECT id, (SELECT COUNT(*) FROM (SELECT 'hello') AS q) FROM t WHERE id = 1".to_string(),
             "1",
         ),
         (over("(SELECT x + 1 FROM u)"), "1"),
@@ -439,7 +439,7 @@ fn a_rewritten_select_item_keeps_its_name_and_binds_no_clause() {
         ("SELECT (SELECT COUNT(*) FROM (SELECT t.a FROM (VALUES (1), (2)) GROUP BY column1) q) FROM t", "2"),
         ("SELECT (SELECT MAX(q.a) FROM (SELECT t.a FROM u GROUP BY a) q) FROM t", "10"),
         ("SELECT (SELECT COUNT(*) FROM (SELECT SUM(id) AS a, t.a FROM u GROUP BY a) q) FROM t", "2"),
-        ("SELECT (SELECT MAX(q.\"t.a + 0\") FROM (SELECT t.a + 0 FROM u ORDER BY \"t.a + 0\") q) FROM t", "10"),
+        ("SELECT (SELECT MAX(q.\"t.a + 0\") FROM (SELECT t.a + 0 FROM u) q) FROM t", "10"),
     ] {
         let line = prepared_line(&db, sql);
         if line != "Prepared: yes" {
@@ -449,6 +449,13 @@ fn a_rewritten_select_item_keeps_its_name_and_binds_no_clause() {
         if got != Ok(vec![vec![expected.to_string()]]) {
             wrong.push(format!("{sql}: {got:?}"));
         }
+    }
+    let sql = "SELECT (SELECT MAX(q.\"t.a + 0\") FROM (SELECT t.a + 0 FROM u ORDER BY \"t.a + 0\") q) FROM t";
+    let got = answer(&db, sql);
+    if !matches!(&got, Err(e) if e.contains("column 't.a + 0' not found")) {
+        wrong.push(format!(
+            "{sql}: the item's name binds the ORDER BY: {got:?}"
+        ));
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
@@ -670,11 +677,11 @@ fn an_exists_binds_a_subquery_in_its_order_by_over_a_table_as_over_a_derived_tab
 #[test]
 fn a_slot_spelled_as_a_name_shares_no_cached_subquery_with_that_name() {
     let _turn = turn();
-    // The inner `a` is t's, a slot holding 'z'; the quoted "a" no table has
-    // is the text 'a'. Neither block keeps the other's answer
+    // The inner `a` is t's, a slot holding 'z'; 'a' is the text. Neither block
+    // keeps the other's answer
     let slot = "SELECT (SELECT MAX(d.c) FROM (SELECT \
                 (SELECT COUNT(*) FROM w WHERE w.k = a) AS c FROM u) AS d) FROM t";
-    let text = "SELECT (SELECT COUNT(*) FROM w WHERE w.k = \"a\"), $1 FROM u";
+    let text = "SELECT (SELECT COUNT(*) FROM w WHERE w.k = 'a'), $1 FROM u";
     for slot_first in [true, false] {
         let db = Database::open(&format!(
             "memory://derived_table_blocks_spelled_slot_cache_{slot_first}"

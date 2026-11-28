@@ -335,78 +335,39 @@ fn test_like_with_null() {
     assert_eq!(ids, vec![1, 3], "NULL should not match LIKE pattern");
 }
 
-/// Test LIKE, NOT LIKE, ILIKE with double-quoted patterns
 #[test]
-fn test_like_double_quoted_patterns() {
+fn test_a_double_quoted_pattern_is_a_column_name() {
     let db = Database::open("memory://like_dq").expect("Failed to create database");
     setup_like_table(&db);
 
-    // Double-quoted LIKE should work the same as single-quoted
-    let result = db
-        .query(
-            "SELECT id FROM fruits WHERE name LIKE \"apple\" ORDER BY id",
-            (),
-        )
-        .expect("Failed to query");
-    let ids: Vec<i64> = result
-        .into_iter()
-        .map(|r| r.unwrap().get::<i64>(0).unwrap())
-        .collect();
-    assert_eq!(ids, vec![1], "Double-quoted exact LIKE");
+    for sql in [
+        "SELECT id FROM fruits WHERE name LIKE \"apple\"",
+        "SELECT id FROM fruits WHERE name NOT LIKE \"%berry\"",
+        "SELECT id FROM fruits WHERE name ILIKE \"GR%\"",
+        "SELECT id FROM fruits WHERE name GLOB \"a*\"",
+        "SELECT id FROM fruits WHERE name REGEXP \"^a\"",
+    ] {
+        let got = db
+            .query(sql, ())
+            .and_then(|rows| rows.collect::<Result<Vec<_>, _>>());
+        assert!(
+            matches!(&got, Err(e) if e.to_string().contains("not found")),
+            "{sql}: {:?}",
+            got.map(|rows| rows.len())
+        );
+    }
 
-    // Double-quoted wildcard pattern
-    let result = db
+    let ids: Vec<i64> = db
         .query(
-            "SELECT id FROM fruits WHERE name LIKE \"%berry\" ORDER BY id",
+            "SELECT id FROM fruits WHERE name LIKE \"name\" ORDER BY id",
             (),
         )
-        .expect("Failed to query");
-    let ids: Vec<i64> = result
-        .into_iter()
-        .map(|r| r.unwrap().get::<i64>(0).unwrap())
-        .collect();
-    assert_eq!(ids, vec![7, 8, 9, 10], "Double-quoted LIKE '%berry'");
-
-    // Double-quoted NOT LIKE
-    let result = db
-        .query(
-            "SELECT id FROM fruits WHERE name NOT LIKE \"%berry\" ORDER BY id",
-            (),
-        )
-        .expect("Failed to query");
-    let ids: Vec<i64> = result
-        .into_iter()
+        .expect("Failed to query")
         .map(|r| r.unwrap().get::<i64>(0).unwrap())
         .collect();
     assert_eq!(
         ids,
-        vec![1, 2, 3, 4, 5, 6],
-        "Double-quoted NOT LIKE '%berry'"
+        (1..=10).collect::<Vec<_>>(),
+        "name LIKE its own column"
     );
-
-    // Double-quoted ILIKE (case-insensitive)
-    let result = db
-        .query(
-            "SELECT id FROM fruits WHERE name ILIKE \"APPLE\" ORDER BY id",
-            (),
-        )
-        .expect("Failed to query");
-    let ids: Vec<i64> = result
-        .into_iter()
-        .map(|r| r.unwrap().get::<i64>(0).unwrap())
-        .collect();
-    assert_eq!(ids, vec![1], "Double-quoted ILIKE 'APPLE'");
-
-    // Double-quoted ILIKE with wildcard
-    let result = db
-        .query(
-            "SELECT id FROM fruits WHERE name ILIKE \"GR%\" ORDER BY id",
-            (),
-        )
-        .expect("Failed to query");
-    let ids: Vec<i64> = result
-        .into_iter()
-        .map(|r| r.unwrap().get::<i64>(0).unwrap())
-        .collect();
-    assert_eq!(ids, vec![4, 5], "Double-quoted ILIKE 'GR%'");
 }

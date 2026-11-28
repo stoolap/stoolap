@@ -123,7 +123,7 @@ fn check(db: &Database, context: &str, wrong: &mut Vec<String>) {
     for (sql, same_as) in [
         ("SELECT y.a FROM y", "SELECT a FROM y"),
         (
-            "SELECT COUNT(\"missing\") FROM (VALUES (1), (2)) AS v (x)",
+            "SELECT COUNT('missing') FROM (VALUES (1), (2)) AS v (x)",
             "SELECT 2",
         ),
         (

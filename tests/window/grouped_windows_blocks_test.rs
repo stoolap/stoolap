@@ -740,21 +740,18 @@ fn an_order_by_subquery_reading_a_select_alias_sorts_by_it() {
         ),
         Err("column 't.grp' not found".to_string())
     );
-    for (sql, twin) in [
-        (
-            "SELECT t.a AS grp, COUNT(*) FROM t GROUP BY t.a ORDER BY (SELECT grp) DESC",
-            "SELECT t.a AS grp, COUNT(*) FROM t GROUP BY t.a ORDER BY t.a DESC",
-        ),
-        // A dotted name is one name, which no column has: its text
-        (
+    // A dotted name is one name, which no column has
+    assert_eq!(
+        rows(
+            &db,
             "SELECT t.a AS grp, COUNT(*) FROM t GROUP BY t.a \
-             ORDER BY (SELECT \"t.grp\" + 0 * t.a), t.a DESC",
-            "SELECT t.a AS grp, COUNT(*) FROM t GROUP BY t.a \
-             ORDER BY (SELECT 't.grp' + 0 * t.a), t.a DESC",
+             ORDER BY (SELECT \"t.grp\" + 0 * t.a), t.a DESC"
         ),
-    ] {
-        assert_eq!(rows(&db, sql), rows(&db, twin), "{sql}");
-    }
+        Err("column 't.grp' not found".to_string())
+    );
+    let sql = "SELECT t.a AS grp, COUNT(*) FROM t GROUP BY t.a ORDER BY (SELECT grp) DESC";
+    let twin = "SELECT t.a AS grp, COUNT(*) FROM t GROUP BY t.a ORDER BY t.a DESC";
+    assert_eq!(rows(&db, sql), rows(&db, twin), "{sql}");
 }
 
 #[test]
